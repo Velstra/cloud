@@ -143,15 +143,59 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
   await send("Page.enable");
   await send("Network.enable");
 
+  // Wait for the browser to really be gone, without the event loop.
+  //
+  // The cleanup below runs from `process.on("exit")`, where nothing async will
+  // ever run again, so `await` and timers are not available. Removing the
+  // profile while chromium is still shutting down half works: the directory is
+  // emptied and the dying browser writes a stub back over it. So the wait is
+  // done by asking the kernel whether the pid is still there.
+  const gone = (within) => {
+    const until = Date.now() + within;
+    const idle = new Int32Array(new SharedArrayBuffer(4));
+    for (;;) {
+      try { process.kill(proc.pid, 0); } catch (e) { return true; }
+      if (Date.now() > until) return false;
+      Atomics.wait(idle, 0, 0, 25);
+    }
+  };
+
+  let shut = false;
+  const shutDown = () => {
+    if (shut) return;
+    shut = true;
+    try { ws.close(); } catch (e) {}
+    // Asked first, so chromium takes its own children with it — a killed parent
+    // leaves the zygote and every renderer behind, and those are what fill a
+    // machine after a handful of interrupted runs.
+    try { proc.kill(); } catch (e) {}
+    if (!gone(3000)) { try { proc.kill("SIGKILL"); } catch (e) {} gone(1000); }
+    try { rmSync(profile, { recursive: true, force: true }); } catch (e) {}
+  };
+
+  // A run that dies takes the browser and its profile with it.
+  //
+  // The suite calls `close()` on its last line, so it only ever ran on the happy
+  // path: any throw above it — an assertion the harness itself raises, a browser
+  // that went away mid-run — left a live chromium behind and a ~147 MB profile
+  // in the temp directory. That is not tidiness. A handful of abandoned runs
+  // fill the tmpfs, and the next run dies with "No space left on device" while
+  // the suite is entirely fine. A failure that makes *later* runs fail for an
+  // unrelated reason is the thing that teaches people to re-run instead of look.
+  //
+  // `exit` is sync-only, which is why the cleanup is sync. The signals are here
+  // because an interrupted run is the common way this happens.
+  const onExit = () => shutDown();
+  process.once("exit", onExit);
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.once(signal, () => { shutDown(); process.exit(130); });
+  }
+
   return {
     evaluate, thrown, requests,
     async goto(url) { await send("Page.navigate", { url }); await sleep(900); },
     async screenshot() { return (await send("Page.captureScreenshot", { format: "png" })).result.data; },
-    close() {
-      try { ws.close(); } catch (e) {}
-      proc.kill();
-      try { rmSync(profile, { recursive: true, force: true }); } catch (e) {}
-    },
+    close() { process.removeListener("exit", onExit); shutDown(); },
   };
 }
 
@@ -163,12 +207,27 @@ export async function signIn(page, token) {
     document.getElementById("tokenform").dispatchEvent(new Event("submit", { cancelable: true }));
     return 1;
   })()`);
-  await sleep(900);
-  const inside = await page.evaluate(`!document.getElementById("app").classList.contains("hidden")`);
+  const inside = await waitFor(page,
+    `!document.getElementById("app").classList.contains("hidden") || null`);
   if (!inside) {
     const why = await page.evaluate(`document.getElementById("loginerr").textContent`);
     throw new Error(`signing in left the sign-in screen up: ${why}`);
   }
+  // Signed in is not the same as ready to be asked a question. The console shows
+  // the app as soon as the token is accepted and lists the first collection
+  // after that, so a check made in between reads a board that has not been
+  // filled and reports "no instances at all" about a cell that has plenty. That
+  // was a fixed 900 ms, which is a guess about a round trip.
+  const board = await waitFor(page, `(() => {
+    if (!view.coll) return null;
+    if (document.querySelectorAll("#boardbody tr").length) return "rows";
+    for (const id of ["listempty", "listerr"]) {
+      const box = document.getElementById(id);
+      if (box && !box.classList.contains("hidden")) return id;
+    }
+    return null;
+  })()`, { timeout: 20000 });
+  if (!board) throw new Error("signing in never produced a board to look at");
 }
 
 /// Wait for something to become true, rather than sleeping and hoping.
@@ -190,13 +249,34 @@ export async function waitFor(page, expression, { timeout = 10000, every = 200 }
   }
 }
 
-/// Open a collection and wait for its board.
+/// Open a collection and wait for its board — for the board, not for a while.
+///
+/// `show()` renders the new collection only once its list has come back, so
+/// until then `view.items` and the rows on screen are still the *previous*
+/// collection's. This used to click and sleep half a second, which is enough on
+/// an idle machine and is not a guarantee: with the API answering a few hundred
+/// milliseconds slower — a rebuild running beside the suite is enough — every
+/// check that names its subject out of `view.items` picks it out of the wrong
+/// world, and reports whatever that produces. Sleeping longer only moves the
+/// line, so what is waited for is the thing itself: the promise the rail's own
+/// handler made.
 export async function open(page, collectionId) {
-  await page.evaluate(`(async () => {
-    document.querySelector('[data-collection="${collectionId}"]').click();
-    await new Promise((r) => setTimeout(r, 500));
-    return 1;
+  const opened = await page.evaluate(`(async () => {
+    const rail = document.querySelector('[data-collection=${JSON.stringify(collectionId)}]');
+    if (!rail) return "no rail item";
+    // Clicked, because that is how an operator gets there and the rail is worth
+    // exercising — and the show it starts is taken in passing so this can wait
+    // on it rather than on a guess. \`show\` is a top-level declaration, so the
+    // rail's handler reaches it through the global object.
+    let started = null;
+    const real = window.show;
+    window.show = (id) => (started = real(id));
+    try { rail.click(); } finally { window.show = real; }
+    if (!started) return "the rail did not open anything";
+    await started;
+    return "";
   })()`);
+  if (opened) throw new Error(`could not open ${collectionId}: ${opened}`);
 }
 
 /// Open one object's sheet by id.

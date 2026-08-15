@@ -31,10 +31,23 @@ const noThrows = (why) => check(page.thrown.length === 0, why + "\n  " + page.th
 const pick = async (what, predicate) => {
   const found = await page.evaluate(`(() => {
     const r = view.items.find((x) => (${predicate})(x));
-    return r ? { id: idOf(r), name: nameOf(r) } : null;
+    if (r) return { id: idOf(r), name: nameOf(r) };
+    // Why there is nothing, not just that there is nothing. A board whose list
+    // failed holds no items either, and reporting that as "the seed has none"
+    // is the lie this suite is least able to afford: it turns a run in which
+    // the API stopped answering into a run that says everything is fine. It has
+    // already happened — one dropped fetch produced six skips and a "36/37
+    // passed" over a migration screen nothing had looked at.
+    const err = document.getElementById("listerr");
+    const broke = err && !err.classList.contains("hidden") ? err.textContent : "";
+    return { trouble: broke, board: view.coll ? view.coll.id : "(none)" };
   })()`);
-  if (!found) skip(`this API's seed holds no ${what}`);
-  return found;
+  if (found.id) return found;
+  if (found.trouble) {
+    throw new Error(`the ${found.board} board is not listing at all, so nothing could be ` +
+      `chosen to check: ${found.trouble}`);
+  }
+  skip(`this API's seed holds no ${what}`);
 };
 
 const ofKind = (kind) => `(x) => verdict(x).kind === ${JSON.stringify(kind)}`;
@@ -651,12 +664,59 @@ const migratable = async () => {
       busy = new Set(ms
         .filter((m) => !deletedAt(m) && condition(m, "Moved")?.status !== "True")
         .map((m) => String(pick(spec(m), "instance"))));
-    } catch (e) { return null; }
+    } catch (e) {
+      // Not "no guest": the question was never asked. Swallowing this into a
+      // skip is how a run in which the API stopped answering reports itself as
+      // a run whose cell simply had nothing to move.
+      return { trouble: String(e.message || e) };
+    }
     const r = view.items.find((x) => at(status(x), "node") && !busy.has(nameOf(x)));
-    return r ? { id: idOf(r), name: nameOf(r), node: at(status(r), "node") } : null;
+    return r ? { id: idOf(r), name: nameOf(r), node: at(status(r), "node") } : {};
   })()`);
-  if (!found) skip("this API's seed holds no running guest that is not already moving");
+  if (found.trouble) {
+    throw new Error("the migrations could not be read, so no guest could be chosen to move: "
+      + found.trouble);
+  }
+  if (!found.id) skip("this API's seed holds no running guest that is not already moving");
   return found;
+};
+
+/// A migration of this check's own, started through the API rather than the
+/// dialog, for the checks that have to change one.
+///
+/// A check that mutates its subject must own it. Choosing one out of the seed by
+/// what is true of it is right for reading — it is what makes these mean the
+/// same thing against another API — and wrong the moment the check writes,
+/// because the predicate can land on the object another check is in the middle
+/// of, or on one a check above already removed. Made here, named after this
+/// suite, and removed by the caller.
+const ownMigration = async () => {
+  await page.evaluate(`closeSheet()`);
+  await open(page, "instances");
+  const guest = await page.evaluate(`(() => {
+    const r = view.items.find((x) => at(status(x), "node"));
+    return r ? { name: nameOf(r), node: at(status(r), "node") } : null;
+  })()`);
+  if (!guest) skip("this cell holds no placed guest to move");
+  // The platform's own answer about this guest, so the destination is one it has
+  // said yes to rather than one this file assumed.
+  const asked = await api("/api/v1/" + guest.name + ":explainMigration");
+  check(asked.ok, `the API would not say where ${guest.name} could go (${asked.status})`);
+  const to = ((await asked.json()).destinations || []).find((d) => d.allowed);
+  if (!to) skip("no node in this cell can receive that guest");
+  const project = guest.name.split("/").slice(0, 2).join("/");
+  const id = "consoletest-expiring-" + Math.random().toString(36).slice(2, 6);
+  const made = await api("/api/v1/" + project + "/migrations", {
+    method: "POST",
+    body: JSON.stringify({ id, spec: { instance: guest.name, toNode: to.node,
+      mode: "Live", downtimeMs: 300, timeoutS: 3600, connections: 1 } }),
+  });
+  if (!made.ok) {
+    check(false, `the API would not start a migration to time out (${made.status}): ` +
+      JSON.stringify(await made.json()));
+  }
+  await open(page, "migrations");
+  return { id, name: project + "/migrations/" + id, node: guest.node };
 };
 
 /// Open the migrate dialog on that guest.
@@ -1044,66 +1104,86 @@ await test("a migration that ran out of time stops reading as one in flight, wit
   // ever really happens.
   if (!SCAFFOLDED) skip("only the in-memory contract server can make a migration older than it is");
   await page.evaluate(`closeSheet()`);
-  await open(page, "migrations");
-  const it = await pick("migration in flight to time out",
-    `(x) => !deletedAt(x) && condition(x, "Moved")?.status === "Unknown"`);
-  // The interval, not its length: fifteen seconds is right for an operator and
-  // wrong for a test, and what is being checked is that it asks at all.
-  await page.evaluate(`(async () => {
-    collection("migrations").recheck = 2;
-    await show("migrations");
-  })()`);
-  const before = await (await api("/api/v1/" + it.name)).json();
-  const aged = await api("/__test/age?name=" + it.name + "&seconds=99999");
-  check(aged.ok, `the API would not age that migration (${aged.status})`);
-  const now = await aged.json();
-  const moved = (now.status.conditions || []).find((c) => c.kind === "Moved");
-  check(moved && moved.reason === "Timeout",
-    "ageing the object past its budget did not produce a timeout: " + JSON.stringify(moved));
-  const said = moved.message;
-  // Nothing was written: same revision, so there was nothing for the store to
-  // announce and the watch could not have carried this.
-  equal(now.meta.revision, before.meta.revision,
-    "the timeout came with a write, which means a watch would have delivered it " +
-    "and this test is no longer checking what it says it checks");
 
-  const caught = await waitFor(page, `(() => {
-    const row = [...document.querySelectorAll("#boardbody tr")]
-      .find((r) => r.dataset.name === ${JSON.stringify(it.name)});
-    return row && /Failing/.test(row.innerText) ? row.innerText : null;
-  })()`, { timeout: 15000 });
-  check(caught, "an expired migration still reads as in flight; nothing asked again");
+  // Its own subject, made here and taken away again.
+  //
+  // This used to choose a migration out of the seed by predicate and then
+  // backdate it by 99999 seconds — a shared object left permanently expired for
+  // everything that ran afterwards, and a name another check may already have
+  // abandoned, in which case `/__test/age` answers 404 about an object this one
+  // never touched. Neither is a hazard a subject nothing else can name has.
+  const it = await ownMigration();
+  try {
+    // The interval, not its length: fifteen seconds is right for an operator and
+    // wrong for a test, and what is being checked is that it asks at all.
+    await page.evaluate(`(async () => {
+      collection("migrations").recheck = 2;
+      await show("migrations");
+    })()`);
+    const there = await waitFor(page, `(() => {
+      const row = [...document.querySelectorAll("#boardbody tr")]
+        .find((r) => r.dataset.name === ${JSON.stringify(it.name)});
+      return row ? 1 : null;
+    })()`);
+    check(there, "the migration this check started never reached the board");
+    const before = await (await api("/api/v1/" + it.name)).json();
+    const aged = await api("/__test/age?name=" + it.name + "&seconds=99999");
+    check(aged.ok, `the API would not age that migration (${aged.status})`);
+    const now = await aged.json();
+    const moved = (now.status.conditions || []).find((c) => c.kind === "Moved");
+    check(moved && moved.reason === "Timeout",
+      "ageing the object past its budget did not produce a timeout: " + JSON.stringify(moved));
+    const said = moved.message;
+    // Nothing was written: same revision, so there was nothing for the store to
+    // announce and the watch could not have carried this.
+    equal(now.meta.revision, before.meta.revision,
+      "the timeout came with a write, which means a watch would have delivered it " +
+      "and this test is no longer checking what it says it checks");
 
-  await openRow(page, it.id);
-  const text = await sheetText(page);
-  check(/Gave up/.test(text), "a migration that ran out of time does not say so:\n" + text.slice(0, 600));
-  // Verbatim: the sentence names where the guest ended up, which is the whole
-  // question at that moment, and no paraphrase can be trusted with it.
-  check(text.includes(said), `the platform's own sentence ("${said}") is not on the page`);
+    const caught = await waitFor(page, `(() => {
+      const row = [...document.querySelectorAll("#boardbody tr")]
+        .find((r) => r.dataset.name === ${JSON.stringify(it.name)});
+      return row && /Failing/.test(row.innerText) ? row.innerText : null;
+    })()`, { timeout: 15000 });
+    check(caught, "an expired migration still reads as in flight; nothing asked again");
 
-  // The one age this screen shows, and the only reason that has earned one: a
-  // timeout happened at `createdAt + timeoutS`, so the API stamps that moment
-  // and two reads agree on it. Every other reason's `lastTransition` is the
-  // moment of the read, which is why nothing else here carries an age.
-  const movement = await page.evaluate(`document.querySelector("#sheet .verdict").innerText`);
-  check(/gave up/i.test(movement) && /ago/.test(movement),
-    "a timed-out migration does not say how long ago it gave up:\n" + movement);
-  const twice = await Promise.all([
-    (await api("/api/v1/" + it.name)).json(),
-    (await api("/api/v1/" + it.name)).json(),
-  ]);
-  const stamps = twice.map((r) =>
-    (r.status.conditions || []).find((c) => c.kind === "Moved").lastTransition);
-  equal(stamps[0], stamps[1],
-    "the timeout's moment moves between reads, so the age beside it is the age of the read");
-  check(!/Copying memory|Not listening yet/.test(text),
-    "an expired migration is still described as if it were moving");
-  // A new migration is a new migration: there is no retry here.
-  check(!/retry|try again/i.test(text), "the screen offers to retry a migration");
-  await page.evaluate(`(async () => {
-    closeSheet();
-    collection("migrations").recheck = 15;
-  })()`);
+    await openRow(page, it.id);
+    const text = await sheetText(page);
+    check(/Gave up/.test(text), "a migration that ran out of time does not say so:\n" + text.slice(0, 600));
+    // Verbatim: the sentence names where the guest ended up, which is the whole
+    // question at that moment, and no paraphrase can be trusted with it.
+    check(text.includes(said), `the platform's own sentence ("${said}") is not on the page`);
+
+    // The one age this screen shows, and the only reason that has earned one: a
+    // timeout happened at `createdAt + timeoutS`, so the API stamps that moment
+    // and two reads agree on it. Every other reason's `lastTransition` is the
+    // moment of the read, which is why nothing else here carries an age.
+    const movement = await page.evaluate(`document.querySelector("#sheet .verdict").innerText`);
+    check(/gave up/i.test(movement) && /ago/.test(movement),
+      "a timed-out migration does not say how long ago it gave up:\n" + movement);
+    const twice = await Promise.all([
+      (await api("/api/v1/" + it.name)).json(),
+      (await api("/api/v1/" + it.name)).json(),
+    ]);
+    const stamps = twice.map((r) =>
+      (r.status.conditions || []).find((c) => c.kind === "Moved").lastTransition);
+    equal(stamps[0], stamps[1],
+      "the timeout's moment moves between reads, so the age beside it is the age of the read");
+    check(!/Copying memory|Not listening yet/.test(text),
+      "an expired migration is still described as if it were moving");
+    // A new migration is a new migration: there is no retry here.
+    check(!/retry|try again/i.test(text), "the screen offers to retry a migration");
+  } finally {
+    // Both of these used to sit on the happy path, where the first failed check
+    // skipped them: a two-second recheck left running for every check after
+    // this one, and a subject left behind. A test that changes something global
+    // has to put it back when it fails, which is the only time it matters.
+    await page.evaluate(`(async () => {
+      closeSheet();
+      collection("migrations").recheck = 15;
+    })()`);
+    await api("/api/v1/" + it.name, { method: "DELETE" }).catch(() => {});
+  }
 });
 
 // --- the promises the page itself makes -------------------------------------

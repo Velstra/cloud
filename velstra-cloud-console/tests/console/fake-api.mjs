@@ -521,11 +521,23 @@ const server = createServer(async (req, res) => {
     const derived = derive(name.split("/").pop(), body.spec || {});
     if (derived.error) return fail(res, derived.status, derived.code, derived.error, derived.field);
     // Created unconverged, which is the honest state: nothing has looked at it.
+    //
+    // And created *now*. `put`'s default backdates an object an hour, which is
+    // right for the seed — a cell that has been up a while — and wrong here, in
+    // a way that was invisible and expensive: a migration's timeout is computed
+    // from `createdAt`, and the console's migrate form asks to give up after
+    // 3600s. A migration created through this path was therefore born exactly at
+    // its own deadline and read `Timeout` about a second later, from the clock,
+    // with nothing written and no event. Every screen that asked again — the
+    // recheck, a reconnecting watch, a reopened sheet — saw a different object
+    // than the one the create returned, so which of them noticed depended on
+    // where a 15s timer happened to land. Checks that name their subject by its
+    // `Moved` status inherited that as a coin toss.
     const r = put(full, derived.spec, {
       observedGeneration: 0,
       conditions: [condition("Ready", "Unknown", "Converging", "nothing has reported on this object yet", 0)],
       ...blankStatus(name),
-    });
+    }, { createdAt: now() });
     announce("PUT", r);
     const op = put(name.split("/").slice(0, 2).join("/") + "/operations/op-" + clock,
       { target: full, targetGeneration: 1, verb: "create", requestedBy: "console" },
