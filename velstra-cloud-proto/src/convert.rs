@@ -524,6 +524,7 @@ impl From<&resources::VolumeStatus> for v1::VolumeStatus {
             conditions: conditions_out(&s.conditions),
             provisioned: s.provisioned,
             actual_size_gib: s.actual_size_gib,
+            pool: s.pool.clone(),
         }
     }
 }
@@ -535,6 +536,7 @@ impl From<&v1::VolumeStatus> for resources::VolumeStatus {
             conditions: conditions_in(&s.conditions),
             provisioned: s.provisioned,
             actual_size_gib: s.actual_size_gib,
+            pool: s.pool.clone(),
         }
     }
 }

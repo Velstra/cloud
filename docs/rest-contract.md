@@ -24,8 +24,8 @@ PATCH  /api/v1/projects/p1/instances/i1         # change spec
 DELETE /api/v1/projects/p1/instances/i1
 ```
 
-Collections: `projects`, `instances`, `volumes`, `attachments`, `networks`,
-`subnets`, `ports`, `images`, `nodes`, `operations`, `migrations`.
+Collections: `projects`, `instances`, `migrations`, `volumes`, `pools`,
+`attachments`, `networks`, `subnets`, `ports`, `images`, `nodes`, `operations`.
 
 Every resource body is the same three parts, always all three:
 
@@ -136,6 +136,30 @@ exception, and it is anchored because the moment is genuinely knowable: a
 `Moved` condition with reason `Timeout` carries `createdAt + timeoutS`, which is
 accurate to the minute and worth showing. For every other computed condition,
 show the message and leave the time alone.
+
+## Storage
+
+A volume lives in a **pool** — `spec.pool` — and the pool is what reports on it.
+That is the same two-field ownership as an instance and its node, and it is why
+`volume.status.pool` exists: `spec.pool` is the ask, `status.pool` is the pool
+that has claimed it. A volume whose `status.pool` is null has not been picked up
+by anything, which usually means no agent is running for the pool it names.
+
+Pools are an ordinary collection. `status.backend` is what the agent found
+itself running, not something an operator declares; `status.allocatedGib` is
+counted from the volumes in the pool rather than tracked as a total.
+
+Two behaviours a client may rely on:
+
+- **A volume is grown, never shrunk.** A `sizeGib` smaller than what exists is
+  accepted as a spec — it is a legitimate thing to write — but nothing happens
+  to the bytes, and the volume reports `Ready=False` with reason
+  `WillNotShrink` and a sentence saying what to do instead. Shrinking would
+  destroy whatever is past the new end, and no request makes that recoverable.
+- **Deleting waits for the pool.** `DELETE` returns 202 and the volume stays
+  listable, carrying `pool.velstra.io/release`, until the pool reports it holds
+  nothing of it. A volume that vanished from the API while its pool still held
+  the gigabytes would be storage nobody is billed for and nobody can find.
 
 ## Long-running operations
 

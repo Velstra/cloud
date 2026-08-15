@@ -12,6 +12,7 @@ pub mod meta;
 pub mod migration;
 pub mod reconcile;
 pub mod resources;
+pub mod storage;
 
 pub use access::{WriteRefused, Writer};
 pub use meta::{Condition, ConditionStatus, Meta, Placement, ResourceName, Revision, Timestamp};

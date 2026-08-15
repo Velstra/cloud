@@ -32,7 +32,7 @@ impl Agent {
     /// total that is incremented and decremented drifts, and a count of what
     /// exists cannot.
     ///
-    /// **Known gap, and it is not in this crate:** `NodeStatus::owner_node()`
+    /// **Known gap, and it is not in this crate:** `NodeStatus::owner()`
     /// returns `None`, so [`velstra_cloud_model::access::judge`] refuses every
     /// agent write to a node object — including this one. The code is written
     /// the way it should work and the refusal is reported once, loudly, rather
@@ -150,11 +150,7 @@ impl Agent {
 
     // ---- writing ---------------------------------------------------------
 
-    /// Report the observed status, and say what the store thought of it.
-    ///
-    /// A status that has not changed is not written. That is what makes a
-    /// converged node quiet, and a quiet node is what makes the resync interval
-    /// a matter of taste.
+    /// Report the observed status. See [`crate::reporting::report`].
     pub(super) async fn report<S, T>(
         &self,
         store: &TypedStore<S, T>,
@@ -165,33 +161,10 @@ impl Agent {
         S: Serialize + DeserializeOwned + PartialEq + Assigned + Send + Sync,
         T: Serialize + DeserializeOwned + PartialEq + Observed + Send + Sync,
     {
-        if next.status == stored.status {
-            return;
-        }
-        match store.update(&next, &self.writer).await {
-            Ok(_) => pass.reports += 1,
-            Err(TypedError::Store(StoreError::Conflict { .. })) => {
-                // Somebody changed the object while this pass was acting. The
-                // next pass reads the new one; there is nothing to resume.
-                tracing::debug!(name = %next.meta.name, "status write lost a race; the next pass redoes it");
-                pass.conflicts += 1;
-            }
-            Err(TypedError::Refused(why)) => {
-                tracing::warn!(name = %next.meta.name, %why, "the store refused this node's report");
-                pass.refused += 1;
-            }
-            Err(e) => {
-                tracing::warn!(name = %next.meta.name, error = %e, "could not report status");
-                pass.failures += 1;
-            }
-        }
+        crate::reporting::report(store, stored, next, &self.writer, pass).await;
     }
 
-    /// Say "this is mine now" and let the store answer.
-    ///
-    /// Nothing on the machine happens first. An object whose status another
-    /// node still owns is an object that node has not let go of, and a guest
-    /// started here in the meantime would be the second copy of itself.
+    /// Say "this is mine now". See [`crate::reporting::claim`].
     pub(super) async fn claim<S, T>(
         &self,
         store: &TypedStore<S, T>,
@@ -202,23 +175,6 @@ impl Agent {
         S: Serialize + DeserializeOwned + PartialEq + Clone + Assigned + Send + Sync,
         T: Serialize + DeserializeOwned + PartialEq + Observed + Clone + Send + Sync,
     {
-        let mut next = stored.clone();
-        take_ownership(&mut next.status);
-        match store.update(&next, &self.writer).await {
-            Ok(_) => pass.reports += 1,
-            Err(TypedError::Refused(why)) => {
-                tracing::warn!(
-                    name = %stored.meta.name, %why,
-                    "assigned to this node, but its status belongs to somebody else; \
-                     doing nothing until that is resolved"
-                );
-                pass.refused += 1;
-            }
-            Err(TypedError::Store(StoreError::Conflict { .. })) => pass.conflicts += 1,
-            Err(e) => {
-                tracing::warn!(name = %stored.meta.name, error = %e, "could not claim");
-                pass.failures += 1;
-            }
-        }
+        crate::reporting::claim(store, stored, take_ownership, &self.writer, pass).await;
     }
 }
