@@ -1,0 +1,42 @@
+//! The API server: one set of handlers, served twice.
+//!
+//! gRPC is the native surface and REST is the JSON gateway over it, but neither
+//! is implemented in terms of the other — they are two renderings of
+//! [`core::Api`], which is where every rule lives. That arrangement is the
+//! whole design of this crate, because the alternative has been tried
+//! everywhere: a REST path that validates one field more than its gRPC twin,
+//! discovered by a customer whose SDK writes something a console refuses.
+//!
+//! Read [`core`] first. [`rest`] and [`grpc`] are deliberately dull.
+
+pub mod auth;
+pub mod collection;
+pub mod core;
+pub mod error;
+pub mod grpc;
+pub mod json;
+pub mod refs;
+pub mod rest;
+
+pub use core::Api;
+use std::sync::Arc;
+
+pub use auth::{Identity, StaticTokenVerifier, TokenVerifier};
+use axum::Router;
+pub use error::{ApiError, ApiResult, Code};
+use velstra_cloud_store::Store;
+
+/// Everything this process serves, on one listener: the JSON gateway under
+/// `/api/v1/` and the gRPC services at their own paths.
+///
+/// One port rather than two because they are one API. A client that has to be
+/// told which port speaks which dialect will eventually be told wrong.
+pub fn server(api: Api) -> Router {
+    grpc::services(api.clone()).merge(rest::router(api))
+}
+
+/// The development arrangement: an in-memory store, one cell, one static token.
+pub fn in_memory(region: &str, cell: &str, verifier: Arc<dyn TokenVerifier>) -> Api {
+    let store: Arc<dyn Store> = Arc::new(velstra_cloud_store::MemoryStore::new());
+    Api::new(store, region, cell, verifier)
+}

@@ -1,0 +1,662 @@
+//! The objects the platform is made of.
+//!
+//! Every one is the same shape — `meta`, `spec`, `status` — and the shape is
+//! the point: one reconcile loop, one API surface, one console rendering, and
+//! no per-type special cases about what "in progress" means.
+//!
+//! Read the `status` types with invariant 2 in mind: none of them can express
+//! "half way". `Instance.status.state` is what the node *sees* right now, and a
+//! node that is mid-boot reports `Stopped` with a `Ready=Unknown` condition —
+//! never `BOOTING`, because a `BOOTING` that outlives the controller that wrote
+//! it is exactly the object an operator has to fix by hand.
+
+use serde::{Deserialize, Serialize};
+
+use crate::meta::{Condition, Meta, Timestamp};
+
+/// One resource: what was asked for, and what is.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Resource<S, T> {
+    pub meta: Meta,
+    pub spec: S,
+    pub status: T,
+}
+
+impl<S, T> Resource<S, T> {
+    pub fn new(meta: Meta, spec: S, status: T) -> Self {
+        Self { meta, spec, status }
+    }
+}
+
+/// The half of ownership a **controller** writes: which node this object was
+/// given to. Read by the access rule so a node can make its first report on an
+/// object it has been assigned but not yet claimed.
+pub trait Assigned {
+    fn assigned_node(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Whether the world has caught up with the ask.
+pub trait Observed {
+    fn observed_generation(&self) -> u64;
+    fn conditions(&self) -> &[Condition];
+    /// The node that owns this object's `status`, if it is assigned.
+    fn owner_node(&self) -> Option<&str>;
+
+    /// True when the object *is* the thing that reports on it.
+    ///
+    /// A node is the only such resource: nothing assigns a hypervisor to a
+    /// hypervisor, so its owner is its own name. Without this the access rule —
+    /// which asks the status who owns it — refuses every node's own capacity
+    /// report, and a cell can never learn what it is made of. Found by running
+    /// the layers together; each of them was individually right.
+    fn self_owned(&self) -> bool {
+        false
+    }
+}
+
+impl<S, T: Observed> Resource<S, T> {
+    /// True when the agent has seen and acted on the current spec.
+    pub fn converged(&self) -> bool {
+        self.status.observed_generation() == self.meta.generation
+    }
+
+    /// How far behind the world is. This is the number the drift metric and the
+    /// console's "still converging" both read, and there is exactly one of it.
+    pub fn drift(&self) -> u64 {
+        self.meta
+            .generation
+            .saturating_sub(self.status.observed_generation())
+    }
+}
+
+// ---- project -------------------------------------------------------------
+
+/// The IAM and quota anchor. Everything chargeable hangs under one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSpec {
+    pub display_name: String,
+    /// `organizations/o1` or `folders/f2` — the parent policies are inherited
+    /// from, kept as a name so the hierarchy is walked, not guessed.
+    pub parent: String,
+    pub quota: Quota,
+}
+
+/// Limits, counted rather than reserved. A reservation that is not released on
+/// a crash is a quota that shrinks over time; a count is recomputed from what
+/// exists and cannot drift.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Quota {
+    pub instances: u32,
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub volume_gib: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// What is actually in use, from counting the objects — never decremented
+    /// by hand.
+    pub used: Quota,
+}
+
+impl Observed for ProjectStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        None
+    }
+}
+
+pub type Project = Resource<ProjectSpec, ProjectStatus>;
+
+// ---- node ----------------------------------------------------------------
+
+/// A hypervisor. Its `spec` is what an operator decides about it (may it take
+/// work, is it being drained); its `status` is what the agent reports.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeSpec {
+    /// False drains the node: nothing new is placed, what runs keeps running.
+    /// Draining is a spec change, not a command, so a controller restart cannot
+    /// lose it half way.
+    pub schedulable: bool,
+    pub labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    pub capacity: Capacity,
+    /// What the agent sees in use on itself. The scheduler reads this rather
+    /// than a placement table it maintains, because a table drifts and a report
+    /// cannot.
+    pub allocated: Capacity,
+    pub agent_version: String,
+    pub last_heartbeat: Timestamp,
+    /// Images this node holds a verified copy of, by resource name.
+    ///
+    /// It lives here, and not as `cached_on` on the image, for the reason that
+    /// keeps coming up: a list of nodes holding an image is an *aggregate*, and
+    /// an aggregate is not a fact anybody owns — every node would have to write
+    /// one field, which is exactly the shared-mutable-list that invariant 1
+    /// exists to forbid. Here it is what it really is: one node's report about
+    /// itself. Whoever needs the aggregate computes it from these.
+    pub images: Vec<String>,
+}
+
+/// Which nodes hold an image, computed from what each node reports about
+/// itself. Never stored — see [`NodeStatus::images`].
+pub fn nodes_holding(image: &str, nodes: &[Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|n| n.status.images.iter().any(|i| i == image))
+        .map(|n| n.meta.name.id().to_string())
+        .collect()
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
+    /// Per-NUMA-node free memory, so placement can refuse a host that has the
+    /// total but not on one node.
+    pub numa_free_mib: Vec<u64>,
+    pub hugepages_1gi: u32,
+}
+
+impl Observed for NodeStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        None
+    }
+    fn self_owned(&self) -> bool {
+        true
+    }
+}
+
+pub type Node = Resource<NodeSpec, NodeStatus>;
+
+// ---- image ---------------------------------------------------------------
+
+/// Content-addressed and immutable: the id *is* the digest.
+///
+/// There is no way to replace the bytes behind an image that instances were
+/// created from, so "the image was deleted and now the VM will not start" is
+/// not a state this system can reach.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImageSpec {
+    /// `sha256:…` — also the resource id.
+    pub digest: String,
+    pub format: ImageFormat,
+    pub size_bytes: u64,
+    pub source_url: String,
+    /// Cosign-style signature; verified before a node will boot it.
+    pub signature: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageFormat {
+    #[default]
+    Raw,
+    Qcow2,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImageStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+}
+
+impl Observed for ImageStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        None
+    }
+}
+
+pub type Image = Resource<ImageSpec, ImageStatus>;
+
+// ---- instance ------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstanceSpec {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    /// `projects/p1/images/sha256-…`
+    pub image: String,
+    pub root_disk_gib: u64,
+    /// What an operator wants it to be doing. Not a command — asking twice is
+    /// the same as asking once.
+    pub desired_state: DesiredState,
+    /// Ports on Velstra networks, in order.
+    pub ports: Vec<String>,
+    pub ssh_keys: Vec<String>,
+    pub user_data: Option<String>,
+    /// Set by the scheduler, once. Moving it is a migration, which is a
+    /// deliberate act with its own resource — never a silent re-place.
+    pub node: Option<String>,
+    pub placement_policy: PlacementPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DesiredState {
+    #[default]
+    Running,
+    Stopped,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlacementPolicy {
+    /// Instances that must not share a node — an availability group.
+    pub anti_affinity_group: Option<String>,
+    /// Only nodes carrying all of these labels.
+    pub required_labels: Vec<String>,
+}
+
+/// What the node sees. Every value here is observable on the host right now;
+/// none of them describe a transition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstanceState {
+    /// The node has not reported yet — the honest answer before first contact,
+    /// and the only one that is not an observation.
+    #[default]
+    Unknown,
+    Stopped,
+    Running,
+    /// The VMM exited in a way the node could not repair.
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstanceStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    pub state: InstanceState,
+    /// The node reporting this status. The only agent allowed to write it.
+    pub node: Option<String>,
+    pub addresses: Vec<String>,
+    /// Host-side identity of the running machine, for the console and for
+    /// re-derivation after an agent restart.
+    pub vmm_pid: Option<u32>,
+    pub started_at: Option<Timestamp>,
+}
+
+impl Observed for InstanceStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+}
+
+pub type Instance = Resource<InstanceSpec, InstanceStatus>;
+
+// ---- volume and attachment ----------------------------------------------
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeSpec {
+    pub size_gib: u64,
+    pub pool: String,
+    /// LUKS with a key from the project's KMS entry. Absent means plaintext,
+    /// which is a decision an operator has to make rather than a default.
+    pub encryption_key: Option<String>,
+    pub source_image: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    pub provisioned: bool,
+    pub actual_size_gib: u64,
+}
+
+impl Observed for VolumeStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        None
+    }
+}
+
+pub type Volume = Resource<VolumeSpec, VolumeStatus>;
+
+/// Attaching a volume to an instance is its **own resource**, not a field on
+/// either one.
+///
+/// This is the single most important shape in the storage model. A field on the
+/// volume has two writers (the controller that wants it attached, the node that
+/// knows whether it is) and no way to express "detached but the node still has
+/// it open". As a resource with a finalizer, the sequence is forced: the
+/// controller asks, the node acts and reports, the node releases the finalizer,
+/// and only then does the object go. A crash anywhere in that leaves a truthful
+/// object rather than a volume that cannot be reattached.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentSpec {
+    pub volume: String,
+    pub instance: String,
+    /// The node that must open it — copied from the instance so the agent's
+    /// watch filter is a single field.
+    pub node: String,
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// True only while the node has it open. There is no third value.
+    pub attached: bool,
+    /// `/dev/vdb` — what the guest sees, reported by the node.
+    pub device: Option<String>,
+    pub node: Option<String>,
+}
+
+impl Observed for AttachmentStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+}
+
+pub type Attachment = Resource<AttachmentSpec, AttachmentStatus>;
+
+/// The finalizer a node holds on an attachment until it has really let go.
+pub const NODE_RELEASE_FINALIZER: &str = "node.velstra.io/release";
+
+// ---- network -------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetworkSpec {
+    /// The VNI on the Velstra fabric. Assigned by the controller from the
+    /// cell's range, never chosen by a tenant.
+    pub vni: u32,
+    pub mtu: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetworkStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// Nodes that have the VNI programmed.
+    pub programmed_on: Vec<String>,
+}
+
+impl Observed for NetworkStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        None
+    }
+}
+
+pub type Network = Resource<NetworkSpec, NetworkStatus>;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubnetSpec {
+    pub network: String,
+    pub cidr: String,
+    pub gateway: String,
+    pub dns: Vec<String>,
+    /// Addresses the platform will not hand out.
+    pub reserved: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubnetStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    pub allocated: u32,
+    pub available: u32,
+}
+
+impl Observed for SubnetStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        None
+    }
+}
+
+pub type Subnet = Resource<SubnetSpec, SubnetStatus>;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PortSpec {
+    pub network: String,
+    pub subnet: String,
+    /// Allocated by the IPAM controller, then never changed — an address that
+    /// moves under a running guest is an outage.
+    pub address: Option<String>,
+    pub mac: Option<String>,
+    pub security_groups: Vec<String>,
+    /// Egress and ingress ceilings, in megabits. Multi-tenancy without these is
+    /// one noisy neighbour away from an incident.
+    pub rate_limit_mbit: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PortStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// The node whose datapath carries it.
+    pub node: Option<String>,
+    /// True when the Velstra agent has the port in its maps.
+    pub programmed: bool,
+    pub tap_device: Option<String>,
+}
+
+impl Observed for PortStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+}
+
+pub type Port = Resource<PortSpec, PortStatus>;
+
+// ---- operation -----------------------------------------------------------
+
+/// AIP-151: a long-running operation is a resource an operator can look at,
+/// not a connection they must hold open.
+///
+/// It carries no state of its own beyond a pointer at the target and what the
+/// caller asked for — "done" is computed from the target's own convergence, so
+/// an operation cannot disagree with the object it describes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperationSpec {
+    /// The resource this operation is about.
+    pub target: String,
+    /// The generation of the target this operation is waiting for.
+    pub target_generation: u64,
+    pub verb: String,
+    pub requested_by: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperationStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    pub done: bool,
+    pub error: Option<String>,
+    pub finished_at: Option<Timestamp>,
+}
+
+impl Observed for OperationStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner_node(&self) -> Option<&str> {
+        None
+    }
+}
+
+pub type Operation = Resource<OperationSpec, OperationStatus>;
+
+impl Assigned for ProjectSpec {}
+
+impl Assigned for NodeSpec {}
+
+impl Assigned for ImageSpec {}
+
+impl Assigned for InstanceSpec {
+    fn assigned_node(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+}
+
+impl Assigned for VolumeSpec {}
+
+impl Assigned for AttachmentSpec {
+    fn assigned_node(&self) -> Option<&str> {
+        Some(self.node.as_str())
+    }
+}
+
+impl Assigned for NetworkSpec {}
+
+impl Assigned for SubnetSpec {}
+
+impl Assigned for PortSpec {}
+
+impl Assigned for OperationSpec {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::{ConditionStatus, Placement, ResourceName};
+
+    fn instance(generation: u64, observed: u64) -> Instance {
+        let mut meta = Meta::new(
+            ResourceName::parse("projects/p1/instances/i1").unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        );
+        meta.generation = generation;
+        Resource::new(
+            meta,
+            InstanceSpec {
+                vcpus: 2,
+                memory_mib: 4096,
+                ..Default::default()
+            },
+            InstanceStatus {
+                observed_generation: observed,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn convergence_is_the_only_thing_in_progress_means() {
+        assert!(instance(3, 3).converged());
+        let behind = instance(4, 3);
+        assert!(!behind.converged());
+        assert_eq!(behind.drift(), 1);
+    }
+
+    #[test]
+    fn an_instance_that_was_never_reported_is_unknown_not_pending() {
+        // The distinction matters: `Unknown` says nobody has looked yet, and it
+        // is replaced by an observation. A `Pending` would be a claim about the
+        // world made by something that cannot see it.
+        let i = instance(1, 0);
+        assert_eq!(i.status.state, InstanceState::Unknown);
+        assert!(i.status.node.is_none());
+    }
+
+    #[test]
+    fn only_the_reporting_node_owns_an_instances_status() {
+        let mut i = instance(1, 1);
+        i.status.node = Some("node-a".into());
+        assert_eq!(i.status.owner_node(), Some("node-a"));
+    }
+
+    #[test]
+    fn an_attachment_carries_its_own_truth() {
+        // Neither the volume nor the instance says whether it is attached —
+        // this object does, and only the node writes it.
+        let a = Attachment::new(
+            Meta::new(
+                ResourceName::parse("projects/p1/attachments/a1").unwrap(),
+                Placement::new("eu-central", "cell-1"),
+            ),
+            AttachmentSpec {
+                volume: "projects/p1/volumes/v1".into(),
+                instance: "projects/p1/instances/i1".into(),
+                node: "node-a".into(),
+                read_only: false,
+            },
+            AttachmentStatus::default(),
+        );
+        assert!(!a.status.attached);
+        assert!(a.status.node.is_none(), "nobody has reported yet");
+    }
+
+    #[test]
+    fn a_condition_carries_the_reason_onto_the_object() {
+        let mut i = instance(2, 1);
+        crate::meta::set_condition(
+            &mut i.status.conditions,
+            Condition::new(
+                "Ready",
+                ConditionStatus::False,
+                "NoCapacity",
+                "no node in cell-1 has 4096 MiB free on one NUMA node",
+                2,
+            ),
+        );
+        let c = crate::meta::condition(&i.status.conditions, "Ready").unwrap();
+        assert_eq!(c.reason, "NoCapacity");
+        assert!(
+            c.message.contains("NUMA"),
+            "the sentence an operator reads is on the object"
+        );
+    }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "velstra-cloud-proto"
+version = "0.1.0"
+description = "The wire contract: protobuf messages and services, and their conversions to the model"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+velstra-cloud-model = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "velstra-cloud-console"
+version = "0.1.0"
+description = "The operator's web console: one self-contained page, served by the API"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "velstra-console-page"
+path = "src/bin/page.rs"

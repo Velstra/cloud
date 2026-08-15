@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "velstra-cloud-api",
+    "velstra-cloud-console",
+    "velstra-cloud-controller",
+    "velstra-cloud-e2e",
+    "velstra-cloud-model",
+    "velstra-cloud-nodeagent",
+    "velstra-cloud-proto",
+    "velstra-cloud-store",
+]
+
+# Same licence as the data plane: the product is AGPL, and a component that
+# deviates says so in its own Cargo.toml rather than by omission.
+[workspace.package]
+license = "AGPL-3.0-or-later"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/Velstra/cloud"
+homepage = "https://github.com/Velstra/cloud"
+
+[workspace.dependencies]
+velstra-cloud-model = { path = "velstra-cloud-model" }
+velstra-cloud-proto = { path = "velstra-cloud-proto" }
+velstra-cloud-store = { path = "velstra-cloud-store" }
+velstra-cloud-controller = { path = "velstra-cloud-controller" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+hex = "0.4"
+hyper = "1"
+prost = "0.13"
+prost-types = "0.13"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic = "0.12"
+tonic-build = "0.12"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
