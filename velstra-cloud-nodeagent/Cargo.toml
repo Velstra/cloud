@@ -1,0 +1,26 @@
+[package]
+name = "velstra-cloud-nodeagent"
+version = "0.1.0"
+description = "The agent on a hypervisor: one stream to the cell, actions on itself, status back"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+velstra-cloud-model = { workspace = true }
+velstra-cloud-store = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }

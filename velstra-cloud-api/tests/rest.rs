@@ -1,0 +1,1488 @@
+//! The contract, tested as a client sees it.
+//!
+//! Every test here is a promise from `docs/rest-contract.md` that a console is
+//! being written against right now, without talking to this crate. If one of
+//! them fails, somebody else's screen is wrong.
+
+use std::{sync::Arc, time::Duration};
+
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, StatusCode, header},
+};
+use futures::StreamExt;
+use serde_json::{Value, json};
+use tower::ServiceExt;
+use velstra_cloud_api::{Api, StaticTokenVerifier, TokenVerifier};
+use velstra_cloud_model::{
+    meta::{Condition, Meta, Placement, ResourceName},
+    resources::{Capacity, NodeSpec, NodeStatus, Resource},
+};
+use velstra_cloud_store::{MemoryStore, Store, TypedStore};
+
+const TOKEN: &str = "development-token";
+
+struct Harness {
+    router: Router,
+    store: Arc<dyn Store>,
+}
+
+struct Answer {
+    status: StatusCode,
+    body: Value,
+    etag: Option<String>,
+    revision_header: Option<String>,
+}
+
+impl Answer {
+    fn error_code(&self) -> &str {
+        self.body["error"]["code"].as_str().unwrap_or("")
+    }
+
+    fn field(&self) -> &str {
+        self.body["error"]["field"].as_str().unwrap_or("")
+    }
+}
+
+impl Harness {
+    fn new() -> Self {
+        let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single(TOKEN));
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let api = Api::new(store.clone(), "eu-central", "cell-1", verifier);
+        Self {
+            // The whole server, gRPC routes and all: the REST paths have to
+            // keep working next to their twins rather than only in isolation.
+            router: velstra_cloud_api::server(api),
+            store,
+        }
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> Answer {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(format!("/api/v1/{path}"))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            None => request.body(Body::empty()).unwrap(),
+        };
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let etag = header_of(&response, header::ETAG.as_str());
+        let revision_header = header_of(&response, velstra_cloud_api::rest::REVISION_HEADER);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        Answer {
+            status,
+            body,
+            etag,
+            revision_header,
+        }
+    }
+
+    async fn get(&self, path: &str) -> Answer {
+        self.send("GET", path, None, &[]).await
+    }
+
+    async fn post(&self, path: &str, body: Value) -> Answer {
+        self.send("POST", path, Some(body), &[]).await
+    }
+
+    async fn patch(&self, path: &str, body: Value) -> Answer {
+        self.send("PATCH", path, Some(body), &[]).await
+    }
+
+    /// Create an instance and hand back its name.
+    async fn instance(&self, project: &str, id: &str, spec: Value) -> String {
+        let created = self
+            .post(
+                &format!("projects/{project}/instances"),
+                json!({ "id": id, "spec": spec }),
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+        created.body["target"].as_str().unwrap().to_string()
+    }
+
+    fn nodes(&self) -> TypedStore<NodeSpec, NodeStatus> {
+        TypedStore::new(self.store.clone(), "cell-1", "nodes")
+    }
+}
+
+fn header_of(response: &axum::response::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+// ---- the halves ----------------------------------------------------------
+
+#[tokio::test]
+async fn spec_is_writable_and_status_is_refused_by_name() {
+    // Invariant 1, as a client meets it. The field matters as much as the
+    // refusal: a client told only "invalid request" will guess, and the guess
+    // that gets made is "retry".
+    let h = Harness::new();
+    let name = h
+        .instance("p1", "i1", json!({ "vcpus": 2, "memory_mib": 2048 }))
+        .await;
+
+    let ok = h.patch(&name, json!({ "spec": { "vcpus": 4 } })).await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert_eq!(ok.body["spec"]["vcpus"], json!(4));
+
+    let refused = h
+        .patch(&name, json!({ "status": { "state": "Running" } }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.error_code(), "INVALID_ARGUMENT");
+    assert_eq!(
+        refused.field(),
+        "status",
+        "the refusal did not name the field"
+    );
+
+    // The same rule at create: a client may not describe a world it has not
+    // observed.
+    let refused = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i2", "spec": {}, "status": { "state": "Running" } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "status");
+}
+
+#[tokio::test]
+async fn generation_moves_when_the_spec_changed_and_not_otherwise() {
+    // The number every agent compares against `observedGeneration`. Bumping it
+    // for a write that changed nothing makes every node in the cell redo its
+    // work; not bumping it for a real change makes them all miss it.
+    let h = Harness::new();
+    let name = h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+    let first = h.get(&name).await;
+    assert_eq!(first.body["meta"]["generation"], json!(1));
+
+    let changed = h.patch(&name, json!({ "spec": { "vcpus": 4 } })).await;
+    assert_eq!(changed.body["meta"]["generation"], json!(2));
+
+    let identical = h.patch(&name, json!({ "spec": { "vcpus": 4 } })).await;
+    assert_eq!(
+        identical.status,
+        StatusCode::OK,
+        "an identical change is not an error"
+    );
+    assert_eq!(
+        identical.body["meta"]["generation"],
+        json!(2),
+        "a no-op moved the generation"
+    );
+    assert_eq!(
+        identical.body["meta"]["revision"], changed.body["meta"]["revision"],
+        "a no-op wrote to the store and woke every watcher in the cell"
+    );
+}
+
+// ---- optimistic concurrency ----------------------------------------------
+
+#[tokio::test]
+async fn if_match_refuses_a_stale_write_and_says_what_the_revision_is_now() {
+    let h = Harness::new();
+    let name = h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+    let read = h.get(&name).await;
+    let stale = read.body["meta"]["revision"].as_str().unwrap().to_string();
+    assert_eq!(
+        read.etag,
+        Some(format!("\"{stale}\"")),
+        "the ETag is the revision"
+    );
+
+    // Somebody else writes.
+    h.patch(&name, json!({ "spec": { "vcpus": 8 } })).await;
+
+    let refused = h
+        .send(
+            "PATCH",
+            &name,
+            Some(json!({ "spec": { "vcpus": 4 } })),
+            &[("if-match", &stale)],
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(refused.error_code(), "ABORTED");
+    let current = h.get(&name).await.body["meta"]["revision"].clone();
+    assert_eq!(
+        refused.body["error"]["revision"], current,
+        "the conflict did not say what to re-read from"
+    );
+    assert_eq!(
+        h.get(&name).await.body["spec"]["vcpus"],
+        json!(8),
+        "the stale write landed"
+    );
+}
+
+#[tokio::test]
+async fn a_write_without_if_match_is_last_writer_wins_because_the_client_said_so() {
+    // Omitting the header is a decision, not an oversight: a client that never
+    // reads before writing has nothing to be stale about.
+    let h = Harness::new();
+    let name = h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+    h.patch(&name, json!({ "spec": { "vcpus": 8 } })).await;
+    let late = h.patch(&name, json!({ "spec": { "vcpus": 16 } })).await;
+    assert_eq!(late.status, StatusCode::OK);
+    assert_eq!(late.body["spec"]["vcpus"], json!(16));
+}
+
+#[tokio::test]
+async fn two_writers_who_both_said_last_writer_wins_both_land() {
+    // Neither sent an `If-Match`, so neither asked to be told about the other.
+    // An API that answered one of them with a conflict anyway would be handing
+    // back a failure for a race it was told not to care about — and the change
+    // that lost would be gone.
+    let h = Harness::new();
+    let name = h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+    let (first, second) = tokio::join!(
+        h.patch(&name, json!({ "spec": { "vcpus": 4 } })),
+        h.patch(&name, json!({ "spec": { "memoryMib": 8192 } })),
+    );
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+    assert_eq!(second.status, StatusCode::OK, "{:?}", second.body);
+
+    let settled = h.get(&name).await;
+    assert_eq!(settled.body["spec"]["vcpus"], json!(4));
+    assert_eq!(settled.body["spec"]["memoryMib"], json!(8192));
+}
+
+// ---- deletion ------------------------------------------------------------
+
+#[tokio::test]
+async fn a_delete_stays_visible_until_the_last_finalizer_goes() {
+    let h = Harness::new();
+    let name = h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+
+    // A controller takes a hold on the object, the way the node agent does
+    // before it has anything to release.
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut held = instances.get(&name).await.unwrap().unwrap();
+    held.meta
+        .add_finalizer(velstra_cloud_model::resources::NODE_RELEASE_FINALIZER);
+    instances
+        .update(
+            &held,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+
+    let deleted = h.send("DELETE", &name, None, &[]).await;
+    assert_eq!(deleted.status, StatusCode::ACCEPTED);
+    assert!(
+        !deleted.body["meta"]["deletedAt"].is_null(),
+        "deletedAt was not stamped"
+    );
+
+    let still_there = h.get(&name).await;
+    assert_eq!(
+        still_there.status,
+        StatusCode::OK,
+        "a deleting object stopped being readable"
+    );
+    let listed = h.get("projects/p1/instances").await;
+    assert_eq!(
+        listed.body["items"].as_array().unwrap().len(),
+        1,
+        "it left the list too early"
+    );
+
+    // The holder lets go, and only now may the object really disappear.
+    let mut released = instances.get(&name).await.unwrap().unwrap();
+    released
+        .meta
+        .remove_finalizer(velstra_cloud_model::resources::NODE_RELEASE_FINALIZER);
+    instances
+        .update(
+            &released,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+
+    let gone = h.send("DELETE", &name, None, &[]).await;
+    assert_eq!(gone.status, StatusCode::ACCEPTED);
+    assert_eq!(
+        h.get(&name).await.status,
+        StatusCode::NOT_FOUND,
+        "404 is the only 'gone'"
+    );
+}
+
+// ---- list, then watch ----------------------------------------------------
+
+#[tokio::test]
+async fn a_list_says_where_to_watch_from_and_the_watch_loses_nothing() {
+    let h = Harness::new();
+    h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+
+    let listed = h.get("projects/p1/instances").await;
+    let revision = listed
+        .revision_header
+        .clone()
+        .expect("the list did not say where it ended");
+    assert_eq!(listed.body["revision"], json!(revision));
+    assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
+
+    // Written *between* the list and the watch: this is the event a naive
+    // implementation drops, and the one a console never recovers from without
+    // a reload.
+    h.instance("p1", "i2", json!({ "vcpus": 2 })).await;
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/v1/projects/p1/instances?watch=true&fromRevision={revision}"
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("the watch delivered nothing")
+        .expect("the stream ended")
+        .unwrap();
+    let text = String::from_utf8(chunk.to_vec()).unwrap();
+    let payload = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("not a server-sent event");
+    let event: Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(event["type"], json!("PUT"));
+    assert_eq!(
+        event["resource"]["meta"]["name"],
+        json!("projects/p1/instances/i2")
+    );
+    assert!(
+        event["resource"]["status"]["observedGeneration"].is_number(),
+        "the event is not in the contract's spelling"
+    );
+}
+
+// ---- quota ---------------------------------------------------------------
+
+#[tokio::test]
+async fn quota_is_counted_from_the_store_and_refused_at_create() {
+    let h = Harness::new();
+    let project = h
+        .post(
+            "projects",
+            json!({ "id": "p1", "spec": { "quota": { "instances": 1, "vcpus": 8 } } }),
+        )
+        .await;
+    assert_eq!(project.status, StatusCode::ACCEPTED, "{:?}", project.body);
+
+    h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+
+    let refused = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i2", "spec": { "vcpus": 2 } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused.error_code(), "RESOURCE_EXHAUSTED");
+
+    // Counted, not reserved: what exists is what is charged, so deleting the
+    // first instance makes room again without anything having to remember to
+    // give a reservation back.
+    h.send("DELETE", "projects/p1/instances/i1", None, &[])
+        .await;
+    let allowed = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i2", "spec": { "vcpus": 2 } }),
+        )
+        .await;
+    assert_eq!(allowed.status, StatusCode::ACCEPTED, "{:?}", allowed.body);
+
+    // A second project, with a limit on vCPUs and none on the count: a zero is
+    // a limit nobody set, not a limit of nothing — otherwise a project created
+    // without a quota would refuse every create and look broken.
+    h.post(
+        "projects",
+        json!({ "id": "p2", "spec": { "quota": { "vcpus": 8 } } }),
+    )
+    .await;
+    h.instance("p2", "i1", json!({ "vcpus": 4 })).await;
+    let too_big = h
+        .post(
+            "projects/p2/instances",
+            json!({ "id": "i2", "spec": { "vcpus": 16 } }),
+        )
+        .await;
+    assert_eq!(too_big.error_code(), "RESOURCE_EXHAUSTED");
+    assert_eq!(
+        too_big.field(),
+        "spec.vcpus",
+        "the refusal did not name the limit that bit"
+    );
+}
+
+// ---- explain -------------------------------------------------------------
+
+#[tokio::test]
+async fn explain_placement_answers_with_the_chain_of_rejections() {
+    let h = Harness::new();
+    // A node the way an agent would have reported it: ready, with capacity.
+    let mut node = Resource::new(
+        Meta::new(
+            ResourceName::parse("nodes/node-a").unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        ),
+        NodeSpec {
+            schedulable: true,
+            labels: vec![],
+        },
+        NodeStatus {
+            capacity: Capacity {
+                vcpus: 8,
+                memory_mib: 16384,
+                disk_gib: 1000,
+                numa_free_mib: vec![16384],
+                hugepages_1gi: 0,
+            },
+            ..Default::default()
+        },
+    );
+    velstra_cloud_model::meta::set_condition(&mut node.status.conditions, Condition::ready(1));
+    h.nodes().create(&node).await.unwrap();
+
+    let name = h
+        .instance("p1", "i1", json!({ "vcpus": 2, "memory_mib": 99999 }))
+        .await;
+    let answer = h.get(&format!("{name}:explainPlacement")).await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert!(
+        answer.body["placed"].is_null(),
+        "an impossible instance was placed"
+    );
+    let rejected = answer.body["rejected"].as_array().unwrap();
+    assert_eq!(
+        rejected.len(),
+        1,
+        "an operator must learn about every candidate"
+    );
+    assert_eq!(rejected[0]["node"], json!("node-a"));
+    assert_eq!(rejected[0]["why"], json!("InsufficientMemory"));
+    assert_eq!(
+        rejected[0]["detail"],
+        json!("16384 free, 99999 wanted"),
+        "the numbers behind the refusal are the answer"
+    );
+}
+
+// ---- operations ----------------------------------------------------------
+
+#[tokio::test]
+async fn an_operation_is_computed_from_the_object_it_describes() {
+    let h = Harness::new();
+    let created = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i1", "spec": { "vcpus": 2 } }),
+        )
+        .await;
+    let operation = created.body["operation"].as_str().unwrap().to_string();
+    assert_eq!(created.body["target"], json!("projects/p1/instances/i1"));
+
+    let waiting = h.get(&operation).await;
+    assert_eq!(waiting.status, StatusCode::OK);
+    assert_eq!(waiting.body["spec"]["targetGeneration"], json!(1));
+    assert_eq!(
+        waiting.body["status"]["done"],
+        json!(false),
+        "an operation was done before anything had reported"
+    );
+
+    // The target goes. An operation that stored its own `done` would wait for
+    // an object nobody will ever report on again.
+    h.send("DELETE", "projects/p1/instances/i1", None, &[])
+        .await;
+    let finished = h.get(&operation).await;
+    assert_eq!(finished.body["status"]["done"], json!(true));
+    assert!(
+        finished.body["status"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no longer exists")
+    );
+}
+
+#[tokio::test]
+async fn an_operation_is_done_when_the_target_has_caught_up() {
+    // The arithmetic, from the other side: an agent has reported the
+    // generation the operation is waiting for.
+    let h = Harness::new();
+    let name = h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+    let created = h.get("projects/p1/operations").await;
+    let operation = created.body["items"][0]["meta"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut reported = instances.get(&name).await.unwrap().unwrap();
+    reported.status.observed_generation = reported.meta.generation;
+    reported.status.state = velstra_cloud_model::resources::InstanceState::Running;
+    // Written as the agent that owns the object would write it — status is its
+    // half, and this test would be lying if it wrote it as a controller.
+    reported.status.node = Some("node-a".into());
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "instances", &name),
+            serde_json::to_vec(&reported).unwrap(),
+            velstra_cloud_store::Expect::Revision(reported.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    let finished = h.get(&operation).await;
+    assert_eq!(finished.body["status"]["done"], json!(true));
+    assert!(finished.body["status"]["error"].is_null());
+}
+
+// ---- authentication ------------------------------------------------------
+
+#[tokio::test]
+async fn a_request_without_an_accepted_token_gets_nowhere() {
+    let h = Harness::new();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/projects/p1/instances")
+        .body(Body::empty())
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/projects/p1/instances")
+        .header(header::AUTHORIZATION, "Bearer guessed")
+        .body(Body::empty())
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], json!("UNAUTHENTICATED"));
+}
+
+// ---- refusals an operator can act on -------------------------------------
+
+#[tokio::test]
+async fn a_taken_name_is_refused_on_the_id_in_a_sentence() {
+    // Every refusal has to land on the control that caused it. A name
+    // collision has exactly one control — the id — and a refusal without
+    // `field` lands in a banner instead, which is the one place an operator
+    // cannot do anything about it.
+    let h = Harness::new();
+    h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+    let again = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i1", "spec": { "vcpus": 2 } }),
+        )
+        .await;
+
+    assert_eq!(again.status, StatusCode::CONFLICT);
+    assert_eq!(again.error_code(), "ALREADY_EXISTS");
+    assert_eq!(again.field(), "id", "the refusal did not name the control");
+
+    let message = again.body["error"]["message"].as_str().unwrap();
+    assert_eq!(
+        message, "an instance called i1 already exists in projects/p1",
+        "the message is what an operator reads, article and all"
+    );
+    // The store's key layout is the store's business. A message carrying it is
+    // one that clients start parsing, and an operator has to decode.
+    assert!(
+        !message.contains("/cell-1/"),
+        "the message leaked a store key: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_field_of_the_wrong_shape_is_named() {
+    // What a form produces most often: one control holding something the type
+    // cannot be. `serde` says what is wrong but not where, so the API finds
+    // the key itself rather than handing back "somewhere in your body".
+    let h = Harness::new();
+    // Under a project that exists, so quota really runs: quota reads the spec
+    // as its real type too, and whichever check touches it first is the one
+    // that reports the failure. Without a project this test passes for the
+    // wrong reason — which is exactly how it slipped through the first time.
+    h.post(
+        "projects",
+        json!({ "id": "p1", "spec": { "quota": { "vcpus": 64 } } }),
+    )
+    .await;
+    let refused = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i1", "spec": { "vcpus": "four", "memoryMib": 2048 } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.vcpus");
+
+    // The volume path, where quota counts gibibytes and would otherwise be the
+    // first thing to read the field.
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "v1", "spec": { "sizeGib": "fifty", "pool": "nvme" } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.sizeGib");
+
+    // The same on the way through a change, where the known-good copy is what
+    // is already stored rather than the type's defaults.
+    let name = h.instance("p1", "i2", json!({ "vcpus": 2 })).await;
+    let refused = h
+        .patch(&name, json!({ "spec": { "rootDiskGib": [] } }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.rootDiskGib");
+}
+
+#[tokio::test]
+async fn nothing_an_operator_is_shown_carries_a_store_key() {
+    // A store key is `/{cell}/{kind}/{name}` and only the name was ever asked
+    // for. This is the sweep the console asked for after finding one.
+    let h = Harness::new();
+    let mut messages = Vec::new();
+    for answer in [
+        h.get("projects/p1/instances/missing").await,
+        h.patch(
+            "projects/p1/instances/missing",
+            json!({ "spec": { "vcpus": 2 } }),
+        )
+        .await,
+        h.send("DELETE", "projects/p1/instances/missing", None, &[])
+            .await,
+        h.post("projects/p1/instances", json!({ "spec": {} })).await,
+        h.get("projects/p1/machines").await,
+    ] {
+        assert!(answer.status.is_client_error(), "{:?}", answer.body);
+        messages.push(
+            answer.body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    for message in messages {
+        assert!(
+            !message.starts_with('/'),
+            "a store key reached an operator: {message}"
+        );
+        assert!(
+            !message.contains("/cell-1/"),
+            "a store key reached an operator: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_node_reference_that_would_never_match_an_agent_is_refused() {
+    // The two spellings in this system are both correct, for different things,
+    // and getting them the wrong way round fails silently on both sides: the
+    // object is assigned to a node that does not answer to that name, so the
+    // agent simply never becomes its owner and nothing ever starts.
+    let h = Harness::new();
+    let refused = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i1", "spec": { "node": "nodes/node-a" } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.node");
+
+    // …and the same on a change, where an edit could otherwise re-spell a
+    // field that was right when it was created.
+    let name = h.instance("p1", "i2", json!({ "node": "node-a" })).await;
+    let refused = h
+        .patch(&name, json!({ "spec": { "node": "nodes/node-a" } }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.node");
+
+    // The other direction: a reference something has to follow needs the whole
+    // name, because a bare id under an unstated parent finds nothing.
+    let refused = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "a1", "spec": { "node": "node-a", "volume": "vol-a", "instance": "projects/p1/instances/i2" } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.volume");
+}
+
+// ---- attachments ---------------------------------------------------------
+
+#[tokio::test]
+async fn an_attachment_takes_its_node_from_the_instance() {
+    // The model says the node is "copied from the instance so the agent's
+    // watch filter is a single field". Copying it here is what makes that
+    // sentence true — and it means an attachment whose node disagrees with its
+    // instance's cannot be written down at all.
+    let h = Harness::new();
+    h.instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
+        .await;
+    let created = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "a1", "spec": {
+                "volume": "projects/p1/volumes/v1",
+                "instance": "projects/p1/instances/i1"
+            }}),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+
+    let attachment = h.get("projects/p1/attachments/a1").await;
+    assert_eq!(
+        attachment.body["spec"]["node"],
+        json!("node-a"),
+        "the caller was made to repeat something the platform already knew"
+    );
+}
+
+#[tokio::test]
+async fn an_attachment_may_not_name_a_node_the_instance_is_not_on() {
+    // Refused rather than corrected: silently rewriting the field would change
+    // what the object says without the caller asking, and they may have meant
+    // the instance rather than the node.
+    let h = Harness::new();
+    h.instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
+        .await;
+    let refused = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "a1", "spec": {
+                "volume": "projects/p1/volumes/v1",
+                "instance": "projects/p1/instances/i1",
+                "node": "node-b"
+            }}),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.node");
+    let message = refused.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("node-a") && message.contains("node-b"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn an_unplaced_instance_has_no_node_to_lend() {
+    // The honest answer, rather than an attachment carrying an empty node that
+    // no agent's watch will ever match.
+    let h = Harness::new();
+    h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+    let refused = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "a1", "spec": {
+                "volume": "projects/p1/volumes/v1",
+                "instance": "projects/p1/instances/i1"
+            }}),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(refused.field(), "spec.node");
+}
+
+#[tokio::test]
+async fn an_attachment_may_follow_a_migration_but_not_wander_off() {
+    let h = Harness::new();
+    let instance = h
+        .instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
+        .await;
+    h.post(
+        "projects/p1/attachments",
+        json!({ "id": "a1", "spec": {
+            "volume": "projects/p1/volumes/v1",
+            "instance": "projects/p1/instances/i1"
+        }}),
+    )
+    .await;
+
+    // Away from the instance: refused, for the life of the object and not only
+    // at its birth.
+    let refused = h
+        .patch(
+            "projects/p1/attachments/a1",
+            json!({ "spec": { "node": "node-b" } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.node");
+
+    // The guest moves — a deliberate act on the instance — and only then may
+    // the attachment follow it.
+    h.patch(&instance, json!({ "spec": { "node": "node-b" } }))
+        .await;
+    let followed = h
+        .patch(
+            "projects/p1/attachments/a1",
+            json!({ "spec": { "node": "node-b" } }),
+        )
+        .await;
+    assert_eq!(followed.status, StatusCode::OK, "{:?}", followed.body);
+    assert_eq!(followed.body["spec"]["node"], json!("node-b"));
+}
+
+// ---- the console ---------------------------------------------------------
+
+#[tokio::test]
+async fn the_console_is_served_without_a_token_and_survives_a_deep_link() {
+    // The page is markup with no data in it, and it carries the sign-in form.
+    // Requiring a token to fetch the form that asks for one would be a locked
+    // door with the key inside.
+    let h = Harness::new();
+    for path in ["/", "/instances", "/projects/p1/instances/i1"] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let response = h.router.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path} did not serve the console"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 22)
+            .await
+            .unwrap();
+        let page = String::from_utf8_lossy(&bytes);
+        assert!(
+            page.starts_with("<!doctype html"),
+            "{path} answered with something else"
+        );
+    }
+
+    // …and the API behind it is still shut.
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/projects")
+        .body(Body::empty())
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "serving the page opened the API with it"
+    );
+}
+
+// ---- shapes --------------------------------------------------------------
+
+#[tokio::test]
+async fn a_body_is_always_all_three_parts_in_the_contracts_spelling() {
+    let h = Harness::new();
+    let name = h
+        .instance("p1", "i1", json!({ "vcpus": 2, "memory_mib": 2048 }))
+        .await;
+    let body = h.get(&name).await.body;
+    for part in ["meta", "spec", "status"] {
+        assert!(body[part].is_object(), "a body arrived without {part}");
+    }
+    assert_eq!(body["meta"]["name"], json!("projects/p1/instances/i1"));
+    assert_eq!(body["meta"]["placement"]["cell"], json!("cell-1"));
+    assert!(
+        body["meta"]["revision"].is_string(),
+        "revision must be opaque"
+    );
+    assert!(body["meta"]["createdAt"].is_number());
+    assert_eq!(body["meta"]["deletedAt"], Value::Null);
+    assert_eq!(body["status"]["observedGeneration"], json!(0));
+    // camelCase on the way in as well, or a console's own round trip breaks.
+    let patched = h
+        .patch(&name, json!({ "spec": { "memoryMib": 8192 } }))
+        .await;
+    assert_eq!(patched.body["spec"]["memoryMib"], json!(8192));
+}
+
+#[tokio::test]
+async fn every_collection_the_contract_lists_is_served() {
+    // The console is written from the same list. A collection that is named
+    // there and missing here is a page that renders an error.
+    let h = Harness::new();
+    for kind in velstra_cloud_api::core::COLLECTIONS {
+        // `projects` and `nodes` are at the root; everything else hangs under a
+        // project, which is what makes a project the thing quota is counted on.
+        let path = match kind {
+            "projects" | "nodes" => kind.to_string(),
+            _ => format!("projects/p1/{kind}"),
+        };
+        let answer = h.get(&path).await;
+        assert_eq!(answer.status, StatusCode::OK, "{kind} is not served");
+        assert!(
+            answer.body["items"].is_array(),
+            "{kind} did not answer with a list"
+        );
+        assert!(
+            answer.revision_header.is_some(),
+            "{kind} did not say where to watch from"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_collection_nobody_serves_is_a_404_rather_than_an_empty_list() {
+    // An interface that answers a typo with `[]` sends somebody looking for
+    // objects that were never missing.
+    let h = Harness::new();
+    let answer = h.get("projects/p1/machines").await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    assert_eq!(answer.error_code(), "NOT_FOUND");
+}
+
+// ---- migration -----------------------------------------------------------
+
+/// A cell with two nodes an operator could move a guest between: one holding
+/// the image and one that does not, so the picker has something to say about
+/// each.
+async fn two_nodes(h: &Harness) {
+    for (id, memory, cached) in [("node-a", 16384u64, true), ("node-b", 16384, true)] {
+        let mut node = Resource::new(
+            Meta::new(
+                ResourceName::parse(&format!("nodes/{id}")).unwrap(),
+                Placement::new("eu-central", "cell-1"),
+            ),
+            NodeSpec {
+                schedulable: true,
+                labels: vec![],
+            },
+            NodeStatus {
+                capacity: Capacity {
+                    vcpus: 16,
+                    memory_mib: memory,
+                    disk_gib: 1000,
+                    numa_free_mib: vec![memory],
+                    hugepages_1gi: 0,
+                },
+                agent_version: "0.1.0".into(),
+                // Which nodes hold an image is worked out from these reports, so
+                // a node that has it says so itself.
+                images: if cached {
+                    vec!["projects/p1/images/sha256-abc".into()]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            },
+        );
+        velstra_cloud_model::meta::set_condition(&mut node.status.conditions, Condition::ready(1));
+        h.nodes().create(&node).await.unwrap();
+    }
+    // A small node nothing will fit on, so a refusal has numbers behind it.
+    let mut small = Resource::new(
+        Meta::new(
+            ResourceName::parse("nodes/node-tiny").unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        ),
+        NodeSpec {
+            schedulable: true,
+            labels: vec![],
+        },
+        NodeStatus {
+            capacity: Capacity {
+                vcpus: 2,
+                memory_mib: 1024,
+                disk_gib: 100,
+                numa_free_mib: vec![1024],
+                hugepages_1gi: 0,
+            },
+            agent_version: "0.1.0".into(),
+            ..Default::default()
+        },
+    );
+    velstra_cloud_model::meta::set_condition(&mut small.status.conditions, Condition::ready(1));
+    h.nodes().create(&small).await.unwrap();
+}
+
+/// An instance running on `node-a`, with its image cached on both real nodes.
+async fn running_guest(h: &Harness) -> String {
+    let image: TypedStore<
+        velstra_cloud_model::resources::ImageSpec,
+        velstra_cloud_model::resources::ImageStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "images");
+    image
+        .create(&Resource::new(
+            Meta::new(
+                ResourceName::parse("projects/p1/images/sha256-abc").unwrap(),
+                Placement::new("eu-central", "cell-1"),
+            ),
+            velstra_cloud_model::resources::ImageSpec {
+                digest: "sha256:abc".into(),
+                ..Default::default()
+            },
+            velstra_cloud_model::resources::ImageStatus::default(),
+        ))
+        .await
+        .unwrap();
+
+    let name = h
+        .instance(
+            "p1",
+            "i1",
+            json!({
+                "vcpus": 2, "memoryMib": 4096, "node": "node-a",
+                "image": "projects/p1/images/sha256-abc"
+            }),
+        )
+        .await;
+
+    // The guest is running, which only an agent may say — so it is said the way
+    // an agent says it.
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut running = instances.get(&name).await.unwrap().unwrap();
+    running.status.node = Some("node-a".into());
+    running.status.state = velstra_cloud_model::resources::InstanceState::Running;
+    running.status.observed_generation = running.meta.generation;
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "instances", &name),
+            serde_json::to_vec(&running).unwrap(),
+            velstra_cloud_store::Expect::Revision(running.meta.revision),
+        )
+        .await
+        .unwrap();
+    name
+}
+
+#[tokio::test]
+async fn explain_migration_gives_every_node_a_verdict() {
+    // Placement and migration ask different questions. A scheduler picks, so
+    // `:explainPlacement` answers with the one it picked; a person picks, so
+    // this has to say something about each candidate — a destination missing
+    // from the answer would be one a console cannot decide about.
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let name = running_guest(&h).await;
+
+    // Asking is free, and it has to stay free: a console asks this every time
+    // somebody opens the picker, and an answer that wrote something would make
+    // hovering over a menu a change to the cluster.
+    let before = h.store.revision().await.unwrap();
+    let answer = h.get(&format!("{name}:explainMigration")).await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+    assert_eq!(answer.body["from"], json!("node-a"));
+    assert_eq!(
+        h.store.revision().await.unwrap(),
+        before,
+        "explaining a migration wrote to the store"
+    );
+    let migrations = h.get("projects/p1/migrations").await;
+    assert!(
+        migrations.body["items"].as_array().unwrap().is_empty(),
+        "asking where a guest could go created a migration"
+    );
+
+    let destinations = answer.body["destinations"].as_array().unwrap();
+    assert_eq!(
+        destinations.len(),
+        3,
+        "a node was left out, so the picker cannot decide about it"
+    );
+
+    let by_node = |id: &str| -> Value {
+        destinations
+            .iter()
+            .find(|d| d["node"] == json!(id))
+            .cloned()
+            .expect("node missing from the answer")
+    };
+    assert_eq!(by_node("node-b")["allowed"], json!(true));
+    // The node it is already on is refused, with the reason rather than by
+    // being absent.
+    assert_eq!(by_node("node-a")["allowed"], json!(false));
+    assert_eq!(by_node("node-a")["why"], json!("AlreadyThere"));
+    let tiny = by_node("node-tiny");
+    assert_eq!(tiny["allowed"], json!(false));
+    assert_eq!(tiny["why"], json!("DestinationTooSmall"));
+    assert!(
+        tiny["detail"].as_str().unwrap().contains("4096 MiB"),
+        "the numbers behind the refusal are the answer: {tiny}"
+    );
+}
+
+#[tokio::test]
+async fn a_migration_takes_its_source_from_the_instance() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+
+    let created = h
+        .post(
+            "projects/p1/migrations",
+            json!({ "id": "m1", "spec": {
+                "instance": "projects/p1/instances/i1",
+                "toNode": "node-b"
+            }}),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+
+    let migration = h.get("projects/p1/migrations/m1").await;
+    assert_eq!(migration.body["spec"]["fromNode"], json!("node-a"));
+    assert_eq!(migration.body["spec"]["toNode"], json!("node-b"));
+    // The model's defaults, not zeroes: a guest that may never pause and a
+    // transfer that may never end are not what "unset" means.
+    assert_eq!(migration.body["spec"]["mode"], json!("Live"));
+    assert_eq!(migration.body["spec"]["downtimeMs"], json!(300));
+    assert_eq!(migration.body["spec"]["timeoutS"], json!(3600));
+
+    // Nothing about the instance has changed yet — step 1 of the dance.
+    let instance = h.get("projects/p1/instances/i1").await;
+    assert_eq!(instance.body["spec"]["node"], json!("node-a"));
+}
+
+#[tokio::test]
+async fn a_migration_that_cannot_work_is_refused_before_it_costs_anything() {
+    // Every one of these is knowable in advance, and the alternative is
+    // finding out after the memory has been copied.
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+
+    let too_small = h
+        .post(
+            "projects/p1/migrations",
+            json!({ "id": "m1", "spec": {
+                "instance": "projects/p1/instances/i1",
+                "toNode": "node-tiny"
+            }}),
+        )
+        .await;
+    assert_eq!(too_small.status, StatusCode::BAD_REQUEST);
+    assert_eq!(too_small.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(
+        too_small.field(),
+        "spec.toNode",
+        "the refusal did not name the control"
+    );
+    assert!(
+        too_small.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1024 MiB"),
+        "{:?}",
+        too_small.body
+    );
+
+    // And a source that disagrees with where the guest actually is.
+    let wrong_source = h
+        .post(
+            "projects/p1/migrations",
+            json!({ "id": "m2", "spec": {
+                "instance": "projects/p1/instances/i1",
+                "fromNode": "node-b",
+                "toNode": "node-b"
+            }}),
+        )
+        .await;
+    assert_eq!(wrong_source.status, StatusCode::BAD_REQUEST);
+    assert_eq!(wrong_source.field(), "spec.fromNode");
+
+    // And neither refusal left anything behind. An object created for a
+    // migration that was refused is one an operator has to notice and delete,
+    // and a list of them is indistinguishable from a list of real ones.
+    let listed = h.get("projects/p1/migrations").await;
+    assert!(
+        listed.body["items"].as_array().unwrap().is_empty(),
+        "a refused migration was created anyway: {:?}",
+        listed.body
+    );
+}
+
+/// The `Moved` condition as a client sees it, or nothing.
+fn moved(document: &Value) -> Option<Value> {
+    document["status"]["conditions"]
+        .as_array()?
+        .iter()
+        .find(|c| c["kind"] == json!("Moved"))
+        .cloned()
+}
+
+fn migrations(
+    h: &Harness,
+) -> TypedStore<
+    velstra_cloud_model::migration::MigrationSpec,
+    velstra_cloud_model::migration::MigrationStatus,
+> {
+    TypedStore::new(h.store.clone(), "cell-1", "migrations")
+}
+
+/// A migration of `i1` to node-b, created the way a client creates one.
+async fn migrate(h: &Harness) {
+    let created = h
+        .post(
+            "projects/p1/migrations",
+            json!({ "id": "m1", "spec": {
+                "instance": "projects/p1/instances/i1",
+                "toNode": "node-b"
+            }}),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+}
+
+#[tokio::test]
+async fn what_a_migration_is_doing_is_computed_when_it_is_read() {
+    // `Moved` is a judgement over the whole dance, not a fact anybody owns —
+    // the same shape as an operation's `done`. Stored, it would be a second
+    // copy that can go stale; computed, it cannot disagree with the world.
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+    migrate(&h).await;
+
+    let read = h.get("projects/p1/migrations/m1").await;
+    let condition = moved(&read.body).expect("a migration says what it is doing");
+    assert_eq!(condition["reason"], json!("PreparingReceiver"));
+    assert_eq!(condition["status"], json!("Unknown"));
+    assert!(
+        condition["message"]
+            .as_str()
+            .unwrap()
+            .contains("node-b is not listening"),
+        "{condition}"
+    );
+
+    // A list says the same thing as a read. A console that learns about an
+    // object from a list and then polls it must not see two different answers.
+    let listed = h.get("projects/p1/migrations").await;
+    let from_list = moved(&listed.body["items"][0]).expect("a listed migration says it too");
+    assert_eq!(from_list["reason"], json!("PreparingReceiver"));
+
+    // And none of it was written down: what is *stored* in `status.conditions`
+    // is only what the destination can say about itself.
+    let stored = migrations(&h)
+        .get("projects/p1/migrations/m1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored.status.conditions.is_empty(),
+        "the condition was stored, and a stored one can go stale: {:?}",
+        stored.status.conditions
+    );
+}
+
+#[tokio::test]
+async fn a_migration_that_ran_out_of_time_reports_it_with_nothing_running() {
+    // The case a stored condition handles worst. Nobody is left to write
+    // anything — the destination may be dead, which is often *why* it timed
+    // out — and this is exactly the moment an operator needs an answer. Because
+    // it is computed, the answer arrives from the process being asked.
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+    migrate(&h).await;
+
+    // Created an hour ago with a one-minute budget: a transfer that was never
+    // going to converge. Backdating is a metadata write, which is a
+    // controller's to make.
+    let store = migrations(&h);
+    let mut m = store
+        .get("projects/p1/migrations/m1")
+        .await
+        .unwrap()
+        .unwrap();
+    m.meta.created_at = velstra_cloud_model::meta::Timestamp(
+        velstra_cloud_model::meta::Timestamp::now().0 - 3_600_000,
+    );
+    m.spec.timeout_s = 60;
+    m.meta.generation += 1;
+    store
+        .update(&m, &velstra_cloud_model::Writer::controller("test"))
+        .await
+        .unwrap();
+
+    let read = h.get("projects/p1/migrations/m1").await;
+    let condition = moved(&read.body).expect("it reports the outcome");
+    assert_eq!(condition["status"], json!("False"));
+    assert_eq!(condition["reason"], json!("Timeout"));
+    assert!(
+        condition["message"].as_str().unwrap().contains("node-a"),
+        "the sentence did not say where the guest is: {condition}"
+    );
+
+    // The guest is exactly where it was. Under pre-copy the source still has
+    // it, so a timeout is something to report and never something to repair by
+    // moving anything.
+    let instance = h.get("projects/p1/instances/i1").await;
+    assert_eq!(instance.body["spec"]["node"], json!("node-a"));
+    assert_eq!(instance.body["status"]["state"], json!("Running"));
+
+    let stored = store
+        .get("projects/p1/migrations/m1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored.status.conditions.is_empty(),
+        "reading a migration wrote to it"
+    );
+
+    // A computed condition is built fresh on every read, so its timestamp is
+    // normally the moment of the read — useless for "how long has it been like
+    // this". A timeout is the exception: it happened at exactly
+    // `createdAt + timeoutS`, and an interface can say "gave up forty minutes
+    // ago" rather than "just now".
+    let gave_up_at = read.body["meta"]["createdAt"].as_u64().unwrap() + 60_000;
+    assert_eq!(
+        condition["lastTransition"].as_u64().unwrap(),
+        gave_up_at,
+        "the timeout was stamped when it was read, not when it happened"
+    );
+    let again = h.get("projects/p1/migrations/m1").await;
+    assert_eq!(
+        moved(&again.body).unwrap()["lastTransition"],
+        condition["lastTransition"],
+        "two reads disagreed about when it gave up"
+    );
+}
+
+#[tokio::test]
+async fn a_destination_without_the_image_is_refused_with_the_sentence() {
+    // The headline case for asking first. Neither VMM ships the guest's disk,
+    // so a destination without the image cannot even start its receiver — and
+    // finding that out from the far end happens after the memory has been
+    // copied, which is the most expensive moment to fail. The operator is told
+    // now, on the control they would change.
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+
+    // A node that could hold the guest in every respect but one.
+    let mut bare = Resource::new(
+        Meta::new(
+            ResourceName::parse("nodes/node-c").unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        ),
+        NodeSpec {
+            schedulable: true,
+            labels: vec![],
+        },
+        NodeStatus {
+            capacity: Capacity {
+                vcpus: 16,
+                memory_mib: 16384,
+                disk_gib: 1000,
+                numa_free_mib: vec![16384],
+                hugepages_1gi: 0,
+            },
+            agent_version: "0.1.0".into(),
+            ..Default::default()
+        },
+    );
+    velstra_cloud_model::meta::set_condition(&mut bare.status.conditions, Condition::ready(1));
+    h.nodes().create(&bare).await.unwrap();
+
+    let refused = h
+        .post(
+            "projects/p1/migrations",
+            json!({ "id": "m1", "spec": {
+                "instance": "projects/p1/instances/i1",
+                "toNode": "node-c"
+            }}),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(refused.field(), "spec.toNode");
+    let message = refused.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("node-c") && message.contains("projects/p1/images/sha256-abc"),
+        "the refusal did not say which node was missing which image: {message}"
+    );
+
+    // Nothing was written. This is the whole claim of checking first.
+    assert_eq!(
+        h.get("projects/p1/migrations/m1").await.status,
+        StatusCode::NOT_FOUND,
+        "a migration that was refused exists anyway"
+    );
+}
+
+#[tokio::test]
+async fn which_nodes_hold_an_image_is_added_up_from_what_each_node_reports() {
+    // The field exists on the image, but nothing writes it there — and that is
+    // the point. A list of nodes is an aggregate, and an aggregate is not a fact
+    // anybody owns: storing it would need every node in the cell writing into
+    // one field. Each node says what it holds; this is the sum, computed on
+    // every read so a node that has gone away leaves the answer by itself.
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+
+    let answer = h.get("projects/p1/images/sha256-abc").await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    let image = &answer.body;
+    let held: Vec<&str> = image["status"]["cachedOn"]
+        .as_array()
+        .expect("an image says where it is held")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(held.contains(&"node-a"), "{image}");
+    assert!(held.contains(&"node-b"), "{image}");
+    // The small node never reported holding it, so it is not in the sum — and
+    // no writer had to remember to take it out.
+    assert!(!held.contains(&"node-tiny"), "{image}");
+}

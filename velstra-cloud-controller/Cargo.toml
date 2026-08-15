@@ -1,0 +1,30 @@
+[package]
+name = "velstra-cloud-controller"
+version = "0.1.0"
+description = "One reconcile loop, and the thin controllers that sit in it"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "velstra-cloud-controller"
+path = "src/bin/velstra-cloud-controller.rs"
+
+[dependencies]
+velstra-cloud-model = { workspace = true }
+velstra-cloud-store = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+# `test-util` is what lets a test pause the clock: a backoff test that really
+# sleeps is a slow test that will eventually be deleted for being slow.
+tokio = { workspace = true, features = ["test-util"] }

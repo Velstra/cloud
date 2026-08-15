@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Velstra Cloud</title>
+<style>/*=CSS=*/</style>
+</head>
+<body>
+
+<!-- The page itself is public: markup with no data in it, and a sign-in that
+     cannot be reached is not a sign-in. Every byte behind it needs the bearer
+     token the API requires. -->
+<main id="signin">
+  <div class="box">
+    <h1>Velstra Cloud</h1>
+    <p class="prose">Sign in with an API token to see this cell.</p>
+    <form id="tokenform">
+      <div class="field">
+        <label for="token">API token</label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false">
+      </div>
+      <div><button class="btn primary" type="submit" id="signinbtn">Sign in</button></div>
+      <p id="loginerr" class="err hidden"></p>
+    </form>
+  </div>
+</main>
+
+<div id="app" class="hidden">
+  <header id="top">
+    <span id="brand">Velstra <b>Cloud</b></span>
+    <label for="project" class="faint" style="font-size:var(--text-xs)">Project</label>
+    <select id="project" style="width:auto;min-width:180px"></select>
+    <div id="fleet" class="summary"></div>
+    <span class="grow"></span>
+    <span id="watchstate"></span>
+    <button class="btn" id="theme" type="button">Light</button>
+    <button class="btn" id="signout" type="button">Sign out</button>
+  </header>
+
+  <aside id="rail" aria-label="Collections"></aside>
+
+  <!-- No margin label over the board. The rail already says which group this
+       is and the heading says which collection, and a third copy of the same
+       word costs the table 208px it needs. The gutter is for a section that
+       genuinely has a name and a body — which is the sheet, not this. -->
+  <section id="content">
+    <h1 id="listtitle"></h1>
+    <p class="prose" id="listblurb"></p>
+    <div class="sheetacts" id="listacts"></div>
+    <p id="listerr" class="err hidden"></p>
+    <div class="boardwrap"><table class="board" id="board">
+      <thead><tr id="boardhead"></tr></thead>
+      <tbody id="boardbody"></tbody>
+    </table></div>
+    <p id="listempty" class="muted hidden"></p>
+  </section>
+</div>
+
+<script>
+/*=JS=*/
+</script>
+</body>
+</html>

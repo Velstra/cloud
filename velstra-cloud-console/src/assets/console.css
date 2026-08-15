@@ -1,0 +1,376 @@
+/* Components. Written once against the semantic tokens, so both appearances
+   follow from the ramp above and neither is maintained separately. */
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg-app); color: var(--text-body);
+  background-image: var(--wash); background-repeat: no-repeat;
+  background-attachment: fixed;
+  font: var(--fw-regular) var(--text-base)/var(--leading-normal) var(--font-sans);
+  letter-spacing: var(--tracking-body);
+}
+.hidden { display: none !important; }
+:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+/* ---- the shell ---------------------------------------------------------- */
+
+#app { display: grid; grid-template-columns: var(--rail-w) 1fr; min-height: 100vh; }
+#top {
+  grid-column: 1 / -1; display: flex; align-items: center; gap: var(--space-5);
+  padding: 0 var(--space-6); height: 56px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-app) 86%, transparent);
+  backdrop-filter: blur(12px); position: sticky; top: 0; z-index: 30;
+}
+#brand {
+  font: var(--fw-semibold) var(--text-sm)/1 var(--font-display);
+  letter-spacing: var(--tracking-caps); text-transform: uppercase;
+  color: var(--text-strong); white-space: nowrap;
+}
+#brand b { color: var(--product); font-weight: inherit; }
+#top .grow { flex: 1; }
+
+aside#rail {
+  background: var(--sidebar-bg); border-right: 1px solid var(--border-subtle);
+  padding: var(--space-5) 0 var(--space-9);
+  position: sticky; top: 56px; align-self: start; height: calc(100vh - 56px);
+  overflow-y: auto;
+}
+/* The rail reads as a directory sign: a tracked group head over a hairline,
+   the current item marked by a flush bar and a weight change. Not a pill. */
+.railgroup {
+  font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
+  letter-spacing: var(--tracking-caps); text-transform: uppercase;
+  color: var(--text-faint); padding: var(--space-5) var(--space-5) var(--space-2);
+  margin: 0 var(--space-5) var(--space-2) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.railitem {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
+  width: 100%; padding: var(--space-2) var(--space-5); border: 0; border-left: 3px solid transparent;
+  background: none; color: var(--text-muted); font: inherit; text-align: left; cursor: pointer;
+}
+.railitem:hover { color: var(--text-body); background: var(--surface-hover); }
+.railitem.on {
+  color: var(--text-strong); font-weight: var(--fw-semibold);
+  border-left-color: var(--brand); background: var(--surface-hover);
+}
+.railitem .n { color: var(--text-faint); font-variant-numeric: tabular-nums; font-size: var(--text-xs); }
+.railitem.on .n { color: var(--text-muted); }
+
+#content { padding: var(--space-7) var(--space-6) var(--space-9); min-width: 0; }
+
+/* ---- the gutter --------------------------------------------------------- */
+
+/* One left edge for labels, one for content. Anything with a name and a body
+   is a .spread, so a section added later lands in the same two columns. */
+.spread { display: grid; grid-template-columns: var(--gutter) 1fr; gap: var(--gutter-gap); align-items: start; }
+.spread + .spread { margin-top: var(--space-7); }
+.margin {
+  font: var(--fw-semibold) var(--text-2xs)/1.4 var(--font-sans);
+  letter-spacing: var(--tracking-caps); text-transform: uppercase;
+  color: var(--text-faint); padding-top: 6px;
+}
+.margin .sub {
+  display: block; text-transform: none; letter-spacing: var(--tracking-body);
+  font-weight: var(--fw-regular); color: var(--text-faint); margin-top: var(--space-2);
+  font-size: var(--text-2xs);
+}
+
+/* ---- headings and prose ------------------------------------------------- */
+
+h1 {
+  font: var(--fw-semibold) var(--text-xl)/var(--leading-tight) var(--font-display);
+  letter-spacing: var(--tracking-display); color: var(--text-strong); margin: 0;
+}
+h2 {
+  font: var(--fw-semibold) var(--text-lg)/var(--leading-snug) var(--font-display);
+  letter-spacing: var(--tracking-tight); color: var(--text-strong); margin: 0;
+}
+p { margin: var(--space-2) 0 0; }
+.prose { max-width: 66ch; color: var(--text-muted); }
+.muted { color: var(--text-muted); }
+.faint { color: var(--text-faint); }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--text-sm); }
+.num { font-variant-numeric: tabular-nums; }
+
+/* ---- controls ----------------------------------------------------------- */
+
+button, input, select, textarea { font: inherit; color: inherit; }
+.btn {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: 7px var(--space-4); border: 1px solid var(--border-strong);
+  background: var(--surface-raised); color: var(--text-body); cursor: pointer;
+  box-shadow: var(--edge-top);
+}
+.btn:hover { background: var(--surface-hover); color: var(--text-strong); }
+.btn:active { transform: translateY(1px); }
+.btn[disabled] { opacity: .45; cursor: not-allowed; }
+.btn.primary {
+  background: var(--brand); border-color: var(--brand); color: var(--on-brand);
+  font-weight: var(--fw-semibold);
+}
+.btn.primary:hover { background: var(--brand-hover); border-color: var(--brand-hover); color: var(--on-brand); }
+/* Quiet until it is aimed at: a list of forty objects must not be a wall of
+   alarm, and the colour arrives when the pointer does. */
+.btn.quiet { color: var(--text-muted); background: none; border-color: var(--border); }
+.btn.quiet:hover { color: var(--failing); border-color: var(--failing); background: none; }
+
+input[type=text], input[type=password], input[type=number], select, textarea {
+  width: 100%; padding: 6px var(--space-3);
+  border: 1px solid var(--border-strong); background: var(--surface-sunken);
+  color: var(--text-body);
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--brand); box-shadow: var(--glow-focus); }
+input.bad, select.bad { border-color: var(--failing); }
+textarea { min-height: 96px; font-family: var(--font-mono); font-size: var(--text-sm); resize: vertical; }
+select { appearance: none; padding-right: var(--space-6); background-image: none; }
+
+/* A stepper, because a size typed into a text box is a size that can be
+   typed wrong. The unit is part of the control, not a hint beside it. */
+.stepper { display: flex; align-items: stretch; max-width: 208px; }
+.stepper button {
+  width: 30px; border: 1px solid var(--border-strong); background: var(--surface-raised);
+  color: var(--text-muted); cursor: pointer;
+}
+.stepper button:hover { color: var(--text-strong); background: var(--surface-hover); }
+.stepper input { border-left: 0; border-right: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.stepper .unit {
+  display: flex; align-items: center; padding: 0 var(--space-3);
+  border: 1px solid var(--border-strong); border-left: 0;
+  background: var(--surface-sunken); color: var(--text-faint); font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.also { color: var(--text-faint); font-size: var(--text-xs); margin-top: var(--space-1); }
+
+/* A boolean is a switch. */
+.switch {
+  position: relative; width: 40px; height: 22px; padding: 0; cursor: pointer;
+  border: 1px solid var(--border-strong); background: var(--surface-sunken);
+  border-radius: var(--radius-pill);
+}
+.switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: var(--radius-pill); background: var(--text-faint);
+  transition: transform var(--dur-fast) var(--ease-out), background var(--dur-fast) ease;
+}
+.switch[aria-checked=true] { background: var(--brand); border-color: var(--brand); }
+.switch[aria-checked=true]::after { transform: translateX(18px); background: var(--on-brand); }
+
+.segmented { display: inline-flex; border: 1px solid var(--border-strong); }
+.segmented button {
+  padding: 6px var(--space-4); border: 0; background: none; color: var(--text-muted); cursor: pointer;
+}
+.segmented button + button { border-left: 1px solid var(--border-strong); }
+.segmented button[aria-pressed=true] { background: var(--brand); color: var(--on-brand); font-weight: var(--fw-semibold); }
+
+/* A name that can be followed says so by being a link, and by nothing else —
+   no icon, no chevron. */
+button.link {
+  border: 0; background: none; padding: 0; color: var(--link); cursor: pointer;
+  text-align: left; font-size: var(--text-sm);
+}
+button.link:hover { text-decoration: underline; }
+
+.rowlist { display: flex; flex-direction: column; gap: var(--space-2); max-width: 480px; }
+.rowlist .row { display: flex; gap: var(--space-2); align-items: center; }
+.rowlist .row .idx { width: 20px; color: var(--text-faint); font-size: var(--text-xs); text-align: right; }
+.rowlist .row button { padding: 4px 8px; }
+/* The row inputs fill the list; the button that adds one is a button. */
+.rowlist > button.btn { align-self: flex-start; }
+.fields + .fields, .fields + .disclose { margin-top: var(--space-5); }
+
+/* ---- fields ------------------------------------------------------------- */
+
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: var(--space-5); align-items: start; }
+.field.wide { grid-column: 1 / -1; max-width: 560px; }
+.field > label {
+  display: block; font-size: var(--text-xs); color: var(--text-muted);
+  letter-spacing: var(--tracking-small); margin-bottom: var(--space-2);
+}
+.field .req { color: var(--drifting); }
+.field .hint { color: var(--text-faint); font-size: var(--text-xs); margin-top: var(--space-2); max-width: 52ch; }
+/* Validation arrives while typing, never on submit. */
+.field .err { color: var(--failing); font-size: var(--text-xs); margin-top: var(--space-2); }
+
+/* ---- the board ---------------------------------------------------------- */
+
+/* Object lists are tables. A card list degrades as it grows; a departure
+   board does not. */
+table.board { width: 100%; border-collapse: collapse; margin-top: var(--space-4); }
+table.board th {
+  text-align: left; font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
+  letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
+  padding: 0 var(--space-3) var(--space-3); border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+table.board td {
+  padding: var(--space-3); border-bottom: 1px solid var(--border-subtle);
+  vertical-align: middle; font-size: var(--text-sm);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+table.board tbody tr { cursor: pointer; }
+table.board tbody tr:hover { background: var(--surface-sunken); }
+table.board tbody tr:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+table.board td.name { color: var(--text-strong); font-weight: var(--fw-medium); }
+table.board td.name .id { font-family: var(--font-mono); font-size: var(--text-sm); }
+table.board td.blank { color: var(--text-faint); }
+.boardwrap { overflow-x: auto; }
+
+/* ---- the convergence mark ----------------------------------------------- */
+
+/* Shape says whether anything has been observed, colour says what was
+   observed, and the word is always there — so none of the three is load
+   bearing alone. Filled: an agent reported. Hollow: it has not. */
+.mark {
+  display: inline-block; width: 9px; height: 9px; border-radius: var(--radius-pill);
+  border: 2px solid transparent; flex: none; vertical-align: -1px; margin-right: var(--space-2);
+}
+.mark.settled { background: var(--settled); }
+.mark.failing { background: var(--failing); }
+.mark.drifting { border-color: var(--drifting); }
+.mark.unreported { border-color: var(--text-faint); }
+.mark.deleting { background: var(--text-faint); position: relative; }
+.mark.deleting::after {
+  content: ""; position: absolute; left: -3px; right: -3px; top: 3px;
+  height: 2px; background: var(--failing);
+}
+.state { display: inline-flex; align-items: center; white-space: nowrap; }
+.state.settled { color: var(--settled); }
+.state.failing { color: var(--failing); }
+.state.drifting { color: var(--drifting); }
+.state.unreported, .state.deleting { color: var(--text-muted); }
+
+/* ---- the sheet ---------------------------------------------------------- */
+
+#scrim {
+  position: fixed; inset: 0; background: var(--scrim); z-index: 40;
+  animation: fade var(--dur-base) var(--ease-out);
+}
+#sheet {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100%);
+  background: var(--surface); border-left: 1px solid var(--border);
+  box-shadow: var(--shadow-lg); z-index: 41; overflow-y: auto;
+  padding: var(--space-6) var(--space-7) var(--space-9);
+  /* The one entrance on the page. It enters from the right and leaves to the
+     right — a panel that arrives one way and dismisses another reads as two
+     unrelated things. */
+  animation: sheetin var(--dur-base) var(--ease-out);
+}
+@keyframes sheetin { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  /* Gentler, not off: the cross-fade still says something appeared. */
+  #sheet { animation: fade var(--dur-base) ease; }
+  .switch::after { transition: none; }
+}
+#sheethead { display: flex; align-items: flex-start; gap: var(--space-4); margin-bottom: var(--space-6); }
+#sheethead .grow { flex: 1; min-width: 0; }
+#sheethead h2 { word-break: break-all; }
+.sheetacts { display: flex; gap: var(--space-2); flex-wrap: wrap; margin-top: var(--space-5); }
+
+/* ---- convergence, said in full ------------------------------------------ */
+
+.verdict { border-left: 3px solid var(--border-strong); padding: var(--space-3) 0 var(--space-3) var(--space-4); }
+.verdict.settled { border-left-color: var(--settled); }
+.verdict.failing { border-left-color: var(--failing); }
+.verdict.drifting { border-left-color: var(--drifting); }
+.verdict .head { font-weight: var(--fw-semibold); color: var(--text-strong); }
+.verdict .why { margin-top: var(--space-2); max-width: 66ch; }
+.gens {
+  display: flex; flex-wrap: wrap; gap: var(--space-4) var(--space-6); margin-top: var(--space-4);
+  font-family: var(--font-mono); font-size: var(--text-sm);
+}
+.gens .k { display: block; font-family: var(--font-sans); font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint); }
+.gens .behind { color: var(--drifting); }
+
+table.pairs, table.conds, table.kv, table.reject { width: 100%; border-collapse: collapse; }
+table.pairs th, table.conds th, table.reject th {
+  text-align: left; font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
+  letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
+  padding: 0 var(--space-3) var(--space-2) 0; border-bottom: 1px solid var(--border);
+}
+table.pairs td, table.conds td, table.kv td, table.reject td {
+  padding: var(--space-3) var(--space-3) var(--space-3) 0;
+  border-bottom: 1px solid var(--border-subtle); vertical-align: top; font-size: var(--text-sm);
+}
+table.kv td:first-child { width: 168px; color: var(--text-muted); }
+table.pairs tr.differs td { background: color-mix(in srgb, var(--drifting) 8%, transparent); }
+table.pairs .note { color: var(--text-muted); font-size: var(--text-xs); margin-top: var(--space-2); max-width: 60ch; }
+table.conds td.msg { color: var(--text-muted); white-space: pre-wrap; }
+table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
+
+/* A confirmation that has something to say takes a line of its own: the
+   sentence is the decision being made, and a row of buttons is not a place to
+   read one. */
+.confirm { flex: 0 1 auto; }
+.confirm:has(p) { flex: 1 0 100%; }
+.confirm p { max-width: 66ch; margin: 0 0 var(--space-3); }
+.confirm .btns { display: flex; gap: var(--space-2); }
+
+/* What the platform said about each choice, under the choice. */
+.candidates { margin-top: var(--space-3); }
+.candidates table.reject { margin-top: var(--space-2); }
+
+/* One migration, on the guest it moves. */
+.movement { margin-top: var(--space-4); }
+.movement .why { margin-top: var(--space-1); }
+
+/* ---- dialog ------------------------------------------------------------- */
+
+#dialogscrim {
+  position: fixed; inset: 0; background: var(--scrim); z-index: 49;
+  animation: fade var(--dur-base) var(--ease-out);
+}
+#dialog {
+  position: fixed; z-index: 50; top: 6vh; left: 50%; transform: translateX(-50%);
+  width: min(880px, calc(100% - 32px)); max-height: 88vh; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg); padding: var(--space-6) var(--space-7);
+  animation: dialogin var(--dur-base) var(--ease-out);
+}
+@keyframes dialogin {
+  from { transform: translateX(-50%) translateY(8px) scale(.99); opacity: 0; }
+  to { transform: translateX(-50%); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) { #dialog { animation: fade var(--dur-base) ease; } }
+#dialog h2 { margin-bottom: var(--space-2); }
+.dialogacts {
+  display: flex; gap: var(--space-3); justify-content: flex-end; align-items: center;
+  margin-top: var(--space-7); padding-top: var(--space-5); border-top: 1px solid var(--border-subtle);
+}
+.dialogacts .grow { flex: 1; }
+.disclose {
+  margin-top: var(--space-6); border: 0; border-top: 1px solid var(--border-subtle);
+  background: none; color: var(--text-muted); cursor: pointer; padding: var(--space-4) 0 0;
+  width: 100%; text-align: left; font-size: var(--text-sm);
+}
+.disclose:hover { color: var(--text-strong); }
+
+/* ---- sign in ------------------------------------------------------------ */
+
+#signin { display: grid; place-items: center; min-height: 100vh; padding: var(--space-6); }
+#signin .box { width: min(420px, 100%); }
+#signin h1 { margin-bottom: var(--space-2); }
+#signin form { margin-top: var(--space-6); display: grid; gap: var(--space-4); }
+
+/* ---- messages ----------------------------------------------------------- */
+
+.err {
+  color: var(--failing); border-left: 3px solid var(--failing);
+  padding-left: var(--space-4); max-width: 66ch;
+}
+#toast {
+  position: fixed; bottom: var(--space-6); left: 50%; transform: translateX(-50%);
+  background: var(--surface-raised); border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-md); padding: var(--space-3) var(--space-5); z-index: 60;
+  max-width: min(720px, 92vw);
+}
+#watchstate { font-size: var(--text-xs); color: var(--text-faint); white-space: nowrap; }
+#watchstate.live { color: var(--text-muted); }
+#watchstate .mark { margin-right: var(--space-2); }
+
+.summary { display: flex; gap: var(--space-4); align-items: center; font-size: var(--text-xs); }
+.summary .state { font-size: var(--text-xs); }

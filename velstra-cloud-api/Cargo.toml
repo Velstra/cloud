@@ -1,0 +1,37 @@
+[package]
+name = "velstra-cloud-api"
+version = "0.1.0"
+description = "The API server: one set of handlers, served as REST and as gRPC"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "velstra-cloud-api"
+path = "src/bin/velstra-cloud-api.rs"
+
+[dependencies]
+velstra-cloud-console = { path = "../velstra-cloud-console" }
+velstra-cloud-model = { workspace = true }
+velstra-cloud-proto = { workspace = true }
+velstra-cloud-store = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

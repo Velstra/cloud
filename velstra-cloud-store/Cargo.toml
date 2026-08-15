@@ -1,0 +1,19 @@
+[package]
+name = "velstra-cloud-store"
+version = "0.1.0"
+description = "The state store behind a trait: in-memory and etcd, one contract"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+velstra-cloud-model = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

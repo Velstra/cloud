@@ -1,0 +1,793 @@
+//! QEMU, one process per guest, under systemd, driven over QMP.
+//!
+//! ## What is true on this machine, and what is not
+//!
+//! QEMU is **not installed on the machine this was written on**. Everything
+//! that needs the binary or a live guest — `start`, `stop`, `delete`, the
+//! volume methods, and every migration method — is written from the documented
+//! QMP protocol and command line and has **never been run**. Each such method
+//! says so. What the tests at the bottom do exercise, because it needs nothing
+//! but bytes and a filesystem: the QMP framing and reply parsing, the command
+//! lines for a normal boot and for an incoming migration, the run-state
+//! mapping, how progress is read out of `query-migrate`, and reading a
+//! receiver's own URL back out of the unit that is listening.
+//!
+//! ## The shape of a migration here
+//!
+//! It is the mirror image of Cloud Hypervisor's, which is what makes one trait
+//! fit both:
+//!
+//! 1. The destination starts the guest's QEMU with `-incoming tcp:0:PORT` (or
+//!    `-incoming unix:/path` on one machine). That process *is* the guest's VMM
+//!    — it sits in the `inmigrate` run state until a guest arrives, which is
+//!    also how this node observes that a receiver is ready.
+//! 2. The source sets `downtime-limit` and then issues `migrate` over QMP.
+//!    QMP's `migrate` returns as soon as the transfer has started, which is
+//!    what `-d` means on the human monitor; progress and completion come from
+//!    `query-migrate`.
+//! 3. `migrate_cancel` abandons it, and under pre-copy the guest is still
+//!    running here when it does.
+//!
+//! Two things QEMU shares with the other backend and which the model refuses
+//! before anything is copied: the kernel and disk must be reachable at the same
+//! paths on both machines, and the two versions must be close enough to
+//! deserialise each other's device state.
+
+use std::{
+    collections::BTreeSet,
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
+
+use async_trait::async_trait;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use velstra_cloud_model::{
+    migration::MigrationMode,
+    resources::{Capacity, InstanceState},
+};
+
+use crate::{
+    host::{HostError, HostState, Receiver, Result, Transfer, VmObservation, VmRequest, Vmm},
+    hostfs::{self, Layout, slug, unslug},
+};
+
+pub struct QemuVmm {
+    layout: Layout,
+}
+
+impl QemuVmm {
+    /// `layout.binary` is the QEMU to run — `qemu-system-x86_64` on a normal
+    /// node — and `layout.firmware` is what it boots.
+    pub fn new(layout: Layout) -> Self {
+        Self { layout }
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    fn monitor(&self, instance: &str) -> PathBuf {
+        self.layout.dir(instance).join("qmp.sock")
+    }
+
+    fn migrate_socket(&self, instance: &str) -> PathBuf {
+        self.layout.dir(instance).join("migrate.sock")
+    }
+
+    fn unit(&self, instance: &str) -> String {
+        format!("velstra-vm-{}", slug(instance))
+    }
+
+    /// One QMP command.
+    ///
+    /// **Untested:** needs a live QEMU. The handshake it performs and the reply
+    /// parsing it uses are tested separately against bytes.
+    ///
+    /// A fresh connection per command, deliberately: a long-lived monitor
+    /// connection is a piece of state this process would have to keep correct
+    /// across a VMM restart, and the whole design of this crate is that it keeps
+    /// none.
+    async fn qmp(&self, instance: &str, command: &str, arguments: Value) -> Result<Value> {
+        let socket = self.monitor(instance);
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .map_err(|e| {
+                HostError::failed(format!("{} is not answering: {e}", socket.display()))
+            })?;
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        // The greeting comes first, unasked. Then capabilities negotiation,
+        // which QEMU requires before it will accept anything else.
+        let _greeting = lines.next_line().await?;
+        ask(&mut write, &json!({ "execute": "qmp_capabilities" })).await?;
+        answer(&mut lines, "qmp_capabilities").await?;
+        ask(
+            &mut write,
+            &json!({ "execute": command, "arguments": arguments }),
+        )
+        .await?;
+        answer(&mut lines, command).await
+    }
+
+    /// **Untested:** needs a live QEMU. Whether a transfer this node started is
+    /// still running — the thing that stops a pass from issuing a second
+    /// `migrate` on top of the first.
+    async fn is_sending(&self, instance: &str) -> bool {
+        match self.qmp(instance, "query-migrate", json!({})).await {
+            Ok(answer) => answer
+                .get("status")
+                .and_then(|s| s.as_str())
+                .map(still_going)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// **Untested:** needs a live QEMU.
+    async fn run_state(&self, instance: &str) -> Option<String> {
+        let answer = self.qmp(instance, "query-status", json!({})).await.ok()?;
+        answer.get("status")?.as_str().map(str::to_string)
+    }
+
+    /// What is listening here for that guest, if anything.
+    ///
+    /// **Untested:** needs QEMU and systemd. Two questions, both asked of the
+    /// machine: is the VMM in the `inmigrate` run state — QEMU's own word for
+    /// "waiting for a guest" — and what was it started with. A receiver whose
+    /// process died answers neither, and so stops being ready.
+    async fn observe_receiver(&self, instance: &str) -> Option<Receiver> {
+        if self.run_state(instance).await.as_deref() != Some("inmigrate") {
+            return None;
+        }
+        let incoming = hostfs::url_in(&hostfs::unit_command(&self.unit(instance)).await?)?;
+        Some(Receiver {
+            url: self.published_url(&incoming)?,
+            // The destination's `query-migrate` carries the counters only once
+            // pages start arriving, and often not at all; it reports what it
+            // has and nothing when it has nothing.
+            received_mib: self.received_mib(instance).await,
+        })
+    }
+
+    /// **Untested:** needs a live QEMU.
+    async fn received_mib(&self, instance: &str) -> u64 {
+        match self.qmp(instance, "query-migrate", json!({})).await {
+            Ok(answer) => transferred_mib(&answer),
+            Err(_) => 0,
+        }
+    }
+
+    /// What `-incoming` says, turned into what a source can send to.
+    ///
+    /// `-incoming tcp:0:4900` means "every address of this machine", which is
+    /// not a thing another node can be told to connect to. The address this
+    /// node's peers reach it at is configuration, because nothing on the machine
+    /// knows which of its addresses that is.
+    fn published_url(&self, incoming: &str) -> Option<String> {
+        if incoming.starts_with("unix:") {
+            return Some(incoming.to_string());
+        }
+        let port = hostfs::port_of(incoming)?;
+        let address = self.layout.migration_address.as_ref()?;
+        Some(format!("tcp:{address}:{port}"))
+    }
+
+    /// The migration ports this machine is already using, read off the units
+    /// using them.
+    async fn ports_in_use(&self) -> Result<BTreeSet<u16>> {
+        let mut taken = BTreeSet::new();
+        for entry in hostfs::read_dir_names(&self.layout.run_dir)? {
+            let instance = unslug(&entry);
+            let Some(command) = hostfs::unit_command(&self.unit(&instance)).await else {
+                continue;
+            };
+            if let Some(port) = hostfs::url_in(&command)
+                .as_deref()
+                .and_then(hostfs::port_of)
+            {
+                taken.insert(port);
+            }
+        }
+        Ok(taken)
+    }
+}
+
+#[async_trait]
+impl Vmm for QemuVmm {
+    /// **Partly untested:** the directory and image scan need only a
+    /// filesystem and are exercised below; the run state of a live guest is
+    /// not.
+    async fn observe(&self) -> Result<HostState> {
+        let mut host = HostState::default();
+
+        for digest in hostfs::read_dir_names(&self.layout.image_dir)? {
+            host.images.insert(unslug(&digest));
+        }
+
+        for entry in hostfs::read_dir_names(&self.layout.run_dir)? {
+            let instance = unslug(&entry);
+            let dir = self.layout.run_dir.join(&entry);
+            if dir.join("root.raw").exists() {
+                host.disks.insert(instance.clone());
+            }
+            if !self.monitor(&instance).exists() {
+                continue;
+            }
+            let Some(state) = self.run_state(&instance).await else {
+                // The socket is there and nobody is behind it: the VMM died and
+                // left it. A failure, not a stop — the two want different
+                // things done about them.
+                host.vms.insert(
+                    instance,
+                    VmObservation {
+                        state: InstanceState::Failed,
+                        pid: None,
+                        started_at: hostfs::started_at(&dir),
+                    },
+                );
+                continue;
+            };
+            if state == "inmigrate" {
+                // Waiting for a guest, not holding one. Reporting a VM here
+                // would tell the control plane the instance has arrived while
+                // the source still has it.
+                if let Some(receiver) = self.observe_receiver(&instance).await {
+                    host.receivers.insert(instance, receiver);
+                }
+                continue;
+            }
+            if self.is_sending(&instance).await {
+                host.sending.insert(instance.clone());
+            }
+            host.vms.insert(
+                instance.clone(),
+                VmObservation {
+                    state: state_of(&state),
+                    pid: hostfs::main_pid(&self.unit(&instance)).await,
+                    started_at: hostfs::started_at(&dir),
+                },
+            );
+        }
+
+        Ok(host)
+    }
+
+    async fn pull_image(&self, image: &str) -> Result<()> {
+        hostfs::publish_image(&self.layout, image).await
+    }
+
+    async fn create_disk(&self, instance: &str, gib: u64) -> Result<()> {
+        hostfs::create_disk(&self.layout, instance, gib).await
+    }
+
+    /// **Untested:** requires `qemu-system-*` and `systemd-run`.
+    async fn start(&self, request: &VmRequest) -> Result<()> {
+        let dir = self.layout.dir(&request.instance);
+        std::fs::create_dir_all(&dir)?;
+        let monitor = self.monitor(&request.instance);
+        // A socket left by a dead VMM would stop the new one binding.
+        let _ = std::fs::remove_file(&monitor);
+        hostfs::systemd_run(
+            &self.unit(&request.instance),
+            &self.layout.slice,
+            &dir,
+            &self.layout.binary,
+            &qemu_args(&self.layout, request, &monitor, None),
+        )
+        .await
+    }
+
+    /// **Untested:** ACPI power button, the graceful stop. A guest that ignores
+    /// it stays running and the object says so, rather than this node
+    /// escalating to a kill on its own.
+    async fn stop(&self, instance: &str) -> Result<()> {
+        self.qmp(instance, "system_powerdown", json!({}))
+            .await
+            .map(|_| ())
+    }
+
+    /// **Untested:** stops the unit and removes everything of the guest.
+    async fn delete(&self, instance: &str) -> Result<()> {
+        if self.monitor(instance).exists() {
+            let _ = self.qmp(instance, "quit", json!({})).await;
+        }
+        hostfs::stop_unit(&self.unit(instance)).await;
+        let dir = self.layout.dir(instance);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+
+    /// **Untested:** hot-plugs a volume into a running guest.
+    async fn open_volume(&self, instance: &str, volume: &str, read_only: bool) -> Result<String> {
+        let id = slug(volume);
+        let path = self.layout.dir(instance).join(&id);
+        self.qmp(
+            instance,
+            "blockdev-add",
+            json!({
+                "node-name": id,
+                "driver": "raw",
+                "read-only": read_only,
+                "file": { "driver": "file", "filename": path.to_string_lossy() },
+            }),
+        )
+        .await?;
+        self.qmp(
+            instance,
+            "device_add",
+            json!({ "driver": "virtio-blk-pci", "drive": id, "id": id }),
+        )
+        .await?;
+        // The name the guest's kernel gives it depends on the guest; what this
+        // node can honestly report is the device it plugged in.
+        Ok(id)
+    }
+
+    /// **Untested:** unplugs the device and drops the block node behind it.
+    async fn close_volume(&self, instance: &str, volume: &str) -> Result<()> {
+        let id = slug(volume);
+        self.qmp(instance, "device_del", json!({ "id": id }))
+            .await?;
+        self.qmp(instance, "blockdev-del", json!({ "node-name": id }))
+            .await
+            .map(|_| ())
+    }
+
+    async fn capacity(&self) -> Result<Capacity> {
+        Ok(hostfs::capacity(&self.layout))
+    }
+
+    /// **Untested:** requires `qemu-system-*` and `systemd-run`.
+    ///
+    /// One process and no second one: QEMU's receiver is the guest's own VMM,
+    /// started with `-incoming` and sitting in `inmigrate` until the transfer
+    /// lands.
+    async fn prepare_receiver(&self, request: &VmRequest, _mode: MigrationMode) -> Result<String> {
+        if let Some(receiver) = self.observe_receiver(&request.instance).await {
+            return Ok(receiver.url);
+        }
+        let dir = self.layout.dir(&request.instance);
+        std::fs::create_dir_all(&dir)?;
+        if !self.layout.disk(&request.instance).exists() {
+            // The guest resumes into its own root disk by the path its command
+            // line names, and QEMU opens that disk at start — before anything
+            // arrives. A receiver without one fails immediately.
+            return Err(HostError::failed(format!(
+                "{} has no root disk on this node",
+                request.instance
+            )));
+        }
+
+        let incoming = match &self.layout.migration_address {
+            Some(_) => format!(
+                "tcp:0:{}",
+                hostfs::free_port(&self.layout, &self.ports_in_use().await?)?
+            ),
+            None => {
+                let socket = self.migrate_socket(&request.instance);
+                let _ = std::fs::remove_file(&socket);
+                format!("unix:{}", socket.display())
+            }
+        };
+        let monitor = self.monitor(&request.instance);
+        let _ = std::fs::remove_file(&monitor);
+        hostfs::systemd_run(
+            &self.unit(&request.instance),
+            &self.layout.slice,
+            &dir,
+            &self.layout.binary,
+            &qemu_args(&self.layout, request, &monitor, Some(&incoming)),
+        )
+        .await?;
+        self.published_url(&incoming)
+            .ok_or_else(|| HostError::failed("this node has no migration address to publish"))
+    }
+
+    /// **Untested:** needs systemd.
+    async fn tear_down_receiver(&self, instance: &str) -> Result<()> {
+        // Only a VMM that is still waiting may be stopped. Once the guest has
+        // arrived this same unit *is* the guest, and stopping it would be the
+        // migration killing what it just moved.
+        if self.run_state(instance).await.as_deref() == Some("inmigrate") {
+            hostfs::stop_unit(&self.unit(instance)).await;
+            let _ = std::fs::remove_file(self.monitor(instance));
+        }
+        let _ = std::fs::remove_file(self.migrate_socket(instance));
+        Ok(())
+    }
+
+    /// **Untested:** needs a live QEMU.
+    ///
+    /// Parameters first, then the transfer. `migrate` over QMP returns as soon
+    /// as the copy is under way — the same thing `-d` means on the human
+    /// monitor — so this returns then too, and `observe` answers what happened.
+    async fn send(&self, transfer: &Transfer) -> Result<()> {
+        for (parameter, value) in migrate_parameters(transfer)? {
+            self.qmp(
+                &transfer.instance,
+                "migrate-set-parameters",
+                json!({ parameter: value }),
+            )
+            .await?;
+        }
+        if transfer.connections > 1 {
+            self.qmp(
+                &transfer.instance,
+                "migrate-set-capabilities",
+                json!({ "capabilities": [{ "capability": "multifd", "state": true }] }),
+            )
+            .await?;
+        }
+        if transfer.mode == MigrationMode::PostCopy {
+            self.qmp(
+                &transfer.instance,
+                "migrate-set-capabilities",
+                json!({ "capabilities": [{ "capability": "postcopy-ram", "state": true }] }),
+            )
+            .await?;
+        }
+        self.qmp(
+            &transfer.instance,
+            "migrate",
+            json!({ "uri": transfer.url }),
+        )
+        .await?;
+        if transfer.mode == MigrationMode::PostCopy {
+            // Post-copy resumes the destination first and faults pages in, so
+            // from here on a failure loses the guest. That is why it is never a
+            // default and why the model makes it a stated mode.
+            self.qmp(&transfer.instance, "migrate-start-postcopy", json!({}))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// **Untested:** needs a live QEMU. Under pre-copy the guest never stopped
+    /// running here, so cancelling costs the memory that was copied and nothing
+    /// else.
+    async fn cancel_send(&self, instance: &str) -> Result<()> {
+        self.qmp(instance, "migrate_cancel", json!({}))
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Write one QMP command.
+async fn ask(write: &mut tokio::net::unix::OwnedWriteHalf, request: &Value) -> std::io::Result<()> {
+    write.write_all(request.to_string().as_bytes()).await?;
+    write.write_all(b"\n").await?;
+    write.flush().await
+}
+
+/// Read until the monitor says something that is an answer.
+///
+/// Events arrive whenever QEMU feels like it, including between a command and
+/// its reply, so this reads past them rather than mistaking the first line for
+/// the answer.
+async fn answer(
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    command: &str,
+) -> Result<Value> {
+    while let Some(line) = lines.next_line().await? {
+        if let Some(answer) = qmp_reply(&line)? {
+            return Ok(answer);
+        }
+    }
+    Err(HostError::failed(format!(
+        "the monitor closed before answering {command}"
+    )))
+}
+
+/// The command line for a guest, with or without an incoming transfer.
+///
+/// Pure, so what a guest is started with can be argued about without QEMU. The
+/// receiving command line is the same one plus `-incoming`, which is what makes
+/// a migrated guest come back as the machine it was: a destination that boots a
+/// different shape of machine is a guest that resumes into missing devices.
+fn qemu_args(
+    layout: &Layout,
+    request: &VmRequest,
+    monitor: &Path,
+    incoming: Option<&str>,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "-machine".into(),
+        "accel=kvm".into(),
+        "-nodefaults".into(),
+        "-display".into(),
+        "none".into(),
+        "-smp".into(),
+        request.vcpus.to_string().into(),
+        "-m".into(),
+        request.memory_mib.to_string().into(),
+        "-kernel".into(),
+        layout.firmware.clone().into(),
+        "-drive".into(),
+        format!(
+            "file={},format=raw,if=virtio",
+            layout.disk(&request.instance).display()
+        )
+        .into(),
+        "-qmp".into(),
+        format!("unix:{},server=on,wait=off", monitor.display()).into(),
+    ];
+    for (index, tap) in request.taps.iter().enumerate() {
+        // The guest's NIC order is the order of this list, and a guest that
+        // finds its addresses on the wrong NIC after a move is an outage with
+        // no error message.
+        args.push("-netdev".into());
+        args.push(format!("tap,id=n{index},ifname={tap},script=no,downscript=no").into());
+        args.push("-device".into());
+        args.push(format!("virtio-net-pci,netdev=n{index}").into());
+    }
+    if let Some(incoming) = incoming {
+        args.push("-incoming".into());
+        args.push(incoming.into());
+    }
+    args
+}
+
+/// What to set before a transfer starts.
+///
+/// `downtime-limit` is the pause the guest may take at the end, in
+/// milliseconds — the same number Cloud Hypervisor calls `downtime_ms`, which
+/// is why the model carries one field and not two.
+fn migrate_parameters(transfer: &Transfer) -> Result<Vec<(&'static str, u64)>> {
+    if transfer.mode == MigrationMode::Reboot {
+        return Err(HostError::failed(
+            "a reboot migration is not a transfer; it is a stop here and a start there",
+        ));
+    }
+    if transfer.connections > 1 && transfer.url.starts_with("unix:") {
+        return Err(HostError::failed(
+            "more than one connection is unsupported over a unix socket",
+        ));
+    }
+    let mut parameters = vec![("downtime-limit", u64::from(transfer.downtime_ms))];
+    if transfer.connections > 1 {
+        parameters.push(("multifd-channels", u64::from(transfer.connections)));
+    }
+    Ok(parameters)
+}
+
+/// One line of QMP: the answer, or nothing if it was an event.
+fn qmp_reply(line: &str) -> Result<Option<Value>> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(line).map_err(|e| {
+        HostError::failed(format!("the monitor sent something that is not QMP: {e}"))
+    })?;
+    if value.get("event").is_some() || value.get("QMP").is_some() {
+        return Ok(None);
+    }
+    if let Some(error) = value.get("error") {
+        let description = error
+            .get("desc")
+            .and_then(|d| d.as_str())
+            .unwrap_or("the monitor refused");
+        return Err(HostError::failed(description));
+    }
+    Ok(value.get("return").cloned().or(Some(Value::Null)))
+}
+
+/// QEMU's run states, mapped to the three words a status may use.
+fn state_of(run_state: &str) -> InstanceState {
+    match run_state {
+        "running" => InstanceState::Running,
+        // Everything here is a machine that exists and is not executing. None
+        // of them is a transition, because a status that means "in progress"
+        // outlives whatever wrote it.
+        "paused" | "prelaunch" | "suspended" | "shutdown" | "postmigrate" | "finish-migrate"
+        | "save-vm" | "restore-vm" | "watchdog" | "debug" => InstanceState::Stopped,
+        // `inmigrate` never reaches here — it is a receiver, not a guest.
+        _ => InstanceState::Failed,
+    }
+}
+
+/// Whether a `query-migrate` status means a transfer is still under way.
+fn still_going(status: &str) -> bool {
+    matches!(
+        status,
+        "setup" | "active" | "postcopy-active" | "postcopy-paused" | "device" | "cancelling"
+    )
+}
+
+/// What `query-migrate` says has moved, in MiB. Zero when it says nothing,
+/// which is what a destination usually says.
+fn transferred_mib(answer: &Value) -> u64 {
+    answer
+        .get("ram")
+        .and_then(|ram| ram.get("transferred"))
+        .and_then(|bytes| bytes.as_u64())
+        .unwrap_or(0)
+        / (1024 * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout() -> Layout {
+        Layout {
+            run_dir: PathBuf::from("/var/lib/velstra/instances"),
+            binary: "qemu-system-x86_64".to_string(),
+            migration_address: Some("10.0.0.2".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn request() -> VmRequest {
+        VmRequest {
+            instance: "projects/p1/instances/i1".into(),
+            vcpus: 4,
+            memory_mib: 8192,
+            image: "projects/p1/images/sha256-abc".into(),
+            root_disk_gib: 20,
+            taps: vec!["vt-a".into(), "vt-b".into()],
+        }
+    }
+
+    fn words(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn transfer(url: &str) -> Transfer {
+        Transfer {
+            instance: "projects/p1/instances/i1".into(),
+            url: url.into(),
+            mode: MigrationMode::Live,
+            downtime_ms: 300,
+            timeout_s: 3600,
+            connections: 1,
+        }
+    }
+
+    #[test]
+    fn a_receiving_guest_is_the_same_machine_as_a_booting_one_plus_incoming() {
+        // The property that makes a migration work at all: the destination's
+        // command line has to describe the same machine, or the guest resumes
+        // into devices that are not there.
+        let booting = words(&qemu_args(
+            &layout(),
+            &request(),
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let receiving = words(&qemu_args(
+            &layout(),
+            &request(),
+            Path::new("/run/qmp.sock"),
+            Some("tcp:0:4900"),
+        ));
+        assert_eq!(receiving[..booting.len()], booting[..]);
+        assert_eq!(&receiving[booting.len()..], &["-incoming", "tcp:0:4900"]);
+
+        // Two taps, in the order the instance declares its ports.
+        let nets: Vec<&String> = booting.iter().filter(|a| a.starts_with("tap,")).collect();
+        assert_eq!(nets.len(), 2);
+        assert!(nets[0].contains("id=n0,ifname=vt-a"), "{nets:?}");
+        assert!(nets[1].contains("id=n1,ifname=vt-b"), "{nets:?}");
+        assert!(booting.contains(&"8192".to_string()));
+    }
+
+    #[test]
+    fn a_receiver_publishes_an_address_a_peer_can_actually_reach() {
+        // `-incoming tcp:0:4900` means every address of this machine, which is
+        // not something another node can be told to connect to.
+        let vmm = QemuVmm::new(layout());
+        assert_eq!(
+            vmm.published_url("tcp:0:4900").as_deref(),
+            Some("tcp:10.0.0.2:4900")
+        );
+        // A local move needs no address and publishes the socket itself.
+        assert_eq!(
+            vmm.published_url("unix:/var/lib/velstra/instances/p~i1/migrate.sock")
+                .as_deref(),
+            Some("unix:/var/lib/velstra/instances/p~i1/migrate.sock")
+        );
+        // And a node that was never told how it is reached cannot publish a TCP
+        // receiver at all, rather than publishing one nobody can connect to.
+        let anonymous = QemuVmm::new(Layout {
+            migration_address: None,
+            ..layout()
+        });
+        assert_eq!(anonymous.published_url("tcp:0:4900"), None);
+    }
+
+    #[test]
+    fn a_reply_is_told_apart_from_the_events_that_arrive_around_it() {
+        assert_eq!(
+            qmp_reply(r#"{"QMP":{"version":{"qemu":{"major":8}}}}"#).unwrap(),
+            None,
+            "the greeting was read as an answer"
+        );
+        assert_eq!(
+            qmp_reply(r#"{"event":"STOP","timestamp":{"seconds":1}}"#).unwrap(),
+            None,
+            "an event was read as an answer"
+        );
+        assert_eq!(
+            qmp_reply(r#"{"return":{"status":"running"}}"#)
+                .unwrap()
+                .unwrap()["status"],
+            "running"
+        );
+        // An error carries the sentence an operator will read on the object.
+        let err = qmp_reply(r#"{"error":{"class":"GenericError","desc":"Migration is disabled"}}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("Migration is disabled"), "{err}");
+        assert!(qmp_reply("not json").is_err());
+    }
+
+    #[test]
+    fn what_the_guest_is_doing_is_one_of_three_words_and_never_a_transition() {
+        assert_eq!(state_of("running"), InstanceState::Running);
+        assert_eq!(state_of("paused"), InstanceState::Stopped);
+        assert_eq!(state_of("finish-migrate"), InstanceState::Stopped);
+        assert_eq!(state_of("guest-panicked"), InstanceState::Failed);
+        assert_eq!(state_of("io-error"), InstanceState::Failed);
+    }
+
+    #[test]
+    fn a_transfer_that_is_still_going_is_not_started_again() {
+        // This is what stops a pass from issuing a second `migrate` on top of
+        // the first every time it comes round while a large guest copies.
+        assert!(still_going("active"));
+        assert!(still_going("postcopy-active"));
+        assert!(!still_going("completed"));
+        assert!(!still_going("failed"));
+        assert!(!still_going("cancelled"));
+    }
+
+    #[test]
+    fn progress_is_whatever_the_monitor_says_and_zero_when_it_says_nothing() {
+        let answer: Value =
+            serde_json::from_str(r#"{"status":"active","ram":{"transferred":1073741824}}"#)
+                .unwrap();
+        assert_eq!(transferred_mib(&answer), 1024);
+        let quiet: Value = serde_json::from_str(r#"{"status":"setup"}"#).unwrap();
+        assert_eq!(transferred_mib(&quiet), 0, "progress was invented");
+    }
+
+    #[test]
+    fn the_pause_the_guest_may_take_is_passed_through_and_the_rest_is_refused() {
+        assert_eq!(
+            migrate_parameters(&transfer("tcp:10.0.0.2:4900")).unwrap(),
+            vec![("downtime-limit", 300)]
+        );
+
+        let mut parallel = transfer("tcp:10.0.0.2:4900");
+        parallel.connections = 4;
+        assert_eq!(
+            migrate_parameters(&parallel).unwrap(),
+            vec![("downtime-limit", 300), ("multifd-channels", 4)]
+        );
+
+        // The combination both VMMs document as unsupported.
+        let mut local = transfer("unix:/tmp/migrate.sock");
+        local.connections = 4;
+        assert!(
+            migrate_parameters(&local)
+                .unwrap_err()
+                .to_string()
+                .contains("unix socket")
+        );
+
+        let mut reboot = transfer("tcp:10.0.0.2:4900");
+        reboot.mode = MigrationMode::Reboot;
+        assert!(
+            migrate_parameters(&reboot)
+                .unwrap_err()
+                .to_string()
+                .contains("stop here and a start there")
+        );
+    }
+}

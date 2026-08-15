@@ -1,0 +1,100 @@
+/* ======================================================================
+   Velstra design system — tokens, inlined.
+
+   Copied in rather than linked, for the same reason nothing else on this
+   page is fetched: an operator opens a cloud console during an incident,
+   sometimes from a network that cannot reach anything but the API. A
+   stylesheet that fails to load is a console that renders as unstyled text
+   at the worst possible moment.
+
+   The families name the system's faces first and fall back to the system
+   stack, because no webfont can be fetched and none is embedded.
+
+   Two roles for colour, never interchanged. Signal blue is the action and
+   the "you are here"; the platform's own mark is the palette's cyan. Cyan
+   is chosen rather than mixed: this console has no licence to invent a
+   hue, and an existing token carries the family without pretending to be
+   a second brand.
+   ====================================================================== */
+:root {
+  color-scheme: dark;
+
+  --ink-950: #070a10; --ink-900: #0b0e14; --ink-850: #0e121a;
+  --ink-800: #11151f; --ink-700: #161c28; --ink-600: #1d2431;
+  --ink-500: #232b3a; --ink-400: #313b4d; --ink-300: #4a566b;
+  --slate-400: #9ba6b8; --slate-100: #e6eaf2; --white: #f6f8fc;
+
+  --signal-300: #85acff; --signal-400: #5f93ff; --signal-500: #4c8dff;
+  --signal-600: #3a72e6; --signal-900: #16264f;
+
+  --green-500: #3fb950; --amber-500: #ffb020; --red-500: #f85149;
+  --cyan-500: #39b4d6; --cyan-600: #2792b0; --cyan-900: #0d323d;
+
+  --bg-app: var(--ink-900); --surface: var(--ink-800);
+  --surface-raised: var(--ink-700); --surface-sunken: var(--ink-850);
+  --surface-hover: var(--ink-600); --sidebar-bg: var(--ink-950);
+  --on-brand: var(--ink-950);
+  --text-strong: var(--white); --text-body: var(--slate-100);
+  --text-muted: var(--slate-400); --text-faint: var(--ink-300);
+  --border: var(--ink-500); --border-strong: var(--ink-400);
+  --border-subtle: var(--ink-600);
+  --brand: var(--signal-500); --brand-hover: var(--signal-400);
+  --brand-active: var(--signal-600); --focus-ring: var(--signal-400);
+  --link: var(--signal-400);
+
+  /* The four meanings, and nothing else may borrow them.
+     green  — settled, true, up
+     red    — failing, destructive
+     amber  — drifting: asked for, not yet observed
+     blue   — you are here, and the one primary action
+     Everything a thing merely *is* — Stopped, qcow2, closed — is neutral. */
+  --settled: var(--green-500);
+  --failing: var(--red-500);
+  --drifting: var(--amber-500);
+
+  --product: var(--cyan-500);
+  --product-strong: var(--cyan-600);
+  --product-subtle: var(--cyan-900);
+
+  --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600;
+  --text-2xs: .6875rem; --text-xs: .75rem; --text-sm: .8125rem;
+  --text-base: .875rem; --text-lg: 1.125rem; --text-xl: 1.5rem;
+  --leading-tight: 1.1; --leading-snug: 1.28; --leading-normal: 1.55;
+
+  /* Tracking is a function of size, not one number for the page. */
+  --tracking-display: -.025em; --tracking-tight: -.015em;
+  --tracking-body: 0em; --tracking-small: .01em; --tracking-caps: .08em;
+
+  --space-1: .25rem; --space-2: .5rem; --space-3: .75rem; --space-4: 1rem;
+  --space-5: 1.25rem; --space-6: 1.5rem; --space-7: 2rem; --space-9: 3rem;
+  --rail-w: 232px;
+
+  /* The one gutter: 180 + 28 = 208, which is also the width of the widest
+     ordinary field. Labels have one left edge, content has the other. */
+  --gutter: 180px; --gutter-gap: 28px;
+
+  /* Square. Hairlines and space carry the structure; a rounded rectangle
+     inside a rounded rectangle is two frames around content that needed
+     none. Only what is genuinely round keeps a radius. */
+  --radius-sm: 0px; --radius-md: 0px; --radius-pill: 999px;
+
+  /* A modal task dims what it covers and a parallel panel does not; the sheet
+     is modal, so this exists and is a token like everything else. */
+  --scrim: rgba(0,0,0,.45);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  --shadow-md: 0 4px 12px rgba(0,0,0,.45);
+  --shadow-lg: 0 12px 32px rgba(0,0,0,.5);
+  --edge-top: inset 0 1px 0 rgba(255,255,255,.05);
+  --glow-focus: 0 0 0 3px rgba(76,141,255,.35);
+  --wash: radial-gradient(1200px 520px at 82% -14%, rgba(57,180,214,.10), transparent 60%);
+
+  /* Almost nothing moves. An operator sees these screens all day, and
+     what is opened dozens of times a day either moves imperceptibly or
+     not at all. The curves are borrowed, not invented. */
+  --dur-fast: 130ms; --dur-base: 200ms;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+}

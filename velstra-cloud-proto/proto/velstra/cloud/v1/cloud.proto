@@ -1,0 +1,898 @@
+// The Velstra Cloud API.
+//
+// Every object in this API has the same three parts — `meta`, `spec`,
+// `status` — and the shape is the contract. `spec` is what was asked for and
+// only a controller may write it; `status` is what is, and only the agent that
+// owns the object may write it. Nothing here can express "in progress":
+// whether the world has caught up with an ask is
+// `status.observed_generation == meta.generation`, and nothing else.
+//
+// This means an SDK generated from this file never has to poll a state
+// machine. It changes a `spec`, remembers the `generation` it was given back,
+// and waits for a `status` that reports it.
+
+syntax = "proto3";
+
+package velstra.cloud.v1;
+
+// ---- common ---------------------------------------------------------------
+
+// Where an object lives. Neither coordinate can be changed afterwards: the
+// cell is the failure domain and the shard, so it is part of the identity of
+// every object rather than a property of one.
+message Placement {
+  string region = 1;
+  string cell = 2;
+}
+
+// The bookkeeping every object carries.
+message Meta {
+  // The full resource name: `projects/p1/instances/i1`.
+  string name = 1;
+  // Stable for the lifetime of this object even if the name is reused later.
+  string uid = 2;
+  Placement placement = 3;
+  // Bumped by the API on every accepted change to `spec`, and never by an
+  // agent. Compare it with `status.observed_generation`.
+  uint64 generation = 4;
+  // Milliseconds since the epoch.
+  int64 created_at = 5;
+  // Set once, when deletion is requested. Its presence is what makes
+  // finalizers run; the object stays readable and listable until the last one
+  // is released, so a delete is never half-done behind an operator's back.
+  optional int64 deleted_at = 6;
+  // The parties that must release the object before it disappears.
+  repeated string finalizers = 7;
+  map<string, string> labels = 8;
+  // The store revision this copy was read at. Opaque: compare it for equality
+  // and send it back to make a write conditional; never order it, parse it, or
+  // do arithmetic on it. A string for exactly that reason.
+  string revision = 9;
+}
+
+// Whether a named aspect of an object is true, false, or not yet known.
+//
+// `UNKNOWN` is load-bearing: it is what a condition says between a spec
+// changing and an agent reporting on it, and it is why there is no `PENDING`
+// anywhere in this API.
+enum ConditionStatus {
+  CONDITION_STATUS_UNSPECIFIED = 0;
+  CONDITION_STATUS_TRUE = 1;
+  CONDITION_STATUS_FALSE = 2;
+  CONDITION_STATUS_UNKNOWN = 3;
+}
+
+// One reported fact about an object: what it is about, whether it holds, a
+// stable token to branch on, and a sentence for the person reading it.
+message Condition {
+  // `Ready`, `Scheduled`, `Attached`, `NetworkProgrammed`, …
+  string kind = 1;
+  ConditionStatus status = 2;
+  // Short and stable, for code: `NoCapacity`, `ImageMissing`, `NodeUnreachable`.
+  string reason = 3;
+  // One sentence, for a person. The error belongs here, on the object, rather
+  // than in a log file on whichever machine ran the controller.
+  string message = 4;
+  // The generation this was observed at, so a stale condition is visibly stale
+  // rather than quietly wrong.
+  uint64 observed_generation = 5;
+  int64 last_transition = 6;
+}
+
+// The read and delete requests carry a name and nothing else, so they are one
+// message rather than ten identical ones. Anything that carries a resource is
+// typed, because that is where an SDK's users need the compiler's help.
+message GetRequest {
+  string name = 1;
+}
+
+message ListRequest {
+  // The collection's parent: `projects/p1` for instances, empty for nodes.
+  string parent = 1;
+}
+
+message DeleteRequest {
+  string name = 1;
+  // The revision the caller believes it is deleting. Empty means
+  // last-writer-wins, and the caller said so by leaving it out.
+  string revision = 2;
+}
+
+message WatchRequest {
+  string parent = 1;
+  // Watch from just after this revision. A client lists, takes the revision
+  // the list reports, and watches from it — nothing in between is lost.
+  string from_revision = 2;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_PUT = 1;
+  EVENT_TYPE_DELETE = 2;
+}
+
+// ---- project --------------------------------------------------------------
+
+// Limits, counted rather than reserved: a reservation that is not released on
+// a crash is a quota that shrinks over time, and a count recomputed from what
+// exists cannot drift. A zero is not a limit of zero — it is no limit set.
+message Quota {
+  uint32 instances = 1;
+  uint32 vcpus = 2;
+  uint64 memory_mib = 3;
+  uint64 volume_gib = 4;
+}
+
+message ProjectSpec {
+  string display_name = 1;
+  // `organizations/o1` or `folders/f2` — kept as a name so the policy
+  // hierarchy is walked rather than guessed.
+  string parent = 2;
+  Quota quota = 3;
+}
+
+message ProjectStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // What is in use, from counting the objects. Never decremented by hand.
+  Quota used = 3;
+}
+
+message Project {
+  Meta meta = 1;
+  ProjectSpec spec = 2;
+  ProjectStatus status = 3;
+}
+
+message CreateProjectRequest {
+  string parent = 1;
+  string project_id = 2;
+  Project project = 3;
+}
+
+message UpdateProjectRequest {
+  Project project = 1;
+  // Empty means last-writer-wins.
+  string revision = 2;
+}
+
+message ListProjectsResponse {
+  repeated Project projects = 1;
+  // The store revision this list was taken at: watch from here.
+  string revision = 2;
+}
+
+message ProjectEvent {
+  EventType type = 1;
+  Project resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// ---- node -----------------------------------------------------------------
+
+message Capacity {
+  uint32 vcpus = 1;
+  uint64 memory_mib = 2;
+  uint64 disk_gib = 3;
+  // Free memory per NUMA node, so placement can refuse a host that has the
+  // total but not on one node — the shape of the "scheduled but will not
+  // start" failure.
+  repeated uint64 numa_free_mib = 4;
+  uint32 hugepages_1gi = 5;
+}
+
+message NodeSpec {
+  // False drains the node: nothing new is placed, what runs keeps running.
+  // Draining is a spec change rather than a command, so a controller restart
+  // cannot lose it half way.
+  bool schedulable = 1;
+  repeated string labels = 2;
+}
+
+message NodeStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  Capacity capacity = 3;
+  // What the agent sees in use on itself. The scheduler reads this rather than
+  // a placement table it maintains, because a table drifts and a report cannot.
+  Capacity allocated = 4;
+  string agent_version = 5;
+  int64 last_heartbeat = 6;
+  // Images this node holds a verified copy of. Which nodes hold an image is an
+  // aggregate, and an aggregate is not a fact anybody owns — so each node
+  // reports its own and callers add them up.
+  repeated string images = 7;
+}
+
+message Node {
+  Meta meta = 1;
+  NodeSpec spec = 2;
+  NodeStatus status = 3;
+}
+
+message CreateNodeRequest {
+  string parent = 1;
+  string node_id = 2;
+  Node node = 3;
+}
+
+message UpdateNodeRequest {
+  Node node = 1;
+  string revision = 2;
+}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+  string revision = 2;
+}
+
+message NodeEvent {
+  EventType type = 1;
+  Node resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// ---- image ----------------------------------------------------------------
+
+enum ImageFormat {
+  IMAGE_FORMAT_UNSPECIFIED = 0;
+  IMAGE_FORMAT_RAW = 1;
+  IMAGE_FORMAT_QCOW2 = 2;
+}
+
+// Content-addressed and immutable: the id is the digest. There is no way to
+// replace the bytes behind an image that instances were created from, so "the
+// image changed and now the VM will not start" is unreachable.
+message ImageSpec {
+  string digest = 1;
+  ImageFormat format = 2;
+  uint64 size_bytes = 3;
+  string source_url = 4;
+  // Cosign-style signature, verified by the node before it will boot the image.
+  optional string signature = 5;
+}
+
+message ImageStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // Which nodes hold a copy is computed from each node's own report, never
+  // stored here: an aggregate is not a fact anybody owns. See NodeStatus.images.
+}
+
+message Image {
+  Meta meta = 1;
+  ImageSpec spec = 2;
+  ImageStatus status = 3;
+}
+
+message CreateImageRequest {
+  string parent = 1;
+  string image_id = 2;
+  Image image = 3;
+}
+
+message UpdateImageRequest {
+  Image image = 1;
+  string revision = 2;
+}
+
+message ListImagesResponse {
+  repeated Image images = 1;
+  string revision = 2;
+}
+
+message ImageEvent {
+  EventType type = 1;
+  Image resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// ---- instance -------------------------------------------------------------
+
+enum DesiredState {
+  DESIRED_STATE_UNSPECIFIED = 0;
+  DESIRED_STATE_RUNNING = 1;
+  DESIRED_STATE_STOPPED = 2;
+}
+
+// What the node sees right now. Every value is observable on the host; none of
+// them describes a transition. A machine that is mid-boot is `STOPPED` with a
+// `Ready=UNKNOWN` condition, never `BOOTING` — a `BOOTING` that outlives the
+// process which wrote it is an object an operator has to repair by hand.
+enum InstanceState {
+  // Nobody has reported yet. The only value here that is not an observation.
+  INSTANCE_STATE_UNSPECIFIED = 0;
+  INSTANCE_STATE_STOPPED = 1;
+  INSTANCE_STATE_RUNNING = 2;
+  INSTANCE_STATE_FAILED = 3;
+}
+
+message PlacementPolicy {
+  // Instances that must not share a node.
+  optional string anti_affinity_group = 1;
+  // Only nodes carrying all of these labels.
+  repeated string required_labels = 2;
+}
+
+message InstanceSpec {
+  uint32 vcpus = 1;
+  uint64 memory_mib = 2;
+  // `projects/p1/images/sha256-…`
+  string image = 3;
+  uint64 root_disk_gib = 4;
+  // What the machine should be doing. Not a command: asking twice is the same
+  // as asking once.
+  DesiredState desired_state = 5;
+  // Ports on Velstra networks, in order.
+  repeated string ports = 6;
+  repeated string ssh_keys = 7;
+  optional string user_data = 8;
+  // Set by the scheduler, once. Moving it is a migration — a deliberate act
+  // with its own resource, never a silent re-place.
+  optional string node = 9;
+  PlacementPolicy placement_policy = 10;
+}
+
+message InstanceStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  InstanceState state = 3;
+  // The node reporting this status, and the only agent allowed to write it.
+  optional string node = 4;
+  repeated string addresses = 5;
+  optional uint32 vmm_pid = 6;
+  optional int64 started_at = 7;
+}
+
+message Instance {
+  Meta meta = 1;
+  InstanceSpec spec = 2;
+  InstanceStatus status = 3;
+}
+
+message CreateInstanceRequest {
+  string parent = 1;
+  string instance_id = 2;
+  Instance instance = 3;
+}
+
+message UpdateInstanceRequest {
+  Instance instance = 1;
+  string revision = 2;
+}
+
+message ListInstancesResponse {
+  repeated Instance instances = 1;
+  string revision = 2;
+}
+
+message InstanceEvent {
+  EventType type = 1;
+  Instance resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// Why one node was not chosen.
+message Rejection {
+  string node = 1;
+  // A stable token: `InsufficientMemory`, `NoNumaNodeFits`, `AntiAffinity`, …
+  string why = 2;
+  // The numbers behind it: "4096 free, 8192 wanted".
+  string detail = 3;
+}
+
+// The answer to "why did this not schedule": the filter that removed each
+// candidate, rather than a log to grep.
+message PlacementExplanation {
+  optional string placed = 1;
+  repeated Rejection rejected = 2;
+}
+
+// ---- volume and attachment ------------------------------------------------
+
+message VolumeSpec {
+  uint64 size_gib = 1;
+  string pool = 2;
+  // LUKS with a key from the project's KMS entry. Absent means plaintext,
+  // which is a decision somebody has to make rather than a default.
+  optional string encryption_key = 3;
+  optional string source_image = 4;
+}
+
+message VolumeStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  bool provisioned = 3;
+  uint64 actual_size_gib = 4;
+}
+
+message Volume {
+  Meta meta = 1;
+  VolumeSpec spec = 2;
+  VolumeStatus status = 3;
+}
+
+message CreateVolumeRequest {
+  string parent = 1;
+  string volume_id = 2;
+  Volume volume = 3;
+}
+
+message UpdateVolumeRequest {
+  Volume volume = 1;
+  string revision = 2;
+}
+
+message ListVolumesResponse {
+  repeated Volume volumes = 1;
+  string revision = 2;
+}
+
+message VolumeEvent {
+  EventType type = 1;
+  Volume resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// Attaching a volume to an instance is its own resource, not a field on
+// either one.
+//
+// A field would have two writers — the controller that wants it attached and
+// the node that knows whether it is — and no way to say "detached, but the
+// node still has it open". As a resource with a finalizer the sequence is
+// forced: the controller asks, the node acts and reports, the node releases
+// the finalizer, and only then does the object go. Two nodes with one volume
+// open is the failure this shape prevents.
+message AttachmentSpec {
+  string volume = 1;
+  string instance = 2;
+  // The node that must open it, copied from the instance so an agent's watch
+  // filter is a single field.
+  string node = 3;
+  bool read_only = 4;
+}
+
+message AttachmentStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // True only while the node has it open. There is no third value.
+  bool attached = 3;
+  // `/dev/vdb` — what the guest sees, reported by the node.
+  optional string device = 4;
+  optional string node = 5;
+}
+
+message Attachment {
+  Meta meta = 1;
+  AttachmentSpec spec = 2;
+  AttachmentStatus status = 3;
+}
+
+message CreateAttachmentRequest {
+  string parent = 1;
+  string attachment_id = 2;
+  Attachment attachment = 3;
+}
+
+message UpdateAttachmentRequest {
+  Attachment attachment = 1;
+  string revision = 2;
+}
+
+message ListAttachmentsResponse {
+  repeated Attachment attachments = 1;
+  string revision = 2;
+}
+
+message AttachmentEvent {
+  EventType type = 1;
+  Attachment resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// ---- network, subnet, port ------------------------------------------------
+
+message NetworkSpec {
+  // The VNI on the Velstra fabric, assigned by the controller from the cell's
+  // range and never chosen by a tenant.
+  uint32 vni = 1;
+  uint32 mtu = 2;
+}
+
+message NetworkStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // Nodes that have the VNI programmed.
+  repeated string programmed_on = 3;
+}
+
+message Network {
+  Meta meta = 1;
+  NetworkSpec spec = 2;
+  NetworkStatus status = 3;
+}
+
+message CreateNetworkRequest {
+  string parent = 1;
+  string network_id = 2;
+  Network network = 3;
+}
+
+message UpdateNetworkRequest {
+  Network network = 1;
+  string revision = 2;
+}
+
+message ListNetworksResponse {
+  repeated Network networks = 1;
+  string revision = 2;
+}
+
+message NetworkEvent {
+  EventType type = 1;
+  Network resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+message SubnetSpec {
+  string network = 1;
+  string cidr = 2;
+  string gateway = 3;
+  repeated string dns = 4;
+  // Addresses the platform will not hand out.
+  repeated string reserved = 5;
+}
+
+message SubnetStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  uint32 allocated = 3;
+  uint32 available = 4;
+}
+
+message Subnet {
+  Meta meta = 1;
+  SubnetSpec spec = 2;
+  SubnetStatus status = 3;
+}
+
+message CreateSubnetRequest {
+  string parent = 1;
+  string subnet_id = 2;
+  Subnet subnet = 3;
+}
+
+message UpdateSubnetRequest {
+  Subnet subnet = 1;
+  string revision = 2;
+}
+
+message ListSubnetsResponse {
+  repeated Subnet subnets = 1;
+  string revision = 2;
+}
+
+message SubnetEvent {
+  EventType type = 1;
+  Subnet resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+message PortSpec {
+  string network = 1;
+  string subnet = 2;
+  // Allocated by the IPAM controller and then never changed: an address that
+  // moves under a running guest is an outage.
+  optional string address = 3;
+  optional string mac = 4;
+  repeated string security_groups = 5;
+  // Egress and ingress ceiling, in megabits. Multi-tenancy without one is one
+  // noisy neighbour away from an incident.
+  optional uint32 rate_limit_mbit = 6;
+}
+
+message PortStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // The node whose datapath carries it.
+  optional string node = 3;
+  // True when the Velstra agent has the port in its maps.
+  bool programmed = 4;
+  optional string tap_device = 5;
+}
+
+message Port {
+  Meta meta = 1;
+  PortSpec spec = 2;
+  PortStatus status = 3;
+}
+
+message CreatePortRequest {
+  string parent = 1;
+  string port_id = 2;
+  Port port = 3;
+}
+
+message UpdatePortRequest {
+  Port port = 1;
+  string revision = 2;
+}
+
+message ListPortsResponse {
+  repeated Port ports = 1;
+  string revision = 2;
+}
+
+message PortEvent {
+  EventType type = 1;
+  Port resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// ---- migration ------------------------------------------------------------
+
+// Moving a running guest is a **resource**, not a state on the instance.
+//
+// `InstanceState::MIGRATING` is the bug this platform exists to remove: a
+// controller dies mid-flight and the guest is stuck in a state nobody can
+// resolve without looking at two machines by hand. Here, whether the move has
+// happened is computed from where the instance actually runs, so a migration
+// can never disagree with the world.
+enum MigrationMode {
+  MIGRATION_MODE_UNSPECIFIED = 0;
+  // Pre-copy: memory moves while the guest runs. The only mode where a failure
+  // is free, because the source still has the guest.
+  MIGRATION_MODE_LIVE = 1;
+  // Post-copy: the destination resumes first and faults pages in. Lower
+  // downtime, but a failure mid-flight loses the guest. Never a default.
+  MIGRATION_MODE_POST_COPY = 2;
+  // Stop, move, start. Honest about the outage.
+  MIGRATION_MODE_REBOOT = 3;
+}
+
+message MigrationSpec {
+  string instance = 1;
+  // Where it is now. Derived from the instance at create — send it empty.
+  string from_node = 2;
+  // Where it should go. This is the assignment: the destination's agent
+  // watches for its own name here, because the receiver must listen before the
+  // source may send.
+  string to_node = 3;
+  MigrationMode mode = 4;
+  // The pause the guest may take at the end, in milliseconds.
+  uint32 downtime_ms = 5;
+  // Give up after this long: a migration that cannot converge would otherwise
+  // run until somebody noticed.
+  uint32 timeout_s = 6;
+  uint32 connections = 7;
+}
+
+message MigrationStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // The destination agent, once it has claimed this object.
+  optional string node = 3;
+  // Where the source should send. Written by the destination, because only it
+  // knows what it managed to bind.
+  optional string receiver_url = 4;
+  // Listening *now* — not "was started". A receiver whose process died must
+  // stop being ready, or the source sends into nothing.
+  bool receiver_ready = 5;
+  // Progress, never a state.
+  uint64 transferred_mib = 6;
+}
+
+message Migration {
+  Meta meta = 1;
+  MigrationSpec spec = 2;
+  MigrationStatus status = 3;
+}
+
+message CreateMigrationRequest {
+  string parent = 1;
+  string migration_id = 2;
+  Migration migration = 3;
+}
+
+message UpdateMigrationRequest {
+  Migration migration = 1;
+  string revision = 2;
+}
+
+message ListMigrationsResponse {
+  repeated Migration migrations = 1;
+  string revision = 2;
+}
+
+message MigrationEvent {
+  EventType type = 1;
+  Migration resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// One destination, and whether this guest may move there.
+message Destination {
+  string node = 1;
+  bool allowed = 2;
+  // Empty when allowed. Otherwise a stable token: `DestinationTooSmall`,
+  // `VersionsTooFarApart`, `DestinationLacksImage`, …
+  string why = 3;
+  // The numbers behind it: "4096 MiB free, 8192 MiB wanted".
+  string detail = 4;
+}
+
+// Where a guest could go, answered before anything moves.
+//
+// Unlike placement — where the scheduler picks — a migration's destination is
+// chosen by a person, so every node carries its own verdict and none is left
+// out. A node that is absent from this list does not exist, rather than being
+// undecided.
+message MigrationExplanation {
+  string from = 1;
+  repeated Destination destinations = 2;
+}
+
+// ---- operations (AIP-151) -------------------------------------------------
+
+// A long-running operation is a resource an operator can look at, not a
+// connection they have to hold open.
+//
+// It carries no state of its own beyond a pointer at its target and the
+// generation of that target it is waiting for: `done` is computed from the
+// target's own convergence, so an operation cannot disagree with the object it
+// describes.
+message OperationSpec {
+  string target = 1;
+  uint64 target_generation = 2;
+  string verb = 3;
+  string requested_by = 4;
+}
+
+message OperationStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  bool done = 3;
+  optional string error = 4;
+  optional int64 finished_at = 5;
+}
+
+message Operation {
+  Meta meta = 1;
+  OperationSpec spec = 2;
+  OperationStatus status = 3;
+}
+
+message ListOperationsResponse {
+  repeated Operation operations = 1;
+  string revision = 2;
+}
+
+message OperationEvent {
+  EventType type = 1;
+  Operation resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+message WaitOperationRequest {
+  string name = 1;
+  // How long the server may hold the request open. It returns the operation as
+  // it stands when this expires, done or not — waiting is an optimisation over
+  // polling, never a guarantee.
+  uint64 timeout_millis = 2;
+}
+
+// ---- services -------------------------------------------------------------
+
+// Create returns an `Operation` rather than the object: the object exists the
+// moment the call returns, but it has not converged, and an API that returned
+// a `Ready`-looking object here would be lying about the only thing the caller
+// wants to know.
+service Compute {
+  rpc GetInstance(GetRequest) returns (Instance);
+  rpc ListInstances(ListRequest) returns (ListInstancesResponse);
+  rpc CreateInstance(CreateInstanceRequest) returns (Operation);
+  rpc UpdateInstance(UpdateInstanceRequest) returns (Instance);
+  rpc DeleteInstance(DeleteRequest) returns (Instance);
+  rpc WatchInstances(WatchRequest) returns (stream InstanceEvent);
+
+  rpc GetImage(GetRequest) returns (Image);
+  rpc ListImages(ListRequest) returns (ListImagesResponse);
+  rpc CreateImage(CreateImageRequest) returns (Operation);
+  rpc UpdateImage(UpdateImageRequest) returns (Image);
+  rpc DeleteImage(DeleteRequest) returns (Image);
+  rpc WatchImages(WatchRequest) returns (stream ImageEvent);
+
+  rpc GetMigration(GetRequest) returns (Migration);
+  rpc ListMigrations(ListRequest) returns (ListMigrationsResponse);
+  rpc CreateMigration(CreateMigrationRequest) returns (Operation);
+  rpc UpdateMigration(UpdateMigrationRequest) returns (Migration);
+  rpc DeleteMigration(DeleteRequest) returns (Migration);
+  rpc WatchMigrations(WatchRequest) returns (stream MigrationEvent);
+
+  // Why an instance is where it is, or why it is nowhere.
+  rpc ExplainPlacement(GetRequest) returns (PlacementExplanation);
+
+  // Where this guest could go, with a verdict for every node.
+  rpc ExplainMigration(GetRequest) returns (MigrationExplanation);
+}
+
+service Storage {
+  rpc GetVolume(GetRequest) returns (Volume);
+  rpc ListVolumes(ListRequest) returns (ListVolumesResponse);
+  rpc CreateVolume(CreateVolumeRequest) returns (Operation);
+  rpc UpdateVolume(UpdateVolumeRequest) returns (Volume);
+  rpc DeleteVolume(DeleteRequest) returns (Volume);
+  rpc WatchVolumes(WatchRequest) returns (stream VolumeEvent);
+
+  rpc GetAttachment(GetRequest) returns (Attachment);
+  rpc ListAttachments(ListRequest) returns (ListAttachmentsResponse);
+  rpc CreateAttachment(CreateAttachmentRequest) returns (Operation);
+  rpc UpdateAttachment(UpdateAttachmentRequest) returns (Attachment);
+  rpc DeleteAttachment(DeleteRequest) returns (Attachment);
+  rpc WatchAttachments(WatchRequest) returns (stream AttachmentEvent);
+}
+
+// Named `Networking` rather than `Network` because a service and a message
+// share one namespace in protobuf, and the object is the one that had to keep
+// its name.
+service Networking {
+  rpc GetNetwork(GetRequest) returns (Network);
+  rpc ListNetworks(ListRequest) returns (ListNetworksResponse);
+  rpc CreateNetwork(CreateNetworkRequest) returns (Operation);
+  rpc UpdateNetwork(UpdateNetworkRequest) returns (Network);
+  rpc DeleteNetwork(DeleteRequest) returns (Network);
+  rpc WatchNetworks(WatchRequest) returns (stream NetworkEvent);
+
+  rpc GetSubnet(GetRequest) returns (Subnet);
+  rpc ListSubnets(ListRequest) returns (ListSubnetsResponse);
+  rpc CreateSubnet(CreateSubnetRequest) returns (Operation);
+  rpc UpdateSubnet(UpdateSubnetRequest) returns (Subnet);
+  rpc DeleteSubnet(DeleteRequest) returns (Subnet);
+  rpc WatchSubnets(WatchRequest) returns (stream SubnetEvent);
+
+  rpc GetPort(GetRequest) returns (Port);
+  rpc ListPorts(ListRequest) returns (ListPortsResponse);
+  rpc CreatePort(CreatePortRequest) returns (Operation);
+  rpc UpdatePort(UpdatePortRequest) returns (Port);
+  rpc DeletePort(DeleteRequest) returns (Port);
+  rpc WatchPorts(WatchRequest) returns (stream PortEvent);
+}
+
+// Projects and nodes: the two collections a tenant reads and an operator
+// writes.
+service Admin {
+  rpc GetProject(GetRequest) returns (Project);
+  rpc ListProjects(ListRequest) returns (ListProjectsResponse);
+  rpc CreateProject(CreateProjectRequest) returns (Operation);
+  rpc UpdateProject(UpdateProjectRequest) returns (Project);
+  rpc DeleteProject(DeleteRequest) returns (Project);
+  rpc WatchProjects(WatchRequest) returns (stream ProjectEvent);
+
+  rpc GetNode(GetRequest) returns (Node);
+  rpc ListNodes(ListRequest) returns (ListNodesResponse);
+  rpc CreateNode(CreateNodeRequest) returns (Operation);
+  rpc UpdateNode(UpdateNodeRequest) returns (Node);
+  rpc DeleteNode(DeleteRequest) returns (Node);
+  rpc WatchNodes(WatchRequest) returns (stream NodeEvent);
+}
+
+// There is no CreateOperation: operations are minted by the API when it
+// accepts a change, never by a caller.
+service Operations {
+  rpc GetOperation(GetRequest) returns (Operation);
+  rpc ListOperations(ListRequest) returns (ListOperationsResponse);
+  rpc DeleteOperation(DeleteRequest) returns (Operation);
+  rpc WatchOperations(WatchRequest) returns (stream OperationEvent);
+  rpc WaitOperation(WaitOperationRequest) returns (Operation);
+}
