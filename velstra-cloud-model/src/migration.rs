@@ -104,7 +104,7 @@ impl Default for MigrationSpec {
 }
 
 impl Assigned for MigrationSpec {
-    fn assigned_node(&self) -> Option<&str> {
+    fn assigned_owner(&self) -> Option<&str> {
         // The destination, because it is the party that must act first and
         // therefore the party with something to report.
         Some(self.to_node.as_str())
@@ -136,7 +136,7 @@ impl Observed for MigrationStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         self.node.as_deref()
     }
 }

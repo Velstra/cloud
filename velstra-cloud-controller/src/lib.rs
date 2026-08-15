@@ -32,6 +32,7 @@ pub mod quota;
 pub mod runner;
 pub mod scheduler;
 pub mod status;
+pub mod volume;
 
 pub use metrics::Metrics;
 pub use runner::{LoopConfig, Reconciler, Related, run, sweep};

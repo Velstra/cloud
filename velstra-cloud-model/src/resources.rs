@@ -28,11 +28,12 @@ impl<S, T> Resource<S, T> {
     }
 }
 
-/// The half of ownership a **controller** writes: which node this object was
-/// given to. Read by the access rule so a node can make its first report on an
-/// object it has been assigned but not yet claimed.
+/// The half of ownership a **controller** writes: who this object was given to
+/// — a node for an instance, a storage pool for a volume. Read by the access
+/// rule so the assignee can make its first report on an object it has been
+/// given but not yet claimed.
 pub trait Assigned {
-    fn assigned_node(&self) -> Option<&str> {
+    fn assigned_owner(&self) -> Option<&str> {
         None
     }
 }
@@ -41,16 +42,20 @@ pub trait Assigned {
 pub trait Observed {
     fn observed_generation(&self) -> u64;
     fn conditions(&self) -> &[Condition];
-    /// The node that owns this object's `status`, if it is assigned.
-    fn owner_node(&self) -> Option<&str>;
+    /// Whoever owns this object's `status`, if it has been claimed.
+    ///
+    /// Usually a node; for a volume it is the storage pool holding its bytes.
+    /// The rule does not care which — it cares that exactly one party writes.
+    fn owner(&self) -> Option<&str>;
 
     /// True when the object *is* the thing that reports on it.
     ///
-    /// A node is the only such resource: nothing assigns a hypervisor to a
-    /// hypervisor, so its owner is its own name. Without this the access rule —
-    /// which asks the status who owns it — refuses every node's own capacity
-    /// report, and a cell can never learn what it is made of. Found by running
-    /// the layers together; each of them was individually right.
+    /// Two resources are like this, and for the same reason: nothing assigns a
+    /// hypervisor to a hypervisor or a storage pool to a storage pool, so each
+    /// one's owner is its own name. Without this the access rule — which asks
+    /// the status who owns it — refuses every node's own capacity report, and a
+    /// cell can never learn what it is made of. Found by running the layers
+    /// together; each of them was individually right.
     fn self_owned(&self) -> bool {
         false
     }
@@ -110,7 +115,7 @@ impl Observed for ProjectStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         None
     }
 }
@@ -180,7 +185,7 @@ impl Observed for NodeStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         None
     }
     fn self_owned(&self) -> bool {
@@ -228,7 +233,7 @@ impl Observed for ImageStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         None
     }
 }
@@ -307,7 +312,7 @@ impl Observed for InstanceStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         self.node.as_deref()
     }
 }
@@ -332,6 +337,14 @@ pub struct VolumeStatus {
     pub conditions: Vec<Condition>,
     pub provisioned: bool,
     pub actual_size_gib: u64,
+    /// The pool that has claimed this volume and is reporting on it.
+    ///
+    /// Until this exists, nothing had written a volume's status at all — not
+    /// because the code was missing but because `owner()` returned `None` and
+    /// `VolumeSpec` was not `Assigned`, so the access rule refused every writer
+    /// there could ever be. A volume lives in a pool, not on a node, so the pool
+    /// is the party with something to report about it.
+    pub pool: Option<String>,
 }
 
 impl Observed for VolumeStatus {
@@ -341,10 +354,81 @@ impl Observed for VolumeStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
-        None
+    fn owner(&self) -> Option<&str> {
+        self.pool.as_deref()
     }
 }
+
+impl Assigned for VolumeSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        // `spec.pool` is the assignment, exactly as `instance.spec.node` is: an
+        // operator (or later a scheduler) says where the bytes belong, and the
+        // pool agent watching for its own name claims it.
+        Some(self.pool.as_str())
+    }
+}
+
+/// A pool releases a volume's bytes before the object may go.
+///
+/// Separate from the node finalizer because they answer different questions: a
+/// node is asked to stop *using* a volume, a pool is asked to destroy it. A
+/// volume that vanished from the API while its pool still held gigabytes would
+/// be storage nobody is billed for and nobody can find.
+pub const POOL_RELEASE_FINALIZER: &str = "pool.velstra.io/release";
+
+// ---- pool ----------------------------------------------------------------
+
+/// Somewhere volumes live: an LVM volume group, a ZFS dataset, a Ceph pool, a
+/// directory.
+///
+/// It is to storage what a [`Node`] is to compute, and deliberately the same
+/// shape — `spec` is what an operator decides about it, `status` is what its
+/// agent reports. Nothing here describes *how* to talk to the backend, because
+/// that is not an operator's statement about the world: the agent knows what it
+/// is running and reports it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PoolSpec {
+    /// False drains the pool: nothing new is provisioned into it, what exists
+    /// stays. A spec change rather than a command, so a restart cannot lose it
+    /// half way.
+    pub accepting: bool,
+    pub labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PoolStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// What the agent found itself running — `lvm`, `zfs`, `ceph`, `directory`.
+    /// Observed rather than declared: an operator writing `zfs` over an LVM pool
+    /// would be describing a world that does not exist.
+    pub backend: String,
+    pub capacity_gib: u64,
+    /// Counted from the volumes this pool holds, never tracked as a running
+    /// total — the same reason quota is counted rather than incremented.
+    pub allocated_gib: u64,
+    pub agent_version: String,
+    pub last_heartbeat: Timestamp,
+}
+
+impl Observed for PoolStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+    fn self_owned(&self) -> bool {
+        true
+    }
+}
+
+impl Assigned for PoolSpec {}
+
+pub type Pool = Resource<PoolSpec, PoolStatus>;
 
 pub type Volume = Resource<VolumeSpec, VolumeStatus>;
 
@@ -386,7 +470,7 @@ impl Observed for AttachmentStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         self.node.as_deref()
     }
 }
@@ -421,7 +505,7 @@ impl Observed for NetworkStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         None
     }
 }
@@ -453,7 +537,7 @@ impl Observed for SubnetStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         None
     }
 }
@@ -492,7 +576,7 @@ impl Observed for PortStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         self.node.as_deref()
     }
 }
@@ -533,7 +617,7 @@ impl Observed for OperationStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn owner_node(&self) -> Option<&str> {
+    fn owner(&self) -> Option<&str> {
         None
     }
 }
@@ -547,15 +631,13 @@ impl Assigned for NodeSpec {}
 impl Assigned for ImageSpec {}
 
 impl Assigned for InstanceSpec {
-    fn assigned_node(&self) -> Option<&str> {
+    fn assigned_owner(&self) -> Option<&str> {
         self.node.as_deref()
     }
 }
 
-impl Assigned for VolumeSpec {}
-
 impl Assigned for AttachmentSpec {
-    fn assigned_node(&self) -> Option<&str> {
+    fn assigned_owner(&self) -> Option<&str> {
         Some(self.node.as_str())
     }
 }
@@ -615,7 +697,7 @@ mod tests {
     fn only_the_reporting_node_owns_an_instances_status() {
         let mut i = instance(1, 1);
         i.status.node = Some("node-a".into());
-        assert_eq!(i.status.owner_node(), Some("node-a"));
+        assert_eq!(i.status.owner(), Some("node-a"));
     }
 
     #[test]

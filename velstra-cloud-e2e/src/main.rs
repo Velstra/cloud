@@ -25,9 +25,11 @@ use std::{sync::Arc, time::Duration};
 use velstra_cloud_api::{Api, StaticTokenVerifier};
 use velstra_cloud_controller::{
     LoopConfig, Metrics, attachment::AttachmentController, quota::QuotaController,
-    scheduler::Scheduler, status::StatusWriter,
+    scheduler::Scheduler, status::StatusWriter, volume::VolumeController,
 };
-use velstra_cloud_nodeagent::{Agent, AgentConfig, FakeDatapath, FakeVmm};
+use velstra_cloud_nodeagent::{
+    Agent, AgentConfig, FakeDatapath, FakePool, FakeVmm, PoolAgent, PoolConfig,
+};
 use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
 const REGION: &str = "eu-central";
@@ -94,9 +96,45 @@ async fn main() {
         projects,
         store.clone(),
         config,
-        metrics,
+        metrics.clone(),
         shutdown.clone(),
     ));
+
+    // Storage, on the same principle as the node below: a development cell that
+    // cannot make a volume is a development cell you have to set up before it is
+    // useful. The volume controller guards the deletion; the pool agent does the
+    // work.
+    let volumes_for_controller: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "volumes");
+    let volume = Arc::new(VolumeController::new(volumes_for_controller.clone()));
+    tokio::spawn(velstra_cloud_controller::run(
+        volume,
+        volumes_for_controller,
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+    ));
+
+    // Named for what the seed asks for: a development cell whose one volume
+    // names a pool that does not exist would demonstrate the bug rather than
+    // the feature.
+    let pool_id = "rbd-standard";
+    register_pool(store.clone(), pool_id).await;
+    let mut pool_config = PoolConfig::new(pool_id, REGION, CELL);
+    // Faster than the 30s default because the pool agent has no watch: claiming
+    // and then provisioning is two passes, and a development cell where a new
+    // volume takes a minute to appear teaches the wrong thing about how long
+    // storage takes.
+    pool_config.resync = Duration::from_secs(2);
+    let pool_agent = PoolAgent::new(store.clone(), pool_config, Arc::new(FakePool::new(20_000)));
+    let mut pool_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        pool_agent
+            .run(async move {
+                let _ = pool_shutdown.changed().await;
+            })
+            .await;
+    });
 
     // One node, with a hypervisor that does not exist. Registering it here
     // rather than making the operator do it is the difference between a
@@ -148,6 +186,29 @@ async fn main() {
 
 /// Create the node object an operator would create, so the cell has somewhere
 /// to put work. The agent fills in its own status.
+async fn register_pool(store: Arc<dyn Store>, id: &str) {
+    use velstra_cloud_model::{
+        meta::{Meta, Placement, ResourceName},
+        resources::{PoolSpec, PoolStatus, Resource},
+    };
+
+    let pools: TypedStore<PoolSpec, PoolStatus> = TypedStore::new(store, CELL, "pools");
+    let pool = Resource::new(
+        Meta::new(
+            ResourceName::parse(&format!("pools/{id}")).expect("a valid pool name"),
+            Placement::new(REGION, CELL),
+        ),
+        PoolSpec {
+            accepting: true,
+            labels: vec!["dev".to_string()],
+        },
+        PoolStatus::default(),
+    );
+    if let Err(e) = pools.create(&pool).await {
+        eprintln!("warning: could not register {id}: {e}");
+    }
+}
+
 async fn register_node(store: Arc<dyn Store>, id: &str) {
     use velstra_cloud_model::{
         meta::{Meta, Placement, ResourceName},

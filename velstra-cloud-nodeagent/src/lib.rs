@@ -40,10 +40,13 @@ pub mod fake;
 pub mod host;
 pub mod hostfs;
 pub mod metadata;
+pub mod pool;
 pub mod qemu;
+pub(crate) mod reporting;
 
 pub use agent::{Agent, AgentConfig, Pass};
 pub use fake::{FakeDatapath, FakeNetwork, FakeVmm, Fault};
 pub use host::{Datapath, HostError, HostState, Receiver, Transfer, VmObservation, VmRequest, Vmm};
 pub use hostfs::Layout;
 pub use metadata::{InstanceMetadata, MetadataRegistry};
+pub use pool::{FakePool, PoolAgent, PoolConfig, PoolState, Storage};

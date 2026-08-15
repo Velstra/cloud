@@ -408,6 +408,9 @@ message VolumeStatus {
   repeated Condition conditions = 2;
   bool provisioned = 3;
   uint64 actual_size_gib = 4;
+  // The pool that claimed this volume and reports on it. A volume lives in a
+  // pool, not on a node, so the pool is the party with something to say.
+  optional string pool = 5;
 }
 
 message Volume {

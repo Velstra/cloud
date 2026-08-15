@@ -18,8 +18,8 @@ use velstra_cloud_model::{
     resources::{
         AttachmentSpec, AttachmentStatus, ImageSpec, ImageStatus, Instance, InstanceSpec,
         InstanceStatus, NetworkSpec, NetworkStatus, Node, NodeSpec, NodeStatus, OperationSpec,
-        OperationStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus, Resource, SubnetSpec,
-        SubnetStatus, Volume, VolumeSpec, VolumeStatus, nodes_holding,
+        OperationStatus, PoolSpec, PoolStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus,
+        Resource, SubnetSpec, SubnetStatus, Volume, VolumeSpec, VolumeStatus, nodes_holding,
     },
 };
 use velstra_cloud_store::{Event, Store};
@@ -35,7 +35,7 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 11] = [
+pub const COLLECTIONS: [&str; 12] = [
     "projects",
     "instances",
     "migrations",
@@ -46,6 +46,7 @@ pub const COLLECTIONS: [&str; 11] = [
     "ports",
     "images",
     "nodes",
+    "pools",
     "operations",
 ];
 
@@ -108,6 +109,7 @@ impl Api {
             collection!("ports", PortSpec, PortStatus),
             collection!("images", ImageSpec, ImageStatus),
             collection!("nodes", NodeSpec, NodeStatus),
+            collection!("pools", PoolSpec, PoolStatus),
             collection!("operations", OperationSpec, OperationStatus),
             collection!("migrations", MigrationSpec, MigrationStatus),
         ]);

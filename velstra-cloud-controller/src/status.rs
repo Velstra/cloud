@@ -92,7 +92,7 @@ where
                 self.who, next.meta.name
             )));
         }
-        let owner = previous.status.owner_node();
+        let owner = previous.status.owner();
         if !controller_may_write_status(owner) {
             return Err(Error::Refused(format!(
                 "{} wrote the status of {}, which the agent on {} owns",

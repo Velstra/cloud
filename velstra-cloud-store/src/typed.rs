@@ -159,7 +159,7 @@ where
             let itself = previous.meta.name.id();
             Ownership::of(Some(itself), Some(itself))
         } else {
-            Ownership::of(previous.spec.assigned_node(), previous.status.owner_node())
+            Ownership::of(previous.spec.assigned_owner(), previous.status.owner())
         };
         judge(writer, changed, held)?;
 
