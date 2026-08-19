@@ -260,11 +260,36 @@ impl Datapath for TapDatapath {
         // report itself in force and pass everything — the one failure a
         // multi-tenant platform must not have. Same for a ceiling: an unenforced
         // rate limit is how one guest takes a node's network with it.
+        //
+        // **The pattern has no `..`, deliberately.** Every field of a port must
+        // be accounted for here, and adding one is a compile error until
+        // somebody says whether this datapath can enforce it. Without that, a
+        // new enforceable field is silently *accepted* by the datapath that
+        // enforces the least — which reads as working and is the worst possible
+        // reading. That is exactly how `rate_limit_mbit` reached the fabric
+        // datapath and was dropped, one layer over.
+        let PortSpec {
+            // What the guest is on and where its address came from: this
+            // datapath gives it a wire, and both are already decided above it.
+            network: _,
+            subnet: _,
+            // Which node holds it — that is why *this* agent is the one here.
+            node: _,
+            // Given to the guest by the VMM and the DHCP responder, not by any
+            // filtering this datapath would have to do.
+            address: _,
+            mac: _,
+            // Arrive already resolved as `rules`; the names alone say nothing
+            // about whether anything is being asked for.
+            security_groups: _,
+            rate_limit_mbit,
+        } = spec;
+
         let mut unenforceable = Vec::new();
         if !rules.is_empty() {
             unenforceable.push(format!("{} security-group rule(s)", rules.len()));
         }
-        if let Some(mbit) = spec.rate_limit_mbit {
+        if let Some(mbit) = rate_limit_mbit {
             unenforceable.push(format!("a {mbit} Mbit ceiling"));
         }
         if !unenforceable.is_empty() {

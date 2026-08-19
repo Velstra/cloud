@@ -308,6 +308,14 @@ impl Reconciler for FloatingIpController {
             FinalizerStep::Wait => {}
         }
 
+        // No `..`: every field of a floating IP is acted on below, and a new one
+        // is a compile error here until somebody says how.
+        let FloatingIpSpec {
+            subnet: _,  // where the address comes from — used by `address`
+            address: _, // the address itself — allocated on the fabric below
+            port: _,    // what it reaches — associated or detached below
+        } = &fip.spec;
+
         // The address first, and always: a cell with no fabric still decides it,
         // so an operator sees what they will get before any data plane exists.
         if self.address(fip).await? {

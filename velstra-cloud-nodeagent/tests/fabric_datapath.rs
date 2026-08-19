@@ -59,6 +59,9 @@ fn may_make_a_tap() -> bool {
 struct Fabric {
     child: Child,
     admin: String,
+    /// The agent-facing channel. A node's *config* is served here, and that is
+    /// where a host declaration has to end up to have meant anything.
+    control: String,
 }
 
 impl Drop for Fabric {
@@ -107,6 +110,7 @@ impl Fabric {
         let me = Self {
             child,
             admin: format!("http://127.0.0.1:{admin}"),
+            control: format!("http://127.0.0.1:{listen}"),
         };
         // Waited for by asking it something, not by sleeping: a fixture that
         // sleeps is a fixture that is flaky on a busy machine.
@@ -127,6 +131,15 @@ impl Fabric {
     > {
         pb::velstra_orchestrator_client::VelstraOrchestratorClient::connect(self.admin.clone())
             .await
+    }
+
+    async fn control(
+        &self,
+    ) -> Result<
+        pb::velstra_control_client::VelstraControlClient<tonic::transport::Channel>,
+        tonic::transport::Error,
+    > {
+        pb::velstra_control_client::VelstraControlClient::connect(self.control.clone()).await
     }
 }
 
@@ -173,6 +186,7 @@ async fn a_port_with_rules_reaches_the_fabric() {
         vtep: "127.0.0.1".into(),
         iface: "lo".into(),
         mac: "02:00:00:00:00:01".into(),
+        mtu: 1450,
     };
     let datapath = FabricDatapath::new(
         TapDatapath::new("vt", None),
@@ -181,9 +195,15 @@ async fn a_port_with_rules_reaches_the_fabric() {
         underlay,
     );
 
+    // Built field by field, with **no** `..Default::default()`. A fixture that
+    // leaves a field at its default cannot tell "it travelled" from "nothing was
+    // there to travel", and every assertion about that field then passes for the
+    // wrong reason. The destructuring below is the other half: adding a field to
+    // `PortSpec` is a compile error here until somebody says where it goes.
     let spec = PortSpec {
         network: "projects/p1/networks/n1".into(),
         subnet: "projects/p1/subnets/s1".into(),
+        node: Some("node-a".into()),
         address: Some("10.20.0.7".into()),
         mac: Some("02:ab:cd:ef:00:07".into()),
         security_groups: vec!["projects/p1/security-groups/web".into()],
@@ -191,8 +211,39 @@ async fn a_port_with_rules_reaches_the_fabric() {
         // dropped there — the tap datapath refuses a ceiling it cannot enforce
         // and says so, and this one, which can, silently ignored it.
         rate_limit_mbit: Some(250),
-        ..PortSpec::default()
     };
+    {
+        // Where each field goes. Not a check that runs — a decision that cannot
+        // be skipped, because the pattern has no `..` and the compiler will not
+        // let a new field past it unnamed.
+        //
+        // This is the guard that was missing when `rate_limit_mbit` was carried
+        // all the way here and dropped: everything else about the port arrived,
+        // so nothing looked wrong.
+        let PortSpec {
+            network,
+            subnet,
+            node,
+            address,
+            mac,
+            security_groups,
+            rate_limit_mbit,
+        } = &spec;
+        // Deliberately **not** sent: the fabric is told the VNI, and a resource
+        // name means nothing to it.
+        let _ = network;
+        // Deliberately not sent: the subnet is how *this* side decided the
+        // address; the fabric is told the address itself.
+        let _ = subnet;
+        // Deliberately not sent: which node holds the port is what makes this
+        // agent the one programming it, not something the request carries — the
+        // host it declares is its own.
+        let _ = node;
+        // Sent, and asserted above, every one of them.
+        assert!(address.is_some() && mac.is_some());
+        assert!(!security_groups.is_empty());
+        assert!(rate_limit_mbit.is_some());
+    }
     let network = NetworkSpec {
         vni: VNI,
         mtu: 1450,
@@ -236,6 +287,28 @@ async fn a_port_with_rules_reaches_the_fabric() {
         mine.rate_limit_mbit,
         Some(250),
         "the send ceiling never reached the fabric, so one guest can take the node's network"
+    );
+
+    // The underlay MTU, read back where it actually matters: the config this
+    // node is served. The fabric derives the overlay MTU and the MSS clamp from
+    // it and reads an absent one as 1500 — so a node on a 1450-byte underlay
+    // (every guest-in-a-guest cloud) was clamping to a size its own path cannot
+    // carry, and the symptom is large transfers that hang on some paths rather
+    // than a network that is visibly broken.
+    let config = fabric
+        .control()
+        .await
+        .expect("the agent-facing channel")
+        .get_config(pb::NodeRequest {
+            node_id: "node-a".into(),
+        })
+        .await
+        .expect("asking for this node's config")
+        .into_inner();
+    assert_eq!(
+        config.overlay.as_ref().map(|o| o.underlay_mtu),
+        Some(1450),
+        "this node's real underlay MTU never reached the config it is served"
     );
 
     let groups = client
@@ -306,6 +379,7 @@ async fn a_rule_the_fabric_cannot_key_leaves_no_port_behind() {
             vtep: "127.0.0.1".into(),
             iface: "lo".into(),
             mac: "02:00:00:00:00:01".into(),
+            mtu: 1450,
         },
     );
     let unsayable = ResolvedRule {
@@ -431,6 +505,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
             vtep: "127.0.0.1".into(),
             iface: "lo".into(),
             mac: "02:00:00:00:00:01".into(),
+            mtu: 1450,
         },
     );
     datapath

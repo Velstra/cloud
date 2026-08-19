@@ -337,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let underlay = Underlay::read(vtep, iface)?;
             tracing::info!(
                 vtep = %underlay.vtep, iface = %underlay.iface, mac = %underlay.mac,
+                mtu = underlay.mtu,
                 "declaring this host to the fabric"
             );
             Arc::new(FabricDatapath::new(

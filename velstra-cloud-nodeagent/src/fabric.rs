@@ -88,13 +88,40 @@ pub struct Underlay {
     /// is a fact about the interface, and asking an operator to repeat it is
     /// asking them to get it wrong.
     pub mac: String,
+    /// Its MTU, read the same way and for the same reason.
+    ///
+    /// It matters more than it looks. The fabric derives the overlay MTU and
+    /// the MSS clamp from this, and it reads an absent one as 1500 — so a node
+    /// on a 1450-byte underlay (which is every guest-in-a-guest cloud) was
+    /// clamping to a size its own path cannot carry. The symptom is not a
+    /// broken network: it is large transfers that hang on some paths, because
+    /// PMTUD's ICMP is filtered almost everywhere, which is the whole reason
+    /// the clamp exists.
+    pub mtu: u32,
 }
 
 impl Underlay {
-    /// Read the interface's MAC, so only the address and the name are stated.
+    /// Read the interface's MAC and MTU, so only the address and the name are
+    /// stated.
     pub fn read(vtep: &str, iface: &str) -> Result<Self> {
-        let path = format!("/sys/class/net/{iface}/address");
-        let mac = std::fs::read_to_string(&path)
+        let mac = Self::sysfs(iface, "address")?;
+        // Refused rather than guessed. Falling back to 1500 here would be this
+        // agent *asserting* an MTU it did not read, and the assertion travels:
+        // the fabric clamps to it and the guests live with the result.
+        let mtu = Self::sysfs(iface, "mtu")?.parse::<u32>().map_err(|e| {
+            HostError::failed(format!("{iface} reports an MTU that is not a number: {e}"))
+        })?;
+        Ok(Self {
+            vtep: vtep.to_string(),
+            iface: iface.to_string(),
+            mac,
+            mtu,
+        })
+    }
+
+    fn sysfs(iface: &str, what: &str) -> Result<String> {
+        let path = format!("/sys/class/net/{iface}/{what}");
+        Ok(std::fs::read_to_string(&path)
             .map_err(|e| {
                 HostError::failed(format!(
                     "{iface} is meant to carry this host's overlay traffic and {path} cannot be \
@@ -102,12 +129,7 @@ impl Underlay {
                 ))
             })?
             .trim()
-            .to_string();
-        Ok(Self {
-            vtep: vtep.to_string(),
-            iface: iface.to_string(),
-            mac,
-        })
+            .to_string())
     }
 }
 
@@ -167,7 +189,9 @@ impl FabricDatapath {
                 // would be a per-host disagreement nobody asked for.
                 encap: 0,
                 udp_port: 0,
-                underlay_mtu: 0,
+                // Read from the interface, not left at the wire's 0 — which
+                // fabric reads as 1500 whatever the interface actually is.
+                underlay_mtu: self.underlay.mtu,
             })
             .await
             .map_err(|e| HostError::failed(format!("declaring this host to the fabric: {e}")))?;
