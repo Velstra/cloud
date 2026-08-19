@@ -210,23 +210,66 @@ pub async fn run<R: Reconciler>(
     raw: Arc<dyn Store>,
     config: LoopConfig,
     metrics: Metrics,
+    shutdown: watch::Receiver<bool>,
+) {
+    // A process with no election in front of it leads unconditionally, which is
+    // what a single-process deployment and every test that drives `run` directly
+    // want. See `run_when_leading`.
+    let (_always, leader) = watch::channel(true);
+    run_when_leading(reconciler, store, raw, config, metrics, shutdown, leader).await
+}
+
+/// [`run`], but acting only while `leader` says this process holds the lease.
+///
+/// Leadership gates the whole loop rather than the write at the end of it, and
+/// that is deliberate: a follower that kept watching and queueing would hold a
+/// watch per controller against the store for no reason, and would come out of a
+/// handover with a queue built from a world it had not been acting on. Standing
+/// down drops the watch and the queue; taking over establishes both from
+/// scratch, along the same path a fresh start takes — so the handover path is
+/// the startup path, exercised on every run rather than only during an incident.
+pub async fn run_when_leading<R: Reconciler>(
+    reconciler: Arc<R>,
+    store: TypedStore<R::Spec, R::Status>,
+    raw: Arc<dyn Store>,
+    config: LoopConfig,
+    metrics: Metrics,
     mut shutdown: watch::Receiver<bool>,
+    mut leader: watch::Receiver<bool>,
 ) {
     let controller = reconciler.name();
     // Depth one, on purpose. A pending sweep already covers everything a second
     // request would, so coalescing is the correct behaviour and not a
     // concession — see `Fanout::All`.
     let (sweep_now, mut sweep_requested) = mpsc::channel::<()>(1);
-    let queue = Arc::new(WorkQueue::new(
-        config.rate,
-        config.backoff_base,
-        config.backoff_ceiling,
-    ));
 
     'establish: loop {
         if *shutdown.borrow() {
             break;
         }
+        // Nothing is read, watched or queued while another process leads.
+        while !*leader.borrow() {
+            if *shutdown.borrow() {
+                break 'establish;
+            }
+            tokio::select! {
+                _ = leader.changed() => {}
+                _ = shutdown.changed() => {}
+            }
+        }
+
+        // One queue per establishment, not one per process. It holds names
+        // decided under a particular lease and a particular watch; carrying it
+        // across a stand-down would mean coming back and reconciling a list
+        // assembled while another process was the one acting. A dropped watch
+        // re-establishes the same way, so this is the existing rule — the queue
+        // belongs to the stream that filled it — rather than a new one for
+        // leases.
+        let queue = Arc::new(WorkQueue::new(
+            config.rate,
+            config.backoff_base,
+            config.backoff_ceiling,
+        ));
 
         // Read the revision first, then watch from it, then list. See the note
         // at the top of the file: the only tolerable direction to be wrong in
@@ -273,6 +316,20 @@ pub async fn run<R: Reconciler>(
                         queue.close();
                         info!(controller, "stopped");
                         return;
+                    }
+                }
+                // Leadership lost mid-flight. Everything established under the
+                // old lease is dropped rather than carried across: the queue
+                // holds names decided under an assumption that no longer holds,
+                // and the watch is a stream this process has no business
+                // reading. Not `queue.close()` — closing is permanent and this
+                // loop is coming back; the queue goes out of scope with the
+                // iteration, which is the whole of what dropping it means here.
+                _ = leader.changed() => {
+                    if !*leader.borrow() {
+                        related.abort_all();
+                        info!(controller, "stood down; another process leads");
+                        continue 'establish;
                     }
                 }
                 _ = resync.tick() => {

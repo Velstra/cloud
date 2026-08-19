@@ -25,6 +25,7 @@ pub mod address;
 pub mod attachment;
 pub mod backoff;
 pub mod drift;
+pub mod election;
 pub mod instance;
 pub mod metrics;
 pub mod migration;
@@ -39,7 +40,7 @@ pub mod status;
 pub mod volume;
 
 pub use metrics::Metrics;
-pub use runner::{LoopConfig, Reconciler, Related, run, sweep};
+pub use runner::{LoopConfig, Reconciler, Related, run, run_when_leading, sweep};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
