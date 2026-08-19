@@ -220,6 +220,7 @@ async fn settled_cell() -> Cell {
                 volume_gib: 1000,
             },
             bindings: Vec::new(),
+            cell: String::new(),
         },
         ProjectStatus {
             observed_generation: 1,

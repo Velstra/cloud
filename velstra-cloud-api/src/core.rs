@@ -673,6 +673,7 @@ impl Api {
         if kind == "volumes" {
             self.settle_volume_source(&mut spec).await?;
         }
+        self.check_cell(&name, kind).await?;
         self.check_quota(&name, kind, &spec).await?;
 
         let mut meta = Meta::new(name.clone(), self.inner.placement.clone());
@@ -1865,6 +1866,58 @@ impl Api {
     /// because a project created without a quota is one nobody has decided
     /// about yet, and the alternative is an API that refuses everything until
     /// somebody notices.
+    /// Refuse to create a resource in a cell that does not own its project.
+    ///
+    /// A project records where its resources live (`ProjectSpec.cell`), and that
+    /// is what a router resolves. This is the check behind the router: without
+    /// it, a request that reached the wrong cell — a stale directory, a client
+    /// with a hardcoded endpoint, a router that has not learned a new project
+    /// yet — would be answered rather than redirected, and the project's
+    /// resources would end up scattered across cells with nothing recording
+    /// that they are.
+    ///
+    /// The refusal **names the cell that should have answered**. That is the
+    /// difference between an error a client can act on and one that only says
+    /// no: a router follows it, and a person reading it knows where to look.
+    ///
+    /// A project with no recorded home is answered here, which is what makes a
+    /// single-cell installation need no configuration at all and what keeps a
+    /// project created a moment ago from being refused while the record
+    /// propagates. Only a project that has *said* it lives elsewhere is refused.
+    async fn check_cell(&self, name: &ResourceName, kind: &str) -> ApiResult<()> {
+        // Global collections are not routed: every cell holds every project.
+        if velstra_cloud_model::routing::is_global_collection(kind) {
+            return Ok(());
+        }
+        let Some(project) = velstra_cloud_model::routing::project_of(name) else {
+            // A cell's own hardware. It never moves, so the cell being asked is
+            // the cell that owns it.
+            return Ok(());
+        };
+        let project_name = ResourceName::parse(&format!("projects/{project}"))?;
+        let Ok(project) = self
+            .typed::<ProjectSpec, ProjectStatus>(&project_name)
+            .await
+        else {
+            // No such project here. Refusing on that basis would be this check
+            // deciding a question that belongs to the create itself, which
+            // reports a missing parent in its own words.
+            return Ok(());
+        };
+        let home = &project.spec.cell;
+        if home.is_empty() || home == &self.inner.placement.cell {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            format!(
+                "{} lives in cell {home}, and this is cell {}; send this request there",
+                project_name, self.inner.placement.cell
+            ),
+        )
+        .at("meta.name"))
+    }
+
     async fn check_quota(&self, name: &ResourceName, kind: &str, spec: &Value) -> ApiResult<()> {
         if kind != "instances" && kind != "volumes" {
             return Ok(());

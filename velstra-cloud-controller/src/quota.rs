@@ -145,6 +145,7 @@ mod tests {
                     parent: "organizations/o1".into(),
                     quota: limit,
                     bindings: Vec::new(),
+                    cell: String::new(),
                 },
                 ProjectStatus::default(),
             ))

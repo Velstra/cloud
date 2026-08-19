@@ -197,6 +197,7 @@ impl From<&resources::ProjectSpec> for v1::ProjectSpec {
             display_name: s.display_name.clone(),
             parent: s.parent.clone(),
             quota: Some((&s.quota).into()),
+            cell: s.cell.clone(),
         }
     }
 }
@@ -207,6 +208,7 @@ impl From<&v1::ProjectSpec> for resources::ProjectSpec {
             display_name: s.display_name.clone(),
             parent: s.parent.clone(),
             quota: s.quota.as_ref().map(Into::into).unwrap_or_default(),
+            cell: s.cell.clone(),
             // The protobuf surface does not describe bindings yet, so a project
             // that arrives over gRPC carries none. Empty is the safe direction:
             // it grants nothing rather than inventing a grant nobody asked for.
