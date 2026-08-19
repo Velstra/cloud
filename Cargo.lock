@@ -2066,6 +2066,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "velstra-cloud-fabric",
  "velstra-cloud-model",
  "velstra-cloud-store",
 ]
@@ -2085,6 +2086,16 @@ dependencies = [
  "velstra-cloud-model",
  "velstra-cloud-nodeagent",
  "velstra-cloud-store",
+]
+
+[[package]]
+name = "velstra-cloud-fabric"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "sha2",
+ "tonic 0.12.3",
+ "tonic-build 0.12.3",
 ]
 
 [[package]]
@@ -2116,9 +2127,9 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tonic 0.12.3",
- "tonic-build 0.12.3",
  "tracing",
  "tracing-subscriber",
+ "velstra-cloud-fabric",
  "velstra-cloud-model",
  "velstra-cloud-store",
  "velstra-cloud-wire",

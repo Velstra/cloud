@@ -5,6 +5,7 @@ members = [
     "velstra-cloud-console",
     "velstra-cloud-controller",
     "velstra-cloud-e2e",
+    "velstra-cloud-fabric",
     "velstra-cloud-model",
     "velstra-cloud-nodeagent",
     "velstra-cloud-proto",
@@ -22,6 +23,7 @@ repository = "https://github.com/Velstra/cloud"
 homepage = "https://github.com/Velstra/cloud"
 
 [workspace.dependencies]
+velstra-cloud-fabric = { path = "velstra-cloud-fabric" }
 velstra-cloud-model = { path = "velstra-cloud-model" }
 velstra-cloud-proto = { path = "velstra-cloud-proto" }
 velstra-cloud-store = { path = "velstra-cloud-store" }

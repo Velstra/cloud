@@ -12,6 +12,7 @@ name = "velstra-cloud-controller"
 path = "src/bin/velstra-cloud-controller.rs"
 
 [dependencies]
+velstra-cloud-fabric = { workspace = true }
 velstra-cloud-model = { workspace = true }
 velstra-cloud-store = { workspace = true }
 axum = { workspace = true }

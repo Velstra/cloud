@@ -48,6 +48,12 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+/// The fabric's contract, from the one crate that owns it.
+///
+/// Re-exported rather than generated here: a controller mirrors networks to the
+/// same fabric, and two vendored copies of one schema drift in ways that show
+/// up as a field quietly meaning something different on one side.
+pub use velstra_cloud_fabric::pb;
 use velstra_cloud_model::{
     resources::{NetworkSpec, PortSpec},
     security::{Direction, Protocol, ResolvedRule},
@@ -57,16 +63,6 @@ use crate::{
     datapath::TapDatapath,
     host::{Datapath, HostError, ProgrammedPort, Result},
 };
-
-/// The generated client for fabric's orchestrator.
-///
-/// Lints are relaxed for generated code only: it is not this repository's to
-/// write, and pinning its style would mean editing it by hand every time the
-/// contract moves — which is exactly what the vendored copy exists to avoid.
-#[allow(clippy::result_large_err, clippy::doc_overindented_list_items)]
-pub mod pb {
-    tonic::include_proto!("velstra.v1");
-}
 
 /// The widest port range this will expand into individual rules.
 ///
@@ -183,7 +179,7 @@ impl FabricDatapath {
         &self,
     ) -> Result<pb::velstra_orchestrator_client::VelstraOrchestratorClient<tonic::transport::Channel>>
     {
-        pb::velstra_orchestrator_client::VelstraOrchestratorClient::connect(self.endpoint.clone())
+        velstra_cloud_fabric::connect(&self.endpoint)
             .await
             .map_err(|e| {
                 HostError::failed(format!("reaching the fabric at {}: {e}", self.endpoint))
