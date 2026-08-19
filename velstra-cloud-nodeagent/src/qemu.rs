@@ -314,8 +314,8 @@ impl Vmm for QemuVmm {
         Ok(host)
     }
 
-    async fn pull_image(&self, image: &str) -> Result<()> {
-        hostfs::publish_image(&self.layout, image).await
+    async fn pull_image(&self, image: &str, source: &str) -> Result<()> {
+        hostfs::fetch_image(&self.layout, image, source).await
     }
 
     async fn create_disk(&self, instance: &str, gib: u64, image: &str) -> Result<()> {

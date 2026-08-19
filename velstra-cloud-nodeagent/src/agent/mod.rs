@@ -44,8 +44,9 @@ use velstra_cloud_model::{
     migration::{MigrationSpec, MigrationStatus},
     reconcile::{Action, instance_condition, reconcile_attachment, reconcile_instance},
     resources::{
-        Attachment, AttachmentSpec, AttachmentStatus, Instance, InstanceSpec, InstanceStatus,
-        NODE_RELEASE_FINALIZER, NetworkSpec, NodeSpec, NodeStatus, Port, PortSpec, PortStatus,
+        Attachment, AttachmentSpec, AttachmentStatus, ImageSpec, Instance, InstanceSpec,
+        InstanceStatus, NODE_RELEASE_FINALIZER, NetworkSpec, NodeSpec, NodeStatus, Port, PortSpec,
+        PortStatus,
     },
     security::{ResolvedRule, SecurityGroupSpec, effective_rules},
 };
@@ -151,6 +152,13 @@ pub(super) struct CellView<'a> {
     /// port would be the same answer fetched many times. It also replaces a
     /// second read this pass used to make when it described guests.
     pub networks: &'a BTreeMap<String, NetworkSpec>,
+    /// The registered images, by name — where an image's bytes come from.
+    ///
+    /// Read once per pass and handed down like the networks above. A node can
+    /// verify an image from the digest in its name but cannot invent its
+    /// source, so without this the agent could refuse a bad image and never
+    /// obtain a good one.
+    pub images: &'a BTreeMap<String, ImageSpec>,
 }
 
 pub struct Agent {
@@ -336,10 +344,25 @@ impl Agent {
             }
         };
 
+        let images = match self.cell.images().await {
+            Ok(list) => list
+                .into_iter()
+                .map(|i| (i.meta.name.to_string(), i.spec))
+                .collect::<BTreeMap<_, _>>(),
+            Err(e) => {
+                // An image that cannot be looked up is an image that cannot be
+                // fetched; the pull below says so on the object rather than
+                // downloading from a guess.
+                tracing::warn!(error = %e, "could not list images");
+                BTreeMap::new()
+            }
+        };
+
         let cell = CellView {
             ports: &ports,
             groups: &groups,
             networks: &networks,
+            images: &images,
         };
 
         let migrations = match self.cell.migrations().await {
@@ -725,7 +748,20 @@ impl Agent {
     ) -> Result<(), String> {
         let (ports, groups, networks) = (cell.ports, cell.groups, cell.networks);
         let result = match action {
-            Action::PullImage { digest } => self.vmm.pull_image(digest).await.map(|_| ()),
+            // Resolved from the cell, exactly as ProgramPort resolves its port:
+            // the decision names what must be present, the agent looks up what
+            // it needs to make that true.
+            Action::PullImage { digest } => match cell.images.get(digest) {
+                Some(image) => self
+                    .vmm
+                    .pull_image(digest, &image.source_url)
+                    .await
+                    .map(|_| ()),
+                None => Err(crate::host::HostError::failed(format!(
+                    "{digest} is not a registered image in this cell, so this \
+                     node has nowhere to fetch it from"
+                ))),
+            },
             Action::CreateDisk {
                 instance,
                 gib,

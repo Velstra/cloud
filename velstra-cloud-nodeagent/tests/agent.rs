@@ -754,3 +754,52 @@ async fn a_teardown_that_half_happened_is_asked_for_again() {
         stored.status.conditions
     );
 }
+
+/// A node fetches an image from the source the operator registered.
+///
+/// The gap this closes: `ImageSpec.source_url` was carried through the wire,
+/// rendered in the console, set in every fixture — and read by nothing. A node
+/// could *verify* an image (the sha256 is in its own name) and had no way to
+/// *obtain* one, because the reconcile action carried only the digest. A fresh
+/// cell could register an image, create an instance from it, and the guest
+/// would never boot until somebody copied the file onto the node by hand.
+///
+/// The half that matters is the second assertion: the node must be handed the
+/// *registered* source. Pulling from the wrong place and pulling from nowhere
+/// look identical from outside.
+#[tokio::test]
+async fn a_node_is_told_where_to_fetch_an_image_from() {
+    let (_store, vmm, _datapath, agent) = one_instance_on("node-a").await;
+    agent.resync().await;
+
+    assert_eq!(
+        vmm.pulled_from(IMAGE).as_deref(),
+        Some("file:///var/lib/velstra/images/abc.raw"),
+        "the node was not handed the registered image's source"
+    );
+}
+
+/// An instance naming an image nothing registered says so on its own object,
+/// rather than failing further down where the reason is gone.
+#[tokio::test]
+async fn an_unregistered_image_is_named_on_the_object() {
+    let (store, vmm, _datapath, agent) = one_instance_on("node-a").await;
+    edit_instance(&store, I1, |spec| {
+        spec.image = "projects/p1/images/sha256-nothingregistered".into()
+    })
+    .await;
+
+    agent.resync().await;
+
+    assert!(
+        vmm.pulled_from("projects/p1/images/sha256-nothingregistered")
+            .is_none(),
+        "the node pulled an image that is not registered anywhere"
+    );
+    let after = read_instance(&store, I1).await;
+    let said = format!("{:?}", after.status.conditions);
+    assert!(
+        said.contains("not a registered image"),
+        "the object does not say why it cannot boot: {said}"
+    );
+}

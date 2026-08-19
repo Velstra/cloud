@@ -577,8 +577,24 @@ impl Agent {
         }
 
         if !host.images.contains(&instance.spec.image) {
+            // The destination fetches from the registered source, the same way
+            // an ordinary pass does. A guest cannot arrive onto a node that
+            // cannot obtain its image, and finding that out here — before a
+            // receiver is opened — is what keeps a half-prepared destination
+            // from waiting for a transfer that will never be usable.
+            let source = cell
+                .images
+                .get(&instance.spec.image)
+                .map(|i| i.source_url.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "{} is not a registered image in this cell, so this node \
+                         has nowhere to fetch it from",
+                        instance.spec.image
+                    )
+                })?;
             self.vmm
-                .pull_image(&instance.spec.image)
+                .pull_image(&instance.spec.image, &source)
                 .await
                 .map_err(|e| e.to_string())?;
         }

@@ -160,7 +160,14 @@ pub trait Vmm: Send + Sync + 'static {
 
     /// Fetch and verify an image. Must be idempotent: an image already present
     /// and verified is a success, not an error.
-    async fn pull_image(&self, digest: &str) -> Result<()>;
+    ///
+    /// `source` is where the bytes come from — the registered image's
+    /// `spec.source_url`. It is a parameter rather than something this node
+    /// derives because a node has no way to invent it: the digest in the name
+    /// says what the bytes must hash to, and says nothing about where they are.
+    /// Passing only the digest is what left this agent able to *verify* an image
+    /// and unable to *obtain* one.
+    async fn pull_image(&self, image: &str, source: &str) -> Result<()>;
 
     /// Make the guest's root disk: a copy of `image`, grown to `gib`.
     ///
