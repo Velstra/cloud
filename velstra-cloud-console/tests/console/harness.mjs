@@ -193,6 +193,16 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
 
   return {
     evaluate, thrown, requests,
+    /// Pretend the viewer has a preference set. The three the console honours —
+    /// reduced motion, reduced transparency, more contrast — have no other way
+    /// to be checked: they are media queries, so nothing about the page reveals
+    /// whether the rules behind them actually resolve until a browser is told
+    /// the preference is on.
+    async emulate(features) {
+      await send("Emulation.setEmulatedMedia", {
+        features: Object.entries(features).map(([name, value]) => ({ name, value })),
+      });
+    },
     async goto(url) { await send("Page.navigate", { url }); await sleep(900); },
     async screenshot() { return (await send("Page.captureScreenshot", { format: "png" })).result.data; },
     close() { process.removeListener("exit", onExit); shutDown(); },

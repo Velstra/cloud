@@ -44,7 +44,7 @@ use velstra_cloud_model::{
         DestinationAction, Migration, MigrationMode, SourceAction, reconcile_destination,
         reconcile_source,
     },
-    resources::{Instance, InstanceState, Port},
+    resources::{Instance, InstanceState},
 };
 
 use super::{Agent, Ownership, Pass, status::host_condition};
@@ -91,6 +91,44 @@ impl Agent {
     /// here; one that ran after without knowing about the migration would see
     /// a missing guest and start it again — a second copy of a guest that is
     /// now running somewhere else.
+    /// Leave alone every instance a transfer is bringing *here*.
+    ///
+    /// The mirror of [`Moving::stalled`] on the receiving side, and it was
+    /// missing. Once the source has let go, the destination claims the instance
+    /// — and the instance pass then sees a guest that should be running and is
+    /// not, and starts one. On one machine that collides with the outgoing VMM's
+    /// unit name and fails loudly, which is how this was found; on two machines
+    /// it is a **second copy of a live guest writing the same disk**, which is
+    /// the worst thing this platform could do.
+    ///
+    /// The guard lifts by itself in both directions: once the guest is here,
+    /// `host.vms` has it and nothing is stalled; once the migration is
+    /// abandoned, it is deleting and no longer holds anything back.
+    pub(super) fn freeze_arrivals(
+        &self,
+        migrations: &[Migration],
+        host: &HostState,
+        moving: &mut Moving,
+    ) {
+        for migration in migrations {
+            if migration.spec.to_node != self.config.node || migration.meta.is_deleting() {
+                continue;
+            }
+            let name = migration.spec.instance.clone();
+            if host.vms.contains_key(&name) {
+                // It has arrived. This node runs it like any other guest.
+                continue;
+            }
+            moving.trouble.insert(
+                name.clone(),
+                "a transfer is bringing this guest to this node; it will not be started here \
+                 until that transfer lands or the migration is abandoned"
+                    .to_string(),
+            );
+            moving.stalled.insert(name);
+        }
+    }
+
     pub(super) async fn source_pass(
         &self,
         migrations: &[Migration],
@@ -106,6 +144,40 @@ impl Agent {
             }
             let name = migration.spec.instance.clone();
             let here = host.vms.contains_key(&name);
+            let running_here = host
+                .vms
+                .get(&name)
+                .map(|vm| vm.state == InstanceState::Running)
+                .unwrap_or(false);
+
+            // A guest this node reported as running, that is now not running
+            // here, is one this node may not start again while a transfer of it
+            // is open — **including when it is still here but stopped**, which
+            // is exactly what a handed-over guest looks like on the source:
+            // Cloud Hypervisor leaves the VMM up with the machine shut down.
+            // Read as "wanted Running, reports Stopped", the instance pass
+            // starts a fresh guest from the same disk that is by then running on
+            // the destination.
+            //
+            // **While a transfer of this guest is open, this node does not start
+            // it.** Not when the guest is gone, and not when it is still here but
+            // stopped — which is what a handed-over guest looks like on the
+            // source, and what a VMM that exited leaves behind.
+            //
+            // The invariant that makes this safe rather than merely cautious is
+            // `may_migrate`: a migration only exists for an instance that was
+            // *running*. So an open migration from this node is proof the guest
+            // ran here, and anything other than "running here now" means it has
+            // either left or died — and starting it in either case risks a second
+            // copy of a guest that is by then on the destination.
+            //
+            // Every narrower version of this was tried and each failed on a real
+            // hypervisor: keyed on the store's reported state, the source's own
+            // honest "Stopped" erased the signal; keyed on the VMM still being
+            // present, a VMM that exited after the send slipped through.
+            if !migration.meta.is_deleting() && !running_here {
+                moving.stalled.insert(name.clone());
+            }
 
             for action in reconcile_source(migration, here) {
                 match self.perform_source(&action, migration, host).await {
@@ -124,8 +196,18 @@ impl Agent {
             // Read the machine again: a send that landed took the guest with
             // it, and the whole handover hangs on noticing that in this pass
             // rather than the next one.
+            // "Still here" means **still running here**, not "there is still a
+            // VMM". Cloud Hypervisor's source VMM does not exit when a transfer
+            // completes: it stays up holding a stopped machine. Read as presence,
+            // the source never noticed the handover, never reported letting go,
+            // and so `spec.node` never moved and no migration could finish — even
+            // with the guest already running on the destination.
             let still_here = match self.vmm.observe().await {
-                Ok(fresh) => fresh.vms.contains_key(&name),
+                Ok(fresh) => fresh
+                    .vms
+                    .get(&name)
+                    .map(|vm| vm.state == InstanceState::Running)
+                    .unwrap_or(false),
                 Err(e) => {
                     tracing::error!(error = %e, "could not re-read this machine after sending");
                     pass.failures += 1;
@@ -142,10 +224,6 @@ impl Agent {
             // has been handed over and one that was never started here.
             let stored = self.instances.get(&name).await.ok().flatten();
             let owner = stored.as_ref().and_then(|i| i.status.node.clone());
-            let was_running_here = stored
-                .as_ref()
-                .map(|i| i.status.state == InstanceState::Running)
-                .unwrap_or(false);
 
             match owner.as_deref() {
                 // This node has already let go. There is nothing left to say —
@@ -157,14 +235,32 @@ impl Agent {
                     moving.released.insert(name);
                     continue;
                 }
-                Some(node) if node == self.config.node && was_running_here => {}
+                // Still ours, and the guest is not running here. That is all this
+                // node needs, and reading the *reported state* as well was what
+                // stopped it: the pass that notices the guest is gone also reports
+                // it, and the next pass then read its own honest report as "it was
+                // never running here" and let go of nothing, for ever.
+                //
+                // `may_migrate` is what makes ownership enough — a migration only
+                // exists for an instance that was running — so an open migration
+                // plus "ours" plus "not running here" is a guest that has left or
+                // died, and both want the same thing from this node: let go, and
+                // do not start it again.
+                Some(node) if node == self.config.node => {}
                 // It was not running here in the first place, so nothing can
                 // have been handed over. An ordinary missing guest, and the
                 // instance pass deals with it exactly as it always does.
                 _ => continue,
             }
 
-            if migration.status.receiver_ready {
+            // Not gated on `receiver_ready`. It reads as "is the far end ready to
+            // receive", and a transfer that has *completed* turns it back off —
+            // the receiver is not listening any more, it is running the guest. So
+            // the fast case, where the guest has arrived before anybody looked,
+            // is precisely the case the gate refused, and the handover could
+            // never finish. What is left is the ambiguity the comment below
+            // already names, and it is narrowed the same way.
+            {
                 // Gone from here while something was listening for it there.
                 // That is what a completed transfer looks like from this side,
                 // and it is the whole of what "done" means to a source: there
@@ -178,17 +274,6 @@ impl Agent {
                 // refuses a migration of anything that is not already running,
                 // so this cannot be a guest that never started.
                 moving.released.insert(name);
-            } else {
-                // Nothing was listening, so nothing can have arrived — but this
-                // node still will not start it, because a migration is open and
-                // being wrong about that is a second copy of a live guest.
-                moving.trouble.insert(
-                    name.clone(),
-                    "this guest is not on this node while a migration of it is open; it will \
-                     not be started here until that migration is resolved"
-                        .to_string(),
-                );
-                moving.stalled.insert(name);
             }
         }
         moving
@@ -299,7 +384,7 @@ impl Agent {
         &self,
         migrations: &[Migration],
         taps: &BTreeMap<String, String>,
-        ports: &BTreeMap<String, Port>,
+        cell: &super::CellView<'_>,
         seen: &HostState,
         pass: &mut Pass,
     ) {
@@ -390,13 +475,17 @@ impl Agent {
                 migration,
                 instance.as_ref(),
                 host.receivers.contains_key(&name),
+                // Read from this machine. See `reconcile_destination`: the
+                // instance's `status.node` is this node's own claim, not an
+                // answer to "is the guest here".
+                host.vms.contains_key(&name),
             );
 
             let mut outcome = Ok(());
             for action in actions {
                 let result = match action {
                     DestinationAction::PrepareReceiver { instance: _, mode } => {
-                        self.prepare_to_receive(&name, instance.as_ref(), mode, &host, taps, ports)
+                        self.prepare_to_receive(&name, instance.as_ref(), mode, &host, taps, cell)
                             .await
                     }
                     DestinationAction::TearDownReceiver { instance } => self
@@ -471,8 +560,9 @@ impl Agent {
         mode: MigrationMode,
         host: &HostState,
         taps: &BTreeMap<String, String>,
-        ports: &BTreeMap<String, Port>,
+        cell: &super::CellView<'_>,
     ) -> Result<bool, String> {
+        let (ports, groups) = (cell.ports, cell.groups);
         let Some(instance) = instance else {
             // Not an error on the machine — a thing to wait for, said out loud
             // so nobody has to guess which half is late.
@@ -494,7 +584,7 @@ impl Agent {
         }
         if !host.disks.contains(name) {
             self.vmm
-                .create_disk(name, instance.spec.root_disk_gib)
+                .create_disk(name, instance.spec.root_disk_gib, &instance.spec.image)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -507,15 +597,25 @@ impl Agent {
             let Some(stored) = ports.get(port) else {
                 return Err(format!("{port} is not in the store yet"));
             };
+            // The destination resolves the groups itself rather than being told
+            // what the source had: membership is a property of the cell, not of
+            // the node the guest is leaving.
+            let Some(network) = cell.networks.get(&stored.spec.network) else {
+                return Err(format!(
+                    "{port} is on {}, which is not in the store yet",
+                    stored.spec.network
+                ));
+            };
+            let rules = self.rules_for(&stored.spec, groups, ports);
             let tap = self
                 .datapath
-                .program(port, &stored.spec)
+                .program(port, &stored.spec, network, &rules)
                 .await
                 .map_err(|e| e.to_string())?;
             taps.insert(port.clone(), tap);
         }
 
-        let request = self.vm_request(instance, &taps)?;
+        let request = self.vm_request(instance, &taps, ports)?;
         self.vmm
             .prepare_receiver(&request, mode)
             .await

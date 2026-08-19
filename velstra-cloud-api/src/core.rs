@@ -7,20 +7,29 @@
 //! one transport and not the other, and the two would drift apart in the exact
 //! place where nobody looks.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use futures::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
 use velstra_cloud_model::{
+    assignment::Assignee,
+    authz::{Verb, governing_project, may},
     meta::{Meta, Placement, ResourceName, Revision, Timestamp, set_condition},
     migration::{Migration, MigrationSpec, MigrationStatus, may_migrate, migration_condition},
     reconcile::place,
     resources::{
         AttachmentSpec, AttachmentStatus, ImageSpec, ImageStatus, Instance, InstanceSpec,
         InstanceStatus, NetworkSpec, NetworkStatus, Node, NodeSpec, NodeStatus, OperationSpec,
-        OperationStatus, PoolSpec, PoolStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus,
-        Resource, SubnetSpec, SubnetStatus, Volume, VolumeSpec, VolumeStatus, nodes_holding,
+        OperationStatus, PoolSpec, PoolStatus, PortSpec, PortStatus, Project, ProjectSpec,
+        ProjectStatus, Resource, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, Volume,
+        VolumeSpec, VolumeStatus, nodes_holding,
     },
+    security::{SecurityGroupSpec, SecurityGroupStatus, group_condition, validate},
+    storage::{may_create_volume, may_snapshot},
 };
 use velstra_cloud_store::{Event, Store};
 
@@ -29,21 +38,25 @@ use crate::{
     collection::{Collection, Deleted, Patch, TypedCollection, merge},
     error::{ApiError, ApiResult, Code},
     json::joined,
+    paging::{PageToken, Paging},
+    served::Served,
 };
 
 /// The collections this API serves, in the order `docs/rest-contract.md` lists
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 12] = [
+pub const COLLECTIONS: [&str; 14] = [
     "projects",
     "instances",
     "migrations",
     "volumes",
+    "snapshots",
     "attachments",
     "networks",
     "subnets",
     "ports",
+    "security-groups",
     "images",
     "nodes",
     "pools",
@@ -58,9 +71,16 @@ pub enum WatchEvent {
 }
 
 /// A list, and the revision to watch from so nothing between the two is lost.
+#[derive(Debug)]
 pub struct Listing {
     pub items: Vec<Value>,
+    /// The revision this walk started at — the *first* page's, carried forward
+    /// on every page after it. See [`crate::paging`] for why that, and not each
+    /// page's own, is what keeps list-then-watch correct.
     pub revision: Revision,
+    /// Present exactly when there is more to fetch. Absent means the walk is
+    /// over, so a caller loops until it is `None` and never has to guess.
+    pub next_page_token: Option<String>,
 }
 
 /// What a create produced: the operation to follow, and the object it is about.
@@ -69,8 +89,132 @@ pub struct Created {
     pub target: String,
 }
 
+/// Which objects a caller is asking for.
+///
+/// There is exactly one thing to filter on and it is the agent asking, because
+/// there is exactly one kind of caller that must not be handed the cell. A
+/// console, an operator or a controller is asking about the cell on purpose.
+///
+/// This is the piece that decides whether a cell is bounded by its store or by
+/// the agents around it. Without it every node lists every instance, port,
+/// attachment and migration on every pass and every pool lists every volume and
+/// snapshot, so load per agent grows with the cell and a thousand agents
+/// multiply every write by a thousand. It is the same wall Kubernetes hit, and
+/// the same answer: filter in front of the store rather than making the store
+/// bigger.
+///
+/// Applied by the API and never by the caller. A filter the caller applies has
+/// already cost the read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// Only what this agent has business with — see
+    /// [`velstra_cloud_model::assignment`] for what that means and why it is not
+    /// simply the assignment.
+    pub assignee: Option<Assignee>,
+}
+
+impl Filter {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn for_node(node: impl Into<String>) -> Self {
+        Self {
+            assignee: Some(Assignee::Node(node.into())),
+        }
+    }
+
+    pub fn for_pool(pool: impl Into<String>) -> Self {
+        Self {
+            assignee: Some(Assignee::Pool(pool.into())),
+        }
+    }
+
+    /// Whether this object passes.
+    ///
+    /// Three answers, and conflating the last two is a hole rather than a
+    /// simplification — see
+    /// [`velstra_cloud_model::assignment::is_shared_collection`].
+    pub fn admits(&self, kind: &str, document: &Value) -> bool {
+        use velstra_cloud_model::assignment as who_reads;
+        let Some(who) = &self.assignee else {
+            return true;
+        };
+        // Shared: nobody owns one, everybody reads them whole.
+        if who_reads::is_shared_collection(kind) {
+            return true;
+        }
+        // Somebody's, but not this kind of agent's. Nothing, not everything.
+        if !who_reads::is_assigned_to(kind, who) {
+            return false;
+        }
+        who_reads::concerns_assignee(document, who)
+    }
+}
+
+/// What a batch of computed fields needs from *other* collections, read at most
+/// once per request.
+///
+/// Without this, `answer` is per-document and every computed field that needs a
+/// collection scan costs one scan **per document** — so listing a thousand
+/// security groups in a cell of ten thousand ports was ten million reads, and
+/// the same shape would have made a subnet's occupancy worse still. One list per
+/// request instead of one per item is the difference between a read that grows
+/// with the cell and one that grows with its square.
+///
+/// Deliberately not a cache that outlives the request. A computed field's whole
+/// point is that it cannot disagree with the world, and a value kept between
+/// requests can.
+#[derive(Default)]
+struct Scratch {
+    ports: Option<Arc<Vec<velstra_cloud_model::resources::Port>>>,
+    nodes: Option<Arc<Vec<Node>>>,
+}
+
+impl Scratch {
+    async fn ports(
+        &mut self,
+        api: &Api,
+    ) -> ApiResult<Arc<Vec<velstra_cloud_model::resources::Port>>> {
+        if let Some(ports) = &self.ports {
+            return Ok(ports.clone());
+        }
+        let ports = Arc::new(api.typed_list("", "ports").await?);
+        self.ports = Some(ports.clone());
+        Ok(ports)
+    }
+
+    async fn nodes(&mut self, api: &Api) -> ApiResult<Arc<Vec<Node>>> {
+        if let Some(nodes) = &self.nodes {
+            return Ok(nodes.clone());
+        }
+        let nodes = Arc::new(api.typed_list("", "nodes").await?);
+        self.nodes = Some(nodes.clone());
+        Ok(nodes)
+    }
+}
+
 struct Inner {
     collections: BTreeMap<&'static str, Arc<dyn Collection>>,
+    /// Subjects that may do anything, anywhere in this cell.
+    ///
+    /// Configuration rather than data, and deliberately: it is what a fresh cell
+    /// is bootstrapped from, and a permission stored inside the thing it
+    /// protects has no answer for the first request. Empty means **nobody is an
+    /// operator**, which is the safe direction — a cell started without one can
+    /// be read and written only where a project grants it.
+    cell_admins: Vec<String>,
+    /// One watch on the store per assigned collection, however many node agents.
+    ///
+    /// Only the four that grow with the cell, and only reached through a
+    /// filtered read — which in this platform means a node agent. Everything
+    /// else, including every path a person looks at, goes to the store, because
+    /// a cached read is eventually consistent and somebody reading back what
+    /// they just changed must not be.
+    ///
+    /// Empty until [`Api::serve_nodes`] is called, so a process that has no node
+    /// agents talking to it — a test, a one-shot tool — pays nothing.
+    served: RwLock<BTreeMap<&'static str, Served>>,
     placement: Placement,
     verifier: Arc<dyn TokenVerifier>,
 }
@@ -103,10 +247,12 @@ impl Api {
             collection!("projects", ProjectSpec, ProjectStatus),
             collection!("instances", InstanceSpec, InstanceStatus),
             collection!("volumes", VolumeSpec, VolumeStatus),
+            collection!("snapshots", SnapshotSpec, SnapshotStatus),
             collection!("attachments", AttachmentSpec, AttachmentStatus),
             collection!("networks", NetworkSpec, NetworkStatus),
             collection!("subnets", SubnetSpec, SubnetStatus),
             collection!("ports", PortSpec, PortStatus),
+            collection!("security-groups", SecurityGroupSpec, SecurityGroupStatus),
             collection!("images", ImageSpec, ImageStatus),
             collection!("nodes", NodeSpec, NodeStatus),
             collection!("pools", PoolSpec, PoolStatus),
@@ -116,6 +262,8 @@ impl Api {
         Self {
             inner: Arc::new(Inner {
                 collections,
+                cell_admins: Vec::new(),
+                served: RwLock::new(BTreeMap::new()),
                 placement: Placement::new(region, cell),
                 verifier: verifier.clone(),
             }),
@@ -138,13 +286,14 @@ impl Api {
     // ---- reads ------------------------------------------------------------
 
     /// One object, by name.
-    pub async fn get(&self, name: &ResourceName) -> ApiResult<Value> {
+    pub async fn get(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+        self.authorize(who, Verb::Read, name).await?;
         let collection = self.collection(name.collection())?;
         let mut document = collection
             .get(&name.to_string())
             .await?
             .ok_or_else(|| ApiError::not_found(name))?;
-        self.answer(&mut document).await?;
+        self.answer(&mut document, &mut Scratch::default()).await?;
         Ok(document)
     }
 
@@ -155,18 +304,313 @@ impl Api {
     /// may repeat an event but can never skip one. The other order loses
     /// whatever was written while the list was being assembled, which is the
     /// bug that makes a console quietly stale until somebody reloads it.
-    pub async fn list(&self, parent: &str, kind: &str) -> ApiResult<Listing> {
-        let collection = self.collection(kind)?;
-        let revision = collection.revision().await?;
-        let mut items = Vec::new();
-        for mut document in collection.list().await? {
-            if !under(&document, parent) {
-                continue;
-            }
-            self.answer(&mut document).await?;
-            items.push(document);
+    /// Name the subjects that may do anything anywhere in this cell.
+    ///
+    /// Called by the server process from its own configuration. A cell with none
+    /// is not broken: it simply has no operator, and every request is decided by
+    /// the bindings on the project it touches. What it cannot do is register a
+    /// node or create a project, which is the honest consequence of nobody
+    /// having been made responsible for the cell.
+    pub fn with_cell_admins(mut self, admins: Vec<String>) -> Self {
+        let inner =
+            Arc::get_mut(&mut self.inner).expect("cell admins are named before the API is shared");
+        inner.cell_admins = admins;
+        self
+    }
+
+    /// Whether `who` may `verb` `name`, from the bindings on the project that
+    /// governs it — or from the operator list, for anything outside every
+    /// project.
+    ///
+    /// One function, called at the top of every entry point, because an
+    /// authorisation rule spread across eleven call sites is an authorisation
+    /// rule with a hole in it.
+    async fn authorize(&self, who: &Identity, verb: Verb, name: &ResourceName) -> ApiResult<()> {
+        if self.inner.cell_admins.contains(&who.subject) {
+            return Ok(());
         }
-        Ok(Listing { items, revision })
+        let Some(project) = governing_project(name) else {
+            // Outside every project: a node, a pool, the projects collection.
+            // These are the cell's, and only an operator has the cell.
+            return Err(ApiError::forbidden(
+                "this is a cell-wide resource; only a cell operator may touch it",
+            ));
+        };
+        // Read the project's bindings. A project that is not there refuses in
+        // the same words as one that refuses, so the error is not an oracle for
+        // which projects exist.
+        let bindings = match self.typed_project(&project).await {
+            Ok(Some(p)) => p.spec.bindings,
+            _ => Vec::new(),
+        };
+        may(&who.subject, &self.inner.cell_admins, &bindings, verb)
+            .map_err(|denied| ApiError::forbidden(denied.to_string()))
+    }
+
+    async fn typed_project(&self, name: &str) -> ApiResult<Option<Project>> {
+        let collection = self.collection("projects")?;
+        match collection.get(name).await? {
+            Some(document) => Ok(Some(serde_json::from_value(document)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Start serving agents — nodes and pools — from one watch per collection
+    /// instead of one per agent.
+    ///
+    /// Called by the server process, not by a test or a one-shot tool: it spawns
+    /// a task per agent-facing collection that holds a copy of it in memory for as
+    /// long as the process lives. What it buys is the difference between an etcd
+    /// cluster with one watcher per collection and one with a thousand.
+    pub fn serve_agents(&self) {
+        let mut served = self.inner.served.write().unwrap();
+        for (kind, collection) in &self.inner.collections {
+            if velstra_cloud_model::assignment::is_assigned_collection(kind)
+                || velstra_cloud_model::assignment::is_pooled_collection(kind)
+            {
+                served.insert(kind, Served::start(collection.clone()));
+            }
+        }
+    }
+
+    /// The cache for a collection, if a filtered caller may be served from one.
+    ///
+    /// An unfiltered read is never served from here — see the field's own note.
+    fn served(&self, kind: &str, filter: &Filter) -> Option<Served> {
+        filter.assignee.as_ref()?;
+        self.inner.served.read().unwrap().get(kind).cloned()
+    }
+
+    pub async fn list(&self, parent: &str, kind: &str) -> ApiResult<Listing> {
+        self.list_filtered(parent, kind, &Filter::none()).await
+    }
+
+    /// A list as a caller may see it.
+    ///
+    /// **Filtered, not refused**, and the difference matters: a caller asking
+    /// for their projects has no permission on the collection as a whole, and
+    /// answering `403` would mean nobody could ever find the projects they do
+    /// have. So a listing under no parent — or under a parent they may not
+    /// read — comes back containing exactly the objects they may read, which
+    /// for most callers is a short list and for none of them is an oracle.
+    ///
+    /// A list *under* a parent they may read is authorised once, on the parent,
+    /// and then served whole: everything under a project is that project's.
+    pub async fn list_for(
+        &self,
+        parent: &str,
+        kind: &str,
+        filter: &Filter,
+        who: &Identity,
+    ) -> ApiResult<Listing> {
+        self.list_page_for(parent, kind, filter, &Paging::unpaged(), who)
+            .await
+    }
+
+    /// [`Self::list_for`], a page at a time.
+    ///
+    /// The per-object permission check runs **inside** the page loop, and that
+    /// is a fix rather than a refactor. It used to run over a finished listing,
+    /// which meant every derived field of every object in the cell was computed
+    /// and then thrown away for the ones the caller could not see — the whole
+    /// cost of a cell-wide read to answer a tenant who owns three machines. It
+    /// also meant a paged answer would come back short, or empty, while claiming
+    /// to be a full page, because the trimming happened after the page was cut.
+    pub async fn list_page_for(
+        &self,
+        parent: &str,
+        kind: &str,
+        filter: &Filter,
+        paging: &Paging,
+        who: &Identity,
+    ) -> ApiResult<Listing> {
+        if !parent.is_empty() {
+            let name = ResourceName::parse(parent).map_err(ApiError::from)?;
+            self.authorize(who, Verb::Read, &name).await?;
+            return self.list_page(parent, kind, filter, paging).await;
+        }
+        // No parent: a cell-wide collection. An operator sees it whole;
+        // everybody else sees the objects they may read, one decision each.
+        let gate = if self.inner.cell_admins.contains(&who.subject) {
+            Gate::Everything
+        } else {
+            Gate::Readable(who.clone())
+        };
+        self.list_gated(parent, kind, filter, paging, &gate).await
+    }
+
+    /// The same, for a caller that must not be handed the whole cell.
+    pub async fn list_filtered(
+        &self,
+        parent: &str,
+        kind: &str,
+        filter: &Filter,
+    ) -> ApiResult<Listing> {
+        self.list_page(parent, kind, filter, &Paging::unpaged())
+            .await
+    }
+
+    /// A filtered list, a page at a time.
+    ///
+    /// **The page size is a promise about the answer, not about the read**, and
+    /// that is the whole subtlety here. The store hands back objects in key
+    /// order; the parent scope and the filter then reject some of them. Ask for
+    /// twenty instances on a node holding three, and a single store page of
+    /// twenty yields three — so this keeps reading until it has a full page or
+    /// the collection runs out. A page size that quietly meant "up to twenty,
+    /// often far fewer" would make every caller write the same retry loop, and
+    /// most of them would write it wrong: the natural mistake is to stop on a
+    /// short page, which stops the walk in the middle.
+    ///
+    /// The cost stays bounded because the rejects are cheap — `under` and
+    /// `admits` read two fields — while the expensive part, `answer`, runs only
+    /// on objects that survived. That ordering is load-bearing and predates
+    /// paging; paging only made it matter more.
+    pub async fn list_page(
+        &self,
+        parent: &str,
+        kind: &str,
+        filter: &Filter,
+        paging: &Paging,
+    ) -> ApiResult<Listing> {
+        self.list_gated(parent, kind, filter, paging, &Gate::Everything)
+            .await
+    }
+
+    async fn list_gated(
+        &self,
+        parent: &str,
+        kind: &str,
+        filter: &Filter,
+        paging: &Paging,
+        gate: &Gate,
+    ) -> ApiResult<Listing> {
+        if let Some(token) = &paging.token {
+            token.check(kind, parent)?;
+        }
+        let collection = self.collection(kind)?;
+        let unpaged = !paging.is_paged();
+        let want = paging.resolved_size();
+
+        let mut items = Vec::new();
+        // One scratch for the whole listing, not one per item: that is the whole
+        // difference between a list that costs the cell once and one that costs
+        // it once per object.
+        let mut scratch = Scratch::default();
+        let mut after: Option<String> = paging.token.as_ref().map(|t| t.after.clone());
+        let mut revision = None;
+        let mut more;
+
+        loop {
+            let (documents, has_more, at) = match self.served(kind, filter) {
+                // From memory, and no read of the store at all. This is the line
+                // that decides how many nodes a cell can hold.
+                Some(cache) => {
+                    let (held, at) = cache.all().await;
+                    let mut documents: Vec<Value> =
+                        held.iter().map(|d| (**d).clone()).collect::<Vec<_>>();
+                    // The cache holds a whole collection, so its page is a slice.
+                    // That still removes the expensive half — the computed fields
+                    // and the serialising — and the cheap half is a memory scan
+                    // the cache exists to make cheap.
+                    if let Some(after) = &after {
+                        documents
+                            .retain(|d| name_of(d).is_some_and(|n| n.as_str() > after.as_str()));
+                    }
+                    let has_more = !unpaged && documents.len() > want;
+                    if !unpaged {
+                        documents.truncate(want);
+                    }
+                    (documents, has_more, at)
+                }
+                None if unpaged => (
+                    collection.list().await?,
+                    false,
+                    collection.revision().await?,
+                ),
+                None => {
+                    let at = collection.revision().await?;
+                    let (documents, has_more) =
+                        collection.list_page(after.as_deref(), want).await?;
+                    (documents, has_more, at)
+                }
+            };
+            // The revision of the first page of this walk, and of no other — a
+            // resumed walk reports the one its token carries.
+            revision.get_or_insert(
+                paging
+                    .token
+                    .as_ref()
+                    .map(|t| Revision(t.revision))
+                    .unwrap_or(at),
+            );
+            more = has_more;
+
+            let last = documents.last().and_then(name_of);
+            for mut document in documents {
+                if !under(&document, parent) {
+                    continue;
+                }
+                // Before the computed fields, not after: those are the expensive
+                // part, and paying for them on an object nobody asked for is the
+                // cost this exists to avoid.
+                if !filter.admits(kind, &document) {
+                    continue;
+                }
+                // Before `answer`, for the same reason `admits` is: the derived
+                // fields are the expensive part, and an object the caller may
+                // not see is an object nobody should pay for.
+                if let Gate::Readable(who) = gate {
+                    let Some(name) = name_of(&document).and_then(|n| ResourceName::parse(&n).ok())
+                    else {
+                        continue;
+                    };
+                    if self.authorize(who, Verb::Read, &name).await.is_err() {
+                        continue;
+                    }
+                }
+                self.answer(&mut document, &mut scratch).await?;
+                items.push(document);
+            }
+
+            if unpaged || items.len() >= want || !more {
+                after = last.or(after);
+                break;
+            }
+            // A short page after filtering: read on rather than hand back a page
+            // the caller would mistake for the end.
+            let Some(last) = last else { break };
+            after = Some(last);
+        }
+
+        // More was read than asked for only if the loop was told to stop early;
+        // trim so the page size is honoured exactly and the token points at what
+        // was actually delivered.
+        if !unpaged && items.len() > want {
+            items.truncate(want);
+            more = true;
+            after = items.last().and_then(name_of);
+        }
+
+        let next_page_token = (!unpaged && more)
+            .then(|| {
+                after.as_ref().map(|after| {
+                    PageToken {
+                        kind: kind.to_string(),
+                        parent: parent.to_string(),
+                        after: after.clone(),
+                        revision: revision.unwrap_or(Revision(0)).0,
+                    }
+                    .encode()
+                })
+            })
+            .flatten();
+
+        Ok(Listing {
+            items,
+            revision: revision.unwrap_or(Revision(0)),
+            next_page_token,
+        })
     }
 
     // ---- writes -----------------------------------------------------------
@@ -184,6 +628,20 @@ impl Api {
         body: &Value,
         who: &Identity,
     ) -> ApiResult<Created> {
+        // Authorised on the **parent**, because the object does not exist yet
+        // and has no bindings of its own. Creating inside a project is a write
+        // to that project; creating without one is a write to the cell.
+        if parent.is_empty() {
+            if !self.inner.cell_admins.contains(&who.subject) {
+                return Err(ApiError::forbidden(
+                    "creating a project, a node or a pool is a change to the cell; only a cell \
+                     operator may make one",
+                ));
+            }
+        } else {
+            let name = ResourceName::parse(parent).map_err(ApiError::from)?;
+            self.authorize(who, Verb::Write, &name).await?;
+        }
         if kind == "operations" {
             return Err(ApiError::invalid(
                 "operations are minted by the API when it accepts a change, never created directly",
@@ -202,11 +660,18 @@ impl Api {
         // one check that knows which field it was.
         collection.check_spec(&spec)?;
         crate::refs::check(kind, &spec)?;
+        check_rules(kind, &spec)?;
         if kind == "attachments" {
             self.settle_node(&mut spec, None).await?;
         }
         if kind == "migrations" {
             self.settle_migration(&mut spec).await?;
+        }
+        if kind == "snapshots" {
+            self.settle_snapshot(&name, &mut spec).await?;
+        }
+        if kind == "volumes" {
+            self.settle_volume_source(&mut spec).await?;
         }
         self.check_quota(&name, kind, &spec).await?;
 
@@ -239,7 +704,20 @@ impl Api {
         name: &ResourceName,
         body: &Value,
         expect: Option<Revision>,
+        who: &Identity,
     ) -> ApiResult<Value> {
+        // Changing who else may is a different permission from changing
+        // anything else, or an editor is an admin one request later.
+        let verb = if body
+            .get("spec")
+            .and_then(|spec| spec.get("bindings"))
+            .is_some()
+        {
+            Verb::Administer
+        } else {
+            Verb::Write
+        };
+        self.authorize(who, verb, name).await?;
         let collection = self.collection(name.collection())?;
         refuse_unwritable(body)?;
         let mut patch = Patch {
@@ -248,10 +726,14 @@ impl Api {
         };
         if let Some(spec) = &mut patch.spec {
             crate::refs::check(name.collection(), spec)?;
+            check_rules(name.collection(), spec)?;
+            if name.collection() == "volumes" {
+                self.refuse_a_new_source(name, spec).await?;
+            }
             // A change may move an attachment's node — after a migration, to
             // agree with the instance again — but never away from it.
             if name.collection() == "attachments" && spec.get("node").is_some() {
-                let stored: Value = self.get(name).await?;
+                let stored: Value = self.get(name, who).await?;
                 let instance = stored["spec"]["instance"]
                     .as_str()
                     .unwrap_or_default()
@@ -266,7 +748,7 @@ impl Api {
             .at("spec"));
         }
         let mut document = collection.patch(&name.to_string(), &patch, expect).await?;
-        self.answer(&mut document).await?;
+        self.answer(&mut document, &mut Scratch::default()).await?;
         Ok(document)
     }
 
@@ -277,9 +759,97 @@ impl Api {
         &self,
         name: &ResourceName,
         expect: Option<Revision>,
+        who: &Identity,
     ) -> ApiResult<Deleted> {
+        self.authorize(who, Verb::Write, name).await?;
+        // Asked before anything is written down. Deleting an object something
+        // still names does not fail loudly anywhere: the reference simply stops
+        // resolving, and whoever finds out is an agent that cannot program a
+        // port, or a guest with no image, at a moment nobody connects to this
+        // request.
+        let held_by = self.holders(name).await?;
+        if !held_by.is_empty() {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{name} is still named by {}{}. Delete those first, or change what they \
+                     point at.",
+                    held_by
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if held_by.len() > 5 {
+                        format!(" and {} more", held_by.len() - 5)
+                    } else {
+                        String::new()
+                    }
+                ),
+            ));
+        }
         let collection = self.collection(name.collection())?;
         collection.delete(&name.to_string(), expect).await
+    }
+
+    /// Everything that still names `target`.
+    ///
+    /// Read from the objects rather than from a reference count, for the reason
+    /// every other total in this system is counted rather than tracked: a count
+    /// that is incremented and decremented is wrong the first time either half
+    /// is missed, and it fails in the direction that refuses a delete nobody can
+    /// explain.
+    ///
+    /// A scan per delete, which is affordable precisely because a delete is rare
+    /// and somebody is waiting for the answer — unlike a reconcile, which
+    /// happens constantly and where the same shape was worth removing.
+    async fn holders(&self, target: &ResourceName) -> ApiResult<Vec<String>> {
+        let wanted = target.to_string();
+        let mut held_by = Vec::new();
+
+        // A project holds everything under it. Nothing names a project as a
+        // *reference*, so this is its own question — and the answer somebody
+        // needs is "there are still machines in it", not "no such field".
+        if target.collection() == "projects" {
+            let prefix = format!("{wanted}/");
+            for kind in COLLECTIONS {
+                // An operation is a *record of a request*, not a thing anybody
+                // holds. Counting them made a project undeletable the moment it
+                // was created, because creating it produced one — which the
+                // tests caught and is the right answer either way: nobody is
+                // waiting on an audit line. They outlive the project and are
+                // pruned by their own retention, not by this.
+                if kind == "projects" || kind == "operations" {
+                    continue;
+                }
+                for document in self.collection(kind)?.list().await? {
+                    if let Some(name) = joined(&document["meta"]["name"])
+                        && name.starts_with(&prefix)
+                    {
+                        held_by.push(name);
+                    }
+                }
+            }
+            return Ok(held_by);
+        }
+
+        for kind in crate::refs::REFERRING_KINDS {
+            for document in self.collection(kind)?.list().await? {
+                let Some(name) = joined(&document["meta"]["name"]) else {
+                    continue;
+                };
+                // An object does not hold itself, which matters for `projects`,
+                // whose `parent` is a reference field.
+                if name == wanted {
+                    continue;
+                }
+                let spec = document.get("spec").cloned().unwrap_or(Value::Null);
+                if crate::refs::names_referenced(kind, &spec).contains(&wanted) {
+                    held_by.push(name);
+                }
+            }
+        }
+        Ok(held_by)
     }
 
     // ---- watching ---------------------------------------------------------
@@ -298,24 +868,136 @@ impl Api {
         kind: &str,
         from: Option<Revision>,
     ) -> ApiResult<impl Stream<Item = WatchEvent> + Send + use<>> {
+        self.watch_filtered(parent, kind, from, Filter::none())
+    }
+
+    /// A watch as a *caller* may see it — the streaming half of
+    /// [`Self::list_page_for`], and the same rule applied event by event.
+    ///
+    /// It did not exist, and neither transport asked for it: REST read the
+    /// bearer token, gRPC called `self.who()`, and both then handed
+    /// `watch_filtered` a parent and a kind with no identity attached. So
+    /// `GET /api/v1/projects/{someone-else}/instances?watch=true` with any
+    /// accepted token streamed another tenant's objects, and the same request
+    /// with no parent streamed the whole cell. Every other entry point on this
+    /// type authorises at the top; the watch was the one that never did.
+    ///
+    /// It survived because `tests/authz.rs` asks about `get`, `create`, `patch`,
+    /// `delete` and `list`, and a watch is the one read whose answer arrives
+    /// after the request that asked for it — so no test that only checks a
+    /// return value would have noticed.
+    ///
+    /// The rule is not a new one: it is `list_page_for`'s, unchanged. A watch
+    /// **under a parent** is authorised once, on the parent, because everything
+    /// under a project is that project's. A **cell-wide** watch is gated per
+    /// object, which is what a list under no parent already does — an operator
+    /// sees the cell, and everybody else sees the objects they may read rather
+    /// than a `403` that would leave them unable to find their own.
+    pub async fn watch_for(
+        &self,
+        parent: &str,
+        kind: &str,
+        from: Option<Revision>,
+        filter: Filter,
+        who: &Identity,
+    ) -> ApiResult<impl Stream<Item = WatchEvent> + Send + use<>> {
+        let gate = if parent.is_empty() {
+            // A cell-wide stream. An operator is asking about the cell on
+            // purpose; anybody else is told about what they may read.
+            if self.inner.cell_admins.contains(&who.subject) {
+                Gate::Everything
+            } else {
+                Gate::Readable(who.clone())
+            }
+        } else {
+            let name = ResourceName::parse(parent).map_err(ApiError::from)?;
+            self.authorize(who, Verb::Read, &name).await?;
+            Gate::Everything
+        };
+        self.watch_gated(parent, kind, from, filter, gate)
+    }
+
+    /// The same, for a caller that must not be sent every event in the cell.
+    ///
+    /// A `Put` that no longer passes the filter is dropped rather than turned
+    /// into a synthetic delete. That is safe here and would not be everywhere:
+    /// this platform's agents use a watch as a **wake-up** and re-read what they
+    /// own on every pass, so an object that left a node disappears from that
+    /// node's next list. An agent that treated the stream as its state would
+    /// need the delete.
+    ///
+    /// **Unauthorised**, and only for callers inside the platform — a
+    /// controller, a test, the cache. Anything reachable from the network wants
+    /// [`Self::watch_for`].
+    pub fn watch_filtered(
+        &self,
+        parent: &str,
+        kind: &str,
+        from: Option<Revision>,
+        filter: Filter,
+    ) -> ApiResult<impl Stream<Item = WatchEvent> + Send + use<>> {
+        self.watch_gated(parent, kind, from, filter, Gate::Everything)
+    }
+
+    fn watch_gated(
+        &self,
+        parent: &str,
+        kind: &str,
+        from: Option<Revision>,
+        filter: Filter,
+        gate: Gate,
+    ) -> ApiResult<impl Stream<Item = WatchEvent> + Send + use<>> {
         let collection = self.collection(kind)?;
-        let receiver = collection.watch(from);
+        // A filtered watcher is a node agent, and there may be a thousand of
+        // them. One store watch feeds all of them; without this the store has
+        // one watcher per agent and every write is delivered once per agent.
+        //
+        // `from` is dropped when the cache answers, and that is the honest
+        // consequence of not keeping history in memory: a subscriber is told
+        // what happens *next*. It is safe here because the revision a cached
+        // list reported is the revision that list was current as of, and an
+        // agent lists before it watches.
+        let receiver = match self.served(kind, &filter) {
+            Some(cache) => cache.subscribe(),
+            None => collection.watch(from),
+        };
         let api = self.clone();
         let parent = parent.to_string();
+        let kind = kind.to_string();
         Ok(
             tokio_stream::wrappers::ReceiverStream::new(receiver).filter_map(move |event| {
                 let api = api.clone();
                 let collection = collection.clone();
                 let parent = parent.clone();
-                async move { api.event(&collection, &parent, event).await }
+                let kind = kind.clone();
+                let filter = filter.clone();
+                let gate = gate.clone();
+                async move {
+                    api.event(&collection, &parent, &kind, &filter, &gate, event)
+                        .await
+                }
             }),
         )
     }
 
+    /// One store event, as this subscriber should see it — or nothing.
+    ///
+    /// The gate is `Readable` only for a cell-wide watch by somebody who is not
+    /// an operator, and then it costs one permission check per event. That is the
+    /// same price `list_gated` pays per object and for the same reason: the
+    /// alternative is a stream that hands the cell to whoever asks.
+    ///
+    /// A **delete** is gated too. It carries a name and no document, which is
+    /// all the check needs — and letting it through unchecked would tell one
+    /// tenant the names of another's objects at the moment they are removed,
+    /// which is the same oracle the refusals are worded to avoid.
     async fn event(
         &self,
         collection: &Arc<dyn Collection>,
         parent: &str,
+        kind: &str,
+        filter: &Filter,
+        gate: &Gate,
         event: Event,
     ) -> Option<WatchEvent> {
         match event {
@@ -324,13 +1006,29 @@ impl Api {
                 if !under(&document, parent) {
                     return None;
                 }
-                self.answer(&mut document).await.ok()?;
+                // Before the computed fields: those are the work, and doing it
+                // for a subscriber who will not be sent the result is exactly
+                // the cost this filter exists to remove.
+                if !filter.admits(kind, &document) {
+                    return None;
+                }
+                if let Gate::Readable(who) = gate {
+                    let name = name_of(&document).and_then(|n| ResourceName::parse(&n).ok())?;
+                    self.authorize(who, Verb::Read, &name).await.ok()?;
+                }
+                self.answer(&mut document, &mut Scratch::default())
+                    .await
+                    .ok()?;
                 Some(WatchEvent::Put(document))
             }
             Event::Delete { key, revision } => {
                 let (_, _, name) = velstra_cloud_store::parse_key(&key)?;
                 if !parent.is_empty() && !name.starts_with(&format!("{parent}/")) {
                     return None;
+                }
+                if let Gate::Readable(who) = gate {
+                    let parsed = ResourceName::parse(name).ok()?;
+                    self.authorize(who, Verb::Read, &parsed).await.ok()?;
                 }
                 Some(WatchEvent::Delete {
                     name: name.to_string(),
@@ -348,7 +1046,8 @@ impl Api {
     /// state as it stands. An explain that consulted a separate copy of the
     /// rules would eventually disagree with the scheduler, and an operator
     /// would believe the wrong one.
-    pub async fn explain_placement(&self, name: &ResourceName) -> ApiResult<Value> {
+    pub async fn explain_placement(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+        self.authorize(who, Verb::Read, name).await?;
         if name.collection() != "instances" {
             return Err(ApiError::invalid("only an instance is placed on a node"));
         }
@@ -391,10 +1090,16 @@ impl Api {
     /// Polling on the server rather than on the client, and bounded: waiting is
     /// an optimisation over asking again, never a promise that the answer will
     /// be `done`.
-    pub async fn wait_operation(&self, name: &ResourceName, timeout: Duration) -> ApiResult<Value> {
+    pub async fn wait_operation(
+        &self,
+        name: &ResourceName,
+        timeout: Duration,
+        who: &Identity,
+    ) -> ApiResult<Value> {
+        self.authorize(who, Verb::Read, name).await?;
         let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(60));
         loop {
-            let document = self.get(name).await?;
+            let document = self.get(name, who).await?;
             if document["status"]["done"].as_bool().unwrap_or(false)
                 || tokio::time::Instant::now() >= deadline
             {
@@ -417,10 +1122,121 @@ impl Api {
     /// One function so that a read, a list, a change and a watch all answer
     /// alike: a console that learns about an object through a watch event must
     /// see what a `GET` would have told it.
-    async fn answer(&self, document: &mut Value) -> ApiResult<()> {
+    async fn answer(&self, document: &mut Value, scratch: &mut Scratch) -> ApiResult<()> {
         self.answer_operation(document).await?;
         self.answer_migration(document).await?;
-        self.answer_image(document).await
+        self.answer_security_group(document, scratch).await?;
+        self.answer_subnet(document, scratch).await?;
+        self.answer_image(document, scratch).await
+    }
+
+    /// Fill in how full a subnet is, from the ports on it.
+    ///
+    /// The fifth of the same idea, and it arrived here by the same route as the
+    /// others after a detour: it was first written as a controller that stored
+    /// the numbers, which is a write on every subnet every time any port
+    /// anywhere changes. Occupancy is an aggregate over ports, no writer owns
+    /// it, and it is looked at by people far less often than it changes — so it
+    /// is added up on the way out, where it cannot be stale and costs nothing
+    /// when nobody asks.
+    async fn answer_subnet(&self, document: &mut Value, scratch: &mut Scratch) -> ApiResult<()> {
+        // Only a subnet has a cidr and a gateway.
+        if document.get("spec").and_then(|s| s.get("cidr")).is_none()
+            || document
+                .get("spec")
+                .and_then(|s| s.get("gateway"))
+                .is_none()
+        {
+            return Ok(());
+        }
+        let Ok(subnet) =
+            serde_json::from_value::<velstra_cloud_model::resources::Subnet>(document.clone())
+        else {
+            return Ok(());
+        };
+        let ports = scratch.ports(self).await?;
+        let (allocated, available) = velstra_cloud_model::ipam::counts(&subnet, &ports);
+        document["status"]["allocated"] = json!(allocated);
+        document["status"]["available"] = json!(available);
+        Ok(())
+    }
+
+    /// Fill in whether a security group is in force, from the ports that use it.
+    ///
+    /// The fourth computed field, and for the same reason as the other three:
+    /// nothing about a group is a fact any writer owns. A controller writing
+    /// "applied" would be guessing, and a node writing it would be one of many
+    /// writers on one field. What is true is on the ports — each says whether
+    /// its own node has programmed it — so the answer is added up here, on read,
+    /// and cannot disagree with the objects it is drawn from.
+    async fn answer_security_group(
+        &self,
+        document: &mut Value,
+        scratch: &mut Scratch,
+    ) -> ApiResult<()> {
+        // Only a security group has `spec.rules`.
+        if document.get("spec").and_then(|s| s.get("rules")).is_none() {
+            return Ok(());
+        }
+        let Some(name) = joined(&document["meta"]["name"]) else {
+            return Ok(());
+        };
+        let generation = document["meta"]["generation"].as_u64().unwrap_or(0);
+        let (carried, referenced) = self.ports_using(&name, scratch).await?;
+        // The addresses in this group, so a node can expand a rule that names it
+        // without reading every port in the cell to find out who is in it.
+        // Computed here for the same reason as everything else on a group: no
+        // writer owns it, and the ports are the only record of it.
+        let ports = scratch.ports(self).await?;
+        let specs: std::collections::BTreeMap<String, velstra_cloud_model::resources::PortSpec> =
+            ports
+                .iter()
+                .map(|p| (p.meta.name.to_string(), p.spec.clone()))
+                .collect();
+        document["status"]["members"] =
+            json!(velstra_cloud_model::security::members_in(&name, &specs));
+        let condition = group_condition(generation, &carried, referenced);
+        let mut conditions: Vec<velstra_cloud_model::Condition> =
+            serde_json::from_value(document["status"]["conditions"].clone()).unwrap_or_default();
+        set_condition(&mut conditions, condition);
+        document["status"]["conditions"] = json!(conditions);
+        // Observed at the generation the ports have caught up with, so a group
+        // whose rules were just changed does not claim to be in force before any
+        // port has re-read it.
+        if carried.iter().all(|(_, programmed)| *programmed) {
+            document["status"]["observed_generation"] = json!(generation);
+        }
+        Ok(())
+    }
+
+    /// The carried ports that name this group with whether each has it in
+    /// force, and how many name it at all.
+    async fn ports_using(
+        &self,
+        group: &str,
+        scratch: &mut Scratch,
+    ) -> ApiResult<(Vec<(String, bool)>, usize)> {
+        let ports = scratch.ports(self).await?;
+        let naming: Vec<_> = ports
+            .iter()
+            .filter(|port| port.spec.security_groups.iter().any(|g| g == group))
+            .collect();
+        let referenced = naming.len();
+        let carried = naming
+            .into_iter()
+            // A port no node carries is not pending: nobody is expected to
+            // program it. It still counts as a reference, so the answer can say
+            // so rather than claiming nothing names the group.
+            .filter(|port| port.status.node.is_some())
+            .map(|port| {
+                // "Programmed" alone is not enough: a port carrying an older
+                // generation of itself is carrying older rules with it.
+                let current = port.status.programmed
+                    && port.status.observed_generation >= port.meta.generation;
+                (port.meta.name.to_string(), current)
+            })
+            .collect();
+        Ok((carried, referenced))
     }
 
     /// Fill in which nodes hold an image, from what each node reports about
@@ -432,7 +1248,7 @@ impl Api {
     /// what it holds, and this adds them up, which also means a node that has
     /// gone away stops being in the answer instead of lingering in a list
     /// nobody is left to correct.
-    async fn answer_image(&self, document: &mut Value) -> ApiResult<()> {
+    async fn answer_image(&self, document: &mut Value, scratch: &mut Scratch) -> ApiResult<()> {
         // Only an image has a digest in its spec.
         if document
             .get("spec")
@@ -447,7 +1263,7 @@ impl Api {
         let Some(name) = joined(&document["meta"]["name"]) else {
             return Ok(());
         };
-        let held = self.image_cached_on(&name).await?;
+        let held = self.image_cached_on(&name, scratch).await?;
         document["status"]["cached_on"] = json!(held);
         Ok(())
     }
@@ -681,6 +1497,179 @@ impl Api {
         }
     }
 
+    // ---- snapshots --------------------------------------------------------
+
+    /// Fill in the pool a copy is made in, and refuse a copy that cannot work.
+    ///
+    /// A snapshot's source is its **parent**: `projects/p1/volumes/data-1/
+    /// snapshots/nightly` is a copy of `data-1`, and there is no field saying
+    /// so. That is why this reads the name rather than the spec — and it is the
+    /// point of the shape, because which volume a copy came from is the one
+    /// thing about it that must never change, and a name cannot be patched.
+    ///
+    /// `spec.pool` is derived from the volume for the same reason an
+    /// attachment's node is derived from its instance: it is one fact, the
+    /// platform has it, and a copy in a pool that does not hold the original is
+    /// not something any backend does. Stated and wrong is refused rather than
+    /// corrected.
+    async fn settle_snapshot(&self, name: &ResourceName, spec: &mut Value) -> ApiResult<()> {
+        let source = name
+            .parent()
+            .filter(|parent| parent.collection() == "volumes")
+            .ok_or_else(|| {
+                ApiError::invalid(
+                    "a snapshot is a copy of one volume and lives under it: post to \
+                     projects/p1/volumes/data-1/snapshots, not to a collection of its own",
+                )
+                .at("meta.name")
+            })?;
+        let volume: Volume = self.typed(&source).await?;
+
+        // Neither of these is anything an operator can fix by changing a field
+        // — one is waiting, the other is a volume on its way out — so they
+        // arrive as a sentence rather than pointing at a control.
+        if let Err(refusal) = may_snapshot(&volume) {
+            return Err(ApiError::new(Code::FailedPrecondition, refusal.to_string()));
+        }
+
+        match spec.get("pool").and_then(Value::as_str).unwrap_or_default() {
+            "" => {
+                spec["pool"] = Value::String(volume.spec.pool.clone());
+                Ok(())
+            }
+            said if said != volume.spec.pool => Err(ApiError::invalid(format!(
+                "{source} is in {}, not in {said}; a copy is made by the pool that holds the \
+                 volume",
+                volume.spec.pool
+            ))
+            .at("spec.pool")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Fill in what a volume made from a snapshot inherits, and refuse one that
+    /// cannot be made.
+    ///
+    /// Two fields are derived, both under the rule the contract already states
+    /// — omitted is filled in, stated must agree:
+    ///
+    /// * `spec.pool`, because a clone is written by the pool that holds the
+    ///   snapshot and no backend copies between pools behind one command;
+    /// * `spec.sizeGib`, because the size of the clone is the size of the
+    ///   snapshot. "Must agree" is relaxed to "must be at least" here, and only
+    ///   here: a volume is grown, so asking for a bigger one at the moment it is
+    ///   made is an ordinary thing to want. Asking for a smaller one is the
+    ///   clone not fitting in what it is written into.
+    async fn settle_volume_source(&self, spec: &mut Value) -> ApiResult<()> {
+        let named = spec
+            .get("source_snapshot")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let from = match &named {
+            Some(name) => {
+                let name = ResourceName::parse(name).map_err(|_| {
+                    ApiError::invalid(
+                        "a snapshot is named in full, like \
+                                       projects/p1/volumes/data-1/snapshots/nightly",
+                    )
+                    .at("spec.sourceSnapshot")
+                })?;
+                if name.collection() != "snapshots" {
+                    return Err(ApiError::invalid(format!(
+                        "{name} is not a snapshot; a volume is made from one, like \
+                         projects/p1/volumes/data-1/snapshots/nightly"
+                    ))
+                    .at("spec.sourceSnapshot"));
+                }
+                Some(self.typed::<SnapshotSpec, SnapshotStatus>(&name).await?)
+            }
+            None => None,
+        };
+
+        if let Some(snapshot) = &from {
+            if spec
+                .get("pool")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                spec["pool"] = Value::String(snapshot.spec.pool.clone());
+            }
+            if spec.get("size_gib").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                spec["size_gib"] = json!(snapshot.status.size_gib);
+            }
+        }
+
+        let wanted: VolumeSpec = serde_json::from_value(spec.clone())?;
+        if let Err(refusal) = may_create_volume(&wanted, from.as_ref()) {
+            use velstra_cloud_model::storage::Refusal;
+            let field = match &refusal {
+                Refusal::SmallerThanItsSnapshot { .. } => "spec.sizeGib",
+                Refusal::AnotherPool { .. } => "spec.pool",
+                _ => "spec.sourceSnapshot",
+            };
+            return Err(ApiError::new(Code::FailedPrecondition, refusal.to_string()).at(field));
+        }
+        Ok(())
+    }
+
+    /// Where a volume's bytes came from is history, and history is not a
+    /// control.
+    ///
+    /// Changing `sourceSnapshot` on an existing volume is what an operator
+    /// reaches for when they mean "restore this". It is refused, and the
+    /// refusal says what to do instead, because an in-place restore is the one
+    /// storage operation this model cannot express honestly: it would be a
+    /// command sitting in a `spec`, and a command in a spec is performed again
+    /// on every resync — undoing whatever the guest wrote in between, forever,
+    /// with nothing on the object to say it happened.
+    ///
+    /// Changing `sourceImage` is refused for the plainer reason: nothing is
+    /// re-cloned, so the field would simply start describing a volume that does
+    /// not exist.
+    async fn refuse_a_new_source(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
+        let asked = |field: &str| -> Option<Option<String>> {
+            spec.get(field).map(|value| match value {
+                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+        };
+        let (snapshot, image) = (asked("source_snapshot"), asked("source_image"));
+        if snapshot.is_none() && image.is_none() {
+            return Ok(());
+        }
+        let stored: Volume = self.typed(name).await?;
+
+        // Sending back what is already there is not a change. A client that
+        // read an object and is writing part of it back must not be refused for
+        // carrying a field it did not touch.
+        if let Some(asked) = snapshot
+            && asked != stored.spec.source_snapshot
+        {
+            let what = asked.unwrap_or_else(|| "nothing".to_string());
+            return Err(ApiError::invalid(format!(
+                "{name} cannot be restored in place from {what}: writing a snapshot back over the \
+                 volume it came from would overwrite whatever a guest has open, and asking for it \
+                 again — which every resync does — would undo everything written since. Create a \
+                 volume with spec.sourceSnapshot set to the copy you want and attach that instead"
+            ))
+            .at("spec.sourceSnapshot"));
+        }
+        if let Some(asked) = image
+            && asked != stored.spec.source_image
+        {
+            return Err(ApiError::invalid(format!(
+                "{name} was cloned when it was created, and spec.sourceImage says what from; \
+                 changing it now re-clones nothing and would describe a volume that does not \
+                 exist — make a new volume from the image you want"
+            ))
+            .at("spec.sourceImage"));
+        }
+        Ok(())
+    }
+
     // ---- migration --------------------------------------------------------
 
     /// Fill in where the guest is now, and refuse a move that cannot work.
@@ -760,7 +1749,9 @@ impl Api {
             .at("spec.toNode")
         })?;
 
-        let cached = self.image_cached_on(&instance.spec.image).await?;
+        let cached = self
+            .image_cached_on(&instance.spec.image, &mut Scratch::default())
+            .await?;
         if let Err(refusal) = may_migrate(&instance, &source, &destination, &cached) {
             // The field is the control an operator can act on: a destination
             // that cannot receive is a different problem from a guest that is
@@ -787,7 +1778,8 @@ impl Api {
     /// per-destination, so this enumerates rather than choosing — and a node
     /// missing from the list means it does not exist, never that it is
     /// undecided.
-    pub async fn explain_migration(&self, name: &ResourceName) -> ApiResult<Value> {
+    pub async fn explain_migration(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+        self.authorize(who, Verb::Read, name).await?;
         if name.collection() != "instances" {
             return Err(ApiError::invalid("a migration moves an instance"));
         }
@@ -811,7 +1803,9 @@ impl Api {
                     format!("{name} is on {from}, which is not a node this cell knows"),
                 )
             })?;
-        let cached = self.image_cached_on(&instance.spec.image).await?;
+        let cached = self
+            .image_cached_on(&instance.spec.image, &mut Scratch::default())
+            .await?;
 
         let destinations: Vec<Value> = nodes
             .iter()
@@ -847,14 +1841,14 @@ impl Api {
     /// invariant 1 exists to forbid. So each node says what it holds and this
     /// adds them up, which also means the answer cannot be stale in the way a
     /// list maintained by a departed node would be.
-    async fn image_cached_on(&self, image: &str) -> ApiResult<Vec<String>> {
+    async fn image_cached_on(&self, image: &str, scratch: &mut Scratch) -> ApiResult<Vec<String>> {
         let Ok(name) = ResourceName::parse(image) else {
             return Ok(Vec::new());
         };
         if name.collection() != "images" {
             return Ok(Vec::new());
         }
-        let nodes: Vec<Node> = self.typed_list("", "nodes").await?;
+        let nodes = scratch.nodes(self).await?;
         Ok(nodes_holding(image, &nodes))
     }
 
@@ -1019,6 +2013,39 @@ fn exceeded(limit: u64, wanted: u64, what: &str, field: &str) -> ApiResult<()> {
     .at(field))
 }
 
+/// Who a read is for, as far as the page loop and the event stream are
+/// concerned.
+///
+/// Two cases and no third: either every object that survives the filter goes
+/// through, or each one is checked against a caller first. Modelled as a type
+/// rather than an `Option<Identity>` so "no identity" cannot be read as "deny
+/// everything" by a future reader — it means the caller has *already* been
+/// authorised, on the parent, which is the common path and the one where being
+/// wrong is silent.
+///
+/// One type for both paths on purpose. A list and a watch answer the same
+/// question about the same objects, and the moment they answer it in two
+/// different shapes is the moment one of them grows a case the other does not —
+/// which is how the watch came to have no authorisation at all while the list
+/// had it all along.
+///
+/// Owns its identity rather than borrowing: the stream outlives the call that
+/// built it, and a lifetime here would push that problem into every caller.
+#[derive(Clone)]
+enum Gate {
+    Everything,
+    Readable(Identity),
+}
+
+/// A document's resource name, which is also the order everything is paged in.
+///
+/// The store keys an object as its collection prefix plus this exact string, so
+/// key order inside a collection *is* name order — which is what lets a page
+/// token carry a name and still be honoured by a read that goes to the store.
+fn name_of(document: &Value) -> Option<String> {
+    joined(&document["meta"]["name"])
+}
+
 /// Whether a document's name sits under `parent`. An empty parent is the whole
 /// collection, which is what a root collection like `nodes` always is.
 fn under(document: &Value, parent: &str) -> bool {
@@ -1066,4 +2093,28 @@ pub fn created_body(created: &Created) -> Value {
     );
     body.insert("target".into(), Value::String(created.target.clone()));
     Value::Object(body)
+}
+
+/// Refuse a security-group rule that cannot mean what it says.
+///
+/// At the edge rather than in the agent, because the alternative is a rule that
+/// is accepted, stored, shown back on read and then quietly skipped by whichever
+/// node reads it — which is the failure this whole feature exists to remove, in
+/// miniature. The agent skips such a rule too, but only as the belt to this
+/// brace, for a group written by an older version of this software.
+fn check_rules(kind: &str, spec: &Value) -> ApiResult<()> {
+    if kind != "security-groups" {
+        return Ok(());
+    }
+    let Some(rules) = spec.get("rules").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (i, rule) in rules.iter().enumerate() {
+        let parsed: velstra_cloud_model::security::SecurityRule =
+            serde_json::from_value(rule.clone())
+                .map_err(|e| ApiError::invalid(format!("{e}")).at(format!("spec.rules[{i}]")))?;
+        validate(&parsed)
+            .map_err(|e| ApiError::invalid(e.to_string()).at(format!("spec.rules[{i}]")))?;
+    }
+    Ok(())
 }

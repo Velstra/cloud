@@ -8,12 +8,19 @@
 //! Start with [`meta`] for the three invariants everything else follows from.
 
 pub mod access;
+pub mod assignment;
+pub mod authz;
+pub mod ipam;
 pub mod meta;
 pub mod migration;
+pub mod network;
 pub mod reconcile;
 pub mod resources;
+pub mod routing;
+pub mod security;
 pub mod storage;
 
 pub use access::{WriteRefused, Writer};
 pub use meta::{Condition, ConditionStatus, Meta, Placement, ResourceName, Revision, Timestamp};
+pub use network::Cidr;
 pub use resources::{Observed, Resource};

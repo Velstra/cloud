@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use velstra_cloud_model::{
     meta::Timestamp,
     migration::MigrationMode,
-    resources::{Capacity, InstanceState, PortSpec},
+    resources::{Capacity, InstanceState, NetworkSpec, PortSpec},
+    security::ResolvedRule,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -111,10 +112,29 @@ pub struct VmRequest {
     pub memory_mib: u64,
     pub image: String,
     pub root_disk_gib: u64,
-    /// Host tap devices, in the order the instance's ports are declared. The
+    /// The guest's NICs, in the order the instance's ports are declared. The
     /// order is the guest's NIC order, and a guest that finds its addresses on
     /// the wrong NIC after a restart is an outage with no error message.
-    pub taps: Vec<String>,
+    pub nics: Vec<Nic>,
+}
+
+/// One NIC, as the host has to build it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Nic {
+    /// The host tap device the datapath handed back for this port.
+    pub tap: String,
+    /// The hardware address the guest must come up with — the port's, so that
+    /// the platform and the guest agree about which NIC this is.
+    ///
+    /// Everything downstream of a NIC is keyed by it: DHCP finds the guest's
+    /// binding by it, the metadata service's network document matches on it,
+    /// and the fabric's filters are written against it. A VMM left to invent
+    /// one gives the guest an identity nothing else in the system has heard of,
+    /// and a guest that is migrated comes back as a different machine.
+    ///
+    /// `None` only for a port that has no MAC of its own, where letting the
+    /// VMM choose is still better than refusing to start the guest.
+    pub mac: Option<String>,
 }
 
 /// What a transfer needs. Assembled by the agent from the migration's spec, so
@@ -142,7 +162,12 @@ pub trait Vmm: Send + Sync + 'static {
     /// and verified is a success, not an error.
     async fn pull_image(&self, digest: &str) -> Result<()>;
 
-    async fn create_disk(&self, instance: &str, gib: u64) -> Result<()>;
+    /// Make the guest's root disk: a copy of `image`, grown to `gib`.
+    ///
+    /// The copy is not a step afterwards. A disk that exists empty for even one
+    /// pass is a disk a guest can be started from, and a guest booted off an
+    /// empty disk fails in the least legible way there is.
+    async fn create_disk(&self, instance: &str, gib: u64, image: &str) -> Result<()>;
 
     async fn start(&self, request: &VmRequest) -> Result<()>;
 
@@ -199,15 +224,53 @@ pub trait Vmm: Send + Sync + 'static {
     async fn cancel_send(&self, instance: &str) -> Result<()>;
 }
 
+/// A port as the datapath currently has it.
+///
+/// The rules are part of the observation and not merely of the request, because
+/// a decision that cannot see them cannot notice when they have gone stale —
+/// and they go stale without anything about the port being touched, since a
+/// group's membership is a property of the cell. A datapath that reported only
+/// its taps would make "programmed" mean "present", and a guest that joined a
+/// group would keep the allowances it had before it joined for ever.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProgrammedPort {
+    pub tap: String,
+    pub rules: Vec<ResolvedRule>,
+}
+
 #[async_trait]
 pub trait Datapath: Send + Sync + 'static {
-    /// Port resource name to the host tap device carrying it, for the ports
+    /// Port resource name to what the datapath has for it, for the ports
     /// programmed on this node right now.
-    async fn observe(&self) -> Result<BTreeMap<String, String>>;
+    async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>>;
 
     /// Program a port and return its tap device. Idempotent: the fabric takes a
     /// desired map, not a delta, so asking twice is asking once.
-    async fn program(&self, port: &str, spec: &PortSpec) -> Result<String>;
+    ///
+    /// `rules` is what the port's security groups came to, already resolved to
+    /// prefixes — no group names, nothing this implementation would have to look
+    /// up. It is passed separately from the spec rather than folded into it
+    /// because it is not part of what anybody declared: it is a function of the
+    /// groups *and* of which ports currently hold which addresses, recomputed
+    /// every pass, so a member coming or going changes it without the port
+    /// having been touched.
+    ///
+    /// An empty list is not "unrestricted": it is the platform's own default —
+    /// ingress denied, egress allowed, replies allowed — with nothing added.
+    ///
+    /// `network` is the segment the port is on, and it is passed rather than
+    /// looked up because `spec.network` is only its *name*. A datapath that has
+    /// to put a frame on a wire needs the segment's identity **on** that wire —
+    /// the VNI — and its MTU, and neither is derivable from a resource name. The
+    /// fake and the tap-only datapath ignore it; the one that programs an
+    /// overlay cannot.
+    async fn program(
+        &self,
+        port: &str,
+        spec: &PortSpec,
+        network: &NetworkSpec,
+        rules: &[ResolvedRule],
+    ) -> Result<String>;
 
     async fn unprogram(&self, port: &str) -> Result<()>;
 }

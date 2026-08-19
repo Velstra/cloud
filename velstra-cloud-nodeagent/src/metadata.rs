@@ -13,11 +13,32 @@
 //! the answerer already knows to be true. An address the agent has not
 //! programmed on this node gets a 404, and one guest asking about another's
 //! user-data is not a request this service can express.
+//!
+//! ## Which shape, and why both
+//!
+//! The paths are **EC2 IMDS** — `/latest/meta-data/…` and `/latest/user-data`.
+//! That is the one surface an unmodified cloud image finds by itself: cloud-init
+//! probes `169.254.169.254` on every boot with no kernel command line, no seed
+//! ISO and no configuration from the operator, and an image that has never
+//! heard of this platform comes up with its hostname, its keys and its
+//! user-data.
+//!
+//! The same document is also served at the three flat **NoCloud** paths
+//! (`/meta-data`, `/user-data`, `/network-config`), and the reason is one
+//! specific gap rather than a wish to support everything: the EC2 surface has
+//! no key for a gateway and no key for a resolver — an AWS guest learns both
+//! from DHCP and there is nowhere in that shape to put them. A guest that wants
+//! to render its own networking needs them, so it needs the NoCloud
+//! `network-config`, which is netplan and can say so.
+//!
+//! Both renderings are computed from one [`crate::guests::GuestView`] on every
+//! request. There is no second copy of the truth to go stale, and no request
+//! anywhere in this file whose answer depends on anything but which guest
+//! asked.
 
 use std::{
-    collections::BTreeMap,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
 use axum::{
@@ -27,61 +48,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use velstra_cloud_model::network::format_mac;
 
-/// What a guest may learn about itself.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct InstanceMetadata {
-    /// The instance resource name.
-    pub instance_id: String,
-    pub hostname: String,
-    pub ssh_keys: Vec<String>,
-    pub user_data: Option<String>,
-}
-
-/// Which address is which guest, on this node.
-///
-/// Replaced wholesale by the agent on every pass rather than edited: the map is
-/// derived from the instances and ports this node currently holds, so an entry
-/// can never outlive the guest it describes — which is how a re-used address
-/// ends up serving the previous tenant's keys.
-#[derive(Clone, Default)]
-pub struct MetadataRegistry {
-    by_address: Arc<RwLock<BTreeMap<IpAddr, Arc<InstanceMetadata>>>>,
-}
-
-impl MetadataRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn replace(&self, entries: BTreeMap<IpAddr, InstanceMetadata>) {
-        let next = entries
-            .into_iter()
-            .map(|(addr, meta)| (addr, Arc::new(meta)))
-            .collect();
-        *self.by_address.write().unwrap() = next;
-    }
-
-    pub fn lookup(&self, addr: IpAddr) -> Option<Arc<InstanceMetadata>> {
-        self.by_address.read().unwrap().get(&addr).cloned()
-    }
-
-    pub fn len(&self) -> usize {
-        self.by_address.read().unwrap().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Parse an address as it appears on a port — with or without a prefix length.
-pub fn address_of(port_address: &str) -> Option<IpAddr> {
-    port_address
-        .split('/')
-        .next()
-        .and_then(|a| a.parse::<IpAddr>().ok())
-}
+use crate::guests::{GuestRegistry, GuestView, Interface};
 
 /// Serve until the returned handle is dropped or aborted.
 ///
@@ -90,7 +59,7 @@ pub fn address_of(port_address: &str) -> Option<IpAddr> {
 /// exactly where it ended up instead of guessing.
 pub async fn serve(
     listen: SocketAddr,
-    registry: MetadataRegistry,
+    registry: GuestRegistry,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let bound = listener.local_addr()?;
@@ -104,28 +73,41 @@ pub async fn serve(
     Ok((bound, handle))
 }
 
-fn router(registry: MetadataRegistry) -> Router {
+fn router(registry: GuestRegistry) -> Router {
     Router::new()
+        // EC2 IMDS: what an unmodified image asks for on its own.
         .route("/latest/meta-data", get(index))
         .route("/latest/meta-data/", get(index))
         .route("/latest/meta-data/instance-id", get(instance_id))
         .route("/latest/meta-data/hostname", get(hostname))
         .route("/latest/meta-data/local-hostname", get(hostname))
+        .route("/latest/meta-data/local-ipv4", get(local_ipv4))
+        .route("/latest/meta-data/mac", get(primary_mac))
         .route("/latest/meta-data/public-keys", get(public_keys))
         .route("/latest/meta-data/public-keys/", get(public_keys))
         .route(
             "/latest/meta-data/public-keys/:index/openssh-key",
             get(openssh_key),
         )
+        .route("/latest/meta-data/network/interfaces/macs", get(macs))
+        .route("/latest/meta-data/network/interfaces/macs/", get(macs))
+        .route(
+            "/latest/meta-data/network/interfaces/macs/:mac/:field",
+            get(nic_field),
+        )
         .route("/latest/user-data", get(user_data))
+        // NoCloud: the flat trio, for an image told `ds=nocloud-net`.
+        .route("/meta-data", get(nocloud_meta_data))
+        .route("/user-data", get(user_data))
+        .route("/network-config", get(network_config))
         .fallback(unknown_path)
         .with_state(registry)
 }
 
 /// The one place a caller becomes a guest. Everything else in this file goes
 /// through it, so there is no handler that can accidentally answer for someone.
-fn caller(registry: &MetadataRegistry, peer: SocketAddr) -> Option<Arc<InstanceMetadata>> {
-    registry.lookup(peer.ip())
+fn caller(registry: &GuestRegistry, peer: SocketAddr) -> Option<Arc<GuestView>> {
+    registry.at_address(peer.ip()).map(|(view, _)| view)
 }
 
 /// Deliberately the same answer for a stranger and for a path that does not
@@ -144,17 +126,19 @@ fn text(body: impl Into<String>) -> Response {
 }
 
 async fn index(
-    State(registry): State<MetadataRegistry>,
+    State(registry): State<GuestRegistry>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
     match caller(&registry, peer) {
-        Some(_) => text("instance-id\nhostname\nlocal-hostname\npublic-keys\n"),
+        Some(_) => {
+            text("instance-id\nhostname\nlocal-hostname\nlocal-ipv4\nmac\nnetwork/\npublic-keys\n")
+        }
         None => not_found(),
     }
 }
 
 async fn instance_id(
-    State(registry): State<MetadataRegistry>,
+    State(registry): State<GuestRegistry>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
     match caller(&registry, peer) {
@@ -164,7 +148,7 @@ async fn instance_id(
 }
 
 async fn hostname(
-    State(registry): State<MetadataRegistry>,
+    State(registry): State<GuestRegistry>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
     match caller(&registry, peer) {
@@ -173,8 +157,37 @@ async fn hostname(
     }
 }
 
+/// The address the guest is asking from, which is by construction one of its
+/// own. Answered from the request rather than from the first interface: a
+/// guest with two NICs asking down one of them means that one.
+async fn local_ipv4(
+    State(registry): State<GuestRegistry>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    match registry.at_address(peer.ip()) {
+        Some((me, n)) => match me.interfaces[n].address() {
+            Some(address) => text(address.to_string()),
+            None => not_found(),
+        },
+        None => not_found(),
+    }
+}
+
+async fn primary_mac(
+    State(registry): State<GuestRegistry>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    match registry.at_address(peer.ip()) {
+        Some((me, n)) => match me.interfaces[n].mac {
+            Some(mac) => text(format_mac(&mac)),
+            None => not_found(),
+        },
+        None => not_found(),
+    }
+}
+
 async fn public_keys(
-    State(registry): State<MetadataRegistry>,
+    State(registry): State<GuestRegistry>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
     match caller(&registry, peer) {
@@ -191,7 +204,7 @@ async fn public_keys(
 }
 
 async fn openssh_key(
-    State(registry): State<MetadataRegistry>,
+    State(registry): State<GuestRegistry>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(index): Path<usize>,
 ) -> Response {
@@ -204,8 +217,72 @@ async fn openssh_key(
     }
 }
 
+/// The index of this guest's NICs, keyed the way EC2 keys them.
+async fn macs(
+    State(registry): State<GuestRegistry>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    let Some(me) = caller(&registry, peer) else {
+        return not_found();
+    };
+    text(
+        me.interfaces
+            .iter()
+            .filter_map(|nic| nic.mac)
+            .map(|mac| format!("{}/\n", format_mac(&mac)))
+            .collect::<String>(),
+    )
+}
+
+/// One field of one of this guest's NICs.
+///
+/// A MAC in the path selects only among **this guest's own** interfaces, so it
+/// is a way of saying "the other one of mine" and never a way of asking about
+/// somebody else's NIC. The identity is still the source address.
+async fn nic_field(
+    State(registry): State<GuestRegistry>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path((mac, field)): Path<(String, String)>,
+) -> Response {
+    let Some(me) = caller(&registry, peer) else {
+        return not_found();
+    };
+    let Some(nic) = me
+        .interfaces
+        .iter()
+        .find(|nic| nic.mac.map(|m| format_mac(&m)) == Some(mac.to_lowercase()))
+    else {
+        return not_found();
+    };
+    // Each of these keys is about one address family, so a v6 NIC asked for
+    // `local-ipv4s` has nothing to say and says nothing — answering with its v6
+    // address under a v4 key is how a guest ends up writing one into a field
+    // that cannot hold it.
+    let Some(cidr) = nic.cidr else {
+        return not_found();
+    };
+    let family = match cidr.address {
+        IpAddr::V4(_) => Family::V4,
+        IpAddr::V6(_) => Family::V6,
+    };
+    match (field.as_str(), family) {
+        ("mac", _) => text(mac),
+        ("local-ipv4s", Family::V4) | ("ipv6s", Family::V6) => text(format!("{}\n", cidr.address)),
+        ("subnet-ipv4-cidr-block", Family::V4) | ("subnet-ipv6-cidr-blocks", Family::V6) => {
+            text(format!("{}/{}\n", cidr.network(), cidr.prefix_len))
+        }
+        _ => not_found(),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Family {
+    V4,
+    V6,
+}
+
 async fn user_data(
-    State(registry): State<MetadataRegistry>,
+    State(registry): State<GuestRegistry>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
     let Some(me) = caller(&registry, peer) else {
@@ -219,43 +296,211 @@ async fn user_data(
     }
 }
 
+async fn nocloud_meta_data(
+    State(registry): State<GuestRegistry>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    match caller(&registry, peer) {
+        Some(me) => text(render_meta_data(&me)),
+        None => not_found(),
+    }
+}
+
+async fn network_config(
+    State(registry): State<GuestRegistry>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    let Some(me) = caller(&registry, peer) else {
+        return not_found();
+    };
+    match render_network_config(&me) {
+        // Nothing this node knows about the guest's NICs is worth rendering —
+        // no MAC, no address. Better a 404 than a document that would leave
+        // cloud-init configuring an interface into nothing.
+        None => not_found(),
+        Some(document) => text(document),
+    }
+}
+
 async fn unknown_path() -> Response {
     not_found()
 }
 
+// ---- the documents -------------------------------------------------------
+
+/// The NoCloud `meta-data` document.
+///
+/// Pure, so what a guest is told is a unit test rather than a live boot.
+pub fn render_meta_data(view: &GuestView) -> String {
+    let mut out = format!(
+        "instance-id: {}\nlocal-hostname: {}\nhostname: {}\n",
+        view.instance_id, view.hostname, view.hostname
+    );
+    if !view.ssh_keys.is_empty() {
+        out.push_str("public-keys:\n");
+        for key in &view.ssh_keys {
+            // Quoted, because a key ends in a comment that may contain
+            // anything, including a colon.
+            out.push_str(&format!("  - \"{}\"\n", key.replace('"', "\\\"")));
+        }
+    }
+    out
+}
+
+/// The NoCloud `network-config` document: netplan v2, one entry per NIC.
+///
+/// **Static addresses rather than `dhcp4: true`**, even though this platform
+/// does run DHCP for these guests. The two cannot disagree — both are rendered
+/// from the same [`GuestView`] — and stating the addresses means a guest whose
+/// DHCP client is slow, disabled or replaced still comes up on the network it
+/// was given. The DHCP responder exists for the guest's *first* moments, before
+/// it has read any of this.
+///
+/// Interfaces are matched by MAC rather than by name, because a NIC's name
+/// depends on the guest's own udev and its bus order, and being wrong about
+/// that means configuring somebody else's interface.
+pub fn render_network_config(view: &GuestView) -> Option<String> {
+    let usable: Vec<&Interface> = view
+        .interfaces
+        .iter()
+        .filter(|nic| nic.mac.is_some() && nic.cidr.is_some())
+        .collect();
+    if usable.is_empty() {
+        return None;
+    }
+    let mut out = String::from("version: 2\nethernets:\n");
+    for (n, nic) in usable.iter().enumerate() {
+        let mac = format_mac(&nic.mac.expect("filtered"));
+        let cidr = nic.cidr.expect("filtered");
+        out.push_str(&format!("  velstra{n}:\n"));
+        out.push_str(&format!("    match:\n      macaddress: \"{mac}\"\n"));
+        out.push_str("    dhcp4: false\n    dhcp6: false\n");
+        out.push_str(&format!(
+            "    addresses:\n      - \"{}/{}\"\n",
+            cidr.address, cidr.prefix_len
+        ));
+        if let Some(mtu) = nic.mtu {
+            out.push_str(&format!("    mtu: {mtu}\n"));
+        }
+        // Only the first NIC gets a default route. Two default routes with no
+        // metric between them is a guest whose egress depends on which one the
+        // kernel happened to install second.
+        if n == 0 {
+            if let Some(gateway) = nic.gateway {
+                let destination = if gateway.is_ipv4() {
+                    "0.0.0.0/0"
+                } else {
+                    "::/0"
+                };
+                out.push_str(&format!(
+                    "    routes:\n      - to: \"{destination}\"\n        via: \"{gateway}\"\n"
+                ));
+            }
+            if !nic.dns.is_empty() {
+                out.push_str("    nameservers:\n      addresses:\n");
+                for resolver in &nic.dns {
+                    out.push_str(&format!("        - \"{resolver}\"\n"));
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
+    use velstra_cloud_model::network::{Cidr, parse_mac};
+
     use super::*;
 
-    #[test]
-    fn an_address_is_taken_from_a_port_with_or_without_its_prefix() {
-        assert_eq!(
-            address_of("10.0.0.5/24"),
-            Some("10.0.0.5".parse::<IpAddr>().unwrap())
-        );
-        assert_eq!(
-            address_of("fd00::5"),
-            Some("fd00::5".parse::<IpAddr>().unwrap())
-        );
-        assert_eq!(address_of("not-an-address"), None);
+    fn guest() -> GuestView {
+        GuestView {
+            instance_id: "projects/p1/instances/i1".into(),
+            hostname: "i1".into(),
+            ssh_keys: vec!["ssh-ed25519 AAAA user@host".into()],
+            user_data: Some("#cloud-config\n".into()),
+            interfaces: vec![Interface {
+                port: "projects/p1/ports/port-a".into(),
+                mac: parse_mac("52:54:00:12:34:56"),
+                cidr: Some(Cidr::parse("10.20.0.10/24").unwrap()),
+                gateway: Some("10.20.0.1".parse().unwrap()),
+                dns: vec!["10.20.0.1".parse().unwrap()],
+                mtu: Some(1450),
+                tap: Some("vt-port-a".into()),
+            }],
+        }
     }
 
     #[test]
-    fn replacing_the_map_forgets_an_address_that_is_no_longer_here() {
-        // The reason this is a replace and not an insert: a guest that moved
-        // away must stop being answerable for, immediately and without anyone
-        // remembering to remove it.
-        let registry = MetadataRegistry::new();
-        let addr: IpAddr = "10.0.0.5".parse().unwrap();
-        registry.replace(BTreeMap::from([(
-            addr,
-            InstanceMetadata {
-                instance_id: "projects/p1/instances/i1".into(),
-                ..Default::default()
-            },
-        )]));
-        assert!(registry.lookup(addr).is_some());
-        registry.replace(BTreeMap::new());
-        assert!(registry.lookup(addr).is_none());
+    fn the_meta_data_document_says_who_the_guest_is() {
+        let document = render_meta_data(&guest());
+        assert!(
+            document.contains("instance-id: projects/p1/instances/i1"),
+            "{document}"
+        );
+        assert!(document.contains("local-hostname: i1"), "{document}");
+        assert!(
+            document.contains("\"ssh-ed25519 AAAA user@host\""),
+            "{document}"
+        );
+    }
+
+    #[test]
+    fn the_network_config_is_netplan_matched_by_mac() {
+        let document = render_network_config(&guest()).unwrap();
+        assert_eq!(
+            document,
+            "version: 2\n\
+             ethernets:\n  \
+               velstra0:\n    \
+                 match:\n      \
+                   macaddress: \"52:54:00:12:34:56\"\n    \
+                 dhcp4: false\n    \
+                 dhcp6: false\n    \
+                 addresses:\n      \
+                   - \"10.20.0.10/24\"\n    \
+                 mtu: 1450\n    \
+                 routes:\n      \
+                   - to: \"0.0.0.0/0\"\n        \
+                     via: \"10.20.0.1\"\n    \
+                 nameservers:\n      \
+                   addresses:\n        \
+                     - \"10.20.0.1\"\n"
+        );
+    }
+
+    #[test]
+    fn only_the_first_interface_carries_the_default_route() {
+        // Two of them, and the guest's egress becomes a race between whichever
+        // the kernel installed last.
+        let mut two = guest();
+        let mut second = two.interfaces[0].clone();
+        second.mac = parse_mac("52:54:00:aa:bb:cc");
+        second.cidr = Some(Cidr::parse("10.21.0.10/24").unwrap());
+        two.interfaces.push(second);
+        let document = render_network_config(&two).unwrap();
+        assert_eq!(
+            document.matches("to: \"0.0.0.0/0\"").count(),
+            1,
+            "{document}"
+        );
+        assert_eq!(document.matches("macaddress").count(), 2, "{document}");
+    }
+
+    #[test]
+    fn a_v6_only_guest_gets_a_v6_default_route() {
+        let mut v6 = guest();
+        v6.interfaces[0].cidr = Some(Cidr::parse("fd00:1::10/64").unwrap());
+        v6.interfaces[0].gateway = Some("fd00:1::1".parse().unwrap());
+        let document = render_network_config(&v6).unwrap();
+        assert!(document.contains("to: \"::/0\""), "{document}");
+        assert!(document.contains("- \"fd00:1::10/64\""), "{document}");
+    }
+
+    #[test]
+    fn a_nic_the_platform_cannot_describe_is_left_out_rather_than_half_written() {
+        let mut unknown = guest();
+        unknown.interfaces[0].cidr = None;
+        assert_eq!(render_network_config(&unknown), None);
     }
 }

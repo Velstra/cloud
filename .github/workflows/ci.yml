@@ -1,0 +1,263 @@
+name: CI
+
+# Three lanes, split by what each one needs from the machine:
+#
+#   check    — the workspace: format, lints, and every test that only needs a
+#              CPU and an etcd. Runs on every push and every pull request.
+#   console  — the browser suite. Also every push and pull request: it takes
+#              about a minute and it is the only thing that catches a console
+#              that loads, parses, renders, and then does nothing.
+#   guests   — the two tests that start a real virtual machine. Needs /dev/kvm,
+#              QEMU, Cloud Hypervisor and a guest image, so it is the one lane
+#              with fixtures to install. It still runs per pull request rather
+#              than nightly, because the change most likely to break it is a
+#              change to the node agent, and the run itself is seconds once the
+#              fixtures are cached.
+#
+# The nightly schedule re-runs all three unchanged. Nothing here is nightly-only:
+# it exists to catch what moves underneath us — a new nightly rustfmt, a mirror
+# that stopped serving an image, a hosted runner that lost KVM — on a day when
+# nobody is waiting on a merge.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 05:00, an hour clear of the other three repositories' nightlies (wren 02,
+    # sentinel 03, fabric 04): concurrent jobs are capped per account, not per
+    # repository, and sentinel's nightly alone asks for twelve of them.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; no job here writes anything back to the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # `rustfmt.toml` sets `group_imports` and `imports_granularity`, which are
+      # nightly-only. Stable rustfmt does not fail on them — it prints
+      # "unstable features are only available in nightly" and formats without
+      # them, so a stable `cargo fmt --check` is a gate that passes whatever the
+      # imports look like. Hence a nightly toolchain, used for `fmt` and nothing
+      # else. It is the rolling nightly, so if one day rustfmt changes its mind
+      # about imports and this goes red on an unrelated pull request, pin
+      # `dtolnay/rust-toolchain@master` with `toolchain: nightly-YYYY-MM-DD`
+      # here — do not reformat the tree to satisfy a moving target.
+      - name: Install Rust (nightly, for rustfmt only)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `velstra-cloud-proto` compiles the `.proto` with prost, which shells out
+      # to `protoc`. Without it the build fails in the build script with
+      # "Could not find `protoc`".
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # `velstra-cloud-store/tests/etcd.rs` starts its own single-node etcd per
+      # case. Without the binary those cases fail rather than skip (deliberately:
+      # `VELSTRA_ETCD_OPTIONAL=1` is the only way to accept the gap, and CI is
+      # exactly where the gap must not be accepted). So install it, and do NOT
+      # set that variable anywhere in this file.
+      - name: Install etcd
+        run: |
+          set -euo pipefail
+          version=v3.6.14
+          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${version}/etcd-${version}-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin --strip-components=1 \
+                "etcd-${version}-linux-amd64/etcd" "etcd-${version}-linux-amd64/etcdctl"
+          etcd --version
+
+      - name: rustfmt
+        run: cargo +nightly fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # `--locked` on purpose: a Cargo.lock that no longer matches the manifests
+      # is a change nobody made on purpose, and it is better found here than in
+      # a release build.
+      #
+      # This runs the two guest-boot tests too, and they will skip — the runner
+      # has no QEMU here. That is what the `guests` job below is for; it installs
+      # the fixtures and fails if they skip there.
+      - name: test
+        run: cargo test --workspace --locked
+
+  console:
+    name: browser suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `run.sh` builds the page with cargo. Only the console crate is built,
+      # which does not need protoc today — installed anyway so that the day a
+      # console dependency reaches the proto crate, this job fails on the
+      # console and not on its toolchain.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # The harness drives Chrome over the DevTools protocol and takes the
+      # binary from $CHROMIUM. The hosted image ships both Chromium and Google
+      # Chrome; resolve whichever is there rather than assuming a name.
+      - name: Locate a browser
+        run: |
+          set -euo pipefail
+          for candidate in chromium chromium-browser google-chrome google-chrome-stable; do
+            if command -v "$candidate" >/dev/null; then
+              echo "CHROMIUM=$(command -v "$candidate")" >> "$GITHUB_ENV"
+              "$candidate" --version
+              exit 0
+            fi
+          done
+          echo "::error::no Chromium or Chrome on this runner — the console suite cannot run."
+          exit 1
+
+      # No setup-node: the harness is one file using only built-in APIs, and it
+      # passes on the Node the hosted image already ships (22.x, verified).
+      - name: Drive the console in a real browser
+        run: velstra-cloud-console/tests/console/run.sh
+
+  guests:
+    name: a guest really boots
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # /dev/kvm exists on hosted x86 Linux runners (GitHub enabled hardware
+      # acceleration on the 2-vCPU images in April 2024), but it is root:kvm
+      # 0660 and the `runner` user is not in that group, so a job that does not
+      # do this finds a device it cannot open. GitHub documents nested
+      # virtualization as unsupported-but-present: if a future image drops it,
+      # this job goes red rather than quietly falling back to software
+      # emulation, and the answer is then a self-hosted runner.
+      - name: Let this user open /dev/kvm
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is not writable — these tests cannot boot anything."
+            ls -l /dev/kvm || true
+            exit 1
+          fi
+          ls -l /dev/kvm
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler qemu-system-x86 qemu-utils
+
+      - name: Install Cloud Hypervisor
+        run: |
+          set -euo pipefail
+          version=v53.0
+          sudo curl -fsSL -o /usr/local/bin/cloud-hypervisor \
+            "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${version}/cloud-hypervisor-static"
+          sudo chmod +x /usr/local/bin/cloud-hypervisor
+          cloud-hypervisor --version
+
+      # Two different guests, because the two backends do not accept the same
+      # one — which is the finding the Cloud Hypervisor test exists to record.
+      # QEMU boots a stock BIOS cloud image through its own firmware; Cloud
+      # Hypervisor has no firmware and takes a kernel and an initramfs directly.
+      # Both are pinned, and cached so the mirror is asked once per pin.
+      - name: Cache the guest fixtures
+        id: fixtures
+        uses: actions/cache@v6
+        with:
+          path: /tmp/vq
+          key: guest-fixtures-alpine-3.21.7-netboot-3.21
+
+      - name: Fetch the guest fixtures
+        if: steps.fixtures.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/vq/boot
+          base=https://dl-cdn.alpinelinux.org/alpine/v3.21/releases
+          # A BIOS-partitioned image on purpose: QEMU's SeaBIOS boots it, and the
+          # UEFI variant would not be booting the same path the platform ships.
+          curl -fsSL -o /tmp/vq/alpine.qcow2 \
+            "$base/cloud/nocloud_alpine-3.21.7-x86_64-bios-cloudinit-r0.qcow2"
+          qemu-img convert -f qcow2 -O raw /tmp/vq/alpine.qcow2 /tmp/vq/alpine.raw
+          rm -f /tmp/vq/alpine.qcow2
+          curl -fsSL -o /tmp/vq/boot/vmlinuz-virt "$base/x86_64/netboot/vmlinuz-virt"
+          curl -fsSL -o /tmp/vq/boot/initramfs-virt "$base/x86_64/netboot/initramfs-virt"
+          ls -l /tmp/vq /tmp/vq/boot
+
+      # Both backends start their guests with `systemd-run --user`, which needs
+      # a user manager and a session bus. A hosted runner has systemd but no
+      # login session for `runner`, so linger is what brings user@UID up.
+      - name: Give this user a systemd manager
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$(id -un)"
+          runtime="/run/user/$(id -u)"
+          # `[ -d … ] && break` would end the step rather than the loop: an
+          # && list whose left side fails is still a failing command, and this
+          # script runs under `set -e`.
+          for _ in $(seq 30); do
+            if [ -d "$runtime" ]; then break; fi
+            sleep 1
+          done
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" \
+            systemd-run --user --scope true
+          echo "systemd-run --user works"
+
+      # Both tests skip themselves when the machine cannot run them, which is
+      # right on a laptop and worthless here: a lane that installed QEMU, Cloud
+      # Hypervisor, KVM and two guest images and then skipped is a green tick
+      # that proves nothing. So the output is kept and read, and any "skipping:"
+      # in it fails the job with the reason the test printed.
+      - name: Boot a guest under each backend
+        run: |
+          set -euo pipefail
+          cargo test -p velstra-cloud-nodeagent --locked \
+            --test qemu_boots_a_guest \
+            --test cloud_hypervisor_boots_a_guest \
+            -- --nocapture 2>&1 | tee /tmp/guests.log
+          if grep -q '^skipping:' /tmp/guests.log; then
+            echo "::error::a guest-boot test skipped instead of running:"
+            grep '^skipping:' /tmp/guests.log
+            exit 1
+          fi
+          # Belt and braces: cargo reports "ok" for a test that returned early,
+          # so count the ones that actually reported.
+          booted=$(grep -c '^test .* \.\.\. ok$' /tmp/guests.log || true)
+          if [ "$booted" -lt 2 ]; then
+            echo "::error::expected two guests to boot, saw $booted"
+            exit 1
+          fi
+          echo "$booted guests booted."

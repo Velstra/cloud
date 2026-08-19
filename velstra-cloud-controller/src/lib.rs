@@ -21,16 +21,20 @@
 //! * **Backed off per object.** One object that can never reconcile costs one
 //!   slot in a rate-limited queue, not a core and not its neighbours' latency.
 
+pub mod address;
 pub mod attachment;
 pub mod backoff;
 pub mod drift;
+pub mod instance;
 pub mod metrics;
 pub mod migration;
 pub mod operations;
+pub mod port;
 pub mod queue;
 pub mod quota;
 pub mod runner;
 pub mod scheduler;
+pub mod snapshot;
 pub mod status;
 pub mod volume;
 

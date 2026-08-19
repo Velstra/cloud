@@ -16,11 +16,22 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use velstra_cloud_model::meta::Revision;
 
+pub mod cache;
+pub mod etcd;
 pub mod memory;
 pub mod typed;
 
+pub use cache::Cached;
+pub use etcd::EtcdStore;
 pub use memory::MemoryStore;
 pub use typed::TypedStore;
+
+/// How far a watcher may fall behind before the store gives up on it.
+///
+/// Public because it is part of the contract rather than a tuning knob: every
+/// backend queues exactly this much and then drops the watcher, and a test that
+/// wants to prove that has to know the number to exceed it.
+pub const WATCH_QUEUE: usize = 1024;
 
 /// One stored object, as bytes plus the revision it was read at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +39,20 @@ pub struct Entry {
     pub key: String,
     pub value: Vec<u8>,
     pub revision: Revision,
+}
+
+/// One page of a prefix scan.
+///
+/// `more` is the answer to "is there anything after this", and it is a separate
+/// field rather than something the caller infers from `entries.len() == limit`:
+/// a collection whose size is an exact multiple of the page size would otherwise
+/// always report one page too many, and the caller would ask for a page that
+/// comes back empty. Small, but it is the difference between a client that stops
+/// and one that makes a pointless round trip every single time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    pub entries: Vec<Entry>,
+    pub more: bool,
 }
 
 /// What the caller believes about the current state, so a write can refuse to
@@ -98,6 +123,39 @@ pub trait Store: Send + Sync + 'static {
     /// offset — an offset into a changing collection skips objects.
     async fn list(&self, prefix: &str) -> Result<Vec<Entry>>;
 
+    /// One page of a prefix, in key order, starting strictly after `after`.
+    ///
+    /// `list` answers a whole collection, which is right for a controller that
+    /// reconciles it and wrong for an API serving a person: a cell of ten
+    /// thousand instances is ten thousand objects built, computed and serialised
+    /// to answer "show me the first twenty". This is the same scan, bounded.
+    ///
+    /// **Keys, not offsets.** An offset into a collection that is being written
+    /// to skips objects — delete the tenth while somebody holds "give me from
+    /// 10" and the eleventh is never seen by anybody. A key resumes exactly where
+    /// the last page stopped whatever happened in between.
+    ///
+    /// **What paging across pages does and does not promise.** A page is a
+    /// consistent read; a sequence of pages is not one. An object created before
+    /// the resume key after an earlier page was read will not appear, and one
+    /// deleted may still. That is deliberate rather than a shortcut: holding a
+    /// snapshot open across client round-trips means holding a revision the
+    /// backend is free to compact, and answering `410 Gone` to a caller whose
+    /// token got old — the cost Kubernetes pays for the guarantee. The
+    /// list-then-watch that actually needs consistency stays correct without it,
+    /// because the caller watches from the revision the *first* page reported and
+    /// the watch replays everything since; events carry whole objects, so
+    /// applying them over a slightly-torn list converges.
+    ///
+    /// **Deliberately without a default implementation.** One in terms of `list`
+    /// would be correct and would cost exactly what `list` costs — so a store
+    /// that wraps another (every counting, failing or delaying decorator in the
+    /// test suites) would inherit it, quietly reading the whole collection while
+    /// the caller believed it was reading a page. The measurement would then
+    /// report the cost of the thing it was written to prove was gone. Requiring
+    /// the method makes forgetting to forward it a compile error instead.
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Page>;
+
     /// Write, subject to `expect`. Returns the new revision.
     async fn put(&self, key: &str, value: Vec<u8>, expect: Expect) -> Result<Revision>;
 
@@ -122,6 +180,13 @@ pub trait Store: Send + Sync + 'static {
 /// The cell leads the key because a cell is the shard: when there are two, the
 /// prefix is what routes a request without parsing the rest.
 pub fn key_for(cell: &str, kind: &str, name: &str) -> String {
+    // `kind` repeats what the name already says — `/cell-1/nodes/nodes/node-a`,
+    // `/cell-1/instances/projects/p1/instances/i1` — and that looks like a wart
+    // until you try to remove it. A resource name carries its collection in the
+    // *middle* (`projects/{p}/instances/{i}`), so it is not a prefix anything
+    // can scan for. This segment is what makes `list` and `watch` a single
+    // range read instead of a walk over the whole cell. The repetition is the
+    // price of the prefix, and the prefix is the point.
     format!("/{cell}/{kind}/{name}")
 }
 

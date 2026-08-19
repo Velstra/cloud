@@ -31,6 +31,22 @@ pub enum TypedError {
     },
     #[error("{0} does not exist")]
     Missing(String),
+    /// An object stored in one cell that says it lives in another.
+    ///
+    /// Names both cells, because the two things worth knowing are which store
+    /// this was read from and which one the object believes it belongs to —
+    /// with those, the cause is usually one line of configuration.
+    #[error(
+        "{kind} {name} is stored in cell {here} and says it lives in cell {claimed}; \
+         one of the two is misconfigured, and until it is fixed two cells may both \
+         believe they own this object"
+    )]
+    Misplaced {
+        kind: &'static str,
+        name: String,
+        here: String,
+        claimed: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, TypedError>;
@@ -91,12 +107,73 @@ where
             .collect()
     }
 
+    /// One page, resuming strictly after the object called `after`.
+    ///
+    /// The resume point is a **resource name**, not a store key, and that is not
+    /// cosmetic: the same walk may be answered from the store on one page and
+    /// from the API's watch cache on the next, and the cache holds objects by
+    /// name. A token carrying a key could not be honoured by the cache, and one
+    /// carrying a name is honoured identically by both — the key is this prefix
+    /// plus the name, so the two orderings are the same ordering.
+    pub async fn list_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Resource<S, T>>, bool)> {
+        let key;
+        let after = match after {
+            Some(name) => {
+                key = self.key(name);
+                Some(key.as_str())
+            }
+            None => None,
+        };
+        let page = self.store.list_page(&self.prefix(), after, limit).await?;
+        let objects = page
+            .entries
+            .into_iter()
+            .map(|e| self.decode(&e.value, e.revision))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((objects, page.more))
+    }
+
     fn decode(&self, bytes: &[u8], revision: Revision) -> Result<Resource<S, T>> {
         let mut r: Resource<S, T> =
             serde_json::from_slice(bytes).map_err(|source| TypedError::Corrupt {
                 kind: self.kind,
                 source,
             })?;
+        // Where the object says it lives has to be where it was read from.
+        //
+        // `meta.placement` has been written on every object since the first
+        // commit and read by **nothing**. A field that records where an object
+        // lives and is never consulted is not placement information — it is a
+        // claim, and the system behaves identically whether it is right or
+        // wrong. This is the one place that can check it cheaply and for
+        // everybody: the key already carries the cell, because this store builds
+        // it, so the comparison needs no extra read and covers the API, the
+        // controllers and every agent at once.
+        //
+        // The failure it catches is not hypothetical corruption. Point two API
+        // processes with different `--cell` at one etcd — a plausible
+        // configuration slip, and one nothing else would notice — and each
+        // stamps its own cell on what it creates while both serve everything.
+        // Two owners for one object, both writing, and a tenant in one cell
+        // reading another's. Restoring a backup into the wrong cell is the same
+        // shape and happens on purpose.
+        //
+        // Refused rather than skipped. A list that quietly dropped foreign
+        // objects would hide the misconfiguration for as long as it took
+        // somebody to notice missing machines, and a partial answer is what a
+        // controller would then reconcile against.
+        if r.meta.placement.cell != self.cell {
+            return Err(TypedError::Misplaced {
+                kind: self.kind,
+                name: r.meta.name.to_string(),
+                here: self.cell.clone(),
+                claimed: r.meta.placement.cell.clone(),
+            });
+        }
         // The revision is where the object was read from, not part of it.
         r.meta.revision = revision;
         Ok(r)
@@ -230,6 +307,54 @@ mod tests {
             },
             InstanceStatus::default(),
         )
+    }
+
+    /// An object stored in one cell that claims another is refused, not served.
+    ///
+    /// This is the test that makes `meta.placement` mean something. It was
+    /// written on every object from the first commit and read by nothing, so the
+    /// system behaved identically whether it was right or wrong — and the way it
+    /// goes wrong is not exotic: two API processes with different `--cell` on one
+    /// etcd, or a backup restored into the wrong cell. Both leave two cells
+    /// believing they own the same object, both writing to it, and each serving
+    /// it to its own tenants.
+    #[tokio::test]
+    async fn an_object_that_says_it_lives_elsewhere_is_refused() {
+        let raw = Arc::new(MemoryStore::new());
+        // Written by "cell-2" — the same store, a differently configured writer.
+        let elsewhere: Instances = TypedStore::new(raw.clone(), "cell-2", "instances");
+        let mut theirs = instance();
+        theirs.meta.placement = Placement::new("eu", "cell-2");
+        elsewhere.create(&theirs).await.unwrap();
+
+        // Now read it back through a store that believes it is cell-2's — the
+        // key matches, so nothing but the body says otherwise. It is served.
+        assert!(
+            elsewhere
+                .get("projects/p1/instances/i1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the cell that owns it cannot read its own object"
+        );
+
+        // And through cell-1, reading cell-2's key space directly, which is what
+        // a misconfigured pair of processes amounts to.
+        let ours: Instances = TypedStore::new(raw.clone(), "cell-1", "instances");
+        let mut also_ours = instance();
+        also_ours.meta.name = ResourceName::parse("projects/p1/instances/i2").unwrap();
+        also_ours.meta.placement = Placement::new("eu", "cell-2");
+        ours.create(&also_ours).await.unwrap();
+
+        let error = ours
+            .get("projects/p1/instances/i2")
+            .await
+            .expect_err("an object claiming another cell was served as if it were ours");
+        let text = error.to_string();
+        assert!(
+            text.contains("cell-1") && text.contains("cell-2"),
+            "the refusal has to name both cells or it is not actionable: {text}"
+        );
     }
 
     #[tokio::test]

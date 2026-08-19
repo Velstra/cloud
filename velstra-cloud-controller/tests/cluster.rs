@@ -67,8 +67,16 @@ impl Cell {
 
     fn quota(&self) -> QuotaController {
         QuotaController::new(
-            self.instances.clone(),
-            self.volumes.clone(),
+            velstra_cloud_store::Cached::start(
+                self.instances.clone(),
+                self.raw.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "instances"),
+            ),
+            velstra_cloud_store::Cached::start(
+                self.volumes.clone(),
+                self.raw.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "volumes"),
+            ),
             StatusWriter::new(self.raw.clone(), "cell-1", "projects", "quota"),
             "cell-1",
         )
@@ -210,6 +218,7 @@ async fn settled_cell() -> Cell {
                 memory_mib: 131072,
                 volume_gib: 1000,
             },
+            bindings: Vec::new(),
         },
         ProjectStatus {
             observed_generation: 1,
@@ -237,7 +246,11 @@ async fn settled_cell() -> Cell {
             observed_generation: 1,
             done: true,
             error: None,
-            finished_at: Some(Timestamp(1_700_000_000_000)),
+            // Recently, not in 2023. A finished operation past its retention is
+            // not settled — it has one thing left to do, which is to go — so a
+            // fixture dated years ago described a cluster with work in it and
+            // the pass below rightly wrote. See `operations::keeping_for`.
+            finished_at: Some(Timestamp::now()),
             ..Default::default()
         },
     );
@@ -245,6 +258,46 @@ async fn settled_cell() -> Cell {
     cell.operations.create(&operation).await.unwrap();
 
     cell
+}
+
+/// The same pass over a cluster carrying a *stale* record does write, exactly
+/// once, to remove it.
+///
+/// Its own test rather than an extra assertion in the settled one, so the
+/// difference between "nothing to do" and "one thing to do" is visible rather
+/// than a fixture detail somebody has to notice. An operation finished long
+/// enough ago has one thing left: to go.
+#[tokio::test]
+async fn a_record_past_its_retention_is_removed_by_an_ordinary_pass() {
+    let cell = settled_cell().await;
+    let mut old = cell
+        .operations
+        .get("projects/p1/operations/op-1")
+        .await
+        .unwrap()
+        .unwrap();
+    old.meta.name = ResourceName::parse("projects/p1/operations/op-old").unwrap();
+    old.meta.revision = Revision(0);
+    old.status.finished_at = Some(Timestamp(1_700_000_000_000));
+    cell.operations.create(&old).await.unwrap();
+
+    cell.reconcile_everything().await;
+    assert!(
+        cell.operations
+            .get("projects/p1/operations/op-old")
+            .await
+            .unwrap()
+            .is_none(),
+        "an operation finished years ago is still in the store"
+    );
+    assert!(
+        cell.operations
+            .get("projects/p1/operations/op-1")
+            .await
+            .unwrap()
+            .is_some(),
+        "a recent operation was removed with the stale one"
+    );
 }
 
 #[tokio::test]
@@ -295,6 +348,15 @@ impl Store for DiesAfter {
 
     async fn list(&self, prefix: &str) -> velstra_cloud_store::Result<Vec<Entry>> {
         self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> velstra_cloud_store::Result<velstra_cloud_store::Page> {
+        self.inner.list_page(prefix, after, limit).await
     }
 
     async fn put(

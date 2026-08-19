@@ -1,0 +1,708 @@
+syntax = "proto3";
+
+// Velstra control-plane distribution API.
+//
+// A central controller serves each data-plane node its desired policy
+// (firewall rules, routes, load-balancer services) and pushes live updates;
+// nodes report their statistics back. The message shapes mirror Velstra's
+// TOML config so one schema describes both the file and the wire format.
+package velstra.v1;
+
+// The control service implemented by the controller and consumed by agents.
+service VelstraControl {
+  // Fetch the current desired config for a node (one-shot).
+  rpc GetConfig(NodeRequest) returns (NodeConfig);
+
+  // Stream the node's config: the current value immediately, then a fresh
+  // message every time it changes. The agent re-applies on each one.
+  rpc WatchConfig(NodeRequest) returns (stream NodeConfig);
+
+  // Report a node's per-counter statistics back to the controller.
+  rpc ReportStats(StatsReport) returns (Ack);
+}
+
+// Administrative service for pushing config at runtime (instead of, or layered
+// over, the per-node TOML files). Intended to be reached over a separate,
+// privileged channel (see the controller's `--admin-listen`).
+service VelstraAdmin {
+  // Set (or replace) a node's config. Takes precedence over its file until
+  // deleted.
+  rpc SetConfig(SetConfigRequest) returns (Ack);
+
+  // Drop a runtime override, reverting the node to its file (or the default).
+  rpc DeleteConfig(NodeRequest) returns (Ack);
+
+  // List the nodes the controller currently serves.
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+}
+
+// High-level fabric orchestration: declare hosts, networks, and ports at
+// runtime and let the controller derive + push each host's config (Track C).
+// Reached over the same privileged admin channel.
+service VelstraOrchestrator {
+  // Register (or replace) a host (VTEP).
+  rpc AddHost(HostSpec) returns (Ack);
+  // Define a network (tenant). Fails on a duplicate or invalid VNI.
+  rpc AddNetwork(NetworkSpec) returns (Ack);
+  // Create a port (VM NIC), allocating an IP/MAC if not pinned. Returns it.
+  rpc CreatePort(CreatePortRequest) returns (PortInfo);
+  // Remove a port by id.
+  rpc RemovePort(RemovePortRequest) returns (Ack);
+  // Move a port to another host, keeping its IP/MAC/id (live migration).
+  rpc MigratePort(MigratePortRequest) returns (PortInfo);
+  // List all ports in the fabric.
+  rpc ListPorts(ListPortsRequest) returns (ListPortsResponse);
+  // Retire a host. Fails while any port is still bound to it.
+  rpc RemoveHost(RemoveHostRequest) returns (Ack);
+  // Decommission a network. Fails while any port is still on it.
+  rpc RemoveNetwork(RemoveNetworkRequest) returns (Ack);
+  // Register a named security group (B5): a reusable firewall rule set assigned
+  // a deterministic policy id. Fails on a duplicate name.
+  rpc AddSecurityGroup(SecurityGroupSpec) returns (Ack);
+  // Remove a security group by name. Fails while any port is still bound to it.
+  rpc RemoveSecurityGroup(RemoveSecurityGroupRequest) returns (Ack);
+  // List all security groups in the fabric (with their derived policy ids).
+  rpc ListSecurityGroups(ListSecurityGroupsRequest) returns (ListSecurityGroupsResponse);
+  // Bind a port to a security group by name, or clear its binding (revert to
+  // the VNI-as-policy default). Returns the updated port.
+  rpc BindPortSecurityGroup(BindPortSecurityGroupRequest) returns (PortInfo);
+
+  // --- Tenant IP-VRFs (B7) --------------------------------------------------
+  // Define a tenant's routed context: the set of L2 segments whose inter-subnet
+  // traffic is routed (symmetric IRB) behind one anycast gateway MAC. Fails on a
+  // duplicate L3 VNI, an undeclared member network, a member already routed by
+  // another VRF, or a non-unicast gateway MAC.
+  rpc AddIpVrf(IpVrfSpec) returns (Ack);
+  // Remove an IP-VRF by its L3 VNI. Its member networks stay, unrouted.
+  rpc RemoveIpVrf(RemoveIpVrfRequest) returns (Ack);
+  // List all tenant IP-VRFs in the fabric.
+  rpc ListIpVrfs(ListIpVrfsRequest) returns (ListIpVrfsResponse);
+
+  // --- Load-balanced services (D2 LBaaS) ------------------------------------
+  // Define a VIP fronting a pool of fabric ports, DNAT-rewritten in XDP at the
+  // ingress host. Fails on a duplicate id, an unknown network or member port, a
+  // member on another network, a VIP that is already fronted or is a port's own
+  // address, or a protocol the datapath cannot balance.
+  rpc AddLoadBalancer(LoadBalancerSpec) returns (Ack);
+  // Remove a load-balanced service by id.
+  rpc RemoveLoadBalancer(RemoveLoadBalancerRequest) returns (Ack);
+  // List all load-balanced services in the fabric.
+  rpc ListLoadBalancers(ListLoadBalancersRequest) returns (ListLoadBalancersResponse);
+
+  // --- Subnets + IPAM (D2) --------------------------------------------------
+  // Define a first-class subnet under a network. Fails on a duplicate id, an
+  // unknown VNI, or a gateway/pool outside the CIDR.
+  rpc AddSubnet(SubnetSpec) returns (Ack);
+  // Remove a subnet by id. Fails while any address is still allocated from it.
+  rpc RemoveSubnet(RemoveSubnetRequest) returns (Ack);
+  // List all subnets in the fabric.
+  rpc ListSubnets(ListSubnetsRequest) returns (ListSubnetsResponse);
+  // Bind a port to a subnet, giving it an IPAM-allocated (or requested) address.
+  // Returns the allocated address.
+  rpc BindPortSubnet(BindPortSubnetRequest) returns (PortAddrInfo);
+  // Release one of a port's bound addresses back to its subnet's pool.
+  rpc UnbindPortAddress(UnbindPortAddressRequest) returns (Ack);
+  // Allocate a standalone address from a subnet's pool (or a requested one).
+  rpc AllocateAddress(AllocateAddressRequest) returns (AllocateAddressResponse);
+  // Release a standalone address back to a subnet's pool.
+  rpc ReleaseAddress(ReleaseAddressRequest) returns (Ack);
+
+  // --- Floating IPs (B6) ----------------------------------------------------
+  // Allocate a floating/secondary IP from a floating subnet via IPAM.
+  rpc AllocateFloatingIp(AllocateFloatingIpRequest) returns (FloatingIpInfo);
+  // Associate a floating IP to a port's fixed address (1:1). Returns the fip.
+  rpc AssociateFloatingIp(AssociateFloatingIpRequest) returns (FloatingIpInfo);
+  // Clear a floating IP's association, leaving it allocated. Returns the fip.
+  rpc DisassociateFloatingIp(DisassociateFloatingIpRequest) returns (FloatingIpInfo);
+  // Release a floating IP. Blocked while it is still associated.
+  rpc ReleaseFloatingIp(ReleaseFloatingIpRequest) returns (Ack);
+  // List all floating IPs in the fabric.
+  rpc ListFloatingIps(ListFloatingIpsRequest) returns (ListFloatingIpsResponse);
+}
+
+message HostSpec {
+  string id = 1;
+  string vtep = 2;            // underlay VTEP IPv4
+  string underlay_iface = 3;
+  string underlay_mac = 4;
+  Encap encap = 5;
+  uint32 udp_port = 6;        // 0 = encap default
+  uint32 underlay_mtu = 7;    // 0 = default (1500)
+}
+
+message NetworkSpec {
+  uint32 vni = 1;
+  string name = 2;
+  string subnet = 3;          // CIDR for IPAM
+  Action default_action = 4;
+  bool drop_icmp = 5;
+}
+
+message CreatePortRequest {
+  uint32 network = 1;         // VNI
+  string host = 2;            // host id
+  string tap = 3;             // tap/veth name on the host
+  string ip = 4;              // empty = auto-allocate from the subnet
+  // Security-group policy, decoupled from the VNI (M4). Absent ⇒ default to the
+  // VNI (single-tenant: one number names both segment and ruleset).
+  optional uint32 policy = 5;
+  // The hardware address this port's workload will use, as `aa:bb:cc:dd:ee:ff`.
+  // Absent ⇒ derived from the address, which is what a caller with no opinion
+  // gets and what every caller got before this field existed.
+  //
+  // It exists because the workload's MAC is not always this orchestrator's to
+  // choose. A platform above it may already have decided — Velstra Cloud derives
+  // one from the port's uid so that a lost-and-retried write cannot change a
+  // running guest's NIC — and two allocators for one identity is not a
+  // disagreement that shows up as a warning. Port security matches the source
+  // MAC, so a guest using one address while the data plane expects another has
+  // every frame dropped, silently, and looks like a network that does not work.
+  optional string mac = 6;
+}
+
+message PortInfo {
+  string id = 1;
+  uint32 vni = 2;
+  string host = 3;
+  string ip = 4;
+  string mac = 5;
+  string tap = 6;
+}
+
+message RemovePortRequest {
+  string id = 1;
+}
+
+message RemoveHostRequest {
+  string id = 1;
+}
+
+message RemoveNetworkRequest {
+  uint32 vni = 1;
+}
+
+message MigratePortRequest {
+  string id = 1;              // the port to move
+  string host = 2;            // destination host id
+  string tap = 3;             // tap/veth name on the destination host
+}
+
+message ListPortsRequest {}
+
+message ListPortsResponse {
+  repeated PortInfo ports = 1;
+}
+
+// A named security group (B5): the same firewall shape as a Policy, addressed by
+// name. Its policy id is derived deterministically from the name by the
+// controller (not carried here). Reuses the PortRule message for its rules.
+message SecurityGroupSpec {
+  string name = 1;
+  Action default_action = 2;
+  bool drop_icmp = 3;
+  bool stateful = 4;
+  repeated string blocklist = 5;
+  repeated PortRule rules = 6;
+}
+
+message RemoveSecurityGroupRequest {
+  string name = 1;
+}
+
+message ListSecurityGroupsRequest {}
+
+// A tenant IP-VRF (B7): one routed context over several bridged segments.
+message IpVrfSpec {
+  // The routed VNI, in its own 24-bit number space.
+  uint32 l3_vni = 1;
+  string name = 2;
+  // The anycast gateway MAC, identical on every host serving the tenant, so a
+  // workload keeps its default-gateway ARP entry when it migrates.
+  string gateway_mac = 3;
+  // The L2 VNIs routed in this context; each belongs to at most one IP-VRF.
+  repeated uint32 networks = 4;
+}
+
+message RemoveIpVrfRequest {
+  uint32 l3_vni = 1;
+}
+
+message ListIpVrfsRequest {}
+
+message ListIpVrfsResponse {
+  repeated IpVrfSpec ip_vrfs = 1;
+}
+
+// One member of a load balancer's pool: a fabric port, not a raw address, so a
+// migrated workload stays in the pool and a member can never point at an
+// address nothing serves.
+message LbMember {
+  string port_id = 1;
+  // Backend port, or 0 to keep the client's original destination port.
+  uint32 port = 2;
+}
+
+// A load-balanced virtual service (D2 LBaaS).
+message LoadBalancerSpec {
+  string id = 1;
+  // The network the VIP lives on; also scopes the service, so two tenants may
+  // front the same VIP:port.
+  uint32 vni = 2;
+  string vip = 3;
+  uint32 port = 4;
+  // TCP or UDP; the datapath balances no others.
+  Proto proto = 5;
+  // The backend pool. May be empty — a drained pool is a legitimate state.
+  repeated LbMember members = 6;
+}
+
+message RemoveLoadBalancerRequest {
+  string id = 1;
+}
+
+message ListLoadBalancersRequest {}
+
+message ListLoadBalancersResponse {
+  repeated LoadBalancerSpec load_balancers = 1;
+}
+
+// A security group as reported by ListSecurityGroups: its spec plus the
+// deterministic policy id the controller assigned it.
+message SecurityGroupInfo {
+  string name = 1;
+  uint32 policy_id = 2;
+  Action default_action = 3;
+  bool drop_icmp = 4;
+  bool stateful = 5;
+  repeated string blocklist = 6;
+  repeated PortRule rules = 7;
+}
+
+message ListSecurityGroupsResponse {
+  repeated SecurityGroupInfo groups = 1;
+}
+
+message BindPortSecurityGroupRequest {
+  string port_id = 1;
+  // Security group name to bind. Absent ⇒ clear the binding (revert to the
+  // VNI-as-policy default). `optional` so "unset" and a name stay distinct.
+  optional string group = 2;
+}
+
+// --- Subnets + IPAM (D2) ----------------------------------------------------
+
+// A first-class subnet under a network (D2). The CIDR may be IPv4 or IPv6.
+// String addresses are validated when the request is applied to the topology.
+message SubnetSpec {
+  string id = 1;
+  uint32 vni = 2;
+  string cidr = 3;         // "192.168.50.0/24" or "2001:db8::/64"
+  string gateway = 4;      // empty = none (auto-reserved from IPAM if set)
+  string pool_start = 5;   // empty (with pool_end empty) = CIDR-derived pool
+  string pool_end = 6;     // empty (with pool_start empty) = CIDR-derived pool
+  bool enable_dhcp = 7;
+}
+
+message RemoveSubnetRequest {
+  string id = 1;
+}
+
+message ListSubnetsRequest {}
+
+// A subnet as reported by ListSubnets. Mirrors SubnetSpec (empty string ⇒ unset).
+message SubnetInfo {
+  string id = 1;
+  uint32 vni = 2;
+  string cidr = 3;
+  string gateway = 4;
+  string pool_start = 5;
+  string pool_end = 6;
+  bool enable_dhcp = 7;
+}
+
+message ListSubnetsResponse {
+  repeated SubnetInfo subnets = 1;
+}
+
+message BindPortSubnetRequest {
+  string port_id = 1;
+  string subnet_id = 2;
+  string ip = 3;  // empty = auto-allocate the lowest free address
+}
+
+// An IPAM address bound to a port (the result of BindPortSubnet).
+message PortAddrInfo {
+  string subnet_id = 1;
+  string addr = 2;
+}
+
+message UnbindPortAddressRequest {
+  string port_id = 1;
+  string subnet_id = 2;
+  string addr = 3;
+}
+
+message AllocateAddressRequest {
+  string subnet_id = 1;
+  string ip = 2;  // empty = auto-allocate the lowest free address
+}
+
+message AllocateAddressResponse {
+  string subnet_id = 1;
+  string addr = 2;
+}
+
+message ReleaseAddressRequest {
+  string subnet_id = 1;
+  string addr = 2;
+}
+
+// --- Floating IPs (B6) ------------------------------------------------------
+
+message AllocateFloatingIpRequest {
+  string subnet_id = 1;
+  string ip = 2;  // empty = auto-allocate the lowest free address
+}
+
+message AssociateFloatingIpRequest {
+  string id = 1;          // floating-ip id
+  string port_id = 2;
+  string fixed_addr = 3;  // a fixed address the port holds
+}
+
+message DisassociateFloatingIpRequest {
+  string id = 1;
+}
+
+message ReleaseFloatingIpRequest {
+  string id = 1;
+}
+
+message ListFloatingIpsRequest {}
+
+// A floating IP as reported by allocate/associate/list. Empty assoc_* ⇒
+// unassociated.
+message FloatingIpInfo {
+  string id = 1;
+  uint32 vni = 2;
+  string subnet_id = 3;
+  string addr = 4;
+  string assoc_port = 5;
+  string assoc_fixed = 6;
+}
+
+message ListFloatingIpsResponse {
+  repeated FloatingIpInfo floating_ips = 1;
+}
+
+message SetConfigRequest {
+  string node_id = 1;
+  NodeConfig config = 2;
+}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated NodeSummary nodes = 1;
+}
+
+message NodeSummary {
+  string node_id = 1;
+  uint64 version = 2;
+  bool from_admin = 3;  // true if a runtime override is active for this node
+  string source = 4;    // which layer it came from: admin / derived / file / default
+}
+
+// Identifies the calling node.
+message NodeRequest {
+  string node_id = 1;
+}
+
+message Ack {
+  bool ok = 1;
+}
+
+// Firewall verdict.
+enum Action {
+  ACTION_PASS = 0;
+  ACTION_DROP = 1;
+}
+
+// Source-address validation (uRPF, RFC 3704). Default (0) is off: uRPF drops
+// traffic, and which traffic depends on the routing table, so a config that
+// does not ask for it never gets it.
+enum SourceValidation {
+  SOURCE_VALIDATION_DISABLE = 0;
+  SOURCE_VALIDATION_LOOSE = 1;  // the source must be routable somewhere
+  SOURCE_VALIDATION_STRICT = 2; // ...and by the interface it arrived on
+}
+
+// A protocol a firewall rule can name. Not only the two that carry ports: a
+// rule on a port-less protocol matches on the protocol alone, with the port
+// field left at zero.
+enum Proto {
+  PROTO_TCP = 0;
+  PROTO_UDP = 1;
+  PROTO_ICMP = 2;
+  PROTO_ICMPV6 = 3;
+  PROTO_VRRP = 4;
+  PROTO_ESP = 5;
+  PROTO_AH = 6;
+  PROTO_GRE = 7;
+  // OSPF (IANA 89) and PIM (IANA 103) ride directly on IP, so no TCP or UDP
+  // rule can describe them -- a router behind default-drop needs to name them
+  // to admit its own neighbours.
+  PROTO_OSPF = 8;
+  PROTO_PIM = 9;
+}
+
+// Forwarding behaviour for a route.
+enum ForwardMode {
+  FORWARD_MODE_ROUTE = 0;  // L3 router: decrement TTL
+  FORWARD_MODE_SWITCH = 1; // L2 switch: re-address only
+}
+
+// The complete desired policy for one data-plane node.
+message NodeConfig {
+  // Monotonic version, bumped by the controller on every change. Lets an agent
+  // skip re-applying an identical config.
+  uint64 version = 1;
+
+  Action default_action = 2;
+  bool drop_icmp = 3;
+  bool log = 4;
+  bool stateful = 11;                // stateful firewall (policy 0)
+
+  repeated string blocklist = 5;     // source CIDRs to drop (policy 0)
+  repeated PortRule port_rules = 6;  // (proto, port) allow/deny (policy 0)
+  repeated Route routes = 7;         // Phase 2 forwarding (global)
+  repeated Service services = 8;     // Phase 3 load balancing (global)
+
+  repeated Policy policies = 9;            // additional tenant policies
+  repeated InterfaceAssignment interfaces = 10; // interface -> policy
+
+  Overlay overlay = 12;             // Phase 4 VXLAN/Geneve endpoint (optional)
+  repeated Tunnel tunnels = 13;     // Phase 4 overlay forwarding entries
+  repeated Neighbor neighbors = 14; // Phase 4 ARP-suppression neighbours
+  repeated MacRoute mac_routes = 15; // B1 per-MAC L2 forwarding entries
+  repeated Nd6 nd_neighbors = 16;   // B3 IPv6 ND-suppression neighbours
+  repeated FloodVtep flood_vteps = 17; // B2 per-VNI BUM head-end flood entries
+
+  // Drop a packet the data plane cannot parse instead of passing it. Host-wide
+  // (the parse fails before any policy is known), so it is not a Policy field.
+  // Absent/false = fail open, the historical behaviour.
+  repeated IrbRoute irb_routes = 19; // B7 symmetric-IRB routed subnets
+  bool fail_closed = 18;
+
+  SourceValidation source_validation = 20; // uRPF for policy 0
+}
+
+// Encapsulation format for the overlay.
+enum Encap {
+  ENCAP_VXLAN = 0;  // UDP/4789
+  ENCAP_GENEVE = 1; // UDP/6081
+}
+
+// This host's overlay tunnel endpoint (VTEP). Absent on non-overlay hosts.
+message Overlay {
+  string local_vtep = 1;     // this host's VTEP underlay IPv4 (outer source)
+  string underlay_iface = 2; // egress interface (its MAC = outer source MAC)
+  Encap encap = 3;
+  uint32 udp_port = 4;       // 0 = the encap's default (4789 / 6081)
+  string local_mac = 5;      // override outer source MAC; empty = iface's MAC
+  uint32 underlay_mtu = 6;   // 0 = default (1500)
+}
+
+// A tenant address → MAC, for local ARP suppression (no overlay flood).
+message Neighbor {
+  uint32 vni = 1;   // tenant segment the address lives on
+  string ip = 2;    // tenant IPv4
+  string mac = 3;   // the MAC that answers for it
+}
+
+// A tenant IPv6 address → MAC, for local IPv6 Neighbor-Discovery suppression
+// (no overlay flood). The IPv6 mirror of Neighbor.
+message Nd6 {
+  uint32 vni = 1;   // tenant segment the address lives on
+  string ip = 2;    // tenant IPv6
+  string mac = 3;   // the MAC that answers for it
+}
+
+// One overlay forwarding entry: which remote VTEP hosts a tenant IP.
+message Tunnel {
+  uint32 vni = 1;          // tenant VNI (24-bit; also the policy id)
+  string inner_dst = 2;    // inner destination IPv4 this entry matches
+  string remote_vtep = 3;  // remote VTEP underlay IPv4 (outer destination)
+  string via_mac = 4;      // next-hop MAC on the underlay
+  string out_iface = 5;    // underlay egress interface
+}
+
+// One symmetric-IRB route (B7): a remote tenant subnet reached by ROUTING, not
+// bridging. Keyed on the ingress VNI -- the segment a packet arrives on, which is
+// what the datapath knows -- with the tenant's routed VNI carried in the value.
+// Distinct from Tunnel because a Tunnel forwards the inner frame untouched, while
+// this rewrites the inner Ethernet header and decrements the TTL.
+message IrbRoute {
+  uint32 vni = 1;          // ingress tenant segment this route applies on
+  string inner_dst = 2;    // remote tenant subnet (longest-prefix match)
+  uint32 l3_vni = 3;       // routed VNI to encapsulate with
+  string remote_vtep = 4;  // remote VTEP underlay IPv4 (outer destination)
+  string via_mac = 5;      // next-hop MAC on the underlay
+  string out_iface = 6;    // underlay egress interface
+  string router_mac = 7;   // egress router's IRB MAC: rewritten inner destination
+  string gateway_mac = 8;  // this tenant's anycast gateway: rewritten inner source
+}
+
+// One L2 forwarding entry (B1): bridge a tenant destination MAC to a remote
+// VTEP. The MAC-FDB is consulted before the L3 Tunnel table.
+message MacRoute {
+  uint32 vni = 1;          // tenant VNI the destination MAC lives on
+  string mac = 2;          // inner destination MAC to bridge toward
+  string remote_vtep = 3;  // remote VTEP underlay IPv4 (outer destination)
+  string via_mac = 4;      // next-hop MAC on the underlay
+  string out_iface = 5;    // underlay egress interface
+}
+
+// One BUM head-end replication entry (B2): a remote VTEP that a
+// broadcast/unknown-unicast/multicast frame on `vni` must be flooded to. The
+// agent groups all rows sharing a `vni` into one per-VNI flood set. One row per
+// (vni, remote_vtep); the fields mirror MacRoute/Tunnel exactly.
+message FloodVtep {
+  uint32 vni = 1;          // tenant VNI whose BUM traffic floods to this VTEP
+  string remote_vtep = 2;  // remote VTEP underlay IPv4 (outer destination)
+  string via_mac = 3;      // next-hop MAC on the underlay
+  string out_iface = 4;    // underlay egress interface
+}
+
+// A named tenant policy (the top-level fields above are policy 0).
+message Policy {
+  uint32 id = 1;
+  string name = 2;
+  Action default_action = 3;
+  bool drop_icmp = 4;
+  bool log = 5;
+  repeated string blocklist = 6;
+  repeated PortRule port_rules = 7;
+  bool stateful = 8;
+  SourceValidation source_validation = 9;
+}
+
+// Maps an interface to a policy id and (optionally) an overlay segment (VNI).
+message InterfaceAssignment {
+  string name = 1;
+  uint32 policy = 2;
+  // Overlay VNI. Absent ⇒ defaults to `policy`; present (incl. 0) is used
+  // verbatim (0 = local-only, never tunneled). `optional` so "unset" and
+  // "explicitly 0" stay distinct across the wire.
+  optional uint32 vni = 3;
+
+  // Everything below was in `InterfaceFile` and not on this wire, so an agent
+  // driven by a controller received an interface with a policy and a VNI and
+  // nothing else. Five features were built, tested and inert in that path:
+  //
+  //   * port security (B12) — `bind_mac` / `bind_addresses`. The orchestrator
+  //     derives both for every tenant tap and says why: without them a guest
+  //     can send as its neighbour. Dropped here, every controller-managed node
+  //     ran with port security off.
+  //   * the per-port send ceiling (B13) — `rate_limit_mbit`.
+  //   * MSS clamping, masquerading, and deterministic CGNAT.
+  //
+  // It survived because the VM checks configure an appliance through its own
+  // CLI, which writes the node's TOML directly; the controller path was the
+  // one nothing exercised. `interface_round_trips_every_field` now fails to
+  // compile if a field is added to `InterfaceFile` and forgotten here.
+
+  // Clamp TCP MSS on this interface. 0 = no clamping.
+  optional uint32 mss = 4;
+  // Port security: the one hardware address this interface may send as.
+  optional string bind_mac = 5;
+  // Port security: the addresses it may source from. Empty = unenforced.
+  repeated string bind_addresses = 6;
+  // Send ceiling in megabits per second. 0 = no ceiling.
+  optional uint32 rate_limit_mbit = 7;
+  // Source-NAT traffic leaving this interface to its own public address.
+  bool masquerade = 8;
+  // Deterministic CGNAT: the first WAN port handed out, and how many each
+  // internal address gets. Both zero = plain hash-spread NAPT.
+  uint32 cgnat_base_port = 9;
+  uint32 cgnat_block_size = 10;
+}
+
+message PortRule {
+  Proto proto = 1;
+  uint32 port = 2;
+  Action action = 3;
+  bool log = 4;  // log packets matching this rule (independent of policy log)
+  string src = 5;  // optional source CIDR ("10.0.0.0/24"); empty = from any
+  // Optional destination CIDR; empty = to any. Mutually exclusive with src — the
+  // data plane ranks one address dimension per rule, so a rule carrying both is
+  // refused rather than half-enforced.
+  string dst = 6;
+  // Rate limit for NEW flows this rule admits, packets/s; 0 = unlimited. Only
+  // meaningful on a pass rule — a limit on a drop throttles nothing.
+  uint32 limit = 7;
+  // Burst capacity in packets; 0 = one second's worth of `limit`.
+  uint32 burst = 8;
+  // The ICMP/ICMPv6 type this rule matches; 0 = every type, which is what a rule
+  // naming only the protocol has always meant. Sent as a u32 for the same reason
+  // `port` is: proto3 has no narrower integer.
+  uint32 icmp_type = 9;
+  // Restrict the rule to one address family ("ipv4"/"ipv6") or one direction
+  // ("in"/"out"). Empty means both, which is the default and what every rule
+  // written before these fields existed means.
+  string family = 10;
+  string direction = 11;
+  // Scope the rule to one interface by name; empty = every interface the policy
+  // covers. Resolved to an ifindex where the maps are written.
+  string in_interface = 12;
+  // Match the sender's hardware address instead of an IP source — a verdict on
+  // the device, which is how a compromised one is quarantined.
+  //
+  // Was not on this wire, so a controller-served rule arrived without it: an
+  // operator quarantining a device got a green apply and an empty MAC_RULES.
+  // The rule *validated* on the way through, which is what made it look fine.
+  string src_mac = 13;
+}
+
+message Route {
+  string dest = 1;       // destination CIDR
+  string out_iface = 2;  // egress interface
+  string via_mac = 3;    // next-hop MAC
+  string src_mac = 4;    // source MAC, empty = use the egress interface's
+  ForwardMode mode = 5;
+  uint32 policy = 6;     // owning tenant policy (0 = default routing table)
+}
+
+message Service {
+  string vip = 1;
+  uint32 port = 2;
+  Proto proto = 3;
+  repeated Backend backends = 4;
+  uint32 policy = 5;     // owning tenant policy (0 = default service table)
+  // Track this service's flows in the policy-independent (router-NAT) namespace.
+  // Set for a router/firewall service whose pool answers through a different zone
+  // than the VIP is reached from — otherwise the reply, arriving under another
+  // policy, never matches its conntrack entry and keeps the backend's address.
+  // Off for a multi-tenant service, where per-policy scoping is the isolation.
+  bool router_nat = 6;
+  // Policy a backend's reply arrives under — the zone owning the pool's segment,
+  // which only the config layer can know. Clears that reply through a
+  // deny-by-default internal zone. Meaningful only with router_nat; 0 = not derived.
+  uint32 reply_policy = 7;
+}
+
+message Backend {
+  string ip = 1;
+  uint32 port = 2; // 0 = keep the client's original destination port
+}
+
+// A node's statistics snapshot.
+message StatsReport {
+  string node_id = 1;
+  repeated Counter counters = 2;
+}
+
+message Counter {
+  string name = 1;
+  uint64 value = 2;
+}

@@ -75,8 +75,34 @@ while there is exactly one cell and it looks like ceremony.
 | `velstra-cloud-proto` | Protobuf as the source of truth; gRPC native, REST generated over the same handlers. |
 | `velstra-cloud-api` | The surface in `docs/rest-contract.md`, AIP conventions, long-running operations as resources. |
 | `velstra-cloud-controller` | One reconcile loop, several thin controllers over the pure functions. |
-| `velstra-cloud-nodeagent` | One stream per node, a `Vmm` trait, local metadata and DHCP. Load per node is O(its own objects). |
+| `velstra-cloud-nodeagent` | One stream per node, a `Vmm` trait, local metadata and DHCP. With `--api` a node is handed only its own objects and the API serves every node from one watch, so load per node is O(its own objects). |
 | `velstra-cloud-console` | The web interface, self-contained, no external fetches. |
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs three lanes on every push and pull request, and
+again nightly:
+
+| Lane | What it runs |
+|---|---|
+| `check` | `cargo +nightly fmt --check` (the `rustfmt.toml` here is nightly-only, and stable rustfmt would degrade the gate to a no-op), `cargo clippy --all-targets -D warnings`, and `cargo test --workspace --locked`. |
+| `console` | `velstra-cloud-console/tests/console/run.sh` — the whole console driven in a real headless browser against the contract server. |
+| `guests` | The two tests that start a real virtual machine, one per backend. |
+
+Some of those tests skip themselves when the machine cannot run them, which is
+right on a laptop and wrong in CI — a green run that skipped everything proves
+nothing. So CI installs the fixtures instead of accepting the gaps: `etcd` (the
+store conformance suite fails rather than skips without it, and
+`VELSTRA_ETCD_OPTIONAL` is deliberately never set in CI), QEMU, Cloud Hypervisor,
+and the two Alpine guests the backends need — a BIOS cloud image for QEMU's own
+firmware, a kernel and initramfs for Cloud Hypervisor, which has no firmware.
+The `guests` lane then reads its own output and fails if a test printed
+`skipping:`.
+
+To run the same things here, install `etcd`, `qemu-system-x86_64`,
+`cloud-hypervisor`, `protobuf-compiler` and a Chromium, and put a guest image at
+`/tmp/vq/alpine.raw` plus `vmlinuz-virt`/`initramfs-virt` under `/tmp/vq/boot`
+(or point `VELSTRA_TEST_IMAGE` and `VELSTRA_TEST_BOOT` elsewhere).
 
 ## Documents
 

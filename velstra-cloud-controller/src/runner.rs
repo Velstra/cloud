@@ -28,7 +28,7 @@
 use std::{sync::Arc, time::Duration};
 
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use velstra_cloud_model::resources::{Observed, Resource};
 use velstra_cloud_store::{Store, TypedStore, parse_key};
@@ -68,10 +68,97 @@ impl Default for LoopConfig {
 /// stale is a quota that admits work it should have refused.
 pub struct Related {
     pub prefix: String,
-    /// Foreign resource name to zero or more names in this controller's own
-    /// collection.
+    /// Which of this controller's objects that change makes worth another look.
     #[allow(clippy::type_complexity)]
-    pub map: Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>,
+    pub wake: Arc<dyn Fn(Changed<'_>) -> Wake + Send + Sync>,
+}
+
+/// What changed over there: its name, and its bytes when there are any.
+///
+/// The bytes matter more than they look. A relation is almost always in the
+/// **spec** — an instance names its ports, a port names its subnet — and a
+/// resource *name* cannot carry it. Without the object, a controller in that
+/// position has only two options, and both are bad: wake everything it owns, or
+/// wake nothing. The port controller shipped with the second, written as a
+/// mapping that returned an empty list, which reads as "all of them" and means
+/// the opposite.
+///
+/// `value` is `None` for a delete, because a deletion carries no object. That is
+/// the one case where the relation genuinely cannot be computed, and [`Wake::All`]
+/// is the honest answer to it.
+pub struct Changed<'a> {
+    pub name: &'a str,
+    pub value: Option<&'a [u8]>,
+}
+
+/// Which of this controller's own objects to look at again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// Exactly these. The cheap case, and the one to reach for: the cost of an
+    /// event is then the cost of the objects it really affects, not of the cell.
+    These(Vec<String>),
+    /// Everything this controller owns, because which ones are affected cannot
+    /// be worked out from what changed.
+    ///
+    /// Measured before being written down: with one of these on a collection of
+    /// N objects, each of whose reconciles reads a collection of N, a single
+    /// event costs N². At ten thousand instances that is a hundred million reads
+    /// for one guest moving. Use it for deletes and for genuine unknowns, and
+    /// not as a way of saying "I did not work out the relation".
+    All,
+}
+
+impl Related {
+    /// Wake objects named from the changed object's *name* alone.
+    ///
+    /// Right when the relation is in the name — a snapshot lives under its
+    /// volume, an operation names its target — and wrong whenever it is in the
+    /// spec. [`Related::of`] is for that.
+    pub fn named(
+        prefix: impl Into<String>,
+        map: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            prefix: prefix.into(),
+            wake: Arc::new(move |changed| Wake::These(map(changed.name))),
+        }
+    }
+
+    /// Wake objects named from the changed object itself.
+    ///
+    /// A delete carries no object, so it wakes everything — correct, and rare
+    /// enough to be affordable.
+    pub fn of<S, St>(
+        prefix: impl Into<String>,
+        map: impl Fn(&Resource<S, St>) -> Vec<String> + Send + Sync + 'static,
+    ) -> Self
+    where
+        S: DeserializeOwned + Send + Sync + 'static,
+        St: DeserializeOwned + Send + Sync + 'static,
+    {
+        Self {
+            prefix: prefix.into(),
+            wake: Arc::new(move |changed| match changed.value {
+                Some(bytes) => match serde_json::from_slice::<Resource<S, St>>(bytes) {
+                    Ok(object) => Wake::These(map(&object)),
+                    // Unreadable bytes are not "nothing changed". Something is
+                    // there and this cannot say what, which is exactly the case
+                    // the sweep is for.
+                    Err(_) => Wake::All,
+                },
+                None => Wake::All,
+            }),
+        }
+    }
+
+    /// Re-examine everything this controller owns when anything under `prefix`
+    /// changes. See [`Wake::All`] for what that costs.
+    pub fn all(prefix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            wake: Arc::new(|_| Wake::All),
+        }
+    }
 }
 
 /// A controller: what it watches, and what it does about one object.
@@ -126,6 +213,10 @@ pub async fn run<R: Reconciler>(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let controller = reconciler.name();
+    // Depth one, on purpose. A pending sweep already covers everything a second
+    // request would, so coalescing is the correct behaviour and not a
+    // concession — see `Fanout::All`.
+    let (sweep_now, mut sweep_requested) = mpsc::channel::<()>(1);
     let queue = Arc::new(WorkQueue::new(
         config.rate,
         config.backoff_base,
@@ -151,7 +242,7 @@ pub async fn run<R: Reconciler>(
             }
         };
         let mut events = store.watch(Some(from));
-        let related = spawn_related(&reconciler, &raw, from, &queue);
+        let related = spawn_related(&reconciler, &raw, from, &queue, &sweep_now);
 
         match store.list().await {
             Ok(objects) => {
@@ -194,6 +285,23 @@ pub async fn run<R: Reconciler>(
                             }
                         }
                         Err(error) => warn!(controller, %error, "resync could not list"),
+                    }
+                }
+                // Something this controller depends on changed, and which of its
+                // own objects that affects cannot be told from the other one's
+                // name. Same body as the resync, on demand rather than on a
+                // timer — which is the whole difference between a port assigned
+                // the moment its guest lands and one assigned five minutes later.
+                Some(()) = sweep_requested.recv() => {
+                    metrics.count("controller_related_sweep_total", &[("controller", controller)]);
+                    match store.list().await {
+                        Ok(objects) => {
+                            debug!(controller, objects = objects.len(), "sweeping for a related change");
+                            for object in &objects {
+                                queue.add(&object.meta.name.to_string());
+                            }
+                        }
+                        Err(error) => warn!(controller, %error, "could not list for a related change"),
                     }
                 }
                 event = events.recv() => {
@@ -290,6 +398,7 @@ fn spawn_related<R: Reconciler>(
     raw: &Arc<dyn Store>,
     from: velstra_cloud_model::meta::Revision,
     queue: &Arc<WorkQueue>,
+    sweep_now: &mpsc::Sender<()>,
 ) -> RelatedWatches {
     RelatedWatches(
         reconciler
@@ -298,13 +407,31 @@ fn spawn_related<R: Reconciler>(
             .map(|related| {
                 let mut events = raw.watch(&related.prefix, Some(from));
                 let queue = queue.clone();
+                let sweep_now = sweep_now.clone();
                 tokio::spawn(async move {
                     while let Some(event) = events.recv().await {
                         let Some((_, _, name)) = parse_key(event.key()) else {
                             continue;
                         };
-                        for key in (related.map)(name) {
-                            queue.add(&key);
+                        let value = match &event {
+                            velstra_cloud_store::Event::Put(entry) => Some(entry.value.as_slice()),
+                            velstra_cloud_store::Event::Delete { .. } => None,
+                        };
+                        match (related.wake)(Changed { name, value }) {
+                            Wake::These(keys) => {
+                                for key in keys {
+                                    queue.add(&key);
+                                }
+                            }
+                            // `try_send` on a channel of one, and a full channel
+                            // is not a dropped signal: it means a sweep is
+                            // already pending, and a second one would look at
+                            // the same objects. A burst of related events
+                            // coalesces into one pass, which is what keeps a
+                            // sweep affordable at all.
+                            Wake::All => {
+                                let _ = sweep_now.try_send(());
+                            }
                         }
                     }
                 })
@@ -399,6 +526,22 @@ mod tests {
             ),
             InstanceSpec::default(),
             InstanceStatus::default(),
+        )
+    }
+
+    fn project(
+        id: &str,
+    ) -> Resource<
+        velstra_cloud_model::resources::ProjectSpec,
+        velstra_cloud_model::resources::ProjectStatus,
+    > {
+        Resource::new(
+            Meta::new(
+                ResourceName::parse(&format!("projects/{id}")).unwrap(),
+                Placement::new("eu", "cell-1"),
+            ),
+            velstra_cloud_model::resources::ProjectSpec::default(),
+            velstra_cloud_model::resources::ProjectStatus::default(),
         )
     }
 
@@ -598,16 +741,16 @@ mod tests {
             }
 
             fn related(&self) -> Vec<Related> {
-                vec![Related {
-                    prefix: velstra_cloud_store::prefix_for("cell-1", "instances"),
-                    map: Arc::new(|name: &str| {
+                vec![Related::named(
+                    velstra_cloud_store::prefix_for("cell-1", "instances"),
+                    |name: &str| {
                         ResourceName::parse(name)
                             .ok()
                             .and_then(|n| n.project().map(|p| format!("projects/{p}")))
                             .into_iter()
                             .collect()
-                    }),
-                }]
+                    },
+                )]
             }
 
             async fn reconcile(
@@ -660,5 +803,93 @@ mod tests {
                 .contains(&"projects/p1".to_string()),
             "an instance changing never woke the project that pays for it"
         );
+    }
+    #[tokio::test]
+    async fn a_related_collection_can_wake_every_object_at_once() {
+        // The case a mapping function cannot express: which of this controller's
+        // objects a foreign change affects is not derivable from the foreign
+        // object's *name*. Written as a mapping that returns nothing, it reads
+        // like "look at all of them" and means "look at none of them" — which is
+        // what shipped, and what nothing caught, because the controller that had
+        // it was only ever tested by calling its `reconcile` directly.
+        //
+        // The resync is turned off here on purpose. With it on, this test would
+        // pass on a broken fan-out simply by waiting.
+        struct Sweeper {
+            seen: Mutex<Vec<String>>,
+        }
+
+        impl Reconciler for Sweeper {
+            type Spec = velstra_cloud_model::resources::ProjectSpec;
+            type Status = velstra_cloud_model::resources::ProjectStatus;
+
+            fn name(&self) -> &'static str {
+                "sweeper"
+            }
+
+            fn related(&self) -> Vec<Related> {
+                vec![Related::all(velstra_cloud_store::prefix_for(
+                    "cell-1",
+                    "instances",
+                ))]
+            }
+
+            async fn reconcile(
+                &self,
+                name: &str,
+                _object: Option<
+                    &Resource<
+                        velstra_cloud_model::resources::ProjectSpec,
+                        velstra_cloud_model::resources::ProjectStatus,
+                    >,
+                >,
+            ) -> Result<()> {
+                self.seen.lock().unwrap().push(name.to_string());
+                Ok(())
+            }
+        }
+
+        let raw = Arc::new(MemoryStore::new());
+        let instances: TypedStore<InstanceSpec, InstanceStatus> =
+            TypedStore::new(raw.clone(), "cell-1", "instances");
+        let projects: TypedStore<
+            velstra_cloud_model::resources::ProjectSpec,
+            velstra_cloud_model::resources::ProjectStatus,
+        > = TypedStore::new(raw.clone(), "cell-1", "projects");
+        projects.create(&project("p1")).await.unwrap();
+        projects.create(&project("p2")).await.unwrap();
+
+        let sweeper = Arc::new(Sweeper {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut config = config();
+        config.resync = Duration::from_secs(3600);
+        let (stop, rx) = watch::channel(false);
+        let handle = tokio::spawn(run(
+            sweeper.clone(),
+            projects,
+            raw.clone(),
+            config,
+            Metrics::new(),
+            rx,
+        ));
+        settle().await;
+        // Everything the startup list already reconciled. What matters is what
+        // happens *after* this line.
+        sweeper.seen.lock().unwrap().clear();
+
+        // One instance, named after neither project.
+        instances.create(&instance("i1")).await.unwrap();
+        settle().await;
+        let _ = stop.send(true);
+        let _ = handle.await;
+
+        let seen = sweeper.seen.lock().unwrap().clone();
+        for name in ["projects/p1", "projects/p2"] {
+            assert!(
+                seen.contains(&name.to_string()),
+                "{name} was never looked at again: {seen:?}"
+            );
+        }
     }
 }

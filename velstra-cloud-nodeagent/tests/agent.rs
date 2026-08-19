@@ -13,8 +13,9 @@ use common::*;
 use velstra_cloud_model::{
     meta::ConditionStatus,
     resources::{DesiredState, InstanceState},
+    security::{Direction, PortRange, Protocol, Remote, ResolvedRule, SecurityRule},
 };
-use velstra_cloud_nodeagent::{FakeDatapath, FakeVmm, Fault, Pass, agent::Agent};
+use velstra_cloud_nodeagent::{Datapath, FakeDatapath, FakeVmm, Fault, Pass, agent::Agent};
 
 const I1: &str = "projects/p1/instances/i1";
 const PORT_A: &str = "projects/p1/ports/port-a";
@@ -527,5 +528,229 @@ async fn an_object_assigned_here_and_owned_by_nobody_is_claimed() {
     assert!(
         vmm.is_running(I1),
         "the guest never started once ownership was settled"
+    );
+}
+
+// ---- security groups -----------------------------------------------------
+//
+// That a group *resolves* correctly is proved in the model, where it is pure
+// arithmetic. What cannot be proved there is that the answer ever reaches the
+// datapath — which is precisely the gap this feature sat in: the port carried
+// group names, the platform stored them, and nothing downstream ever asked what
+// they meant.
+
+#[tokio::test]
+async fn what_a_port_is_allowed_reaches_the_datapath() {
+    let store = store();
+    create_security_group(
+        &store,
+        "projects/p1/security-groups/web",
+        vec![SecurityRule {
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            ports: Some(PortRange { from: 443, to: 443 }),
+            remote: Remote::Cidr("0.0.0.0/0".into()),
+        }],
+    )
+    .await;
+    create_port_in_groups(
+        &store,
+        PORT_A,
+        "10.0.0.5/24",
+        "node-a",
+        &["projects/p1/security-groups/web"],
+    )
+    .await;
+    create_instance(&store, I1, Some("node-a"), Some("node-a"), &[PORT_A]).await;
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+    agent.resync().await;
+
+    let rules = datapath
+        .rules_programmed(PORT_A)
+        .expect("the port was never programmed at all");
+    assert_eq!(
+        rules,
+        vec![ResolvedRule {
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            ports: Some(PortRange { from: 443, to: 443 }),
+            remote: "0.0.0.0/0".into(),
+        }],
+        "the datapath was programmed with something other than what the group says"
+    );
+}
+
+#[tokio::test]
+async fn a_port_in_no_group_is_programmed_with_no_allowances() {
+    // Not the same as being unprogrammed, and the distinction is the whole
+    // safety story: no allowances means the platform's default — ingress
+    // denied — and not "the datapath was never told about this port".
+    let (_store, _vmm, datapath, agent) = one_instance_on("node-a").await;
+    agent.resync().await;
+    assert_eq!(datapath.rules_programmed(PORT_A), Some(vec![]));
+}
+
+#[tokio::test]
+async fn a_group_naming_another_follows_its_members_as_they_arrive() {
+    // The property a stored expansion would break: nothing about `db` or its
+    // port changes here, and what it is allowed changes anyway, because
+    // membership is read off the ports on every pass.
+    let store = store();
+    create_security_group(
+        &store,
+        "projects/p1/security-groups/db",
+        vec![SecurityRule {
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            ports: Some(PortRange {
+                from: 5432,
+                to: 5432,
+            }),
+            remote: Remote::Group("projects/p1/security-groups/web".into()),
+        }],
+    )
+    .await;
+    create_port_in_groups(
+        &store,
+        PORT_A,
+        "10.0.0.20/24",
+        "node-a",
+        &["projects/p1/security-groups/db"],
+    )
+    .await;
+    create_instance(&store, I1, Some("node-a"), Some("node-a"), &[PORT_A]).await;
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+    agent.resync().await;
+    assert_eq!(
+        datapath.rules_programmed(PORT_A),
+        Some(vec![]),
+        "an empty group let something through"
+    );
+
+    // A web server appears somewhere in the cell — on another node, which is the
+    // point: membership is a property of the cell, not of this machine.
+    create_port_in_groups(
+        &store,
+        "projects/p1/ports/port-web",
+        "10.0.0.5/24",
+        "node-b",
+        &["projects/p1/security-groups/web"],
+    )
+    .await;
+    agent.resync().await;
+    let rules = datapath.rules_programmed(PORT_A).unwrap();
+    assert_eq!(
+        rules.iter().map(|r| r.remote.as_str()).collect::<Vec<_>>(),
+        vec!["10.0.0.5/24"],
+        "the new member never reached the datapath"
+    );
+}
+
+#[tokio::test]
+async fn naming_a_group_that_does_not_exist_does_not_stop_the_port_working() {
+    // Rules only add allowances, so a missing group is strictly fewer of them —
+    // the safe direction. Refusing to program the port would turn a typo into an
+    // outage, which is a worse failure than the one being guarded against.
+    let store = store();
+    create_port_in_groups(
+        &store,
+        PORT_A,
+        "10.0.0.5/24",
+        "node-a",
+        &["projects/p1/security-groups/typo"],
+    )
+    .await;
+    create_instance(&store, I1, Some("node-a"), Some("node-a"), &[PORT_A]).await;
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+    agent.resync().await;
+
+    assert_eq!(datapath.rules_programmed(PORT_A), Some(vec![]));
+    assert!(
+        datapath.is_programmed(PORT_A),
+        "a typo cost the guest its network"
+    );
+}
+
+#[tokio::test]
+async fn a_teardown_that_half_happened_is_asked_for_again() {
+    // The guard on this branch used to be `is_deleting() && taps.contains_key(…)`,
+    // and that second half was not a cheap early exit — it made the retry
+    // impossible in exactly the case that needs one. `unprogram` has more to
+    // undo than the tap: on the fabric datapath it also removes the port and
+    // its security group, which hold an address and a MAC. Remove the tap, fail
+    // on the rest, and the next pass sees no tap and concludes there is nothing
+    // to do — so the fabric keeps the port for ever, *because* the teardown
+    // half-succeeded.
+    //
+    // No instance uses the port, and that is load-bearing rather than
+    // minimalism. With a live guest plugged into it, `instance_pass` programs
+    // the port again on every pass, the tap comes back, and the teardown is
+    // asked for a second time for a reason that has nothing to do with the
+    // guard being right — a test that passes whether or not the fix is there.
+    let store = store();
+    create_port(&store, PORT_A, "10.0.0.5/24", "node-a").await;
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+
+    // This node carries the port, which is the state a previous pass left.
+    datapath
+        .program(
+            PORT_A,
+            &velstra_cloud_model::resources::PortSpec::default(),
+            &velstra_cloud_model::resources::NetworkSpec::default(),
+            &[],
+        )
+        .await
+        .expect("the fake datapath refused a port");
+    assert!(datapath.is_programmed(PORT_A));
+
+    datapath.fail_teardown(PORT_A, "the fabric would not let go of the port");
+    request_delete_port(&store, PORT_A).await;
+
+    let first = agent.resync().await;
+    assert_eq!(first.failures, 1, "a failed teardown was not counted");
+    assert_eq!(datapath.unprograms(PORT_A), 1);
+    assert!(
+        !datapath.is_programmed(PORT_A),
+        "the tap survived, so this test is not exercising the half-done case"
+    );
+
+    // The second pass is the one that matters: the tap is genuinely gone now,
+    // so anything that decided from the machine alone would say "released" and
+    // let the guard come off over a fabric still holding an address.
+    let second = agent.resync().await;
+    assert_eq!(
+        datapath.unprograms(PORT_A),
+        2,
+        "the teardown was never retried, because the half of it that succeeded \
+         removed the evidence that the other half had not"
+    );
+    assert_eq!(second.failures, 1, "the retry's failure was not counted");
+    let stored = read_port(&store, PORT_A).await;
+    assert_ne!(
+        condition(&stored.status.conditions, "Released").status,
+        ConditionStatus::True,
+        "a teardown that is still failing reported itself released: {:?}",
+        stored.status.conditions
+    );
+
+    datapath.heal_teardown(PORT_A);
+    agent.resync().await;
+    let stored = read_port(&store, PORT_A).await;
+    assert_eq!(
+        condition(&stored.status.conditions, "Released").status,
+        ConditionStatus::True,
+        "a finished teardown never said so, so the guard would never come off: {:?}",
+        stored.status.conditions
     );
 }

@@ -89,6 +89,31 @@ message GetRequest {
 message ListRequest {
   // The collection's parent: `projects/p1` for instances, empty for nodes.
   string parent = 1;
+  // Only what this node has business with: what it holds, what it has been
+  // given, and either end of a migration that names it.
+  //
+  // This is what keeps the size of a cell off a node agent's wire. Without it
+  // every agent lists every instance, port, attachment and migration in the
+  // cell on every pass, so load per node grows with the cell — and the server
+  // has to read the whole collection to answer, once per agent. Empty means the
+  // whole collection, which is what a console or an operator is asking for.
+  string node = 2;
+  // The same, for a storage pool: only the volumes and snapshots this pool holds
+  // or has been given. Setting both this and `node` is refused — an agent is one
+  // or the other.
+  string pool = 3;
+  // The most objects to return. Zero means "as many as the server likes", which
+  // it caps; the server never returns more than asked for.
+  //
+  // Unset is the whole collection, deliberately: a controller reconciling a
+  // collection wants all of it, and making it page would only make it
+  // re-implement the loop. A caller that sets either paging field gets a page.
+  int32 page_size = 4;
+  // Where to resume, taken verbatim from a previous response's
+  // `next_page_token`. Opaque: it encodes the collection, the parent and the
+  // position, and presenting it against a different collection is refused
+  // rather than answered with the wrong objects.
+  string page_token = 5;
 }
 
 message DeleteRequest {
@@ -103,6 +128,13 @@ message WatchRequest {
   // Watch from just after this revision. A client lists, takes the revision
   // the list reports, and watches from it — nothing in between is lost.
   string from_revision = 2;
+  // As on ListRequest. A filtered watch is also served from one shared watch on
+  // the store rather than opening another, so a thousand agents are one watcher
+  // and not a thousand — and `from_revision` is then ignored, because what a
+  // shared view can offer is what happens next rather than what already has.
+  string node = 3;
+  // As on ListRequest.
+  string pool = 4;
 }
 
 enum EventType {
@@ -158,8 +190,17 @@ message UpdateProjectRequest {
 
 message ListProjectsResponse {
   repeated Project projects = 1;
-  // The store revision this list was taken at: watch from here.
+  // The store revision this *walk* was taken at — the first page's, repeated
+  // on every page after it. Watch from here: the watch then replays every
+  // change that landed while the walk was in progress, including between two
+  // pages, and events carry whole objects so applying them over a slightly
+  // torn list converges. Reporting each page's own revision instead would
+  // have the caller watch from the *end* of the walk and silently miss
+  // everything that happened during it.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over, so a caller loops until it is empty.
+  string next_page_token = 3;
 }
 
 message ProjectEvent {
@@ -224,7 +265,13 @@ message UpdateNodeRequest {
 
 message ListNodesResponse {
   repeated Node nodes = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message NodeEvent {
@@ -280,7 +327,13 @@ message UpdateImageRequest {
 
 message ListImagesResponse {
   repeated Image images = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message ImageEvent {
@@ -366,7 +419,13 @@ message UpdateInstanceRequest {
 
 message ListInstancesResponse {
   repeated Instance instances = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message InstanceEvent {
@@ -401,6 +460,14 @@ message VolumeSpec {
   // which is a decision somebody has to make rather than a default.
   optional string encryption_key = 3;
   optional string source_image = 4;
+  // The snapshot this volume was cloned from, if it came from one. A volume
+  // comes from one place: naming both this and `source_image` is refused.
+  //
+  // This is also the whole of "restore": a snapshot is never written back over
+  // the volume it came from. That would be a command living in a spec, and a
+  // command in a spec is carried out again on every resync — undoing whatever
+  // the guest wrote in between.
+  optional string source_snapshot = 5;
 }
 
 message VolumeStatus {
@@ -432,12 +499,82 @@ message UpdateVolumeRequest {
 
 message ListVolumesResponse {
   repeated Volume volumes = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message VolumeEvent {
   EventType type = 1;
   Volume resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// A point-in-time copy of a volume, in that volume's own pool.
+//
+// The source is in the **name**: `projects/p1/volumes/data-1/snapshots/nightly`
+// is a copy of `data-1` and can never be a copy of anything else. There is no
+// field for it, deliberately — which volume a copy came from is the one thing
+// about it that must never change, and a name cannot be patched.
+message SnapshotSpec {
+  // The pool holding it, always the source volume's. Derived by the API from
+  // the volume; it is a field so that a pool agent's watch filter is one
+  // comparison.
+  string pool = 1;
+}
+
+message SnapshotStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // The pool that claimed this snapshot and reports on it.
+  optional string pool = 3;
+  // True while the pool holds the copy.
+  bool taken = 4;
+  // The logical size of the copy: how large the volume was when it was made,
+  // and so the smallest volume that can be made from it. Not what it occupies.
+  uint64 size_gib = 5;
+  // The moment the copy is of, as the backend records it. Milliseconds.
+  optional int64 taken_at = 6;
+}
+
+message Snapshot {
+  Meta meta = 1;
+  SnapshotSpec spec = 2;
+  SnapshotStatus status = 3;
+}
+
+message CreateSnapshotRequest {
+  // The volume being copied: `projects/p1/volumes/data-1`. A snapshot is
+  // created under one, never in a collection of its own.
+  string parent = 1;
+  string snapshot_id = 2;
+  Snapshot snapshot = 3;
+}
+
+message UpdateSnapshotRequest {
+  Snapshot snapshot = 1;
+  string revision = 2;
+}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
+  string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
+}
+
+message SnapshotEvent {
+  EventType type = 1;
+  Snapshot resource = 2;
   string name = 3;
   string revision = 4;
 }
@@ -489,7 +626,13 @@ message UpdateAttachmentRequest {
 
 message ListAttachmentsResponse {
   repeated Attachment attachments = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message AttachmentEvent {
@@ -511,8 +654,11 @@ message NetworkSpec {
 message NetworkStatus {
   uint64 observed_generation = 1;
   repeated Condition conditions = 2;
-  // Nodes that have the VNI programmed.
-  repeated string programmed_on = 3;
+  // 3 was `programmed_on`, a list of nodes nothing was allowed to write: an
+  // aggregate is not a fact anybody owns. Reserved rather than reused so an old
+  // client's field never lands in a new meaning.
+  reserved 3;
+  reserved "programmed_on";
 }
 
 message Network {
@@ -534,7 +680,13 @@ message UpdateNetworkRequest {
 
 message ListNetworksResponse {
   repeated Network networks = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message NetworkEvent {
@@ -579,7 +731,13 @@ message UpdateSubnetRequest {
 
 message ListSubnetsResponse {
   repeated Subnet subnets = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message SubnetEvent {
@@ -600,6 +758,10 @@ message PortSpec {
   // Egress and ingress ceiling, in megabits. Multi-tenancy without one is one
   // noisy neighbour away from an incident.
   optional uint32 rate_limit_mbit = 6;
+  // Derived, never set by a client: the node holding the guest that uses this
+  // port, copied from that instance. It is what makes the port claimable at
+  // all — see `PortSpec::node` in the model.
+  optional string node = 7;
 }
 
 message PortStatus {
@@ -631,7 +793,13 @@ message UpdatePortRequest {
 
 message ListPortsResponse {
   repeated Port ports = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message PortEvent {
@@ -713,7 +881,13 @@ message UpdateMigrationRequest {
 
 message ListMigrationsResponse {
   repeated Migration migrations = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message MigrationEvent {
@@ -777,7 +951,13 @@ message Operation {
 
 message ListOperationsResponse {
   repeated Operation operations = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision` for why the walk reports where it
+  // started rather than where each page did.
   string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`. Empty
+  // means the walk is over.
+  string next_page_token = 3;
 }
 
 message OperationEvent {
@@ -837,6 +1017,15 @@ service Storage {
   rpc UpdateVolume(UpdateVolumeRequest) returns (Volume);
   rpc DeleteVolume(DeleteRequest) returns (Volume);
   rpc WatchVolumes(WatchRequest) returns (stream VolumeEvent);
+
+  // There is no RestoreSnapshot. Restoring is creating a volume with
+  // `spec.source_snapshot` set — see `VolumeSpec`.
+  rpc GetSnapshot(GetRequest) returns (Snapshot);
+  rpc ListSnapshots(ListRequest) returns (ListSnapshotsResponse);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (Operation);
+  rpc UpdateSnapshot(UpdateSnapshotRequest) returns (Snapshot);
+  rpc DeleteSnapshot(DeleteRequest) returns (Snapshot);
+  rpc WatchSnapshots(WatchRequest) returns (stream SnapshotEvent);
 
   rpc GetAttachment(GetRequest) returns (Attachment);
   rpc ListAttachments(ListRequest) returns (ListAttachmentsResponse);

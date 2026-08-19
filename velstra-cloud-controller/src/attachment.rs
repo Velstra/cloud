@@ -14,6 +14,7 @@
 use tracing::info;
 use velstra_cloud_model::{
     access::Writer,
+    meta::{ConditionStatus, condition},
     reconcile::{FinalizerStep, finalizer_step},
     resources::{Attachment, AttachmentSpec, AttachmentStatus, NODE_RELEASE_FINALIZER},
 };
@@ -64,9 +65,44 @@ impl Reconciler for AttachmentController {
                 info!(attachment = name, "released");
                 Ok(())
             }
-            FinalizerStep::Wait => Ok(()),
+            FinalizerStep::Wait => {
+                // Deleting, and still guarded. This arm used to be `Ok(())`,
+                // and nothing anywhere else took the finalizer off — so an
+                // attachment the node had closed and reported `Released` on sat
+                // in the store for ever, carrying its `deletedAt`. That is not
+                // only an object nobody can be rid of: a volume cannot be
+                // deleted while an attachment names it, so one detach that never
+                // completed made its volume undeletable too.
+                //
+                // It survived because the test for the second half removed the
+                // finalizer by hand to get to the case it was interested in,
+                // which is exactly the shape of a test that would pass with the
+                // code under it deleted.
+                if !attachment.meta.is_deleting() || !node_has_let_go(attachment) {
+                    return Ok(());
+                }
+                let mut next = attachment.clone();
+                next.meta.remove_finalizer(NODE_RELEASE_FINALIZER);
+                self.attachments
+                    .update(&next, &Writer::controller("attachment"))
+                    .await?;
+                info!(attachment = name, "the node let go; the guard is off");
+                Ok(())
+            }
         }
     }
+}
+
+/// Whether the node has said it holds nothing of this attachment any more.
+///
+/// Read from the condition the node writes, never inferred from
+/// `status.attached`. An attachment that never opened has `attached == false`
+/// too, and treating that as "let go" would take the record away while a node
+/// was part way through opening the image — which is the one case where two
+/// nodes end up with one volume open, and that eats data.
+fn node_has_let_go(attachment: &Attachment) -> bool {
+    condition(&attachment.status.conditions, "Released")
+        .is_some_and(|c| c.status == ConditionStatus::True)
 }
 
 #[cfg(test)]
@@ -200,5 +236,116 @@ mod tests {
             .reconcile("projects/p1/attachments/gone", None)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use std::sync::Arc;
+
+    use velstra_cloud_model::{
+        meta::{Condition, Meta, Placement, ResourceName, Timestamp, set_condition},
+        resources::Resource,
+    };
+    use velstra_cloud_store::{MemoryStore, Store};
+
+    use super::*;
+
+    const NAME: &str = "projects/p1/attachments/a1";
+
+    async fn fixture() -> (
+        TypedStore<AttachmentSpec, AttachmentStatus>,
+        AttachmentController,
+    ) {
+        let raw: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let store: TypedStore<AttachmentSpec, AttachmentStatus> =
+            TypedStore::new(raw, "cell-1", "attachments");
+        let controller = AttachmentController::new(store.clone());
+        store
+            .create(&Resource::new(
+                Meta::new(
+                    ResourceName::parse(NAME).unwrap(),
+                    Placement::new("eu", "cell-1"),
+                ),
+                AttachmentSpec {
+                    volume: "projects/p1/volumes/v1".into(),
+                    instance: "projects/p1/instances/i1".into(),
+                    node: "node-a".into(),
+                    read_only: false,
+                },
+                AttachmentStatus::default(),
+            ))
+            .await
+            .unwrap();
+        (store, controller)
+    }
+
+    async fn pass(
+        controller: &AttachmentController,
+        store: &TypedStore<AttachmentSpec, AttachmentStatus>,
+    ) {
+        let object = store.get(NAME).await.unwrap();
+        controller.reconcile(NAME, object.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attachment_the_node_has_let_go_of_is_deleted() {
+        // Nothing used to take this finalizer off, so a detach never finished
+        // and the volume underneath could never be deleted either.
+        let (store, controller) = fixture().await;
+        pass(&controller, &store).await;
+
+        let mut deleting = store.get(NAME).await.unwrap().unwrap();
+        deleting.meta.deleted_at = Some(Timestamp::now());
+        store
+            .update(&deleting, &Writer::controller("api"))
+            .await
+            .unwrap();
+
+        let mut released = store.get(NAME).await.unwrap().unwrap();
+        released.status.node = Some("node-a".into());
+        set_condition(
+            &mut released.status.conditions,
+            Condition::new(
+                "Released",
+                ConditionStatus::True,
+                "Released",
+                "this node no longer has the volume open",
+                released.meta.generation,
+            ),
+        );
+        store
+            .update(&released, &Writer::agent("node-a"))
+            .await
+            .unwrap();
+
+        // One pass takes the guard off, the next takes the object.
+        pass(&controller, &store).await;
+        pass(&controller, &store).await;
+        assert!(
+            store.get(NAME).await.unwrap().is_none(),
+            "the node let go and the attachment stayed for ever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_that_has_not_reported_keeps_the_guard_on() {
+        // `Released` absent is not `Released == False`. Two nodes with one RBD
+        // image open is what this whole dance exists to prevent.
+        let (store, controller) = fixture().await;
+        pass(&controller, &store).await;
+        let mut deleting = store.get(NAME).await.unwrap().unwrap();
+        deleting.meta.deleted_at = Some(Timestamp::now());
+        store
+            .update(&deleting, &Writer::controller("api"))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            pass(&controller, &store).await;
+        }
+        assert!(
+            store.get(NAME).await.unwrap().is_some(),
+            "a silent node was taken for a node that had let go"
+        );
     }
 }

@@ -14,11 +14,18 @@ pub mod collection;
 pub mod core;
 pub mod error;
 pub mod grpc;
-pub mod json;
+/// The JSON the contract promises, from the model as it is.
+///
+/// Moved out of this crate so a node agent can speak the same wire without
+/// linking an API server: the shaping is pure, and the two ends of a contract
+/// should not have two implementations of it.
+pub use velstra_cloud_wire as json;
+pub mod paging;
 pub mod refs;
 pub mod rest;
+pub mod served;
 
-pub use core::Api;
+pub use core::{Api, Filter, WatchEvent};
 use std::sync::Arc;
 
 pub use auth::{Identity, StaticTokenVerifier, TokenVerifier};

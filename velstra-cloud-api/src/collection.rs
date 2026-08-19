@@ -70,6 +70,16 @@ pub trait Collection: Send + Sync {
     async fn get(&self, name: &str) -> ApiResult<Option<Value>>;
     async fn list(&self) -> ApiResult<Vec<Value>>;
 
+    /// One page of the collection, resuming strictly after the object named
+    /// `after`, and whether anything follows it.
+    ///
+    /// Separate from `list` rather than a parameter on it because the callers
+    /// differ in kind: a controller reconciling a collection wants all of it and
+    /// would only re-implement this loop, while an API answering a person wants
+    /// a bounded read. Both are legitimate; conflating them is what produced an
+    /// API whose cost grew with the cell.
+    async fn list_page(&self, after: Option<&str>, limit: usize) -> ApiResult<(Vec<Value>, bool)>;
+
     /// This collection's spec with every field at its default.
     ///
     /// A create merges the client's `spec` onto this rather than deserialising
@@ -257,6 +267,15 @@ where
             .iter()
             .map(Self::document)
             .collect()
+    }
+
+    async fn list_page(&self, after: Option<&str>, limit: usize) -> ApiResult<(Vec<Value>, bool)> {
+        let (objects, more) = self.store.list_page(after, limit).await?;
+        let documents = objects
+            .iter()
+            .map(Self::document)
+            .collect::<ApiResult<Vec<_>>>()?;
+        Ok((documents, more))
     }
 
     fn empty_spec(&self) -> Value {

@@ -7,8 +7,11 @@
    stylesheet that fails to load is a console that renders as unstyled text
    at the worst possible moment.
 
-   The families name the system's faces first and fall back to the system
-   stack, because no webfont can be fetched and none is embedded.
+   The families are the *system* stack and nothing else. They used to name
+   the design system's own faces first and fall back — which, given that no
+   webfont can be fetched here and none is embedded, meant those faces
+   applied on exactly the machines that happened to have them installed:
+   one console rendering two ways, for a reason invisible from the page.
 
    Two roles for colour, never interchanged. Signal blue is the action and
    the "you are here"; the platform's own mark is the palette's cyan. Cyan
@@ -56,17 +59,33 @@
   --product-strong: var(--cyan-600);
   --product-subtle: var(--cyan-900);
 
-  --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
-  --font-sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600;
+  /* The system stack, and only the system stack.
+     It used to name "Space Grotesk" and "IBM Plex Sans" ahead of it, which was
+     a divergence rather than a preference: nothing on this page may be fetched,
+     so those faces load on exactly the machines that happen to have them
+     installed and nowhere else — the same console, rendering two ways, for a
+     reason nobody can see from the page. The system face is also the one that
+     ships optical sizing and legibility tuning already tuned for UI at these
+     sizes, which is the argument for it even where a webfont *could* be had. */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-display: var(--font-sans);
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600; --fw-bold: 700;
   --text-2xs: .6875rem; --text-xs: .75rem; --text-sm: .8125rem;
-  --text-base: .875rem; --text-lg: 1.125rem; --text-xl: 1.5rem;
-  --leading-tight: 1.1; --leading-snug: 1.28; --leading-normal: 1.55;
+  --text-base: .875rem; --text-lg: 1.0625rem; --text-xl: 1.375rem;
+  /* The page had no anchor: everything sat between 11px and 24px, so the
+     largest thing on screen read as a label rather than a title. */
+  --text-display: 2rem; --text-hero: 2.5rem;
+  --leading-hero: 1.04; --leading-tight: 1.12; --leading-snug: 1.3;
+  --leading-normal: 1.55;
 
-  /* Tracking is a function of size, not one number for the page. */
-  --tracking-display: -.025em; --tracking-tight: -.015em;
-  --tracking-body: 0em; --tracking-small: .01em; --tracking-caps: .08em;
+  /* Tracking is a function of size, not one number for the page: letters read
+     too far apart as they grow, and too close together as they shrink. So the
+     large steps are negative and get more so, body sits at zero, and the small
+     caps used for column heads get a positive bump to stay legible. */
+  --tracking-hero: -.032em; --tracking-display: -.024em;
+  --tracking-tight: -.014em; --tracking-body: 0em;
+  --tracking-small: .006em; --tracking-caps: .07em;
 
   --space-1: .25rem; --space-2: .5rem; --space-3: .75rem; --space-4: 1rem;
   --space-5: 1.25rem; --space-6: 1.5rem; --space-7: 2rem; --space-9: 3rem;
@@ -76,10 +95,28 @@
      ordinary field. Labels have one left edge, content has the other. */
   --gutter: 180px; --gutter-gap: 28px;
 
-  /* Square. Hairlines and space carry the structure; a rounded rectangle
-     inside a rounded rectangle is two frames around content that needed
-     none. Only what is genuinely round keeps a radius. */
-  --radius-sm: 0px; --radius-md: 0px; --radius-pill: 999px;
+  /* Radius, as a scale that tracks surface size.
+     This was `0px` throughout, defended as "hairlines and space carry the
+     structure". That is a coherent house style and it is not this one: a
+     continuous, softened corner is most of what makes a surface read as an
+     object you could pick up rather than a region that was cut out. The scale
+     is small-to-large because a big surface with a small radius looks clipped
+     and a small one with a big radius looks like a pill by accident. */
+  --radius-xs: 5px; --radius-sm: 8px; --radius-md: 12px;
+  --radius-lg: 18px; --radius-pill: 999px;
+
+  /* Materials. A floating layer is translucent so the content it covers stays
+     legible *as* content underneath — that is what says "this is over that"
+     without a drop shadow doing all the work.
+     Two rules the tokens encode. Bigger surfaces read thicker, so the sheet and
+     the dialog get more blur and more saturation than the header. And a
+     translucent surface is never stacked on another: the scrim between them is
+     opaque enough that the sheet is over one material, not two. */
+  --material-chrome: color-mix(in srgb, var(--bg-app) 72%, transparent);
+  --material-panel: color-mix(in srgb, var(--surface) 86%, transparent);
+  --blur-chrome: blur(20px) saturate(180%);
+  --blur-panel: blur(32px) saturate(180%);
+  --material-edge: inset 0 1px 0 color-mix(in srgb, var(--white) 8%, transparent);
 
   /* A modal task dims what it covers and a parallel panel does not; the sheet
      is modal, so this exists and is a token like everything else. */
@@ -94,7 +131,12 @@
   /* Almost nothing moves. An operator sees these screens all day, and
      what is opened dozens of times a day either moves imperceptibly or
      not at all. The curves are borrowed, not invented. */
-  --dur-fast: 130ms; --dur-base: 200ms;
+  --dur-press: 100ms; --dur-fast: 140ms; --dur-base: 220ms; --dur-slow: 320ms;
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  /* A critically damped spring, as a curve: it arrives and stops, with no
+     overshoot. Overshoot belongs to motion a gesture threw, and nothing on this
+     page is thrown — a panel that bounces on open is a panel an operator sees
+     bounce forty times a day. */
+  --ease-settle: cubic-bezier(0.32, 0.72, 0, 1);
 }

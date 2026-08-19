@@ -49,7 +49,7 @@ use velstra_cloud_model::{
 
 use crate::{
     host::{HostError, HostState, Receiver, Result, Transfer, VmObservation, VmRequest, Vmm},
-    hostfs::{self, Layout, slug, unslug},
+    hostfs::{self, Boot, Layout, slug, unslug},
 };
 
 pub struct QemuVmm {
@@ -76,7 +76,40 @@ impl QemuVmm {
     }
 
     fn unit(&self, instance: &str) -> String {
-        format!("velstra-vm-{}", slug(instance))
+        format!("velstra-vm-{}", hostfs::unit_slug(instance))
+    }
+
+    /// The VMM an **arriving** guest resumes into, and the monitor it answers on.
+    ///
+    /// Distinct from [`Self::unit`], and it has to be: an in-place VMM upgrade
+    /// migrates a guest to the node it is already on, so the outgoing QEMU still
+    /// holds that unit name and that monitor path while the incoming one is
+    /// started. `systemd-run` refuses the name outright — "already loaded or has
+    /// a fragment file" — which is how this was found, by running the whole chain
+    /// against a real hypervisor.
+    ///
+    /// A guest that arrived this way keeps the incoming pair for the rest of its
+    /// life on this node: a transient unit cannot be renamed.
+    fn incoming_unit(&self, instance: &str) -> String {
+        format!("velstra-in-{}", hostfs::unit_slug(instance))
+    }
+
+    fn incoming_monitor(&self, instance: &str) -> PathBuf {
+        self.layout.dir(instance).join("incoming-qmp.sock")
+    }
+
+    /// Which of the two VMMs is this guest's, right now. The ordinary pair wins
+    /// when both are there, which is the state during a transfer: the guest is
+    /// still the outgoing one until it is not.
+    fn live(&self, instance: &str) -> (String, PathBuf) {
+        if !self.monitor(instance).exists() && self.incoming_monitor(instance).exists() {
+            (
+                self.incoming_unit(instance),
+                self.incoming_monitor(instance),
+            )
+        } else {
+            (self.unit(instance), self.monitor(instance))
+        }
     }
 
     /// One QMP command.
@@ -89,7 +122,15 @@ impl QemuVmm {
     /// across a VMM restart, and the whole design of this crate is that it keeps
     /// none.
     async fn qmp(&self, instance: &str, command: &str, arguments: Value) -> Result<Value> {
-        let socket = self.monitor(instance);
+        let (_, socket) = self.live(instance);
+        self.qmp_at(&socket, command, arguments).await
+    }
+
+    /// The same, against a monitor the caller names — needed by the receiver
+    /// paths, which must ask the *incoming* VMM even while the outgoing one is
+    /// still answering on its own socket.
+    async fn qmp_at(&self, socket: &Path, command: &str, arguments: Value) -> Result<Value> {
+        let socket = socket.to_path_buf();
         let stream = tokio::net::UnixStream::connect(&socket)
             .await
             .map_err(|e| {
@@ -127,7 +168,12 @@ impl QemuVmm {
 
     /// **Untested:** needs a live QEMU.
     async fn run_state(&self, instance: &str) -> Option<String> {
-        let answer = self.qmp(instance, "query-status", json!({})).await.ok()?;
+        let (_, socket) = self.live(instance);
+        self.run_state_at(&socket).await
+    }
+
+    async fn run_state_at(&self, socket: &Path) -> Option<String> {
+        let answer = self.qmp_at(socket, "query-status", json!({})).await.ok()?;
         answer.get("status")?.as_str().map(str::to_string)
     }
 
@@ -138,10 +184,20 @@ impl QemuVmm {
     /// "waiting for a guest" — and what was it started with. A receiver whose
     /// process died answers neither, and so stops being ready.
     async fn observe_receiver(&self, instance: &str) -> Option<Receiver> {
-        if self.run_state(instance).await.as_deref() != Some("inmigrate") {
+        // Asked of the incoming VMM by name: during a same-machine transfer the
+        // outgoing one is still answering on its own monitor, and it is not the
+        // one in `inmigrate`.
+        if self
+            .run_state_at(&self.incoming_monitor(instance))
+            .await
+            .as_deref()
+            != Some("inmigrate")
+        {
             return None;
         }
-        let incoming = hostfs::url_in(&hostfs::unit_command(&self.unit(instance)).await?)?;
+        let incoming = hostfs::url_in(
+            &hostfs::unit_command(self.layout.scope, &self.incoming_unit(instance)).await?,
+        )?;
         Some(Receiver {
             url: self.published_url(&incoming)?,
             // The destination's `query-migrate` carries the counters only once
@@ -180,7 +236,11 @@ impl QemuVmm {
         let mut taken = BTreeSet::new();
         for entry in hostfs::read_dir_names(&self.layout.run_dir)? {
             let instance = unslug(&entry);
-            let Some(command) = hostfs::unit_command(&self.unit(&instance)).await else {
+            let Some(command) =
+                // The incoming unit is the one started with `-incoming <url>`, so
+                // that is where a port in use is named.
+                hostfs::unit_command(self.layout.scope, &self.incoming_unit(&instance)).await
+            else {
                 continue;
             };
             if let Some(port) = hostfs::url_in(&command)
@@ -212,7 +272,7 @@ impl Vmm for QemuVmm {
             if dir.join("root.raw").exists() {
                 host.disks.insert(instance.clone());
             }
-            if !self.monitor(&instance).exists() {
+            if !self.monitor(&instance).exists() && !self.incoming_monitor(&instance).exists() {
                 continue;
             }
             let Some(state) = self.run_state(&instance).await else {
@@ -245,7 +305,7 @@ impl Vmm for QemuVmm {
                 instance.clone(),
                 VmObservation {
                     state: state_of(&state),
-                    pid: hostfs::main_pid(&self.unit(&instance)).await,
+                    pid: hostfs::main_pid(self.layout.scope, &self.unit(&instance)).await,
                     started_at: hostfs::started_at(&dir),
                 },
             );
@@ -258,11 +318,14 @@ impl Vmm for QemuVmm {
         hostfs::publish_image(&self.layout, image).await
     }
 
-    async fn create_disk(&self, instance: &str, gib: u64) -> Result<()> {
-        hostfs::create_disk(&self.layout, instance, gib).await
+    async fn create_disk(&self, instance: &str, gib: u64, image: &str) -> Result<()> {
+        let source = hostfs::image_path(&self.layout, image);
+        hostfs::create_disk(&self.layout, instance, gib, source.as_deref()).await
     }
 
-    /// **Untested:** requires `qemu-system-*` and `systemd-run`.
+    /// Covered by `tests/qemu_boots_a_guest.rs`, which starts a real guest and
+    /// reads its console: "running" is what a VMM reports for a machine that
+    /// loaded nothing, so the console is the only proof that it booted.
     async fn start(&self, request: &VmRequest) -> Result<()> {
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
@@ -270,6 +333,7 @@ impl Vmm for QemuVmm {
         // A socket left by a dead VMM would stop the new one binding.
         let _ = std::fs::remove_file(&monitor);
         hostfs::systemd_run(
+            self.layout.scope,
             &self.unit(&request.instance),
             &self.layout.slice,
             &dir,
@@ -288,12 +352,13 @@ impl Vmm for QemuVmm {
             .map(|_| ())
     }
 
-    /// **Untested:** stops the unit and removes everything of the guest.
+    /// The teardown half of `tests/qemu_boots_a_guest.rs`: the guest is deleted and
+    /// the machine is asked again, so "gone" is observed rather than assumed.
     async fn delete(&self, instance: &str) -> Result<()> {
-        if self.monitor(instance).exists() {
+        if self.monitor(instance).exists() || self.incoming_monitor(instance).exists() {
             let _ = self.qmp(instance, "quit", json!({})).await;
         }
-        hostfs::stop_unit(&self.unit(instance)).await;
+        hostfs::stop_unit(self.layout.scope, &self.unit(instance)).await;
         let dir = self.layout.dir(instance);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
@@ -373,10 +438,13 @@ impl Vmm for QemuVmm {
                 format!("unix:{}", socket.display())
             }
         };
-        let monitor = self.monitor(&request.instance);
+        // Its own name and monitor — see `incoming_unit` for why it cannot be the
+        // guest's.
+        let monitor = self.incoming_monitor(&request.instance);
         let _ = std::fs::remove_file(&monitor);
         hostfs::systemd_run(
-            &self.unit(&request.instance),
+            self.layout.scope,
+            &self.incoming_unit(&request.instance),
             &self.layout.slice,
             &dir,
             &self.layout.binary,
@@ -392,9 +460,16 @@ impl Vmm for QemuVmm {
         // Only a VMM that is still waiting may be stopped. Once the guest has
         // arrived this same unit *is* the guest, and stopping it would be the
         // migration killing what it just moved.
-        if self.run_state(instance).await.as_deref() == Some("inmigrate") {
-            hostfs::stop_unit(&self.unit(instance)).await;
-            let _ = std::fs::remove_file(self.monitor(instance));
+        // Asked of the incoming VMM by name: on one machine the outgoing one is
+        // still answering, and it is not the one that may be stopped.
+        if self
+            .run_state_at(&self.incoming_monitor(instance))
+            .await
+            .as_deref()
+            == Some("inmigrate")
+        {
+            hostfs::stop_unit(self.layout.scope, &self.incoming_unit(instance)).await;
+            let _ = std::fs::remove_file(self.incoming_monitor(instance));
         }
         let _ = std::fs::remove_file(self.migrate_socket(instance));
         Ok(())
@@ -504,8 +579,6 @@ fn qemu_args(
         request.vcpus.to_string().into(),
         "-m".into(),
         request.memory_mib.to_string().into(),
-        "-kernel".into(),
-        layout.firmware.clone().into(),
         "-drive".into(),
         format!(
             "file={},format=raw,if=virtio",
@@ -514,15 +587,58 @@ fn qemu_args(
         .into(),
         "-qmp".into(),
         format!("unix:{},server=on,wait=off", monitor.display()).into(),
+        // Always, and to a file rather than nowhere. A guest that cannot boot is
+        // the one that most needs to be heard, and it is the one that says the
+        // least: with no console at all, the first real image started here
+        // produced not a single byte to explain itself.
+        "-serial".into(),
+        format!("file:{}", layout.console(&request.instance).display()).into(),
     ];
-    for (index, tap) in request.taps.iter().enumerate() {
+    match &layout.boot {
+        // `-bios`, not `-kernel`. QEMU's `-kernel` takes a Linux kernel and
+        // nothing else; a firmware blob given to it boots nothing and says
+        // nothing. `None` leaves QEMU its own SeaBIOS, which is what makes a
+        // stock cloud image just work.
+        Boot::Firmware(None) => {}
+        Boot::Firmware(Some(path)) => {
+            args.push("-bios".into());
+            args.push(path.clone().into());
+        }
+        Boot::Kernel {
+            kernel,
+            cmdline,
+            initrd,
+        } => {
+            args.push("-kernel".into());
+            args.push(kernel.clone().into());
+            if let Some(initrd) = initrd {
+                args.push("-initrd".into());
+                args.push(initrd.clone().into());
+            }
+            // Passed even when empty would be wrong, but an empty one is a
+            // kernel that cannot find a root filesystem — the caller's problem
+            // to notice, not this function's to paper over.
+            if !cmdline.is_empty() {
+                args.push("-append".into());
+                args.push(cmdline.clone().into());
+            }
+        }
+    }
+    for (index, nic) in request.nics.iter().enumerate() {
         // The guest's NIC order is the order of this list, and a guest that
         // finds its addresses on the wrong NIC after a move is an outage with
         // no error message.
         args.push("-netdev".into());
-        args.push(format!("tap,id=n{index},ifname={tap},script=no,downscript=no").into());
+        args.push(format!("tap,id=n{index},ifname={},script=no,downscript=no", nic.tap).into());
         args.push("-device".into());
-        args.push(format!("virtio-net-pci,netdev=n{index}").into());
+        // Stated rather than left to QEMU, which would otherwise hand every
+        // guest the same default address and give the second one on a link a
+        // duplicate.
+        let mut device = format!("virtio-net-pci,netdev=n{index}");
+        if let Some(mac) = &nic.mac {
+            device.push_str(&format!(",mac={mac}"));
+        }
+        args.push(device.into());
     }
     if let Some(incoming) = incoming {
         args.push("-incoming".into());
@@ -612,6 +728,7 @@ fn transferred_mib(answer: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::Nic;
 
     fn layout() -> Layout {
         Layout {
@@ -629,7 +746,16 @@ mod tests {
             memory_mib: 8192,
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
-            taps: vec!["vt-a".into(), "vt-b".into()],
+            nics: vec![
+                Nic {
+                    tap: "vt-a".into(),
+                    mac: Some("52:54:00:00:00:0a".into()),
+                },
+                Nic {
+                    tap: "vt-b".into(),
+                    mac: None,
+                },
+            ],
         }
     }
 

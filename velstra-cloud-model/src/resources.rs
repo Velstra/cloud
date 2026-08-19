@@ -86,6 +86,19 @@ pub struct ProjectSpec {
     /// from, kept as a name so the hierarchy is walked, not guessed.
     pub parent: String,
     pub quota: Quota,
+    /// Who may do what inside this project.
+    ///
+    /// Here rather than in a collection of its own because a project **is** the
+    /// unit of tenancy: everything the bindings govern is under this name, and a
+    /// policy object one indirection away is one more thing that can be deleted
+    /// while what it protects stays.
+    ///
+    /// Empty means nobody but a cell operator, which is the safe direction and
+    /// the state a freshly created project is in: whoever created it grants
+    /// themselves, deliberately, rather than being granted by a default nobody
+    /// chose. See [`crate::authz`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<crate::authz::Binding>,
 }
 
 /// Limits, counted rather than reserved. A reservation that is not released on
@@ -329,6 +342,16 @@ pub struct VolumeSpec {
     /// which is a decision an operator has to make rather than a default.
     pub encryption_key: Option<String>,
     pub source_image: Option<String>,
+    /// The snapshot this volume was cloned from, if it came from one.
+    ///
+    /// Alongside `source_image` rather than replacing it, because they are the
+    /// same statement about two different origins — and like it, this describes
+    /// how the volume came into existence rather than something that keeps
+    /// happening. A volume is never restored *in place* from a snapshot: that
+    /// would be a command, and asking a command twice undoes whatever happened
+    /// in between. Restoring is making a new volume from a snapshot, which is
+    /// this field.
+    pub source_snapshot: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -375,6 +398,92 @@ impl Assigned for VolumeSpec {
 /// volume that vanished from the API while its pool still held gigabytes would
 /// be storage nobody is billed for and nobody can find.
 pub const POOL_RELEASE_FINALIZER: &str = "pool.velstra.io/release";
+
+// ---- snapshot ------------------------------------------------------------
+
+/// A point-in-time copy of a volume, in that volume's own pool.
+///
+/// **The source is in the name, not in a field.**
+/// `projects/p1/volumes/data-1/snapshots/nightly` is a copy of `data-1` and can
+/// never be a copy of anything else. That is not tidiness. Which volume a copy
+/// came from is the one thing about it that must never change — a snapshot
+/// repointed at another volume is a restore that quietly hands back somebody
+/// else's data — and a fact that lives in the identity cannot be edited, cannot
+/// disagree with a second copy of itself, and outlives the object: a controller
+/// reconciling the *name* of a snapshot that has just been deleted still knows
+/// which volume it was holding.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotSpec {
+    /// The pool holding it, which is always the source volume's pool — a copy
+    /// is made where the bytes already are, and no backend copies one between
+    /// pools without reading and writing every block.
+    ///
+    /// Derived by the API from the volume rather than asked for. It is a field
+    /// at all so that a pool agent's watch filter is one comparison, exactly as
+    /// an attachment carries the node it is opened on.
+    pub pool: String,
+}
+
+/// What the pool can see of the copy. Every value here is observable on the
+/// backend right now; none of them describe a transition.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// The pool that has claimed this snapshot and reports on it.
+    pub pool: Option<String>,
+    /// True while the pool holds the copy.
+    ///
+    /// Unlike everything else in a status, this one is also *consulted* — see
+    /// [`crate::storage::reconcile_snapshot`]. A snapshot that the pool no
+    /// longer holds but once reported must not be taken again, because a copy
+    /// made now is a copy of a different moment wearing the same name.
+    pub taken: bool,
+    /// How big the copy is, logically: how large the volume was at the moment
+    /// it was made, and therefore the smallest volume that can be made from it.
+    /// Not what it occupies in the pool — a delta against a live volume grows
+    /// as the volume moves on, and billing is a separate question.
+    pub size_gib: u64,
+    /// The moment the copy is *of*, as the backend records it. Read from the
+    /// pool rather than stamped when we noticed: an agent that was restarted
+    /// mid-pass would otherwise date a week-old snapshot to this morning.
+    pub taken_at: Option<Timestamp>,
+}
+
+impl Observed for SnapshotStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        self.pool.as_deref()
+    }
+}
+
+impl Assigned for SnapshotSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        // The same two-field ownership as a volume, for the same reason: the
+        // bytes are in a pool, so the pool is the party with something to
+        // report about them.
+        Some(self.pool.as_str())
+    }
+}
+
+pub type Snapshot = Resource<SnapshotSpec, SnapshotStatus>;
+
+/// The guard a **volume** carries while any snapshot has been taken from it.
+///
+/// Held on the source, not on the copy, because the danger runs that way: on
+/// every backend this platform will speak to — LVM thin, ZFS, Ceph RBD — a
+/// snapshot is a delta against the volume it came from, and destroying the
+/// volume makes the copies unreadable. Which of them are full copies is a
+/// property of the backend and not of anything an operator wrote down, so the
+/// platform assumes the dependency exists; the cost of assuming wrongly is a
+/// delete that waits for an explicit second delete, and the cost of guessing
+/// the other way is data nobody can get back.
+pub const SNAPSHOT_SOURCE_FINALIZER: &str = "snapshot.velstra.io/source";
 
 // ---- pool ----------------------------------------------------------------
 
@@ -494,8 +603,12 @@ pub struct NetworkSpec {
 pub struct NetworkStatus {
     pub observed_generation: u64,
     pub conditions: Vec<Condition>,
-    /// Nodes that have the VNI programmed.
-    pub programmed_on: Vec<String>,
+    // There was a `programmed_on: Vec<String>` here, and nothing ever wrote it:
+    // a list of nodes is an aggregate, and an aggregate is not a fact anybody
+    // owns — every node in the cell would have been writing into one field,
+    // which the one-writer rule forbids. It is the same shape that was removed
+    // from `ImageStatus`, and the same answer applies if it is ever wanted
+    // back: each node says what it holds, and the API adds them up on read.
 }
 
 impl Observed for NetworkStatus {
@@ -548,6 +661,19 @@ pub type Subnet = Resource<SubnetSpec, SubnetStatus>;
 pub struct PortSpec {
     pub network: String,
     pub subnet: String,
+    /// The node this port is assigned to — **derived**, never written by a
+    /// client: it is the node holding the guest that uses the port, copied from
+    /// that instance by the port controller.
+    ///
+    /// It is here because the access rule needs it. "The fact wins while it
+    /// exists; the assignee may claim only when nobody holds it" leaves a port
+    /// with neither unclaimable by anybody, which is what it was: every node's
+    /// attempt to report on a port it was carrying was refused, and the port sat
+    /// at `programmed: false` for ever while the guest ran perfectly. Same shape
+    /// as `AttachmentSpec::node`, and derived the same way, so a port naming the
+    /// wrong node is not something anybody can write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
     /// Allocated by the IPAM controller, then never changed — an address that
     /// moves under a running guest is an outage.
     pub address: Option<String>,
@@ -646,7 +772,11 @@ impl Assigned for NetworkSpec {}
 
 impl Assigned for SubnetSpec {}
 
-impl Assigned for PortSpec {}
+impl Assigned for PortSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+}
 
 impl Assigned for OperationSpec {}
 

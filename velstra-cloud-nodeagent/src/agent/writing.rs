@@ -7,7 +7,7 @@
 //! allowed to report is a node whose objects are quietly going stale, and that
 //! has to be visible.
 
-use std::{collections::BTreeMap, net::IpAddr, sync::atomic::Ordering};
+use std::{collections::BTreeMap, sync::atomic::Ordering};
 
 use serde::{Serialize, de::DeserializeOwned};
 use velstra_cloud_model::{
@@ -17,10 +17,7 @@ use velstra_cloud_model::{
 use velstra_cloud_store::{StoreError, TypedStore, typed::TypedError};
 
 use super::{Agent, Pass};
-use crate::{
-    host::HostState,
-    metadata::{InstanceMetadata, address_of},
-};
+use crate::{guests, host::HostState};
 
 impl Agent {
     // ---- the node's own object ------------------------------------------
@@ -110,42 +107,53 @@ impl Agent {
         }
     }
 
-    // ---- metadata --------------------------------------------------------
+    // ---- what this node tells its guests ----------------------------------
 
-    /// Rebuild the address-to-guest map the metadata service answers from.
+    /// Rebuild what the metadata service and the DHCP responder answer from.
     ///
     /// Built fresh from the objects this node holds, so an address that moved
     /// away stops resolving here on the same pass. An entry that outlived its
     /// guest would hand the next tenant of that address somebody else's keys.
-    pub(super) fn refresh_metadata(&self, mine: &[&Instance], ports: &BTreeMap<String, Port>) {
-        let mut by_address: BTreeMap<IpAddr, InstanceMetadata> = BTreeMap::new();
-        for instance in mine.iter().filter(|i| !i.meta.is_deleting()) {
-            let name = instance.meta.name.to_string();
-            let meta = InstanceMetadata {
-                instance_id: name.clone(),
-                hostname: instance.meta.name.id().to_string(),
-                ssh_keys: instance.spec.ssh_keys.clone(),
-                user_data: instance.spec.user_data.clone(),
-            };
-            for port in instance.spec.ports.iter().filter_map(|p| ports.get(p)) {
-                let Some(address) = port.spec.address.as_deref().and_then(address_of) else {
-                    continue;
-                };
-                if let Some(other) = by_address.get(&address) {
-                    // Two guests on one address is a datapath that would give
-                    // the second one the first one's identity. Refuse to answer
-                    // for either rather than pick.
-                    tracing::error!(
-                        %address, first = %other.instance_id, second = %name,
-                        "two instances claim one address; answering for neither"
-                    );
-                    by_address.remove(&address);
-                    continue;
-                }
-                by_address.insert(address, meta.clone());
+    ///
+    /// A subnet or network this node could not read costs a guest its gateway
+    /// and its mask for one pass, and the refresh happens anyway rather than
+    /// leaving the previous answer standing. That is the deliberate order of
+    /// the two risks: an incomplete configuration is visible and self-repairing,
+    /// and a stale *identity* is neither — it is somebody else's keys handed to
+    /// whoever holds a re-used address.
+    pub(super) async fn refresh_guests(
+        &self,
+        mine: &[&Instance],
+        ports: &BTreeMap<String, Port>,
+        taps: &BTreeMap<String, String>,
+        pass: &mut Pass,
+    ) {
+        let subnets = self.shared(self.cell.subnets().await, "subnets", pass);
+        let networks = self.shared(self.cell.networks().await, "networks", pass);
+        self.guests
+            .replace(guests::derive(mine, ports, &subnets, &networks, taps));
+    }
+
+    /// A collection this node only reads, keyed by name. An unreadable one is a
+    /// counted failure and an empty map — see [`Agent::refresh_guests`] for why
+    /// that is better here than keeping what was read last time.
+    fn shared<S, T>(
+        &self,
+        read: crate::host::Result<Vec<Resource<S, T>>>,
+        what: &str,
+        pass: &mut Pass,
+    ) -> BTreeMap<String, Resource<S, T>> {
+        match read {
+            Ok(objects) => objects
+                .into_iter()
+                .map(|o| (o.meta.name.to_string(), o))
+                .collect(),
+            Err(e) => {
+                tracing::error!(error = %e, "could not list {what}; guests will be told less");
+                pass.failures += 1;
+                BTreeMap::new()
             }
         }
-        self.metadata.replace(by_address);
     }
 
     // ---- writing ---------------------------------------------------------

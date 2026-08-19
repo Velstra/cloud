@@ -207,6 +207,12 @@ impl From<&v1::ProjectSpec> for resources::ProjectSpec {
             display_name: s.display_name.clone(),
             parent: s.parent.clone(),
             quota: s.quota.as_ref().map(Into::into).unwrap_or_default(),
+            // The protobuf surface does not describe bindings yet, so a project
+            // that arrives over gRPC carries none. Empty is the safe direction:
+            // it grants nothing rather than inventing a grant nobody asked for.
+            // Managing them over gRPC needs a message, and until there is one,
+            // REST is where a policy is written.
+            bindings: Vec::new(),
         }
     }
 }
@@ -502,6 +508,7 @@ impl From<&resources::VolumeSpec> for v1::VolumeSpec {
             pool: s.pool.clone(),
             encryption_key: s.encryption_key.clone(),
             source_image: s.source_image.clone(),
+            source_snapshot: s.source_snapshot.clone(),
         }
     }
 }
@@ -513,6 +520,49 @@ impl From<&v1::VolumeSpec> for resources::VolumeSpec {
             pool: s.pool.clone(),
             encryption_key: s.encryption_key.clone(),
             source_image: s.source_image.clone(),
+            source_snapshot: s.source_snapshot.clone(),
+        }
+    }
+}
+
+impl From<&resources::SnapshotSpec> for v1::SnapshotSpec {
+    fn from(s: &resources::SnapshotSpec) -> Self {
+        Self {
+            pool: s.pool.clone(),
+        }
+    }
+}
+
+impl From<&v1::SnapshotSpec> for resources::SnapshotSpec {
+    fn from(s: &v1::SnapshotSpec) -> Self {
+        Self {
+            pool: s.pool.clone(),
+        }
+    }
+}
+
+impl From<&resources::SnapshotStatus> for v1::SnapshotStatus {
+    fn from(s: &resources::SnapshotStatus) -> Self {
+        Self {
+            observed_generation: s.observed_generation,
+            conditions: conditions_out(&s.conditions),
+            pool: s.pool.clone(),
+            taken: s.taken,
+            size_gib: s.size_gib,
+            taken_at: s.taken_at.map(millis),
+        }
+    }
+}
+
+impl From<&v1::SnapshotStatus> for resources::SnapshotStatus {
+    fn from(s: &v1::SnapshotStatus) -> Self {
+        Self {
+            observed_generation: s.observed_generation,
+            conditions: conditions_in(&s.conditions),
+            pool: s.pool.clone(),
+            taken: s.taken,
+            size_gib: s.size_gib,
+            taken_at: s.taken_at.map(timestamp),
         }
     }
 }
@@ -612,7 +662,6 @@ impl From<&resources::NetworkStatus> for v1::NetworkStatus {
         Self {
             observed_generation: s.observed_generation,
             conditions: conditions_out(&s.conditions),
-            programmed_on: s.programmed_on.clone(),
         }
     }
 }
@@ -622,7 +671,6 @@ impl From<&v1::NetworkStatus> for resources::NetworkStatus {
         Self {
             observed_generation: s.observed_generation,
             conditions: conditions_in(&s.conditions),
-            programmed_on: s.programmed_on.clone(),
         }
     }
 }
@@ -682,6 +730,7 @@ impl From<&resources::PortSpec> for v1::PortSpec {
             mac: s.mac.clone(),
             security_groups: s.security_groups.clone(),
             rate_limit_mbit: s.rate_limit_mbit,
+            node: s.node.clone(),
         }
     }
 }
@@ -695,6 +744,7 @@ impl From<&v1::PortSpec> for resources::PortSpec {
             mac: s.mac.clone(),
             security_groups: s.security_groups.clone(),
             rate_limit_mbit: s.rate_limit_mbit,
+            node: s.node.clone(),
         }
     }
 }
@@ -937,6 +987,7 @@ resource_conversions!(resources::Node, Node);
 resource_conversions!(resources::Image, Image);
 resource_conversions!(resources::Instance, Instance);
 resource_conversions!(resources::Volume, Volume);
+resource_conversions!(resources::Snapshot, Snapshot);
 resource_conversions!(resources::Attachment, Attachment);
 resource_conversions!(resources::Network, Network);
 resource_conversions!(resources::Subnet, Subnet);

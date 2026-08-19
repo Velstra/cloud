@@ -15,16 +15,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serde::Deserialize;
+use tracing::debug;
 use velstra_cloud_model::{
     Condition, ConditionStatus,
     meta::{ResourceName, Timestamp, condition, set_condition},
     reconcile::{TargetView, operation_progress},
     resources::{Operation, OperationSpec, OperationStatus},
 };
-use velstra_cloud_store::{Store, key_for, prefix_for};
+use velstra_cloud_store::{Expect, Store, key_for, prefix_for};
 
 use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
 
@@ -39,6 +41,13 @@ const TARGET_KINDS: [&str; 6] = [
     "ports",
 ];
 
+/// How long a finished operation is kept.
+///
+/// A day: long enough that a client polling one, or a person reading a console
+/// after a night's sleep, still finds it; short enough that a busy cell's
+/// records do not outweigh the objects they are about.
+const DEFAULT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
 pub struct OperationsController {
     store: Arc<dyn Store>,
     status: StatusWriter<OperationSpec, OperationStatus>,
@@ -47,6 +56,7 @@ pub struct OperationsController {
     /// reconciled. Only ever an optimisation: an operation missing from here is
     /// found by the resync, one interval later.
     watching: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
+    retention: Duration,
 }
 
 impl OperationsController {
@@ -60,7 +70,19 @@ impl OperationsController {
             status,
             cell: cell.to_string(),
             watching: Arc::new(Mutex::new(BTreeMap::new())),
+            retention: DEFAULT_RETENTION,
         }
+    }
+
+    /// How long a finished operation is kept before it is removed.
+    ///
+    /// Nothing removed them at all, and an operation is created by every write
+    /// this API serves — so the collection grew without bound, in the one store
+    /// whose capacity is what bounds a cell. A record nobody can ever read again
+    /// is not an audit trail, it is ballast.
+    pub fn keeping_for(mut self, retention: Duration) -> Self {
+        self.retention = retention;
+        self
     }
 
     /// What the target looks like, in the two fields any resource has.
@@ -112,17 +134,14 @@ impl Reconciler for OperationsController {
             .iter()
             .map(|kind| {
                 let watching = self.watching.clone();
-                Related {
-                    prefix: prefix_for(&self.cell, kind),
-                    map: Arc::new(move |target: &str| {
-                        watching
-                            .lock()
-                            .unwrap()
-                            .get(target)
-                            .map(|ops| ops.iter().cloned().collect())
-                            .unwrap_or_default()
-                    }),
-                }
+                Related::named(prefix_for(&self.cell, kind), move |target: &str| {
+                    watching
+                        .lock()
+                        .unwrap()
+                        .get(target)
+                        .map(|ops| ops.iter().cloned().collect())
+                        .unwrap_or_default()
+                })
             })
             .collect()
     }
@@ -169,6 +188,30 @@ impl Reconciler for OperationsController {
             },
         );
         self.status.write(operation, &next).await?;
+
+        // Old enough to go. Measured from when it *finished*, not from when it
+        // was made: an operation that took an hour is readable for the whole
+        // retention after it ended rather than for whatever was left of it.
+        if let Some(finished) = next.status.finished_at
+            // `>=`, not `>`: a retention of nothing means "as soon as it has
+            // finished", and with `>` the two would differ only when the pass
+            // that finishes it and the pass that removes it land in the same
+            // millisecond — which is a flake, not a policy.
+            && Timestamp::now().0.saturating_sub(finished.0) >= self.retention.as_millis() as u64
+        {
+            // Best effort, and deliberately: a delete that loses a race with
+            // another pass has already had the effect it wanted. What must not
+            // happen is the pass failing over it and the operation's *target*
+            // going unreconciled.
+            let key = key_for(&self.cell, "operations", name);
+            if let Err(error) = self.store.delete(&key, Expect::Any).await {
+                debug!(operation = name, %error, "could not prune a finished operation");
+            }
+            self.watching.lock().unwrap().values_mut().for_each(|ops| {
+                ops.remove(name);
+            });
+            return Ok(());
+        }
 
         let mut watching = self.watching.lock().unwrap();
         if progress.done {
@@ -385,5 +428,84 @@ mod tests {
         let done = f.reload().await;
         assert!(done.status.done);
         assert!(done.status.error.is_some());
+    }
+
+    // ---- retention -------------------------------------------------------
+
+    /// The same world, with a retention this test chooses. A retention of
+    /// nothing takes the same code path a day would.
+    fn keeping(f: &Fixture, retention: Duration) -> OperationsController {
+        OperationsController::new(
+            f.raw.clone(),
+            StatusWriter::new(f.raw.clone(), "cell-1", "operations", "operations"),
+            "cell-1",
+        )
+        .keeping_for(retention)
+    }
+
+    const OP: &str = "projects/p1/operations/op-7";
+
+    /// A finished operation older than the retention is removed.
+    ///
+    /// Nothing removed them at all before this. An operation is created by
+    /// every write the API serves, so the collection grew without bound — in
+    /// the one store whose capacity is what bounds a cell.
+    #[tokio::test]
+    async fn a_finished_operation_is_eventually_removed() {
+        let (f, _) = fixture();
+        let controller = keeping(&f, Duration::from_millis(0));
+        f.instance(1, Some(Condition::ready(1))).await;
+        let op = f.operation("create", 1).await;
+
+        // One pass: it computes as finished, is stamped, and is already past a
+        // retention of nothing — so it goes in the same pass. That is the same
+        // code path a day-old operation takes, without a day.
+        controller.reconcile(OP, Some(&op)).await.unwrap();
+        assert!(
+            f.operations.get(OP).await.unwrap().is_none(),
+            "a finished operation past its retention is still here"
+        );
+    }
+
+    /// One that has not finished is never removed, however old it is.
+    ///
+    /// The retention is measured from when an operation *ended*. Removing an
+    /// unfinished one would delete the only record of work still going on.
+    #[tokio::test]
+    async fn an_unfinished_operation_is_kept_however_old() {
+        let (f, _) = fixture();
+        let controller = keeping(&f, Duration::from_millis(0));
+        f.instance(1, Some(Condition::ready(1))).await;
+        // Generation 5, which the instance at generation 1 has not caught up to.
+        let op = f.operation("create", 5).await;
+
+        controller.reconcile(OP, Some(&op)).await.unwrap();
+        let stored = f.operations.get(OP).await.unwrap().expect("still here");
+        assert!(
+            !stored.status.done,
+            "the fixture is wrong: this operation should not be finished"
+        );
+        controller.reconcile(OP, Some(&stored)).await.unwrap();
+        assert!(
+            f.operations.get(OP).await.unwrap().is_some(),
+            "an operation still working was removed"
+        );
+    }
+
+    /// Within the retention it is still readable — that is what a retention is.
+    #[tokio::test]
+    async fn a_freshly_finished_operation_is_still_readable() {
+        let (f, _) = fixture();
+        let controller = keeping(&f, Duration::from_secs(3600));
+        f.instance(1, Some(Condition::ready(1))).await;
+        let op = f.operation("create", 1).await;
+
+        controller.reconcile(OP, Some(&op)).await.unwrap();
+        let stored = f.operations.get(OP).await.unwrap().expect("still here");
+        controller.reconcile(OP, Some(&stored)).await.unwrap();
+        assert!(
+            f.operations.get(OP).await.unwrap().is_some(),
+            "an operation was removed inside its retention, so a client polling it sees a 404"
+        );
     }
 }

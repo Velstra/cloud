@@ -123,18 +123,77 @@ function movedCondition(m) {
 /// where a freshly created migration has no `Moved` condition, which is a world
 /// the real API never produces. That is exactly the drift this fake exists to
 /// prevent, so it went wrong here once already.
+/// Every port in the store, which is what the three computed fields below are
+/// computed from.
+const allPorts = () => [...store.values()].filter((r) => /\/ports\//.test(r.meta.name));
+
+/// How many addresses this subnet has given out, and how many are left —
+/// `velstra_cloud_model::ipam::counts`, which the API runs on the way out.
+///
+/// Counted from the ports, never stored. A port created or deleted changes these
+/// two numbers with **nothing written to the subnet**, which is the whole point
+/// of computing them on read and is also what makes them the hardest thing on
+/// this contract for a client to get right: there is no event to tell anybody.
+function subnetCounts(subnet) {
+  const cidr = String(subnet.spec.cidr || "");
+  const [, bits] = cidr.split("/");
+  const prefix = Number(bits);
+  if (!cidr.includes("/") || !Number.isFinite(prefix)) return [0, 0];
+  const v6 = cidr.includes(":");
+  const usable = v6
+    ? (prefix === 128 ? 0 : prefix >= 65 ? 2 ** (128 - prefix) - 1 : Number.MAX_SAFE_INTEGER)
+    : (prefix >= 31 ? 0 : 2 ** (32 - prefix) - 2);
+
+  const name = subnet.meta.name;
+  const allocated = allPorts()
+    .filter((p) => p.spec.subnet === name && p.spec.address).length;
+  // The gateway and anything explicitly reserved are not available even though
+  // nothing holds them. A set, because a gateway that is also listed as reserved
+  // is one address, not two.
+  const reserved = new Set([...(subnet.spec.reserved || []), subnet.spec.gateway].filter(Boolean));
+  return [allocated, Math.max(0, usable - allocated - reserved.size)];
+}
+
+/// The addresses in a security group, as the ports say it —
+/// `velstra_cloud_model::security::members_in`.
+const groupMembers = (group) => allPorts()
+  .filter((p) => (p.spec.securityGroups || []).some((g) => g === group.meta.name))
+  .map((p) => p.spec.address)
+  .filter(Boolean);
+
+/// What the API adds on the way out, and only on the way out.
+///
+/// Three fields, and every one of them is an aggregate over *other* objects that
+/// no writer owns — so none of them is ever written, and none of them produces a
+/// watch event on the object carrying it. This used to compute only the
+/// migration's condition, which made the other two static: a subnet's occupancy
+/// and a group's membership never moved however many ports a test created, so a
+/// console that read them once and never asked again passed, and a console that
+/// re-read them was doing work no test could see the point of. That is the fake
+/// deciding, by omission, that a whole class of contract behaviour does not
+/// exist.
 function decorate(r) {
-  if (!r || !/\/migrations\//.test(r.meta.name)) return r;
-  return {
-    ...r,
-    status: {
-      ...r.status,
-      conditions: [
-        ...(r.status.conditions || []).filter((c) => c.kind !== "Moved"),
-        movedCondition(r),
-      ],
-    },
-  };
+  if (!r) return r;
+  if (/\/migrations\//.test(r.meta.name)) {
+    return {
+      ...r,
+      status: {
+        ...r.status,
+        conditions: [
+          ...(r.status.conditions || []).filter((c) => c.kind !== "Moved"),
+          movedCondition(r),
+        ],
+      },
+    };
+  }
+  if (/\/subnets\//.test(r.meta.name)) {
+    const [allocated, available] = subnetCounts(r);
+    return { ...r, status: { ...r.status, allocated, available } };
+  }
+  if (/\/security-groups\//.test(r.meta.name)) {
+    return { ...r, status: { ...r.status, members: groupMembers(r) } };
+  }
+  return r;
 }
 
 // ---- the seed --------------------------------------------------------------
@@ -188,7 +247,11 @@ function seed() {
     { observedGeneration: 1, conditions: ready(1), allocated: 12, available: 241 });
   put("projects/p1/ports/web-1-eth0", { network: "projects/p1/networks/prod",
     subnet: "projects/p1/subnets/prod-a", address: "10.20.0.11", mac: "02:1a:4b:00:11:22",
-    securityGroups: ["web"], rateLimitMbit: 1000 },
+    // A full resource name, which is how the platform spells a reference to
+    // anything but a node — the API refuses a bare id at the door. The group it
+    // names does not exist, and that is a real state rather than an oversight: a
+    // port whose group has been deleted keeps working with fewer allowances.
+    securityGroups: ["projects/p1/security-groups/web"], rateLimitMbit: 1000 },
     { observedGeneration: 1, conditions: ready(1), node: "node-a", programmed: true, tapDevice: "tap0" });
 
   // Settled.
@@ -310,8 +373,90 @@ function listUnder(name) {
   // `projects/p1/instances` selects every resource whose name is that plus one
   // id, which is what the store's prefix scan does.
   const prefix = name + "/";
-  return [...store.values()].filter((r) =>
-    r.meta.name.startsWith(prefix) && r.meta.name.slice(prefix.length).indexOf("/") < 0);
+  return [...store.values()]
+    .filter((r) =>
+      r.meta.name.startsWith(prefix) && r.meta.name.slice(prefix.length).indexOf("/") < 0)
+    // Name order, because that is what the store's key order *is* and it is what
+    // makes a page token work at all: a token carries the last name delivered
+    // and the next page resumes strictly after it. Served in insertion order —
+    // which is what a `Map` gives and what this returned before — resuming
+    // "after" a name means nothing, and a walk would repeat some objects and
+    // skip others while looking perfectly well-behaved.
+    .sort((a, b) => (a.meta.name < b.meta.name ? -1 : a.meta.name > b.meta.name ? 1 : 0));
+}
+
+// ---- paging ----------------------------------------------------------------
+//
+// `velstra-cloud-api/src/paging.rs`, in the shape a client sees it. This is the
+// half the console cannot be tested without: a fake that always answers with a
+// whole collection is a fake that no client can fail against, so the console's
+// paging would be untested by construction and every test would pass against a
+// server that cannot behave like the real one.
+//
+// Three things here are the contract rather than convenience, and each is a way
+// a plausible implementation goes wrong:
+//
+//  * **`nextPageToken` is absent, not empty, when the walk is done** — and it is
+//    absent when a collection ends exactly on a page boundary. Emitting one
+//    because the last page was full costs every client one pointless round trip
+//    per walk, for ever, and no test that only counts objects would notice.
+//  * **Every page reports the revision the *first* page was read at**, carried
+//    in the token. Report each page's own and a client that lists to the end and
+//    then watches from what it was given silently misses everything that
+//    happened during the walk — the exact failure the list-then-watch order
+//    exists to prevent.
+//  * **A token is checked against the collection and parent it was minted for.**
+//    Presented against another it does not mean "start there"; it means the
+//    caller has two walks confused.
+
+const DEFAULT_PAGE_SIZE = 100;
+const MAX_PAGE_SIZE = 1000;
+
+/// This server's ceiling on a page, lowered by `/__test/pagesize` so a suite can
+/// prove a client walks a multi-page list without seeding a thousand objects.
+///
+/// A ceiling and not a forced page size: an unpaged request is still answered
+/// whole, exactly as the real API answers one. What this models is a server
+/// whose maximum is smaller than what the client asked for — which is what the
+/// real API is to any client asking for more than a thousand, and the case a
+/// client is most likely to get wrong because it believes its own number.
+let pageCeiling = MAX_PAGE_SIZE;
+
+/// Report each page's *own* revision instead of the walk's — a server getting
+/// the rule wrong, on purpose.
+///
+/// It exists because a client's own correctness here is otherwise untestable. A
+/// faithful server repeats the first page's revision on every page, so a client
+/// that keeps the first and one that keeps the last read the same value and no
+/// test can tell them apart. Pointing the client at a server that gets it wrong
+/// is the only way to ask whether the client is doing the conservative thing —
+/// and the conservative thing is what it must do, because it cannot know which
+/// kind of server it is talking to.
+let ownRevisionPerPage = false;
+
+const SEP = "\u001f";
+
+function encodeToken(t) {
+  return Buffer.from([t.kind, t.parent, t.revision, t.after].join(SEP), "utf8")
+    .toString("base64url");
+}
+
+function decodeToken(raw) {
+  let plain;
+  try { plain = Buffer.from(raw, "base64url").toString("utf8"); } catch (e) { return null; }
+  const parts = plain.split(SEP);
+  if (parts.length !== 4) return null;
+  const [kind, parent, revision, after] = parts;
+  if (!/^\d+$/.test(revision)) return null;
+  return { kind, parent, revision, after };
+}
+
+/// Split a collection name into the parent and the collection, the way a token
+/// records them: `projects/p1/instances` → `["projects/p1", "instances"]`, and
+/// `nodes` → `["", "nodes"]`.
+function splitCollection(name) {
+  const cut = name.lastIndexOf("/");
+  return cut < 0 ? ["", name] : [name.slice(0, cut), name.slice(cut + 1)];
 }
 
 function announce(type, resource, name) {
@@ -421,7 +566,24 @@ const server = createServer(async (req, res) => {
     r.meta.createdAt -= Number(url.searchParams.get("seconds") || 0) * 1000;
     return json(res, 200, decorate(r));
   }
-  if (path === "/__test/reset") { seed(); return json(res, 200, { ok: true }); }
+  // Lower this server's page ceiling, so a client's walk can be exercised over
+  // a handful of objects instead of a thousand. `0` puts it back.
+  // See `ownRevisionPerPage`.
+  if (path === "/__test/pagerevision") {
+    ownRevisionPerPage = url.searchParams.get("own") === "1";
+    return json(res, 200, { ownRevisionPerPage });
+  }
+  if (path === "/__test/pagesize") {
+    const n = Number(url.searchParams.get("n") || 0);
+    pageCeiling = n > 0 ? n : MAX_PAGE_SIZE;
+    return json(res, 200, { pageCeiling });
+  }
+  if (path === "/__test/reset") {
+    pageCeiling = MAX_PAGE_SIZE;
+    ownRevisionPerPage = false;
+    seed();
+    return json(res, 200, { ok: true });
+  }
 
   if (!path.startsWith("/api/v1/")) return fail(res, 404, "NOT_FOUND", "no such path");
 
@@ -477,7 +639,7 @@ const server = createServer(async (req, res) => {
   const name = nameFrom(path);
 
   if (req.method === "GET" && isCollectionName(name)) {
-    const items = listUnder(name);
+    const all = listUnder(name);
     if (url.searchParams.get("watch") === "true") {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -487,7 +649,7 @@ const server = createServer(async (req, res) => {
       const from = Number(url.searchParams.get("fromRevision") || 0);
       // Nothing between the list and the watch is lost: anything already newer
       // than the revision the client came with is replayed at once.
-      for (const r of items) {
+      for (const r of all) {
         if (Number(r.meta.revision) > from) {
           res.write("data: " + JSON.stringify({ type: "PUT", resource: decorate(r) }) + "\n\n");
         }
@@ -497,9 +659,67 @@ const server = createServer(async (req, res) => {
       req.on("close", () => watchers.delete(w));
       return;
     }
-    const newest = items.reduce((n, r) => Math.max(n, Number(r.meta.revision)), 0);
-    return json(res, 200, { items: items.map(decorate) },
-      { "X-Velstra-Revision": String(newest || clock) });
+    // The revision of the collection as a whole, not of whatever subset this
+    // answer happens to carry. A walk pins it on its first page and every later
+    // page repeats it.
+    const newest = String(all.reduce((n, r) => Math.max(n, Number(r.meta.revision)), 0) || clock);
+
+    const askedSize = url.searchParams.get("pageSize");
+    const askedToken = url.searchParams.get("pageToken");
+    if (askedSize === null && askedToken === null) {
+      // Unpaged: the whole collection, and no token field at all. A field that
+      // appeared on every answer — even empty — would itself be the change that
+      // every client written before paging has to cope with.
+      return json(res, 200, { items: all.map(decorate), revision: newest },
+        { "X-Velstra-Revision": newest });
+    }
+
+    if (askedSize !== null && !/^\d+$/.test(askedSize)) {
+      // Refused, never ignored: ignoring it hands the whole cell to a client
+      // that believes it asked for twenty.
+      return fail(res, 400, "INVALID_ARGUMENT",
+        `pageSize must be a whole number, and was ${JSON.stringify(askedSize)}`, "pageSize");
+    }
+
+    const [parent, kind] = splitCollection(name);
+    let token = null;
+    if (askedToken !== null) {
+      token = decodeToken(askedToken);
+      if (!token) {
+        return fail(res, 400, "INVALID_ARGUMENT",
+          "page token is not a token this API issued", "pageToken");
+      }
+      if (token.kind !== kind || token.parent !== parent) {
+        return fail(res, 400, "INVALID_ARGUMENT",
+          `this page token was issued for ${token.parent}/${token.kind} and was presented ` +
+          `for ${parent}/${kind}; start the list again`, "pageToken");
+      }
+    }
+
+    const asked = Number(askedSize || 0);
+    const size = Math.min(asked || DEFAULT_PAGE_SIZE, pageCeiling);
+    const remaining = token ? all.filter((r) => r.meta.name > token.after) : all;
+    const page = remaining.slice(0, size);
+    const revision = ownRevisionPerPage
+      // The mistake, made deliberately: the newest revision among the objects on
+      // *this* page.
+      ? String(page.reduce((n, r) => Math.max(n, Number(r.meta.revision)), 0) || clock)
+      : token
+        ? token.revision
+        : newest;
+    // Strictly greater: a collection that ends exactly on a page boundary is
+    // done, and offering a token for the empty page after it is one wasted round
+    // trip per walk that no count of objects would ever reveal.
+    const more = remaining.length > size;
+
+    const body = { items: page.map(decorate), revision };
+    if (more) {
+      body.nextPageToken = encodeToken({
+        kind, parent, revision,
+        after: page[page.length - 1].meta.name,
+      });
+    }
+    return json(res, 200, body, { "X-Velstra-Revision": revision });
   }
 
   if (req.method === "GET") {

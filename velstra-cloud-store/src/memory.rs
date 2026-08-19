@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use velstra_cloud_model::meta::Revision;
 
-use crate::{Entry, Event, Expect, Result, Store, StoreError};
+use crate::{Entry, Event, Expect, Page, Result, Store, StoreError, WATCH_QUEUE};
 
 #[derive(Default)]
 struct Inner {
@@ -57,6 +57,17 @@ impl MemoryStore {
     }
 }
 
+impl MemoryStore {
+    /// How many watchers this store is currently feeding.
+    ///
+    /// Exists so a test can assert the claim the watch cache makes: that one
+    /// watch upstream serves however many readers downstream. Nothing else can
+    /// see the difference between one watcher and a thousand.
+    pub fn watchers(&self) -> usize {
+        self.inner.lock().unwrap().watchers.len()
+    }
+}
+
 #[async_trait]
 impl Store for MemoryStore {
     async fn get(&self, key: &str) -> Result<Option<Entry>> {
@@ -71,6 +82,33 @@ impl Store for MemoryStore {
             .take_while(|(k, _)| k.starts_with(prefix))
             .map(|(_, v)| v.clone())
             .collect())
+    }
+
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Page> {
+        let inner = self.inner.lock().unwrap();
+        // A BTreeMap range, so the scan starts at the resume key rather than at
+        // the front of the collection. Sliced-after-listing would give the same
+        // answer and re-read the whole cell to do it, which is the cost this
+        // exists to remove — and a dev cell that behaves differently from a
+        // production one is a dev cell that hides exactly this class of defect.
+        let start = match after {
+            // `String` compares by bytes, the same order etcd ranges in, so the
+            // two backends page identically. The excluded bound is what makes
+            // `after` mean "strictly after".
+            Some(after) => std::ops::Bound::Excluded(after.to_string()),
+            None => std::ops::Bound::Included(prefix.to_string()),
+        };
+        // One past the limit, purely to answer `more` without a second query.
+        let mut entries: Vec<Entry> = inner
+            .data
+            .range((start, std::ops::Bound::Unbounded))
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .take(limit + 1)
+            .map(|(_, v)| v.clone())
+            .collect();
+        let more = entries.len() > limit;
+        entries.truncate(limit);
+        Ok(Page { entries, more })
     }
 
     async fn put(&self, key: &str, value: Vec<u8>, expect: Expect) -> Result<Revision> {
@@ -144,7 +182,7 @@ impl Store for MemoryStore {
     fn watch(&self, prefix: &str, from: Option<Revision>) -> mpsc::Receiver<Event> {
         // Bounded on purpose: see the note on `Store::watch`. A slow watcher is
         // disconnected, and its controller re-lists on the next resync.
-        let (tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(WATCH_QUEUE);
         let mut inner = self.inner.lock().unwrap();
         if let Some(from) = from {
             for event in inner

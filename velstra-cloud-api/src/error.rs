@@ -110,6 +110,15 @@ impl ApiError {
         Self::new(Code::NotFound, format!("{what} does not exist"))
     }
 
+    /// The caller is who they say they are and may not do this.
+    ///
+    /// Deliberately says the same thing whether the resource is theirs and
+    /// forbidden or somebody else's and invisible: an error that tells the two
+    /// apart is an oracle for enumerating other tenants.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(Code::PermissionDenied, message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(Code::Internal, message)
     }
@@ -241,6 +250,11 @@ impl From<TypedError> for ApiError {
                 ApiError::internal(format!("a stored {kind} could not be read: {source}"))
             }
             TypedError::Missing(name) => ApiError::not_found(name),
+            // Internal, and deliberately not a 404. The object exists; this
+            // installation is wired wrong. Answering "does not exist" would send
+            // an operator looking for a deleted machine instead of at the two
+            // cell names the message hands them.
+            misplaced @ TypedError::Misplaced { .. } => ApiError::internal(misplaced.to_string()),
         }
     }
 }

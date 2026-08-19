@@ -1,11 +1,22 @@
 // Getting in, and staying oriented once in.
 
+/// End the session, and leave nothing of it behind.
+///
+/// This used to stop the stream and drop the token, which is what makes the
+/// *next* request fail — and left everything the session had already read
+/// sitting in memory and on screen: the rail's counts, the board's rows, the
+/// picker cache. On a shared machine that is the previous tenant's inventory,
+/// shown by name to whoever signs in next. Neither cache had anything to clear
+/// it, because both were only ever invalidated by a write or a watch event, and
+/// a signed-out console has neither.
 function signedOut(why) {
   session.token = "";
   sessionStorage.removeItem(TOKEN_KEY);
   if (view.watcher) { view.watcher.stop(); view.watcher = null; }
   stopRecheck();
   closeSheet(); closeDialog();
+  forgetSession();
+  forgetBoard();
   $("app").classList.add("hidden");
   $("signin").classList.remove("hidden");
   const box = $("loginerr");

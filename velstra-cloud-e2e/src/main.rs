@@ -24,8 +24,9 @@ use std::{sync::Arc, time::Duration};
 
 use velstra_cloud_api::{Api, StaticTokenVerifier};
 use velstra_cloud_controller::{
-    LoopConfig, Metrics, attachment::AttachmentController, quota::QuotaController,
-    scheduler::Scheduler, status::StatusWriter, volume::VolumeController,
+    LoopConfig, Metrics, address::AddressController, attachment::AttachmentController,
+    quota::QuotaController, scheduler::Scheduler, snapshot::SnapshotController,
+    status::StatusWriter, volume::VolumeController,
 };
 use velstra_cloud_nodeagent::{
     Agent, AgentConfig, FakeDatapath, FakePool, FakeVmm, PoolAgent, PoolConfig,
@@ -43,12 +44,16 @@ async fn main() {
     let token = std::env::var("VELSTRA_TOKEN").unwrap_or_else(|_| "devtoken".to_string());
 
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    // The dev cell's one token is its operator. It registers nodes and pools,
+    // which are the cell's and not any tenant's — and a demo where half the
+    // requests are refused teaches nothing about the platform.
     let api = Api::new(
         store.clone(),
         REGION,
         CELL,
         Arc::new(StaticTokenVerifier::single(&token)),
-    );
+    )
+    .with_cell_admins(vec!["dev".into()]);
 
     let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let metrics = Metrics::default();
@@ -73,6 +78,43 @@ async fn main() {
         shutdown.clone(),
     ));
 
+    // Addresses, so a port created here comes up on the network without an
+    // operator picking one — which is also what makes the node's DHCP responder
+    // have something to publish.
+    let ports: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "ports");
+    let address = Arc::new(AddressController::new(
+        ports.clone(),
+        TypedStore::new(store.clone(), CELL, "subnets"),
+        StatusWriter::new(store.clone(), CELL, "ports", "address"),
+        CELL,
+    ));
+    tokio::spawn(velstra_cloud_controller::run(
+        address,
+        ports,
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+    ));
+
+    let port_controller = Arc::new(velstra_cloud_controller::port::PortController::new(
+        TypedStore::new(store.clone(), CELL, "ports"),
+        velstra_cloud_store::Cached::start(
+            TypedStore::new(store.clone(), CELL, "instances"),
+            store.clone(),
+            velstra_cloud_store::prefix_for(CELL, "instances"),
+        ),
+        CELL,
+    ));
+    tokio::spawn(velstra_cloud_controller::run(
+        port_controller,
+        TypedStore::new(store.clone(), CELL, "ports"),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+    ));
+
     let attachments: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "attachments");
     let attachment = Arc::new(AttachmentController::new(attachments.clone()));
     tokio::spawn(velstra_cloud_controller::run(
@@ -86,8 +128,16 @@ async fn main() {
 
     let projects: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "projects");
     let quota = Arc::new(QuotaController::new(
-        instances,
-        TypedStore::new(store.clone(), CELL, "volumes"),
+        velstra_cloud_store::Cached::start(
+            instances,
+            store.clone(),
+            velstra_cloud_store::prefix_for(CELL, "instances"),
+        ),
+        velstra_cloud_store::Cached::start(
+            TypedStore::new(store.clone(), CELL, "volumes"),
+            store.clone(),
+            velstra_cloud_store::prefix_for(CELL, "volumes"),
+        ),
         StatusWriter::new(store.clone(), CELL, "projects", "quota"),
         CELL,
     ));
@@ -105,10 +155,29 @@ async fn main() {
     // useful. The volume controller guards the deletion; the pool agent does the
     // work.
     let volumes_for_controller: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "volumes");
-    let volume = Arc::new(VolumeController::new(volumes_for_controller.clone()));
+    let snapshots: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "snapshots");
+    let volume = Arc::new(VolumeController::new(
+        volumes_for_controller.clone(),
+        snapshots.clone(),
+        CELL,
+    ));
     tokio::spawn(velstra_cloud_controller::run(
         volume,
         volumes_for_controller,
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+    ));
+
+    // The copies' own guard. Separate from the volume controller because it
+    // answers a different question — has the pool let go of *this* copy — and
+    // because a controller that writes two collections is one that has to be
+    // read twice to see what it writes.
+    let snapshot = Arc::new(SnapshotController::new(snapshots.clone()));
+    tokio::spawn(velstra_cloud_controller::run(
+        snapshot,
+        snapshots,
         store.clone(),
         config,
         metrics.clone(),
@@ -256,7 +325,7 @@ async fn seed(store: Arc<dyn Store>) {
         resources::{
             ImageFormat, ImageSpec, ImageStatus, InstanceSpec, InstanceStatus, NetworkSpec,
             NetworkStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus, Quota, Resource,
-            SubnetSpec, SubnetStatus, VolumeSpec, VolumeStatus,
+            SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, VolumeSpec, VolumeStatus,
         },
     };
 
@@ -297,6 +366,14 @@ async fn seed(store: Arc<dyn Store>) {
                     memory_mib: 409_600,
                     volume_gib: 10_000,
                 },
+                // The dev cell's one token is an admin of its one project, so
+                // the console and the CLI can do everything against it. A cell
+                // that handed out a viewer here would be a demo where half the
+                // buttons refuse.
+                bindings: vec![velstra_cloud_model::authz::Binding {
+                    role: velstra_cloud_model::authz::Role::Admin,
+                    members: vec!["dev".into()],
+                }],
             },
             ProjectStatus::default(),
         ),
@@ -361,9 +438,14 @@ async fn seed(store: Arc<dyn Store>) {
             PortSpec {
                 network: "projects/p1/networks/net-a".into(),
                 subnet: "projects/p1/subnets/sub-a".into(),
-                address: Some("10.20.0.10".into()),
-                mac: Some("02:00:00:00:00:10".into()),
+                // Left out on purpose: the address controller fills both in,
+                // which is what a port an operator creates looks like.
+                address: None,
+                mac: None,
                 security_groups: vec![],
+                // Likewise: the port controller assigns it to whichever node
+                // ends up holding the guest.
+                node: None,
                 rate_limit_mbit: Some(1000),
             },
             PortStatus::default(),
@@ -381,8 +463,30 @@ async fn seed(store: Arc<dyn Store>) {
                 pool: "rbd-standard".into(),
                 encryption_key: None,
                 source_image: None,
+                source_snapshot: None,
             },
             VolumeStatus::default(),
+        ),
+    )
+    .await;
+
+    // A copy of it, under it — a snapshot's source is its parent name rather
+    // than a field. Seeded rather than left to the operator because the thing
+    // worth seeing here is what it does to the *volume*: try to delete
+    // `data-1` and it stays, saying which copies are in the way.
+    //
+    // It is created before the pool has made the volume, which is ordinary in
+    // a level-triggered system: the pool copies nothing until there is
+    // something to copy, and the pass that finds it is the one after.
+    put(
+        &store,
+        "snapshots",
+        Resource::new(
+            meta("projects/p1/volumes/data-1/snapshots/nightly"),
+            SnapshotSpec {
+                pool: "rbd-standard".into(),
+            },
+            SnapshotStatus::default(),
         ),
     )
     .await;
