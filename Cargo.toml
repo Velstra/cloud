@@ -9,6 +9,7 @@ members = [
     "velstra-cloud-nodeagent",
     "velstra-cloud-proto",
     "velstra-cloud-store",
+    "velstra-cloud-wire",
 ]
 
 # Same licence as the data plane: the product is AGPL, and a component that
@@ -24,6 +25,7 @@ homepage = "https://github.com/Velstra/cloud"
 velstra-cloud-model = { path = "velstra-cloud-model" }
 velstra-cloud-proto = { path = "velstra-cloud-proto" }
 velstra-cloud-store = { path = "velstra-cloud-store" }
+velstra-cloud-wire = { path = "velstra-cloud-wire" }
 velstra-cloud-controller = { path = "velstra-cloud-controller" }
 
 anyhow = "1"
@@ -31,15 +33,19 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+etcd-client = "0.19"
 futures = "0.3"
 hex = "0.4"
-hyper = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 prost = "0.13"
 prost-types = "0.13"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+socket2 = { version = "0.5", features = ["all"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

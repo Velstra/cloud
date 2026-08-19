@@ -45,14 +45,16 @@ use velstra_cloud_model::{
     reconcile::{Action, instance_condition, reconcile_attachment, reconcile_instance},
     resources::{
         Attachment, AttachmentSpec, AttachmentStatus, Instance, InstanceSpec, InstanceStatus,
-        NODE_RELEASE_FINALIZER, NodeSpec, NodeStatus, Port, PortSpec, PortStatus,
+        NODE_RELEASE_FINALIZER, NetworkSpec, NodeSpec, NodeStatus, Port, PortSpec, PortStatus,
     },
+    security::{ResolvedRule, SecurityGroupSpec, effective_rules},
 };
 use velstra_cloud_store::{Store, TypedStore};
 
 use crate::{
-    host::{Datapath, HostState, VmRequest, Vmm},
-    metadata::MetadataRegistry,
+    cell::{CellReader, StoreCell},
+    guests::GuestRegistry,
+    host::{Datapath, HostState, Nic, ProgrammedPort, VmRequest, Vmm},
 };
 
 mod migrate;
@@ -127,6 +129,30 @@ enum Ownership {
     Skip,
 }
 
+/// Just the tap devices, for the many places that need to know a port is
+/// carried and nothing more.
+fn taps_of(programmed: &BTreeMap<String, ProgrammedPort>) -> BTreeMap<String, String> {
+    programmed
+        .iter()
+        .map(|(port, p)| (port.clone(), p.tap.clone()))
+        .collect()
+}
+
+/// What one pass has read about the cell, handed down whole.
+///
+/// Both of these are needed together wherever either is: what a port is allowed
+/// is a function of the groups *and* of every port, so a caller holding one
+/// without the other cannot answer the question anyway.
+pub(super) struct CellView<'a> {
+    pub ports: &'a BTreeMap<String, Port>,
+    pub groups: &'a BTreeMap<String, SecurityGroupSpec>,
+    /// Read once per pass and handed down, for the same reason the groups are:
+    /// a port's segment is a fact about the cell, and looking it up again per
+    /// port would be the same answer fetched many times. It also replaces a
+    /// second read this pass used to make when it described guests.
+    pub networks: &'a BTreeMap<String, NetworkSpec>,
+}
+
 pub struct Agent {
     config: AgentConfig,
     writer: Writer,
@@ -134,21 +160,46 @@ pub struct Agent {
     attachments: TypedStore<AttachmentSpec, AttachmentStatus>,
     ports: TypedStore<PortSpec, PortStatus>,
     nodes: TypedStore<NodeSpec, NodeStatus>,
+    /// Written, not read: the destination of a migration owns its status and
+    /// reports on it. What this node is *told* about migrations comes through
+    /// `cell`, which hands it only the ones naming it.
     migrations: TypedStore<MigrationSpec, MigrationStatus>,
+    /// Everything this node *reads* about the cell, and the only thing that ever
+    /// grew with the cell rather than with this node's own work. See
+    /// [`crate::cell`] for the two ways it can be answered and why it matters.
+    cell: Arc<dyn CellReader>,
     vmm: Arc<dyn Vmm>,
     datapath: Arc<dyn Datapath>,
-    metadata: MetadataRegistry,
+    guests: GuestRegistry,
     /// An agent that cannot write its own node object says so once. Repeating
     /// it every resync would bury everything else in the journal.
     warned_about_node: AtomicBool,
 }
 
 impl Agent {
+    /// Reads the store directly, which is what this did from the beginning.
+    /// [`Agent::reading`] is the same agent pointed at something that hands it
+    /// only its own share.
     pub fn new(
         store: Arc<dyn Store>,
         config: AgentConfig,
         vmm: Arc<dyn Vmm>,
         datapath: Arc<dyn Datapath>,
+    ) -> Self {
+        let reader = Arc::new(StoreCell::new(
+            store.clone(),
+            &config.placement.cell,
+            &config.node,
+        ));
+        Self::reading(store, config, vmm, datapath, reader)
+    }
+
+    pub fn reading(
+        store: Arc<dyn Store>,
+        config: AgentConfig,
+        vmm: Arc<dyn Vmm>,
+        datapath: Arc<dyn Datapath>,
+        reader: Arc<dyn CellReader>,
     ) -> Self {
         let cell = config.placement.cell.clone();
         Self {
@@ -158,18 +209,21 @@ impl Agent {
             ports: TypedStore::new(store.clone(), &cell, "ports"),
             nodes: TypedStore::new(store.clone(), &cell, "nodes"),
             migrations: TypedStore::new(store, &cell, "migrations"),
+            cell: reader,
             config,
             vmm,
             datapath,
-            metadata: MetadataRegistry::new(),
+            guests: GuestRegistry::new(),
             warned_about_node: AtomicBool::new(false),
         }
     }
 
-    /// The registry the metadata service answers from. Handed out so the
-    /// service and the agent share one map rather than two that can differ.
-    pub fn metadata(&self) -> MetadataRegistry {
-        self.metadata.clone()
+    /// The registry the metadata service and the DHCP responder both answer
+    /// from. Handed out so all three share one map rather than three that can
+    /// differ — a guest leased an address the metadata service does not think
+    /// it has is a guest nobody can debug.
+    pub fn guests(&self) -> GuestRegistry {
+        self.guests.clone()
     }
 
     pub fn node(&self) -> &str {
@@ -187,11 +241,8 @@ impl Agent {
     pub async fn run(&self, shutdown: impl std::future::Future<Output = ()> + Send) {
         // Watch first, then list. The other order has a gap in it exactly one
         // change wide, and that change is invisible until the next resync.
-        let from = self.instances.revision().await.ok();
-        let mut instances = self.instances.watch(from);
-        let mut attachments = self.attachments.watch(from);
-        let mut ports = self.ports.watch(from);
-        let mut migrations = self.migrations.watch(from);
+        let mut wake = self.cell.wake().await;
+        tracing::info!(node = %self.config.node, reads = %self.cell.describe(), "watching");
 
         self.resync().await;
 
@@ -199,69 +250,18 @@ impl Agent {
         ticker.tick().await; // the first tick is immediate, and we just swept
         let mut shutdown = std::pin::pin!(shutdown);
         loop {
-            let mut woken = tokio::select! {
+            let woken = tokio::select! {
                 _ = &mut shutdown => return,
                 _ = ticker.tick() => true,
-                Some(event) = instances.recv() => self.concerns_me(&event),
-                Some(event) = attachments.recv() => self.concerns_me(&event),
-                Some(event) = ports.recv() => self.concerns_me(&event),
-                Some(event) = migrations.recv() => self.concerns_me(&event),
+                woken = wake.recv() => woken.is_some(),
             };
-            // A pass is level-triggered, so a burst of events collapses into
-            // one sweep rather than one sweep each.
-            woken |= self.drain(&mut instances);
-            woken |= self.drain(&mut attachments);
-            woken |= self.drain(&mut ports);
-            woken |= self.drain(&mut migrations);
+            // A pass is level-triggered, so a burst collapses into one sweep
+            // rather than one sweep each.
+            while wake.try_recv().is_ok() {}
             if woken {
                 self.resync().await;
             }
         }
-    }
-
-    /// Take everything already queued, and say whether any of it was ours.
-    fn drain(&self, rx: &mut tokio::sync::mpsc::Receiver<velstra_cloud_store::Event>) -> bool {
-        let mut mine = false;
-        while let Ok(event) = rx.try_recv() {
-            mine |= self.concerns_me(&event);
-        }
-        mine
-    }
-
-    /// Whether a change is about an object this node has anything to do with.
-    ///
-    /// Read out of the stored JSON rather than by decoding into a resource
-    /// type, because the answer is the same field in every one of them and a
-    /// node should not have to know the schema of an object that is not its
-    /// own. This is the client-side half of a filter that belongs on the
-    /// server: see the caveat in the module documentation.
-    fn concerns_me(&self, event: &velstra_cloud_store::Event) -> bool {
-        let velstra_cloud_store::Event::Put(entry) = event else {
-            // A delete carries no object to judge. It is also rare, and a
-            // needless pass is cheap; guessing wrong in the other direction
-            // would strand an object.
-            return true;
-        };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
-            return true;
-        };
-        let owner = value
-            .get("status")
-            .and_then(|s| s.get("node"))
-            .and_then(|n| n.as_str());
-        let spec = value.get("spec");
-        let assigned = spec.and_then(|s| s.get("node")).and_then(|n| n.as_str());
-        // A migration names two nodes and neither of them is called `node`.
-        // Both halves of it are this node's business when they name it: the
-        // destination owns the object, and the source has to read it to know
-        // where to send.
-        let moving = ["to_node", "from_node"].iter().any(|field| {
-            spec.and_then(|s| s.get(field)).and_then(|n| n.as_str())
-                == Some(self.config.node.as_str())
-        });
-        owner == Some(self.config.node.as_str())
-            || assigned == Some(self.config.node.as_str())
-            || moving
     }
 
     /// One full pass over everything this node owns.
@@ -282,8 +282,8 @@ impl Agent {
                 return pass;
             }
         };
-        let taps = match self.datapath.observe().await {
-            Ok(taps) => taps,
+        let programmed = match self.datapath.observe().await {
+            Ok(programmed) => programmed,
             Err(e) => {
                 tracing::error!(error = %e, "could not read the datapath; skipping the pass");
                 pass.failures += 1;
@@ -291,7 +291,7 @@ impl Agent {
             }
         };
 
-        let ports = match self.ports.list().await {
+        let ports = match self.cell.ports().await {
             Ok(ports) => ports
                 .into_iter()
                 .map(|p| (p.meta.name.to_string(), p))
@@ -303,7 +303,46 @@ impl Agent {
             }
         };
 
-        let migrations = match self.migrations.list().await {
+        // Read once per pass and handed down: what a port is allowed depends on
+        // every port in the cell, so recomputing it per instance would be the
+        // same answer fetched many times.
+        let groups = match self.cell.security_groups().await {
+            Ok(list) => list
+                .into_iter()
+                .map(|g| (g.meta.name.to_string(), g.spec))
+                .collect::<BTreeMap<_, _>>(),
+            Err(e) => {
+                // Fewer allowances, never more: a port is still programmed, with
+                // whatever its groups came to, which with none readable is
+                // nothing. A guest with no network at all would be the worse
+                // failure.
+                tracing::warn!(error = %e, "could not list security groups");
+                BTreeMap::new()
+            }
+        };
+
+        let networks = match self.cell.networks().await {
+            Ok(list) => list
+                .into_iter()
+                .map(|n| (n.meta.name.to_string(), n.spec))
+                .collect::<BTreeMap<_, _>>(),
+            Err(e) => {
+                // A port whose segment cannot be read is a port that must not be
+                // programmed: putting a frame on the wrong wire is worse than
+                // putting it on none. The pass says so on the object rather than
+                // guessing at a VNI.
+                tracing::warn!(error = %e, "could not list networks");
+                BTreeMap::new()
+            }
+        };
+
+        let cell = CellView {
+            ports: &ports,
+            groups: &groups,
+            networks: &networks,
+        };
+
+        let migrations = match self.cell.migrations().await {
             Ok(migrations) => migrations,
             Err(e) => {
                 tracing::error!(error = %e, "could not list migrations");
@@ -315,7 +354,11 @@ impl Agent {
         // what the instance loop below is looking at: the guest is gone from
         // this machine, and the only right thing to do about that is to report
         // it, not to start it again.
-        let moving = self.source_pass(&migrations, &host, &mut pass).await;
+        let mut moving = self.source_pass(&migrations, &host, &mut pass).await;
+        // Both halves of "leave this instance alone", in one place and before
+        // any instance is acted on: what this node is giving up, and what is on
+        // its way here.
+        self.freeze_arrivals(&migrations, &host, &mut moving);
         let host = if moving.released.is_empty() {
             host
         } else {
@@ -329,7 +372,7 @@ impl Agent {
             }
         };
 
-        let instances = match self.instances.list().await {
+        let instances = match self.cell.instances().await {
             Ok(instances) => instances,
             Err(e) => {
                 tracing::error!(error = %e, "could not list instances");
@@ -359,7 +402,7 @@ impl Agent {
                 instance.spec.node.as_deref(),
             ) {
                 Ownership::Mine => {
-                    self.instance_pass(instance, &host, &taps, &ports, &moving, &mut pass)
+                    self.instance_pass(instance, &host, &programmed, &cell, &moving, &mut pass)
                         .await;
                     mine.push(instance);
                 }
@@ -377,7 +420,7 @@ impl Agent {
             }
         }
 
-        match self.attachments.list().await {
+        match self.cell.attachments().await {
             Ok(attachments) => {
                 for attachment in &attachments {
                     match self.ownership(
@@ -410,7 +453,7 @@ impl Agent {
         // reported from what the datapath says *now*, or a port would always be
         // one pass behind the guest that uses it.
         let taps = match self.datapath.observe().await {
-            Ok(taps) => taps,
+            Ok(programmed) => taps_of(&programmed),
             Err(e) => {
                 tracing::error!(error = %e, "could not re-read the datapath");
                 pass.failures += 1;
@@ -445,10 +488,10 @@ impl Agent {
         // is claimed above, the receiver it came through is taken down in the
         // same sweep. A receiver left listening holds a memory reservation on a
         // node that is not running the guest.
-        self.destination_pass(&migrations, &taps, &ports, &host, &mut pass)
+        self.destination_pass(&migrations, &taps, &cell, &host, &mut pass)
             .await;
 
-        self.refresh_metadata(&mine, &ports);
+        self.refresh_guests(&mine, &ports, &taps, &mut pass).await;
         self.node_pass(&mine, &host, &mut pass).await;
         pass
     }
@@ -474,15 +517,20 @@ impl Agent {
         &self,
         stored: &Instance,
         host: &HostState,
-        taps: &BTreeMap<String, String>,
-        ports: &BTreeMap<String, Port>,
+        programmed: &BTreeMap<String, ProgrammedPort>,
+        cell: &CellView<'_>,
         moving: &Moving,
         pass: &mut Pass,
     ) {
+        let (ports, groups) = (cell.ports, cell.groups);
+        // Owned, because the loop below acts and then looks again: the decision
+        // it makes on the second round has to be made against what the datapath
+        // says *then*, not against the snapshot this pass opened with.
+        let mut programmed = programmed.clone();
+        let mut taps = taps_of(&programmed);
         let name = stored.meta.name.to_string();
         let acted_on = stored.meta.generation;
         let mut host = host.clone();
-        let mut taps = taps.clone();
         let mut outcome = Ok(());
         let mut previous: Option<Vec<Action>> = None;
         // A guest that is missing while a migration of it is open is the one
@@ -510,11 +558,24 @@ impl Agent {
             let actions = reconcile_instance(
                 &observed,
                 host.images.contains(&stored.spec.image),
+                // Not "is there a tap": a port whose group gained a member is
+                // carried and out of date, and a check that only asked whether
+                // it was present would never notice.
                 &stored
                     .spec
                     .ports
                     .iter()
-                    .map(|p| taps.contains_key(p))
+                    .map(|p| match (programmed.get(p.as_str()), ports.get(p)) {
+                        (Some(have), Some(port)) => {
+                            have.rules == self.rules_for(&port.spec, groups, ports)
+                        }
+                        // Carried, but its object has not reached this cell yet:
+                        // there is nothing to compare against, and asking for it
+                        // to be programmed again would fail for want of the very
+                        // object that is missing.
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    })
                     .collect::<Vec<_>>(),
                 host.disks.contains(&name),
             );
@@ -542,7 +603,7 @@ impl Agent {
 
             let mut failed = None;
             for action in &work {
-                match self.perform_instance(action, stored, &taps, ports).await {
+                match self.perform_instance(action, stored, &taps, cell).await {
                     Ok(()) => pass.actions += 1,
                     Err(why) => {
                         // The order in `reconcile_instance` is load-bearing, so
@@ -566,13 +627,14 @@ impl Agent {
                     break;
                 }
             };
-            taps = match self.datapath.observe().await {
-                Ok(taps) => taps,
+            programmed = match self.datapath.observe().await {
+                Ok(fresh) => fresh,
                 Err(e) => {
                     outcome = Err(e.to_string());
                     break;
                 }
             };
+            taps = taps_of(&programmed);
         }
 
         // "Let go" is an observation, not a conclusion drawn from the action
@@ -623,18 +685,71 @@ impl Agent {
         self.report(&self.instances, stored, next, pass).await;
     }
 
+    /// What this port's security groups currently come to.
+    ///
+    /// Recomputed from the objects rather than remembered, because it depends on
+    /// which ports hold which addresses right now: a guest joining a group
+    /// changes what its neighbours are allowed without any of their objects
+    /// being touched. Pure, so the same question asked twice in one pass gives
+    /// the same answer, which is what makes comparing it with the datapath's
+    /// observation meaningful.
+    fn rules_for(
+        &self,
+        spec: &PortSpec,
+        groups: &BTreeMap<String, SecurityGroupSpec>,
+        ports: &BTreeMap<String, Port>,
+    ) -> Vec<ResolvedRule> {
+        if spec.security_groups.is_empty() {
+            return Vec::new();
+        }
+        let specs: BTreeMap<String, PortSpec> = ports
+            .iter()
+            .map(|(name, p)| (name.clone(), p.spec.clone()))
+            .collect();
+        let effective = effective_rules(spec, groups, &specs);
+        if !effective.unknown_groups.is_empty() {
+            tracing::warn!(
+                "port names security groups that do not exist: {}",
+                effective.unknown_groups.join(", ")
+            );
+        }
+        effective.rules
+    }
+
     async fn perform_instance(
         &self,
         action: &Action,
         instance: &Instance,
         taps: &BTreeMap<String, String>,
-        ports: &BTreeMap<String, Port>,
+        cell: &CellView<'_>,
     ) -> Result<(), String> {
+        let (ports, groups, networks) = (cell.ports, cell.groups, cell.networks);
         let result = match action {
             Action::PullImage { digest } => self.vmm.pull_image(digest).await.map(|_| ()),
-            Action::CreateDisk { instance, gib } => self.vmm.create_disk(instance, *gib).await,
+            Action::CreateDisk {
+                instance,
+                gib,
+                image,
+            } => self.vmm.create_disk(instance, *gib, image).await,
             Action::ProgramPort { port } => match ports.get(port) {
-                Some(p) => self.datapath.program(port, &p.spec).await.map(|_| ()),
+                Some(p) => {
+                    // Said out loud rather than guessed at: a datapath that
+                    // programmed the port without knowing its segment would be
+                    // putting a tenant's frames somewhere nobody chose.
+                    match networks.get(&p.spec.network) {
+                        Some(network) => {
+                            let rules = self.rules_for(&p.spec, groups, ports);
+                            self.datapath
+                                .program(port, &p.spec, network, &rules)
+                                .await
+                                .map(|_| ())
+                        }
+                        None => Err(crate::host::HostError::failed(format!(
+                            "{} is on {}, which is not in the store yet",
+                            port, p.spec.network
+                        ))),
+                    }
+                }
                 // The port object has not reached this cell's store yet. Not an
                 // error on the machine — a thing to wait for, said out loud on
                 // the instance so nobody has to guess which half is late.
@@ -644,7 +759,7 @@ impl Agent {
             },
             Action::UnprogramPort { port } => self.datapath.unprogram(port).await,
             Action::StartVm { .. } | Action::RestartCrashedVm { .. } => {
-                match self.vm_request(instance, taps) {
+                match self.vm_request(instance, taps, ports) {
                     Ok(request) => self.vmm.start(&request).await,
                     Err(why) => Err(crate::host::HostError::failed(why)),
                 }
@@ -662,11 +777,19 @@ impl Agent {
         &self,
         instance: &Instance,
         taps: &BTreeMap<String, String>,
+        ports: &BTreeMap<String, Port>,
     ) -> Result<VmRequest, String> {
         let mut wanted = Vec::with_capacity(instance.spec.ports.len());
         for port in &instance.spec.ports {
             match taps.get(port) {
-                Some(tap) => wanted.push(tap.clone()),
+                Some(tap) => wanted.push(Nic {
+                    tap: tap.clone(),
+                    // From the object, so the guest comes up as the NIC the
+                    // rest of the platform already knows. A port whose object
+                    // has not arrived yet still starts the guest — the tap is
+                    // what it cannot boot without.
+                    mac: ports.get(port).and_then(|p| p.spec.mac.clone()),
+                }),
                 None => return Err(format!("{port} is not programmed on this node")),
             }
         }
@@ -676,7 +799,7 @@ impl Agent {
             memory_mib: instance.spec.memory_mib,
             image: instance.spec.image.clone(),
             root_disk_gib: instance.spec.root_disk_gib,
-            taps: wanted,
+            nics: wanted,
         })
     }
 
@@ -788,12 +911,23 @@ impl Agent {
         let mut outcome = Ok(());
         let mut taps = taps.clone();
 
-        if stored.meta.is_deleting() && taps.contains_key(&name) {
+        // Not gated on the tap still being there, and that guard was not a
+        // cheap early exit — it was the bug. `unprogram` has more to undo than
+        // the tap: on the fabric datapath it also removes the port and its
+        // security group, which hold an address and a MAC. So a pass that
+        // deleted the tap and then failed, or an agent replaced between the two,
+        // left the rest in place and never came back for it — because on the
+        // next pass there was no tap, so the condition that triggers the
+        // teardown was false precisely because the teardown had half happened.
+        //
+        // `unprogram` is idempotent in both implementations, so asking again is
+        // asking once.
+        if stored.meta.is_deleting() {
             match self.datapath.unprogram(&name).await {
                 Ok(()) => {
                     pass.actions += 1;
                     match self.datapath.observe().await {
-                        Ok(fresh) => taps = fresh,
+                        Ok(fresh) => taps = taps_of(&fresh),
                         Err(e) => outcome = Err(e.to_string()),
                     }
                 }
@@ -821,6 +955,17 @@ impl Agent {
         set_condition(
             &mut next.status.conditions,
             host_condition(&outcome, stored.meta.generation),
+        );
+        // "This node holds nothing of it" — an observation, not an inference
+        // from the action list, and the fact the port controller waits for
+        // before it drops the release guard. It has to include `outcome`: a
+        // teardown that failed part way leaves the tap gone and the fabric
+        // still holding the port, and saying "released" on the strength of the
+        // missing tap alone would drop the guard over exactly that state.
+        let released = outcome.is_ok() && !next.status.programmed;
+        set_condition(
+            &mut next.status.conditions,
+            release_condition(released, stored.meta.is_deleting(), stored.meta.generation),
         );
         if outcome.is_err() {
             pass.failures += 1;

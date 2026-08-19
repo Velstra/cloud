@@ -10,10 +10,12 @@ repository.workspace = true
 [dependencies]
 velstra-cloud-model = { workspace = true }
 async-trait = { workspace = true }
+etcd-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

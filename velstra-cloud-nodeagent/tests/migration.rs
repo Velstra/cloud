@@ -44,7 +44,6 @@ async fn two_nodes(status: MigrationStatus) -> Cell {
     let store = store();
     create_port(&store, PORT_A, "10.0.0.5/24", SOURCE).await;
     create_instance(&store, I1, Some(SOURCE), Some(SOURCE), &[PORT_A]).await;
-    create_migration(&store, M1, I1, SOURCE, DESTINATION, status).await;
 
     // One network, so a URL one machine publishes is a URL the other can
     // actually send to. Two unconnected fakes would let every test pass by
@@ -72,6 +71,11 @@ async fn two_nodes(status: MigrationStatus) -> Cell {
     // happens, which is the only situation a live migration starts from.
     cell.source.resync().await;
     assert!(cell.source_vmm.is_running(I1), "the guest never started");
+    // The migration is created *after* the guest is up, which is the only order
+    // the platform allows: `may_migrate` refuses one for an instance that is not
+    // running. Creating it first also asked the source to start a guest it was
+    // simultaneously forbidden to start.
+    create_migration(&cell.store, M1, I1, SOURCE, DESTINATION, status).await;
     cell
 }
 
@@ -344,14 +348,16 @@ async fn a_receiver_that_outlived_its_transfer_is_taken_down() {
     let datapath = FakeDatapath::new();
     let agent = node_agent(store.clone(), DESTINATION, &vmm, &datapath);
     vmm.cache_image(IMAGE);
-    vmm.create_disk(I1, 20).await.unwrap();
+    vmm.create_disk(I1, 20, "projects/p1/images/sha256-abc")
+        .await
+        .unwrap();
     let request = VmRequest {
         instance: I1.to_string(),
         vcpus: 2,
         memory_mib: 2048,
         image: IMAGE.to_string(),
         root_disk_gib: 20,
-        taps: vec![],
+        nics: vec![],
     };
     // A receive process that did not exit when its transfer did: the guest is
     // here and something is still listening for it.

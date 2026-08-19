@@ -85,7 +85,7 @@ const DERIVE = {
 };
 
 function fieldControl(form, f) {
-  const box = el("div.field" + (f.kind === "lines" || f.kind === "refList" || f.kind === "textList" ? ".wide" : ""));
+  const box = el("div.field" + (f.kind === "lines" || f.kind === "refList" || f.kind === "textList" || f.kind === "ruleList" ? ".wide" : ""));
   const id = "f-" + f.key.replace(/\./g, "-");
   form.boxes[f.key] = box;
   box.appendChild(el("label", { for: id }, f.label, f.required ? el("span.req", " ·") : null));
@@ -209,6 +209,20 @@ function fieldControl(form, f) {
       box.appendChild(host);
       break;
     }
+    case "ruleList": {
+      const host = el("div.rowlist", { id });
+      // Goes through the picker machinery so the groups a remote can name are
+      // fetched the same way every other reference is, rather than this control
+      // inventing its own loader.
+      form.pickers.push({
+        field: { key: f.key, collection: f.remoteCollection, spelling: "name" },
+        list: host,
+        render: () => renderRuleList(form, f, host, setErr),
+      });
+      renderRuleList(form, f, host, setErr);
+      box.appendChild(host);
+      break;
+    }
     default: {
       const input = el("input", { id, type: "text", placeholder: f.placeholder || "", spellcheck: "false" });
       input.value = current ?? "";
@@ -252,6 +266,109 @@ function renderTextList(form, f, host, setErr) {
   });
   host.appendChild(el("button.btn", { type: "button", onclick: () => { values.push(""); renderTextList(form, f, host, setErr); } },
     "Add" + (values.length ? " another" : "")));
+}
+
+// One rule is direction, protocol, an optional port range and a remote. They
+// are rendered together because they only mean anything together: a port range
+// on a protocol with no ports is refused by the API, and a remote naming a
+// group that is spelled by hand is a rule that silently allows nothing.
+const RULE_DIRECTIONS = ["ingress", "egress"];
+const RULE_PROTOCOLS = ["any", "tcp", "udp", "icmp"];
+
+function blankRule() {
+  return { direction: "ingress", protocol: "tcp", ports: { from: 443, to: 443 }, remote: { cidr: "0.0.0.0/0" } };
+}
+
+function ruleRemoteKind(rule) {
+  return rule && rule.remote && Object.prototype.hasOwnProperty.call(rule.remote, "group") ? "group" : "cidr";
+}
+
+function renderRuleList(form, f, host, setErr) {
+  // The array lives in the form, not in this closure: the control redraws
+  // itself after every change, and a rule pushed into a local copy would be
+  // gone by the time the redraw read the values back.
+  if (!Array.isArray(form.values[f.key])) form.values[f.key] = [];
+  const rules = form.values[f.key];
+  // The picker fills this in a moment later; the control is drawn once before
+  // that, so it must not assume the fetch has happened.
+  const groups = (form.refs || {})[f.remoteCollection] || [];
+  clear(host);
+
+  const commit = () => {
+    form.values[f.key] = rules;
+    // Only what the API would refuse. A rule that is merely broad is the
+    // operator's business.
+    let bad = "";
+    for (const r of rules) {
+      const kind = ruleRemoteKind(r);
+      if (kind === "cidr" && check("cidr", r.remote.cidr || "")) bad = "a remote prefix is address/length";
+      if (kind === "group" && !r.remote.group) bad = "choose a group for the remote";
+      if (r.ports && r.ports.from > r.ports.to) bad = "a port range runs from the lower number to the higher one";
+    }
+    setErr(bad);
+  };
+
+  const redraw = () => { renderRuleList(form, f, host, setErr); commit(); };
+
+  rules.forEach((rule, i) => {
+    const direction = el("select");
+    for (const d of RULE_DIRECTIONS) direction.appendChild(el("option", { value: d, selected: rule.direction === d ? "" : null }, d));
+    direction.addEventListener("change", () => { rule.direction = direction.value; commit(); });
+
+    const protocol = el("select");
+    for (const p of RULE_PROTOCOLS) protocol.appendChild(el("option", { value: p, selected: rule.protocol === p ? "" : null }, p));
+    protocol.addEventListener("change", () => {
+      rule.protocol = protocol.value;
+      // Dropped rather than hidden: a range kept out of sight would be sent
+      // with the rule and refused, and the operator would be looking at a form
+      // that shows no range at all.
+      if (rule.protocol !== "tcp" && rule.protocol !== "udp") delete rule.ports;
+      else if (!rule.ports) rule.ports = { from: 1, to: 65535 };
+      redraw();
+    });
+
+    const row = el("div.row", direction, protocol);
+
+    if (rule.protocol === "tcp" || rule.protocol === "udp") {
+      const from = el("input", { type: "number", min: "1", max: "65535", value: String(rule.ports.from), "aria-label": "from port" });
+      const to = el("input", { type: "number", min: "1", max: "65535", value: String(rule.ports.to), "aria-label": "to port" });
+      from.addEventListener("input", () => { rule.ports.from = Number(from.value); commit(); });
+      to.addEventListener("input", () => { rule.ports.to = Number(to.value); commit(); });
+      row.appendChild(el("span.idx", "ports"));
+      row.appendChild(from);
+      row.appendChild(el("span.idx", "to"));
+      row.appendChild(to);
+    }
+
+    const kind = el("select");
+    for (const k of ["cidr", "group"]) kind.appendChild(el("option", { value: k, selected: ruleRemoteKind(rule) === k ? "" : null }, k === "cidr" ? "from prefix" : "from group"));
+    kind.addEventListener("change", () => {
+      rule.remote = kind.value === "cidr" ? { cidr: "0.0.0.0/0" } : { group: "" };
+      redraw();
+    });
+    row.appendChild(kind);
+
+    if (ruleRemoteKind(rule) === "cidr") {
+      const cidr = el("input", { type: "text", value: rule.remote.cidr || "", placeholder: "0.0.0.0/0", spellcheck: "false", "aria-label": "remote prefix" });
+      cidr.addEventListener("input", () => { rule.remote.cidr = cidr.value; cidr.classList.toggle("bad", !!check("cidr", cidr.value)); commit(); });
+      row.appendChild(cidr);
+    } else {
+      const pick = el("select", { "aria-label": "remote group" });
+      pick.appendChild(el("option", { value: "" }, groups.length ? "Choose…" : "none exist yet"));
+      for (const g of groups) {
+        const wire = nameOf(g);
+        pick.appendChild(el("option", { value: wire, selected: wire === rule.remote.group ? "" : null }, shortName(wire)));
+      }
+      pick.addEventListener("change", () => { rule.remote.group = pick.value; commit(); });
+      row.appendChild(pick);
+    }
+
+    row.appendChild(el("button.btn", { type: "button", "aria-label": "remove", onclick: () => { rules.splice(i, 1); redraw(); } }, "\u2212"));
+    host.appendChild(row);
+  });
+
+  host.appendChild(el("button.btn", { type: "button", id: "addrule", onclick: () => { rules.push(blankRule()); redraw(); } },
+    "Add" + (rules.length ? " another" : " a rule")));
 }
 
 function renderRefList(form, f, host) {
@@ -380,11 +497,22 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
   if (advanced.childElementCount) {
     // The common path first, the rest one level deeper. Not hidden — one click
     // away, and the click says how many are behind it.
-    const toggle = el("button.disclose", { type: "button", id: "moresettings" },
-      "More settings (" + advanced.childElementCount + ")");
+    const n = advanced.childElementCount;
+    const toggle = el("button.disclose", { type: "button", id: "moresettings",
+      "aria-expanded": "false", "aria-controls": "moresettingsfields" },
+      "More settings (" + n + ")");
+    // The deeper level is a level: what it opens sits inside its own inset
+    // surface, so the rest of the form reads as *behind* the common path rather
+    // than as more of it. Without the container the disclosure is a button
+    // floating between two identical field grids, which is the same crowding
+    // one click later.
+    advanced.id = "moresettingsfields";
+    advanced.classList.add("deeper");
     toggle.addEventListener("click", () => {
       const shown = !advanced.classList.toggle("hidden");
-      toggle.textContent = (shown ? "Fewer settings" : "More settings (" + advanced.childElementCount + ")");
+      toggle.setAttribute("aria-expanded", String(shown));
+      toggle.classList.toggle("open", shown);
+      toggle.textContent = (shown ? "Fewer settings" : "More settings (" + n + ")");
     });
     dialog.appendChild(toggle);
     dialog.appendChild(advanced);

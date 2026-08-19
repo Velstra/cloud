@@ -80,6 +80,19 @@ pub enum Kind {
         placeholder: &'static str,
         check: Check,
     },
+    /// A list of security-group rules. The one field here that is not a scalar,
+    /// and it is not one because a rule is not one: direction, protocol, an
+    /// optional port range and a remote that is either a prefix or another
+    /// group. Spelling it as four separate list fields would let somebody build
+    /// a rule out of parts that do not line up.
+    ///
+    /// `remote_collection` is the collection a group-shaped remote picks from,
+    /// so the picker offers what exists rather than asking for a name to be
+    /// typed correctly.
+    RuleList {
+        #[serde(rename = "remoteCollection")]
+        remote_collection: &'static str,
+    },
 }
 
 /// How a reference is written on the wire.
@@ -302,7 +315,10 @@ const PROJECT_FIELDS: &[Field] = &[
             scale: Scale::None,
         },
         required: false,
-        advanced: false,
+        // The four together are one decision — how large this project may
+        // get — and it is a decision an operator makes about a project that
+        // exists, not while naming one. Creating a project is naming it.
+        advanced: true,
         help: "",
         derived: false,
     },
@@ -317,7 +333,7 @@ const PROJECT_FIELDS: &[Field] = &[
             scale: Scale::None,
         },
         required: false,
-        advanced: false,
+        advanced: true,
         help: "",
         derived: false,
     },
@@ -332,7 +348,7 @@ const PROJECT_FIELDS: &[Field] = &[
             scale: Scale::Mib,
         },
         required: false,
-        advanced: false,
+        advanced: true,
         help: "",
         derived: false,
     },
@@ -347,7 +363,7 @@ const PROJECT_FIELDS: &[Field] = &[
             scale: Scale::None,
         },
         required: false,
-        advanced: false,
+        advanced: true,
         help: "",
         derived: false,
     },
@@ -419,7 +435,9 @@ const INSTANCE_FIELDS: &[Field] = &[
             options: &[choice("Running", "Running"), choice("Stopped", "Stopped")],
         },
         required: false,
-        advanced: false,
+        // A guest somebody asked to exist runs. Saying so on the way in is
+        // a choice almost nobody makes, and it is one switch away.
+        advanced: true,
         help: "What it should be doing. Asking twice is the same as asking once.",
         derived: false,
     },
@@ -431,7 +449,9 @@ const INSTANCE_FIELDS: &[Field] = &[
             spelling: Spelling::Name,
         },
         required: false,
-        advanced: false,
+        // A guest with no NIC is unusual but it is not the thing most people
+        // are deciding while they name a machine.
+        advanced: true,
         help: "Attached in this order.",
         derived: false,
     },
@@ -443,7 +463,8 @@ const INSTANCE_FIELDS: &[Field] = &[
             check: Check::None,
         },
         required: false,
-        advanced: false,
+        // Almost always cloud-init's business rather than a field typed here.
+        advanced: true,
         help: "",
         derived: false,
     },
@@ -708,6 +729,20 @@ const SUBNET_FIELDS: &[Field] = &[
     },
 ];
 
+const SECURITY_GROUP_FIELDS: &[Field] = &[Field {
+    key: "rules",
+    label: "Rules",
+    kind: Kind::RuleList {
+        remote_collection: "security-groups",
+    },
+    required: false,
+    advanced: false,
+    help: "Every rule permits; none of them forbids. A group with no rules \
+               is a group that allows nothing extra, which is the platform's \
+               default anyway: nothing in, everything out, replies always.",
+    derived: false,
+}];
+
 const PORT_FIELDS: &[Field] = &[
     Field {
         key: "network",
@@ -733,6 +768,21 @@ const PORT_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        derived: false,
+    },
+    Field {
+        key: "securityGroups",
+        label: "Security groups",
+        kind: Kind::RefList {
+            collection: "security-groups",
+            spelling: Spelling::Name,
+        },
+        required: false,
+        advanced: false,
+        help: "Rules only ever add allowances, so ordering does not matter and \
+               two groups cannot contradict each other. With none, the port \
+               keeps the platform's default: nothing in, everything out, \
+               replies always.",
         derived: false,
     },
     Field {
@@ -1248,12 +1298,6 @@ pub const COLLECTIONS: &[Collection] = &[
                 cell: Cell::Number { unit: "" },
                 width: 80,
             },
-            Column {
-                path: "status.programmedOn",
-                label: "Programmed on",
-                cell: Cell::Count,
-                width: 136,
-            },
         ],
         agreements: &[],
         creatable: true,
@@ -1265,7 +1309,13 @@ pub const COLLECTIONS: &[Collection] = &[
         id: "subnets",
         title: "Subnets",
         singular: "subnet",
-        recheck: 0,
+        // Its two occupancy columns are counted from the *ports*, by the API, on
+        // the way out — so a port created or deleted moves them with nothing
+        // written to the subnet and no event on this collection. A console that
+        // only listened showed the occupancy as of whenever the board was
+        // opened, for as long as it stayed open, which is precisely the
+        // staleness that computing them on read exists to remove.
+        recheck: 15,
         condition: "Ready",
         group: "Network",
         scope: Scope::Project,
@@ -1356,6 +1406,34 @@ pub const COLLECTIONS: &[Collection] = &[
                 width: 120,
             },
         ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "security-groups",
+        title: "Security groups",
+        singular: "security group",
+        // `Applied` is computed by the API from the *ports* that name the group.
+        // Those change without anything being written to the group, so there is
+        // no event on this collection to listen for — the same reason a
+        // migration is asked again.
+        recheck: 15,
+        condition: "Applied",
+        group: "Network",
+        scope: Scope::Project,
+        blurb: "What a port is allowed to carry. Rules only add allowances — \
+                ingress is denied, egress is allowed and replies always come \
+                back, so a port in no group is not an open one.",
+        fields: SECURITY_GROUP_FIELDS,
+        columns: &[Column {
+            path: "spec.rules",
+            label: "Rules",
+            cell: Cell::Count,
+            width: 96,
+        }],
         agreements: &[],
         creatable: true,
         editable: true,
@@ -1690,7 +1768,7 @@ mod tests {
         }
         assert_eq!(
             COLLECTIONS.len(),
-            11,
+            12,
             "a collection was added without a screen"
         );
     }
@@ -1716,11 +1794,27 @@ mod tests {
         // listens shows it as transferring until somebody reloads the page.
         // Everything whose status is written by an agent needs no such thing,
         // and polling it would be a request per screen per interval for nothing.
-        assert!(
-            find("migrations").unwrap().recheck > 0,
-            "a computed condition is only listened for"
-        );
-        for c in COLLECTIONS.iter().filter(|c| c.id != "migrations") {
+        // The three the API computes on read. A migration's verdict comes from
+        // the clock; a security group's membership and a subnet's occupancy are
+        // both counted from the ports that name them. None of the three
+        // produces a write, so none produces an event on the object being
+        // looked at, and a screen that only listens is stale for as long as it
+        // is open.
+        //
+        // `subnets` was missing, and the assertion below is what kept it
+        // missing: it asserts that everything not on this list polls for
+        // *nothing*, so the list is not a note about which collections happen to
+        // poll — it is the claim that the rest do not need to. A collection that
+        // grows a computed field and is not added here is one this test now
+        // insists is fine.
+        let computed = ["migrations", "security-groups", "subnets"];
+        for id in computed {
+            assert!(
+                find(id).unwrap().recheck > 0,
+                "{id} has a computed condition and is only listened for"
+            );
+        }
+        for c in COLLECTIONS.iter().filter(|c| !computed.contains(&c.id)) {
             assert_eq!(c.recheck, 0, "{} polls for a status that is written", c.id);
         }
     }
@@ -1877,6 +1971,15 @@ mod tests {
     fn the_common_path_is_short() {
         // Simplicity is showing the common path first. A create form with ten
         // fields before "More settings" is a form nobody reads.
+        //
+        // The bound was seven, and seven turned out to *be* the complaint: an
+        // instance asked for an id, an image, three sizes, a power state, a
+        // port list and a key list before it asked anything advanced, and the
+        // form read as a wall of boxes. Seven is not a common path — it is
+        // every field that happens not to be exotic. Four is the number that
+        // forces the question "would almost everyone fill this in", and
+        // everything else keeps existing exactly where it was, one disclosure
+        // deeper.
         for c in COLLECTIONS.iter().filter(|c| c.creatable) {
             let common = c
                 .fields
@@ -1884,7 +1987,7 @@ mod tests {
                 .filter(|f| !f.advanced && !f.derived)
                 .count();
             assert!(
-                common <= 7,
+                common <= 4,
                 "{} asks {common} things before it asks anything advanced",
                 c.id
             );

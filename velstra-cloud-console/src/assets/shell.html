@@ -29,8 +29,11 @@
 <div id="app" class="hidden">
   <header id="top">
     <span id="brand">Velstra <b>Cloud</b></span>
-    <label for="project" class="faint" style="font-size:var(--text-xs)">Project</label>
-    <select id="project" style="width:auto;min-width:180px"></select>
+    <!-- No inline sizing: an inline style outranks the stylesheet, so the
+         `min-width: 180px` that used to be here made the tenancy switch the
+         widest thing in the header whatever the sheet said about it. -->
+    <label for="project" class="visually-hidden">Project</label>
+    <select id="project"></select>
     <div id="fleet" class="summary"></div>
     <span class="grow"></span>
     <span id="watchstate"></span>

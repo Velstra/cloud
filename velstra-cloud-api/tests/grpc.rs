@@ -35,7 +35,12 @@ impl Both {
     fn new() -> Self {
         let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single(TOKEN));
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
-        let api = Api::new(store, "eu-central", "cell-1", verifier);
+        // The harness acts as a cell operator: it registers nodes and creates
+        // projects, which are the cell's and not any tenant's. Authorisation is
+        // exercised on purpose in `tests/authz.rs` rather than incidentally
+        // here.
+        let api =
+            Api::new(store, "eu-central", "cell-1", verifier).with_cell_admins(vec!["dev".into()]);
         Self {
             rest: velstra_cloud_api::rest::router(api.clone()),
             grpc: Service::new(api),
@@ -261,6 +266,10 @@ async fn a_grpc_list_says_where_to_watch_from_and_the_watch_catches_up() {
         .grpc
         .list_instances(signed(ListRequest {
             parent: "projects/p1".into(),
+            node: String::new(),
+            pool: String::new(),
+            page_size: 0,
+            page_token: String::new(),
         }))
         .await
         .unwrap()
@@ -278,6 +287,8 @@ async fn a_grpc_list_says_where_to_watch_from_and_the_watch_catches_up() {
         .watch_instances(signed(WatchRequest {
             parent: "projects/p1".into(),
             from_revision: listed.revision,
+            node: String::new(),
+            pool: String::new(),
         }))
         .await
         .unwrap()
@@ -395,4 +406,92 @@ async fn a_derived_field_is_derived_on_both_transports() {
 
     let (_, body) = both.http("GET", "projects/p1/attachments/a1", None).await;
     assert_eq!(body["spec"]["node"], json!("node-a"));
+}
+
+/// gRPC `ListOperations` used to hand every operation in the cell to any
+/// accepted token.
+///
+/// It called `who()` for the side effect of authenticating and then threw the
+/// identity away, reaching for the API's unfiltered read. An operation names the
+/// object it acted on, so what a tenant got back was every other tenant's
+/// machines, volumes and networks and what was recently done to each. The REST
+/// surface for the same collection has always gone through the authorised path,
+/// which is precisely the two-surfaces-one-API asymmetry this file exists to
+/// catch — and did not, because nothing here had ever listed operations as
+/// somebody who is not an operator.
+#[tokio::test]
+async fn grpc_list_operations_shows_a_tenant_only_their_own() {
+    use velstra_cloud_api::Identity;
+    use velstra_cloud_proto::v1::operations_server::Operations;
+
+    const OPERATOR_TOKEN: &str = "operator-token";
+    const ADA_TOKEN: &str = "ada-token";
+
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::new([
+        (OPERATOR_TOKEN.to_string(), Identity::new("operator")),
+        (ADA_TOKEN.to_string(), Identity::new("ada")),
+    ]));
+    let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let api =
+        Api::new(store, "eu-central", "cell-1", verifier).with_cell_admins(vec!["operator".into()]);
+
+    // Two projects; only p1 is Ada's.
+    for (project, admin) in [("p1", "ada"), ("p2", "bob")] {
+        api.create(
+            "",
+            "projects",
+            &json!({"id": project, "spec": {
+                "quota": {},
+                "bindings": [{"role": "admin", "members": [admin]}]
+            }}),
+            &Identity::new("operator"),
+        )
+        .await
+        .unwrap();
+        // A create mints an operation, which is how operations come to exist.
+        api.create(
+            &format!("projects/{project}"),
+            "networks",
+            &json!({"id": format!("n-{admin}"), "spec": {"vni": 5001, "mtu": 1500}}),
+            &Identity::new(admin),
+        )
+        .await
+        .unwrap();
+    }
+
+    let grpc = Service::new(api);
+    let as_ada = |message: ListRequest| {
+        let mut request = Request::new(message);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {ADA_TOKEN}").parse().unwrap(),
+        );
+        request
+    };
+
+    let listed = grpc
+        .list_operations(as_ada(ListRequest {
+            parent: String::new(),
+            node: String::new(),
+            pool: String::new(),
+            page_size: 0,
+            page_token: String::new(),
+        }))
+        .await
+        .expect("a tenant may list operations")
+        .into_inner();
+
+    let names: Vec<String> = listed
+        .operations
+        .iter()
+        .filter_map(|o| o.meta.as_ref().map(|m| m.name.clone()))
+        .collect();
+    assert!(
+        !names.is_empty(),
+        "the tenant was shown nothing at all, so this proves nothing"
+    );
+    assert!(
+        names.iter().all(|n| !n.contains("/p2/")),
+        "gRPC handed a tenant another tenant's operations: {names:?}"
+    );
 }

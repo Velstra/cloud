@@ -76,6 +76,96 @@ function itemsOf(body, coll) {
   return found || [];
 }
 
+// ---- listing, a page at a time ---------------------------------------------
+//
+// **The console holds whole collections and it must go on holding them.** The
+// board sorts client-side, the rail counts, and the watch folds each event into
+// the list it already has — none of those can be done over one page of an
+// unknown many. So paging here is a transport detail: the walk happens inside
+// `list`, and everything above it still gets a collection.
+//
+// The alternative — a visible "next page" control — was rejected rather than
+// missed. It would mean a count that is the size of one page, a sort that is
+// only within a page, and a watch event for an object on another page with
+// nowhere to land: three ways to be quietly wrong, to save round trips on
+// collections that in this platform are hundreds of objects, not millions.
+//
+// Two things about the walk are the contract and not choices:
+//
+//  * **The revision is the *first* page's.** A client lists, then watches from
+//    what the list reported. Take the last page's revision and every change that
+//    landed while the walk was running is skipped for ever — silently, because
+//    the board looks complete and the watch looks live. The API pins it in the
+//    page token and repeats it on every page; this takes the first one it saw
+//    and keeps it.
+//  * **The walk ends when there is no token, not when a page is short.** A full
+//    last page with no token is a finished walk, and a short page with a token
+//    is not — stopping on a short page is the natural mistake and it stops the
+//    walk in the middle.
+
+/// What the console asks for per page.
+///
+/// The API's own maximum, so a cell of a thousand objects is still one round
+/// trip, and a larger one is bounded work per response instead of one answer
+/// that has to build and serialise the whole cell. The number is not load-
+/// bearing: the walk below is correct at any page size, including a server
+/// whose ceiling is lower than this.
+const PAGE_SIZE = 1000;
+
+/// A walk that cannot end is a tab that never stops fetching. Reaching this is a
+/// server that keeps handing out tokens, so it is reported rather than absorbed
+/// — see `complete` below.
+const MOST_PAGES = 200;
+
+function pagePath(coll, scope, token) {
+  const q = "pageSize=" + PAGE_SIZE + (token ? "&pageToken=" + encodeURIComponent(token) : "");
+  return basePath(coll, scope) + "?" + q;
+}
+
+/// Follow `nextPageToken` from a first page already in hand.
+async function walk(coll, scope, first) {
+  const items = first.items.slice();
+  let token = first.next;
+  let pages = 1;
+  while (token) {
+    if (pages >= MOST_PAGES) {
+      // Loud, not silent. Everything read so far is still handed back — an
+      // operator staring at a truncated fleet is better served by the rows plus
+      // a sentence than by an error page with nothing in it — but `complete` is
+      // false and the board says so.
+      return { items, revision: first.revision, complete: false };
+    }
+    const r = await request("GET", pagePath(coll, scope, token));
+    const page = itemsOf(r.body, coll);
+    const next = r.body && r.body.nextPageToken;
+    // A server that answers a token with the same token would spin here for
+    // ever; a page that adds nothing and still offers a token is the same
+    // failure one step removed.
+    if (next === token || (!page.length && next)) {
+      return { items, revision: first.revision, complete: false };
+    }
+    items.push(...page);
+    token = next;
+    pages++;
+  }
+  return { items, revision: first.revision, complete: true };
+}
+
+/// One page, and what the contract said about it.
+async function firstPage(coll, scope) {
+  const r = await request("GET", pagePath(coll, scope, null));
+  const items = itemsOf(r.body, coll);
+  return {
+    items,
+    // Header, then the body's own field, then — only if neither is there — the
+    // newest revision on *this page*. Never over the whole walk: a revision
+    // taken from a later page is one the watch would start after, and the
+    // fallback must err towards replaying rather than skipping.
+    revision: r.revision || (r.body && r.body.revision) || newestRevision(items),
+    next: (r.body && r.body.nextPageToken) || null,
+  };
+}
+
 async function list(coll) {
   const tries = scopeFound[coll.id]
     ? [scopeFound[coll.id]]
@@ -84,23 +174,24 @@ async function list(coll) {
   for (const scope of tries) {
     if (scope === "project" && !session.project) continue;
     try {
-      const r = await request("GET", basePath(coll, scope));
-      const items = itemsOf(r.body, coll);
-      const answer = { items, revision: r.revision || newestRevision(items) };
-      if (items.length) { scopeFound[coll.id] = scope; return answer; }
+      // Probed one page at a time: whether this is the right address is
+      // answered by the first page, and walking the wrong one to the end before
+      // finding out would be the whole cell fetched under a parent nobody meant.
+      const first = await firstPage(coll, scope);
+      if (first.items.length) { scopeFound[coll.id] = scope; return walk(coll, scope, first); }
       // An empty answer is not proof of the right address: a collection asked
       // for under the wrong parent answers 200 with nothing in it, which reads
       // as "you have no nodes" rather than as a mistake. So the other scope is
       // tried before an empty listing is believed — and if both are empty the
       // declared one is kept, because it is the one that will start answering
       // once something exists.
-      if (!empty) empty = { scope, answer };
+      if (!empty) empty = { scope, first };
     } catch (e) {
       last = e;
       if (!(e instanceof ApiError) || e.status !== 404) throw e;
     }
   }
-  if (empty) { scopeFound[coll.id] = empty.scope; return empty.answer; }
+  if (empty) { scopeFound[coll.id] = empty.scope; return walk(coll, empty.scope, empty.first); }
   throw last || new ApiError(404, null);
 }
 
@@ -238,4 +329,26 @@ async function options(collectionId) {
 
 function forgetOptions(collectionId) {
   if (collectionId) optionCache.delete(collectionId); else optionCache.clear();
+}
+
+/// Everything this module remembers about the session that is ending.
+///
+/// A function rather than three lines at the call site, because the hazard is a
+/// fourth cache added here later and not added there. What is forgotten:
+///
+///  * **the picker cache**, which holds resolved promises and is otherwise only
+///    ever invalidated by a write or a watch event — so it outlived not just the
+///    sign-out but the whole next session, and offered the previous tenant's
+///    ports and volumes, by name, to whoever signed in next on a shared machine;
+///  * **where each collection was found**, which is a fact about what the last
+///    token could see, not about the API; and
+///  * **the project**, which names the tenant this session was looking at. It is
+///    a far weaker secret than the token, and it is cleared for the same reason
+///    the token is: `signedOut` means nothing behind, and a sign-in screen
+///    pre-filled with somebody else's project is not nothing.
+function forgetSession() {
+  optionCache.clear();
+  for (const key of Object.keys(scopeFound)) delete scopeFound[key];
+  session.project = "";
+  sessionStorage.removeItem(PROJECT_KEY);
 }

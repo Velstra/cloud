@@ -3,6 +3,11 @@
 const view = {
   coll: null,          // the collection being shown
   items: [],
+  // Whether `items` is the whole collection. False only when a paged walk had to
+  // be abandoned — see `walk` in api.js. It is here rather than implied by the
+  // row count because the whole hazard is that a short list looks exactly like a
+  // small collection.
+  complete: true,
   watcher: null,
   revision: null,
   rechecker: null,     // see startRecheck
@@ -39,7 +44,7 @@ function renderRail() {
         // one. Amber here means exactly what it means everywhere else.
         unsettled
           ? el("span.state.drifting", mark("drifting"), String(unsettled))
-          : el("span.n", seen ? String(seen.total) : "")));
+          : el("span.n", seen ? String(seen.total) + (seen.complete === false ? "+" : "") : "")));
     }
   }
 }
@@ -52,7 +57,8 @@ function renderFleet() {
   const total = known.reduce((n, c) => n + c.total, 0);
   const unsettled = known.reduce((n, c) => n + c.unsettled, 0);
   const failed = Object.values(census).filter((c) => !c.ok).length;
-  box.appendChild(el("span.muted", total + " objects"));
+  const partial = known.some((c) => c.complete === false);
+  box.appendChild(el("span.muted", (partial ? "at least " : "") + total + " objects"));
   box.appendChild(unsettled
     ? el("span.state.drifting", mark("drifting"), unsettled + " not settled")
     : el("span.state.settled", mark("settled"), "all settled"));
@@ -66,6 +72,11 @@ async function sweep() {
       census[c.id] = {
         ok: true,
         total: r.items.length,
+        // A count that is the length of what arrived, when what arrived is not
+        // the collection, is the failure worth being loud about: it reads as an
+        // answer. `complete` comes back false only when a walk had to be given
+        // up on, and everywhere the number is shown it is marked as a floor.
+        complete: r.complete !== false,
         unsettled: r.items.filter((x) => verdict(x, c.condition).kind !== "settled").length,
       };
     } catch (e) {
@@ -83,10 +94,32 @@ function recount() {
   census[view.coll.id] = {
     ok: true,
     total: view.items.length,
+    // Recounted from the board, so it inherits whatever the listing that filled
+    // the board managed to read.
+    complete: view.complete !== false,
     unsettled: view.items.filter((x) => verdict(x, view.coll.condition).kind !== "settled").length,
   };
   renderRail();
   renderFleet();
+}
+
+/// Everything the board remembers, and everything it has put on screen.
+///
+/// The counts are the part worth being explicit about: `census` feeds the rail
+/// and the fleet bar, so leaving it means the next person to sign in is told how
+/// many objects the *previous* one had — for as long as it takes the new
+/// session's sweep to come back, which is a round trip per collection and is not
+/// awaited.
+function forgetBoard() {
+  for (const key of Object.keys(census)) delete census[key];
+  view.coll = null;
+  view.items = [];
+  view.revision = null;
+  view.complete = true;
+  clear($("rail"));
+  clear($("fleet"));
+  clear($("boardbody"));
+  clear($("boardhead"));
 }
 
 function cell(r, col) {
@@ -225,6 +258,7 @@ function startRecheck(coll) {
     let fresh;
     try { fresh = await list(coll); } catch (e) { return; }   // the watch reports being down
     view.items = fresh.items;
+    view.complete = fresh.complete !== false;
     renderBoard();
     recount();
     // The object somebody has open is the one they are watching for exactly
@@ -254,8 +288,19 @@ async function show(id) {
     const r = await list(coll);
     view.items = r.items;
     view.revision = r.revision;
+    view.complete = r.complete !== false;
+    if (!view.complete) {
+      // The rows are still shown — a truncated fleet plus a sentence is more use
+      // to an operator than an empty error page — but the board must not read as
+      // the whole collection.
+      fill($("listerr"),
+        "This list did not finish: the API kept offering more pages. " +
+        view.items.length + " shown, and there are more.")
+        .classList.remove("hidden");
+    }
   } catch (e) {
     view.items = [];
+    view.complete = true;
     fill($("listerr"), e.message).classList.remove("hidden");
   }
   renderBoard();

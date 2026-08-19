@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use velstra_cloud_api::{Api, StaticTokenVerifier, TokenVerifier};
 use velstra_cloud_model::{
+    access::Writer,
     meta::{Condition, Meta, Placement, ResourceName},
-    resources::{Capacity, NodeSpec, NodeStatus, Resource},
+    resources::{Capacity, NodeSpec, NodeStatus, PortSpec, PortStatus, Resource},
 };
 use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
@@ -49,7 +50,12 @@ impl Harness {
     fn new() -> Self {
         let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single(TOKEN));
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
-        let api = Api::new(store.clone(), "eu-central", "cell-1", verifier);
+        // The harness acts as a cell operator: it registers nodes and creates
+        // projects, which are the cell's and not any tenant's. Authorisation is
+        // exercised on purpose in `tests/authz.rs` rather than incidentally
+        // here.
+        let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+            .with_cell_admins(vec!["dev".into()]);
         Self {
             // The whole server, gRPC routes and all: the REST paths have to
             // keep working next to their twins rather than only in isolation.
@@ -1485,4 +1491,661 @@ async fn which_nodes_hold_an_image_is_added_up_from_what_each_node_reports() {
     // The small node never reported holding it, so it is not in the sum — and
     // no writer had to remember to take it out.
     assert!(!held.contains(&"node-tiny"), "{image}");
+}
+
+// ---- snapshots -----------------------------------------------------------
+
+type Volumes = TypedStore<
+    velstra_cloud_model::resources::VolumeSpec,
+    velstra_cloud_model::resources::VolumeStatus,
+>;
+type Snapshots = TypedStore<
+    velstra_cloud_model::resources::SnapshotSpec,
+    velstra_cloud_model::resources::SnapshotStatus,
+>;
+
+impl Harness {
+    fn volumes(&self) -> Volumes {
+        TypedStore::new(self.store.clone(), "cell-1", "volumes")
+    }
+
+    fn snapshots(&self) -> Snapshots {
+        TypedStore::new(self.store.clone(), "cell-1", "snapshots")
+    }
+
+    /// A volume its pool has claimed and made, which is the only kind that can
+    /// be copied.
+    async fn volume(&self, id: &str, gib: u64) -> String {
+        let created = self
+            .post(
+                "projects/p1/volumes",
+                json!({ "id": id, "spec": { "sizeGib": gib, "pool": "pool-a" } }),
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+        let name = created.body["target"].as_str().unwrap().to_string();
+
+        let volumes = self.volumes();
+        let mut v = volumes.get(&name).await.unwrap().unwrap();
+        v.status.pool = Some("pool-a".into());
+        v.status.provisioned = true;
+        v.status.actual_size_gib = gib;
+        v.status.observed_generation = v.meta.generation;
+        volumes
+            .update(&v, &velstra_cloud_model::access::Writer::agent("pool-a"))
+            .await
+            .expect("the pool claiming a volume assigned to it");
+        name
+    }
+
+    /// The pool reporting that it has made the copy.
+    async fn taken(&self, name: &str, gib: u64) {
+        let snapshots = self.snapshots();
+        let mut s = snapshots.get(name).await.unwrap().unwrap();
+        s.status.pool = Some("pool-a".into());
+        s.status.taken = true;
+        s.status.size_gib = gib;
+        s.status.observed_generation = s.meta.generation;
+        snapshots
+            .update(&s, &velstra_cloud_model::access::Writer::agent("pool-a"))
+            .await
+            .expect("the pool claiming a snapshot assigned to it");
+    }
+}
+
+#[tokio::test]
+async fn a_snapshot_is_created_under_the_volume_it_copies() {
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+
+    let created = h
+        .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    let name = created.body["target"].as_str().unwrap();
+    assert_eq!(name, "projects/p1/volumes/data-1/snapshots/nightly");
+
+    // The pool is derived from the volume: a copy is made where the bytes
+    // already are, and nobody is asked for a fact the platform holds.
+    let snapshot = h.get(name).await;
+    assert_eq!(snapshot.body["spec"]["pool"], json!("pool-a"));
+    assert_eq!(snapshot.body["status"]["taken"], json!(false));
+
+    // It is in the volume's subtree and in the project's, because a name is a
+    // path and both of those are prefixes of it.
+    let under_volume = h.get(&format!("{volume}/snapshots")).await;
+    assert_eq!(under_volume.body["items"].as_array().unwrap().len(), 1);
+    let under_project = h.get("projects/p1/snapshots").await;
+    assert_eq!(under_project.body["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_snapshot_that_is_not_under_a_volume_is_refused() {
+    // The source lives in the name, so a name that does not carry one is a
+    // copy of nothing — and it would sit there being reconciled forever.
+    let h = Harness::new();
+    h.volume("data-1", 100).await;
+    let refused = h
+        .post("projects/p1/snapshots", json!({ "id": "nightly" }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "meta.name");
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("volumes/data-1/snapshots"),
+        "the refusal did not show the shape that works: {}",
+        refused.body
+    );
+}
+
+#[tokio::test]
+async fn a_copy_is_refused_of_a_volume_that_has_nothing_in_it_yet() {
+    // Knowable before anything is written. Otherwise the object exists, the
+    // pool fails on it, and an operator reads a backend error instead of a
+    // sentence.
+    let h = Harness::new();
+    let created = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data-1", "spec": { "sizeGib": 100, "pool": "pool-a" } }),
+        )
+        .await;
+    let volume = created.body["target"].as_str().unwrap().to_string();
+
+    let refused = h
+        .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
+        .await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing to copy"),
+        "{}",
+        refused.body
+    );
+    assert_eq!(
+        h.get(&format!("{volume}/snapshots")).await.body["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "a refused copy was created anyway"
+    );
+}
+
+#[tokio::test]
+async fn a_copy_is_refused_of_a_volume_on_its_way_out() {
+    // It would put a guard on an object nobody would ever release it from.
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+
+    // Guarded by its pool, as every provisioned volume is, so that the delete
+    // is the two-phase one an operator actually sees.
+    let volumes = h.volumes();
+    let mut held = volumes.get(&volume).await.unwrap().unwrap();
+    held.meta
+        .add_finalizer(velstra_cloud_model::resources::POOL_RELEASE_FINALIZER);
+    volumes
+        .update(
+            &held,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+    h.send("DELETE", &volume, None, &[]).await;
+
+    let refused = h
+        .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
+        .await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("being deleted"),
+        "{}",
+        refused.body
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_may_not_name_a_pool_the_volume_is_not_in() {
+    // Stated and wrong is refused rather than corrected, exactly as an
+    // attachment's node is: rewriting what somebody typed changes what the
+    // object says without them asking.
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+    let refused = h
+        .post(
+            &format!("{volume}/snapshots"),
+            json!({ "id": "nightly", "spec": { "pool": "pool-b" } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.pool");
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pool-a"),
+        "{}",
+        refused.body
+    );
+}
+
+#[tokio::test]
+async fn a_volume_made_from_a_snapshot_takes_its_size_and_pool_from_it() {
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+    let created = h
+        .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
+        .await;
+    let snapshot = created.body["target"].as_str().unwrap().to_string();
+    h.taken(&snapshot, 100).await;
+
+    let restored = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data-2", "spec": { "sourceSnapshot": snapshot } }),
+        )
+        .await;
+    assert_eq!(restored.status, StatusCode::ACCEPTED, "{}", restored.body);
+    let body = h.get(restored.body["target"].as_str().unwrap()).await.body;
+    assert_eq!(body["spec"]["sizeGib"], json!(100));
+    assert_eq!(body["spec"]["pool"], json!("pool-a"));
+    assert_eq!(body["spec"]["sourceSnapshot"], json!(snapshot));
+
+    // Bigger is ordinary — a volume is grown.
+    let bigger = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data-3", "spec": { "sizeGib": 200, "sourceSnapshot": snapshot } }),
+        )
+        .await;
+    assert_eq!(bigger.status, StatusCode::ACCEPTED, "{}", bigger.body);
+
+    // Smaller is the clone not fitting in what it is written into.
+    let smaller = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data-4", "spec": { "sizeGib": 50, "sourceSnapshot": snapshot } }),
+        )
+        .await;
+    assert_eq!(smaller.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(smaller.field(), "spec.sizeGib");
+    assert!(
+        smaller.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("at least as big"),
+        "{}",
+        smaller.body
+    );
+}
+
+#[tokio::test]
+async fn a_volume_comes_from_one_place() {
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+    let created = h
+        .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
+        .await;
+    let snapshot = created.body["target"].as_str().unwrap().to_string();
+
+    // Not taken yet: there is nothing to clone, and the pool would fail on it
+    // one pass later.
+    let early = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data-2", "spec": { "sizeGib": 100, "sourceSnapshot": snapshot } }),
+        )
+        .await;
+    assert_eq!(early.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(early.field(), "spec.sourceSnapshot");
+
+    h.taken(&snapshot, 100).await;
+    let both = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data-3", "spec": {
+                "sizeGib": 100,
+                "sourceSnapshot": snapshot,
+                "sourceImage": "projects/p1/images/sha256-abc",
+            } }),
+        )
+        .await;
+    assert_eq!(both.error_code(), "FAILED_PRECONDITION");
+    assert!(
+        both.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not from both"),
+        "{}",
+        both.body
+    );
+}
+
+#[tokio::test]
+async fn a_volume_is_not_restored_in_place() {
+    // What an operator reaches for when they mean "restore this". It is
+    // refused, and the refusal says what to do instead — because an in-place
+    // restore would be a command sitting in a spec, carried out again on every
+    // resync, undoing whatever the guest wrote in between.
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+    let created = h
+        .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
+        .await;
+    let snapshot = created.body["target"].as_str().unwrap().to_string();
+    h.taken(&snapshot, 100).await;
+
+    let refused = h
+        .patch(&volume, json!({ "spec": { "sourceSnapshot": snapshot } }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(refused.field(), "spec.sourceSnapshot");
+    let sentence = refused.body["error"]["message"].as_str().unwrap();
+    assert!(sentence.contains("in place"), "{sentence}");
+    assert!(
+        sentence.contains("Create a volume"),
+        "the refusal did not say what to do instead: {sentence}"
+    );
+
+    // Nothing was written: the volume still says where it came from, which is
+    // nowhere.
+    assert_eq!(
+        h.get(&volume).await.body["spec"]["sourceSnapshot"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn where_a_volume_came_from_is_history_rather_than_a_control() {
+    let h = Harness::new();
+    let created = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data-1", "spec": {
+                "sizeGib": 20,
+                "pool": "pool-a",
+                "sourceImage": "projects/p1/images/sha256-abc",
+            } }),
+        )
+        .await;
+    let volume = created.body["target"].as_str().unwrap().to_string();
+
+    let refused = h
+        .patch(
+            &volume,
+            json!({ "spec": { "sourceImage": "projects/p1/images/sha256-def" } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.sourceImage");
+
+    // Sending back what is already there is not a change: a client that read
+    // an object and is writing part of it back must not be refused for
+    // carrying a field it did not touch.
+    let unchanged = h
+        .patch(
+            &volume,
+            json!({ "spec": {
+                "sizeGib": 40,
+                "sourceImage": "projects/p1/images/sha256-abc",
+            } }),
+        )
+        .await;
+    assert_eq!(unchanged.status, StatusCode::OK, "{}", unchanged.body);
+    assert_eq!(unchanged.body["spec"]["sizeGib"], json!(40));
+}
+
+#[tokio::test]
+async fn deleting_a_snapshot_waits_for_the_pool_like_a_volume_does() {
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+    let created = h
+        .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
+        .await;
+    let snapshot = created.body["target"].as_str().unwrap().to_string();
+
+    // The guard a controller puts on before the pool is asked for anything.
+    let snapshots = h.snapshots();
+    let mut held = snapshots.get(&snapshot).await.unwrap().unwrap();
+    held.meta
+        .add_finalizer(velstra_cloud_model::resources::POOL_RELEASE_FINALIZER);
+    snapshots
+        .update(
+            &held,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+
+    let deleted = h.send("DELETE", &snapshot, None, &[]).await;
+    assert_eq!(deleted.status, StatusCode::ACCEPTED);
+    assert_eq!(
+        h.get(&snapshot).await.status,
+        StatusCode::OK,
+        "a deleting copy stopped being readable while the pool still held it"
+    );
+}
+
+// ---- security groups -----------------------------------------------------
+
+#[tokio::test]
+async fn a_security_group_is_an_ordinary_collection() {
+    let h = Harness::new();
+    let made = h
+        .post(
+            "projects/p1/security-groups",
+            json!({
+                "id": "web",
+                "spec": { "rules": [{
+                    "direction": "ingress",
+                    "protocol": "tcp",
+                    "ports": { "from": 443, "to": 443 },
+                    "remote": { "cidr": "0.0.0.0/0" }
+                }] }
+            }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    let read = h.get("projects/p1/security-groups/web").await;
+    assert_eq!(read.status, StatusCode::OK);
+    assert_eq!(read.body["spec"]["rules"][0]["protocol"], "tcp");
+}
+
+#[tokio::test]
+async fn a_rule_that_cannot_mean_what_it_says_is_refused_with_its_index() {
+    let h = Harness::new();
+    let refused = h
+        .post(
+            "projects/p1/security-groups",
+            json!({
+                "id": "bad",
+                "spec": { "rules": [
+                    {
+                        "direction": "ingress",
+                        "protocol": "tcp",
+                        "ports": { "from": 22, "to": 22 },
+                        "remote": { "cidr": "0.0.0.0/0" }
+                    },
+                    {
+                        // A port range on a protocol that has none. Accepting
+                        // this would show the operator a narrower rule than the
+                        // one in force.
+                        "direction": "ingress",
+                        "protocol": "icmp",
+                        "ports": { "from": 0, "to": 65535 },
+                        "remote": { "cidr": "0.0.0.0/0" }
+                    }
+                ] }
+            }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.field(), "spec.rules[1]", "{:?}", refused.body);
+}
+
+#[tokio::test]
+async fn whether_a_group_is_in_force_is_answered_from_the_ports_that_use_it() {
+    let h = Harness::new();
+    h.post(
+        "projects/p1/security-groups",
+        json!({ "id": "web", "spec": { "rules": [] } }),
+    )
+    .await;
+
+    // Nothing references it yet: vacuously in force, and it says so rather than
+    // sitting at "unknown" for ever.
+    let alone = h.get("projects/p1/security-groups/web").await;
+    assert_eq!(condition(&alone.body, "Applied")["status"], "True");
+    assert_eq!(condition(&alone.body, "Applied")["reason"], "InForce");
+
+    // A port names it, and no node carries that port. Not an alarm: nobody is
+    // expected to have programmed anything, and saying "pending" here would be
+    // an alarm about nothing.
+    h.post(
+        "projects/p1/ports",
+        json!({
+            "id": "port-a",
+            "spec": {
+                "network": "projects/p1/networks/n1",
+                "subnet": "projects/p1/subnets/s1",
+                "securityGroups": ["projects/p1/security-groups/web"]
+            }
+        }),
+    )
+    .await;
+    let spare = h.get("projects/p1/security-groups/web").await;
+    let applied = condition(&spare.body, "Applied");
+    assert_eq!(applied["status"], "True", "{:?}", spare.body);
+    assert!(
+        applied["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("none of them carried"),
+        "{applied:?}"
+    );
+
+    // A node picks the port up and has not programmed it yet. Two writes, in
+    // this order and no other: the port controller assigns it — a node cannot
+    // claim what nothing has assigned to it, which is the whole point of the
+    // access rule — and only then may the node report on it.
+    let ports: TypedStore<PortSpec, PortStatus> =
+        TypedStore::new(h.store.clone(), "cell-1", "ports");
+    let mut port = ports
+        .get("projects/p1/ports/port-a")
+        .await
+        .unwrap()
+        .expect("the port was created above");
+    port.spec.node = Some("node-a".into());
+    port.meta.generation += 1;
+    ports
+        .update(&port, &Writer::controller("port"))
+        .await
+        .unwrap();
+    let mut port = ports
+        .get("projects/p1/ports/port-a")
+        .await
+        .unwrap()
+        .unwrap();
+    port.status.node = Some("node-a".into());
+    ports.update(&port, &Writer::agent("node-a")).await.unwrap();
+
+    let pending = h.get("projects/p1/security-groups/web").await;
+    let applied = condition(&pending.body, "Applied");
+    assert_eq!(applied["status"], "False", "{:?}", pending.body);
+    assert_eq!(applied["reason"], "PortsPending");
+    assert!(
+        applied["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("projects/p1/ports/port-a"),
+        "the message does not say which port: {applied:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_is_status_like_everything_else_and_cannot_be_patched() {
+    let h = Harness::new();
+    h.post(
+        "projects/p1/security-groups",
+        json!({ "id": "web", "spec": { "rules": [] } }),
+    )
+    .await;
+    let refused = h
+        .patch(
+            "projects/p1/security-groups/web",
+            json!({ "status": { "observedGeneration": 9 } }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+}
+
+/// One condition out of a document, or `Value::Null` if it is not there.
+fn condition(document: &Value, kind: &str) -> Value {
+    document["status"]["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["kind"] == kind)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+// ---- paging ---------------------------------------------------------------
+
+/// The query parameters a client actually sends, spelled the way AIP-158 spells
+/// them. The behaviour is proved in `paging.rs`; what is proved here is that the
+/// REST surface reaches it, and reaches it under the names a client will use.
+#[tokio::test]
+async fn a_rest_list_pages_under_the_names_a_client_expects() {
+    let both = Harness::new();
+    for i in 0..5 {
+        both.instance(
+            "p1",
+            &format!("i{i}"),
+            json!({"vcpus": 1, "memoryMib": 512}),
+        )
+        .await;
+    }
+
+    let first = both.get("projects/p1/instances?pageSize=2").await;
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+    assert_eq!(first.body["items"].as_array().unwrap().len(), 2);
+    let token = first.body["nextPageToken"]
+        .as_str()
+        .expect("a short page did not offer a token")
+        .to_string();
+
+    let mut seen = 2;
+    let mut token = Some(token);
+    while let Some(t) = token.take() {
+        let next = both
+            .get(&format!("projects/p1/instances?pageSize=2&pageToken={t}"))
+            .await;
+        assert_eq!(next.status, StatusCode::OK, "{:?}", next.body);
+        seen += next.body["items"].as_array().unwrap().len();
+        token = next.body["nextPageToken"].as_str().map(str::to_string);
+    }
+    assert_eq!(seen, 5, "the walk lost or repeated objects");
+}
+
+#[tokio::test]
+async fn a_rest_list_without_paging_is_unchanged() {
+    // The contract every client written before paging relies on. A field that
+    // appeared on every answer — even empty — would also be a change, so the
+    // token is absent rather than "".
+    let both = Harness::new();
+    both.instance("p1", "i1", json!({"vcpus": 1, "memoryMib": 512}))
+        .await;
+    let listed = both.get("projects/p1/instances").await;
+    assert_eq!(listed.status, StatusCode::OK);
+    assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
+    assert!(
+        listed.body.get("nextPageToken").is_none(),
+        "an unpaged answer grew a field: {:?}",
+        listed.body
+    );
+}
+
+#[tokio::test]
+async fn a_page_size_that_is_not_a_number_is_refused_rather_than_ignored() {
+    // Ignoring it hands back the whole cell to a client that believes it asked
+    // for twenty — the shape where a load test passes and production does not.
+    let both = Harness::new();
+    let answer = both.get("projects/p1/instances?pageSize=twenty").await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
+    assert!(
+        answer.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pageSize"),
+        "the refusal did not name the parameter: {:?}",
+        answer.body
+    );
+}
+
+#[tokio::test]
+async fn a_forged_page_token_is_refused() {
+    let both = Harness::new();
+    let answer = both
+        .get("projects/p1/instances?pageSize=2&pageToken=obviously-not-one")
+        .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
 }

@@ -20,8 +20,10 @@ use velstra_cloud_model::{
     migration::{Migration, MigrationSpec, MigrationStatus},
     resources::{
         Attachment, AttachmentSpec, AttachmentStatus, Instance, InstanceSpec, InstanceStatus,
-        NODE_RELEASE_FINALIZER, Node, NodeSpec, NodeStatus, Port, PortSpec, PortStatus, Resource,
+        NODE_RELEASE_FINALIZER, NetworkSpec, NetworkStatus, Node, NodeSpec, NodeStatus, Port,
+        PortSpec, PortStatus, Resource, SubnetSpec, SubnetStatus,
     },
+    security::{SecurityGroupSpec, SecurityGroupStatus, SecurityRule},
 };
 use velstra_cloud_nodeagent::{Agent, AgentConfig, FakeDatapath, FakeVmm};
 use velstra_cloud_store::{Entry, Event, Expect, MemoryStore, Store, StoreError, TypedStore};
@@ -144,6 +146,17 @@ fn meta(name: &str) -> Meta {
     );
     // The controller that assigns work also holds the release finalizer, so
     // every object here carries one from the start — the same as in a cell.
+    //
+    // That sentence was false for two years and this line is why nobody found
+    // out. Nothing added a finalizer to an instance or a port: `InstanceController`
+    // and the guard in `PortController` did not exist, so `Api::delete` removed
+    // both outright the moment it was asked, and the teardown paths below —
+    // which are reached only by reading a *stored* object that is being deleted —
+    // never ran outside this file. A fixture that manufactures the precondition
+    // production never produced is a fixture that tests a branch nothing
+    // reaches. It is true now, and `velstra-cloud-e2e/tests/cell.rs` asserts it
+    // from the outside so that this line cannot go back to being the only place
+    // it holds.
     meta.add_finalizer(NODE_RELEASE_FINALIZER);
     meta
 }
@@ -183,12 +196,76 @@ pub async fn create_instance(
     instance
 }
 
+/// The network and subnet every port here names.
+///
+/// Both, because they carry different halves of what a guest is told: the
+/// network has the MTU, the subnet has the range, the gateway and the
+/// resolvers. A cell that has ports but neither of these can still run guests —
+/// they are simply told less — which is why they are a separate helper rather
+/// than something `create_port` does.
+pub async fn create_network(store: &Arc<dyn Store>, cidr: &str, gateway: &str) {
+    let networks: TypedStore<NetworkSpec, NetworkStatus> =
+        TypedStore::new(store.clone(), CELL, "networks");
+    networks
+        .create(&Resource::new(
+            meta("projects/p1/networks/n1"),
+            NetworkSpec {
+                vni: 4711,
+                mtu: 1450,
+            },
+            NetworkStatus::default(),
+        ))
+        .await
+        .unwrap();
+    let subnets: TypedStore<SubnetSpec, SubnetStatus> =
+        TypedStore::new(store.clone(), CELL, "subnets");
+    subnets
+        .create(&Resource::new(
+            meta("projects/p1/subnets/s1"),
+            SubnetSpec {
+                network: "projects/p1/networks/n1".into(),
+                cidr: cidr.to_string(),
+                gateway: gateway.to_string(),
+                dns: vec![gateway.to_string()],
+                reserved: vec![gateway.to_string()],
+            },
+            SubnetStatus::default(),
+        ))
+        .await
+        .unwrap();
+}
+
+/// The segment a fixture port sits on, if nobody has written it yet.
+///
+/// A port really is on one: the datapath is handed the network so it can put the
+/// frame on the right wire, and a port naming a network nobody wrote down is a
+/// port no real datapath could program. The fixtures used to leave it out, and
+/// the agent used to not notice — which is what the trait taking only the
+/// network's *name* had been hiding.
+///
+/// Idempotent, because several ports share one segment and each of them asks.
+async fn ensure_segment(store: &Arc<dyn Store>) {
+    let typed: TypedStore<NetworkSpec, NetworkStatus> =
+        TypedStore::new(store.clone(), CELL, "networks");
+    let _ = typed
+        .create(&Resource::new(
+            meta("projects/p1/networks/n1"),
+            NetworkSpec {
+                vni: 4711,
+                mtu: 1450,
+            },
+            NetworkStatus::default(),
+        ))
+        .await;
+}
+
 pub async fn create_port(
     store: &Arc<dyn Store>,
     name: &str,
     address: &str,
     owned_by: &str,
 ) -> Port {
+    ensure_segment(store).await;
     let port = Resource::new(
         meta(name),
         PortSpec {
@@ -270,6 +347,15 @@ pub async fn request_delete_instance(store: &Arc<dyn Store>, name: &str) {
         .unwrap();
 }
 
+pub async fn request_delete_port(store: &Arc<dyn Store>, name: &str) {
+    let mut port = read_port(store, name).await;
+    port.meta.deleted_at = Some(Timestamp::now());
+    ports(store)
+        .update(&port, &velstra_cloud_model::Writer::controller("test"))
+        .await
+        .unwrap();
+}
+
 pub async fn request_delete_attachment(store: &Arc<dyn Store>, name: &str) {
     let mut attachment = read_attachment(store, name).await;
     attachment.meta.deleted_at = Some(Timestamp::now());
@@ -326,6 +412,15 @@ impl Store for Brittle {
         self.inner.list(prefix).await
     }
 
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<velstra_cloud_store::Page, StoreError> {
+        self.inner.list_page(prefix, after, limit).await
+    }
+
     async fn put(&self, key: &str, value: Vec<u8>, expect: Expect) -> Result<Revision, StoreError> {
         if self.dead.load(Ordering::SeqCst) {
             return Err(StoreError::Backend("the agent stopped existing".into()));
@@ -344,4 +439,49 @@ impl Store for Brittle {
     async fn revision(&self) -> Result<Revision, StoreError> {
         self.inner.revision().await
     }
+}
+
+pub fn security_groups(
+    store: &Arc<dyn Store>,
+) -> TypedStore<SecurityGroupSpec, SecurityGroupStatus> {
+    TypedStore::new(store.clone(), "cell-1", "security-groups")
+}
+
+pub async fn create_security_group(store: &Arc<dyn Store>, name: &str, rules: Vec<SecurityRule>) {
+    let group = Resource::new(
+        meta(name),
+        SecurityGroupSpec { rules },
+        SecurityGroupStatus::default(),
+    );
+    security_groups(store).create(&group).await.unwrap();
+}
+
+/// A port that names security groups. The plain [`create_port`] deliberately
+/// names none, so that every existing test keeps describing a port with no
+/// allowances rather than quietly acquiring some.
+pub async fn create_port_in_groups(
+    store: &Arc<dyn Store>,
+    name: &str,
+    address: &str,
+    owned_by: &str,
+    groups: &[&str],
+) -> Port {
+    ensure_segment(store).await;
+    let port = Resource::new(
+        meta(name),
+        PortSpec {
+            network: "projects/p1/networks/n1".into(),
+            subnet: "projects/p1/subnets/s1".into(),
+            address: Some(address.to_string()),
+            mac: Some("52:54:00:12:34:56".into()),
+            security_groups: groups.iter().map(|g| (*g).to_string()).collect(),
+            ..Default::default()
+        },
+        PortStatus {
+            node: Some(owned_by.to_string()),
+            ..Default::default()
+        },
+    );
+    ports(store).create(&port).await.unwrap();
+    port
 }

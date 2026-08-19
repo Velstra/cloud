@@ -11,55 +11,113 @@ body {
   letter-spacing: var(--tracking-body);
 }
 .hidden { display: none !important; }
+/* Present for a screen reader, absent from the layout. The project switch says
+   what it is by showing a project name and offering others; the word "Project"
+   beside it was a label for something already labelled. */
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
 :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
 /* ---- the shell ---------------------------------------------------------- */
 
 #app { display: grid; grid-template-columns: var(--rail-w) 1fr; min-height: 100vh; }
+/* The floating layer. Content scrolls *under* it, which is what a material is
+   for — an opaque bar would just be a strip the page does not reach into.
+   No border underneath: a 1px rule is a hard edge where the real thing is a
+   transition, so the separation is a short fade below the bar instead. It is
+   drawn only where floating chrome actually overlaps content. */
 #top {
   grid-column: 1 / -1; display: flex; align-items: center; gap: var(--space-5);
-  padding: 0 var(--space-6); height: 56px;
-  border-bottom: 1px solid var(--border-subtle);
-  background: color-mix(in srgb, var(--bg-app) 86%, transparent);
-  backdrop-filter: blur(12px); position: sticky; top: 0; z-index: 30;
+  padding: 0 var(--space-6); height: 60px;
+  background: var(--material-chrome);
+  backdrop-filter: var(--blur-chrome);
+  -webkit-backdrop-filter: var(--blur-chrome);
+  position: sticky; top: 0; z-index: 30;
+}
+#top::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 20px;
+  background: linear-gradient(to bottom, var(--bg-app), transparent);
+  pointer-events: none; opacity: .7;
 }
 #brand {
   font: var(--fw-semibold) var(--text-sm)/1 var(--font-display);
   letter-spacing: var(--tracking-caps); text-transform: uppercase;
   color: var(--text-strong); white-space: nowrap;
 }
+/* The tenancy switch. It was a 300px box holding two characters, which made the
+   widest thing in the header a control that reads as a search field — the one
+   place on the page a wrong guess costs the most. Sized to its content, with a
+   chevron so it says "there are others" without a word beside it. */
+#top #project {
+  width: auto; min-width: 0; padding: 6px var(--space-6) 6px var(--space-3);
+  background: var(--surface-raised); border-color: var(--border);
+  border-radius: var(--radius-sm); font-weight: var(--fw-medium);
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+                    linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+  background-position: right 14px center, right 9px center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+#top #project:hover { background-color: var(--surface-hover); }
 #brand b { color: var(--product); font-weight: inherit; }
 #top .grow { flex: 1; }
 
 aside#rail {
   background: var(--sidebar-bg); border-right: 1px solid var(--border-subtle);
-  padding: var(--space-5) 0 var(--space-9);
-  position: sticky; top: 56px; align-self: start; height: calc(100vh - 56px);
+  padding: var(--space-4) var(--space-3) var(--space-9);
+  position: sticky; top: 60px; align-self: start; height: calc(100vh - 60px);
   overflow-y: auto;
 }
-/* The rail reads as a directory sign: a tracked group head over a hairline,
-   the current item marked by a flush bar and a weight change. Not a pill. */
+/* The rail reads as a directory: a tracked group head, then its items, with the
+   current one filled.
+   It used to say "a tracked group head over a hairline, the current item marked
+   by a flush bar — not a pill", which was accurate under the all-square ramp and
+   is the opposite of what is here now. The hairline under each group head has
+   gone (space separates the groups, and a rule under every one of four heads is
+   three rules more than the eye needs), and the flush left bar has become a
+   filled rounded item. The bar marked the *edge of the rail*; the fill marks the
+   item, which is the thing that is actually selected. */
 .railgroup {
   font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
   letter-spacing: var(--tracking-caps); text-transform: uppercase;
-  color: var(--text-faint); padding: var(--space-5) var(--space-5) var(--space-2);
-  margin: 0 var(--space-5) var(--space-2) var(--space-5);
-  border-bottom: 1px solid var(--border-subtle);
+  /* `--text-faint` on the rail's own background is roughly 3.5:1, which is
+     under AA for text this small. These are the only words that say what part
+     of the platform a section belongs to; they have to be readable. */
+  color: var(--text-muted); padding: var(--space-5) var(--space-3) var(--space-2);
 }
+/* Shape and colour saying the same thing: the selected item is a filled surface
+   in the accent, so it is distinguishable without resolving the tint. */
 .railitem {
   display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
-  width: 100%; padding: var(--space-2) var(--space-5); border: 0; border-left: 3px solid transparent;
+  width: 100%; padding: var(--space-2) var(--space-3); border: 0;
+  border-radius: var(--radius-sm);
   background: none; color: var(--text-muted); font: inherit; text-align: left; cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 }
+.railitem + .railitem { margin-top: 1px; }
 .railitem:hover { color: var(--text-body); background: var(--surface-hover); }
+.railitem:active { transform: scale(.985); transition-duration: var(--dur-press); }
 .railitem.on {
-  color: var(--text-strong); font-weight: var(--fw-semibold);
-  border-left-color: var(--brand); background: var(--surface-hover);
+  color: var(--text-strong); font-weight: var(--fw-medium);
+  background: color-mix(in srgb, var(--brand) 16%, transparent);
 }
-.railitem .n { color: var(--text-faint); font-variant-numeric: tabular-nums; font-size: var(--text-xs); }
+.railitem .n {
+  color: var(--text-faint); font-variant-numeric: tabular-nums; font-size: var(--text-xs);
+}
 .railitem.on .n { color: var(--text-muted); }
 
-#content { padding: var(--space-7) var(--space-6) var(--space-9); min-width: 0; }
+#content { padding: var(--space-7) var(--space-7) var(--space-9); min-width: 0; }
+/* A subtitle, not another paragraph. One size up from the table, lighter than
+   the title, and given room — a 32px title with a 14px line jammed under it
+   reads as a caption that got stuck. */
+#listblurb {
+  font-size: var(--text-lg); line-height: var(--leading-snug);
+  letter-spacing: var(--tracking-tight); color: var(--text-muted);
+  margin-top: var(--space-3); max-width: 62ch;
+}
+#listacts { margin-top: var(--space-6); }
 
 /* ---- the gutter --------------------------------------------------------- */
 
@@ -67,10 +125,15 @@ aside#rail {
    is a .spread, so a section added later lands in the same two columns. */
 .spread { display: grid; grid-template-columns: var(--gutter) 1fr; gap: var(--gutter-gap); align-items: start; }
 .spread + .spread { margin-top: var(--space-7); }
+/* These sit on the sheet, which is glass. Flat grey over a blurred, moving
+   background is the one place small text stops resolving — so the label takes
+   contrast and a touch of weight, and the sentence under it stays faint. That
+   is the whole of "vibrancy": the foreground gets stronger, the material does
+   not get more opaque. */
 .margin {
   font: var(--fw-semibold) var(--text-2xs)/1.4 var(--font-sans);
   letter-spacing: var(--tracking-caps); text-transform: uppercase;
-  color: var(--text-faint); padding-top: 6px;
+  color: var(--text-muted); padding-top: 6px;
 }
 .margin .sub {
   display: block; text-transform: none; letter-spacing: var(--tracking-body);
@@ -80,13 +143,17 @@ aside#rail {
 
 /* ---- headings and prose ------------------------------------------------- */
 
+/* Hierarchy from weight + size + leading as a set, and tracking that tightens
+   as the size grows. A title that was 24px semibold with the same leading as a
+   table cell read as one more label; at display size with tight leading it is
+   the thing the eye lands on first, which is the whole job. */
 h1 {
-  font: var(--fw-semibold) var(--text-xl)/var(--leading-tight) var(--font-display);
+  font: var(--fw-bold) var(--text-display)/var(--leading-hero) var(--font-display);
   letter-spacing: var(--tracking-display); color: var(--text-strong); margin: 0;
 }
 h2 {
-  font: var(--fw-semibold) var(--text-lg)/var(--leading-snug) var(--font-display);
-  letter-spacing: var(--tracking-tight); color: var(--text-strong); margin: 0;
+  font: var(--fw-semibold) var(--text-xl)/var(--leading-tight) var(--font-display);
+  letter-spacing: var(--tracking-display); color: var(--text-strong); margin: 0;
 }
 p { margin: var(--space-2) 0 0; }
 .prose { max-width: 66ch; color: var(--text-muted); }
@@ -100,12 +167,21 @@ p { margin: var(--space-2) 0 0; }
 button, input, select, textarea { font: inherit; color: inherit; }
 .btn {
   display: inline-flex; align-items: center; gap: var(--space-2);
-  padding: 7px var(--space-4); border: 1px solid var(--border-strong);
+  padding: 8px var(--space-4); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
   background: var(--surface-raised); color: var(--text-body); cursor: pointer;
   box-shadow: var(--edge-top);
+  font-weight: var(--fw-medium);
+  transition: background-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-press) var(--ease-out);
 }
 .btn:hover { background: var(--surface-hover); color: var(--text-strong); }
-.btn:active { transform: translateY(1px); }
+/* On the press, not on the release, and it is a squash rather than a nudge
+   downward: the control gives under the finger the way a physical one does.
+   `translateY(1px)` moved the button out from under the pointer, which is the
+   opposite of the thing being direct. */
+.btn:active { transform: scale(.97); }
 .btn[disabled] { opacity: .45; cursor: not-allowed; }
 .btn.primary {
   background: var(--brand); border-color: var(--brand); color: var(--on-brand);
@@ -118,9 +194,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .btn.quiet:hover { color: var(--failing); border-color: var(--failing); background: none; }
 
 input[type=text], input[type=password], input[type=number], select, textarea {
-  width: 100%; padding: 6px var(--space-3);
-  border: 1px solid var(--border-strong); background: var(--surface-sunken);
-  color: var(--text-body);
+  width: 100%; padding: 8px var(--space-3);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--surface-sunken); color: var(--text-body);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
 }
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--brand); box-shadow: var(--glow-focus); }
 input.bad, select.bad { border-color: var(--failing); }
@@ -130,10 +208,15 @@ select { appearance: none; padding-right: var(--space-6); background-image: none
 /* A stepper, because a size typed into a text box is a size that can be
    typed wrong. The unit is part of the control, not a hint beside it. */
 .stepper { display: flex; align-items: stretch; max-width: 208px; }
+.stepper > :first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.stepper > :last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.stepper input { border-radius: 0; }
 .stepper button {
-  width: 30px; border: 1px solid var(--border-strong); background: var(--surface-raised);
+  width: 32px; border: 1px solid var(--border-strong); background: var(--surface-raised);
   color: var(--text-muted); cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 }
+.stepper button:active { transform: scale(.94); }
 .stepper button:hover { color: var(--text-strong); background: var(--surface-hover); }
 .stepper input { border-left: 0; border-right: 0; text-align: right; font-variant-numeric: tabular-nums; }
 .stepper .unit {
@@ -158,12 +241,25 @@ select { appearance: none; padding-right: var(--space-6); background-image: none
 .switch[aria-checked=true] { background: var(--brand); border-color: var(--brand); }
 .switch[aria-checked=true]::after { transform: translateX(18px); background: var(--on-brand); }
 
-.segmented { display: inline-flex; border: 1px solid var(--border-strong); }
-.segmented button {
-  padding: 6px var(--space-4); border: 0; background: none; color: var(--text-muted); cursor: pointer;
+/* A segmented control, as one continuous object: the selection is a filled
+   sub-surface that slides between positions rather than a cell that lights up.
+   Inset padding is what makes it read as one control containing choices. */
+.segmented {
+  display: inline-flex; gap: 2px; padding: 2px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
 }
-.segmented button + button { border-left: 1px solid var(--border-strong); }
-.segmented button[aria-pressed=true] { background: var(--brand); color: var(--on-brand); font-weight: var(--fw-semibold); }
+.segmented button {
+  padding: 5px var(--space-4); border: 0; border-radius: var(--radius-xs);
+  background: none; color: var(--text-muted); cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out),
+              transform var(--dur-press) var(--ease-out);
+}
+.segmented button:hover { color: var(--text-strong); }
+.segmented button:active { transform: scale(.96); }
+.segmented button[aria-pressed=true] {
+  background: var(--brand); color: var(--on-brand); font-weight: var(--fw-medium);
+}
 
 /* A name that can be followed says so by being a link, and by nothing else —
    no icon, no chevron. */
@@ -183,14 +279,20 @@ button.link:hover { text-decoration: underline; }
 
 /* ---- fields ------------------------------------------------------------- */
 
-.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: var(--space-5); align-items: start; }
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: var(--space-6) var(--space-5); align-items: start; }
 .field.wide { grid-column: 1 / -1; max-width: 560px; }
 .field > label {
   display: block; font-size: var(--text-xs); color: var(--text-muted);
   letter-spacing: var(--tracking-small); margin-bottom: var(--space-2);
 }
 .field .req { color: var(--drifting); }
-.field .hint { color: var(--text-faint); font-size: var(--text-xs); margin-top: var(--space-2); max-width: 52ch; }
+/* Kept, and made quiet. Every field carrying a two-line explanation at the same
+   weight as its label is most of what "crowded" meant: the boxes were not the
+   problem so much as the prose stacked between them. */
+.field .hint {
+  color: var(--text-faint); font-size: var(--text-xs); line-height: 1.45;
+  margin-top: var(--space-2); max-width: 46ch;
+}
 /* Validation arrives while typing, never on submit. */
 .field .err { color: var(--failing); font-size: var(--text-xs); margin-top: var(--space-2); }
 
@@ -198,7 +300,7 @@ button.link:hover { text-decoration: underline; }
 
 /* Object lists are tables. A card list degrades as it grows; a departure
    board does not. */
-table.board { width: 100%; border-collapse: collapse; margin-top: var(--space-4); }
+table.board { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: var(--space-5); }
 table.board th {
   text-align: left; font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
   letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
@@ -206,15 +308,31 @@ table.board th {
   white-space: nowrap;
 }
 table.board td {
-  padding: var(--space-3); border-bottom: 1px solid var(--border-subtle);
+  padding: var(--space-4) var(--space-3); border-bottom: 1px solid var(--border-subtle);
   vertical-align: middle; font-size: var(--text-sm);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* Every figure in a column shares a width, so the eye compares magnitudes
+     instead of re-reading each number. */
+  font-variant-numeric: tabular-nums;
 }
 table.board tbody tr { cursor: pointer; }
-table.board tbody tr:hover { background: var(--surface-sunken); }
+/* The hover is a rounded band rather than a full-bleed stripe: the row becomes
+   an object under the pointer, which is also what makes it obvious it can be
+   opened. */
+table.board tbody tr td { transition: background-color var(--dur-fast) var(--ease-out); }
+table.board tbody tr:hover td { background: var(--surface-hover); }
+table.board tbody tr td:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+table.board tbody tr td:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
 table.board tbody tr:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
-table.board td.name { color: var(--text-strong); font-weight: var(--fw-medium); }
-table.board td.name .id { font-family: var(--font-mono); font-size: var(--text-sm); }
+/* The name is what the row *is*. It was the same 13px as every other cell, so
+   the row had no anchor and the eye started wherever it landed. */
+/* Everything after the name and the verdict is detail. It was all one colour,
+   so eight columns arrived at once and the row had no reading order — and on a
+   settled guest four of them say the same word. Muting the tail is not hiding
+   it: it is saying which two answer the question the board is for. */
+table.board td { color: var(--text-muted); }
+table.board td.name { color: var(--text-strong); font-weight: var(--fw-semibold); }
+table.board td.name .id { font-size: var(--text-base); letter-spacing: var(--tracking-tight); }
 table.board td.blank { color: var(--text-faint); }
 .boardwrap { overflow-x: auto; }
 
@@ -236,10 +354,25 @@ table.board td.blank { color: var(--text-faint); }
   content: ""; position: absolute; left: -3px; right: -3px; top: 3px;
   height: 2px; background: var(--failing);
 }
-.state { display: inline-flex; align-items: center; white-space: nowrap; }
-.state.settled { color: var(--settled); }
-.state.failing { color: var(--failing); }
-.state.drifting { color: var(--drifting); }
+/* A chip, not coloured text.
+   A dashboard is scanned, not read: a green word in a table cell is the same
+   *shape* as every other cell, so the eye has to read it to know it. A filled
+   pill is a different shape at a glance, and the tint carries the meaning
+   before any word is resolved. The mark and the word both stay inside it —
+   colour is never the only channel. */
+.state {
+  display: inline-flex; align-items: center; white-space: nowrap;
+  padding: 3px var(--space-3) 3px var(--space-2);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs); font-weight: var(--fw-medium);
+  letter-spacing: var(--tracking-small);
+  background: color-mix(in srgb, var(--text-muted) 12%, transparent);
+  color: var(--text-muted);
+}
+.state .mark { margin-right: var(--space-2); }
+.state.settled { color: var(--settled); background: color-mix(in srgb, var(--settled) 15%, transparent); }
+.state.failing { color: var(--failing); background: color-mix(in srgb, var(--failing) 15%, transparent); }
+.state.drifting { color: var(--drifting); background: color-mix(in srgb, var(--drifting) 15%, transparent); }
 .state.unreported, .state.deleting { color: var(--text-muted); }
 
 /* ---- the sheet ---------------------------------------------------------- */
@@ -249,21 +382,59 @@ table.board td.blank { color: var(--text-faint); }
   animation: fade var(--dur-base) var(--ease-out);
 }
 #sheet {
-  position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100%);
-  background: var(--surface); border-left: 1px solid var(--border);
-  box-shadow: var(--shadow-lg); z-index: 41; overflow-y: auto;
+  position: fixed; top: var(--space-3); right: var(--space-3); bottom: var(--space-3);
+  width: min(760px, calc(100% - var(--space-6)));
+  background: var(--material-panel);
+  backdrop-filter: var(--blur-panel);
+  -webkit-backdrop-filter: var(--blur-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg), var(--material-edge);
+  z-index: 41; overflow-y: auto;
   padding: var(--space-6) var(--space-7) var(--space-9);
   /* The one entrance on the page. It enters from the right and leaves to the
      right — a panel that arrives one way and dismisses another reads as two
-     unrelated things. */
-  animation: sheetin var(--dur-base) var(--ease-out);
+     unrelated things.
+     It materialises rather than fading: the blur and the scale come up
+     together, so it reads as a pane of glass arriving instead of an opacity
+     ramp on a rectangle. The curve is critically damped — it arrives and
+     stops, because a panel opened forty times a day must not bounce. */
+  animation: sheetin var(--dur-slow) var(--ease-settle);
 }
-@keyframes sheetin { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes sheetin {
+  from { transform: translateX(28px) scale(.985); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
-  /* Gentler, not off: the cross-fade still says something appeared. */
-  #sheet { animation: fade var(--dur-base) ease; }
+  /* Gentler, not off: the cross-fade still says something appeared, and it is
+     the vestibular half — the travel — that goes, not the feedback. */
+  #sheet, #dialog { animation: fade var(--dur-base) ease; }
   .switch::after { transition: none; }
+  .btn:active, .railitem:active, .segmented button:active, .stepper button:active {
+    transform: none;
+  }
+}
+/* Frosty rather than clear, never a surface that has stopped being one.
+   Dropping the blur without raising the opacity would leave text over live
+   content, which is the failure this preference exists to prevent. */
+@media (prefers-reduced-transparency: reduce) {
+  #top { background: var(--bg-app); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  #sheet, #dialog { background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none; }
+}
+/* A defined, contrasting edge where the material would otherwise be doing the
+   separating.
+   The header needs its hairline *back*, not merely recoloured: it has no border
+   at all — a soft fade below it does the separating — so setting a border colour
+   on it changed nothing at all until this was measured with the preference
+   actually turned on. Under high contrast the fade is the wrong instrument and
+   a 1px rule is the right one. */
+@media (prefers-contrast: more) {
+  #top { border-bottom: 1px solid var(--text-muted); }
+  #top::after { display: none; }
+  #sheet, #dialog, #toast { border-color: var(--text-muted); }
+  .state { outline: 1px solid currentColor; outline-offset: -1px; }
+  .railitem.on { outline: 1px solid var(--brand); outline-offset: -1px; }
 }
 #sheethead { display: flex; align-items: flex-start; gap: var(--space-4); margin-bottom: var(--space-6); }
 #sheethead .grow { flex: 1; min-width: 0; }
@@ -286,7 +457,9 @@ table.board td.blank { color: var(--text-faint); }
   letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint); }
 .gens .behind { color: var(--drifting); }
 
-table.pairs, table.conds, table.kv, table.reject { width: 100%; border-collapse: collapse; }
+table.pairs, table.conds, table.kv, table.reject {
+  width: 100%; border-collapse: separate; border-spacing: 0;
+}
 table.pairs th, table.conds th, table.reject th {
   text-align: left; font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
   letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
@@ -297,7 +470,11 @@ table.pairs td, table.conds td, table.kv td, table.reject td {
   border-bottom: 1px solid var(--border-subtle); vertical-align: top; font-size: var(--text-sm);
 }
 table.kv td:first-child { width: 168px; color: var(--text-muted); }
-table.pairs tr.differs td { background: color-mix(in srgb, var(--drifting) 8%, transparent); }
+/* The one row that disagrees, marked as an object rather than as a full-bleed
+   stripe with square ends cutting the panel's rounded edge. */
+table.pairs tr.differs td { background: color-mix(in srgb, var(--drifting) 10%, transparent); }
+table.pairs tr.differs td:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+table.pairs tr.differs td:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
 table.pairs .note { color: var(--text-muted); font-size: var(--text-xs); margin-top: var(--space-2); max-width: 60ch; }
 table.conds td.msg { color: var(--text-muted); white-space: pre-wrap; }
 table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
@@ -325,36 +502,70 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
   animation: fade var(--dur-base) var(--ease-out);
 }
 #dialog {
-  position: fixed; z-index: 50; top: 6vh; left: 50%; transform: translateX(-50%);
-  width: min(880px, calc(100% - 32px)); max-height: 88vh; overflow-y: auto;
-  background: var(--surface); border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow-lg); padding: var(--space-6) var(--space-7);
-  animation: dialogin var(--dur-base) var(--ease-out);
+  position: fixed; z-index: 50; top: 8vh; left: 50%; transform: translateX(-50%);
+  width: min(680px, calc(100% - 32px)); max-height: 84vh; overflow-y: auto;
+  background: var(--material-panel);
+  backdrop-filter: var(--blur-panel);
+  -webkit-backdrop-filter: var(--blur-panel);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg), var(--material-edge);
+  padding: var(--space-7);
+  animation: dialogin var(--dur-slow) var(--ease-settle);
 }
 @keyframes dialogin {
-  from { transform: translateX(-50%) translateY(8px) scale(.99); opacity: 0; }
+  from { transform: translateX(-50%) translateY(10px) scale(.985); opacity: 0; }
   to { transform: translateX(-50%); opacity: 1; }
 }
-@media (prefers-reduced-motion: reduce) { #dialog { animation: fade var(--dur-base) ease; } }
 #dialog h2 { margin-bottom: var(--space-2); }
 .dialogacts {
   display: flex; gap: var(--space-3); justify-content: flex-end; align-items: center;
   margin-top: var(--space-7); padding-top: var(--space-5); border-top: 1px solid var(--border-subtle);
 }
 .dialogacts .grow { flex: 1; }
+/* The way to the rest of the form, and it has to look like a way rather than a
+   footnote. A rule above it and a filled row make it an object to press, not a
+   sentence somebody might read past — the common path is only short if the
+   remainder is obviously still there. */
 .disclose {
-  margin-top: var(--space-6); border: 0; border-top: 1px solid var(--border-subtle);
-  background: none; color: var(--text-muted); cursor: pointer; padding: var(--space-4) 0 0;
-  width: 100%; text-align: left; font-size: var(--text-sm);
+  margin-top: var(--space-6); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken); color: var(--text-muted); cursor: pointer;
+  padding: var(--space-3) var(--space-4);
+  width: 100%; text-align: left; font-size: var(--text-sm); font-weight: var(--fw-medium);
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out),
+              transform var(--dur-press) var(--ease-out);
 }
-.disclose:hover { color: var(--text-strong); }
+.disclose:hover { color: var(--text-strong); background: var(--surface-hover); }
+.disclose:active { transform: scale(.99); }
+/* Open, it becomes the lid of the region it opened: the two share an edge, so
+   the button and its contents read as one object rather than two stacked ones. */
+.disclose.open {
+  border-bottom-left-radius: 0; border-bottom-right-radius: 0;
+  border-bottom-color: transparent; color: var(--text-strong);
+}
+.deeper {
+  border: 1px solid var(--border-subtle); border-top: 0;
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-sunken) 60%, transparent);
+  padding: var(--space-5);
+}
+.fields + .deeper { margin-top: 0; }
 
 /* ---- sign in ------------------------------------------------------------ */
 
 #signin { display: grid; place-items: center; min-height: 100vh; padding: var(--space-6); }
-#signin .box { width: min(420px, 100%); }
-#signin h1 { margin-bottom: var(--space-2); }
-#signin form { margin-top: var(--space-6); display: grid; gap: var(--space-4); }
+#signin .box {
+  width: min(400px, 100%);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-lg), var(--edge-top);
+  padding: var(--space-7);
+}
+#signin h1 {
+  font-size: var(--text-hero); line-height: var(--leading-hero);
+  letter-spacing: var(--tracking-hero); margin-bottom: var(--space-3);
+}
+#signin form { margin-top: var(--space-6); display: grid; gap: var(--space-5); }
+#signin .btn.primary { width: 100%; justify-content: center; padding: 10px var(--space-4); }
 
 /* ---- messages ----------------------------------------------------------- */
 
@@ -364,13 +575,26 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
 }
 #toast {
   position: fixed; bottom: var(--space-6); left: 50%; transform: translateX(-50%);
-  background: var(--surface-raised); border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow-md); padding: var(--space-3) var(--space-5); z-index: 60;
+  background: var(--material-panel); border: 1px solid var(--border-strong);
+  backdrop-filter: var(--blur-chrome); -webkit-backdrop-filter: var(--blur-chrome);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md), var(--material-edge);
+  padding: var(--space-3) var(--space-5); z-index: 60;
   max-width: min(720px, 92vw);
+  animation: toastin var(--dur-base) var(--ease-settle);
+}
+@keyframes toastin {
+  from { transform: translateX(-50%) translateY(8px); opacity: 0; }
+  to { transform: translateX(-50%); opacity: 1; }
 }
 #watchstate { font-size: var(--text-xs); color: var(--text-faint); white-space: nowrap; }
 #watchstate.live { color: var(--text-muted); }
 #watchstate .mark { margin-right: var(--space-2); }
 
-.summary { display: flex; gap: var(--space-4); align-items: center; font-size: var(--text-xs); }
+.summary {
+  display: flex; gap: var(--space-4); align-items: center; font-size: var(--text-xs);
+  /* It changes while somebody is looking at it, and proportional digits make
+     the whole line shuffle sideways every time it does. */
+  font-variant-numeric: tabular-nums;
+}
 .summary .state { font-size: var(--text-xs); }

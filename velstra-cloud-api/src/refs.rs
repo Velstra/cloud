@@ -58,12 +58,76 @@ fn fields(kind: &str) -> &'static [(&'static str, Form)] {
             ("from_node", Form::BareId),
             ("to_node", Form::BareId),
         ],
-        "volumes" => &[("source_image", Form::Name)],
-        "ports" => &[("network", Form::Name), ("subnet", Form::Name)],
+        "volumes" => &[
+            ("source_image", Form::Name),
+            ("source_snapshot", Form::Name),
+        ],
+        "ports" => &[
+            ("network", Form::Name),
+            ("subnet", Form::Name),
+            // Checked for *shape*, not for existence: a group can be created
+            // after the port that names it, and a port whose group has been
+            // deleted keeps working with fewer allowances rather than falling
+            // over. What is refused here is a name nothing could ever resolve.
+            ("security_groups", Form::Name),
+        ],
         "subnets" => &[("network", Form::Name)],
         "projects" => &[("parent", Form::Name)],
         _ => &[],
     }
+}
+
+/// The collections that name other objects at all.
+///
+/// The same knowledge as [`fields`], listed rather than matched, because a
+/// delete has to ask the question in the other direction: not "is this
+/// reference well-formed" but "does anything still hold this object". One table
+/// serving both directions means a reference added for the first also protects
+/// against the second, and the test below is what keeps the two in step — add a
+/// kind to `fields` without adding it here and it fails.
+pub const REFERRING_KINDS: &[&str] = &[
+    "instances",
+    "attachments",
+    "migrations",
+    "volumes",
+    "ports",
+    "subnets",
+    "projects",
+];
+
+/// Every resource this spec names, in full-name form.
+///
+/// A bare node id becomes `nodes/<id>`, so a caller comparing against a resource
+/// name does not have to know which spelling a field uses — the distinction is
+/// this module's and should not leak into the question "who holds this".
+pub fn names_referenced(kind: &str, spec: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for (field, form) in fields(kind) {
+        let Some(value) = spec.get(field) else {
+            continue;
+        };
+        let mut push = |text: &str| {
+            if text.is_empty() {
+                return;
+            }
+            out.push(match form {
+                Form::BareId => format!("nodes/{text}"),
+                Form::Name => text.to_string(),
+            });
+        };
+        match value {
+            Value::String(one) => push(one),
+            Value::Array(many) => {
+                for item in many {
+                    if let Value::String(one) = item {
+                        push(one);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Check every reference in a spec — whole or partial, since a change carries
@@ -178,5 +242,67 @@ mod tests {
     fn a_collection_with_nothing_to_follow_is_left_alone() {
         assert!(check("networks", &json!({ "vni": 5001 })).is_ok());
         assert!(check("nodes", &json!({ "schedulable": true })).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod referrer_tests {
+    use super::*;
+
+    /// The two directions of one table have to stay in step.
+    ///
+    /// `fields` says how to *check* a reference on the way in; `REFERRING_KINDS`
+    /// says where to *look* for one on the way out. A kind added to the first
+    /// and forgotten in the second is a resource that can be deleted while
+    /// something still names it — silently, because the check simply never
+    /// looks there.
+    #[test]
+    fn every_kind_that_names_something_is_searched_when_something_is_deleted() {
+        for kind in [
+            "projects",
+            "instances",
+            "migrations",
+            "volumes",
+            "snapshots",
+            "attachments",
+            "networks",
+            "subnets",
+            "ports",
+            "security-groups",
+            "images",
+            "nodes",
+            "pools",
+            "operations",
+        ] {
+            let names = !fields(kind).is_empty();
+            let searched = REFERRING_KINDS.contains(&kind);
+            assert_eq!(
+                names, searched,
+                "{kind} names other objects: {names}, but is searched on delete: {searched}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_node_id_comes_back_as_a_resource_name() {
+        // So that "who holds nodes/node-a" does not have to know which of the
+        // two spellings each field uses.
+        let spec = serde_json::json!({"node": "node-a", "image": "projects/p1/images/i"});
+        let mut found = names_referenced("instances", &spec);
+        found.sort();
+        assert_eq!(found, vec!["nodes/node-a", "projects/p1/images/i"]);
+    }
+
+    #[test]
+    fn an_unset_reference_names_nothing() {
+        let spec = serde_json::json!({"node": "", "image": "", "ports": []});
+        assert!(names_referenced("instances", &spec).is_empty());
+    }
+
+    #[test]
+    fn every_element_of_a_list_counts() {
+        // A port held by an instance's second NIC is as held as the first.
+        let spec = serde_json::json!({"ports": ["projects/p1/ports/a", "projects/p1/ports/b"]});
+        assert_eq!(names_referenced("instances", &spec).len(), 2);
     }
 }

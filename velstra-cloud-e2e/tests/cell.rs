@@ -18,12 +18,20 @@
 //!    level-triggered reconciliation worth the trouble;
 //! 6. deletion runs the finalizer to the end rather than dropping the object on
 //!    a node that still holds it.
+//!
+//! Point 6 was a claim in this comment and nowhere else, and it was false: an
+//! instance carried no finalizer, so a delete took the object out of the store
+//! inside the request that asked for it and the node was never told to stop the
+//! guest. `deleting_an_instance_stops_the_guest` is what makes it a property
+//! rather than a sentence — and it asks the *hypervisor*, because the store
+//! agreeing with itself was never the thing in doubt.
 
 use std::sync::Arc;
 
 use velstra_cloud_api::{Api, StaticTokenVerifier};
 use velstra_cloud_controller::{
-    migration::MigrationController, scheduler::Scheduler, status::StatusWriter, sweep,
+    instance::InstanceController, migration::MigrationController, scheduler::Scheduler,
+    status::StatusWriter, sweep,
 };
 use velstra_cloud_model::{
     Writer,
@@ -60,12 +68,16 @@ struct Cell {
 impl Cell {
     async fn start(node_id: &str) -> Cell {
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        // An operator: this cell registers its own nodes and creates its own
+        // project, which are the cell's rather than any tenant's. What a
+        // *tenant* may do is exercised on purpose in `api/tests/authz.rs`.
         let api = Api::new(
             store.clone(),
             REGION,
             CELL,
             Arc::new(StaticTokenVerifier::single(TOKEN)),
-        );
+        )
+        .with_cell_admins(vec!["dev".into()]);
 
         // A real socket, not a tower service called in-process: the console and
         // any customer SDK reach this over HTTP, and the parts that only break
@@ -117,6 +129,12 @@ impl Cell {
     /// controller, then every node in turn.
     async fn turn_with(&self, others: &[&Agent]) {
         sweep(&self.scheduler(), &self.instances).await.unwrap();
+        sweep(
+            &InstanceController::new(self.instances.clone()),
+            &self.instances,
+        )
+        .await
+        .unwrap();
         sweep(
             &MigrationController::new(self.instances.clone(), CELL),
             &self.migrations,
@@ -184,6 +202,12 @@ impl Cell {
     /// the sleep it happened to pick.
     async fn turn(&self) {
         sweep(&self.scheduler(), &self.instances).await.unwrap();
+        sweep(
+            &InstanceController::new(self.instances.clone()),
+            &self.instances,
+        )
+        .await
+        .unwrap();
         self.agent.resync().await;
     }
 
@@ -207,6 +231,21 @@ impl Cell {
     async fn get(&self, path: &str) -> (u16, serde_json::Value) {
         let response = reqwest::Client::new()
             .get(format!("{}{path}", self.address))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+        )
+    }
+
+    async fn delete(&self, path: &str) -> (u16, serde_json::Value) {
+        let response = reqwest::Client::new()
+            .delete(format!("{}{path}", self.address))
             .bearer_auth(TOKEN)
             .send()
             .await
@@ -664,5 +703,33 @@ async fn a_transfer_that_fails_leaves_the_guest_running_where_it_was() {
     assert!(
         !vmm_b.is_receiving("projects/p1/instances/i1"),
         "the destination is still listening for a migration that was called off"
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_instance_stops_the_guest() {
+    // Point 6 of what this file claims at the top. Nothing here asserted it
+    // until now, and the claim was false: an instance carries no finalizer, so
+    // `delete` dropped the object out of the store in the same request that
+    // stamped `deletedAt`, and the node never saw a guest it was meant to tear
+    // down. The API answered 200, the console showed the machine gone, and the
+    // hypervisor kept running it.
+    let cell = Cell::start("node-a").await;
+    cell.add_node("node-a", 8, 16384).await;
+    create_instance(&cell, "i1").await;
+    cell.settle("i1", 8).await;
+    assert!(cell.vmm.is_running("projects/p1/instances/i1"));
+
+    let (status, body) = cell.delete("/api/v1/projects/p1/instances/i1").await;
+    assert!(status < 300, "deleting answered {status}: {body}");
+
+    // Turns, not a sleep: the teardown is a reconcile like every other, so if
+    // it happens at all it happens within a bounded number of passes.
+    for _ in 0..6 {
+        cell.turn().await;
+    }
+    assert!(
+        !cell.vmm.is_running("projects/p1/instances/i1"),
+        "the object is gone from the API and the guest is still running on the hypervisor"
     );
 }

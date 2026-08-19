@@ -37,6 +37,14 @@ pub enum Action {
     CreateDisk {
         instance: String,
         gib: u64,
+        /// The image the disk starts life as a copy of.
+        ///
+        /// Carried here rather than looked up on the node, because cloning the
+        /// image *is* creating the disk. It used to be created empty and the
+        /// image was never used at all: every instance this platform started
+        /// booted a blank disk, which on a direct-kernel boot looks exactly
+        /// like a guest that is simply slow.
+        image: String,
     },
     StartVm {
         instance: String,
@@ -121,6 +129,7 @@ pub fn reconcile_instance(
         actions.push(Action::CreateDisk {
             instance: name.clone(),
             gib: instance.spec.root_disk_gib,
+            image: instance.spec.image.clone(),
         });
     }
     for (i, port) in instance.spec.ports.iter().enumerate() {

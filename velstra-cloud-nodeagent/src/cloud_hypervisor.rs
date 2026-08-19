@@ -57,7 +57,12 @@
 //! protocol versions must match or be one apart — which is why the model
 //! refuses a version gap before anything is copied.
 
-use std::{collections::BTreeSet, ffi::OsString, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -69,7 +74,7 @@ use velstra_cloud_model::{
 pub use crate::hostfs::Layout;
 use crate::{
     host::{HostError, HostState, Receiver, Result, Transfer, VmObservation, VmRequest, Vmm},
-    hostfs::{self, slug, unslug},
+    hostfs::{self, Boot, slug, unslug},
 };
 
 /// How long to wait for a VMM's API socket to appear before giving up on it.
@@ -112,25 +117,87 @@ impl CloudHypervisorVmm {
         self.dir(instance).join("migrate.sock")
     }
 
-    /// The guest's VMM. A receiver runs under this same name on purpose: the
-    /// VMM that takes delivery *is* the VMM that then runs the guest, so a
-    /// destination has one unit for an instance and not two.
+    /// The guest's VMM, as started here.
     fn unit(&self, instance: &str) -> String {
-        format!("velstra-vm-{}", slug(instance))
+        format!("velstra-vm-{}", hostfs::unit_slug(instance))
+    }
+
+    /// The VMM an **arriving** guest resumes into, and the socket it answers on.
+    ///
+    /// Distinct from [`Self::unit`], and it has to be: an in-place VMM upgrade
+    /// migrates a guest to the node it is already on, so the outgoing VMM still
+    /// holds that unit name and that socket path while the incoming one is being
+    /// started. `systemd-run` refuses the name outright — "already loaded or has
+    /// a fragment file" — which is how this was found, by running the whole
+    /// chain rather than a fake.
+    ///
+    /// A guest that arrived this way keeps the incoming pair for the rest of its
+    /// life on this node. A transient unit cannot be renamed, and pretending
+    /// otherwise would mean asking a socket nobody is holding.
+    fn incoming_unit(&self, instance: &str) -> String {
+        format!("velstra-in-{}", hostfs::unit_slug(instance))
+    }
+
+    fn incoming_socket(&self, instance: &str) -> PathBuf {
+        self.dir(instance).join("incoming.sock")
+    }
+
+    /// Where this node remembers the URL a receiver is listening on.
+    fn receiver_url_path(&self, instance: &str) -> PathBuf {
+        self.dir(instance).join("receiver.url")
+    }
+
+    /// Whether the incoming VMM is holding the guest **yet**.
+    ///
+    /// A receiver is an *empty* VMM with a `receive-migration` pointed at it, and
+    /// an empty VMM answers `vm.info` like a guest that has failed. Counting its
+    /// socket as the guest therefore reads as "the guest here is broken" — and a
+    /// node that believes that restarts a guest which is still running on the
+    /// source. That is the two-copies-one-disk failure reached from the other
+    /// direction, and it is what this predicate exists to stop.
+    ///
+    /// The signal is the VMM's own state, and it has to be. `ch-remote
+    /// receive-migration` **returns as soon as the VMM is listening** — exit 0,
+    /// no output — so its liveness says nothing about whether anything arrived;
+    /// reading it that way meant "arrived" the instant the receiver was set up.
+    /// A VMM that is receiving answers `vm.info` in a state that is not
+    /// `Running`; Cloud Hypervisor resumes the guest when the transfer lands,
+    /// and `Running` is that moment.
+    async fn incoming_holds_guest(&self, instance: &str) -> bool {
+        if !self.incoming_socket(instance).exists() {
+            return false;
+        }
+        matches!(
+            self.api_at(&self.incoming_socket(instance), "GET", "/api/v1/vm.info", "")
+                .await,
+            Ok(body) if state_of(&body) == InstanceState::Running
+        )
+    }
+
+    /// Which of the two VMMs is this guest's, right now.
+    ///
+    /// The ordinary pair wins when both are present, which is the state during a
+    /// transfer: the guest is still the outgoing one until it is not.
+    async fn live(&self, instance: &str) -> (String, PathBuf) {
+        if !self.socket(instance).exists() && self.incoming_holds_guest(instance).await {
+            (self.incoming_unit(instance), self.incoming_socket(instance))
+        } else {
+            (self.unit(instance), self.socket(instance))
+        }
     }
 
     /// The `ch-remote receive-migration` that waits for a guest. Separate,
     /// because it blocks until the transfer completes and its liveness is the
     /// answer to "is a receiver listening".
     fn receive_unit(&self, instance: &str) -> String {
-        format!("velstra-recv-{}", slug(instance))
+        format!("velstra-recv-{}", hostfs::unit_slug(instance))
     }
 
     /// The `ch-remote send-migration` that copies a guest away. Also separate,
     /// and also for its liveness: a transfer under way must not be started a
     /// second time by the next pass.
     fn send_unit(&self, instance: &str) -> String {
-        format!("velstra-send-{}", slug(instance))
+        format!("velstra-send-{}", hostfs::unit_slug(instance))
     }
 
     /// One request to a guest's API socket.
@@ -138,7 +205,19 @@ impl CloudHypervisorVmm {
     /// **Untested:** needs a live Cloud Hypervisor. The framing it builds and
     /// the response parsing it uses are tested separately against bytes.
     async fn api(&self, instance: &str, method: &str, path: &str, body: &str) -> Result<String> {
-        let socket = self.socket(instance);
+        let (_, socket) = self.live(instance).await;
+        self.api_at(&socket, method, path, body).await
+    }
+
+    /// The same, against a socket the caller names.
+    ///
+    /// Needed because one caller must not go through [`Self::live`]: tearing down
+    /// a receiver asks the *incoming* VMM whether it is holding a guest, and
+    /// `live` deliberately answers "the ordinary one" while a transfer is still
+    /// arriving. Routing that question through it made the teardown decide the
+    /// receiver held nothing and kill it a moment after it was started — which
+    /// looked exactly like a receiver that never came up.
+    async fn api_at(&self, socket: &Path, method: &str, path: &str, body: &str) -> Result<String> {
         let mut stream = tokio::net::UnixStream::connect(&socket)
             .await
             .map_err(|e| {
@@ -148,8 +227,28 @@ impl CloudHypervisorVmm {
             .write_all(request(method, path, body).as_bytes())
             .await?;
         stream.flush().await?;
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await?;
+        // Read exactly one response and stop — never to end-of-file.
+        //
+        // Cloud Hypervisor sends a complete answer and then **keeps the
+        // connection open**, `Connection: close` in the request
+        // notwithstanding. A `read_to_end` therefore never returns, and because
+        // this is called from `observe`, one running guest was enough to wedge
+        // the agent's entire pass: the node stops reporting, stops reconciling,
+        // stops everything, and says nothing about why. Measured, not guessed:
+        // 1272 bytes arrive in milliseconds and the socket then sits there.
+        //
+        // The timeout is the second line of defence, for a VMM that stops
+        // mid-header rather than after it. A local unix socket that has not
+        // answered in this long is not going to.
+        let raw = tokio::time::timeout(API_TIMEOUT, read_one_response(&mut stream))
+            .await
+            .map_err(|_| {
+                HostError::failed(format!(
+                    "{} accepted the connection and did not answer within {:?}",
+                    socket.display(),
+                    API_TIMEOUT
+                ))
+            })??;
         parse_response(&raw)
     }
 
@@ -160,11 +259,26 @@ impl CloudHypervisorVmm {
     /// being ready on the next pass, and one started by a previous agent is
     /// found by this one with its URL intact.
     async fn observe_receiver(&self, instance: &str) -> Option<Receiver> {
-        let unit = self.receive_unit(instance);
-        if !hostfs::unit_is_active(&unit).await {
+        // Read from a file this node wrote, not from the unit that set the
+        // receiver up: `ch-remote receive-migration` exits immediately, so by the
+        // next pass there is no unit left to ask and its command line — where the
+        // URL used to be read from — is gone with it. A receiver's URL is state on
+        // this machine for as long as the VMM holding it is up, so that is where
+        // it lives.
+        if !self.incoming_socket(instance).exists() {
             return None;
         }
-        let url = hostfs::url_in(&hostfs::unit_command(&unit).await?)?;
+        // Already holding a guest: that is an arrival, not a receiver waiting.
+        if self.incoming_holds_guest(instance).await {
+            return None;
+        }
+        let url = std::fs::read_to_string(self.receiver_url_path(instance))
+            .ok()?
+            .trim()
+            .to_string();
+        if url.is_empty() {
+            return None;
+        }
         Some(Receiver {
             // Cloud Hypervisor does not tell the receiving side how much has
             // arrived — there is no counter in `vm.info` and none in
@@ -190,11 +304,14 @@ impl CloudHypervisorVmm {
         taken
     }
 
-    /// Wait for a VMM to bind its API socket.
+    /// Wait for a VMM to bind the API socket it was told to.
+    ///
+    /// Takes the path rather than the instance, because an arriving guest's VMM
+    /// binds a different one — waiting for the wrong socket here would mean
+    /// handing `ch-remote` a receiver that is not listening yet.
     ///
     /// **Untested:** needs a live Cloud Hypervisor.
-    async fn await_socket(&self, instance: &str) -> Result<()> {
-        let socket = self.socket(instance);
+    async fn await_socket(&self, socket: &Path) -> Result<()> {
         let deadline = std::time::Instant::now() + SOCKET_TIMEOUT;
         while std::time::Instant::now() < deadline {
             if socket.exists() {
@@ -214,8 +331,8 @@ impl Vmm for CloudHypervisorVmm {
     /// Re-derive everything from the machine.
     ///
     /// **Partly untested:** the directory and image scan are exercised by the
-    /// tests below; asking a live VMM for its state, and asking systemd about
-    /// receivers and transfers, are not.
+    /// tests below, and `tests/cloud_hypervisor_boots_a_guest.rs` reads a running guest's state back
+    /// through it; asking systemd about receivers and transfers is not.
     async fn observe(&self) -> Result<HostState> {
         let mut host = HostState::default();
 
@@ -232,7 +349,7 @@ impl Vmm for CloudHypervisorVmm {
             if dir.join("root.raw").exists() {
                 host.disks.insert(instance.clone());
             }
-            if hostfs::unit_is_active(&self.send_unit(&instance)).await {
+            if hostfs::unit_is_active(self.layout.scope, &self.send_unit(&instance)).await {
                 host.sending.insert(instance.clone());
             }
             if let Some(receiver) = self.observe_receiver(&instance).await {
@@ -243,21 +360,35 @@ impl Vmm for CloudHypervisorVmm {
                 host.receivers.insert(instance, receiver);
                 continue;
             }
-            if !self.socket(&instance).exists() {
+            if !self.socket(&instance).exists() && !self.incoming_holds_guest(&instance).await {
                 // No socket: nothing of this guest is running. The disk stays,
                 // which is why a stopped instance keeps its data.
                 continue;
             }
+            let (unit, _) = self.live(&instance).await;
             let observation = match self.api(&instance, "GET", "/api/v1/vm.info", "").await {
                 Ok(body) => VmObservation {
                     state: state_of(&body),
-                    pid: hostfs::main_pid(&self.unit(&instance)).await,
+                    pid: hostfs::main_pid(self.layout.scope, &unit).await,
                     started_at: hostfs::started_at(&dir),
                 },
-                // The socket is there and nobody is behind it: the VMM died and
-                // left its socket. That is a failure, and it is reported as one
-                // rather than as "stopped", because the two want different
-                // things done about them.
+                // Nobody answered *and* no VMM is running: the process is gone
+                // and only its socket file is left. That is **absent**, not
+                // failed, and the difference decides whether a migration can
+                // finish: Cloud Hypervisor's source VMM exits when a transfer
+                // completes, leaving exactly this, and reported as a failure it
+                // kept the source from ever saying it had let go.
+                //
+                // The stale file goes with it, so the next pass does not have to
+                // work this out again.
+                Err(_) if !hostfs::unit_is_active(self.layout.scope, &unit).await => {
+                    let _ = std::fs::remove_file(self.socket(&instance));
+                    let _ = std::fs::remove_file(self.incoming_socket(&instance));
+                    continue;
+                }
+                // A VMM that is running and not answering. That is a failure, and
+                // it is reported as one rather than as "stopped", because the two
+                // want different things done about them.
                 Err(_) => VmObservation {
                     state: InstanceState::Failed,
                     pid: None,
@@ -278,11 +409,14 @@ impl Vmm for CloudHypervisorVmm {
     }
 
     /// A sparse file of the asked-for size. Real, and covered by a test.
-    async fn create_disk(&self, instance: &str, gib: u64) -> Result<()> {
-        hostfs::create_disk(&self.layout, instance, gib).await
+    async fn create_disk(&self, instance: &str, gib: u64, image: &str) -> Result<()> {
+        let source = hostfs::image_path(&self.layout, image);
+        hostfs::create_disk(&self.layout, instance, gib, source.as_deref()).await
     }
 
-    /// **Untested:** requires `cloud-hypervisor` and `systemd-run`.
+    /// Covered by `tests/cloud_hypervisor_boots_a_guest.rs`, which starts a real guest and
+    /// reads its console: "running" is what a VMM reports for a machine that
+    /// loaded nothing, so the console is the only proof that it booted.
     async fn start(&self, request: &VmRequest) -> Result<()> {
         let dir = self.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
@@ -291,6 +425,7 @@ impl Vmm for CloudHypervisorVmm {
         let _ = std::fs::remove_file(&socket);
 
         hostfs::systemd_run(
+            self.layout.scope,
             &self.unit(&request.instance),
             &self.layout.slice,
             &dir,
@@ -316,16 +451,23 @@ impl Vmm for CloudHypervisorVmm {
             .map(|_| ())
     }
 
-    /// **Untested:** stops the unit and removes everything of the guest.
+    /// The teardown half of `tests/cloud_hypervisor_boots_a_guest.rs`: the guest is deleted and
+    /// the machine is asked again, so "gone" is observed rather than assumed.
     async fn delete(&self, instance: &str) -> Result<()> {
-        if self.socket(instance).exists() {
+        // Either socket: a guest that arrived by migration answers on the
+        // incoming one, and asking the absent one would skip the shutdown.
+        if self.socket(instance).exists() || self.incoming_socket(instance).exists() {
             let _ = self.api(instance, "PUT", "/api/v1/vm.shutdown", "").await;
         }
         // Anything this instance had in flight goes with it. A transfer of a
         // guest that is being deleted has nowhere to land.
-        hostfs::stop_unit(&self.send_unit(instance)).await;
-        hostfs::stop_unit(&self.receive_unit(instance)).await;
-        hostfs::stop_unit(&self.unit(instance)).await;
+        hostfs::stop_unit(self.layout.scope, &self.send_unit(instance)).await;
+        hostfs::stop_unit(self.layout.scope, &self.receive_unit(instance)).await;
+        let _ = std::fs::remove_file(self.incoming_socket(instance));
+        // Both, because a guest that arrived by migration runs under the
+        // incoming unit and stopping only the ordinary one would leave it up.
+        hostfs::stop_unit(self.layout.scope, &self.unit(instance)).await;
+        hostfs::stop_unit(self.layout.scope, &self.incoming_unit(instance)).await;
         let dir = self.dir(instance);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
@@ -404,22 +546,24 @@ impl Vmm for CloudHypervisorVmm {
             }
         };
 
-        // The VMM first, empty. It is started under the guest's own unit name
-        // because in a moment it will be the guest's VMM.
-        let socket = self.socket(&request.instance);
+        // The VMM first, empty, under its own name and socket — see
+        // `incoming_unit` for why it cannot be the guest's.
+        let socket = self.incoming_socket(&request.instance);
         let _ = std::fs::remove_file(&socket);
         hostfs::systemd_run(
-            &self.unit(&request.instance),
+            self.layout.scope,
+            &self.incoming_unit(&request.instance),
             &self.layout.slice,
             &dir,
             &self.layout.binary,
             &[OsString::from("--api-socket"), socket.clone().into()],
         )
         .await?;
-        self.await_socket(&request.instance).await?;
+        self.await_socket(&socket).await?;
 
         // Then the receiver, which listens until the guest arrives.
         hostfs::systemd_run(
+            self.layout.scope,
             &self.receive_unit(&request.instance),
             &self.layout.slice,
             &dir,
@@ -427,24 +571,31 @@ impl Vmm for CloudHypervisorVmm {
             &receive_args(&socket, &url),
         )
         .await?;
+        // Written after the VMM is listening, so a file that exists means a
+        // receiver that exists — and never the other way round.
+        std::fs::write(self.receiver_url_path(&request.instance), &url)?;
         Ok(url)
     }
 
     /// **Untested:** needs systemd.
     async fn tear_down_receiver(&self, instance: &str) -> Result<()> {
-        hostfs::stop_unit(&self.receive_unit(instance)).await;
+        hostfs::stop_unit(self.layout.scope, &self.receive_unit(instance)).await;
         // The order of these two checks is the whole method. Once a transfer
         // has landed, the receiver *is* the guest's VMM: stopping that unit
         // would kill the guest this migration just moved here. So the VMM is
         // only stopped when the machine says there is no guest behind it.
-        let holds_a_guest = self.socket(instance).exists()
+        // The receiver's VMM is the incoming one, so that is the socket to ask —
+        // by name, not through `live`.
+        let holds_a_guest = self.incoming_socket(instance).exists()
             && matches!(
-                self.api(instance, "GET", "/api/v1/vm.info", "").await,
+                self.api_at(&self.incoming_socket(instance), "GET", "/api/v1/vm.info", "")
+                    .await,
                 Ok(body) if state_of(&body) != InstanceState::Failed
             );
         if !holds_a_guest {
-            hostfs::stop_unit(&self.unit(instance)).await;
-            let _ = std::fs::remove_file(self.socket(instance));
+            hostfs::stop_unit(self.layout.scope, &self.incoming_unit(instance)).await;
+            let _ = std::fs::remove_file(self.incoming_socket(instance));
+            let _ = std::fs::remove_file(self.receiver_url_path(instance));
         }
         let _ = std::fs::remove_file(self.migrate_socket(instance));
         Ok(())
@@ -460,6 +611,7 @@ impl Vmm for CloudHypervisorVmm {
     async fn send(&self, transfer: &Transfer) -> Result<()> {
         let args = send_args(&self.layout, transfer, &self.socket(&transfer.instance))?;
         hostfs::systemd_run(
+            self.layout.scope,
             &self.send_unit(&transfer.instance),
             &self.layout.slice,
             &self.dir(&transfer.instance),
@@ -476,7 +628,7 @@ impl Vmm for CloudHypervisorVmm {
     /// cancellation somebody asked for afterwards is to stop the transfer: the
     /// guest is still running here, because under pre-copy it never stopped.
     async fn cancel_send(&self, instance: &str) -> Result<()> {
-        hostfs::stop_unit(&self.send_unit(instance)).await;
+        hostfs::stop_unit(self.layout.scope, &self.send_unit(instance)).await;
         Ok(())
     }
 }
@@ -492,14 +644,53 @@ fn vmm_args(layout: &Layout, request: &VmRequest, socket: &std::path::Path) -> V
         format!("boot={}", request.vcpus).into(),
         "--memory".into(),
         format!("size={}M", request.memory_mib).into(),
-        "--kernel".into(),
-        layout.firmware.clone().into(),
         "--disk".into(),
         format!("path={}", layout.disk(&request.instance).display()).into(),
+        // To a file, always: a guest that will not boot is the one with the most
+        // to say and the least chance of being heard.
+        "--serial".into(),
+        format!("file={}", layout.console(&request.instance).display()).into(),
     ];
-    for tap in &request.taps {
+    match &layout.boot {
+        // Cloud Hypervisor takes either a Linux kernel or a firmware blob here,
+        // which is why one field served both backends for so long — and why the
+        // same field quietly meant something else to QEMU.
+        Boot::Firmware(Some(path)) => {
+            args.push("--kernel".into());
+            args.push(path.clone().into());
+        }
+        // Unlike QEMU, Cloud Hypervisor has no firmware of its own to fall back
+        // on. Starting it with neither a kernel nor a firmware fails at the VMM
+        // rather than here, and its message is better than any this could
+        // invent.
+        Boot::Firmware(None) => {}
+        Boot::Kernel {
+            kernel,
+            cmdline,
+            initrd,
+        } => {
+            args.push("--kernel".into());
+            args.push(kernel.clone().into());
+            if let Some(initrd) = initrd {
+                args.push("--initramfs".into());
+                args.push(initrd.clone().into());
+            }
+            if !cmdline.is_empty() {
+                args.push("--cmdline".into());
+                args.push(cmdline.clone().into());
+            }
+        }
+    }
+    for nic in &request.nics {
         args.push("--net".into());
-        args.push(format!("tap={tap}").into());
+        // The MAC is stated so that the guest's NIC is the one the platform
+        // recorded: DHCP, the metadata service and the fabric all key off it,
+        // and a VMM-invented address is an identity nothing else has heard of.
+        let mut net = format!("tap={}", nic.tap);
+        if let Some(mac) = &nic.mac {
+            net.push_str(&format!(",mac={mac}"));
+        }
+        args.push(net.into());
     }
     args
 }
@@ -540,27 +731,40 @@ fn send_args(
             ));
         }
     };
-    let mut args: Vec<OsString> = vec![
-        "--api-socket".into(),
-        socket.into(),
-        "send-migration".into(),
-        format!("destination_url={}", transfer.url).into(),
-        format!("downtime_ms={}", transfer.downtime_ms).into(),
-        format!("timeout_s={}", transfer.timeout_s).into(),
+    // **One** comma-joined argument, not one per setting. `ch-remote
+    // send-migration` takes a single positional value —
+    // `destination_url=…[,downtime_ms=…,timeout_s=…,…]` — and refuses anything
+    // after it with "unexpected argument", which is how the transfer failed
+    // silently as far as the platform could see: the source reported its action
+    // done, the destination sat listening, and the migration stayed at 0 MiB.
+    let mut settings = vec![
+        format!("destination_url={}", transfer.url),
+        format!("downtime_ms={}", transfer.downtime_ms),
+        format!("timeout_s={}", transfer.timeout_s),
         // Give the guest back rather than leaving it paused with half its
         // memory somewhere else. `ignore` is the setting that loses guests.
-        "timeout_strategy=cancel".into(),
-        format!("connections={}", transfer.connections).into(),
-        format!("memory_mode={memory_mode}").into(),
+        "timeout_strategy=cancel".to_string(),
+        format!("connections={}", transfer.connections),
+        format!("memory_mode={memory_mode}"),
     ];
+    if local {
+        // The flag the tool wants for a unix-socket transfer, and it has to be
+        // said: without it the URL is taken as a network destination.
+        settings.push("local=on".to_string());
+    }
     // TLS is only available over TCP. Over a unix socket it is not a downgrade
     // worth being quiet about — there is no network between the two ends.
     if let Some(dir) = &layout.migration_tls_dir {
         if !local {
-            args.push(format!("tls_dir={}", dir.display()).into());
+            settings.push(format!("tls_dir={}", dir.display()));
         }
     }
-    Ok(args)
+    Ok(vec![
+        "--api-socket".into(),
+        socket.into(),
+        "send-migration".into(),
+        settings.join(",").into(),
+    ])
 }
 
 fn state_of(vm_info: &str) -> InstanceState {
@@ -591,6 +795,57 @@ fn request(method: &str, path: &str, body: &str) -> String {
 /// conversation is one request to a socket owned by this node, and a client
 /// library would bring a connection pool, TLS and a retry policy for a Unix
 /// socket that is either there or not.
+/// How long a VMM on a local socket gets to answer.
+///
+/// Generous for something on the same machine, and the point is not the number:
+/// it is that there *is* one, so a wedged VMM costs one pass rather than every
+/// pass from now on.
+const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Read one HTTP response: the headers, then exactly `Content-Length` bytes.
+///
+/// Framed by the message rather than by the socket closing, because this
+/// server does not close it. Anything without a `Content-Length` is read as a
+/// bodyless response — the VMM sends one for every call that has nothing to
+/// say, and waiting for a body it will never send is the bug this exists to
+/// avoid.
+async fn read_one_response(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(HostError::failed(
+                "the VMM closed the connection before finishing its headers",
+            ));
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    };
+    let length = String::from_utf8_lossy(&raw[..head_end])
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    while raw.len() < head_end + length {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(HostError::failed(
+                "the VMM closed the connection part way through its answer",
+            ));
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    }
+    raw.truncate(head_end + length);
+    Ok(raw)
+}
+
 fn parse_response(raw: &[u8]) -> Result<String> {
     let text = String::from_utf8_lossy(raw);
     let (head, body) = text
@@ -613,9 +868,78 @@ fn parse_response(raw: &[u8]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A response is framed by its own length, not by the socket closing.
+    ///
+    /// This is the shape of the worst bug found in this crate. Cloud Hypervisor
+    /// answers in milliseconds and then **keeps the connection open**, whatever
+    /// `Connection: close` said. The old code read to end-of-file, so it never
+    /// returned — and since `observe` calls this, one running guest wedged the
+    /// agent's whole pass for ever: no reports, no reconciliation, no error,
+    /// nothing in a log to say why.
+    ///
+    /// The server here does exactly that, because a server that closes politely
+    /// cannot show the difference.
+    #[tokio::test]
+    async fn a_server_that_never_closes_does_not_wedge_the_reader() {
+        let dir = std::env::temp_dir().join(format!("vq-frame-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("a socket");
+
+        let held = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("a connection");
+            let body = r#"{"state":"Running"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("written");
+            stream.flush().await.expect("flushed");
+            // …and now hold it open, which is the whole point. Kept until the
+            // task is dropped, so the reader has no end-of-file to wait for.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connects");
+        client
+            .write_all(request("GET", "/api/v1/vm.info", "").as_bytes())
+            .await
+            .expect("written");
+        client.flush().await.expect("flushed");
+
+        // Two seconds is a hundred times what a local socket needs, and far
+        // under the API timeout — so this fails by hanging if the framing is
+        // wrong, rather than by quietly taking the timeout path.
+        let raw = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_one_response(&mut client),
+        )
+        .await
+        .expect("the reader waited for an end-of-file that was never coming")
+        .expect("a response");
+
+        assert_eq!(
+            parse_response(&raw).expect("parsed"),
+            r#"{"state":"Running"}"#
+        );
+        assert_eq!(
+            state_of(&parse_response(&raw).unwrap()),
+            InstanceState::Running
+        );
+
+        held.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use sha2::Digest;
 
     use super::*;
+    use crate::host::Nic;
 
     /// A directory of our own, cleaned up by the test that made it.
     struct Scratch(PathBuf);
@@ -666,13 +990,30 @@ mod tests {
             .collect()
     }
 
+    /// The settings out of the one positional value `ch-remote` takes.
+    ///
+    /// Split here rather than asserted as separate argv entries, because that is
+    /// the shape the tool documents — and asserting the other shape is exactly
+    /// how these tests passed while every real transfer was refused with
+    /// "unexpected argument".
+    fn settings(args: &[OsString]) -> Vec<String> {
+        words(args)
+            .last()
+            .map(|value| value.split(',').map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
     #[tokio::test]
     async fn a_disk_is_the_size_that_was_asked_for_and_making_it_twice_is_fine() {
         let scratch = Scratch::new("disk");
         let vmm = vmm(&scratch);
-        vmm.create_disk("projects/p1/instances/i1", 2)
-            .await
-            .unwrap();
+        vmm.create_disk(
+            "projects/p1/instances/i1",
+            2,
+            "projects/p1/images/sha256-abc",
+        )
+        .await
+        .unwrap();
         let path = vmm.disk("projects/p1/instances/i1");
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
@@ -680,9 +1021,13 @@ mod tests {
         );
         // Idempotence, on a method that would otherwise truncate a guest's
         // root disk on the second pass over the same instance.
-        vmm.create_disk("projects/p1/instances/i1", 2)
-            .await
-            .unwrap();
+        vmm.create_disk(
+            "projects/p1/instances/i1",
+            2,
+            "projects/p1/images/sha256-abc",
+        )
+        .await
+        .unwrap();
         assert!(path.exists());
     }
 
@@ -690,9 +1035,13 @@ mod tests {
     async fn a_disk_that_exists_is_what_observe_reports() {
         let scratch = Scratch::new("observe");
         let vmm = vmm(&scratch);
-        vmm.create_disk("projects/p1/instances/i1", 1)
-            .await
-            .unwrap();
+        vmm.create_disk(
+            "projects/p1/instances/i1",
+            1,
+            "projects/p1/images/sha256-abc",
+        )
+        .await
+        .unwrap();
         let host = vmm.observe().await.unwrap();
         assert!(host.disks.contains("projects/p1/instances/i1"));
         // No socket, so nothing is running — and that is a fact read off the
@@ -768,7 +1117,7 @@ mod tests {
             memory_mib: 2048,
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
-            taps: vec![],
+            nics: vec![],
         };
         let err = vmm
             .prepare_receiver(&request, MigrationMode::Live)
@@ -786,8 +1135,8 @@ mod tests {
             std::path::Path::new("/s"),
         )
         .unwrap();
-        let args = words(&args);
-        assert!(args.contains(&"send-migration".to_string()));
+        assert!(words(&args).contains(&"send-migration".to_string()));
+        let args = settings(&args);
         assert!(args.contains(&"destination_url=tcp:10.0.0.2:4901".to_string()));
         assert!(args.contains(&"downtime_ms=300".to_string()));
         assert!(args.contains(&"timeout_s=3600".to_string()));
@@ -836,7 +1185,7 @@ mod tests {
             migration_tls_dir: Some(PathBuf::from("/etc/velstra/migration")),
             ..Default::default()
         };
-        let remote = words(
+        let remote = settings(
             &send_args(
                 &layout,
                 &transfer("tcp:10.0.0.2:4901"),
@@ -849,7 +1198,7 @@ mod tests {
             "{remote:?}"
         );
 
-        let local = words(
+        let local = settings(
             &send_args(
                 &layout,
                 &transfer("unix:/tmp/s"),
@@ -885,7 +1234,16 @@ mod tests {
             memory_mib: 8192,
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
-            taps: vec!["vt-a".into(), "vt-b".into()],
+            nics: vec![
+                Nic {
+                    tap: "vt-a".into(),
+                    mac: Some("52:54:00:00:00:0a".into()),
+                },
+                Nic {
+                    tap: "vt-b".into(),
+                    mac: None,
+                },
+            ],
         };
         let args = words(&vmm_args(
             &Layout::default(),
@@ -893,7 +1251,10 @@ mod tests {
             std::path::Path::new("/s"),
         ));
         let nets: Vec<&String> = args.iter().filter(|a| a.starts_with("tap=")).collect();
-        assert_eq!(nets, vec!["tap=vt-a", "tap=vt-b"]);
+        // The MAC travels with the tap: a guest whose NIC comes up with an
+        // address the platform never recorded is one DHCP cannot recognise and
+        // the metadata service cannot describe.
+        assert_eq!(nets, vec!["tap=vt-a,mac=52:54:00:00:00:0a", "tap=vt-b"]);
         assert!(args.contains(&"boot=4".to_string()));
         assert!(args.contains(&"size=8192M".to_string()));
     }

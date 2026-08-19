@@ -26,6 +26,13 @@ color-scheme: light;
 --green-500: #1a7f37; --amber-500: #9a6700; --red-500: #cf222e;
 --cyan-500: #1b7f9e; --cyan-600: #14657e; --cyan-900: #e2f2f7;
 
+/* The same two materials, re-pointed. Light chrome is more opaque than dark:
+   dark text over a blurred light background loses contrast far faster than
+   light text over a blurred dark one. */
+--material-chrome: color-mix(in srgb, var(--bg-app) 78%, transparent);
+--material-panel: color-mix(in srgb, var(--surface) 90%, transparent);
+--material-edge: inset 0 1px 0 rgba(255,255,255,.9);
+
 --scrim: rgba(16,24,40,.32);
 --shadow-sm: 0 1px 2px rgba(16,24,40,.05);
 --shadow-md: 0 6px 16px rgba(16,24,40,.08);

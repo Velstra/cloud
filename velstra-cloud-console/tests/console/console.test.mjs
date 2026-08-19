@@ -82,7 +82,7 @@ await test("signing in lands on a collection, with the rail beside it", async ()
     title: document.getElementById("listtitle").textContent,
     rows: document.querySelectorAll("#boardbody tr").length,
   })`);
-  equal(seen.rail.length, 11, "the rail does not list every collection");
+  equal(seen.rail.length, 12, "the rail does not list every collection");
   check(seen.title === "Instances", `landed on ${seen.title}`);
   check(seen.rows >= 1, "the board showed no instances at all");
 });
@@ -1214,15 +1214,371 @@ await test("the appearance can be changed and is remembered", async () => {
   await page.evaluate(`document.getElementById("theme").click()`);
 });
 
+const GROUP = "sg-" + Math.random().toString(36).slice(2, 6);
+
+await test("a security group can be built out of rules, not just named", async () => {
+  // The half of this feature that was missing for a while: a form that could
+  // only produce an *empty* group would make something the platform accepts and
+  // that allows nothing.
+  await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
+  await open(page, "security-groups");
+  await page.evaluate(`document.getElementById("newbtn").click()`);
+  await sleep(300);
+  await page.evaluate(`(() => {
+    const id = document.getElementById("f-id");
+    id.value = ${JSON.stringify(GROUP)}; id.dispatchEvent(new Event("input"));
+    document.getElementById("addrule").click();
+  })()`);
+  await sleep(200);
+  const built = await page.evaluate(`(() => {
+    const host = document.getElementById("f-rules");
+    const row = host.querySelector(".row");
+    const selects = [...row.querySelectorAll("select")];
+    const numbers = [...row.querySelectorAll("input[type=number]")];
+    const text = row.querySelector("input[type=text]");
+    return {
+      // A rule offered blank would be a rule somebody has to fill in four times
+      // before it means anything; it starts as the commonest one instead.
+      direction: selects[0].value,
+      protocol: selects[1].value,
+      ports: numbers.length,
+      remote: text ? text.value : null,
+    };
+  })()`);
+  equal(built.direction, "ingress", "a new rule does not start as ingress");
+  equal(built.protocol, "tcp", "a new rule does not start as tcp");
+  equal(built.ports, 2, "a tcp rule has no port range");
+  equal(built.remote, "0.0.0.0/0", "a new rule has no remote");
+
+  // Switching to a protocol with no ports drops the range rather than hiding
+  // it: sent along, it would be refused, and the operator would be looking at a
+  // form with no range in it wondering what the API meant.
+  const gone = await page.evaluate(`(() => {
+    const row = document.getElementById("f-rules").querySelector(".row");
+    const protocol = [...row.querySelectorAll("select")][1];
+    protocol.value = "icmp"; protocol.dispatchEvent(new Event("change"));
+    const now = document.getElementById("f-rules").querySelector(".row");
+    return now.querySelectorAll("input[type=number]").length;
+  })()`);
+  equal(gone, 0, "a port range survived a switch to icmp");
+
+  await page.evaluate(`(() => {
+    const row = document.getElementById("f-rules").querySelector(".row");
+    const protocol = [...row.querySelectorAll("select")][1];
+    protocol.value = "tcp"; protocol.dispatchEvent(new Event("change"));
+    const back = document.getElementById("f-rules").querySelector(".row");
+    const numbers = [...back.querySelectorAll("input[type=number]")];
+    numbers[0].value = "443"; numbers[0].dispatchEvent(new Event("input"));
+    numbers[1].value = "443"; numbers[1].dispatchEvent(new Event("input"));
+    document.getElementById("submitform").click();
+  })()`);
+  await sleep(1500);
+
+  const seen = await page.evaluate(`({
+    dialog: !!document.getElementById("dialog"),
+    rows: [...document.querySelectorAll("#boardbody tr")].map((r) => r.dataset.name.split("/").pop()),
+  })`);
+  check(!seen.dialog, "the form stayed open after a successful create");
+  check(seen.rows.includes(GROUP), "the new group is not on the board: " + seen.rows.join(", "));
+
+  // Read back through the API rather than off the screen: what matters is that
+  // the shape the platform stored is the shape it documents, not that the form
+  // remembers what was typed into it.
+  const stored = await page.evaluate(`(async () => {
+    const row = [...document.querySelectorAll("#boardbody tr")]
+      .find((r) => r.dataset.name.endsWith("/" + ${JSON.stringify(GROUP)}));
+    const r = await fetch("/api/v1/" + row.dataset.name,
+      { headers: { authorization: "Bearer " + sessionStorage.getItem("velstra-cloud-token") } });
+    const d = await r.json();
+    return d.spec.rules;
+  })()`);
+  equal(stored.length, 1, "the group was created without its rule");
+  equal(stored[0].protocol, "tcp", "the rule reached the API as something else");
+  equal(stored[0].ports.from, 443, "the port range did not survive");
+  equal(stored[0].remote.cidr, "0.0.0.0/0", "the remote did not survive");
+});
+
+// ---- paging ----------------------------------------------------------------
+//
+// The API answers a list a page at a time, and the failure this guards against
+// is the silent one: a client that reads the first page and renders it as the
+// whole collection. Nothing about that looks wrong — the board is populated, the
+// rail shows a count, the watch says live — and an operator is simply missing
+// machines.
+//
+// The first three of these are about the *fake*, and they are here rather than
+// nowhere because a fake that always answers with a whole collection is a fake
+// no client can fail against. Every console test would pass against a server
+// that cannot behave like the real one, and the console's paging would be
+// untested by construction.
+
+/// Every page of a walk, fetched by hand. Returns what each page said, so the
+/// checks below can be about the shape of the walk and not only its result.
+const walkByHand = async (path, pageSize) => {
+  const pages = [];
+  let token = null;
+  for (let i = 0; i < 50; i++) {
+    const q = path + "?pageSize=" + pageSize + (token ? "&pageToken=" + encodeURIComponent(token) : "");
+    const r = await api(q);
+    if (!r.ok) throw new Error(`page ${i + 1} answered ${r.status}`);
+    const body = await r.json();
+    pages.push(body);
+    token = body.nextPageToken || null;
+    if (!token) return pages;
+  }
+  throw new Error("the walk never ended");
+};
+
+const setCeiling = (n) => api("/__test/pagesize?n=" + n);
+
+await test("a paged walk hands back the whole collection, once each", async () => {
+  if (!SCAFFOLDED) skip("only the in-memory contract server can be told to page small");
+  const whole = await (await api("/api/v1/projects/p1/instances")).json();
+  const expected = whole.items.map((r) => r.meta.name).sort();
+  check(expected.length >= 3,
+    `this seed has ${expected.length} instances, which is too few to page over`);
+
+  await setCeiling(2);
+  const pages = await walkByHand("/api/v1/projects/p1/instances", 1000);
+  await setCeiling(0);
+
+  check(pages.length > 1, `the server never paged: one page of ${pages[0].items.length}`);
+  const walked = pages.flatMap((p) => p.items.map((r) => r.meta.name));
+  equal([...walked].sort(), expected, "the walk lost, repeated or reordered objects");
+  equal(walked.length, new Set(walked).size, "the walk delivered the same object twice");
+});
+
+await test("a walk that ends on a page boundary does not offer another page", async () => {
+  // A token after the last full page is one round trip per walk, for ever, on
+  // every client — and no count of objects would ever reveal it, because the
+  // extra page is correctly empty.
+  if (!SCAFFOLDED) skip("only the in-memory contract server can be told to page small");
+  const whole = await (await api("/api/v1/projects/p1/instances")).json();
+  const total = whole.items.length;
+
+  await setCeiling(total);
+  const exact = await (await api("/api/v1/projects/p1/instances?pageSize=1000")).json();
+  await setCeiling(0);
+
+  equal(exact.items.length, total, "the exact-size page was not the whole collection");
+  check(exact.nextPageToken === undefined,
+    "a collection that ended exactly on a page boundary still offered a token");
+});
+
+await test("every page of a walk reports the revision the first page was read at", async () => {
+  // The one that decides whether list-then-watch is correct across a paged
+  // list. A client pages to the end and then watches from what it was given; if
+  // each page reported its own revision, the client would watch from the end of
+  // the walk and silently miss everything that landed during it. Nothing about
+  // that is visible — the board is complete, the watch is live, and it is simply
+  // never told about the change.
+  if (!SCAFFOLDED) skip("only the in-memory contract server can be told to page small");
+  await setCeiling(2);
+  const pages = await walkByHand("/api/v1/projects/p1/instances", 1000);
+  await setCeiling(0);
+  check(pages.length > 1, "the server never paged, so there is nothing to compare");
+  const first = pages[0].revision;
+  check(first, "the first page reported no revision at all");
+  for (let i = 1; i < pages.length; i++) {
+    equal(pages[i].revision, first,
+      `page ${i + 1} reported its own revision instead of the walk's`);
+  }
+});
+
+await test("a page token is refused where it does not belong, and so is a bad size", async () => {
+  if (!SCAFFOLDED) skip("only the in-memory contract server can be told to page small");
+  await setCeiling(2);
+  const first = await (await api("/api/v1/projects/p1/instances?pageSize=1000")).json();
+  const token = first.nextPageToken;
+  check(token, "the first page offered no token to misuse");
+
+  // Presented against another collection it does not mean "start there" — it
+  // means two walks have been confused, and answering would hand back objects
+  // nobody asked for in an order that looks deliberate.
+  const wrong = await api("/api/v1/projects/p1/volumes?pageSize=1000&pageToken=" + encodeURIComponent(token));
+  equal(wrong.status, 400, "a token minted for instances was accepted for volumes");
+
+  const forged = await api("/api/v1/projects/p1/instances?pageSize=1000&pageToken=obviously-not-one");
+  equal(forged.status, 400, "a forged page token was accepted");
+
+  // Ignoring an unparseable size hands the whole cell to a client that believes
+  // it asked for twenty.
+  const size = await api("/api/v1/projects/p1/instances?pageSize=twenty");
+  equal(size.status, 400, "pageSize=twenty was not refused");
+  const said = await size.json();
+  check(/pageSize/.test(said.error?.message || ""),
+    `the refusal did not name the parameter: ${said.error?.message}`);
+  await setCeiling(0);
+});
+
+await test("the board shows a whole collection even when the API pages it small", async () => {
+  // The console's own half. It never sent `pageSize` and never read
+  // `nextPageToken`, so it was safe only because an unpaged list happened to
+  // return everything — a property of today's API and not of the contract. The
+  // moment it asked for a page, or the API grew a default cap, it would have
+  // rendered the first page and looked complete.
+  if (!SCAFFOLDED) skip("only the in-memory contract server can be told to page small");
+  const whole = await (await api("/api/v1/projects/p1/instances")).json();
+  const expected = whole.items.map((r) => r.meta.name.split("/").pop()).sort();
+
+  await setCeiling(2);
+  await open(page, "instances");
+  const seen = await page.evaluate(`({
+    items: view.items.map((r) => idOf(r)).sort(),
+    rows: [...document.querySelectorAll("#boardbody tr")].map((r) => r.dataset.name.split("/").pop()).sort(),
+    complete: view.complete,
+    railCount: (document.querySelector('[data-collection="instances"] .n')
+      || document.querySelector('[data-collection="instances"] .state')).textContent,
+  })`);
+  await setCeiling(0);
+
+  equal(seen.items, expected, "the console kept only part of a paged collection");
+  equal(seen.rows, expected, "the board rendered only part of a paged collection");
+  check(seen.complete !== false, "a walk that finished was reported as incomplete");
+  check(!/\+$/.test(seen.railCount),
+    `the rail marked a complete count as a floor: ${seen.railCount}`);
+  noThrows("walking a paged list threw");
+});
+
+await test("a paged list is watched from where the walk started, not where it ended", async () => {
+  // The console's side of the revision rule above: it keeps the *first* page's
+  // revision and watches from that. Taking the last page's would compile, run,
+  // and lose every change that landed during the walk.
+  //
+  // Asked against a server that gets the rule **wrong** on purpose, and that is
+  // the whole point of the test. Against a faithful server every page carries
+  // the same revision, so a client that keeps the first and one that keeps the
+  // last read the same number and no assertion can separate them — which is
+  // exactly how a client-side mistake here would survive a green suite for ever.
+  // The first version of this test did that, and a mutation that took the last
+  // page's revision passed it.
+  //
+  // Keeping the first is also the only safe rule for a client, which cannot know
+  // which kind of server it is talking to: an earlier revision replays events it
+  // already has, and a later one skips events it never will.
+  if (!SCAFFOLDED) skip("only the in-memory contract server can be told to page small");
+  await api("/__test/pagerevision?own=1");
+  await setCeiling(2);
+  await open(page, "instances");
+  const held = await page.evaluate(`view.revision`);
+  const pages = await walkByHand("/api/v1/projects/p1/instances", 1000);
+  await setCeiling(0);
+  await api("/__test/pagerevision?own=0");
+
+  check(pages.length > 1, "the server never paged, so there is nothing to compare");
+  const last = pages[pages.length - 1].revision;
+  check(last !== pages[0].revision,
+    `the server was asked to report each page's own revision and did not: ${pages.map((p) => p.revision).join(", ")}`);
+  equal(String(held), String(pages[0].revision),
+    "the console watches from a revision that is not the one its walk began at");
+});
+
+await test("a subnet's occupancy follows the ports, with no event to announce it", async () => {
+  // The hardest thing on this contract for a client to get right, because
+  // nothing goes wrong visibly. `status.allocated` and `status.available` are
+  // counted by the API from the *ports*, on the way out — so taking an address
+  // moves both numbers with **nothing written to the subnet**: no revision, no
+  // watch event, nothing for a listening console to react to. A console that
+  // only listens shows the occupancy as of the moment the board was opened, for
+  // as long as it stays open, and the number looks perfectly plausible the whole
+  // time.
+  //
+  // The schema said `recheck: 0` for subnets, and the test guarding that list
+  // asserted it — so the gap was not merely unnoticed, it was pinned in place.
+  //
+  // It was invisible for a second reason too: the fake stored whatever the seed
+  // put in those fields and never recomputed them, so no test could have moved
+  // the number even if the console had asked.
+  await open(page, "subnets");
+  const subnet = await pick("subnet with a range", `(x) => !!at(x, "spec.cidr")`);
+  const before = await page.evaluate(`(() => {
+    const r = view.items.find((x) => idOf(x) === ${JSON.stringify(subnet.id)});
+    return { allocated: at(r, "status.allocated"), available: at(r, "status.available") };
+  })()`);
+  check(Number.isFinite(Number(before.allocated)),
+    `the subnet reports no occupancy at all: ${JSON.stringify(before)}`);
+
+  // A port takes an address on that subnet. Nothing about the subnet is written.
+  const made = "probe-" + Date.now().toString(36);
+  const created = await api("/api/v1/projects/p1/ports", {
+    method: "POST",
+    body: JSON.stringify({
+      id: made,
+      spec: {
+        network: (await (await api("/api/v1/projects/p1/subnets/" + subnet.id)).json()).spec.network,
+        subnet: subnet.name,
+        address: "10.20.0.201",
+      },
+    }),
+  });
+  check(created.ok, `creating the probe port answered ${created.status}`);
+
+  const moved = await waitFor(page, `(() => {
+    const r = view.items.find((x) => idOf(x) === ${JSON.stringify(subnet.id)});
+    if (!r) return null;
+    return Number(at(r, "status.allocated")) === ${Number(before.allocated) + 1} ? "moved" : null;
+  })()`, { timeout: 25000 });
+
+  await api("/api/v1/projects/p1/ports/" + made, { method: "DELETE" });
+
+  check(moved,
+    "the subnet's occupancy never moved after a port took an address from it — " +
+    "the board is showing a count from whenever it was opened");
+});
+
 await test("signing out leaves nothing behind", async () => {
+  // "Nothing behind" used to mean the token and the panel, and that is what this
+  // checked — an assertion that held while everything the session had read was
+  // still sitting in memory. Sign out on a shared machine, sign in as somebody
+  // else, and the rail still counted the previous tenant's objects, the board
+  // still held their rows, and the picker cache still offered their ports and
+  // volumes by name. The picker was the worst of the three: `optionCache` holds
+  // resolved promises and is only ever invalidated by a write or a watch event,
+  // so it survived not just the sign-out but the next session entirely.
+  //
+  // So the check is now over everything the console accumulates, by name. A new
+  // cache added later and not cleared is a line here that has to be added — and
+  // if it is not, this test is the thing that was supposed to notice.
+  await open(page, "instances");
+  // Make the caches real first: a picker fills `optionCache`, a board fills
+  // `view`, and signing in filled `census` and `scopeFound`.
+  await page.evaluate(`options("volumes")`);
+  const before = await page.evaluate(`({
+    options: optionCache.size,
+    census: Object.keys(census).length,
+    items: view.items.length,
+    scopes: Object.keys(scopeFound).length,
+  })`);
+  check(before.options > 0 && before.census > 0 && before.items > 0,
+    `nothing was cached, so this test would pass without checking anything: ${JSON.stringify(before)}`);
+
   await page.evaluate(`document.getElementById("signout").click()`);
   const left = await page.evaluate(`({
     inside: !document.getElementById("app").classList.contains("hidden"),
     token: sessionStorage.getItem("velstra-cloud-token"),
+    project: sessionStorage.getItem("velstra-cloud-project"),
+    options: optionCache.size,
+    census: Object.keys(census).length,
+    items: view.items.length,
+    coll: view.coll ? view.coll.id : null,
+    revision: view.revision,
+    scopes: Object.keys(scopeFound).length,
+    rail: document.getElementById("rail").textContent.trim(),
+    board: document.querySelectorAll("#boardbody tr").length,
   })`);
   check(!left.inside, "signing out left the console up");
   check(!left.token, "the token survived signing out");
+  check(!left.project, "the project this session was looking at survived signing out");
+  equal(left.options, 0, "the picker cache survived signing out, names and all");
+  equal(left.census, 0, "the rail's counts survived signing out");
+  equal(left.items, 0, "the board's rows survived signing out");
+  equal(left.coll, null, "the console still believes it is showing a collection");
+  check(!left.revision, "the watch revision survived signing out");
+  equal(left.scopes, 0, "where each collection was found survived signing out");
+  equal(left.rail, "", "the rail still lists the previous session's collections");
+  equal(left.board, 0, "the previous session's rows are still on screen");
 });
 
 page.close();
+
 process.exit(summary());

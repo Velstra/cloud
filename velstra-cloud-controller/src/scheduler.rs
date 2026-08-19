@@ -83,10 +83,10 @@ impl Reconciler for Scheduler {
         // operator who has just fixed a node waits out the resync interval
         // wondering whether anything noticed.
         let pending = self.pending.clone();
-        vec![Related {
-            prefix: prefix_for(&self.cell, "nodes"),
-            map: Arc::new(move |_node: &str| pending.lock().unwrap().iter().cloned().collect()),
-        }]
+        vec![Related::named(
+            prefix_for(&self.cell, "nodes"),
+            move |_node: &str| pending.lock().unwrap().iter().cloned().collect(),
+        )]
     }
 
     async fn reconcile(&self, name: &str, object: Option<&Instance>) -> Result<()> {

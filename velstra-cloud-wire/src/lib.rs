@@ -125,7 +125,7 @@ pub fn joined(value: &Value) -> Option<String> {
     Some(parts.join("/"))
 }
 
-pub(crate) fn to_camel(key: &str) -> String {
+pub fn to_camel(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     let mut upper_next = false;
     for c in key.chars() {

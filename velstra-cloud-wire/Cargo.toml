@@ -1,0 +1,17 @@
+[package]
+name = "velstra-cloud-wire"
+version = "0.1.0"
+description = "The JSON the REST contract promises, from the model as it is"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The tests round-trip real resources, which is the only way to prove the
+# shaping is right about the model rather than about a hand-written fixture.
+velstra-cloud-model = { workspace = true }
+serde = { workspace = true }

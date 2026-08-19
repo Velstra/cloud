@@ -21,11 +21,13 @@ use async_trait::async_trait;
 use velstra_cloud_model::{
     meta::Timestamp,
     migration::MigrationMode,
-    resources::{Capacity, InstanceState, PortSpec},
+    resources::{Capacity, InstanceState, NetworkSpec, PortSpec},
+    security::ResolvedRule,
 };
 
 use crate::host::{
-    Datapath, HostError, HostState, Receiver, Result, Transfer, VmObservation, VmRequest, Vmm,
+    Datapath, HostError, HostState, ProgrammedPort, Receiver, Result, Transfer, VmObservation,
+    VmRequest, Vmm,
 };
 
 /// How much a single `send` copies before it either lands or fails.
@@ -370,7 +372,7 @@ impl Vmm for FakeVmm {
         Ok(())
     }
 
-    async fn create_disk(&self, instance: &str, _gib: u64) -> Result<()> {
+    async fn create_disk(&self, instance: &str, _gib: u64, _image: &str) -> Result<()> {
         let mut m = self.machine.lock().unwrap();
         check(&mut m, Fault::Disk, instance)?;
         m.disks.insert(instance.to_string());
@@ -585,7 +587,22 @@ struct Fabric {
     /// Port resource name to tap device — the same thing a real datapath is
     /// asked for, and the only state a datapath has.
     taps: BTreeMap<String, String>,
+    /// What each port was last programmed with. Kept so a test can assert on
+    /// the allowances that actually reached the datapath: whether a security
+    /// group *resolved* correctly is provable in the model, but whether the
+    /// result ever arrives here is not, and that is exactly the gap this
+    /// feature existed in for as long as it did.
+    rules: BTreeMap<String, Vec<ResolvedRule>>,
     faults: BTreeMap<String, String>,
+    /// Make tearing this port down fail — *after* the tap has gone, which is
+    /// what a real half-finished teardown looks like. The fabric datapath
+    /// removes the device first and then talks to the orchestrator, so the
+    /// interesting failure is exactly the one where the machine looks clean and
+    /// the fabric is still holding an address.
+    teardown_faults: BTreeMap<String, String>,
+    /// How many times each port was asked to be torn down, so a test can say
+    /// "and it asked again" rather than only "it failed".
+    unprograms: BTreeMap<String, usize>,
 }
 
 /// The fabric, in a process. Same rule: cloning shares the datapath.
@@ -615,26 +632,87 @@ impl FakeDatapath {
     pub fn is_programmed(&self, port: &str) -> bool {
         self.fabric.lock().unwrap().taps.contains_key(port)
     }
+
+    /// Make tearing this port down fail after the tap is already gone. See
+    /// [`Fabric::teardown_faults`].
+    pub fn fail_teardown(&self, port: &str, why: &str) {
+        self.fabric
+            .lock()
+            .unwrap()
+            .teardown_faults
+            .insert(port.to_string(), why.to_string());
+    }
+
+    pub fn heal_teardown(&self, port: &str) {
+        self.fabric.lock().unwrap().teardown_faults.remove(port);
+    }
+
+    /// How many times this port was asked to be torn down.
+    pub fn unprograms(&self, port: &str) -> usize {
+        self.fabric
+            .lock()
+            .unwrap()
+            .unprograms
+            .get(port)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The allowances this port was last programmed with, or `None` if it was
+    /// never programmed at all — which is a different thing from being
+    /// programmed with none, and a test that could not tell them apart would
+    /// pass on a datapath that was never called.
+    pub fn rules_programmed(&self, port: &str) -> Option<Vec<ResolvedRule>> {
+        self.fabric.lock().unwrap().rules.get(port).cloned()
+    }
 }
 
 #[async_trait]
 impl Datapath for FakeDatapath {
-    async fn observe(&self) -> Result<BTreeMap<String, String>> {
-        Ok(self.fabric.lock().unwrap().taps.clone())
+    async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>> {
+        let f = self.fabric.lock().unwrap();
+        Ok(f.taps
+            .iter()
+            .map(|(port, tap)| {
+                (
+                    port.clone(),
+                    ProgrammedPort {
+                        tap: tap.clone(),
+                        rules: f.rules.get(port).cloned().unwrap_or_default(),
+                    },
+                )
+            })
+            .collect())
     }
 
-    async fn program(&self, port: &str, _spec: &PortSpec) -> Result<String> {
+    async fn program(
+        &self,
+        port: &str,
+        _spec: &PortSpec,
+        _network: &NetworkSpec,
+        rules: &[ResolvedRule],
+    ) -> Result<String> {
         let mut f = self.fabric.lock().unwrap();
         if let Some(why) = f.faults.get(port) {
             return Err(HostError::failed(why));
         }
         let tap = format!("vt-{}", port.rsplit('/').next().unwrap_or(port));
         f.taps.insert(port.to_string(), tap.clone());
+        f.rules.insert(port.to_string(), rules.to_vec());
         Ok(tap)
     }
 
     async fn unprogram(&self, port: &str) -> Result<()> {
-        self.fabric.lock().unwrap().taps.remove(port);
+        let mut f = self.fabric.lock().unwrap();
+        *f.unprograms.entry(port.to_string()).or_default() += 1;
+        f.taps.remove(port);
+        f.rules.remove(port);
+        // After the tap, deliberately: a real teardown removes the device first
+        // and then the fabric's port, so the failure worth modelling is the one
+        // that leaves nothing on the machine and everything on the fabric.
+        if let Some(why) = f.teardown_faults.get(port) {
+            return Err(HostError::failed(why));
+        }
         Ok(())
     }
 }
@@ -650,7 +728,7 @@ mod tests {
             memory_mib: 2048,
             image: "sha256:abc".into(),
             root_disk_gib: 10,
-            taps: vec![],
+            nics: vec![],
         }
     }
 
@@ -663,9 +741,13 @@ mod tests {
             vmm.start(&request()).await.is_err(),
             "started without a disk"
         );
-        vmm.create_disk("projects/p1/instances/i1", 10)
-            .await
-            .unwrap();
+        vmm.create_disk(
+            "projects/p1/instances/i1",
+            10,
+            "projects/p1/images/sha256-abc",
+        )
+        .await
+        .unwrap();
         vmm.start(&request()).await.unwrap();
         assert!(vmm.is_running("projects/p1/instances/i1"));
     }
@@ -676,9 +758,13 @@ mod tests {
         // guests, because a node has one machine and not one per process.
         let vmm = FakeVmm::new();
         vmm.pull_image("sha256:abc").await.unwrap();
-        vmm.create_disk("projects/p1/instances/i1", 10)
-            .await
-            .unwrap();
+        vmm.create_disk(
+            "projects/p1/instances/i1",
+            10,
+            "projects/p1/images/sha256-abc",
+        )
+        .await
+        .unwrap();
         vmm.start(&request()).await.unwrap();
 
         let other = vmm.clone();
@@ -690,9 +776,13 @@ mod tests {
     async fn a_crashed_guest_is_visible_as_failed_rather_than_absent() {
         let vmm = FakeVmm::new();
         vmm.pull_image("sha256:abc").await.unwrap();
-        vmm.create_disk("projects/p1/instances/i1", 10)
-            .await
-            .unwrap();
+        vmm.create_disk(
+            "projects/p1/instances/i1",
+            10,
+            "projects/p1/images/sha256-abc",
+        )
+        .await
+        .unwrap();
         vmm.start(&request()).await.unwrap();
         vmm.crash("projects/p1/instances/i1");
 
@@ -706,9 +796,13 @@ mod tests {
     async fn an_injected_fault_is_what_the_operator_will_read() {
         let vmm = FakeVmm::new();
         vmm.cache_image("sha256:abc");
-        vmm.create_disk("projects/p1/instances/i1", 10)
-            .await
-            .unwrap();
+        vmm.create_disk(
+            "projects/p1/instances/i1",
+            10,
+            "projects/p1/images/sha256-abc",
+        )
+        .await
+        .unwrap();
         vmm.fail(
             Fault::Start,
             "projects/p1/instances/i1",
@@ -725,9 +819,13 @@ mod tests {
     async fn ready(network: &FakeNetwork, id: &str) -> FakeVmm {
         let vmm = network.host(id);
         vmm.cache_image("sha256:abc");
-        vmm.create_disk("projects/p1/instances/i1", 10)
-            .await
-            .unwrap();
+        vmm.create_disk(
+            "projects/p1/instances/i1",
+            10,
+            "projects/p1/images/sha256-abc",
+        )
+        .await
+        .unwrap();
         vmm
     }
 

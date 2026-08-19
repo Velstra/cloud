@@ -109,17 +109,17 @@ impl Reconciler for MigrationController {
         // mean the one moment this controller exists for arrives at resync
         // speed — minutes of a guest belonging to nobody.
         let watching = self.watching.clone();
-        vec![Related {
-            prefix: prefix_for(&self.cell, "instances"),
-            map: Arc::new(move |instance: &str| {
+        vec![Related::named(
+            prefix_for(&self.cell, "instances"),
+            move |instance: &str| {
                 watching
                     .lock()
                     .unwrap()
                     .get(instance)
                     .map(|set| set.iter().cloned().collect())
                     .unwrap_or_default()
-            }),
-        }]
+            },
+        )]
     }
 
     async fn reconcile(&self, name: &str, object: Option<&Migration>) -> Result<()> {

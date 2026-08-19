@@ -1,0 +1,888 @@
+//! Every model type that crosses the wire, and every field of it.
+//!
+//! `convert.rs` has one round-trip test, for an instance, and it is honest
+//! about what it is for: what a customer's SDK sends is what the platform
+//! reasons about. What it cannot do is speak for the other eleven types, and
+//! that is exactly the shape a dropped field hides in — the sibling data-plane
+//! repository shipped a protobuf message carrying three of a struct's ten
+//! fields, and port security, rate limiting, MSS clamping and NAT were built,
+//! unit-tested and inert on every node, because the tests exercised the config
+//! struct and never the wire.
+//!
+//! ## Two halves, and neither is enough alone
+//!
+//! **Equality** catches a conversion that loses a field: give every field a
+//! value, send it through the proto and back, and compare.
+//!
+//! **Destructuring** catches the way that check goes quietly blind. A field
+//! added later and left at its default round-trips to itself whether or not the
+//! conversion carries it, so the equality assertion stays green while the field
+//! is silently dropped on every real request. So each test also destructures
+//! the value with no `..` and asserts every field differs from the type's
+//! default — which makes an eleventh field a **compile error** here rather than
+//! an omission nobody notices.
+//!
+//! The one deliberate exception is stated where it is made.
+
+use velstra_cloud_model::{meta, migration, resources};
+use velstra_cloud_proto::v1;
+
+/// One type, its populated value, and every field of it named.
+///
+/// The field list is not documentation: it is a `let` pattern with no `..`, so
+/// adding a field to the model without adding it here does not compile.
+macro_rules! survives_the_wire {
+    ($name:ident, $model:path, $proto:ty, $value:expr, { $($field:ident),+ $(,)? }) => {
+        #[test]
+        fn $name() {
+            let original: $model = $value;
+
+            // Nothing is at its default, so the comparison below is actually
+            // asking something of every field.
+            let default = <$model>::default();
+            let $model { $($field),+ } = &original;
+            $(
+                assert_ne!(
+                    $field, &default.$field,
+                    concat!(
+                        stringify!($model), ".", stringify!($field),
+                        " is at its default value in this test, so the round trip would hold ",
+                        "even if the conversion dropped it. Give it a distinct value."
+                    )
+                );
+            )+
+
+            let wire = <$proto>::from(&original);
+            let back = <$model>::from(&wire);
+            assert_eq!(
+                back, original,
+                concat!(stringify!($model), " did not survive the round trip intact")
+            );
+        }
+    };
+}
+
+fn a_condition() -> meta::Condition {
+    meta::Condition {
+        kind: "Ready".into(),
+        status: meta::ConditionStatus::False,
+        reason: "VmFailed".into(),
+        message: "the virtual machine exited".into(),
+        observed_generation: 6,
+        last_transition: meta::Timestamp(1_786_732_801_000),
+    }
+}
+
+// ---- meta -----------------------------------------------------------------
+
+#[test]
+fn a_placement_survives_the_wire() {
+    // Not the macro: `Placement` has no `Default`, because a cell with an empty
+    // region is not a sensible zero value for anything.
+    let original = meta::Placement::new("eu-central", "cell-1");
+    let meta::Placement { region, cell } = &original;
+    assert!(!region.is_empty() && !cell.is_empty());
+    let back = meta::Placement::from(&v1::Placement::from(&original));
+    assert_eq!(back, original);
+}
+
+#[test]
+fn a_condition_survives_the_wire() {
+    let original = a_condition();
+    let meta::Condition {
+        kind,
+        status,
+        reason,
+        message,
+        observed_generation,
+        last_transition,
+    } = &original;
+    assert!(!kind.is_empty());
+    assert_ne!(*status, meta::ConditionStatus::Unknown);
+    assert!(!reason.is_empty());
+    assert!(!message.is_empty());
+    assert_ne!(*observed_generation, 0);
+    assert_ne!(*last_transition, meta::Timestamp(0));
+
+    let back = meta::Condition::from(&v1::Condition::from(&original));
+    assert_eq!(back, original);
+}
+
+#[test]
+fn a_meta_survives_the_wire() {
+    // `TryFrom` rather than `From`, and no `Default`: a name is parsed, and a
+    // malformed one has to be a rejection rather than a plausible-looking
+    // empty.
+    let original = meta::Meta {
+        name: meta::ResourceName::parse("projects/p1/instances/i1").unwrap(),
+        uid: "6b1f-0000".into(),
+        placement: meta::Placement::new("eu-central", "cell-1"),
+        generation: 7,
+        created_at: meta::Timestamp(1_786_732_800_000),
+        deleted_at: Some(meta::Timestamp(1_786_732_900_000)),
+        finalizers: vec!["node.velstra.io/release".into()],
+        labels: [("tier".to_string(), "web".to_string())]
+            .into_iter()
+            .collect(),
+        revision: meta::Revision(412),
+    };
+    let meta::Meta {
+        name,
+        uid,
+        placement,
+        generation,
+        created_at,
+        deleted_at,
+        finalizers,
+        labels,
+        revision,
+    } = &original;
+    assert!(!name.to_string().is_empty());
+    assert!(!uid.is_empty());
+    assert!(!placement.region.is_empty());
+    assert_ne!(*generation, 0);
+    assert_ne!(*created_at, meta::Timestamp(0));
+    assert!(deleted_at.is_some());
+    assert!(!finalizers.is_empty());
+    assert!(!labels.is_empty());
+    assert_ne!(*revision, meta::Revision(0));
+
+    let back = meta::Meta::try_from(&v1::Meta::from(&original)).unwrap();
+    assert_eq!(back, original);
+}
+
+// ---- project --------------------------------------------------------------
+
+survives_the_wire!(
+    a_quota_survives_the_wire,
+    resources::Quota,
+    v1::Quota,
+    resources::Quota {
+        instances: 40,
+        vcpus: 200,
+        memory_mib: 512_000,
+        volume_gib: 20_000,
+    },
+    { instances, vcpus, memory_mib, volume_gib }
+);
+
+#[test]
+fn a_project_spec_survives_the_wire_except_its_bindings() {
+    // The one deliberate exception, and it is deliberate in both directions:
+    // there is no protobuf message for a binding, so a project that arrives
+    // over gRPC carries none and one that leaves loses them. Empty is the safe
+    // direction — it grants nothing rather than inventing a grant nobody asked
+    // for — and REST is where a policy is written.
+    //
+    // Asserted rather than merely commented, because the thing that makes this
+    // safe is *not* the conversion: it is that `ProjectSpec.bindings` is
+    // `skip_serializing_if = "Vec::is_empty"`, so the JSON a gRPC update
+    // produces has no `bindings` key at all and the API's merge-patch leaves the
+    // stored policy alone. Take that attribute off and every `UpdateProject`
+    // over gRPC silently revokes every grant in the project. The test that says
+    // so lives in `velstra-cloud-api/tests/authz.rs`; this one pins the field
+    // list, so that a *second* field cannot join `bindings` by accident.
+    let original = resources::ProjectSpec {
+        display_name: "Payments".into(),
+        parent: "organizations/o1".into(),
+        quota: resources::Quota {
+            instances: 40,
+            vcpus: 200,
+            memory_mib: 512_000,
+            volume_gib: 20_000,
+        },
+        bindings: vec![velstra_cloud_model::authz::Binding {
+            role: velstra_cloud_model::authz::Role::Admin,
+            members: vec!["ada".into()],
+        }],
+    };
+    let default = resources::ProjectSpec::default();
+    let resources::ProjectSpec {
+        display_name,
+        parent,
+        quota,
+        bindings,
+    } = &original;
+    assert_ne!(display_name, &default.display_name);
+    assert_ne!(parent, &default.parent);
+    assert_ne!(quota, &default.quota);
+    assert_ne!(bindings, &default.bindings);
+
+    let back = resources::ProjectSpec::from(&v1::ProjectSpec::from(&original));
+    assert_eq!(back.display_name, original.display_name);
+    assert_eq!(back.parent, original.parent);
+    assert_eq!(back.quota, original.quota);
+    assert!(
+        back.bindings.is_empty(),
+        "gRPC grew a way to carry bindings; either give it a message and carry \
+         them properly, or this test is now wrong"
+    );
+}
+
+survives_the_wire!(
+    a_project_status_survives_the_wire,
+    resources::ProjectStatus,
+    v1::ProjectStatus,
+    resources::ProjectStatus {
+        observed_generation: 6,
+        conditions: vec![a_condition()],
+        used: resources::Quota {
+            instances: 3,
+            vcpus: 12,
+            memory_mib: 24_576,
+            volume_gib: 300,
+        },
+    },
+    { observed_generation, conditions, used }
+);
+
+// ---- node -----------------------------------------------------------------
+
+survives_the_wire!(
+    a_capacity_survives_the_wire,
+    resources::Capacity,
+    v1::Capacity,
+    resources::Capacity {
+        vcpus: 64,
+        memory_mib: 262_144,
+        disk_gib: 4096,
+        numa_free_mib: vec![65_536, 65_536],
+        hugepages_1gi: 8,
+    },
+    { vcpus, memory_mib, disk_gib, numa_free_mib, hugepages_1gi }
+);
+
+survives_the_wire!(
+    a_node_spec_survives_the_wire,
+    resources::NodeSpec,
+    v1::NodeSpec,
+    resources::NodeSpec {
+        // `NodeSpec::default()` is *not* schedulable — the derived zero value,
+        // which is also the safe direction for a node nobody has vouched for.
+        schedulable: true,
+        labels: vec!["ssd".into(), "gpu".into()],
+    },
+    { schedulable, labels }
+);
+
+survives_the_wire!(
+    a_node_status_survives_the_wire,
+    resources::NodeStatus,
+    v1::NodeStatus,
+    resources::NodeStatus {
+        observed_generation: 4,
+        conditions: vec![a_condition()],
+        capacity: resources::Capacity {
+            vcpus: 64,
+            memory_mib: 262_144,
+            disk_gib: 4096,
+            numa_free_mib: vec![65_536],
+            hugepages_1gi: 8,
+        },
+        allocated: resources::Capacity {
+            vcpus: 8,
+            memory_mib: 16_384,
+            disk_gib: 200,
+            numa_free_mib: vec![32_768],
+            hugepages_1gi: 1,
+        },
+        agent_version: "0.1.0".into(),
+        last_heartbeat: meta::Timestamp(1_786_732_802_000),
+        images: vec!["projects/p1/images/sha256-abc".into()],
+    },
+    {
+        observed_generation, conditions, capacity, allocated, agent_version,
+        last_heartbeat, images,
+    }
+);
+
+// ---- image ----------------------------------------------------------------
+
+survives_the_wire!(
+    an_image_spec_survives_the_wire,
+    resources::ImageSpec,
+    v1::ImageSpec,
+    resources::ImageSpec {
+        digest: "sha256:abc".into(),
+        format: resources::ImageFormat::Qcow2,
+        size_bytes: 4_294_967_296,
+        source_url: "https://example.invalid/img.qcow2".into(),
+        signature: Some("base64-signature".into()),
+    },
+    { digest, format, size_bytes, source_url, signature }
+);
+
+survives_the_wire!(
+    an_image_status_survives_the_wire,
+    resources::ImageStatus,
+    v1::ImageStatus,
+    resources::ImageStatus {
+        observed_generation: 2,
+        conditions: vec![a_condition()],
+    },
+    { observed_generation, conditions }
+);
+
+// ---- instance -------------------------------------------------------------
+
+survives_the_wire!(
+    a_placement_policy_survives_the_wire,
+    resources::PlacementPolicy,
+    v1::PlacementPolicy,
+    resources::PlacementPolicy {
+        anti_affinity_group: Some("web".into()),
+        required_labels: vec!["ssd".into()],
+    },
+    { anti_affinity_group, required_labels }
+);
+
+survives_the_wire!(
+    an_instance_spec_survives_the_wire,
+    resources::InstanceSpec,
+    v1::InstanceSpec,
+    resources::InstanceSpec {
+        vcpus: 4,
+        memory_mib: 8192,
+        image: "projects/p1/images/sha256-abc".into(),
+        root_disk_gib: 40,
+        // `Running` is the default, so `Stopped` is the distinct one.
+        desired_state: resources::DesiredState::Stopped,
+        ports: vec!["projects/p1/ports/port-a".into()],
+        ssh_keys: vec!["ssh-ed25519 AAAA".into()],
+        user_data: Some("#cloud-config".into()),
+        node: Some("node-a".into()),
+        placement_policy: resources::PlacementPolicy {
+            anti_affinity_group: Some("web".into()),
+            required_labels: vec!["ssd".into()],
+        },
+    },
+    {
+        vcpus, memory_mib, image, root_disk_gib, desired_state, ports, ssh_keys,
+        user_data, node, placement_policy,
+    }
+);
+
+survives_the_wire!(
+    an_instance_status_survives_the_wire,
+    resources::InstanceStatus,
+    v1::InstanceStatus,
+    resources::InstanceStatus {
+        observed_generation: 6,
+        conditions: vec![a_condition()],
+        state: resources::InstanceState::Failed,
+        node: Some("node-a".into()),
+        addresses: vec!["10.0.0.5".into()],
+        vmm_pid: Some(4242),
+        started_at: Some(meta::Timestamp(1_786_732_801_000)),
+    },
+    { observed_generation, conditions, state, node, addresses, vmm_pid, started_at }
+);
+
+// ---- storage --------------------------------------------------------------
+
+survives_the_wire!(
+    a_volume_spec_survives_the_wire,
+    resources::VolumeSpec,
+    v1::VolumeSpec,
+    resources::VolumeSpec {
+        size_gib: 100,
+        pool: "rbd-standard".into(),
+        encryption_key: Some("projects/p1/keys/k1".into()),
+        source_image: Some("projects/p1/images/sha256-abc".into()),
+        source_snapshot: Some("projects/p1/volumes/v1/snapshots/nightly".into()),
+    },
+    { size_gib, pool, encryption_key, source_image, source_snapshot }
+);
+
+survives_the_wire!(
+    a_volume_status_survives_the_wire,
+    resources::VolumeStatus,
+    v1::VolumeStatus,
+    resources::VolumeStatus {
+        observed_generation: 3,
+        conditions: vec![a_condition()],
+        provisioned: true,
+        actual_size_gib: 100,
+        pool: Some("rbd-standard".into()),
+    },
+    { observed_generation, conditions, provisioned, actual_size_gib, pool }
+);
+
+survives_the_wire!(
+    a_snapshot_spec_survives_the_wire,
+    resources::SnapshotSpec,
+    v1::SnapshotSpec,
+    resources::SnapshotSpec {
+        pool: "rbd-standard".into(),
+    },
+    { pool }
+);
+
+survives_the_wire!(
+    a_snapshot_status_survives_the_wire,
+    resources::SnapshotStatus,
+    v1::SnapshotStatus,
+    resources::SnapshotStatus {
+        observed_generation: 3,
+        conditions: vec![a_condition()],
+        pool: Some("rbd-standard".into()),
+        taken: true,
+        size_gib: 100,
+        taken_at: Some(meta::Timestamp(1_786_732_803_000)),
+    },
+    { observed_generation, conditions, pool, taken, size_gib, taken_at }
+);
+
+survives_the_wire!(
+    an_attachment_spec_survives_the_wire,
+    resources::AttachmentSpec,
+    v1::AttachmentSpec,
+    resources::AttachmentSpec {
+        volume: "projects/p1/volumes/v1".into(),
+        instance: "projects/p1/instances/i1".into(),
+        node: "node-a".into(),
+        read_only: true,
+    },
+    { volume, instance, node, read_only }
+);
+
+survives_the_wire!(
+    an_attachment_status_survives_the_wire,
+    resources::AttachmentStatus,
+    v1::AttachmentStatus,
+    resources::AttachmentStatus {
+        observed_generation: 2,
+        conditions: vec![a_condition()],
+        attached: true,
+        device: Some("/dev/vdb".into()),
+        node: Some("node-a".into()),
+    },
+    { observed_generation, conditions, attached, device, node }
+);
+
+// ---- networking -----------------------------------------------------------
+
+survives_the_wire!(
+    a_network_spec_survives_the_wire,
+    resources::NetworkSpec,
+    v1::NetworkSpec,
+    resources::NetworkSpec {
+        vni: 5001,
+        mtu: 1450
+    },
+    { vni, mtu }
+);
+
+survives_the_wire!(
+    a_network_status_survives_the_wire,
+    resources::NetworkStatus,
+    v1::NetworkStatus,
+    resources::NetworkStatus {
+        observed_generation: 1,
+        conditions: vec![a_condition()],
+    },
+    { observed_generation, conditions }
+);
+
+survives_the_wire!(
+    a_subnet_spec_survives_the_wire,
+    resources::SubnetSpec,
+    v1::SubnetSpec,
+    resources::SubnetSpec {
+        network: "projects/p1/networks/n1".into(),
+        cidr: "10.20.0.0/24".into(),
+        gateway: "10.20.0.1".into(),
+        dns: vec!["10.20.0.2".into()],
+        reserved: vec!["10.20.0.3".into()],
+    },
+    { network, cidr, gateway, dns, reserved }
+);
+
+survives_the_wire!(
+    a_subnet_status_survives_the_wire,
+    resources::SubnetStatus,
+    v1::SubnetStatus,
+    resources::SubnetStatus {
+        observed_generation: 1,
+        conditions: vec![a_condition()],
+        allocated: 12,
+        available: 240,
+    },
+    { observed_generation, conditions, allocated, available }
+);
+
+survives_the_wire!(
+    a_port_spec_survives_the_wire,
+    resources::PortSpec,
+    v1::PortSpec,
+    resources::PortSpec {
+        network: "projects/p1/networks/n1".into(),
+        subnet: "projects/p1/subnets/s1".into(),
+        node: Some("node-a".into()),
+        address: Some("10.20.0.7".into()),
+        mac: Some("02:ab:cd:ef:00:07".into()),
+        security_groups: vec!["projects/p1/security-groups/web".into()],
+        rate_limit_mbit: Some(1000),
+    },
+    { network, subnet, node, address, mac, security_groups, rate_limit_mbit }
+);
+
+survives_the_wire!(
+    a_port_status_survives_the_wire,
+    resources::PortStatus,
+    v1::PortStatus,
+    resources::PortStatus {
+        observed_generation: 2,
+        conditions: vec![a_condition()],
+        node: Some("node-a".into()),
+        programmed: true,
+        tap_device: Some("vtweb1a2b".into()),
+    },
+    { observed_generation, conditions, node, programmed, tap_device }
+);
+
+// ---- operation ------------------------------------------------------------
+
+survives_the_wire!(
+    an_operation_spec_survives_the_wire,
+    resources::OperationSpec,
+    v1::OperationSpec,
+    resources::OperationSpec {
+        target: "projects/p1/instances/i1".into(),
+        target_generation: 3,
+        verb: "create".into(),
+        requested_by: "ada".into(),
+    },
+    { target, target_generation, verb, requested_by }
+);
+
+survives_the_wire!(
+    an_operation_status_survives_the_wire,
+    resources::OperationStatus,
+    v1::OperationStatus,
+    resources::OperationStatus {
+        observed_generation: 3,
+        conditions: vec![a_condition()],
+        done: true,
+        error: Some("the node refused".into()),
+        finished_at: Some(meta::Timestamp(1_786_732_804_000)),
+    },
+    { observed_generation, conditions, done, error, finished_at }
+);
+
+// ---- migration ------------------------------------------------------------
+
+survives_the_wire!(
+    a_migration_spec_survives_the_wire,
+    migration::MigrationSpec,
+    v1::MigrationSpec,
+    migration::MigrationSpec {
+        instance: "projects/p1/instances/i1".into(),
+        from_node: "node-a".into(),
+        to_node: "node-b".into(),
+        // `Live` is the default, so `PostCopy` is the distinct one.
+        mode: migration::MigrationMode::PostCopy,
+        downtime_ms: 500,
+        timeout_s: 1800,
+        connections: 4,
+    },
+    { instance, from_node, to_node, mode, downtime_ms, timeout_s, connections }
+);
+
+survives_the_wire!(
+    a_migration_status_survives_the_wire,
+    migration::MigrationStatus,
+    v1::MigrationStatus,
+    migration::MigrationStatus {
+        observed_generation: 1,
+        conditions: vec![a_condition()],
+        node: Some("node-b".into()),
+        receiver_url: Some("tcp:10.0.0.2:4900".into()),
+        receiver_ready: true,
+        transferred_mib: 2048,
+    },
+    { observed_generation, conditions, node, receiver_url, receiver_ready, transferred_mib }
+);
+
+// ---- the whole objects ----------------------------------------------------
+
+/// The object level, where the macro in `convert.rs` wires `meta` + `spec` +
+/// `status` together for twelve types.
+///
+/// What is worth asserting here is that the *macro* carries all three halves —
+/// a resource that lost its `meta` on the way out would still round-trip its
+/// spec and status perfectly — and a type the macro was never applied to does
+/// not compile here at all.
+macro_rules! whole_object_survives {
+    ($name:ident, $model:ty, $proto:ty, $spec:expr, $status:expr) => {
+        #[test]
+        fn $name() {
+            let mut meta = meta::Meta::new(
+                meta::ResourceName::parse("projects/p1/instances/i1").unwrap(),
+                meta::Placement::new("eu-central", "cell-1"),
+            );
+            meta.generation = 7;
+            meta.revision = meta::Revision(412);
+            meta.finalizers = vec!["node.velstra.io/release".into()];
+            meta.labels.insert("tier".into(), "web".into());
+            meta.deleted_at = Some(meta::Timestamp(1_786_732_800_000));
+
+            let original = <$model>::new(meta, $spec, $status);
+            let back = <$model>::try_from(&<$proto>::from(&original)).unwrap();
+            assert_eq!(back, original);
+        }
+    };
+}
+
+whole_object_survives!(
+    a_whole_project_survives,
+    resources::Project,
+    v1::Project,
+    resources::ProjectSpec {
+        display_name: "Payments".into(),
+        parent: "organizations/o1".into(),
+        quota: resources::Quota {
+            instances: 40,
+            vcpus: 200,
+            memory_mib: 512_000,
+            volume_gib: 20_000,
+        },
+        // Not carried on the wire; see the spec test above.
+        bindings: Vec::new(),
+    },
+    resources::ProjectStatus {
+        observed_generation: 6,
+        conditions: vec![a_condition()],
+        used: resources::Quota {
+            instances: 3,
+            vcpus: 12,
+            memory_mib: 24_576,
+            volume_gib: 300,
+        },
+    }
+);
+
+whole_object_survives!(
+    a_whole_node_survives,
+    resources::Node,
+    v1::Node,
+    resources::NodeSpec {
+        schedulable: false,
+        labels: vec!["ssd".into()],
+    },
+    resources::NodeStatus {
+        observed_generation: 4,
+        conditions: vec![a_condition()],
+        capacity: resources::Capacity {
+            vcpus: 64,
+            memory_mib: 262_144,
+            disk_gib: 4096,
+            numa_free_mib: vec![65_536],
+            hugepages_1gi: 8,
+        },
+        allocated: resources::Capacity::default(),
+        agent_version: "0.1.0".into(),
+        last_heartbeat: meta::Timestamp(1_786_732_802_000),
+        images: vec!["projects/p1/images/sha256-abc".into()],
+    }
+);
+
+whole_object_survives!(
+    a_whole_image_survives,
+    resources::Image,
+    v1::Image,
+    resources::ImageSpec {
+        digest: "sha256:abc".into(),
+        format: resources::ImageFormat::Qcow2,
+        size_bytes: 4_294_967_296,
+        source_url: "https://example.invalid/img.qcow2".into(),
+        signature: Some("base64-signature".into()),
+    },
+    resources::ImageStatus {
+        observed_generation: 2,
+        conditions: vec![a_condition()],
+    }
+);
+
+whole_object_survives!(
+    a_whole_volume_survives,
+    resources::Volume,
+    v1::Volume,
+    resources::VolumeSpec {
+        size_gib: 100,
+        pool: "rbd-standard".into(),
+        encryption_key: Some("projects/p1/keys/k1".into()),
+        source_image: None,
+        source_snapshot: None,
+    },
+    resources::VolumeStatus {
+        observed_generation: 3,
+        conditions: vec![a_condition()],
+        provisioned: true,
+        actual_size_gib: 100,
+        pool: Some("rbd-standard".into()),
+    }
+);
+
+whole_object_survives!(
+    a_whole_snapshot_survives,
+    resources::Snapshot,
+    v1::Snapshot,
+    resources::SnapshotSpec {
+        pool: "rbd-standard".into(),
+    },
+    resources::SnapshotStatus {
+        observed_generation: 3,
+        conditions: vec![a_condition()],
+        pool: Some("rbd-standard".into()),
+        taken: true,
+        size_gib: 100,
+        taken_at: Some(meta::Timestamp(1_786_732_803_000)),
+    }
+);
+
+whole_object_survives!(
+    a_whole_attachment_survives,
+    resources::Attachment,
+    v1::Attachment,
+    resources::AttachmentSpec {
+        volume: "projects/p1/volumes/v1".into(),
+        instance: "projects/p1/instances/i1".into(),
+        node: "node-a".into(),
+        read_only: true,
+    },
+    resources::AttachmentStatus {
+        observed_generation: 2,
+        conditions: vec![a_condition()],
+        attached: true,
+        device: Some("/dev/vdb".into()),
+        node: Some("node-a".into()),
+    }
+);
+
+whole_object_survives!(
+    a_whole_network_survives,
+    resources::Network,
+    v1::Network,
+    resources::NetworkSpec {
+        vni: 5001,
+        mtu: 1450
+    },
+    resources::NetworkStatus {
+        observed_generation: 1,
+        conditions: vec![a_condition()],
+    }
+);
+
+whole_object_survives!(
+    a_whole_subnet_survives,
+    resources::Subnet,
+    v1::Subnet,
+    resources::SubnetSpec {
+        network: "projects/p1/networks/n1".into(),
+        cidr: "10.20.0.0/24".into(),
+        gateway: "10.20.0.1".into(),
+        dns: vec!["10.20.0.2".into()],
+        reserved: vec!["10.20.0.3".into()],
+    },
+    resources::SubnetStatus {
+        observed_generation: 1,
+        conditions: vec![a_condition()],
+        allocated: 12,
+        available: 240,
+    }
+);
+
+whole_object_survives!(
+    a_whole_port_survives,
+    resources::Port,
+    v1::Port,
+    resources::PortSpec {
+        network: "projects/p1/networks/n1".into(),
+        subnet: "projects/p1/subnets/s1".into(),
+        node: Some("node-a".into()),
+        address: Some("10.20.0.7".into()),
+        mac: Some("02:ab:cd:ef:00:07".into()),
+        security_groups: vec!["projects/p1/security-groups/web".into()],
+        rate_limit_mbit: Some(1000),
+    },
+    resources::PortStatus {
+        observed_generation: 2,
+        conditions: vec![a_condition()],
+        node: Some("node-a".into()),
+        programmed: true,
+        tap_device: Some("vtweb1a2b".into()),
+    }
+);
+
+whole_object_survives!(
+    a_whole_operation_survives,
+    resources::Operation,
+    v1::Operation,
+    resources::OperationSpec {
+        target: "projects/p1/instances/i1".into(),
+        target_generation: 3,
+        verb: "create".into(),
+        requested_by: "ada".into(),
+    },
+    resources::OperationStatus {
+        observed_generation: 3,
+        conditions: vec![a_condition()],
+        done: true,
+        error: Some("the node refused".into()),
+        finished_at: Some(meta::Timestamp(1_786_732_804_000)),
+    }
+);
+
+whole_object_survives!(
+    a_whole_instance_survives,
+    resources::Instance,
+    v1::Instance,
+    resources::InstanceSpec {
+        vcpus: 4,
+        memory_mib: 8192,
+        image: "projects/p1/images/sha256-abc".into(),
+        root_disk_gib: 40,
+        desired_state: resources::DesiredState::Stopped,
+        ports: vec!["projects/p1/ports/port-a".into()],
+        ssh_keys: vec!["ssh-ed25519 AAAA".into()],
+        user_data: Some("#cloud-config".into()),
+        node: Some("node-a".into()),
+        placement_policy: resources::PlacementPolicy {
+            anti_affinity_group: Some("web".into()),
+            required_labels: vec!["ssd".into()],
+        },
+    },
+    resources::InstanceStatus {
+        observed_generation: 6,
+        conditions: vec![a_condition()],
+        state: resources::InstanceState::Failed,
+        node: Some("node-a".into()),
+        addresses: vec!["10.0.0.5".into()],
+        vmm_pid: Some(4242),
+        started_at: Some(meta::Timestamp(1_786_732_801_000)),
+    }
+);
+
+whole_object_survives!(
+    a_whole_migration_survives,
+    migration::Migration,
+    v1::Migration,
+    migration::MigrationSpec {
+        instance: "projects/p1/instances/i1".into(),
+        from_node: "node-a".into(),
+        to_node: "node-b".into(),
+        mode: migration::MigrationMode::PostCopy,
+        downtime_ms: 500,
+        timeout_s: 1800,
+        connections: 4,
+    },
+    migration::MigrationStatus {
+        observed_generation: 1,
+        conditions: vec![a_condition()],
+        node: Some("node-b".into()),
+        receiver_url: Some("tcp:10.0.0.2:4900".into()),
+        receiver_ready: true,
+        transferred_mib: 2048,
+    }
+);

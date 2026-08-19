@@ -21,14 +21,19 @@ use velstra_cloud_model::{
     access::Writer,
     meta::{Condition, ConditionStatus, Placement, Timestamp, set_condition},
     resources::{
-        POOL_RELEASE_FINALIZER, Pool, PoolSpec, PoolStatus, Volume, VolumeSpec, VolumeStatus,
+        POOL_RELEASE_FINALIZER, Pool, PoolSpec, PoolStatus, Snapshot, SnapshotSpec, SnapshotStatus,
+        Volume, VolumeSpec, VolumeStatus,
     },
-    storage::{SeenInPool, VolumeAction, reconcile_volume, volume_condition},
+    storage::{
+        SeenInPool, SeenSnapshot, SnapshotAction, VolumeAction, VolumeSource, reconcile_snapshot,
+        reconcile_volume, snapshot_condition, volume_condition,
+    },
 };
 use velstra_cloud_store::{Store, TypedStore};
 
 use crate::{
     agent::Pass,
+    cell::PoolReader,
     host::{HostError, Result},
     reporting,
 };
@@ -44,6 +49,53 @@ pub struct PoolState {
     /// configured, because an operator's guess about what a machine is running
     /// is not a fact about it.
     pub backend: String,
+    /// Every copy this pool holds, by snapshot resource name.
+    ///
+    /// Observed, like everything else here, and counted rather than trusted:
+    /// this is what makes destroying a volume safe or unsafe, and the backend is
+    /// the only place that knows about a copy somebody took with a shell.
+    pub snapshots: BTreeMap<String, SnapshotInPool>,
+}
+
+/// One copy, as the pool holds it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotInPool {
+    /// The volume it was taken from. What makes destroying that volume unsafe.
+    pub volume: String,
+    /// How large the volume was at the moment the copy was made, which is the
+    /// smallest volume that can be made from it.
+    pub gib: u64,
+}
+
+impl PoolState {
+    /// What this pool sees of one volume.
+    ///
+    /// In one place because the two call sites — before acting and after — must
+    /// answer the same question, and a second copy of this arithmetic is how
+    /// they would come to differ.
+    pub fn of(&self, volume: &str) -> SeenInPool {
+        SeenInPool {
+            exists: self.volumes.contains_key(volume),
+            gib: self.volumes.get(volume).copied().unwrap_or(0),
+            snapshots: self
+                .snapshots
+                .values()
+                .filter(|copy| copy.volume == volume)
+                .count() as u32,
+        }
+    }
+
+    /// What this pool sees of one snapshot. Same reason as `of`: the pass asks
+    /// before acting and again after, and two copies of this would drift.
+    pub fn snapshot_of(&self, snapshot: &str) -> SeenSnapshot {
+        match self.snapshots.get(snapshot) {
+            Some(copy) => SeenSnapshot {
+                exists: true,
+                gib: copy.gib,
+            },
+            None => SeenSnapshot::default(),
+        }
+    }
 }
 
 /// A storage backend. One implementation per real technology; the fake is what
@@ -51,18 +103,36 @@ pub struct PoolState {
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
     async fn observe(&self) -> Result<PoolState>;
-    /// Create the backing store. Cloning `source_image` is part of creating it,
-    /// never a step afterwards — a volume that exists blank for one pass is a
-    /// volume a guest can be started from.
+    /// Create the backing store, from whatever `source` says it starts as.
+    ///
+    /// Cloning is part of creating it, never a step afterwards — a volume that
+    /// exists blank for one pass is a volume a guest can be started from, and
+    /// the guest that boots it finds nothing.
+    ///
+    /// Takes the model's own [`VolumeSource`] rather than a pair of options, so
+    /// "an image" and "a snapshot" cannot both be set by a caller that has not
+    /// thought about which wins.
     async fn provision(
         &self,
         volume: &str,
         gib: u64,
-        source_image: Option<&str>,
+        source: &VolumeSource,
         encryption_key: Option<&str>,
     ) -> Result<()>;
     async fn grow(&self, volume: &str, to_gib: u64) -> Result<()>;
     async fn destroy(&self, volume: &str) -> Result<()>;
+
+    /// Copy `volume` as it stands, under this name.
+    ///
+    /// Not "start copying": when this returns the copy is a copy of the moment
+    /// it was asked for. A backend that returned early would have the pool
+    /// report `taken` over a half-written file, and `reconcile_snapshot`
+    /// deliberately never takes a snapshot twice — so a copy reported before it
+    /// is one is a copy that is wrong for ever.
+    async fn take_snapshot(&self, snapshot: &str, volume: &str) -> Result<()>;
+
+    /// Destroy the copy. The volume it was taken from is untouched.
+    async fn destroy_snapshot(&self, snapshot: &str) -> Result<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -87,21 +157,44 @@ impl PoolConfig {
 pub struct PoolAgent {
     config: PoolConfig,
     writer: Writer,
+    /// Written, not read: what this pool reports about a volume it holds. What
+    /// it is *told* about comes through `cell`.
     volumes: TypedStore<VolumeSpec, VolumeStatus>,
+    snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
     pools: TypedStore<PoolSpec, PoolStatus>,
+    /// Everything this pool reads about the cell — the only thing that grew with
+    /// the cell rather than with this pool's own work. See [`crate::cell`].
+    cell: Arc<dyn PoolReader>,
     storage: Arc<dyn Storage>,
 }
 
 impl PoolAgent {
+    /// Reads the store directly. [`PoolAgent::reading`] is the same agent
+    /// pointed at something that hands it only its own share.
     pub fn new(store: Arc<dyn Store>, config: PoolConfig, storage: Arc<dyn Storage>) -> Self {
+        let reader = Arc::new(crate::cell::StorePool::new(
+            store.clone(),
+            &config.placement.cell,
+        ));
+        Self::reading(store, config, storage, reader)
+    }
+
+    pub fn reading(
+        store: Arc<dyn Store>,
+        config: PoolConfig,
+        storage: Arc<dyn Storage>,
+        reader: Arc<dyn PoolReader>,
+    ) -> Self {
         let cell = config.placement.cell.clone();
         Self {
             // A pool writes under its own name, so a store refusal says which
             // pool tried — the same identity discipline as a node.
             writer: Writer::agent(&config.pool),
             volumes: TypedStore::new(store.clone(), &cell, "volumes"),
+            snapshots: TypedStore::new(store.clone(), &cell, "snapshots"),
             pools: TypedStore::new(store, &cell, "pools"),
             config,
+            cell: reader,
             storage,
         }
     }
@@ -153,7 +246,7 @@ impl PoolAgent {
             }
         };
 
-        let volumes = match self.volumes.list().await {
+        let volumes = match self.cell.volumes().await {
             Ok(volumes) => volumes,
             Err(e) => {
                 tracing::error!(error = %e, "could not list volumes");
@@ -163,6 +256,23 @@ impl PoolAgent {
         };
         for volume in volumes.iter().filter(|v| v.spec.pool == self.config.pool) {
             self.volume_pass(volume, &seen, &mut pass).await;
+        }
+
+        // Volumes first, copies second: a snapshot is of a volume, and a copy
+        // asked for in the same pass that provisions its source would be a copy
+        // of something not there yet. The other order converges one pass sooner
+        // when a volume and its snapshots are deleted together, which is the
+        // cheaper of the two problems to have.
+        match self.cell.snapshots().await {
+            Ok(snapshots) => {
+                for snapshot in snapshots.iter().filter(|s| s.spec.pool == self.config.pool) {
+                    self.snapshot_pass(snapshot, &mut pass).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "could not list snapshots");
+                pass.failures += 1;
+            }
         }
 
         self.pool_pass(&volumes, &seen, &mut pass).await;
@@ -192,10 +302,7 @@ impl PoolAgent {
             }
         }
 
-        let here = SeenInPool {
-            exists: seen.volumes.contains_key(&name),
-            gib: seen.volumes.get(&name).copied().unwrap_or(0),
-        };
+        let here = seen.of(&name);
 
         let mut next = stored.clone();
         let mut trouble = None;
@@ -214,10 +321,7 @@ impl PoolAgent {
         // Re-read: acting changed the pool, and reporting the picture from
         // before it would be a status that describes a world one pass old.
         let after = match self.storage.observe().await {
-            Ok(after) => SeenInPool {
-                exists: after.volumes.contains_key(&name),
-                gib: after.volumes.get(&name).copied().unwrap_or(0),
-            },
+            Ok(after) => after.of(&name),
             Err(e) => {
                 tracing::error!(error = %e, "could not re-read this pool after acting");
                 pass.failures += 1;
@@ -258,21 +362,115 @@ impl PoolAgent {
         reporting::report(&self.volumes, stored, next, &self.writer, pass).await;
     }
 
+    /// One snapshot: claim it, do what the model says, report what is there.
+    ///
+    /// The pool is re-observed rather than reasoned about, exactly as for a
+    /// volume — and here it matters more, because `status.taken` is the one
+    /// stored value the model *consults*. Setting it from what was attempted
+    /// rather than from what is there would make a failed copy permanent: a
+    /// snapshot that says `taken` is never taken again, on purpose, because a
+    /// copy made later is a copy of a different moment under a name somebody
+    /// trusts.
+    async fn snapshot_pass(&self, stored: &Snapshot, pass: &mut Pass) {
+        let name = stored.meta.name.to_string();
+
+        match stored.status.pool.as_deref() {
+            Some(owner) if owner == self.config.pool => {}
+            Some(_) => return,
+            None => {
+                let me = self.config.pool.clone();
+                reporting::claim(
+                    &self.snapshots,
+                    stored,
+                    |status| status.pool = Some(me),
+                    &self.writer,
+                    pass,
+                )
+                .await;
+                return;
+            }
+        }
+
+        // Read again rather than reuse the pass's picture: a volume acted on
+        // earlier in this same pass may have changed what is here, and taking a
+        // copy of a stale reading is how one gets made twice.
+        let before = match self.storage.observe().await {
+            Ok(seen) => seen.snapshot_of(&name),
+            Err(e) => {
+                tracing::error!(error = %e, "could not read this pool before a snapshot");
+                pass.failures += 1;
+                return;
+            }
+        };
+
+        let mut trouble = None;
+        for action in reconcile_snapshot(stored, before) {
+            let done = match &action {
+                SnapshotAction::Take { snapshot, volume } => {
+                    self.storage.take_snapshot(snapshot, volume).await
+                }
+                SnapshotAction::Destroy { snapshot } => {
+                    self.storage.destroy_snapshot(snapshot).await
+                }
+            };
+            match done {
+                Ok(()) => pass.actions += 1,
+                Err(e) => {
+                    tracing::warn!(snapshot = %name, error = %e, "this copy could not be brought into line");
+                    pass.failures += 1;
+                    trouble = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+
+        let after = match self.storage.observe().await {
+            Ok(seen) => seen.snapshot_of(&name),
+            Err(e) => {
+                tracing::error!(error = %e, "could not re-read this pool after a snapshot");
+                pass.failures += 1;
+                before
+            }
+        };
+
+        let mut next = stored.clone();
+        next.status.taken = after.exists;
+        next.status.size_gib = after.gib;
+        next.status.observed_generation = stored.meta.generation;
+        set_condition(
+            &mut next.status.conditions,
+            match trouble {
+                Some(why) => Condition::new(
+                    "Ready",
+                    ConditionStatus::False,
+                    "PoolFailed",
+                    &why,
+                    stored.meta.generation,
+                ),
+                None => snapshot_condition(stored, after),
+            },
+        );
+        set_condition(
+            &mut next.status.conditions,
+            release_condition(
+                !after.exists,
+                stored.meta.is_deleting(),
+                stored.meta.generation,
+            ),
+        );
+        reporting::report(&self.snapshots, stored, next, &self.writer, pass).await;
+    }
+
     async fn perform(&self, action: &VolumeAction) -> Result<()> {
         match action {
             VolumeAction::Provision {
                 volume,
                 gib,
-                source_image,
+                source,
                 encryption_key,
             } => {
                 self.storage
-                    .provision(
-                        volume,
-                        *gib,
-                        source_image.as_deref(),
-                        encryption_key.as_deref(),
-                    )
+                    .provision(volume, *gib, source, encryption_key.as_deref())
                     .await
             }
             VolumeAction::Grow { volume, to_gib } => self.storage.grow(volume, *to_gib).await,
@@ -380,6 +578,10 @@ struct FakeInner {
     /// What each volume was cloned from, so a test can prove a bootable volume
     /// was never briefly blank.
     from_image: BTreeMap<String, String>,
+    /// The same, for volumes made from a snapshot.
+    from_snapshot: BTreeMap<String, String>,
+    /// Every copy this fake holds.
+    snapshots: BTreeMap<String, SnapshotInPool>,
     encrypted: BTreeMap<String, String>,
 }
 
@@ -430,6 +632,22 @@ impl FakePool {
         self.inner.lock().unwrap().volumes.remove(volume);
     }
 
+    /// The same for a copy — which is the more interesting case, because the
+    /// model refuses to take it again.
+    pub fn vanish_snapshot(&self, snapshot: &str) {
+        self.inner.lock().unwrap().snapshots.remove(snapshot);
+    }
+
+    pub fn has_snapshot(&self, snapshot: &str) -> bool {
+        self.inner.lock().unwrap().snapshots.contains_key(snapshot)
+    }
+
+    /// The volume a copy was taken from, so a test can prove it was taken from
+    /// the right one.
+    pub fn snapshot_of(&self, snapshot: &str) -> Option<SnapshotInPool> {
+        self.inner.lock().unwrap().snapshots.get(snapshot).cloned()
+    }
+
     fn fault(&self, what: &str, target: &str) -> Result<()> {
         let inner = self.inner.lock().unwrap();
         for key in [format!("{what}:{target}"), format!("{what}:")] {
@@ -450,6 +668,7 @@ impl Storage for FakePool {
             volumes: inner.volumes.clone(),
             capacity_gib: inner.capacity_gib,
             backend: "fake".to_string(),
+            snapshots: inner.snapshots.clone(),
         })
     }
 
@@ -457,16 +676,34 @@ impl Storage for FakePool {
         &self,
         volume: &str,
         gib: u64,
-        source_image: Option<&str>,
+        source: &VolumeSource,
         encryption_key: Option<&str>,
     ) -> Result<()> {
         self.fault("provision", volume)?;
         let mut inner = self.inner.lock().unwrap();
+        // A volume made from a snapshot that this pool does not hold is not an
+        // empty volume, it is a mistake — and a fake that quietly made one
+        // anyway could not be used to prove the platform refuses it.
+        if let VolumeSource::Snapshot(snapshot) = source
+            && !inner.snapshots.contains_key(snapshot)
+        {
+            return Err(HostError::failed(format!(
+                "{snapshot} is not in this pool, so nothing can be copied from it"
+            )));
+        }
         inner.volumes.insert(volume.to_string(), gib);
-        if let Some(image) = source_image {
-            inner
-                .from_image
-                .insert(volume.to_string(), image.to_string());
+        match source {
+            VolumeSource::Image(image) => {
+                inner
+                    .from_image
+                    .insert(volume.to_string(), image.to_string());
+            }
+            VolumeSource::Snapshot(snapshot) => {
+                inner
+                    .from_snapshot
+                    .insert(volume.to_string(), snapshot.to_string());
+            }
+            VolumeSource::Blank => {}
         }
         if let Some(key) = encryption_key {
             inner.encrypted.insert(volume.to_string(), key.to_string());
@@ -493,6 +730,33 @@ impl Storage for FakePool {
         self.inner.lock().unwrap().volumes.remove(volume);
         Ok(())
     }
+
+    async fn take_snapshot(&self, snapshot: &str, volume: &str) -> Result<()> {
+        self.fault("take_snapshot", snapshot)?;
+        let mut inner = self.inner.lock().unwrap();
+        // A copy of nothing is not an empty copy, it is a mistake — and a fake
+        // that made one anyway could not be used to prove the platform refuses
+        // it. Same shape as provisioning from a snapshot that is not here.
+        let Some(gib) = inner.volumes.get(volume).copied() else {
+            return Err(HostError::failed(format!(
+                "{volume} is not in this pool, so there is nothing to copy"
+            )));
+        };
+        inner.snapshots.insert(
+            snapshot.to_string(),
+            SnapshotInPool {
+                volume: volume.to_string(),
+                gib,
+            },
+        );
+        Ok(())
+    }
+
+    async fn destroy_snapshot(&self, snapshot: &str) -> Result<()> {
+        self.fault("destroy_snapshot", snapshot)?;
+        self.inner.lock().unwrap().snapshots.remove(snapshot);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +773,7 @@ mod tests {
 
     struct Cell {
         volumes: TypedStore<VolumeSpec, VolumeStatus>,
+        snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
         pools: TypedStore<PoolSpec, PoolStatus>,
         fake: FakePool,
     }
@@ -518,6 +783,7 @@ mod tests {
         let fake = FakePool::new(1000);
         let cell = Cell {
             volumes: TypedStore::new(store.clone(), "cell-1", "volumes"),
+            snapshots: TypedStore::new(store.clone(), "cell-1", "snapshots"),
             pools: TypedStore::new(store.clone(), "cell-1", "pools"),
             fake: fake.clone(),
         };
@@ -537,6 +803,7 @@ mod tests {
                     pool: pool.to_string(),
                     encryption_key: None,
                     source_image: None,
+                    source_snapshot: None,
                 },
                 VolumeStatus::default(),
             );
@@ -562,6 +829,32 @@ mod tests {
 
         async fn reload(&self) -> Volume {
             self.volumes.get(VOLUME).await.unwrap().unwrap()
+        }
+
+        async fn snapshot(&self, id: &str, pool: &str) -> Snapshot {
+            // Under the volume, because a snapshot's source is in its identity
+            // rather than in a field — `source_volume` reads the parent.
+            let mut s: Snapshot = Resource::new(
+                Meta::new(
+                    ResourceName::parse(&format!("{VOLUME}/snapshots/{id}")).unwrap(),
+                    Placement::new("eu", "cell-1"),
+                ),
+                SnapshotSpec {
+                    pool: pool.to_string(),
+                },
+                SnapshotStatus::default(),
+            );
+            s.meta.finalizers = vec![POOL_RELEASE_FINALIZER.to_string()];
+            self.snapshots.create(&s).await.unwrap();
+            self.reload_snapshot(id).await
+        }
+
+        async fn reload_snapshot(&self, id: &str) -> Snapshot {
+            self.snapshots
+                .get(&format!("{VOLUME}/snapshots/{id}"))
+                .await
+                .unwrap()
+                .unwrap()
         }
     }
 
@@ -593,10 +886,21 @@ mod tests {
             "the volume never caught up with its own spec"
         );
 
-        // Settled: a further pass writes nothing at all.
+        // Settled: nothing happens to the volume on a further pass.
+        //
+        // Asserted on the volume rather than on the pass's write count, because
+        // the pool's own object carries a heartbeat and that is *supposed* to be
+        // written every time. Counting all writes made this test pass only when
+        // two resyncs happened to land in the same millisecond — green on an
+        // idle machine, red under load, and about the clock either way.
+        let before = cell.reload().await;
         let quiet = agent.resync().await;
-        assert_eq!(quiet.actions, 0);
-        assert_eq!(quiet.reports, 0, "a settled volume was written to again");
+        let after = cell.reload().await;
+        assert_eq!(quiet.actions, 0, "a settled volume was acted on again");
+        assert_eq!(
+            before.meta.revision, after.meta.revision,
+            "a settled volume was written to again"
+        );
     }
 
     #[tokio::test]
@@ -802,6 +1106,217 @@ mod tests {
         let pass = agent.resync().await;
         assert_eq!(pass.failures, 1);
         assert_eq!(pass.actions, 0, "it acted on a picture it could not read");
+        // Zero writes is the right assertion *here*, unlike on a settled pass: a
+        // pool that cannot be read returns before it reaches its own object, so
+        // not even the heartbeat goes out. That silence is the point — a node
+        // reporting a heartbeat it could not verify would look alive.
         assert_eq!(pass.reports, 0);
+    }
+    // ---- copies ----------------------------------------------------------
+    //
+    // `reconcile_snapshot`, `snapshot_condition` and `source_volume` were
+    // written, reasoned about at length and fully tested in the model — and had
+    // no caller anywhere. A Snapshot could be created through the API and
+    // nothing on any machine would ever make one. These are the tests for the
+    // half that was missing.
+
+    #[tokio::test]
+    async fn a_snapshot_is_claimed_before_it_is_taken() {
+        let (cell, agent) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        cell.volume("pool-a", 100).await;
+        agent.resync().await; // claim the volume
+        agent.resync().await; // provision it
+        cell.snapshot("s1", "pool-a").await;
+
+        // Claiming touches nothing: a copy taken before ownership is settled is
+        // a copy two pools could each make under one name.
+        agent.resync().await;
+        assert_eq!(
+            cell.reload_snapshot("s1").await.status.pool.as_deref(),
+            Some("pool-a")
+        );
+        assert!(
+            !cell.fake.has_snapshot(&format!("{VOLUME}/snapshots/s1")),
+            "the pool copied before it owned the object"
+        );
+
+        agent.resync().await;
+        let after = cell.reload_snapshot("s1").await;
+        assert!(after.status.taken, "the copy was never made");
+        assert_eq!(
+            after.status.size_gib, 100,
+            "the copy does not know its size"
+        );
+        assert_eq!(
+            cell.fake
+                .snapshot_of(&format!("{VOLUME}/snapshots/s1"))
+                .map(|c| c.volume),
+            Some(VOLUME.to_string()),
+            "the copy was taken from the wrong volume"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_vanished_is_not_quietly_made_again() {
+        // The one property the model insists on and the reason `status.taken`
+        // is the only stored value it consults: a copy made now is a copy of a
+        // *different moment*, and it would wear the name of the one somebody is
+        // about to restore from. Losing the copy has to be said out loud.
+        let (cell, agent) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        cell.volume("pool-a", 100).await;
+        agent.resync().await;
+        agent.resync().await;
+        cell.snapshot("s1", "pool-a").await;
+        agent.resync().await;
+        agent.resync().await;
+        assert!(cell.reload_snapshot("s1").await.status.taken);
+
+        // Somebody with a shell removes it.
+        cell.fake.vanish_snapshot(&format!("{VOLUME}/snapshots/s1"));
+        agent.resync().await;
+
+        assert!(
+            !cell.fake.has_snapshot(&format!("{VOLUME}/snapshots/s1")),
+            "a lost copy was silently remade, of a different moment, under the same name"
+        );
+        let after = cell.reload_snapshot("s1").await;
+        assert!(!after.status.taken);
+        let ready = after
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Ready")
+            .expect("nothing said the copy was gone");
+        assert_eq!(ready.reason, "Vanished", "{ready:?}");
+    }
+
+    #[tokio::test]
+    async fn a_volume_is_not_destroyed_under_the_copies_taken_from_it() {
+        let (cell, agent) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        cell.volume("pool-a", 100).await;
+        agent.resync().await;
+        agent.resync().await;
+        cell.snapshot("s1", "pool-a").await;
+        agent.resync().await;
+        agent.resync().await;
+
+        // Delete the volume while the copy is still there.
+        let mut v = cell.reload().await;
+        v.meta.deleted_at = Some(Timestamp::now());
+        cell.volumes
+            .update(&v, &Writer::controller("test"))
+            .await
+            .unwrap();
+        agent.resync().await;
+
+        assert!(
+            cell.fake.has(VOLUME),
+            "the volume was destroyed while a copy is read through it"
+        );
+        let ready = cell
+            .reload()
+            .await
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Ready")
+            .cloned()
+            .expect("nothing said why the volume is still here");
+        assert!(
+            ready.message.contains("snapshots"),
+            "the refusal does not say what is holding it: {ready:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_copy_destroys_it_and_says_the_finalizer_may_go() {
+        let (cell, agent) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        cell.volume("pool-a", 100).await;
+        agent.resync().await;
+        agent.resync().await;
+        cell.snapshot("s1", "pool-a").await;
+        agent.resync().await;
+        agent.resync().await;
+
+        let mut s = cell.reload_snapshot("s1").await;
+        s.meta.deleted_at = Some(Timestamp::now());
+        cell.snapshots
+            .update(&s, &Writer::controller("test"))
+            .await
+            .unwrap();
+        agent.resync().await;
+
+        assert!(!cell.fake.has_snapshot(&format!("{VOLUME}/snapshots/s1")));
+        let after = cell.reload_snapshot("s1").await;
+        assert!(!after.status.taken);
+        let released = after
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Released")
+            .expect("nothing said whether the bytes are gone");
+        assert_eq!(
+            released.status,
+            ConditionStatus::True,
+            "the controller is never told it may drop the finalizer: {released:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_could_not_be_made_does_not_report_itself_made() {
+        // If a failed take set `taken`, the model would refuse to try again for
+        // ever — a snapshot that can never exist and can never be retried.
+        let (cell, agent) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        cell.volume("pool-a", 100).await;
+        agent.resync().await;
+        agent.resync().await;
+        cell.snapshot("s1", "pool-a").await;
+        agent.resync().await; // claim
+        cell.fake.fail(
+            "take_snapshot",
+            &format!("{VOLUME}/snapshots/s1"),
+            "the disks said no",
+        );
+        agent.resync().await;
+
+        let after = cell.reload_snapshot("s1").await;
+        assert!(
+            !after.status.taken,
+            "a copy that was never made says it was"
+        );
+        let ready = after
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Ready")
+            .expect("nothing said the copy failed");
+        assert!(ready.message.contains("the disks said no"), "{ready:?}");
+
+        // And it is retried once the pool is well again, which is the whole
+        // point of not having written `taken`.
+        cell.fake
+            .heal("take_snapshot", &format!("{VOLUME}/snapshots/s1"));
+        agent.resync().await;
+        assert!(cell.reload_snapshot("s1").await.status.taken);
+    }
+
+    #[tokio::test]
+    async fn a_copy_in_another_pool_is_left_alone() {
+        let (cell, agent) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        cell.volume("pool-a", 100).await;
+        agent.resync().await;
+        agent.resync().await;
+        cell.snapshot("s1", "pool-b").await;
+        agent.resync().await;
+        agent.resync().await;
+
+        assert!(!cell.fake.has_snapshot(&format!("{VOLUME}/snapshots/s1")));
+        assert_eq!(cell.reload_snapshot("s1").await.status.pool, None);
     }
 }

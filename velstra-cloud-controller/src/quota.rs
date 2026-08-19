@@ -12,8 +12,6 @@
 //! version is a project that cannot start anything because a counter says it is
 //! full and nothing in the system can prove otherwise.
 
-use std::sync::Arc;
-
 use velstra_cloud_model::{
     meta::{ResourceName, set_condition},
     reconcile::{count_quota, quota_condition},
@@ -21,21 +19,26 @@ use velstra_cloud_model::{
         InstanceSpec, InstanceStatus, Project, ProjectSpec, ProjectStatus, VolumeSpec, VolumeStatus,
     },
 };
-use velstra_cloud_store::{TypedStore, prefix_for};
+use velstra_cloud_store::{Cached, prefix_for};
 
 use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
 
 pub struct QuotaController {
-    instances: TypedStore<InstanceSpec, InstanceStatus>,
-    volumes: TypedStore<VolumeSpec, VolumeStatus>,
+    /// Cached rather than listed. Usage is counted per *project*, and a count
+    /// that lists the whole collection per project is projects × instances per
+    /// resync — measured at 16 040 reads for 400 instances over 40 projects in
+    /// `tests/scaling.rs`, against 42 at a twentieth the size. The same wall the
+    /// port controller hit, found by the same test, fixed the same way.
+    instances: Cached<InstanceSpec, InstanceStatus>,
+    volumes: Cached<VolumeSpec, VolumeStatus>,
     status: StatusWriter<ProjectSpec, ProjectStatus>,
     cell: String,
 }
 
 impl QuotaController {
     pub fn new(
-        instances: TypedStore<InstanceSpec, InstanceStatus>,
-        volumes: TypedStore<VolumeSpec, VolumeStatus>,
+        instances: Cached<InstanceSpec, InstanceStatus>,
+        volumes: Cached<VolumeSpec, VolumeStatus>,
         status: StatusWriter<ProjectSpec, ProjectStatus>,
         cell: &str,
     ) -> Self {
@@ -72,10 +75,7 @@ impl Reconciler for QuotaController {
         // is exactly how a project overshoots its limit.
         ["instances", "volumes"]
             .into_iter()
-            .map(|kind| Related {
-                prefix: prefix_for(&self.cell, kind),
-                map: Arc::new(owning_project),
-            })
+            .map(|kind| Related::named(prefix_for(&self.cell, kind), owning_project))
             .collect()
     }
 
@@ -84,8 +84,10 @@ impl Reconciler for QuotaController {
             return Ok(());
         };
 
-        let instances = self.instances.list().await?;
-        let volumes = self.volumes.list().await?;
+        let (instances, _) = self.instances.all().await;
+        let (volumes, _) = self.volumes.all().await;
+        let instances: Vec<_> = instances.iter().map(|i| (**i).clone()).collect();
+        let volumes: Vec<_> = volumes.iter().map(|v| (**v).clone()).collect();
         let used = count_quota(&project.meta.name, &instances, &volumes);
 
         let mut next = project.clone();
@@ -113,7 +115,7 @@ mod tests {
         meta::{Meta, Placement, condition},
         resources::{Quota, Resource},
     };
-    use velstra_cloud_store::{MemoryStore, Store};
+    use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
     use super::*;
 
@@ -142,14 +144,23 @@ mod tests {
                     display_name: "one".into(),
                     parent: "organizations/o1".into(),
                     quota: limit,
+                    bindings: Vec::new(),
                 },
                 ProjectStatus::default(),
             ))
             .await
             .unwrap();
         let controller = QuotaController::new(
-            f.instances.clone(),
-            f.volumes.clone(),
+            Cached::start(
+                f.instances.clone(),
+                raw.clone(),
+                prefix_for("cell-1", "instances"),
+            ),
+            Cached::start(
+                f.volumes.clone(),
+                raw.clone(),
+                prefix_for("cell-1", "volumes"),
+            ),
             StatusWriter::new(raw, "cell-1", "projects", "quota"),
             "cell-1",
         );
@@ -231,13 +242,22 @@ mod tests {
             )
             .await
             .unwrap();
-        controller
-            .reconcile("projects/p1", Some(&f.project().await))
-            .await
-            .unwrap();
-
-        // Recounted, not decremented. A decrement that is lost to a crash is a
-        // quota that shrinks a little every time something goes wrong.
+        // Recounted, not decremented — and now counted from a *cache*, which is
+        // eventually consistent. The reconcile is retried until the deletion has
+        // reached it, which is exactly what the loop's resync does in
+        // production: a count one event stale costs a pass, never a wrong
+        // number that persists. Asserting on the first pass would encode an
+        // immediacy the design deliberately does not promise.
+        for _ in 0..200 {
+            controller
+                .reconcile("projects/p1", Some(&f.project().await))
+                .await
+                .unwrap();
+            if f.project().await.status.used.instances == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         assert_eq!(f.project().await.status.used.instances, 0);
         assert_eq!(f.project().await.status.used.vcpus, 0);
     }

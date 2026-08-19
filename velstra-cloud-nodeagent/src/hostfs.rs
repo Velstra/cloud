@@ -26,6 +26,69 @@ use velstra_cloud_model::meta::Timestamp;
 
 use crate::host::{HostError, Result};
 
+/// Whose systemd runs the guests.
+///
+/// A production node runs them in the system manager, where a node's cgroup
+/// limits and its slice live. A development node has no root and must still be
+/// able to start something — and a platform whose data path can only be
+/// exercised as root is a platform almost nobody exercises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Scope {
+    #[default]
+    System,
+    /// `systemd-run --user`, so a guest can be started by whoever is logged in.
+    User,
+}
+
+impl Scope {
+    /// The flag this scope adds to every systemd call, if any. One place, so
+    /// the four call sites cannot drift into asking two different managers
+    /// about one unit — which reads as "the guest vanished".
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            Scope::System => None,
+            Scope::User => Some("--user"),
+        }
+    }
+}
+
+/// How a guest gets from powered-off to running its own code.
+///
+/// This used to be one `firmware: PathBuf` handed to both backends, and the two
+/// of them read it differently in a way nobody could see until a guest was
+/// actually started. Cloud Hypervisor's `--kernel` accepts either a Linux kernel
+/// or a firmware blob; QEMU's `-kernel` accepts **only** a kernel, and a
+/// firmware belongs on `-bios`. So the default — Cloud Hypervisor's
+/// `hypervisor-fw` — was being passed to QEMU as if it were a Linux kernel.
+///
+/// The observable result, on this machine, with a stock Alpine cloud image:
+/// nothing at all. No boot, and — because a directly-booted kernel gets no
+/// `console=` unless somebody supplies one — not one byte on the serial either.
+/// The same image booted in seconds through its own bootloader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Boot {
+    /// The guest boots itself: its own bootloader runs off its disk, and it
+    /// chooses its kernel, its root and its console. This is what every stock
+    /// cloud image expects, so it is the sane default for a platform that runs
+    /// images it did not build.
+    ///
+    /// `None` means the VMM's built-in firmware, which is the right answer for
+    /// QEMU (SeaBIOS) and not an answer at all for Cloud Hypervisor, which has
+    /// none and must be given one.
+    Firmware(Option<PathBuf>),
+    /// Direct kernel boot: the host supplies the kernel, and with it the command
+    /// line, because a kernel started this way has no bootloader to write one.
+    ///
+    /// The `cmdline` is not optional in practice even though the type allows an
+    /// empty one: without `root=` the kernel cannot mount anything, and without
+    /// `console=` it cannot say so.
+    Kernel {
+        kernel: PathBuf,
+        cmdline: String,
+        initrd: Option<PathBuf>,
+    },
+}
+
 /// Where a guest's things live and what it is called on this host.
 ///
 /// Shared by both backends: `binary` and `firmware` mean "the VMM" and "what it
@@ -40,12 +103,14 @@ pub struct Layout {
     pub incoming_dir: PathBuf,
     pub slice: String,
     pub binary: String,
-    /// Firmware or kernel to boot the guest with.
+    /// Which systemd starts the guests. See [`Scope`].
+    pub scope: Scope,
+    /// How a guest is started.
     ///
-    /// Both VMMs require this at the **same path on both machines** for a
-    /// migration: the guest's saved configuration names it, and the destination
-    /// resolves that name against its own filesystem.
-    pub firmware: PathBuf,
+    /// Whatever paths this names must exist at the **same place on both
+    /// machines** for a migration: the guest's saved configuration names them,
+    /// and the destination resolves those names against its own filesystem.
+    pub boot: Boot,
     /// What this node offers for guest disks. Not derivable from `std` without
     /// `statvfs`, so it is configured rather than guessed at.
     pub disk_gib: u64,
@@ -75,7 +140,10 @@ impl Default for Layout {
             incoming_dir: PathBuf::from("/var/lib/velstra/images/incoming"),
             slice: "velstra-vm.slice".to_string(),
             binary: "cloud-hypervisor".to_string(),
-            firmware: PathBuf::from("/usr/share/cloud-hypervisor/hypervisor-fw"),
+            scope: Scope::System,
+            boot: Boot::Firmware(Some(PathBuf::from(
+                "/usr/share/cloud-hypervisor/hypervisor-fw",
+            ))),
             disk_gib: 0,
             migration_address: None,
             migration_ports: 4900..4950,
@@ -92,6 +160,17 @@ impl Layout {
     pub fn disk(&self, instance: &str) -> PathBuf {
         self.dir(instance).join("root.raw")
     }
+
+    /// Where the guest's serial output is kept.
+    ///
+    /// Every guest gets one, always. Without it a guest that fails to boot says
+    /// nothing at all to anybody — the first time this platform started a real
+    /// image, the evidence that it had not booted was an empty file that did not
+    /// exist. A console is also the only thing that answers "why is it not
+    /// coming up" for an image the operator did not build.
+    pub fn console(&self, instance: &str) -> PathBuf {
+        self.dir(instance).join("console.log")
+    }
 }
 
 // ---- names ---------------------------------------------------------------
@@ -103,6 +182,27 @@ impl Layout {
 /// because a `ResourceName` may only hold `a-z`, `0-9`, `-`, `.` and `/`.
 pub fn slug(name: &str) -> String {
     name.replace('/', "~")
+}
+
+/// A resource name as a **systemd unit** name.
+///
+/// Not [`slug`], because systemd does not accept `~` in a unit name: it escapes
+/// it to `\x7e` and hands back
+/// `velstra-vm-projects\x7ep1\x7einstances\x7ei1.service`, which is what an
+/// operator then has to type, quote and read in `systemctl` output while trying
+/// to work out why a guest will not start. It works — systemd normalises both
+/// spellings — but every one of those is a place to get it wrong by hand.
+///
+/// `_` is in systemd's own allowed set, so nothing is escaped and the name says
+/// what it is. The path layout keeps `~`; only the unit changes, and the two
+/// have no reason to match.
+pub fn unit_slug(name: &str) -> String {
+    name.replace('/', "_")
+}
+
+/// The resource name a unit was made for.
+pub fn from_unit_slug(slug: &str) -> String {
+    slug.replace('_', "/")
 }
 
 pub fn unslug(slug: &str) -> String {
@@ -138,6 +238,16 @@ pub async fn sha256_file(path: &Path) -> Result<String> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect())
+}
+
+/// Where a verified image lives on this node, if it is here.
+///
+/// `None` means it has not been published, which the caller must treat as "not
+/// yet" rather than "boot without it": a disk made from no image is a disk with
+/// no operating system on it.
+pub fn image_path(layout: &Layout, image: &str) -> Option<PathBuf> {
+    let path = layout.image_dir.join(slug(image));
+    path.exists().then_some(path)
 }
 
 /// Verify bytes that arrived in `incoming` and publish them under their digest.
@@ -178,7 +288,12 @@ pub async fn publish_image(layout: &Layout, image: &str) -> Result<()> {
 }
 
 /// A sparse file of the asked-for size, made once.
-pub async fn create_disk(layout: &Layout, instance: &str, gib: u64) -> Result<()> {
+pub async fn create_disk(
+    layout: &Layout,
+    instance: &str,
+    gib: u64,
+    image: Option<&Path>,
+) -> Result<()> {
     let dir = layout.dir(instance);
     std::fs::create_dir_all(&dir)?;
     let path = layout.disk(instance);
@@ -186,10 +301,28 @@ pub async fn create_disk(layout: &Layout, instance: &str, gib: u64) -> Result<()
         return Ok(());
     }
     // Written under a temporary name and renamed, so an interrupted creation
-    // cannot leave a short disk that looks finished.
+    // cannot leave a short disk that looks finished — and, now that the image
+    // is copied in, cannot leave a *half-copied* one that looks bootable.
     let partial = dir.join("root.raw.partial");
-    let file = std::fs::File::create(&partial)?;
-    file.set_len(gib.saturating_mul(1024 * 1024 * 1024))?;
+    match image {
+        // The disk starts life as the image. Nothing between "created" and
+        // "has an operating system on it": a guest started off an empty disk
+        // fails in the least legible way there is, and before this the image
+        // was pulled, verified, and then never used for anything.
+        Some(image) => {
+            std::fs::copy(image, &partial)?;
+        }
+        None => {
+            std::fs::File::create(&partial)?;
+        }
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(&partial)?;
+    // Grow, never shrink: the image may already be larger than the size asked
+    // for, and truncating it would cut the filesystem off at the knees.
+    let wanted = gib.saturating_mul(1024 * 1024 * 1024);
+    if file.metadata()?.len() < wanted {
+        file.set_len(wanted)?;
+    }
     file.sync_all()?;
     std::fs::rename(&partial, &path)?;
     Ok(())
@@ -235,6 +368,7 @@ pub fn started_at(dir: &Path) -> Option<Timestamp> {
 /// time: the unit's parent is systemd, so restarting or upgrading the agent
 /// cannot take a tenant's workload — or a transfer half way through — with it.
 pub async fn systemd_run(
+    scope: Scope,
     unit: &str,
     slice: &str,
     dir: &Path,
@@ -242,6 +376,9 @@ pub async fn systemd_run(
     args: &[OsString],
 ) -> Result<()> {
     let mut command = tokio::process::Command::new("systemd-run");
+    if let Some(flag) = scope.flag() {
+        command.arg(flag);
+    }
     command
         .arg("--collect")
         .arg(format!("--unit={unit}"))
@@ -270,8 +407,12 @@ pub async fn systemd_run(
 /// **Untested:** needs systemd. This is how "is a receiver listening" is
 /// answered, and it must be a question rather than a memory: a receiver whose
 /// process died has to stop being ready on the very next pass.
-pub async fn unit_is_active(unit: &str) -> bool {
-    let Ok(output) = tokio::process::Command::new("systemctl")
+pub async fn unit_is_active(scope: Scope, unit: &str) -> bool {
+    let mut command = tokio::process::Command::new("systemctl");
+    if let Some(flag) = scope.flag() {
+        command.arg(flag);
+    }
+    let Ok(output) = command
         .arg("is-active")
         .arg(format!("{unit}.service"))
         .output()
@@ -285,8 +426,12 @@ pub async fn unit_is_active(unit: &str) -> bool {
 /// One property of a unit, as systemd prints it.
 ///
 /// **Untested:** needs systemd.
-pub async fn unit_property(unit: &str, property: &str) -> Option<String> {
-    let output = tokio::process::Command::new("systemctl")
+pub async fn unit_property(scope: Scope, unit: &str, property: &str) -> Option<String> {
+    let mut command = tokio::process::Command::new("systemctl");
+    if let Some(flag) = scope.flag() {
+        command.arg(flag);
+    }
+    let output = command
         .arg("show")
         .arg(format!("--property={property}"))
         .arg("--value")
@@ -301,8 +446,8 @@ pub async fn unit_property(unit: &str, property: &str) -> Option<String> {
 /// Ask systemd for the process, rather than remembering it.
 ///
 /// **Untested:** needs a systemd unit.
-pub async fn main_pid(unit: &str) -> Option<u32> {
-    let pid: u32 = unit_property(unit, "MainPID").await?.parse().ok()?;
+pub async fn main_pid(scope: Scope, unit: &str) -> Option<u32> {
+    let pid: u32 = unit_property(scope, unit, "MainPID").await?.parse().ok()?;
     (pid != 0).then_some(pid)
 }
 
@@ -310,14 +455,18 @@ pub async fn main_pid(unit: &str) -> Option<u32> {
 /// asked for the last time it started something.
 ///
 /// **Untested:** needs systemd. What it is *for* is tested: see [`url_in`].
-pub async fn unit_command(unit: &str) -> Option<String> {
-    unit_property(unit, "ExecStart").await
+pub async fn unit_command(scope: Scope, unit: &str) -> Option<String> {
+    unit_property(scope, unit, "ExecStart").await
 }
 
 /// **Untested:** needs systemd. A unit that is already gone is the state that
 /// was wanted, so this reports nothing rather than failing.
-pub async fn stop_unit(unit: &str) {
-    let result = tokio::process::Command::new("systemctl")
+pub async fn stop_unit(scope: Scope, unit: &str) {
+    let mut command = tokio::process::Command::new("systemctl");
+    if let Some(flag) = scope.flag() {
+        command.arg(flag);
+    }
+    let result = command
         .arg("stop")
         .arg(format!("{unit}.service"))
         .output()
@@ -433,6 +582,29 @@ pub fn capacity(layout: &Layout) -> velstra_cloud_model::resources::Capacity {
 
 #[cfg(test)]
 mod tests {
+
+    /// A unit name systemd takes as written.
+    ///
+    /// Asserted against systemd's own allowed set rather than against `_`,
+    /// because the point is not the character — it is that nothing gets
+    /// escaped. With `~` the name came back as
+    /// `velstra-vm-projects\x7ep1\x7einstances\x7ei1.service`, which is what an
+    /// operator then has to read and quote while working out why a guest will
+    /// not start.
+    #[test]
+    fn a_unit_name_needs_no_escaping_and_survives_the_round_trip() {
+        let name = "projects/p1/instances/i1";
+        let unit = unit_slug(name);
+        assert_eq!(from_unit_slug(&unit), name);
+        assert!(
+            unit.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '@')),
+            "systemd would escape {unit}"
+        );
+        // The path layout is a different question and keeps its own separator:
+        // nothing requires the two to agree, and `~` reads better in a path.
+        assert!(slug(name).contains('~'));
+    }
     use super::*;
 
     #[test]

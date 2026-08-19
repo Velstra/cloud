@@ -310,10 +310,23 @@ pub fn reconcile_destination(
     migration: &Migration,
     instance: Option<&Instance>,
     receiver_listening: bool,
+    here: bool,
 ) -> Vec<DestinationAction> {
-    let arrived = instance
-        .map(|i| i.status.node.as_deref() == Some(migration.spec.to_node.as_str()))
-        .unwrap_or(false);
+    // Whether the guest is **on this machine**, read from the machine — the same
+    // source of truth `reconcile_source` uses, and for a sharper reason here.
+    //
+    // This used to be `instance.status.node == to_node`, and that could not work
+    // on a real hypervisor: the destination writes `status.node` when it claims
+    // the *object*, which the handover has it do before the guest arrives. So
+    // the moment it claimed, it believed the guest had landed, tore down its own
+    // receiver, and nothing could ever arrive — a deadlock the fake never showed
+    // because in one process the guest appears on the destination at the same
+    // instant the claim does.
+    //
+    // `status.node` answers "who speaks for this object". Only the machine
+    // answers "is the guest here", and the two are not the same question.
+    let _ = instance;
+    let arrived = here;
 
     // Finished, or asked to go away: nothing should be left listening. A
     // receiver kept alive holds the guest's memory reservation on a node that
@@ -668,7 +681,8 @@ mod tests {
             reconcile_destination(
                 &m,
                 Some(&instance(InstanceState::Running, Some("node-a"))),
-                false
+                false,
+                false,
             ),
             vec![DestinationAction::PrepareReceiver {
                 instance: "projects/p1/instances/i1".into(),
@@ -716,14 +730,29 @@ mod tests {
         let m = migration("node-b");
         let arrived_instance = instance(InstanceState::Running, Some("node-b"));
         assert_eq!(
-            reconcile_destination(&m, Some(&arrived_instance), true),
+            reconcile_destination(&m, Some(&arrived_instance), true, true),
             vec![DestinationAction::TearDownReceiver {
                 instance: "projects/p1/instances/i1".into()
             }]
         );
         // And once it is gone, the pass is empty — reconciling a finished
         // migration must cost nothing, or every resync churns.
-        assert!(reconcile_destination(&m, Some(&arrived_instance), false).is_empty());
+        assert!(reconcile_destination(&m, Some(&arrived_instance), false, true).is_empty());
+    }
+
+    #[test]
+    fn a_destination_that_has_claimed_the_object_keeps_listening() {
+        // The handover has the destination write `status.node` *before* the
+        // guest arrives. Reading that as "it is here" tore down the receiver the
+        // moment the claim landed, so nothing could ever arrive — and no test
+        // against a fake could show it, because in one process the guest appears
+        // at the same instant the claim does.
+        let m = migration("node-b");
+        let claimed = instance(InstanceState::Running, Some("node-b"));
+        assert!(
+            reconcile_destination(&m, Some(&claimed), true, false).is_empty(),
+            "the destination tore down its own receiver on the strength of its own claim"
+        );
     }
 
     #[test]
@@ -743,7 +772,8 @@ mod tests {
             reconcile_destination(
                 &m,
                 Some(&instance(InstanceState::Running, Some("node-a"))),
-                true
+                true,
+                false,
             ),
             vec![DestinationAction::TearDownReceiver {
                 instance: "projects/p1/instances/i1".into()
