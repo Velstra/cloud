@@ -32,7 +32,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use velstra_cloud_model::{
     migration::Migration,
-    resources::{Attachment, Instance, Network, Port, Subnet},
+    resources::{Attachment, Image, Instance, Network, Port, Subnet},
     security::SecurityGroup,
 };
 
@@ -255,6 +255,10 @@ impl CellReader for ApiCell {
     }
     async fn networks(&self) -> Result<Vec<Network>> {
         self.list("networks").await
+    }
+
+    async fn images(&self) -> Result<Vec<Image>> {
+        self.list("images").await
     }
 
     async fn wake(&self) -> tokio::sync::mpsc::Receiver<()> {

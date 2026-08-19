@@ -19,9 +19,9 @@ use velstra_cloud_model::{
     meta::{Meta, Placement, ResourceName, Revision, Timestamp},
     migration::{Migration, MigrationSpec, MigrationStatus},
     resources::{
-        Attachment, AttachmentSpec, AttachmentStatus, Instance, InstanceSpec, InstanceStatus,
-        NODE_RELEASE_FINALIZER, NetworkSpec, NetworkStatus, Node, NodeSpec, NodeStatus, Port,
-        PortSpec, PortStatus, Resource, SubnetSpec, SubnetStatus,
+        Attachment, AttachmentSpec, AttachmentStatus, ImageFormat, ImageSpec, ImageStatus,
+        Instance, InstanceSpec, InstanceStatus, NODE_RELEASE_FINALIZER, NetworkSpec, NetworkStatus,
+        Node, NodeSpec, NodeStatus, Port, PortSpec, PortStatus, Resource, SubnetSpec, SubnetStatus,
     },
     security::{SecurityGroupSpec, SecurityGroupStatus, SecurityRule},
 };
@@ -192,8 +192,39 @@ pub async fn create_instance(
             ..Default::default()
         },
     );
+    // The image this instance names has to exist as an object, not only as a
+    // string in the spec: a node fetches from the registered image's
+    // `source_url`, so an instance pointing at an unregistered image can never
+    // boot. Registered here, idempotently, because every instance in these
+    // tests boots the same one.
+    register_image(store, IMAGE).await;
     instances(store).create(&instance).await.unwrap();
     instance
+}
+
+/// Register the image the instances here boot from, if it is not already there.
+///
+/// `file://` because these tests drive the fake VMM, which does not fetch. What
+/// they exercise is that the node is told *where* to look — the field that was
+/// carried on the wire, shown in the console, and read by nothing until the
+/// agent learned to resolve it.
+pub async fn register_image(store: &Arc<dyn Store>, name: &str) {
+    let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store.clone(), CELL, "images");
+    if images.get(name).await.ok().flatten().is_some() {
+        return;
+    }
+    let image = Resource::new(
+        meta(name),
+        ImageSpec {
+            digest: "sha256-abc".into(),
+            format: ImageFormat::Raw,
+            size_bytes: 1024,
+            source_url: "file:///var/lib/velstra/images/abc.raw".into(),
+            signature: None,
+        },
+        ImageStatus::default(),
+    );
+    let _ = images.create(&image).await;
 }
 
 /// The network and subnet every port here names.

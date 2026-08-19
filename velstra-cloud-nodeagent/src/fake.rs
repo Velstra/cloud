@@ -63,6 +63,9 @@ struct Machine {
     vms: BTreeMap<String, VmObservation>,
     disks: BTreeSet<String>,
     images: BTreeSet<String>,
+    /// Where each pulled image was told to come from, so a test can assert the
+    /// node was handed the *right* source and not merely that it pulled.
+    pulled_from: BTreeMap<String, String>,
     volumes: BTreeMap<String, String>,
     receivers: BTreeMap<String, Receiver>,
     /// Transfers this machine has begun and not yet finished, and where each
@@ -229,6 +232,15 @@ impl FakeVmm {
             .insert(digest.to_string());
     }
 
+    /// Where this machine was told to fetch `image` from, if it pulled it.
+    ///
+    /// The question a test has to be able to ask: not "did it pull" but "was it
+    /// handed the source the operator registered". Pulling from the wrong place
+    /// and pulling from nowhere look identical from the outside otherwise.
+    pub fn pulled_from(&self, image: &str) -> Option<String> {
+        self.machine.lock().unwrap().pulled_from.get(image).cloned()
+    }
+
     // ---- migration, from a test's side -----------------------------------
 
     /// Whether something is listening here for that guest right now.
@@ -365,8 +377,12 @@ impl Vmm for FakeVmm {
         })
     }
 
-    async fn pull_image(&self, digest: &str) -> Result<()> {
+    async fn pull_image(&self, digest: &str, source: &str) -> Result<()> {
+        // Recorded, so a test can assert the node was told *where* to fetch
+        // from and not merely that it tried: passing the wrong source is the
+        // failure this whole path exists to make impossible.
         let mut m = self.machine.lock().unwrap();
+        m.pulled_from.insert(digest.to_string(), source.to_string());
         check(&mut m, Fault::Pull, digest)?;
         m.images.insert(digest.to_string());
         Ok(())
@@ -736,7 +752,9 @@ mod tests {
     async fn a_guest_will_not_start_without_its_image_and_disk() {
         let vmm = FakeVmm::new();
         assert!(vmm.start(&request()).await.is_err());
-        vmm.pull_image("sha256:abc").await.unwrap();
+        vmm.pull_image("sha256:abc", "http://images.invalid/x")
+            .await
+            .unwrap();
         assert!(
             vmm.start(&request()).await.is_err(),
             "started without a disk"
@@ -757,7 +775,9 @@ mod tests {
         // The property the restart tests rest on: another handle sees the same
         // guests, because a node has one machine and not one per process.
         let vmm = FakeVmm::new();
-        vmm.pull_image("sha256:abc").await.unwrap();
+        vmm.pull_image("sha256:abc", "http://images.invalid/x")
+            .await
+            .unwrap();
         vmm.create_disk(
             "projects/p1/instances/i1",
             10,
@@ -775,7 +795,9 @@ mod tests {
     #[tokio::test]
     async fn a_crashed_guest_is_visible_as_failed_rather_than_absent() {
         let vmm = FakeVmm::new();
-        vmm.pull_image("sha256:abc").await.unwrap();
+        vmm.pull_image("sha256:abc", "http://images.invalid/x")
+            .await
+            .unwrap();
         vmm.create_disk(
             "projects/p1/instances/i1",
             10,

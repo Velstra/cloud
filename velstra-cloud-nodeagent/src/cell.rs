@@ -42,9 +42,9 @@ use async_trait::async_trait;
 use velstra_cloud_model::{
     migration::{Migration, MigrationSpec, MigrationStatus},
     resources::{
-        Attachment, AttachmentSpec, AttachmentStatus, Instance, InstanceSpec, InstanceStatus,
-        Network, NetworkSpec, NetworkStatus, Port, PortSpec, PortStatus, Subnet, SubnetSpec,
-        SubnetStatus,
+        Attachment, AttachmentSpec, AttachmentStatus, Image, ImageSpec, ImageStatus, Instance,
+        InstanceSpec, InstanceStatus, Network, NetworkSpec, NetworkStatus, Port, PortSpec,
+        PortStatus, Subnet, SubnetSpec, SubnetStatus,
     },
     security::{SecurityGroup, SecurityGroupSpec, SecurityGroupStatus},
 };
@@ -120,6 +120,14 @@ pub trait CellReader: Send + Sync + 'static {
     async fn security_groups(&self) -> Result<Vec<SecurityGroup>>;
     async fn subnets(&self) -> Result<Vec<Subnet>>;
     async fn networks(&self) -> Result<Vec<Network>>;
+    /// The registered images, which is where an image's *source* lives.
+    ///
+    /// A node verifies an image against the sha256 in its own name, but the
+    /// bytes have to come from somewhere, and that somewhere is a field on the
+    /// Image object. Without this the node could check an image and never
+    /// obtain one: `spec.source_url` was carried through the wire, shown in
+    /// the console, and read by nothing.
+    async fn images(&self) -> Result<Vec<Image>>;
 
     /// Woken whenever something this node has business with changes.
     ///
@@ -147,6 +155,7 @@ pub struct StoreCell {
     groups: TypedStore<SecurityGroupSpec, SecurityGroupStatus>,
     subnets: TypedStore<SubnetSpec, SubnetStatus>,
     networks: TypedStore<NetworkSpec, NetworkStatus>,
+    images: TypedStore<ImageSpec, ImageStatus>,
     migrations: TypedStore<MigrationSpec, MigrationStatus>,
 }
 
@@ -160,6 +169,7 @@ impl StoreCell {
             groups: TypedStore::new(store.clone(), cell, "security-groups"),
             subnets: TypedStore::new(store.clone(), cell, "subnets"),
             networks: TypedStore::new(store.clone(), cell, "networks"),
+            images: TypedStore::new(store.clone(), cell, "images"),
             migrations: TypedStore::new(store, cell, "migrations"),
         }
     }
@@ -206,6 +216,9 @@ impl CellReader for StoreCell {
             .list()
             .await
             .map_err(|e| failed("networks", e))
+    }
+    async fn images(&self) -> Result<Vec<Image>> {
+        self.images.list().await.map_err(|e| failed("images", e))
     }
 
     async fn wake(&self) -> tokio::sync::mpsc::Receiver<()> {

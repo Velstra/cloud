@@ -38,7 +38,8 @@ use velstra_cloud_model::{
     meta::{Condition, ConditionStatus, Meta, Placement, ResourceName, set_condition},
     migration::{MigrationSpec, MigrationStatus},
     resources::{
-        Capacity, InstanceSpec, InstanceState, InstanceStatus, Node, NodeSpec, NodeStatus, Resource,
+        Capacity, Image, ImageFormat, ImageSpec, ImageStatus, InstanceSpec, InstanceState,
+        InstanceStatus, Node, NodeSpec, NodeStatus, Resource,
     },
 };
 use velstra_cloud_nodeagent::{Agent, AgentConfig, FakeDatapath, FakeNetwork, FakeVmm, Fault};
@@ -46,6 +47,8 @@ use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
 const REGION: &str = "eu-central";
 const CELL: &str = "cell-1";
+/// The image every instance in this file boots from.
+const IMAGE: &str = "projects/p1/images/sha256-abc";
 const TOKEN: &str = "e2e-token";
 
 /// Everything a cell is made of, sharing one store — which is the point: there
@@ -59,6 +62,7 @@ struct Cell {
     instances: TypedStore<InstanceSpec, InstanceStatus>,
     nodes: TypedStore<NodeSpec, NodeStatus>,
     migrations: TypedStore<MigrationSpec, MigrationStatus>,
+    images: TypedStore<ImageSpec, ImageStatus>,
     /// The wire between the machines. A migration is the one thing a node
     /// cannot do alone, so the fake hypervisors have to be able to reach each
     /// other or the interesting half of it is untested.
@@ -99,16 +103,22 @@ impl Cell {
             Arc::new(FakeDatapath::new()),
         );
 
-        Cell {
+        let cell = Cell {
             instances: TypedStore::new(store.clone(), CELL, "instances"),
             nodes: TypedStore::new(store.clone(), CELL, "nodes"),
             migrations: TypedStore::new(store.clone(), CELL, "migrations"),
+            images: TypedStore::new(store.clone(), CELL, "images"),
             store,
             address,
             agent,
             vmm,
             network,
-        }
+        };
+        // Registered here rather than per test: every instance in this file
+        // boots the same image, and an unregistered one is not a thing a node
+        // can obtain. See `register_image`.
+        cell.register_image(IMAGE).await;
+        cell
     }
 
     /// A second hypervisor in the same cell: same store, same network, its own
@@ -150,6 +160,33 @@ impl Cell {
     /// Register a hypervisor the way one registers itself: the node object is
     /// created by an operator (spec), and the agent reports what it has
     /// (status). Both halves, by their rightful writers.
+    /// Register the image every instance in this file boots from.
+    ///
+    /// Not decoration: a node fetches an image from the registered object's
+    /// `source_url`, so an instance naming an image that exists only as a
+    /// string in its spec can never boot. These tests used to do exactly that
+    /// and pass, because the node only ever needed the digest out of the name —
+    /// the source was carried on the wire, shown in the console, and read by
+    /// nothing. `file://` because the fake VMM does not fetch; what is being
+    /// exercised here is that the node is *told where to look*.
+    async fn register_image(&self, name: &str) {
+        let image: Image = Resource::new(
+            Meta::new(
+                ResourceName::parse(name).unwrap(),
+                Placement::new(REGION, CELL),
+            ),
+            ImageSpec {
+                digest: "sha256-abc".into(),
+                format: ImageFormat::Raw,
+                size_bytes: 1024,
+                source_url: "file:///var/lib/velstra/images/abc.raw".into(),
+                signature: None,
+            },
+            ImageStatus::default(),
+        );
+        self.images.create(&image).await.unwrap();
+    }
+
     async fn add_node(&self, id: &str, vcpus: u32, memory_mib: u64) {
         let mut node: Node = Resource::new(
             Meta::new(
@@ -317,7 +354,7 @@ async fn create_instance(cell: &Cell, id: &str) -> serde_json::Value {
                 "spec": {
                     "vcpus": 2,
                     "memoryMib": 2048,
-                    "image": "projects/p1/images/sha256-abc",
+                    "image": IMAGE,
                     "rootDiskGib": 20,
                     "desiredState": "Running",
                     "ports": []
@@ -442,7 +479,7 @@ async fn an_instance_that_cannot_be_placed_says_why_on_itself() {
                 "spec": {
                     "vcpus": 2,
                     "memoryMib": 999999,
-                    "image": "projects/p1/images/sha256-abc",
+                    "image": IMAGE,
                     "rootDiskGib": 20,
                     "desiredState": "Running",
                     "ports": []
@@ -529,7 +566,7 @@ async fn a_running_guest_moves_to_another_node_and_nobody_is_ever_in_two_places(
     // cannot start a receiver — and the platform refuses the migration rather
     // than finding out after the memory has been copied.
     for vmm in [&cell.vmm, &vmm_b] {
-        vmm.cache_image("projects/p1/images/sha256-abc");
+        vmm.cache_image(IMAGE);
     }
 
     create_instance(&cell, "i1").await;
@@ -639,7 +676,7 @@ async fn a_transfer_that_fails_leaves_the_guest_running_where_it_was() {
     // cannot start a receiver — and the platform refuses the migration rather
     // than finding out after the memory has been copied.
     for vmm in [&cell.vmm, &vmm_b] {
-        vmm.cache_image("projects/p1/images/sha256-abc");
+        vmm.cache_image(IMAGE);
     }
 
     create_instance(&cell, "i1").await;

@@ -404,8 +404,8 @@ impl Vmm for CloudHypervisorVmm {
     /// Verify bytes that arrived in `incoming` and publish them under their
     /// digest. Fetching them is somebody else's job — this node's job is to
     /// refuse to boot anything it has not hashed itself.
-    async fn pull_image(&self, image: &str) -> Result<()> {
-        hostfs::publish_image(&self.layout, image).await
+    async fn pull_image(&self, image: &str, source: &str) -> Result<()> {
+        hostfs::fetch_image(&self.layout, image, source).await
     }
 
     /// A sparse file of the asked-for size. Real, and covered by a test.
@@ -1065,7 +1065,10 @@ mod tests {
         let image = format!("projects/p1/images/sha256-{digest}");
         std::fs::write(vmm.layout.incoming_dir.join(slug(&image)), bytes).unwrap();
 
-        vmm.pull_image(&image).await.unwrap();
+        // The source names a file that does not exist: the copy already in
+        // `incoming` must be what is verified and published, and if the fetch
+        // were attempted anyway this would fail rather than pass quietly.
+        vmm.pull_image(&image, "file:///nonexistent").await.unwrap();
         assert!(vmm.observe().await.unwrap().images.contains(&image));
     }
 
@@ -1083,7 +1086,10 @@ mod tests {
         let arrived = vmm.layout.incoming_dir.join(slug(&image));
         std::fs::write(&arrived, b"something else entirely").unwrap();
 
-        let err = vmm.pull_image(&image).await.unwrap_err();
+        let err = vmm
+            .pull_image(&image, "file:///nonexistent")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("hashed to"), "{err}");
         assert!(
             vmm.observe().await.unwrap().images.is_empty(),
@@ -1098,7 +1104,10 @@ mod tests {
         // bytes is a node whose tenant isolation rests on the network alone.
         let scratch = Scratch::new("nodigest");
         let err = vmm(&scratch)
-            .pull_image("projects/p1/images/ubuntu-latest")
+            .pull_image(
+                "projects/p1/images/ubuntu-latest",
+                "http://images.invalid/x",
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("verify"), "{err}");

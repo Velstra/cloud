@@ -250,9 +250,138 @@ pub fn image_path(layout: &Layout, image: &str) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+/// Fetch an image from `source` into the incoming directory, then verify and
+/// publish it.
+///
+/// **The digest is the integrity control, not the transport.** The image's own
+/// resource name carries its `sha256:`, and [`publish_image`] below refuses
+/// anything that does not hash to it — so bytes that arrive over a plain,
+/// unauthenticated connection still cannot make this node boot something other
+/// than what the operator registered. That is the same property a container
+/// layer or a Nix fixed-output derivation relies on, and it is why fetching over
+/// `http://` is a defensible thing for this to do rather than a corner cut.
+/// What a transport would add is confidentiality and knowing *who* served the
+/// bytes; neither changes what gets booted.
+///
+/// Nothing is fetched when a verified copy is already published — an image is
+/// content-addressed, so "already here" is a complete answer.
+pub async fn fetch_image(layout: &Layout, image: &str, source: &str) -> Result<()> {
+    let name = slug(image);
+    if layout.image_dir.join(&name).exists() {
+        return Ok(());
+    }
+    // Refuse an image whose name carries no digest before spending a download on
+    // it: publish would refuse it afterwards anyway, and saying so first costs
+    // the operator a wait rather than a gigabyte.
+    digest_of(image).ok_or_else(|| {
+        HostError::failed(format!(
+            "{image} carries no sha256 digest in its name, so this node cannot verify it"
+        ))
+    })?;
+
+    let incoming = layout.incoming_dir.join(&name);
+    if incoming.exists() {
+        // A copy is already here — from a previous attempt, or placed by hand.
+        // Verification below is what decides whether it is usable.
+        return publish_image(layout, image).await;
+    }
+    std::fs::create_dir_all(&layout.incoming_dir)?;
+
+    // Downloaded to a private name and renamed into place, so a second agent
+    // pass never reads a half-written file and calls it "already arrived".
+    let partial = layout.incoming_dir.join(format!("{name}.partial"));
+    let _ = std::fs::remove_file(&partial);
+    match source.split_once("://") {
+        Some(("file", path)) => {
+            // A pre-seeded or shared-storage deployment: the bytes are already
+            // on a filesystem this node can see. Copied rather than linked —
+            // publish renames, and renaming a hard link would move the
+            // operator's own file out from under them.
+            tokio::fs::copy(path, &partial)
+                .await
+                .map_err(|e| HostError::failed(format!("copying {image} from {path}: {e}")))?;
+        }
+        Some(("http", _)) => fetch_http(source, &partial).await?,
+        Some(("https", _)) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(HostError::failed(format!(
+                "{image} is served over https and this agent has no TLS support                  built in; publish it over http (the sha256 in its name is what                  makes that safe) or place it on a path reachable as file://"
+            )));
+        }
+        _ => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(HostError::failed(format!(
+                "{image} has source {source:?}, which names no scheme this agent                  can fetch (http:// or file://)"
+            )));
+        }
+    }
+    std::fs::rename(&partial, &incoming)?;
+    publish_image(layout, image).await
+}
+
+/// Stream an `http://` URL into `dest`.
+///
+/// Streamed rather than buffered: an image is measured in gigabytes and this
+/// runs on a hypervisor whose memory belongs to the guests.
+async fn fetch_http(url: &str, dest: &Path) -> Result<()> {
+    use http_body_util::BodyExt;
+    use tokio::io::AsyncWriteExt;
+
+    let uri: hyper::Uri = url
+        .parse()
+        .map_err(|e| HostError::failed(format!("{url} is not a URL: {e}")))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| HostError::failed(format!("{url} names no host")))?;
+    let port = uri.port_u16().unwrap_or(80);
+    let stream = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| HostError::failed(format!("connecting to {host}:{port}: {e}")))?;
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| HostError::failed(format!("http handshake with {host}: {e}")))?;
+    // The connection task ends when the response body is done; a failure there
+    // surfaces as a short read below rather than being swallowed here.
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let path = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let request = hyper::Request::builder()
+        .uri(path)
+        .header(hyper::header::HOST, host)
+        .body(String::new())
+        .map_err(|e| HostError::failed(format!("building request for {url}: {e}")))?;
+    let mut response = sender
+        .send_request(request)
+        .await
+        .map_err(|e| HostError::failed(format!("fetching {url}: {e}")))?;
+    if !response.status().is_success() {
+        return Err(HostError::failed(format!(
+            "fetching {url}: the server answered {}",
+            response.status()
+        )));
+    }
+
+    let mut file = tokio::fs::File::create(dest).await?;
+    while let Some(frame) = response.frame().await {
+        let frame = frame.map_err(|e| HostError::failed(format!("reading {url}: {e}")))?;
+        if let Some(chunk) = frame.data_ref() {
+            file.write_all(chunk).await?;
+        }
+    }
+    file.flush().await?;
+    Ok(())
+}
+
 /// Verify bytes that arrived in `incoming` and publish them under their digest.
 ///
-/// Fetching them is somebody else's job — this node's job is to refuse to boot
+/// Fetching them is [`fetch_image`]'s job; this one's is to refuse to boot
 /// anything it has not hashed itself. Identical on both backends because it is
 /// about bytes on a disk and not about a hypervisor.
 pub async fn publish_image(layout: &Layout, image: &str) -> Result<()> {
