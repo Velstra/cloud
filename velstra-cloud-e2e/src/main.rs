@@ -85,6 +85,7 @@ async fn main() {
     let address = Arc::new(AddressController::new(
         ports.clone(),
         TypedStore::new(store.clone(), CELL, "subnets"),
+        TypedStore::new(store.clone(), CELL, "floatingips"),
         StatusWriter::new(store.clone(), CELL, "ports", "address"),
         CELL,
     ));

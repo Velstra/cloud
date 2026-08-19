@@ -21,13 +21,23 @@ pub mod pb {
 
 pub use pb::velstra_orchestrator_client::VelstraOrchestratorClient as Client;
 
+/// The client as [`connect`] hands it back.
+///
+/// Re-exported as a name of its own because a caller that keeps one — a
+/// controller that makes several calls in a pass — otherwise has to spell
+/// `tonic::transport::Channel`, and would need tonic as a dependency to say a
+/// type it never constructs.
+pub type Connected = Client<tonic::transport::Channel>;
+
+/// Re-exported so a caller can name a refusal without depending on tonic
+/// directly: every method on [`Connected`] fails with one.
+pub use tonic::Status;
+
 /// Connect to the fabric's orchestrator.
 ///
 /// A plain helper rather than a wrapper type: every caller wants the generated
 /// client, and a type that only forwarded to it would be one more thing to read
 /// before finding out it does nothing.
-pub async fn connect(
-    endpoint: &str,
-) -> Result<Client<tonic::transport::Channel>, tonic::transport::Error> {
+pub async fn connect(endpoint: &str) -> Result<Connected, tonic::transport::Error> {
     Client::connect(endpoint.to_string()).await
 }

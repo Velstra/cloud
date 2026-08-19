@@ -23,10 +23,11 @@ use velstra_cloud_model::{
     meta::{ResourceName, Revision},
     migration::{MigrationSpec, MigrationStatus},
     resources::{
-        AttachmentSpec, AttachmentStatus, ImageSpec, ImageStatus, InstanceSpec, InstanceStatus,
-        NetworkSpec, NetworkStatus, NodeSpec, NodeStatus, Operation, OperationSpec,
-        OperationStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus, Resource, SnapshotSpec,
-        SnapshotStatus, SubnetSpec, SubnetStatus, VolumeSpec, VolumeStatus,
+        AttachmentSpec, AttachmentStatus, FloatingIpSpec, FloatingIpStatus, ImageSpec, ImageStatus,
+        InstanceSpec, InstanceStatus, NetworkSpec, NetworkStatus, NodeSpec, NodeStatus, Operation,
+        OperationSpec, OperationStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus, Resource,
+        RouterSpec, RouterStatus, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus,
+        VolumeSpec, VolumeStatus,
     },
 };
 use velstra_cloud_proto::v1::{
@@ -454,6 +455,25 @@ service! {
             create: create_network, create_request: CreateNetworkRequest, id_field: network_id,
             update: update_network, update_request: UpdateNetworkRequest,
             delete: delete_network, watch: watch_networks, stream: WatchNetworksStream,
+        },
+        {
+            kind: "routers", spec: RouterSpec, status: RouterStatus,
+            message: Router, event: RouterEvent, resource_field: router,
+            get: get_router, list: list_routers, list_response: ListRoutersResponse, list_field: routers,
+            create: create_router, create_request: CreateRouterRequest, id_field: router_id,
+            update: update_router, update_request: UpdateRouterRequest,
+            delete: delete_router, watch: watch_routers, stream: WatchRoutersStream,
+        },
+        {
+            kind: "floatingips", spec: FloatingIpSpec, status: FloatingIpStatus,
+            message: FloatingIp, event: FloatingIpEvent, resource_field: floating_ip,
+            get: get_floating_ip, list: list_floating_ips,
+            list_response: ListFloatingIpsResponse, list_field: floating_ips,
+            create: create_floating_ip, create_request: CreateFloatingIpRequest,
+            id_field: floating_ip_id,
+            update: update_floating_ip, update_request: UpdateFloatingIpRequest,
+            delete: delete_floating_ip, watch: watch_floating_ips,
+            stream: WatchFloatingIpsStream,
         },
         {
             kind: "subnets", spec: SubnetSpec, status: SubnetStatus,

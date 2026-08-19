@@ -423,6 +423,143 @@ pub const POOL_RELEASE_FINALIZER: &str = "pool.velstra.io/release";
 
 // ---- snapshot ------------------------------------------------------------
 
+/// A tenant's router: the networks whose subnets reach each other.
+///
+/// Without one, a project's networks are separate L2 segments and a guest on one
+/// cannot reach a guest on another even inside the same project — which is right
+/// as a default (two segments a tenant made separate stay separate) and useless
+/// as the only option.
+///
+/// **A router is a membership, not a box.** There is no appliance to place, no
+/// interface to attach and nothing to fail over: the fabric implements it as an
+/// IP-VRF with an *anycast* gateway — the same gateway MAC and address on every
+/// host serving the tenant — so a guest keeps its default-gateway ARP entry when
+/// it migrates, and routing happens on whichever machine the packet is already
+/// on. Modelling it as a resource with a list of networks says exactly that and
+/// nothing that is not true.
+///
+/// A network belongs to at most one router. Two routers claiming one network
+/// would be two answers to "where does this subnet's traffic go", and the fabric
+/// refuses it for the same reason.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouterSpec {
+    /// The networks that route to each other, by resource name.
+    ///
+    /// Order does not matter and duplicates are not an error — this is a set
+    /// written as a list, because a list is what a person types and what every
+    /// other collection of names here is.
+    #[serde(default)]
+    pub networks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouterStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// The routed VNI the platform gave this router, in its own number space.
+    ///
+    /// Assigned rather than asked for, like a network's VNI: a tenant choosing
+    /// one would be choosing whether it collides.
+    pub l3_vni: u32,
+    /// The anycast gateway's hardware address, identical on every host serving
+    /// this tenant. Recorded because a person debugging an ARP table needs to
+    /// recognise it, and derived from the VNI so it is stable across a restart.
+    pub gateway_mac: String,
+}
+
+impl Observed for RouterStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    /// Nobody. A router is a cell-wide fact like the networks it joins — no
+    /// machine holds it, which is what lets a controller write its status.
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl Assigned for RouterSpec {}
+
+pub type Router = Resource<RouterSpec, RouterStatus>;
+
+/// A **floating IP**: an address that outlives the machine answering on it.
+///
+/// The point of one is that it is not a property of a port. A guest is
+/// rebuilt, replaced, or moved to a different instance entirely, and the
+/// address the outside world knows follows the operator's declaration rather
+/// than the machine — which is why `port` is a field a person edits and why
+/// detaching is an ordinary state rather than deletion.
+///
+/// The address itself comes from a subnet, allocated by the same counting the
+/// ports use, so a floating address and a port address are never the same
+/// address. That is the whole reason [`crate::ipam`] counts both: two
+/// allocators over one range is the defect this design exists to not have.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloatingIpSpec {
+    /// The subnet the address comes from, by resource name.
+    pub subnet: String,
+    /// The address, once something has decided it.
+    ///
+    /// `None` means "any", and a controller fills it in — the same arrangement
+    /// as a port's address, and written into `spec` for the same reason: it is
+    /// the thing a person may pin, so it must be a field they can write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// The port this address currently forwards to, by resource name. Empty
+    /// means allocated and pointing at nothing, which is a floating IP an
+    /// operator is holding on to — the reason to have one at all.
+    #[serde(default)]
+    pub port: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloatingIpStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// The id the fabric gave this address. Recorded because every later call
+    /// about it — associate, disassociate, release — is keyed on that id and
+    /// not on the address, so losing it would strand the allocation in the
+    /// fabric with nothing able to name it.
+    pub fabric_id: String,
+    /// The port's fixed address this is forwarding to right now, as the fabric
+    /// has it. Empty means not associated. It is the *observed* half of
+    /// `spec.port`: the two differing is what a reconcile is for.
+    pub associated: String,
+}
+
+impl Observed for FloatingIpStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    /// Nobody. A floating IP is a fabric-wide fact, not a machine's — the port
+    /// it points at may not even be placed yet.
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl Assigned for FloatingIpSpec {}
+
+/// Held while the fabric still holds this address.
+///
+/// The id needed to release an allocation lives on the object being deleted, so
+/// without a guard the record goes and the allocation stays — an address the
+/// fabric holds that nothing in the control plane can name, and a subnet that
+/// fills up for no visible reason.
+pub const FABRIC_RELEASE_FINALIZER: &str = "fabric.velstra.io/release";
+
+pub type FloatingIp = Resource<FloatingIpSpec, FloatingIpStatus>;
+
 /// A point-in-time copy of a volume, in that volume's own pool.
 ///
 /// **The source is in the name, not in a field.**

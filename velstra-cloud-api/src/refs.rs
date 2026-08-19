@@ -72,6 +72,14 @@ fn fields(kind: &str) -> &'static [(&'static str, Form)] {
             ("security_groups", Form::Name),
         ],
         "subnets" => &[("network", Form::Name)],
+        // Shape only, like a port's groups: a router may name a network that
+        // does not exist yet, and a network deleted out from under one leaves
+        // the router routing what remains rather than failing over.
+        "routers" => &[("networks", Form::Name)],
+        // Shape only, and for a stronger reason than the others: a floating IP
+        // whose port is deleted is precisely the state a floating IP exists to
+        // be in — the address is held while the machine behind it is replaced.
+        "floatingips" => &[("subnet", Form::Name), ("port", Form::Name)],
         "projects" => &[("parent", Form::Name)],
         _ => &[],
     }
@@ -93,6 +101,8 @@ pub const REFERRING_KINDS: &[&str] = &[
     "ports",
     "subnets",
     "projects",
+    "routers",
+    "floatingips",
 ];
 
 /// Every resource this spec names, in full-name form.
@@ -256,24 +266,15 @@ mod referrer_tests {
     /// and forgotten in the second is a resource that can be deleted while
     /// something still names it — silently, because the check simply never
     /// looks there.
+    ///
+    /// **The list walked here is the API's own.** It used to be a copy of it,
+    /// and the copy went stale the first time a collection was added: `routers`
+    /// named networks, was not searched on delete, and the test that exists to
+    /// catch exactly that simply never looked at it. A hand-maintained list of
+    /// everything is a list that is wrong as soon as somebody adds something.
     #[test]
     fn every_kind_that_names_something_is_searched_when_something_is_deleted() {
-        for kind in [
-            "projects",
-            "instances",
-            "migrations",
-            "volumes",
-            "snapshots",
-            "attachments",
-            "networks",
-            "subnets",
-            "ports",
-            "security-groups",
-            "images",
-            "nodes",
-            "pools",
-            "operations",
-        ] {
+        for kind in crate::core::COLLECTIONS {
             let names = !fields(kind).is_empty();
             let searched = REFERRING_KINDS.contains(&kind);
             assert_eq!(

@@ -975,6 +975,73 @@ const NODE_FIELDS: &[Field] = &[
     },
 ];
 
+/// A tenant's router: which of its networks reach each other.
+const ROUTER_FIELDS: &[Field] = &[Field {
+    key: "networks",
+    label: "Networks",
+    kind: Kind::RefList {
+        collection: "networks",
+        spelling: Spelling::Name,
+    },
+    required: true,
+    // The only decision there is. A router with no networks routes nothing,
+    // so asking for them is not an advanced variation on making one — it is
+    // making one.
+    advanced: false,
+    help: "The networks whose subnets reach each other. A network belongs to \
+               at most one router.",
+    derived: false,
+}];
+
+/// A floating IP: the address, where it comes from, and what it points at.
+const FLOATING_IP_FIELDS: &[Field] = &[
+    Field {
+        key: "subnet",
+        label: "Subnet",
+        kind: Kind::Ref {
+            collection: "subnets",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: true,
+        advanced: false,
+        help: "Where the address comes from. The same counting as a port's \
+               address, so the two are never the same address.",
+        derived: false,
+    },
+    Field {
+        key: "address",
+        label: "Address",
+        kind: Kind::Text {
+            placeholder: "the lowest free one",
+            check: Check::Address,
+        },
+        required: false,
+        // Pinning one is the unusual case — an operator moving a known address
+        // — and leaving it empty is what almost everybody wants.
+        advanced: true,
+        help: "Leave empty to be given the lowest address nothing else holds.",
+        derived: false,
+    },
+    Field {
+        key: "port",
+        label: "Forwards to",
+        kind: Kind::Ref {
+            collection: "ports",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: false,
+        // Not advanced, and not required: detaching is the ordinary state a
+        // floating IP exists to be in, so it has to be as easy to clear as to
+        // set.
+        advanced: false,
+        help: "The port this address reaches. Clearing it holds the address \
+               while the machine behind it is replaced.",
+        derived: false,
+    },
+];
+
 /// A storage pool, which is infrastructure in the same sense a node is: an
 /// operator decides whether it takes new work, and the agent reports the rest.
 const POOL_FIELDS: &[Field] = &[
@@ -1704,6 +1771,89 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "routers",
+        title: "Routers",
+        singular: "router",
+        recheck: 0,
+        condition: "Routed",
+        group: "Network",
+        scope: Scope::Project,
+        blurb: "Which of this project's networks reach each other. A membership \
+                rather than a box: there is nothing to place and nothing to fail \
+                over — the gateway answers on whichever machine the packet is \
+                already on.",
+        fields: ROUTER_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.networks",
+                label: "Networks",
+                cell: Cell::Mono,
+                width: 280,
+            },
+            Column {
+                // Assigned, not asked for. Shown because it is what appears in a
+                // packet capture and in the fabric's own tables.
+                path: "status.l3Vni",
+                label: "Routed VNI",
+                cell: Cell::Number { unit: "" },
+                width: 104,
+            },
+            Column {
+                path: "status.gatewayMac",
+                label: "Gateway MAC",
+                cell: Cell::Mono,
+                width: 152,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "floatingips",
+        title: "Floating IPs",
+        singular: "floating IP",
+        recheck: 0,
+        condition: "Allocated",
+        group: "Network",
+        scope: Scope::Project,
+        blurb: "Addresses that outlive the machine answering on them. The \
+                address is held by the declaration, not by the port, so \
+                replacing a guest does not change what the outside world \
+                reaches.",
+        fields: FLOATING_IP_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.address",
+                label: "Address",
+                cell: Cell::Mono,
+                width: 152,
+            },
+            Column {
+                path: "spec.port",
+                label: "Forwards to",
+                cell: Cell::Mono,
+                width: 240,
+            },
+            Column {
+                // The *observed* half. It differing from the column beside it is
+                // the whole reason both are shown: that is a reconcile in
+                // flight, or one that could not finish.
+                path: "status.associated",
+                label: "Reaching",
+                cell: Cell::Mono,
+                width: 136,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
         id: "pools",
         title: "Pools",
         singular: "pool",
@@ -1903,18 +2053,20 @@ mod tests {
             "networks",
             "subnets",
             "ports",
+            "routers",
             "security-groups",
             "images",
             "nodes",
             "pools",
             "operations",
             "migrations",
+            "floatingips",
         ] {
             assert!(find(id).is_some(), "no screen for {id}");
         }
         assert_eq!(
             COLLECTIONS.len(),
-            13,
+            15,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:

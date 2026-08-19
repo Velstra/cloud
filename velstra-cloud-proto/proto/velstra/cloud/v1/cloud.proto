@@ -702,6 +702,118 @@ message NetworkEvent {
   string revision = 4;
 }
 
+// A tenant's router: the networks whose subnets reach each other. A membership
+// rather than a box — the fabric implements it as an IP-VRF with an anycast
+// gateway, so there is nothing to place and nothing to fail over.
+message RouterSpec {
+  // The networks that route to each other, by resource name. A set written as a
+  // list; order does not matter and a network belongs to at most one router.
+  repeated string networks = 1;
+}
+
+message RouterStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // The routed VNI the platform assigned, in its own number space. Assigned
+  // rather than asked for: a tenant choosing one would be choosing whether it
+  // collides.
+  uint32 l3_vni = 3;
+  // The anycast gateway's hardware address, the same on every host serving this
+  // tenant. Recorded so a person reading an ARP table recognises it.
+  string gateway_mac = 4;
+}
+
+message Router {
+  Meta meta = 1;
+  RouterSpec spec = 2;
+  RouterStatus status = 3;
+}
+
+message CreateRouterRequest {
+  string parent = 1;
+  string router_id = 2;
+  Router router = 3;
+}
+
+message UpdateRouterRequest {
+  Router router = 1;
+  string revision = 2;
+}
+
+message ListRoutersResponse {
+  repeated Router routers = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision`.
+  string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`.
+  string next_page_token = 3;
+}
+
+message RouterEvent {
+  EventType type = 1;
+  Router resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
+// A floating IP: an address that outlives the machine answering on it. The
+// address is allocated from a subnet and forwarded to a port; both halves are
+// declared, so detaching is an ordinary state and not a deletion.
+message FloatingIpSpec {
+  // The subnet the address comes from, by resource name.
+  string subnet = 1;
+  // The address. Empty means "any", and a controller fills it in — the same
+  // arrangement as a port's address.
+  string address = 2;
+  // The port this address forwards to, by resource name. Empty means allocated
+  // and pointing at nothing, which is a held address and the reason to have one.
+  string port = 3;
+}
+
+message FloatingIpStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+  // The id the fabric gave this address; every later call about it is keyed on
+  // that id and not on the address.
+  string fabric_id = 3;
+  // The port's fixed address this is forwarding to right now, as the fabric has
+  // it. Empty means not associated.
+  string associated = 4;
+}
+
+message FloatingIp {
+  Meta meta = 1;
+  FloatingIpSpec spec = 2;
+  FloatingIpStatus status = 3;
+}
+
+message CreateFloatingIpRequest {
+  string parent = 1;
+  string floating_ip_id = 2;
+  FloatingIp floating_ip = 3;
+}
+
+message UpdateFloatingIpRequest {
+  FloatingIp floating_ip = 1;
+  string revision = 2;
+}
+
+message ListFloatingIpsResponse {
+  repeated FloatingIp floating_ips = 1;
+  // The first page's revision, repeated on every page after it — see
+  // `ListProjectsResponse.revision`.
+  string revision = 2;
+  // Set when there is more to fetch; pass it back as `page_token`.
+  string next_page_token = 3;
+}
+
+message FloatingIpEvent {
+  EventType type = 1;
+  FloatingIp resource = 2;
+  string name = 3;
+  string revision = 4;
+}
+
 message SubnetSpec {
   string network = 1;
   string cidr = 2;
@@ -1051,6 +1163,19 @@ service Networking {
   rpc UpdateNetwork(UpdateNetworkRequest) returns (Network);
   rpc DeleteNetwork(DeleteRequest) returns (Network);
   rpc WatchNetworks(WatchRequest) returns (stream NetworkEvent);
+  rpc GetRouter(GetRequest) returns (Router);
+  rpc ListRouters(ListRequest) returns (ListRoutersResponse);
+  rpc CreateRouter(CreateRouterRequest) returns (Operation);
+  rpc UpdateRouter(UpdateRouterRequest) returns (Router);
+  rpc DeleteRouter(DeleteRequest) returns (Router);
+  rpc WatchRouters(WatchRequest) returns (stream RouterEvent);
+
+  rpc GetFloatingIp(GetRequest) returns (FloatingIp);
+  rpc ListFloatingIps(ListRequest) returns (ListFloatingIpsResponse);
+  rpc CreateFloatingIp(CreateFloatingIpRequest) returns (Operation);
+  rpc UpdateFloatingIp(UpdateFloatingIpRequest) returns (FloatingIp);
+  rpc DeleteFloatingIp(DeleteRequest) returns (FloatingIp);
+  rpc WatchFloatingIps(WatchRequest) returns (stream FloatingIpEvent);
 
   rpc GetSubnet(GetRequest) returns (Subnet);
   rpc ListSubnets(ListRequest) returns (ListSubnetsResponse);
