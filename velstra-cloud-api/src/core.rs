@@ -22,11 +22,11 @@ use velstra_cloud_model::{
     migration::{Migration, MigrationSpec, MigrationStatus, may_migrate, migration_condition},
     reconcile::place,
     resources::{
-        AttachmentSpec, AttachmentStatus, ImageSpec, ImageStatus, Instance, InstanceSpec,
-        InstanceStatus, NetworkSpec, NetworkStatus, Node, NodeSpec, NodeStatus, OperationSpec,
-        OperationStatus, PoolSpec, PoolStatus, PortSpec, PortStatus, Project, ProjectSpec,
-        ProjectStatus, Resource, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, Volume,
-        VolumeSpec, VolumeStatus, nodes_holding,
+        AttachmentSpec, AttachmentStatus, FloatingIpSpec, FloatingIpStatus, ImageSpec, ImageStatus,
+        Instance, InstanceSpec, InstanceStatus, NetworkSpec, NetworkStatus, Node, NodeSpec,
+        NodeStatus, OperationSpec, OperationStatus, PoolSpec, PoolStatus, PortSpec, PortStatus,
+        Project, ProjectSpec, ProjectStatus, Resource, RouterSpec, RouterStatus, SnapshotSpec,
+        SnapshotStatus, SubnetSpec, SubnetStatus, Volume, VolumeSpec, VolumeStatus, nodes_holding,
     },
     security::{SecurityGroupSpec, SecurityGroupStatus, group_condition, validate},
     storage::{may_create_volume, may_snapshot},
@@ -46,7 +46,7 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 14] = [
+pub const COLLECTIONS: [&str; 16] = [
     "projects",
     "instances",
     "migrations",
@@ -54,6 +54,8 @@ pub const COLLECTIONS: [&str; 14] = [
     "snapshots",
     "attachments",
     "networks",
+    "routers",
+    "floatingips",
     "subnets",
     "ports",
     "security-groups",
@@ -169,6 +171,7 @@ impl Filter {
 struct Scratch {
     ports: Option<Arc<Vec<velstra_cloud_model::resources::Port>>>,
     nodes: Option<Arc<Vec<Node>>>,
+    floating: Option<Arc<Vec<velstra_cloud_model::resources::FloatingIp>>>,
 }
 
 impl Scratch {
@@ -182,6 +185,18 @@ impl Scratch {
         let ports = Arc::new(api.typed_list("", "ports").await?);
         self.ports = Some(ports.clone());
         Ok(ports)
+    }
+
+    async fn floating(
+        &mut self,
+        api: &Api,
+    ) -> ApiResult<Arc<Vec<velstra_cloud_model::resources::FloatingIp>>> {
+        if let Some(floating) = &self.floating {
+            return Ok(floating.clone());
+        }
+        let floating = Arc::new(api.typed_list("", "floatingips").await?);
+        self.floating = Some(floating.clone());
+        Ok(floating)
     }
 
     async fn nodes(&mut self, api: &Api) -> ApiResult<Arc<Vec<Node>>> {
@@ -250,6 +265,8 @@ impl Api {
             collection!("snapshots", SnapshotSpec, SnapshotStatus),
             collection!("attachments", AttachmentSpec, AttachmentStatus),
             collection!("networks", NetworkSpec, NetworkStatus),
+            collection!("routers", RouterSpec, RouterStatus),
+            collection!("floatingips", FloatingIpSpec, FloatingIpStatus),
             collection!("subnets", SubnetSpec, SubnetStatus),
             collection!("ports", PortSpec, PortStatus),
             collection!("security-groups", SecurityGroupSpec, SecurityGroupStatus),
@@ -1156,7 +1173,10 @@ impl Api {
             return Ok(());
         };
         let ports = scratch.ports(self).await?;
-        let (allocated, available) = velstra_cloud_model::ipam::counts(&subnet, &ports);
+        // Floating addresses come out of this same range, so a count that saw
+        // only ports would tell an operator a full subnet had room.
+        let floating = scratch.floating(self).await?;
+        let (allocated, available) = velstra_cloud_model::ipam::counts(&subnet, &ports, &floating);
         document["status"]["allocated"] = json!(allocated);
         document["status"]["available"] = json!(available);
         Ok(())

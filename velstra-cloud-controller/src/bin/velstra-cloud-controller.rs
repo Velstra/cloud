@@ -17,12 +17,14 @@ use velstra_cloud_controller::{
     attachment::AttachmentController,
     drift,
     election::{ElectionConfig, elect},
+    floating_ip::FloatingIpController,
     instance::InstanceController,
     migration::MigrationController,
     network::NetworkController,
     operations::OperationsController,
     port::PortController,
     quota::QuotaController,
+    router::RouterController,
     run_when_leading,
     scheduler::Scheduler,
     snapshot::SnapshotController,
@@ -33,9 +35,10 @@ use velstra_cloud_model::{
     meta::Timestamp,
     migration::{MigrationSpec, MigrationStatus},
     resources::{
-        AttachmentSpec, AttachmentStatus, InstanceSpec, InstanceStatus, NetworkSpec, NetworkStatus,
-        NodeSpec, NodeStatus, OperationSpec, OperationStatus, PortSpec, PortStatus, ProjectSpec,
-        ProjectStatus, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, VolumeSpec,
+        AttachmentSpec, AttachmentStatus, FloatingIpSpec, FloatingIpStatus, InstanceSpec,
+        InstanceStatus, NetworkSpec, NetworkStatus, NodeSpec, NodeStatus, OperationSpec,
+        OperationStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus, RouterSpec,
+        RouterStatus, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, VolumeSpec,
         VolumeStatus,
     },
 };
@@ -162,6 +165,10 @@ async fn main() {
         TypedStore::new(store.clone(), cell, "subnets");
     let networks: TypedStore<NetworkSpec, NetworkStatus> =
         TypedStore::new(store.clone(), cell, "networks");
+    let routers: TypedStore<RouterSpec, RouterStatus> =
+        TypedStore::new(store.clone(), cell, "routers");
+    let floating_ips: TypedStore<FloatingIpSpec, FloatingIpStatus> =
+        TypedStore::new(store.clone(), cell, "floatingips");
 
     let (stop, shutdown) = watch::channel(false);
 
@@ -218,6 +225,7 @@ async fn main() {
         Arc::new(AddressController::new(
             ports.clone(),
             subnets.clone(),
+            floating_ips.clone(),
             StatusWriter::new(store.clone(), cell, "ports", "address"),
             cell,
         )),
@@ -349,6 +357,42 @@ async fn main() {
             args.fabric.clone(),
         )),
         networks.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // And the fabric learns that two of those networks route to each other from
+    // here. Without it a tenant's networks are each reachable and mutually
+    // isolated — which is the correct default, and not what the operator asked
+    // for when they declared a router.
+    tasks.spawn(run_when_leading(
+        Arc::new(RouterController::new(
+            store.clone(),
+            cell,
+            networks.clone(),
+            args.fabric.clone(),
+        )),
+        routers.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // And a floating IP, which is the one address in this system that is not a
+    // property of the machine answering on it.
+    tasks.spawn(run_when_leading(
+        Arc::new(FloatingIpController::new(
+            store.clone(),
+            cell,
+            floating_ips.clone(),
+            subnets.clone(),
+            ports.clone(),
+            args.fabric.clone(),
+        )),
+        floating_ips.clone(),
         store.clone(),
         config,
         metrics.clone(),

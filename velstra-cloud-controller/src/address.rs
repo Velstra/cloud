@@ -24,7 +24,9 @@ use velstra_cloud_model::{
     access::Writer,
     ipam::{assign, needs_assignment, unaddressable_condition},
     meta::{condition, set_condition},
-    resources::{Port, PortSpec, PortStatus, SubnetSpec, SubnetStatus},
+    resources::{
+        FloatingIpSpec, FloatingIpStatus, Port, PortSpec, PortStatus, SubnetSpec, SubnetStatus,
+    },
 };
 use velstra_cloud_store::{TypedStore, prefix_for};
 
@@ -33,6 +35,9 @@ use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
 pub struct AddressController {
     ports: TypedStore<PortSpec, PortStatus>,
     subnets: TypedStore<SubnetSpec, SubnetStatus>,
+    /// Read, never written: a floating address is one this controller must not
+    /// hand to a port.
+    floating: TypedStore<FloatingIpSpec, FloatingIpStatus>,
     status: StatusWriter<PortSpec, PortStatus>,
     cell: String,
     /// Ports that could not be given an address, so that a subnet appearing or
@@ -45,12 +50,14 @@ impl AddressController {
     pub fn new(
         ports: TypedStore<PortSpec, PortStatus>,
         subnets: TypedStore<SubnetSpec, SubnetStatus>,
+        floating: TypedStore<FloatingIpSpec, FloatingIpStatus>,
         status: StatusWriter<PortSpec, PortStatus>,
         cell: &str,
     ) -> Self {
         Self {
             ports,
             subnets,
+            floating,
             status,
             cell: cell.to_string(),
             pending: Arc::new(Mutex::new(BTreeSet::new())),
@@ -114,8 +121,12 @@ impl Reconciler for AddressController {
 
         let subnet = self.subnets.get(&port.spec.subnet).await?;
         let others = self.ports.list().await?;
+        // Floating IPs come out of the same range. Reading them here is what
+        // keeps one allocator over that range rather than two — see
+        // [`velstra_cloud_model::ipam`].
+        let floating = self.floating.list().await?;
 
-        let assignment = match assign(port, subnet.as_ref(), &others) {
+        let assignment = match assign(port, subnet.as_ref(), &others, &floating) {
             Ok(assignment) => assignment,
             Err(why) => {
                 self.explain(port, &why).await?;
@@ -211,6 +222,7 @@ mod tests {
             AddressController::new(
                 self.ports.clone(),
                 self.subnets.clone(),
+                TypedStore::new(self.raw.clone(), "cell-1", "floatingips"),
                 StatusWriter::new(self.raw.clone(), "cell-1", "ports", "address"),
                 "cell-1",
             )

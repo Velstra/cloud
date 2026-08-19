@@ -786,6 +786,45 @@ whole_object_survives!(
 );
 
 whole_object_survives!(
+    a_whole_router_survives,
+    resources::Router,
+    v1::Router,
+    resources::RouterSpec {
+        networks: vec![
+            "projects/p1/networks/front".into(),
+            "projects/p1/networks/back".into(),
+        ],
+    },
+    resources::RouterStatus {
+        observed_generation: 3,
+        conditions: vec![a_condition()],
+        l3_vni: 900_001,
+        // Recorded rather than derived on read: a person reading an ARP table
+        // has to recognise it, and it must not change under them.
+        gateway_mac: "02:00:5e:00:53:01".into(),
+    }
+);
+
+whole_object_survives!(
+    a_whole_floating_ip_survives,
+    resources::FloatingIp,
+    v1::FloatingIp,
+    resources::FloatingIpSpec {
+        subnet: "projects/p1/subnets/s1".into(),
+        // Present, not `None`: an absent address is the *default*, and a
+        // round-trip of the default proves only that nothing was written.
+        address: Some("203.0.113.7".into()),
+        port: "projects/p1/ports/web".into(),
+    },
+    resources::FloatingIpStatus {
+        observed_generation: 2,
+        conditions: vec![a_condition()],
+        fabric_id: "fip-9f3c".into(),
+        associated: "10.20.0.7".into(),
+    }
+);
+
+whole_object_survives!(
     a_whole_subnet_survives,
     resources::Subnet,
     v1::Subnet,

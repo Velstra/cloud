@@ -677,6 +677,89 @@ impl From<&v1::NetworkStatus> for resources::NetworkStatus {
     }
 }
 
+impl From<&resources::RouterSpec> for v1::RouterSpec {
+    fn from(s: &resources::RouterSpec) -> Self {
+        Self {
+            networks: s.networks.clone(),
+        }
+    }
+}
+
+impl From<&v1::RouterSpec> for resources::RouterSpec {
+    fn from(s: &v1::RouterSpec) -> Self {
+        Self {
+            networks: s.networks.clone(),
+        }
+    }
+}
+
+impl From<&resources::RouterStatus> for v1::RouterStatus {
+    fn from(s: &resources::RouterStatus) -> Self {
+        Self {
+            observed_generation: s.observed_generation,
+            conditions: conditions_out(&s.conditions),
+            l3_vni: s.l3_vni,
+            gateway_mac: s.gateway_mac.clone(),
+        }
+    }
+}
+
+impl From<&v1::RouterStatus> for resources::RouterStatus {
+    fn from(s: &v1::RouterStatus) -> Self {
+        Self {
+            observed_generation: s.observed_generation,
+            conditions: conditions_in(&s.conditions),
+            l3_vni: s.l3_vni,
+            gateway_mac: s.gateway_mac.clone(),
+        }
+    }
+}
+
+impl From<&resources::FloatingIpSpec> for v1::FloatingIpSpec {
+    fn from(s: &resources::FloatingIpSpec) -> Self {
+        Self {
+            subnet: s.subnet.clone(),
+            // Absent and empty are the same thing on the wire — "nobody has
+            // decided yet" — because proto3 has no third state and inventing one
+            // would mean two ways to say it.
+            address: s.address.clone().unwrap_or_default(),
+            port: s.port.clone(),
+        }
+    }
+}
+
+impl From<&v1::FloatingIpSpec> for resources::FloatingIpSpec {
+    fn from(s: &v1::FloatingIpSpec) -> Self {
+        Self {
+            subnet: s.subnet.clone(),
+            address: (!s.address.is_empty()).then(|| s.address.clone()),
+            port: s.port.clone(),
+        }
+    }
+}
+
+impl From<&resources::FloatingIpStatus> for v1::FloatingIpStatus {
+    fn from(s: &resources::FloatingIpStatus) -> Self {
+        Self {
+            observed_generation: s.observed_generation,
+            conditions: conditions_out(&s.conditions),
+            fabric_id: s.fabric_id.clone(),
+            associated: s.associated.clone(),
+        }
+    }
+}
+
+impl From<&v1::FloatingIpStatus> for resources::FloatingIpStatus {
+    fn from(s: &v1::FloatingIpStatus) -> Self {
+        Self {
+            observed_generation: s.observed_generation,
+            conditions: conditions_in(&s.conditions),
+            fabric_id: s.fabric_id.clone(),
+            associated: s.associated.clone(),
+        }
+    }
+}
+
 impl From<&resources::SubnetSpec> for v1::SubnetSpec {
     fn from(s: &resources::SubnetSpec) -> Self {
         Self {
@@ -992,6 +1075,8 @@ resource_conversions!(resources::Volume, Volume);
 resource_conversions!(resources::Snapshot, Snapshot);
 resource_conversions!(resources::Attachment, Attachment);
 resource_conversions!(resources::Network, Network);
+resource_conversions!(resources::Router, Router);
+resource_conversions!(resources::FloatingIp, FloatingIp);
 resource_conversions!(resources::Subnet, Subnet);
 resource_conversions!(resources::Port, Port);
 resource_conversions!(resources::Operation, Operation);

@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use velstra_cloud_fabric::pb;
 use velstra_cloud_model::{
     meta::{Condition, ConditionStatus, condition, set_condition},
-    resources::{Network, NetworkSpec, NetworkStatus, SubnetSpec, SubnetStatus},
+    resources::{Network, NetworkSpec, NetworkStatus, Subnet, SubnetSpec, SubnetStatus},
 };
 use velstra_cloud_store::TypedStore;
 
@@ -79,17 +79,15 @@ impl NetworkController {
     /// first would work for one subnet's ports and refuse the other's, with an
     /// error naming a subnet the operator never asked about. So a network with
     /// more than one subnet is **not mirrored**, and says so on itself.
-    async fn cidr_for(&self, network: &str) -> Result<std::result::Result<String, String>> {
-        let mut found: Vec<String> = self
+    async fn subnet_for(&self, network: &str) -> Result<std::result::Result<Subnet, String>> {
+        let mut found: Vec<Subnet> = self
             .subnets
             .list()
             .await?
             .into_iter()
             .filter(|s| s.spec.network == network)
-            .map(|s| s.spec.cidr)
             .collect();
-        found.sort();
-        found.dedup();
+        found.sort_by_key(|s| s.meta.name.to_string());
         Ok(match found.len() {
             0 => Err("no subnet yet, so there is no range to allocate ports from".into()),
             1 => Ok(found.remove(0)),
@@ -97,7 +95,11 @@ impl NetworkController {
                 "{n} subnets ({}), and the fabric's network holds one range against which it \
                  checks every port's address; mirroring one of them would refuse the others' \
                  ports and widening to cover both would stop the check meaning anything",
-                found.join(", ")
+                found
+                    .iter()
+                    .map(|s| s.spec.cidr.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         })
     }
@@ -125,8 +127,8 @@ impl Reconciler for NetworkController {
             return Ok(());
         };
 
-        let cidr = match self.cidr_for(name).await? {
-            Ok(cidr) => cidr,
+        let subnet = match self.subnet_for(name).await? {
+            Ok(subnet) => subnet,
             Err(why) => {
                 return self
                     .say(network, ConditionStatus::False, "Unmirrorable", &why)
@@ -141,19 +143,46 @@ impl Reconciler for NetworkController {
         let spec = pb::NetworkSpec {
             vni: network.spec.vni,
             name: name.to_string(),
-            subnet: cidr,
+            subnet: subnet.spec.cidr.clone(),
             // Deny by default, matching what the cloud tells fabric for a port's
             // own group. A network whose default were `pass` would let anything
             // the per-port groups had not thought of straight through.
             default_action: pb::Action::Drop as i32,
             drop_icmp: false,
         };
+        // The subnet as an object of its own, not only as the network's range.
+        //
+        // The network's `subnet` field is what fabric validates a port's address
+        // against; a fabric *Subnet* is what its IPAM allocates out of, and a
+        // floating IP is allocated by id from one. Without this a floating IP
+        // has no subnet to name and the whole collection is inert.
+        //
+        // Fabric's own pool is never drawn from — every address this control
+        // plane hands out is decided here, by counting, and passed explicitly.
+        // Declaring the gateway is still worth doing: it is the one address
+        // fabric reserves itself, and it agrees with what this side reserves.
+        let fabric_subnet = pb::SubnetSpec {
+            id: subnet.meta.name.to_string(),
+            vni: network.spec.vni,
+            cidr: subnet.spec.cidr.clone(),
+            gateway: subnet.spec.gateway.clone(),
+            pool_start: String::new(),
+            pool_end: String::new(),
+            enable_dhcp: false,
+        };
         match velstra_cloud_fabric::connect(&endpoint).await {
             Ok(mut client) => match client.add_network(spec).await {
-                Ok(_) => {
-                    self.say(network, ConditionStatus::True, "Mirrored", "")
-                        .await
-                }
+                Ok(_) => match client.add_subnet(fabric_subnet).await {
+                    Ok(_) => {
+                        self.say(network, ConditionStatus::True, "Mirrored", "")
+                            .await
+                    }
+                    Err(status) => {
+                        warn!(network = %name, error = %status, "the fabric refused the subnet");
+                        self.say(network, ConditionStatus::False, "Refused", status.message())
+                            .await
+                    }
+                },
                 Err(status) => {
                     warn!(network = %name, error = %status, "the fabric refused the network");
                     self.say(network, ConditionStatus::False, "Refused", status.message())
@@ -265,10 +294,12 @@ mod tests {
         add_subnet(&subnets, "s1", "projects/p1/networks/n1", "10.20.0.0/24").await;
         let c = NetworkController::new(raw, CELL, subnets, None);
 
-        assert_eq!(
-            c.cidr_for("projects/p1/networks/n1").await.unwrap(),
-            Ok("10.20.0.0/24".to_string())
-        );
+        let picked = c
+            .subnet_for("projects/p1/networks/n1")
+            .await
+            .unwrap()
+            .expect("a network with one subnet was not mirrorable");
+        assert_eq!(picked.spec.cidr, "10.20.0.0/24");
     }
 
     /// A network nobody has given a subnet yet is not an error to shout about —
@@ -279,7 +310,7 @@ mod tests {
         let c = NetworkController::new(raw, CELL, subnets, None);
 
         let why = c
-            .cidr_for("projects/p1/networks/n1")
+            .subnet_for("projects/p1/networks/n1")
             .await
             .unwrap()
             .expect_err("a network with no subnet was mirrored anyway");
@@ -302,7 +333,7 @@ mod tests {
         let c = NetworkController::new(raw, CELL, subnets, None);
 
         let why = c
-            .cidr_for("projects/p1/networks/n1")
+            .subnet_for("projects/p1/networks/n1")
             .await
             .unwrap()
             .expect_err("two subnets were mirrored into one range");
@@ -325,10 +356,12 @@ mod tests {
         add_subnet(&subnets, "s2", "projects/p1/networks/OTHER", "10.99.0.0/24").await;
         let c = NetworkController::new(raw, CELL, subnets, None);
 
-        assert_eq!(
-            c.cidr_for("projects/p1/networks/n1").await.unwrap(),
-            Ok("10.20.0.0/24".to_string())
-        );
+        let picked = c
+            .subnet_for("projects/p1/networks/n1")
+            .await
+            .unwrap()
+            .expect("a network with one subnet was not mirrorable");
+        assert_eq!(picked.spec.cidr, "10.20.0.0/24");
     }
 
     /// With no fabric configured, a reconcile is a no-op rather than a failure.
