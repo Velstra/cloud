@@ -12,10 +12,21 @@ use clap::Parser;
 use tokio::sync::watch;
 use tracing::{error, info};
 use velstra_cloud_controller::{
-    LoopConfig, Metrics, address::AddressController, attachment::AttachmentController, drift,
-    instance::InstanceController, migration::MigrationController, operations::OperationsController,
-    port::PortController, quota::QuotaController, run, scheduler::Scheduler,
-    snapshot::SnapshotController, status::StatusWriter, volume::VolumeController,
+    LoopConfig, Metrics,
+    address::AddressController,
+    attachment::AttachmentController,
+    drift,
+    election::{ElectionConfig, elect},
+    instance::InstanceController,
+    migration::MigrationController,
+    operations::OperationsController,
+    port::PortController,
+    quota::QuotaController,
+    run_when_leading,
+    scheduler::Scheduler,
+    snapshot::SnapshotController,
+    status::StatusWriter,
+    volume::VolumeController,
 };
 use velstra_cloud_model::{
     meta::Timestamp,
@@ -64,6 +75,31 @@ struct Args {
     /// Where to serve Prometheus metrics, or `off`.
     #[arg(long, default_value = "127.0.0.1:9310")]
     metrics_addr: String,
+
+    /// What this process calls itself in the leader lease.
+    ///
+    /// Defaults to the hostname, which is what makes a lease record readable
+    /// during an incident: "which machine is acting" is the first question, and
+    /// a random id answers it with a lookup. Two processes on one host must be
+    /// given distinct identities — the election is correct either way (the
+    /// compare-and-swap does not care what the holder is called), but a lease
+    /// naming a host twice tells an operator nothing.
+    #[arg(long, env = "VELSTRA_IDENTITY")]
+    identity: Option<String>,
+
+    /// How long an unrenewed lease stands before another process may take it,
+    /// in seconds. Also the longest a leader's death pauses reconciliation.
+    #[arg(long, default_value_t = 15)]
+    lease_seconds: u64,
+
+    /// Run without leader election, acting unconditionally.
+    ///
+    /// For a single-process deployment and for a developer cell, where the
+    /// lease is one more thing to wait for and nothing else is contending. Never
+    /// for two processes against one store — that is the case the election
+    /// exists for.
+    #[arg(long)]
+    no_leader_election: bool,
 }
 
 #[tokio::main]
@@ -114,9 +150,41 @@ async fn main() {
         TypedStore::new(store.clone(), cell, "subnets");
 
     let (stop, shutdown) = watch::channel(false);
+
+    // Exactly one process acts; the others stand ready. Every controller below
+    // is gated on this, so a follower holds no watch and no queue — see
+    // `runner::run_when_leading`.
+    let identity = args.identity.clone().unwrap_or_else(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| format!("controller-{}", std::process::id()))
+    });
+    let (leader, election) = if args.no_leader_election {
+        info!("leader election disabled; this process acts unconditionally");
+        let (tx, rx) = watch::channel(true);
+        // Held for the life of the process: dropping the sender would close the
+        // channel and every controller would read it as a stand-down.
+        std::mem::forget(tx);
+        (rx, None)
+    } else {
+        let config = ElectionConfig {
+            lease: Duration::from_secs(args.lease_seconds),
+            // A third of the lease: three attempts fit inside one, so two may
+            // fail outright and a healthy leader still keeps it.
+            renew: Duration::from_secs((args.lease_seconds / 3).max(1)),
+            ..Default::default()
+        };
+        let (rx, handle) = elect(store.clone(), cell, &identity, config, shutdown.clone());
+        info!(identity = %identity, lease_s = args.lease_seconds, "campaigning for the cell");
+        (rx, Some(handle))
+    };
     let mut tasks = tokio::task::JoinSet::new();
 
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(Scheduler::new(
             instances.clone(),
             nodes.clone(),
@@ -128,10 +196,11 @@ async fn main() {
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
     // A port with no address is a guest with no network, and nothing else in
     // the cell fills one in.
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(AddressController::new(
             ports.clone(),
             subnets.clone(),
@@ -143,8 +212,9 @@ async fn main() {
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(PortController::new(
             ports.clone(),
             // One copy of the instances in memory, shared by whoever needs a
@@ -162,27 +232,30 @@ async fn main() {
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
     // The guard that makes a delete a teardown: without it the object leaves
     // the store in the same request that asks for it, and the node never sees
     // an instance it was meant to stop.
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(InstanceController::new(instances.clone())),
         instances.clone(),
         store.clone(),
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(AttachmentController::new(attachments.clone())),
         attachments.clone(),
         store.clone(),
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(QuotaController::new(
             // One in-memory copy each, fed by one watch — without it a quota
             // resync reads every instance once per project, which is measured
@@ -205,8 +278,9 @@ async fn main() {
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(OperationsController::new(
             store.clone(),
             StatusWriter::new(store.clone(), cell, "operations", "operations"),
@@ -217,9 +291,10 @@ async fn main() {
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
 
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         // No status writer, and deliberately so: this controller has no business
         // writing a migration's status, and not handing it the means is the
         // cheapest way to keep it that way.
@@ -229,12 +304,13 @@ async fn main() {
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
 
     // The two guards storage lives by: nothing is billed for bytes nobody can
     // find, and no volume is destroyed underneath the copies that are read
     // through it. Both are finalizers, so both are a controller's work.
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(VolumeController::new(
             volumes.clone(),
             snapshots.clone(),
@@ -245,14 +321,16 @@ async fn main() {
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
-    tasks.spawn(run(
+    tasks.spawn(run_when_leading(
         Arc::new(SnapshotController::new(snapshots.clone())),
         snapshots.clone(),
         store.clone(),
         config,
         metrics.clone(),
         shutdown.clone(),
+        leader.clone(),
     ));
 
     // The drift scan is not a controller: it writes nothing and decides
@@ -307,6 +385,13 @@ async fn main() {
     }
     let _ = stop.send(true);
     tasks.shutdown().await;
+    // Awaited, not aborted: the campaign releases the lease on its way out, so a
+    // planned restart costs a follower one poll instead of a whole lease. Aborting
+    // here would throw that away and make every deliberate restart look like a
+    // crash to the rest of the cell.
+    if let Some(election) = election {
+        let _ = election.await;
+    }
 }
 
 async fn serve_metrics(addr: String, metrics: Metrics, mut shutdown: watch::Receiver<bool>) {

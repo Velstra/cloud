@@ -13,7 +13,8 @@ use std::sync::{
 use async_trait::async_trait;
 use velstra_cloud_controller::{
     LoopConfig, Metrics, attachment::AttachmentController, operations::OperationsController,
-    quota::QuotaController, run, scheduler::Scheduler, status::StatusWriter, sweep,
+    quota::QuotaController, run, run_when_leading, scheduler::Scheduler, status::StatusWriter,
+    sweep,
 };
 use velstra_cloud_model::{
     Condition,
@@ -548,4 +549,93 @@ async fn two_schedulers_place_each_instance_exactly_once() {
             instance.meta.name
         );
     }
+}
+
+/// A controller stood down and then given the lease back still works.
+///
+/// This is here because of a bug written while adding leader election and caught
+/// before it shipped: standing down closed the work queue, and closing it is
+/// permanent — so a process that lost the lease and won it again came back with
+/// a queue that would never hand out another name. It would have looked like a
+/// controller that leads and does nothing, which is the hardest failure to see
+/// from outside: the lease record is healthy, the logs say "elected", and no
+/// object moves.
+///
+/// The queue now belongs to the establishment rather than to the process, so a
+/// stand-down drops it and a takeover builds a fresh one along the same path a
+/// cold start takes.
+#[tokio::test]
+async fn a_controller_that_stands_down_and_returns_still_reconciles() {
+    let cell = Cell::new();
+    let raw = cell.raw.clone();
+    for id in ["node-a", "node-b"] {
+        cell.nodes.create(&node(id)).await.unwrap();
+    }
+
+    let config = LoopConfig {
+        resync: std::time::Duration::from_millis(30),
+        rate: std::time::Duration::ZERO,
+        backoff_base: std::time::Duration::from_millis(20),
+        backoff_ceiling: std::time::Duration::from_millis(100),
+    };
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let (lead, leader) = tokio::sync::watch::channel(true);
+
+    let handle = tokio::spawn(run_when_leading(
+        Arc::new(cell.scheduler()),
+        cell.instances.clone(),
+        raw.clone(),
+        config,
+        Metrics::new(),
+        shutdown,
+        leader,
+    ));
+
+    // Leading: it places what it is given.
+    cell.instances.create(&unplaced("before")).await.unwrap();
+    assert!(
+        placed(&cell, "before").await,
+        "the controller did not place an instance while it was leading"
+    );
+
+    // Stood down: it must not act at all.
+    lead.send(false).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    cell.instances.create(&unplaced("during")).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    let during = cell
+        .instances
+        .get("projects/p1/instances/during")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        during.spec.node.is_none(),
+        "a follower placed an instance it had no lease to touch"
+    );
+
+    // Given the lease back: it picks up everything, including what arrived while
+    // it was standing down.
+    lead.send(true).unwrap();
+    assert!(
+        placed(&cell, "during").await,
+        "the controller never acted again after being given the lease back"
+    );
+
+    let _ = stop.send(true);
+    let _ = handle.await;
+}
+
+/// Wait for an instance to be scheduled, or give up.
+async fn placed(cell: &Cell, id: &str) -> bool {
+    let name = format!("projects/p1/instances/{id}");
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Ok(Some(i)) = cell.instances.get(&name).await
+            && i.spec.node.is_some()
+        {
+            return true;
+        }
+    }
+    false
 }
