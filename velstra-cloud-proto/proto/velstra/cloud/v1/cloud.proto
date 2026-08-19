@@ -161,6 +161,12 @@ message ProjectSpec {
   // hierarchy is walked rather than guessed.
   string parent = 2;
   Quota quota = 3;
+  // Which cell this project's resources live in — what a router resolves a
+  // request against. NOT the same as `Meta.placement.cell`, which says which
+  // store holds this particular copy: projects are global, so every cell has a
+  // copy stamped with its own cell. Empty means "wherever it is being read",
+  // which is what a single-cell installation means.
+  string cell = 4;
 }
 
 message ProjectStatus {

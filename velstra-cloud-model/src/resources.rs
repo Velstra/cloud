@@ -99,6 +99,28 @@ pub struct ProjectSpec {
     /// chose. See [`crate::authz`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<crate::authz::Binding>,
+
+    /// Which cell this project's resources live in.
+    ///
+    /// **Not the same thing as `meta.placement.cell`, and the difference is the
+    /// whole of cell routing.** `placement` says which store holds *this copy of
+    /// this object* — it is checked on every decode, so an object read out of
+    /// cell-1's key space that claims cell-2 is refused. Projects are global:
+    /// every cell holds a copy of every project, and each copy is correctly
+    /// stamped with the cell whose store it sits in. So `placement` cannot say
+    /// where a project's *instances* go — it says where the project record is.
+    ///
+    /// This field says that, and it is what a router resolves: a request naming
+    /// `projects/p1/instances/i1` is routed by looking up `p1` and reading this,
+    /// which makes routing a lookup on the first two segments of a name and
+    /// never deeper. See [`crate::routing`].
+    ///
+    /// Empty means "wherever it is being read", which is what every project
+    /// written before routing existed means and what a single-cell installation
+    /// goes on meaning. Resolved rather than defaulted at rest, so a one-cell
+    /// deployment never has to name its cell for anything to work.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cell: String,
 }
 
 /// Limits, counted rather than reserved. A reservation that is not released on

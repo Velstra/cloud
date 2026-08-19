@@ -366,6 +366,10 @@ async fn seed(store: Arc<dyn Store>) {
                     memory_mib: 409_600,
                     volume_gib: 10_000,
                 },
+                // Left empty on purpose: a dev cell is one cell, and an empty
+                // home resolves to whichever cell is reading. Naming it here
+                // would make the one-cell case look like it needs configuring.
+                cell: String::new(),
                 // The dev cell's one token is an admin of its one project, so
                 // the console and the CLI can do everything against it. A cell
                 // that handed out a viewer here would be a demo where half the

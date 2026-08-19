@@ -420,6 +420,7 @@ async fn a_grpc_update_of_a_project_does_not_revoke_its_grants() {
         parent: String::new(),
         quota: Default::default(),
         bindings: Vec::new(),
+        cell: String::new(),
     };
     api.patch(
         &name("projects/p1"),

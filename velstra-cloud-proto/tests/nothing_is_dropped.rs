@@ -195,6 +195,7 @@ fn a_project_spec_survives_the_wire_except_its_bindings() {
             role: velstra_cloud_model::authz::Role::Admin,
             members: vec!["ada".into()],
         }],
+        cell: "cell-2".into(),
     };
     let default = resources::ProjectSpec::default();
     let resources::ProjectSpec {
@@ -202,11 +203,13 @@ fn a_project_spec_survives_the_wire_except_its_bindings() {
         parent,
         quota,
         bindings,
+        cell,
     } = &original;
     assert_ne!(display_name, &default.display_name);
     assert_ne!(parent, &default.parent);
     assert_ne!(quota, &default.quota);
     assert_ne!(bindings, &default.bindings);
+    assert_ne!(cell, &default.cell);
 
     let back = resources::ProjectSpec::from(&v1::ProjectSpec::from(&original));
     assert_eq!(back.display_name, original.display_name);
@@ -216,6 +219,13 @@ fn a_project_spec_survives_the_wire_except_its_bindings() {
         back.bindings.is_empty(),
         "gRPC grew a way to carry bindings; either give it a message and carry \
          them properly, or this test is now wrong"
+    );
+    // The home cell IS carried, and must be: a project created over gRPC that
+    // lost it would silently become a project of whichever cell took the call,
+    // and every resource in it would be routed there.
+    assert_eq!(
+        back.cell, original.cell,
+        "the project's home cell did not survive the wire"
     );
 }
 
@@ -649,6 +659,7 @@ whole_object_survives!(
         },
         // Not carried on the wire; see the spec test above.
         bindings: Vec::new(),
+        cell: "cell-2".into(),
     },
     resources::ProjectStatus {
         observed_generation: 6,
