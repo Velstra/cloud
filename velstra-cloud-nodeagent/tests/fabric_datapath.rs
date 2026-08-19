@@ -187,6 +187,10 @@ async fn a_port_with_rules_reaches_the_fabric() {
         address: Some("10.20.0.7".into()),
         mac: Some("02:ab:cd:ef:00:07".into()),
         security_groups: vec!["projects/p1/security-groups/web".into()],
+        // Carried all the way down to the datapath and, until this was fixed,
+        // dropped there — the tap datapath refuses a ceiling it cannot enforce
+        // and says so, and this one, which can, silently ignored it.
+        rate_limit_mbit: Some(250),
         ..PortSpec::default()
     };
     let network = NetworkSpec {
@@ -227,6 +231,11 @@ async fn a_port_with_rules_reaches_the_fabric() {
     assert_eq!(
         mine.host, "node-a",
         "the host this agent declared is not the one it used"
+    );
+    assert_eq!(
+        mine.rate_limit_mbit,
+        Some(250),
+        "the send ceiling never reached the fabric, so one guest can take the node's network"
     );
 
     let groups = client

@@ -381,6 +381,22 @@ impl Datapath for FabricDatapath {
             .await
             .map_err(|e| HostError::failed(format!("binding the rules for {port}: {e}")))?;
 
+        // The send ceiling, restated on every pass like everything else here.
+        //
+        // It was carried, stored and echoed all the way down to this function
+        // and then **dropped**: the tap datapath refuses a ceiling it cannot
+        // enforce and says so, and this one — the datapath that can — silently
+        // ignored it. One guest could take a node's network with it and the
+        // port would report itself in force. Sent unconditionally rather than
+        // only when set, so *removing* a ceiling is a decision that arrives too.
+        client
+            .limit_port(pb::LimitPortRequest {
+                id: info.id.clone(),
+                rate_limit_mbit: spec.rate_limit_mbit,
+            })
+            .await
+            .map_err(|e| HostError::failed(format!("setting the ceiling for {port}: {e}")))?;
+
         Ok(tap)
     }
 
