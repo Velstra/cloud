@@ -29,6 +29,7 @@ pub mod election;
 pub mod instance;
 pub mod metrics;
 pub mod migration;
+pub mod network;
 pub mod operations;
 pub mod port;
 pub mod queue;

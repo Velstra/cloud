@@ -8,6 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+velstra-cloud-fabric = { workspace = true }
 velstra-cloud-model = { workspace = true }
 velstra-cloud-store = { workspace = true }
 velstra-cloud-wire = { workspace = true }
@@ -29,7 +30,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [build-dependencies]
-tonic-build = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

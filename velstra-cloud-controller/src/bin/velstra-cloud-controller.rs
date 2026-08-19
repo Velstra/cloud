@@ -19,6 +19,7 @@ use velstra_cloud_controller::{
     election::{ElectionConfig, elect},
     instance::InstanceController,
     migration::MigrationController,
+    network::NetworkController,
     operations::OperationsController,
     port::PortController,
     quota::QuotaController,
@@ -32,9 +33,10 @@ use velstra_cloud_model::{
     meta::Timestamp,
     migration::{MigrationSpec, MigrationStatus},
     resources::{
-        AttachmentSpec, AttachmentStatus, InstanceSpec, InstanceStatus, NodeSpec, NodeStatus,
-        OperationSpec, OperationStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus,
-        SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, VolumeSpec, VolumeStatus,
+        AttachmentSpec, AttachmentStatus, InstanceSpec, InstanceStatus, NetworkSpec, NetworkStatus,
+        NodeSpec, NodeStatus, OperationSpec, OperationStatus, PortSpec, PortStatus, ProjectSpec,
+        ProjectStatus, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, VolumeSpec,
+        VolumeStatus,
     },
 };
 use velstra_cloud_store::{EtcdStore, MemoryStore, Store, TypedStore};
@@ -92,6 +94,16 @@ struct Args {
     #[arg(long, default_value_t = 15)]
     lease_seconds: u64,
 
+    /// Where the fabric's orchestrator answers, if this cell has one.
+    ///
+    /// Given, this process mirrors each tenant network to the fabric — the one
+    /// fact no node can state, because it belongs to the cell rather than to any
+    /// machine. Omitted, nothing is mirrored and nothing pretends to be: a cell
+    /// with no fabric is a control plane that runs and programs no data plane,
+    /// which is exactly what a test cell is.
+    #[arg(long, env = "VELSTRA_FABRIC")]
+    fabric: Option<String>,
+
     /// Run without leader election, acting unconditionally.
     ///
     /// For a single-process deployment and for a developer cell, where the
@@ -148,6 +160,8 @@ async fn main() {
     let ports: TypedStore<PortSpec, PortStatus> = TypedStore::new(store.clone(), cell, "ports");
     let subnets: TypedStore<SubnetSpec, SubnetStatus> =
         TypedStore::new(store.clone(), cell, "subnets");
+    let networks: TypedStore<NetworkSpec, NetworkStatus> =
+        TypedStore::new(store.clone(), cell, "networks");
 
     let (stop, shutdown) = watch::channel(false);
 
@@ -317,6 +331,24 @@ async fn main() {
             cell,
         )),
         volumes.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // The fabric learns about a tenant network from here and nowhere else: a
+    // node agent calls `create_port` with a VNI, and until something has said
+    // what that VNI *is*, the fabric answers `unknown network vni` and no guest
+    // reaches the network.
+    tasks.spawn(run_when_leading(
+        Arc::new(NetworkController::new(
+            store.clone(),
+            cell,
+            subnets.clone(),
+            args.fabric.clone(),
+        )),
+        networks.clone(),
         store.clone(),
         config,
         metrics.clone(),
