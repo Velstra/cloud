@@ -17,6 +17,9 @@ base64 = { workspace = true }
 velstra-cloud-model = { workspace = true }
 velstra-cloud-proto = { workspace = true }
 velstra-cloud-store = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 velstra-cloud-wire = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

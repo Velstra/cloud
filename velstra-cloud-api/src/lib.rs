@@ -21,6 +21,7 @@ pub mod grpc;
 /// should not have two implementations of it.
 pub use velstra_cloud_wire as json;
 pub mod paging;
+pub mod proxy;
 pub mod refs;
 pub mod rest;
 pub mod served;
@@ -40,6 +41,21 @@ use velstra_cloud_store::Store;
 /// told which port speaks which dialect will eventually be told wrong.
 pub fn server(api: Api) -> Router {
     grpc::services(api.clone()).merge(rest::router(api))
+}
+
+/// The same server, with a routing hop in front of it.
+///
+/// A request for a resource this cell does not own is forwarded to the cell that
+/// does, rather than answered here. Everything else — including every request in
+/// a single-cell installation, where the router has no opinion — reaches exactly
+/// the handlers [`server`] serves.
+///
+/// Separate from `server` rather than a parameter on it because the two have
+/// different dependencies: this one needs to know where the other cells are, and
+/// a single-cell deployment should not have to say "no cells" to get a working
+/// API.
+pub fn server_routed(api: Api, router: proxy::Router) -> Router {
+    server(api).layer(axum::middleware::from_fn_with_state(router, proxy::route))
 }
 
 /// The development arrangement: an in-memory store, one cell, one static token.
