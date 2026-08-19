@@ -305,6 +305,26 @@ const PROJECT_FIELDS: &[Field] = &[
         derived: false,
     },
     Field {
+        key: "cell",
+        label: "Cell",
+        kind: Kind::Text {
+            placeholder: "cell-1",
+            check: Check::Id,
+        },
+        required: false,
+        // Behind the disclosure, because a project is named far more often than
+        // it is placed: an installation with one cell never sets this, and one
+        // with several sets it once, when the project is created.
+        advanced: true,
+        // Says what it decides rather than what it is. "The home cell" tells an
+        // operator nothing they could act on; "where this project's resources
+        // live" tells them the consequence of getting it wrong.
+        help: "Which cell this project's resources live in, and where requests \
+               for them are routed. Leave empty to use whichever cell answers — \
+               which is what an installation with one cell wants.",
+        derived: false,
+    },
+    Field {
         key: "quota.instances",
         label: "Instances",
         kind: Kind::Number {
@@ -558,6 +578,31 @@ const VOLUME_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "Left empty the volume comes up blank.",
+        derived: false,
+    },
+    Field {
+        key: "sourceSnapshot",
+        label: "From snapshot",
+        // A name typed in, not a picker, and that is a limitation rather than a
+        // choice: a snapshot's name hangs under a *volume*
+        // (`projects/p1/volumes/data-1/snapshots/nightly`), and `Scope` knows
+        // only Project and Global. Until the schema can express a collection
+        // nested under an object, there is no snapshots screen for a picker to
+        // read — and offering a dropdown backed by nothing would be worse than
+        // asking for the name.
+        kind: Kind::Text {
+            placeholder: "projects/p1/volumes/data-1/snapshots/nightly",
+            check: Check::Name,
+        },
+        required: false,
+        // Beside "From image" rather than behind the disclosure: restoring a
+        // snapshot is not an advanced variation on making a volume, it is the
+        // other ordinary reason to make one. A volume is never restored in
+        // place — restoring *is* making a new volume from a snapshot — so this
+        // is where a person comes looking for it.
+        advanced: false,
+        help: "Restores that snapshot into a new volume. A volume is never \
+               restored in place, so this is what restoring means.",
         derived: false,
     },
     Field {
@@ -926,6 +971,33 @@ const NODE_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "What placement policies match on.",
+        derived: false,
+    },
+];
+
+/// A storage pool, which is infrastructure in the same sense a node is: an
+/// operator decides whether it takes new work, and the agent reports the rest.
+const POOL_FIELDS: &[Field] = &[
+    Field {
+        key: "accepting",
+        label: "Accepts new volumes",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "Turning this off drains the pool: nothing new is provisioned \
+               into it, what it holds stays.",
+        derived: false,
+    },
+    Field {
+        key: "labels",
+        label: "Labels",
+        kind: Kind::TextList {
+            placeholder: "ssd",
+            check: Check::Id,
+        },
+        required: false,
+        advanced: false,
+        help: "What a volume's placement matches on.",
         derived: false,
     },
 ];
@@ -1632,6 +1704,70 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "pools",
+        title: "Pools",
+        singular: "pool",
+        recheck: 0,
+        condition: "Ready",
+        group: "Fleet",
+        scope: Scope::Global,
+        blurb: "Where volumes live. The spec is what an operator decided about \
+                a pool; the backend, the capacity and what is used are what its \
+                agent found.",
+        fields: POOL_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.accepting",
+                label: "Accepts work",
+                cell: Cell::Yes {
+                    yes: "yes",
+                    no: "draining",
+                },
+                width: 120,
+            },
+            Column {
+                // Observed, never declared: an operator writing "zfs" over an
+                // LVM pool would be describing a world that does not exist.
+                path: "status.backend",
+                label: "Backend",
+                cell: Cell::Mono,
+                width: 96,
+            },
+            Column {
+                path: "status.allocatedGib",
+                label: "Used",
+                cell: Cell::Number { unit: "GiB" },
+                width: 104,
+            },
+            Column {
+                path: "status.capacityGib",
+                label: "Capacity",
+                cell: Cell::Number { unit: "GiB" },
+                width: 112,
+            },
+            Column {
+                path: "status.agentVersion",
+                label: "Agent",
+                cell: Cell::Mono,
+                width: 96,
+            },
+            Column {
+                path: "status.lastHeartbeat",
+                label: "Heard from",
+                cell: Cell::Ago,
+                width: 112,
+            },
+        ],
+        agreements: &[],
+        // A pool comes into existence when its agent registers one, the same
+        // way a node does. Creating one here would be describing a backend
+        // nobody has attached.
+        creatable: false,
+        editable: true,
+        deletable: false,
+        explainable: false,
+    },
+    Collection {
         id: "operations",
         title: "Operations",
         singular: "operation",
@@ -1697,6 +1833,14 @@ pub const COLLECTIONS: &[Collection] = &[
                 width: 200,
             },
             Column {
+                // Second, right after the name: where a project lives is a fact
+                // about the project itself, not one of its measurements.
+                path: "spec.cell",
+                label: "Cell",
+                cell: Cell::Text,
+                width: 96,
+            },
+            Column {
                 path: "status.used.instances",
                 label: "Instances",
                 cell: Cell::Number { unit: "" },
@@ -1759,8 +1903,10 @@ mod tests {
             "networks",
             "subnets",
             "ports",
+            "security-groups",
             "images",
             "nodes",
+            "pools",
             "operations",
             "migrations",
         ] {
@@ -1768,9 +1914,16 @@ mod tests {
         }
         assert_eq!(
             COLLECTIONS.len(),
-            12,
+            13,
             "a collection was added without a screen"
         );
+        // This list is maintained by hand, and on 2026-08-19 it was two short:
+        // `pools` and `snapshots` were served by the API and had no screen, and
+        // this test passed anyway because it only checks what somebody
+        // remembered to write down. The list that cannot fall behind is the
+        // API's own, and comparing against it needs both crates — so that
+        // check lives in `velstra-cloud-api/tests/console_covers_the_model.rs`
+        // and this one is the fast local echo of it.
     }
 
     #[test]

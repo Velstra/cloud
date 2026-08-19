@@ -26,7 +26,7 @@ pub mod refs;
 pub mod rest;
 pub mod served;
 
-pub use core::{Api, Filter, WatchEvent};
+pub use core::{Api, COLLECTIONS, Filter, WatchEvent};
 use std::sync::Arc;
 
 pub use auth::{Identity, StaticTokenVerifier, TokenVerifier};
