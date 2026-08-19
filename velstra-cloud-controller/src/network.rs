@@ -140,8 +140,17 @@ impl Reconciler for NetworkController {
         // network of the same VNI, so this converges after a fabric restart, a
         // controller failover, or a subnet that arrived late — none of which
         // leave anything to repair by hand.
+        // No `..` here either, and this one really does drop something.
+        let NetworkSpec {
+            vni,
+            // Not on the fabric's network at all. It reaches the guest instead,
+            // through DHCP and the metadata service, which is where an MTU has
+            // to arrive to have any effect — the fabric's own overlay sizing
+            // comes from the *underlay* MTU each node reads off its interface.
+            mtu: _,
+        } = &network.spec;
         let spec = pb::NetworkSpec {
-            vni: network.spec.vni,
+            vni: *vni,
             name: name.to_string(),
             subnet: subnet.spec.cidr.clone(),
             // Deny by default, matching what the cloud tells fabric for a port's
@@ -161,13 +170,36 @@ impl Reconciler for NetworkController {
         // plane hands out is decided here, by counting, and passed explicitly.
         // Declaring the gateway is still worth doing: it is the one address
         // fabric reserves itself, and it agrees with what this side reserves.
+        //
+        // The pattern has **no `..`**: adding a field to a cloud subnet is a
+        // compile error here until somebody says whether the fabric needs it.
+        // Two of them already do not, and the reasons are written down rather
+        // than left as a silent omission — which is the shape that put a send
+        // ceiling on a port and never applied it.
+        let SubnetSpec {
+            network: _,
+            cidr,
+            gateway,
+            // Given to the guest by DHCP and the metadata service; the fabric
+            // does not resolve anything on anyone's behalf.
+            dns: _,
+            // Honoured by this side's IPAM, which is the *only* allocator over
+            // this range — the fabric is always handed an explicit address and
+            // never picks one, so a reservation it does not know about cannot
+            // be handed out by it. If that ever stops being true, this is the
+            // line that has to change.
+            reserved: _,
+        } = &subnet.spec;
         let fabric_subnet = pb::SubnetSpec {
             id: subnet.meta.name.to_string(),
-            vni: network.spec.vni,
-            cidr: subnet.spec.cidr.clone(),
-            gateway: subnet.spec.gateway.clone(),
+            vni: *vni,
+            cidr: cidr.clone(),
+            gateway: gateway.clone(),
+            // Left to the CIDR: a pool this side does not use is a pool that
+            // could only ever disagree with it.
             pool_start: String::new(),
             pool_end: String::new(),
+            // The node agent answers DHCP, not the fabric.
             enable_dhcp: false,
         };
         match velstra_cloud_fabric::connect(&endpoint).await {

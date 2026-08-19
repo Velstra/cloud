@@ -118,14 +118,18 @@ impl RouterController {
     /// Waiting until the name exists costs a reconcile; guessing costs a
     /// debugging session.
     async fn vnis_for(&self, router: &Router) -> Result<std::result::Result<Vec<u32>, String>> {
-        if router.spec.networks.is_empty() {
+        // No `..`: everything a router says has to reach the fabric or be
+        // refused here. One field today, and the next one is a compile error
+        // until somebody decides which.
+        let RouterSpec { networks } = &router.spec;
+        if networks.is_empty() {
             return Ok(Err(
                 "no networks, so there is nothing to route between; add at least two".into(),
             ));
         }
         let mut vnis = Vec::new();
         let mut missing = Vec::new();
-        for name in &router.spec.networks {
+        for name in networks {
             match self.networks.get(name).await? {
                 Some(network) => vnis.push(network.spec.vni),
                 None => missing.push(name.clone()),
