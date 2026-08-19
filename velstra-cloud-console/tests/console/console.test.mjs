@@ -82,7 +82,10 @@ await test("signing in lands on a collection, with the rail beside it", async ()
     title: document.getElementById("listtitle").textContent,
     rows: document.querySelectorAll("#boardbody tr").length,
   })`);
-  equal(seen.rail.length, 12, "the rail does not list every collection");
+  // Counted rather than named, so a collection added to the schema and not to
+  // the rail is caught. The number moves when a screen is added — pools joined
+  // on 2026-08-19, which is what took it from 12 to 13.
+  equal(seen.rail.length, 13, "the rail does not list every collection");
   check(seen.title === "Instances", `landed on ${seen.title}`);
   check(seen.rows >= 1, "the board showed no instances at all");
 });
