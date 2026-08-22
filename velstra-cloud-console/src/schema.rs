@@ -93,7 +93,148 @@ pub enum Kind {
         #[serde(rename = "remoteCollection")]
         remote_collection: &'static str,
     },
+    /// The disks handed to Ceph: a list of `{node, device}` pairs.
+    ///
+    /// Modelled on [`Kind::RuleList`] and for the same reason — an OSD is not a
+    /// scalar. A device path means nothing without the machine it is plugged
+    /// into, and two list fields side by side would let somebody assemble the
+    /// third disk of one node out of the second row of the node list and the
+    /// third row of the path list. One control produces the pair or it produces
+    /// nothing.
+    ///
+    /// It is not a [`Kind::RefList`] either, because a disk is not an object the
+    /// API serves. It exists only inside `status.devices` on the node that can
+    /// see it, so this control reads the collection named here and offers what
+    /// each node reports about its own hardware.
+    ///
+    /// **The refusals are the feature.** Handing a disk to Ceph erases it, so a
+    /// device is offered only when it is provably empty and every other one is
+    /// shown *with the reason, in words*. Greying a row out answers "why can I
+    /// not select this disk" with silence, and silence is what sends somebody to
+    /// a terminal to find out something the platform already knew.
+    ///
+    /// The sentences are carried here rather than written in the script so there
+    /// is one copy of each, and
+    /// `velstra-cloud-api/tests/console_covers_the_model.rs` pins every one of
+    /// them against `ceph::may_consume`. The console does not link the model —
+    /// that is deliberate, it speaks REST — so nothing else is in a position to
+    /// stop the two wordings drifting apart, and a refusal that no longer
+    /// matches what the API would do is worse than no refusal at all.
+    DiskList {
+        /// The collection whose `status.devices` are offered.
+        collection: &'static str,
+        /// One sentence per state a device can be in that is not free, keyed by
+        /// the tag that state carries on the wire. `{field}` in the sentence is
+        /// replaced by whatever the state carries under that key.
+        refusals: &'static [Refusal],
+        /// Below this a disk is refused on size alone, whatever is on it.
+        #[serde(rename = "minGib")]
+        min_gib: u64,
+        /// That refusal, with `{sizeGib}` and `{minGib}` in it.
+        #[serde(rename = "tooSmall")]
+        too_small: &'static str,
+        /// What a device in a state this console has never heard of gets.
+        ///
+        /// Refused, never offered, and `{kind}` says which state it was. A node
+        /// running a newer agent can report something this table has no sentence
+        /// for, and the safe direction when the answer is unknown is the
+        /// conservative one: a disk whose state cannot be read is not provably
+        /// empty, and offering it would erase whatever the newer agent was
+        /// trying to warn about.
+        unknown: &'static str,
+        /// Said on the control itself, loudly. Not a hint: this is the one
+        /// action in the platform that nothing undoes.
+        warning: &'static str,
+    },
+    /// The pools to create once the cluster is up: a name and its two
+    /// replication numbers.
+    ///
+    /// A third bespoke list, and the alternative was genuinely considered: a
+    /// [`Kind::TextList`] of pool names would fit the existing machinery exactly
+    /// and let the model's serde defaults fill in the rest. It is rejected
+    /// because those two numbers are the pool's whole risk profile — `size` is
+    /// how many copies exist, `min_size` is how few may be written to — and a
+    /// control that cannot show them is a control that hides the difference
+    /// between a pool that survives a node reboot and one that stops taking
+    /// writes during it. They also constrain each other, and a cross-check needs
+    /// both halves in one row.
+    ///
+    /// The defaults are carried here so a blank row starts where the model
+    /// starts. Duplicated numbers, pinned in
+    /// `velstra-cloud-api/tests/console_covers_the_model.rs` against what
+    /// `CephPoolSpec` deserialises from a bare name — a console that offered 2/1
+    /// while the API meant 3/2 would be a form quietly proposing a weaker pool
+    /// than the one it was copying.
+    PoolList {
+        #[serde(rename = "defaultSize")]
+        default_size: u32,
+        #[serde(rename = "defaultMinSize")]
+        default_min_size: u32,
+    },
 }
+
+/// One reason a disk is not offered, in the words the model would use.
+///
+/// `kind` is the tag the state carries on the wire — `Filesystem`, `Mounted`,
+/// `Osd` — and `text` is the sentence, with `{field}` wherever a value that
+/// state carries belongs. The substitution is what keeps the sentence specific:
+/// "it holds an ext4 filesystem" is an answer, "it is in use" is a shrug.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Refusal {
+    pub kind: &'static str,
+    pub text: &'static str,
+}
+
+const fn refusal(kind: &'static str, text: &'static str) -> Refusal {
+    Refusal { kind, text }
+}
+
+/// Every state a block device can be in that is not free, and what to say about
+/// it.
+///
+/// Word for word what `velstra_cloud_model::ceph::may_consume` returns, and
+/// held to it by a test in the API crate — the one place both halves are
+/// linkable. Nothing here is paraphrase: an operator who reads this sentence and
+/// then reads the API's refusal of the same disk has to see the same words, or
+/// the console has taught them something the platform does not believe.
+const DEVICE_REFUSALS: &[Refusal] = &[
+    refusal(
+        "Partitioned",
+        "it has a partition table with {partitions} partition(s) on it. Something laid this disk \
+         out deliberately; wipe it outside the platform if it really is spare.",
+    ),
+    refusal(
+        "Filesystem",
+        "it holds a {fstype} filesystem. Handing it to Ceph erases that, so it is not offered \
+         until the filesystem is gone.",
+    ),
+    refusal(
+        "Mounted",
+        "it is mounted at {at} right now. Whatever is using it is using it.",
+    ),
+    refusal(
+        "System",
+        "it holds swap or the root filesystem — consuming it takes this node down.",
+    ),
+    refusal("Osd", "it is already OSD {id}."),
+    refusal(
+        "Volume",
+        "it is a member of {of}. Take it out of that first, if that is really what you want.",
+    ),
+    // The agent already wrote the sentence for this one — it is the state it
+    // reaches for when it cannot classify a device, and it carries its own
+    // reason. Repeating it verbatim is the whole template.
+    refusal("Unsuitable", "{why}"),
+];
+
+/// The smallest disk worth making an OSD of, and the sentence that refuses a
+/// smaller one.
+///
+/// `velstra_cloud_model::ceph::MIN_OSD_GIB`, copied for the same reason the
+/// sentences above are, and pinned by the same test.
+const MIN_OSD_GIB: u64 = 20;
+const TOO_SMALL: &str = "it is {sizeGib} GiB, and an OSD wants at least {minGib}. Below that the \
+                         OSD's own bookkeeping is a meaningful fraction of the disk.";
 
 /// How a reference is written on the wire.
 ///
@@ -278,6 +419,175 @@ pub struct Collection {
 }
 
 // ---- the collections -------------------------------------------------------
+
+const USER_FIELDS: &[Field] = &[
+    Field {
+        key: "displayName",
+        label: "Display name",
+        kind: Kind::Text {
+            placeholder: "Ada Lovelace",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        // Says what it is *not* for, because the obvious assumption is wrong and
+        // the consequence of acting on it is a permission that does not apply.
+        help: "Shown on screen. Never used to decide anything — the account's id \
+               is its identity.",
+        derived: false,
+    },
+    Field {
+        key: "email",
+        label: "Email",
+        kind: Kind::Text {
+            placeholder: "ada@example.org",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        help: "",
+        derived: false,
+    },
+    Field {
+        key: "disabled",
+        label: "Disabled",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        // The two things an operator needs to know before flipping it: it takes
+        // effect now, and it is the reversible half of deleting.
+        help: "Ends every session this account holds immediately, and refuses \
+               new sign-ins. Its roles are kept, so turning it back on restores \
+               exactly what it had.",
+        derived: false,
+    },
+    Field {
+        key: "cellAdmin",
+        label: "Cell administrator",
+        kind: Kind::Switch,
+        required: false,
+        // Behind the disclosure on purpose. It is the most consequential switch
+        // on the screen and the one least often wanted, and putting it beside
+        // the display name invites the mis-click.
+        advanced: true,
+        help: "May do anything anywhere in this cell, including inside every \
+               project. Grant it to operate the platform, not to use it.",
+        derived: false,
+    },
+];
+
+const CEPH_FIELDS: &[Field] = &[
+    Field {
+        key: "publicNetwork",
+        label: "Network",
+        kind: Kind::Text {
+            placeholder: "10.0.0.0/24",
+            check: Check::Cidr,
+        },
+        required: true,
+        advanced: false,
+        // Says the consequence of getting it wrong, not what the field is. "The
+        // public network" tells an operator nothing they could act on.
+        help: "Where the daemons talk to each other and to clients. A node with \
+               several interfaces has several answers, and the wrong one puts \
+               replication traffic on the tenant network.",
+        derived: false,
+    },
+    Field {
+        key: "clusterNetwork",
+        label: "Replication network",
+        kind: Kind::Text {
+            placeholder: "10.1.0.0/24",
+            check: Check::Cidr,
+        },
+        required: false,
+        advanced: true,
+        help: "A separate network for replication. Empty means the one above \
+               carries both, which is the ordinary answer for a small cluster.",
+        derived: false,
+    },
+    Field {
+        key: "monitors",
+        label: "Monitors",
+        kind: Kind::RefList {
+            collection: "nodes",
+            // A bare id, like every other reference to a node in this platform.
+            // The convention exists because a node is a cell-scoped root object
+            // — `hv-1`, not `nodes/hv-1` — and one spelling everywhere is what
+            // keeps a reference from having to be re-expanded somewhere.
+            spelling: Spelling::Id,
+        },
+        required: true,
+        advanced: false,
+        // The one number worth being loud about is two, and the reason is not
+        // obvious — it looks redundant and is not.
+        help: "Three nodes, or one for a lab. Never two: a quorum of two \
+               survives no failures and looks like it would.",
+        derived: false,
+    },
+    Field {
+        key: "osds",
+        label: "Disks",
+        kind: Kind::DiskList {
+            collection: "nodes",
+            refusals: DEVICE_REFUSALS,
+            min_gib: MIN_OSD_GIB,
+            too_small: TOO_SMALL,
+            unknown: "this node reports it as {kind}, which this console has no answer for. Not \
+                      offered: a disk whose state cannot be read is not a disk anything here can \
+                      call empty.",
+            // The one action in this platform that nothing undoes, said on the
+            // control where the click is, in the colour of a thing that cannot
+            // be taken back. The collection's blurb says it too, at the top of
+            // the dialog — but by the time somebody is reading a list of disks
+            // they are past the blurb, and this is the sentence that has to be
+            // in the way.
+            warning: "Adding a disk here erases it. Everything on that device goes, and nothing \
+                      in this platform brings it back.",
+        },
+        required: false,
+        advanced: false,
+        // Says what the refusals are for, because the first thing an operator
+        // does on this screen is look for a disk that is not in the list.
+        help: "One disk, one OSD. Anything that cannot be chosen says why beside \
+               it rather than being greyed out — only a device the node can see \
+               is empty is offered, so a disk you really do want to give up has \
+               to be wiped outside the platform first.",
+        derived: false,
+    },
+    Field {
+        key: "pools",
+        label: "Pools",
+        kind: Kind::PoolList {
+            default_size: 3,
+            default_min_size: 2,
+        },
+        required: false,
+        // One level deeper because three copies and a floor of two is the answer
+        // almost everybody wants and the model already fills in. An operator who
+        // needs another comes looking; nobody should have to answer it to get a
+        // cluster.
+        advanced: true,
+        // The consequence of each number, not what each number is called. "Size
+        // is the replica count" is a definition; "min size is where writes stop"
+        // is the thing that happens at three in the morning.
+        help: "Where volumes are stored. Copies is how many of every object \
+               exist; below the floor the pool refuses writes rather than \
+               holding data it cannot protect — so a floor equal to the copies \
+               means one node rebooting stops writing.",
+        derived: false,
+    },
+    Field {
+        key: "paused",
+        label: "Paused",
+        kind: Kind::Switch,
+        required: false,
+        advanced: true,
+        help: "Stops the deployment where it stands. Nothing is torn down, and \
+               turning it off carries on from there.",
+        derived: false,
+    },
+];
 
 const PROJECT_FIELDS: &[Field] = &[
     Field {
@@ -937,17 +1247,12 @@ const IMAGE_FIELDS: &[Field] = &[
         help: "",
         derived: false,
     },
-    Field {
-        key: "signature",
-        label: "Signature",
-        kind: Kind::Lines {
-            placeholder: "cosign signature",
-        },
-        required: false,
-        advanced: true,
-        help: "Verified before a node will boot it.",
-        derived: false,
-    },
+    // There is deliberately no `signature` field. It used to be here, with the
+    // help text "Verified before a node will boot it" — and nothing in the
+    // platform has ever verified it. A box that records a security claim
+    // nothing checks is not a neutral convenience: it is where the claim comes
+    // from. The API now refuses one, so a box here could only produce an error.
+    // See `ImageSpec::signature`.
 ];
 
 const NODE_FIELDS: &[Field] = &[
@@ -1615,15 +1920,10 @@ pub const COLLECTIONS: &[Collection] = &[
                 cell: Cell::Count,
                 width: 112,
             },
-            Column {
-                path: "spec.signature",
-                label: "Signed",
-                cell: Cell::Yes {
-                    yes: "yes",
-                    no: "no",
-                },
-                width: 80,
-            },
+            // And deliberately no `Signed` column. It read yes or no off a
+            // string nothing had checked, at a glance, in a list — which is the
+            // worst possible place for an unverified claim to appear, because
+            // that is exactly how somebody decides an image is safe.
         ],
         agreements: &[],
         creatable: true,
@@ -1965,6 +2265,100 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "users",
+        title: "Users",
+        singular: "user",
+        recheck: 0,
+        condition: "Ready",
+        group: "Access",
+        scope: Scope::Global,
+        blurb: "Who can sign in. A password is set from the row rather than \
+                shown on it — the platform stores a hash and cannot recover the \
+                original, which is the point.",
+        fields: USER_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.displayName",
+                label: "Name",
+                cell: Cell::Text,
+                width: 176,
+            },
+            Column {
+                path: "spec.email",
+                label: "Email",
+                cell: Cell::Text,
+                width: 200,
+            },
+            Column {
+                path: "spec.cellAdmin",
+                label: "Operator",
+                cell: Cell::Text,
+                width: 88,
+            },
+            Column {
+                path: "spec.disabled",
+                label: "Disabled",
+                cell: Cell::Text,
+                width: 88,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "ceph-clusters",
+        title: "Ceph",
+        singular: "Ceph cluster",
+        // Zero, like every collection whose status is *written*. A bootstrap
+        // takes minutes, which makes polling tempting — and the controller
+        // writes each step's result, so the watch delivers it. Polling here
+        // would ask again for something already on its way.
+        recheck: 0,
+        condition: "Ready",
+        group: "Storage",
+        scope: Scope::Global,
+        blurb: "Cluster storage every node reaches, instead of a pool per \
+                machine. Optional: a cell with directory pools is a working \
+                cell, and nothing here turns itself on. Choosing a disk for an \
+                OSD erases it.",
+        fields: CEPH_FIELDS,
+        columns: &[
+            Column {
+                path: "status.phase",
+                label: "Phase",
+                cell: Cell::Text,
+                width: 120,
+            },
+            Column {
+                path: "status.monitorsUp",
+                label: "Monitors",
+                cell: Cell::Count,
+                width: 96,
+            },
+            Column {
+                path: "status.osdsUp",
+                label: "OSDs",
+                cell: Cell::Count,
+                width: 80,
+            },
+        ],
+        agreements: &[Agreement {
+            label: "Monitors",
+            asked: "monitors",
+            is: "monitorsUp",
+            note: "A monitor that was chosen is not running. Until the \
+                       quorum is what was asked for, the cluster tolerates \
+                       fewer failures than it looks like it does.",
+        }],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
         id: "projects",
         title: "Projects",
         singular: "project",
@@ -2061,12 +2455,14 @@ mod tests {
             "operations",
             "migrations",
             "floatingips",
+            "users",
+            "ceph-clusters",
         ] {
             assert!(find(id).is_some(), "no screen for {id}");
         }
         assert_eq!(
             COLLECTIONS.len(),
-            15,
+            17,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:
@@ -2151,9 +2547,13 @@ mod tests {
         for c in COLLECTIONS {
             for f in c.fields {
                 let target = match f.kind {
-                    Kind::Ref { collection, .. } | Kind::RefList { collection, .. } => {
-                        Some(collection)
-                    }
+                    Kind::Ref { collection, .. }
+                    | Kind::RefList { collection, .. }
+                    // A disk picker points at a collection too — it reads
+                    // `status.devices` off every object in it — and a misspelling
+                    // there renders as a node list with no disks anywhere, which
+                    // reads as "this cell has no spare disks".
+                    | Kind::DiskList { collection, .. } => Some(collection),
                     _ => None,
                 };
                 if let Some(t) = target {
@@ -2161,6 +2561,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_refusal_is_a_sentence_whose_placeholders_close() {
+        // The script substitutes `{field}` out of the state a device reports. An
+        // unclosed brace is a refusal that renders with a brace in it — on the
+        // one control where the sentence *is* the feature — and the API-side
+        // test that pins these against the model would panic on it rather than
+        // say what was wrong.
+        for f in COLLECTIONS.iter().flat_map(|c| c.fields) {
+            let Kind::DiskList {
+                refusals,
+                too_small,
+                unknown,
+                ..
+            } = f.kind
+            else {
+                continue;
+            };
+            let texts = refusals
+                .iter()
+                .map(|r| r.text)
+                .chain([too_small, unknown])
+                .collect::<Vec<_>>();
+            for text in texts {
+                assert_eq!(
+                    text.matches('{').count(),
+                    text.matches('}').count(),
+                    "a refusal has an unbalanced placeholder: {text}"
+                );
+                assert!(!text.is_empty(), "a refusal says nothing");
+                assert!(
+                    !refusals.iter().any(|r| r.kind == "Free"),
+                    "a free disk is offered, not refused"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_disk_picker_says_what_cannot_be_undone_on_the_control() {
+        // The collection's blurb says it too, at the top of the dialog — and by
+        // the time somebody is reading a list of disks they are past the blurb.
+        // This is the sentence that has to be in the way of the click.
+        let ceph = find("ceph-clusters").unwrap();
+        let Some(Kind::DiskList { warning, .. }) = ceph
+            .fields
+            .iter()
+            .map(|f| f.kind)
+            .find(|k| matches!(k, Kind::DiskList { .. }))
+        else {
+            panic!("the Ceph screen has no disk picker, so nobody can choose an OSD");
+        };
+        assert!(
+            warning.contains("erases"),
+            "the disk picker's warning does not say what happens to the disk: {warning}"
+        );
     }
 
     #[test]

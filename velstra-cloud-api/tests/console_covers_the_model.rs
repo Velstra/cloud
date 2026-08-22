@@ -17,8 +17,11 @@
 //! it serves the model and it ships the console. Neither crate could hold it
 //! without gaining a dependency it has no other use for.
 
-use velstra_cloud_console::COLLECTIONS;
-use velstra_cloud_model::resources::{ImageSpec, InstanceSpec, ProjectSpec, VolumeSpec};
+use velstra_cloud_console::{COLLECTIONS, Kind};
+use velstra_cloud_model::{
+    ceph::{BlockDevice, CephClusterSpec, DeviceUse, MIN_OSD_GIB, may_consume},
+    resources::{ImageSpec, InstanceSpec, ProjectSpec, VolumeSpec},
+};
 
 /// Spec fields the console deliberately does not offer, and why.
 ///
@@ -30,6 +33,11 @@ fn exempt(collection: &str, field: &str) -> Option<&'static str> {
             "IAM is its own surface: a role grant is not a form field, and a \
              text box that silently replaced a project's whole policy is worse \
              than no box at all",
+        ),
+        ("images", "signature") => Some(
+            "nothing in this platform verifies a signature, so the API refuses \
+             one — and a box that records a security claim nothing checks is \
+             where the claim comes from. It comes back with verification",
         ),
         ("instances", "node") => Some(
             "where a guest runs is the scheduler's answer, not an operator's \
@@ -103,6 +111,24 @@ mod complete {
             encryption_key: Some("projects/p1/keys/k".into()),
             source_image: Some("projects/p1/images/sha256-abc".into()),
             source_snapshot: Some("projects/p1/volumes/v/snapshots/s".into()),
+        }
+    }
+
+    pub fn ceph_cluster() -> CephClusterSpec {
+        CephClusterSpec {
+            public_network: "10.0.0.0/24".into(),
+            cluster_network: "10.1.0.0/24".into(),
+            monitors: vec!["node-a".into()],
+            osds: vec![velstra_cloud_model::ceph::OsdSpec {
+                node: "node-a".into(),
+                device: "/dev/disk/by-id/nvme-x".into(),
+            }],
+            pools: vec![velstra_cloud_model::ceph::CephPoolSpec {
+                pool: "volumes".into(),
+                size: 3,
+                min_size: 2,
+            }],
+            paused: true,
         }
     }
 
@@ -184,6 +210,236 @@ fn the_console_can_express_every_image_field() {
     assert_covered("images", &complete::image());
 }
 
+#[test]
+fn the_console_can_express_every_ceph_cluster_field() {
+    // The one that made this test worth extending. `CEPH_FIELDS` had four
+    // entries — two networks, the monitors and the pause switch — so an operator
+    // could describe a Ceph cluster in every respect except the two the feature
+    // exists for: which disks it is made of and which pools it holds.
+    assert_covered("ceph-clusters", &complete::ceph_cluster());
+}
+
+// ---- the disks, and the one wording that is written down twice --------------
+//
+// The console deliberately does not link the model, so the sentences it shows
+// beside a disk it will not take are a *copy* of the ones `may_consume`
+// produces. A copy is a thing that drifts, and this is the pair of tests that
+// does not let it: every refusal the console can print is expanded here and
+// compared, character for character, against what the model would have said
+// about the same disk.
+//
+// It is worth the machinery because of what the drift would look like. The
+// console would keep offering a considered, specific reason — "it holds an ext4
+// filesystem" — for a disk the API now refuses for some other reason entirely,
+// and an operator would act on a sentence nothing in the platform believes any
+// more. On this screen, acting on it erases a disk.
+
+/// The disk picker's payload, or a failure saying the field is gone.
+fn disk_picker() -> (
+    &'static [velstra_cloud_console::Refusal],
+    u64,
+    &'static str,
+    &'static str,
+) {
+    let ceph = COLLECTIONS
+        .iter()
+        .find(|c| c.id == "ceph-clusters")
+        .expect("the console has a Ceph screen");
+    for f in ceph.fields {
+        if let Kind::DiskList {
+            refusals,
+            min_gib,
+            too_small,
+            unknown,
+            ..
+        } = f.kind
+        {
+            return (refusals, min_gib, too_small, unknown);
+        }
+    }
+    panic!("the Ceph screen has no disk picker, so nobody can choose an OSD from the console");
+}
+
+/// One `BlockDevice` per state the model can report.
+///
+/// The `match` below reads nothing and exists for what it refuses to compile: a
+/// state added to `DeviceUse` without a line in the list above is an error
+/// *here*, at the moment the state is added, rather than a device the console
+/// silently has no sentence for.
+fn every_device_state() -> Vec<DeviceUse> {
+    let all = vec![
+        DeviceUse::Free,
+        DeviceUse::Partitioned { partitions: 3 },
+        DeviceUse::Filesystem {
+            fstype: "ext4".into(),
+        },
+        DeviceUse::Mounted { at: "/srv".into() },
+        DeviceUse::System,
+        DeviceUse::Osd { id: "7".into() },
+        DeviceUse::Volume { of: "md0".into() },
+        DeviceUse::Unsuitable {
+            why: "it is removable, and removable is not a disk to build storage on.".into(),
+        },
+    ];
+    for state in &all {
+        match state {
+            DeviceUse::Free
+            | DeviceUse::Partitioned { .. }
+            | DeviceUse::Filesystem { .. }
+            | DeviceUse::Mounted { .. }
+            | DeviceUse::System
+            | DeviceUse::Osd { .. }
+            | DeviceUse::Volume { .. }
+            | DeviceUse::Unsuitable { .. } => {}
+        }
+    }
+    all
+}
+
+/// `{fstype}` from the same JSON the console reads it out of.
+fn expand(template: &str, values: &serde_json::Value) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let close = open
+            + rest[open..]
+                .find('}')
+                .expect("every placeholder in the schema is closed");
+        let key = &rest[open + 1..close];
+        let value = values
+            .get(key)
+            .unwrap_or_else(|| panic!("the schema asks for {{{key}}}, which no disk carries"));
+        match value {
+            serde_json::Value::String(s) => out.push_str(s),
+            other => out.push_str(&other.to_string()),
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn device(state: DeviceUse, size_gib: u64) -> BlockDevice {
+    BlockDevice {
+        path: "/dev/disk/by-id/nvme-eui.0001".into(),
+        kernel_name: "nvme0n1".into(),
+        size_gib,
+        rotational: false,
+        model: "Samsung SSD 990".into(),
+        serial: "S1A2B3".into(),
+        state,
+    }
+}
+
+/// The values the console substitutes into a refusal: the device's state, as the
+/// wire spells it, plus the two numbers the size refusal needs.
+fn placeholders(d: &BlockDevice, min_gib: u64) -> serde_json::Value {
+    let mut v = velstra_cloud_wire::to_wire(
+        serde_json::to_value(&d.state).expect("a device state always serialises"),
+    );
+    let map = v.as_object_mut().expect("a state is an object");
+    map.insert("sizeGib".into(), d.size_gib.into());
+    map.insert("minGib".into(), min_gib.into());
+    v
+}
+
+#[test]
+fn a_disk_that_is_not_free_is_refused_in_the_models_exact_words() {
+    let (refusals, min_gib, _, _) = disk_picker();
+    for state in every_device_state() {
+        let d = device(state, 931);
+        let values = placeholders(&d, min_gib);
+        let kind = values["kind"].as_str().expect("a state carries its tag");
+        let template = refusals.iter().find(|r| r.kind == kind);
+        match may_consume(&d) {
+            Ok(()) => assert!(
+                template.is_none(),
+                "the console refuses a {kind} disk that the model would accept, so an operator \
+                 is told they cannot have a disk they can have"
+            ),
+            Err(model_says) => {
+                let t = template.unwrap_or_else(|| {
+                    panic!(
+                        "the model refuses a {kind} disk and the console has no sentence for it, \
+                         so the row would say `{model_says}` nowhere and the disk would simply be \
+                         missing from the list"
+                    )
+                });
+                assert_eq!(
+                    expand(t.text, &values),
+                    model_says,
+                    "the console and the model disagree about a {kind} disk"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_disk_too_small_to_be_an_osd_is_refused_in_the_models_exact_words() {
+    let (_, min_gib, too_small, _) = disk_picker();
+    assert_eq!(
+        min_gib, MIN_OSD_GIB,
+        "the console's floor for an OSD is not the model's, so it offers disks the API refuses"
+    );
+    let d = device(DeviceUse::Free, MIN_OSD_GIB - 1);
+    let model_says = may_consume(&d).expect_err("a disk under the floor is refused");
+    assert_eq!(expand(too_small, &placeholders(&d, min_gib)), model_says);
+}
+
+/// A state this console has never heard of gets a sentence too, and it refuses.
+///
+/// There is no model wording to pin this one against — it is the case where the
+/// model has moved and this page has not. What matters is that it exists and
+/// that it names the state, because the alternative is a newer agent reporting
+/// something protective and the console reading the silence as "free".
+#[test]
+fn a_state_the_console_has_never_heard_of_still_says_something() {
+    let (_, _, _, unknown) = disk_picker();
+    assert!(
+        unknown.contains("{kind}"),
+        "the fallback refusal does not say which state it could not read"
+    );
+    assert!(
+        unknown.len() > 40,
+        "the fallback refusal is too short to be an answer"
+    );
+}
+
+/// A blank pool row starts where `CephPoolSpec` starts.
+///
+/// Three copies with a floor of two is the model's answer for a pool named and
+/// nothing else, and a form that proposed 2/1 while the API meant 3/2 would be
+/// quietly offering a weaker pool than the one it is copying — visible to nobody
+/// until a node reboots and writes stop.
+#[test]
+fn a_blank_pool_starts_where_the_model_starts() {
+    let ceph = COLLECTIONS
+        .iter()
+        .find(|c| c.id == "ceph-clusters")
+        .expect("the console has a Ceph screen");
+    let kind = ceph
+        .fields
+        .iter()
+        .find_map(|f| match f.kind {
+            Kind::PoolList {
+                default_size,
+                default_min_size,
+            } => Some((default_size, default_min_size)),
+            _ => None,
+        })
+        .expect("the Ceph screen has no pool control");
+    let bare: velstra_cloud_model::ceph::CephPoolSpec =
+        serde_json::from_value(serde_json::json!({ "pool": "volumes" }))
+            .expect("a pool needs only a name");
+    assert_eq!(
+        kind,
+        (bare.size, bare.min_size),
+        "the console's blank pool is not the pool the API would make from a bare name"
+    );
+}
+
 /// An exemption is a claim, and a claim needs a reason attached.
 #[test]
 fn every_exemption_says_why() {
@@ -243,3 +499,260 @@ fn every_unscreened_collection_says_why() {
     let why = unscreened("snapshots").expect("listed above but not exempt");
     assert!(why.len() > 60, "snapshots is unscreened without saying why");
 }
+
+// ---- the other direction ---------------------------------------------------
+//
+// Everything above asks whether the model reached the console. This asks
+// whether the console points at anything the model does not have — the same
+// drift running the other way, and the more embarrassing of the two, because
+// what it produces is a column of blanks that looks like data nobody has yet.
+//
+// It has already happened. `ImageStatus.cachedOn` was removed for being a field
+// no writer could ever have written, and the column stayed: an operator reading
+// the image list saw "Cached on" and a number that could only ever be zero, and
+// every test was green because coverage was only ever checked in the direction
+// that adds things.
+
+/// Every path a complete resource of this kind actually has, in the wire's
+/// spelling, including `meta.*` and every nested key.
+fn paths_of(
+    spec: serde_json::Value,
+    status: serde_json::Value,
+) -> std::collections::BTreeSet<String> {
+    use velstra_cloud_model::meta::{Meta, Placement, ResourceName};
+
+    let meta = serde_json::to_value(Meta::new(
+        ResourceName::parse("projects/p1/instances/i1").expect("a name"),
+        Placement::new("eu", "cell-1"),
+    ))
+    .expect("meta serialises");
+
+    let document = velstra_cloud_wire::to_wire(serde_json::json!({
+        "meta": meta,
+        "spec": spec,
+        "status": status,
+    }));
+
+    let mut out = std::collections::BTreeSet::new();
+    walk(&document, String::new(), &mut out);
+    out
+}
+
+fn walk(value: &serde_json::Value, at: String, out: &mut std::collections::BTreeSet<String>) {
+    if !at.is_empty() {
+        out.insert(at.clone());
+    }
+    let step = |key: &str| {
+        if at.is_empty() {
+            key.to_string()
+        } else {
+            format!("{at}.{key}")
+        }
+    };
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                walk(child, step(key), out);
+            }
+        }
+        // The console indexes into lists — `status.addresses.0` is how an
+        // instance's first address is shown — so a list's positions are paths
+        // too. Only the ones that exist: a column naming `.3` of a list the
+        // fixture gives one entry is not something this can call wrong, which is
+        // why the complete fixtures above give every list at least one member.
+        serde_json::Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                walk(child, step(&i.to_string()), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Paths the API adds to a document on the way out, which no typed status has.
+///
+/// **This list is the point of the exercise, not an escape from it.** A handful
+/// of status fields are computed when a document is read rather than stored —
+/// membership over ports, occupancy over a subnet, which nodes hold an image —
+/// because they are aggregates that no single writer owns and that change far
+/// more often than anybody looks at them. They are real, and a console column
+/// for one is correct, but they are absent from the Rust type, so a check built
+/// from the type alone would call every one of them a column pointing nowhere.
+///
+/// Registering them here rather than silently ignoring unknown paths does three
+/// things: it says which fields are computed and why, in one place; it makes
+/// adding another one a decision made here; and — because the test asserts every
+/// entry is still *needed* — it fails if one of them ever becomes a stored field
+/// and the note goes stale.
+fn computed_on_read(collection: &str, path: &str) -> Option<&'static str> {
+    match (collection, path) {
+        ("images", "status.cachedOn") => Some(
+            "which nodes hold a verified copy is an aggregate over every node's \
+             own report; an image cannot write it and no controller owns it",
+        ),
+        _ => None,
+    }
+}
+
+/// Column paths the console names that the model does not have.
+///
+/// `status.*` is checked against a **default** status rather than a complete
+/// one, and that is deliberate in one direction only: a status field carrying
+/// `skip_serializing_if` is absent from a default value, so this would report it
+/// as missing. Every such field is therefore listed in the complete status
+/// below — which makes adding one a decision here, exactly like the spec side.
+fn assert_no_column_points_nowhere(
+    collection: &str,
+    spec: serde_json::Value,
+    status: serde_json::Value,
+) {
+    let Some(c) = COLLECTIONS.iter().find(|c| c.id == collection) else {
+        panic!("there is no {collection} collection in the console");
+    };
+    let have = paths_of(spec, status);
+    let mut nowhere = Vec::new();
+    let mut stale = Vec::new();
+    for column in c.columns {
+        let computed = computed_on_read(collection, column.path);
+        match (have.contains(column.path), computed.is_some()) {
+            // Ordinary: a column over a field the model has.
+            (true, false) => {}
+            // Registered above, and genuinely not on the type.
+            (false, true) => {}
+            // A column over nothing at all.
+            (false, false) => nowhere.push(column.path),
+            // Registered as computed and now present on the type. The note is
+            // no longer true, and a list of reasons that have stopped being
+            // reasons is how the next person is misled.
+            (true, true) => stale.push(column.path),
+        }
+    }
+    assert!(
+        nowhere.is_empty(),
+        "the {collection} list has columns for {nowhere:?}, which nothing in the model produces \
+         and nothing computes on read. A column pointing at a path that does not exist is not \
+         empty data — it is a heading over a column of blanks, which reads as \"none yet\".\n\
+         the model has: {have:?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "{stale:?} is registered as computed-on-read for {collection} and is now a stored field. \
+         Take the entry out: a reason that has stopped being true is worse than none."
+    );
+}
+
+/// Every status field spelled out, for the same reason the specs are: one
+/// carrying `skip_serializing_if` is absent from a default value, so a default
+/// status would report a perfectly good column as pointing nowhere. Writing
+/// them out makes adding a status field a decision here.
+mod settled {
+    use velstra_cloud_model::{
+        ceph::{CephClusterStatus, CephPhase, OsdSpec},
+        meta::Timestamp,
+        resources::{
+            ImageStatus, InstanceState, InstanceStatus, ProjectStatus, Quota, VolumeStatus,
+        },
+    };
+
+    pub fn project() -> ProjectStatus {
+        ProjectStatus {
+            observed_generation: 1,
+            conditions: vec![],
+            used: Quota {
+                instances: 1,
+                vcpus: 2,
+                memory_mib: 3,
+                volume_gib: 4,
+            },
+        }
+    }
+
+    pub fn instance() -> InstanceStatus {
+        InstanceStatus {
+            observed_generation: 1,
+            conditions: vec![],
+            state: InstanceState::Running,
+            node: Some("hv-1".into()),
+            addresses: vec!["10.0.0.5".into()],
+            vmm_pid: Some(4242),
+            started_at: Some(Timestamp(1)),
+        }
+    }
+
+    pub fn volume() -> VolumeStatus {
+        VolumeStatus {
+            observed_generation: 1,
+            conditions: vec![],
+            provisioned: true,
+            actual_size_gib: 10,
+            pool: Some("pool-a".into()),
+        }
+    }
+
+    pub fn image() -> ImageStatus {
+        ImageStatus {
+            observed_generation: 1,
+            conditions: vec![],
+        }
+    }
+
+    pub fn ceph_cluster() -> CephClusterStatus {
+        CephClusterStatus {
+            ssh_pubkey: "ssh-ed25519 AAAA cluster".into(),
+            observed_generation: 1,
+            conditions: vec![],
+            phase: CephPhase::Ready,
+            monitors_up: vec!["hv-1".into()],
+            managers_up: vec!["hv-1".into()],
+            osds_up: vec![OsdSpec {
+                node: "hv-1".into(),
+                device: "/dev/sdb".into(),
+            }],
+            pools_present: vec!["velstra-volumes".into()],
+        }
+    }
+}
+
+macro_rules! nothing_points_nowhere {
+    ($name:ident, $collection:literal, $spec:expr, $status:expr) => {
+        #[test]
+        fn $name() {
+            assert_no_column_points_nowhere(
+                $collection,
+                serde_json::to_value($spec).expect("a spec serialises"),
+                serde_json::to_value($status).expect("a status serialises"),
+            );
+        }
+    };
+}
+
+nothing_points_nowhere!(
+    no_image_column_points_at_something_the_model_does_not_have,
+    "images",
+    complete::image(),
+    settled::image()
+);
+nothing_points_nowhere!(
+    no_project_column_points_at_something_the_model_does_not_have,
+    "projects",
+    complete::project(),
+    settled::project()
+);
+nothing_points_nowhere!(
+    no_instance_column_points_at_something_the_model_does_not_have,
+    "instances",
+    complete::instance(),
+    settled::instance()
+);
+nothing_points_nowhere!(
+    no_volume_column_points_at_something_the_model_does_not_have,
+    "volumes",
+    complete::volume(),
+    settled::volume()
+);
+nothing_points_nowhere!(
+    no_ceph_column_points_at_something_the_model_does_not_have,
+    "ceph-clusters",
+    complete::ceph_cluster(),
+    settled::ceph_cluster()
+);

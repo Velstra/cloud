@@ -10,6 +10,8 @@ import { browser, signIn, open, openRow, sheetText, sleep, waitFor, test, check,
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:18100/";
 const TOKEN = process.env.CONSOLE_TOKEN || "testtoken";
+const USERNAME = process.env.CONSOLE_USER || "operator";
+const PASSWORD = process.env.CONSOLE_PASSWORD || "a test operator passphrase";
 // The scaffolding endpoints only the in-memory API has. Against a real API
 // these tests are skipped rather than faked.
 const SCAFFOLDED = process.env.CONSOLE_SCAFFOLD !== "0";
@@ -74,7 +76,145 @@ await test("a bad token is refused, and says so", async () => {
   check(/refused/i.test(said.said), `the refusal said "${said.said}"`);
 });
 
-await signIn(page, TOKEN);
+await test("token-only sign-in survives native form validation", async () => {
+  // The username and password inputs carry `required` for the password path. A
+  // service account signs in with a token alone and leaves both blank, so the
+  // form must not let native constraint validation reject that submit before
+  // the handler can route it to the token.
+  //
+  // This drives the form through `requestSubmit()`, which runs native
+  // validation exactly as a real click does — unlike the synthetic
+  // `dispatchEvent(new Event("submit"))` the rest of the suite uses, which
+  // bypasses validation and so cannot see this regression. A bad token keeps us
+  // on the sign-in screen; the tell is whether the submit fired at all: if the
+  // form validated the empty required fields it would never reach the API and
+  // no refusal would appear.
+  const said = await page.evaluate(`(async () => {
+    const form = document.getElementById("tokenform");
+    document.getElementById("username").value = "";
+    document.getElementById("password").value = "";
+    document.getElementById("token").value = "not-the-token";
+    const novalidate = form.noValidate;
+    form.requestSubmit();
+    await new Promise((r) => setTimeout(r, 700));
+    return {
+      novalidate,
+      inside: !document.getElementById("app").classList.contains("hidden"),
+      said: document.getElementById("loginerr").textContent,
+    };
+  })()`);
+  check(said.novalidate, "the sign-in form does not carry novalidate, so native "
+    + "validation of the empty username/password blocks token-only sign-in");
+  check(!said.inside, "a wrong token got in");
+  check(/refused/i.test(said.said),
+    "the token submit never reached the API — native validation swallowed it "
+    + `before the handler ran (loginerr said "${said.said}")`);
+});
+
+await test("a wrong password is refused in the API's own words", async () => {
+  const said = await page.evaluate(`(async () => {
+    document.getElementById("token").value = "";
+    document.getElementById("username").value = ${JSON.stringify(USERNAME)};
+    document.getElementById("password").value = "not the password";
+    document.getElementById("tokenform").dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 700));
+    return {
+      inside: !document.getElementById("app").classList.contains("hidden"),
+      said: document.getElementById("loginerr").textContent,
+      leftBehind: document.getElementById("password").value,
+    };
+  })()`);
+  check(!said.inside, "a wrong password got in");
+  // The API refuses every cause in one sentence so the response is not a
+  // username oracle. A console that translated it into something friendlier —
+  // "no such user", "wrong password" — would undo that from the outside.
+  check(/not accepted/i.test(said.said), `the refusal said "${said.said}"`);
+  check(said.leftBehind === "not the password",
+    "a failed sign-in cleared the field, so a typo means retyping the whole thing");
+});
+
+await signIn(page, { username: USERNAME, password: PASSWORD });
+
+await test("the console says who is signed in", async () => {
+  const chip = await page.evaluate(`document.getElementById("whoami").textContent`);
+  // Name and standing both: an operator who cannot tell which account they are
+  // using eventually does something as the wrong one.
+  check(/Test Operator/.test(chip), `the header said "${chip}"`);
+  check(/operator/.test(chip), `the header did not say this account holds the cell: "${chip}"`);
+});
+
+await test("the password field does not keep the password", async () => {
+  // It sat in a DOM node for the life of the tab, where a screen-share or a
+  // stray extension reads it back. Asserted after a *successful* sign-in,
+  // because that is the path where clearing it is easy to forget.
+  const left = await page.evaluate(`document.getElementById("password").value`);
+  check(left === "", `the password field still held ${left.length} characters`);
+});
+
+// --- setting a password -----------------------------------------------------
+//
+// The "Set password" action on a user opens a dialog. For the operator's *own*
+// account it must ask for and send the current password, because the API
+// refuses a self-change that does not — a stolen session that could set a new
+// password would otherwise be a permanent takeover. These drive that real
+// dialog against the (fake) API's own password route.
+
+await test("the password dialog sends current + new for a self-service change", async () => {
+  // Mutating, and only meaningful against the in-memory API, whose password
+  // route accepts the current one without changing anything real.
+  if (!SCAFFOLDED) return skip("this API's password route is real, so a self-change would alter the account");
+  const outcome = await page.evaluate(`(async () => {
+    // The operator's own subject, so the dialog takes the "prove the current
+    // one" shape and shows the current-password field it must send.
+    openPasswordDialog(session.who.subject);
+    const cur = document.getElementById("currentpassword");
+    if (!document.getElementById("dialog") || !cur || !document.getElementById("newpassword")) {
+      return { built: false, subject: (session.who || {}).subject };
+    }
+    cur.value = ${JSON.stringify(PASSWORD)};
+    document.getElementById("newpassword").value = "a freshly chosen passphrase";
+    document.getElementById("newpasswordagain").value = "a freshly chosen passphrase";
+    document.getElementById("submitpassword").click();
+    await new Promise((r) => setTimeout(r, 500));
+    const err = document.querySelector("#dialog .err");
+    return {
+      built: true,
+      // Success closes the dialog; the API refusing keeps it open with the reason.
+      closed: !document.getElementById("dialog"),
+      said: err ? err.textContent : "",
+    };
+  })()`);
+  check(outcome.built,
+    `the self-change dialog did not show the current-password field (own not detected; subject=${JSON.stringify(outcome.subject)})`);
+  check(outcome.closed,
+    `a self-change with the right current password did not go through: "${outcome.said}"`);
+});
+
+await test("the password dialog shows the API's refusal for a wrong current password", async () => {
+  const outcome = await page.evaluate(`(async () => {
+    openPasswordDialog(session.who.subject);
+    const cur = document.getElementById("currentpassword");
+    if (!cur) return { built: false, subject: (session.who || {}).subject };
+    cur.value = "not the current one";
+    document.getElementById("newpassword").value = "a freshly chosen passphrase";
+    document.getElementById("newpasswordagain").value = "a freshly chosen passphrase";
+    document.getElementById("submitpassword").click();
+    await new Promise((r) => setTimeout(r, 500));
+    const err = document.querySelector("#dialog .err");
+    return {
+      built: true,
+      open: !!document.getElementById("dialog"),
+      shown: err && !err.classList.contains("hidden"),
+      said: err ? err.textContent : "",
+    };
+  })()`);
+  check(outcome.built,
+    `the self-change dialog did not ask for the current password (own not detected; subject=${JSON.stringify(outcome.subject)})`);
+  check(outcome.open, "a refused password change closed the dialog instead of showing why");
+  check(outcome.shown && /current password/i.test(outcome.said),
+    `the refusal was not shown honestly: "${outcome.said}"`);
+  await page.evaluate(`closeDialog()`);
+});
 
 await test("signing in lands on a collection, with the rail beside it", async () => {
   const seen = await page.evaluate(`({
@@ -83,9 +223,15 @@ await test("signing in lands on a collection, with the rail beside it", async ()
     rows: document.querySelectorAll("#boardbody tr").length,
   })`);
   // Counted rather than named, so a collection added to the schema and not to
-  // the rail is caught. The number moves when a screen is added — pools joined
-  // on 2026-08-19, which is what took it from 12 to 13.
-  equal(seen.rail.length, 13, "the rail does not list every collection");
+  // the rail is caught. The number moves when a screen is added — pools took it
+  // from 12 to 13, then routers and floating IPs to 15, users to 16, and Ceph
+  // to 17.
+  //
+  // It sat at 13 for two of those, which says something about the check rather
+  // than about the console: a hand-kept number is only a guard if somebody runs
+  // it, and this suite is not in `cargo test`. What it caught in the end was
+  // itself.
+  equal(seen.rail.length, 17, "the rail does not list every collection");
   check(seen.title === "Instances", `landed on ${seen.title}`);
   check(seen.rows >= 1, "the board showed no instances at all");
 });
@@ -1299,6 +1445,177 @@ await test("a security group can be built out of rules, not just named", async (
   equal(stored[0].protocol, "tcp", "the rule reached the API as something else");
   equal(stored[0].ports.from, 443, "the port range did not survive");
   equal(stored[0].remote.cidr, "0.0.0.0/0", "the remote did not survive");
+});
+
+// ---- picking disks ---------------------------------------------------------
+//
+// The one control on the page that destroys something. Everything below is
+// about the half of it that is easy to build wrong and invisible when it is: a
+// disk that cannot be taken has to say *why*, in the model's own words, rather
+// than being greyed out or quietly left off the list. A picker that silently
+// omitted them would look perfectly correct and would answer "why can I not
+// select this disk" with nothing at all.
+
+const CLUSTER = "ceph-" + Math.random().toString(36).slice(2, 6);
+
+const diskRows = (page) => page.evaluate(`(() => {
+  const host = document.getElementById("f-osds");
+  if (!host) return { trouble: "the Ceph form has no disk picker at all" };
+  return {
+    warning: (host.querySelector("p.warn") || {}).textContent || "",
+    hosts: [...host.querySelectorAll(".diskhost")].map((h) => h.textContent),
+    rows: [...host.querySelectorAll(".disk")].map((r) => ({
+      node: r.dataset.node,
+      device: r.dataset.device,
+      why: (r.querySelector(".why") || {}).textContent || "",
+      button: (r.querySelector("button") || {}).textContent || "",
+      note: (r.querySelector(".note") || {}).textContent || "",
+    })),
+  };
+})()`);
+
+await test("a disk that cannot be taken says why in words, not by being greyed out", async () => {
+  await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
+  await open(page, "ceph-clusters");
+  await page.evaluate(`document.getElementById("newbtn").click()`);
+  // The picker is filled after the dialog is on screen, from a real list of
+  // nodes — the control is drawn once before that fetch lands.
+  await sleep(500);
+  const seen = await diskRows(page);
+  check(!seen.trouble, seen.trouble || "");
+  check(seen.rows.length >= 6,
+    `the picker offered ${seen.rows.length} disks, so this seed cannot exercise a refusal`);
+  // Grouped by the machine the disk is plugged into: a bare list of paths is a
+  // list in which /dev/sda appears three times and means three things.
+  check(seen.hosts.some((h) => h.startsWith("node-a")) && seen.hosts.some((h) => h.startsWith("node-c")),
+    "the disks are not grouped by node: " + seen.hosts.join(", "));
+
+  const find = (suffix) => seen.rows.find((r) => r.device.endsWith(suffix)) || {};
+  const ext4 = find("0002"), small = find("0003"), system = find("0004"),
+    mounted = find("0005"), partitioned = find("0006"), osd = find("0008");
+
+  // Word for word what `may_consume` returns — the schema carries the sentences
+  // and a test in the API crate holds them to the model. What is checked here
+  // is that they reach the screen at all.
+  check(/it holds a ext4 filesystem/.test(ext4.why), `the ext4 disk said "${ext4.why}"`);
+  check(/erases that/.test(ext4.why), "the reason stops before saying what would happen");
+  check(/at least 20/.test(small.why), `the 16 GiB disk said "${small.why}"`);
+  check(/takes this node down/.test(system.why), `the system disk said "${system.why}"`);
+  check(/mounted at \/var\/lib\/velstra/.test(mounted.why), `the mounted disk said "${mounted.why}"`);
+  check(/partition table with 3 partition/.test(partitioned.why),
+    `the partitioned disk said "${partitioned.why}"`);
+  check(/already OSD 7/.test(osd.why), `the disk that is already an OSD said "${osd.why}"`);
+
+  // Not greyed out — refused. A row that carried a disabled button would be
+  // saying "not now" where the platform means "not until you wipe it".
+  for (const r of seen.rows.filter((r) => r.why)) {
+    check(!r.button, `${r.device} is refused and still offers a "${r.button}" button`);
+  }
+  // And the erase warning is on the control, not only in the blurb at the top
+  // of the dialog: by the time somebody is reading a list of disks they are
+  // past the blurb.
+  check(/erases it/.test(seen.warning), `the disk picker warned: "${seen.warning}"`);
+
+  // What is offered still has to be legible as a disk: a path and nothing else
+  // is not a choice anybody can make.
+  const free = find("0001");
+  equal(free.button, "Add", "the empty NVMe was not offered");
+  check(/931 GiB/.test(free.note) && /solid state/.test(free.note),
+    `the offered disk read as "${free.note}"`);
+});
+
+await test("picking a disk stages the node and the device together", async () => {
+  const chosen = await page.evaluate(`(() => {
+    const row = document.querySelector('#f-osds .disk[data-device$="0001"]');
+    row.querySelector("button[data-disk=add]").click();
+    const now = document.querySelector('#f-osds .disk[data-device$="0001"]');
+    return { chosen: now.classList.contains("chosen"),
+             button: now.querySelector("button").textContent };
+  })()`);
+  check(chosen.chosen, "adding a disk did not mark it as taken");
+  equal(chosen.button, "Remove", "a disk that was added cannot be given back");
+
+  // Everything else the form needs, and a pool — which lives one level deeper,
+  // because three copies with a floor of two is the answer almost everybody
+  // wants and the model already fills it in.
+  await page.evaluate(`(() => {
+    const id = document.getElementById("f-id");
+    id.value = ${JSON.stringify(CLUSTER)}; id.dispatchEvent(new Event("input"));
+    const net = document.getElementById("f-publicNetwork");
+    net.value = "10.20.0.0/24"; net.dispatchEvent(new Event("input"));
+    document.querySelector("#f-monitors > button.btn").click();
+    document.getElementById("moresettings").click();
+    document.getElementById("addpool").click();
+  })()`);
+  await sleep(200);
+  const pool = await page.evaluate(`(() => {
+    const row = document.querySelector("#f-pools .row");
+    const numbers = [...row.querySelectorAll("input[type=number]")];
+    const name = row.querySelector("input[type=text]");
+    name.value = "volumes"; name.dispatchEvent(new Event("input"));
+    return { copies: numbers[0].value, floor: numbers[1].value };
+  })()`);
+  // The blank row starts where `CephPoolSpec` starts. A form proposing 2/1
+  // while the API means 3/2 would be quietly offering a weaker pool than the
+  // one it is copying.
+  equal(pool.copies, "3", "a blank pool does not start at three copies");
+  equal(pool.floor, "2", "a blank pool does not start at a floor of two");
+
+  await page.evaluate(`document.getElementById("submitform").click()`);
+  await sleep(1500);
+
+  // Read back through the API rather than off the screen: what matters is the
+  // shape the platform stored, not that the form remembers what was clicked.
+  const stored = await page.evaluate(`(async () => {
+    const r = await fetch("/api/v1/ceph-clusters/" + ${JSON.stringify(CLUSTER)},
+      { headers: { authorization: "Bearer " + sessionStorage.getItem("velstra-cloud-token") } });
+    if (!r.ok) return { status: r.status };
+    return { spec: (await r.json()).spec };
+  })()`);
+  check(!stored.status, "the cluster was never created: the API answered " + stored.status);
+  equal((stored.spec.osds || []).length, 1, "the OSD did not reach the API");
+  // A bare id, like every other reference to a node in this platform. A full
+  // resource name here is an OSD assigned to a node that does not answer to it.
+  equal(stored.spec.osds[0].node, "node-a", "the OSD names its node the wrong way");
+  equal(stored.spec.osds[0].device, "/dev/disk/by-id/nvme-eui.0001",
+    "the OSD lost the disk it was made from");
+  equal((stored.spec.pools || []).length, 1, "the pool did not reach the API");
+  equal(stored.spec.pools[0].pool, "volumes", "the pool lost its name");
+  equal(stored.spec.pools[0].size, 3, "the pool lost its copies");
+  equal(stored.spec.pools[0].minSize, 2, "the pool lost its write floor");
+});
+
+await test("a disk already given to this cluster can still be taken back", async () => {
+  // The trap in an edit form: once Ceph owns a disk the node reports it as an
+  // OSD, which `may_consume` refuses — so a picker that believed the refusal
+  // would render every disk of a working cluster as unavailable, with no way
+  // left to remove one.
+  await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
+  // The picker cache is per collection and a write to a Ceph cluster does not
+  // touch `nodes`, so it is dropped here by hand. This is not the test working
+  // around the console — it is what the operator sees after any node event, a
+  // project switch or a reload, which is to say the ordinary case.
+  await page.evaluate(`forgetOptions("nodes")`);
+  await open(page, "ceph-clusters");
+  await openRow(page, CLUSTER);
+  await page.evaluate(`document.getElementById("editbtn").click()`);
+  await sleep(500);
+  const seen = await page.evaluate(`(async () => {
+    const nodes = await options("nodes");
+    const disk = (at(status(nodes.find((n) => idOf(n) === "node-a")), "devices") || [])
+      .find((d) => d.path.endsWith("0001"));
+    const row = document.querySelector('#f-osds .disk[data-device$="0001"]');
+    return { reported: at(disk, "state.kind"),
+             chosen: row.classList.contains("chosen"),
+             why: (row.querySelector(".why") || {}).textContent || "",
+             button: (row.querySelector("button") || {}).textContent || "" };
+  })()`);
+  check(seen.reported === "Osd",
+    `the node is reporting this disk as ${seen.reported}, so this test is not exercising the trap`);
+  check(seen.chosen, "the disk this cluster already holds is not shown as held");
+  check(!seen.why, `the form refuses a disk it already asked for: "${seen.why}"`);
+  equal(seen.button, "Remove", "a disk already in the spec cannot be removed");
+  await page.evaluate(`document.getElementById("cancelform").click(); closeSheet();`);
 });
 
 // ---- paging ----------------------------------------------------------------

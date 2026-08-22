@@ -63,6 +63,10 @@ struct Machine {
     vms: BTreeMap<String, VmObservation>,
     disks: BTreeSet<String>,
     images: BTreeSet<String>,
+    /// Disks this fake machine claims to have, so a test can drive the console's
+    /// disk picker without a machine that has spare disks.
+    devices: Vec<velstra_cloud_model::ceph::BlockDevice>,
+    ceph: Option<velstra_cloud_model::ceph::NodeCeph>,
     /// Where each pulled image was told to come from, so a test can assert the
     /// node was handed the *right* source and not merely that it pulled.
     pulled_from: BTreeMap<String, String>,
@@ -166,6 +170,16 @@ impl FakeVmm {
         let vmm = Self::new();
         vmm.machine.lock().unwrap().capacity = capacity;
         vmm
+    }
+
+    /// Give this machine some disks.
+    ///
+    /// A real VMM reports what `lsblk` says; this is how a test says the same
+    /// thing. It matters for the Ceph pass, which decides whether a disk may be
+    /// consumed from this list and from nothing else.
+    pub fn with_devices(self, devices: Vec<velstra_cloud_model::ceph::BlockDevice>) -> Self {
+        self.machine.lock().unwrap().devices = devices;
+        self
     }
 
     /// Make the next attempt at `what` on `target` fail, until healed.
@@ -374,6 +388,8 @@ impl Vmm for FakeVmm {
             volumes: m.volumes.clone(),
             receivers: m.receivers.clone(),
             sending: m.sending.keys().cloned().collect(),
+            devices: m.devices.clone(),
+            ceph: m.ceph.clone(),
         })
     }
 
@@ -619,6 +635,16 @@ struct Fabric {
     /// How many times each port was asked to be torn down, so a test can say
     /// "and it asked again" rather than only "it failed".
     unprograms: BTreeMap<String, usize>,
+    /// Behave like the fabric datapath: report no rules from `observe`, and
+    /// answer `agrees` from what the datapath is actually holding.
+    ///
+    /// Not a quirk to be tolerated but the shape of the real thing. The fabric
+    /// keeps the rules, in its own vocabulary, and the tap layer this observes
+    /// through is deliberately programmed with none — so a datapath that could
+    /// only be asked "what are your rules" would answer "none" for ever, every
+    /// port would read as out of date on every pass, and an instance whose
+    /// start is gated on its ports being current would never start.
+    holds_rules_elsewhere: bool,
 }
 
 /// The fabric, in a process. Same rule: cloning shares the datapath.
@@ -674,6 +700,14 @@ impl FakeDatapath {
             .unwrap_or(0)
     }
 
+    /// Make this datapath behave like the fabric one: rules kept somewhere this
+    /// process cannot read back, and the "is it current" question answered by
+    /// the datapath itself. See [`Fabric::holds_rules_elsewhere`].
+    pub fn holding_rules_elsewhere(self) -> Self {
+        self.fabric.lock().unwrap().holds_rules_elsewhere = true;
+        self
+    }
+
     /// The allowances this port was last programmed with, or `None` if it was
     /// never programmed at all — which is a different thing from being
     /// programmed with none, and a test that could not tell them apart would
@@ -687,6 +721,7 @@ impl FakeDatapath {
 impl Datapath for FakeDatapath {
     async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>> {
         let f = self.fabric.lock().unwrap();
+        let hidden = f.holds_rules_elsewhere;
         Ok(f.taps
             .iter()
             .map(|(port, tap)| {
@@ -694,11 +729,23 @@ impl Datapath for FakeDatapath {
                     port.clone(),
                     ProgrammedPort {
                         tap: tap.clone(),
-                        rules: f.rules.get(port).cloned().unwrap_or_default(),
+                        rules: if hidden {
+                            Vec::new()
+                        } else {
+                            f.rules.get(port).cloned().unwrap_or_default()
+                        },
                     },
                 )
             })
             .collect())
+    }
+
+    fn agrees(&self, port: &str, have: &ProgrammedPort, want: &[ResolvedRule]) -> bool {
+        let f = self.fabric.lock().unwrap();
+        if !f.holds_rules_elsewhere {
+            return have.rules == want;
+        }
+        f.rules.get(port).map(Vec::as_slice).unwrap_or_default() == want
     }
 
     async fn program(

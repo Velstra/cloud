@@ -31,11 +31,31 @@ struct Args {
 
     /// Bearer tokens, one per line, optionally `token subject`.
     ///
-    /// This is the development verifier. In production the token is an
-    /// OIDC-issued JWT and the only thing that changes is which
-    /// implementation of the trait is constructed here.
+    /// Service accounts and automation. People sign in with a password and get a
+    /// session; a daemon holds one of these, because issuing a session to a
+    /// daemon means something has to renew it. Optional: a cell where only
+    /// people sign in needs no token file at all.
     #[arg(long, env = "VELSTRA_TOKEN_FILE")]
-    token_file: PathBuf,
+    token_file: Option<PathBuf>,
+
+    /// Create this administrator if — and only if — the cell has no users yet.
+    ///
+    /// A cell with no users is a cell nobody can sign into, so an installation
+    /// has to be able to make the first one. The guard is "no users at all", not
+    /// "this user is missing": re-running against a populated cell must never
+    /// resurrect a deleted administrator or reset a live one's password, which
+    /// would be an unauthenticated way back in for anyone who can restart this
+    /// process.
+    #[arg(long, env = "VELSTRA_BOOTSTRAP_ADMIN")]
+    bootstrap_admin: Option<String>,
+
+    /// The password for `--bootstrap-admin`.
+    ///
+    /// Read from the environment rather than typed on a command line wherever
+    /// possible: an argument is visible in `ps` to every user on the machine,
+    /// and this one is the cell's first administrator.
+    #[arg(long, env = "VELSTRA_BOOTSTRAP_PASSWORD", hide = true)]
+    bootstrap_password: Option<String>,
 
     /// A subject that may do anything anywhere in this cell. Repeatable.
     ///
@@ -68,15 +88,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    let contents = std::fs::read_to_string(&args.token_file).map_err(|e| {
-        anyhow::anyhow!(
-            "the token file {} could not be read: {e}",
-            args.token_file.display()
-        )
-    })?;
-    let verifier: Arc<dyn TokenVerifier> = Arc::new(
-        StaticTokenVerifier::from_file_contents(&contents).map_err(|e| anyhow::anyhow!("{e}"))?,
-    );
+    let static_tokens: Option<Arc<dyn TokenVerifier>> = match &args.token_file {
+        Some(path) => {
+            let contents = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("the token file {} could not be read: {e}", path.display())
+            })?;
+            Some(Arc::new(
+                StaticTokenVerifier::from_file_contents(&contents)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            ))
+        }
+        None => None,
+    };
 
     let store: Arc<dyn Store> = if args.store == "memory" {
         tracing::warn!(
@@ -90,15 +113,50 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(endpoints = %args.store, "state store connected");
         Arc::new(store)
     };
-    if args.cell_admin.is_empty() {
+    if args.cell_admin.is_empty() && args.bootstrap_admin.is_none() {
         // Said out loud rather than discovered: a cell with no operator can
         // still serve every tenant whose project grants them, but nobody can
-        // register a node, create a project, or repair either.
+        // register a node, create a project, or repair either. A stored
+        // administrator counts too, which is why this is not fatal — the cell may
+        // already have one from an earlier start.
         tracing::warn!(
-            "no --cell-admin given: nothing in this cell may register a node, create a project, \
-             or read anything outside one"
+            "no --cell-admin and no --bootstrap-admin: unless this cell already holds an \
+             administrator, nothing in it may register a node or create a project"
         );
     }
+    // Sessions first, static tokens second. A person signs in and holds a
+    // session; a daemon holds a token; the API cannot tell them apart afterwards
+    // and does not need to.
+    let identity =
+        velstra_cloud_api::sessions::IdentityStore::new(store.clone(), &args.region, &args.cell);
+    let mut sessions = velstra_cloud_api::sessions::StoreTokenVerifier::new(identity.clone());
+    if let Some(tokens) = static_tokens {
+        sessions = sessions.with_fallback(tokens);
+    }
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(sessions);
+
+    match (&args.bootstrap_admin, &args.bootstrap_password) {
+        (Some(user), Some(password)) => {
+            if identity.bootstrap_admin(user, password).await? {
+                tracing::info!(user, "created the first administrator");
+            } else {
+                tracing::info!(
+                    "this cell already has users; --bootstrap-admin did nothing, which is \
+                     what keeps it from being a way back in"
+                );
+            }
+        }
+        (Some(_), None) => {
+            anyhow::bail!(
+                "--bootstrap-admin needs --bootstrap-password (or VELSTRA_BOOTSTRAP_PASSWORD)"
+            )
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("--bootstrap-password was given with no --bootstrap-admin to use it")
+        }
+        (None, None) => {}
+    }
+
     let api = velstra_cloud_api::Api::new(store, &args.region, &args.cell, verifier)
         .with_cell_admins(args.cell_admin.clone());
     // One watch on the store per assigned collection, from here on, however many

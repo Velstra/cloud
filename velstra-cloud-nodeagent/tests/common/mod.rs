@@ -19,7 +19,7 @@ use velstra_cloud_model::{
     meta::{Meta, Placement, ResourceName, Revision, Timestamp},
     migration::{Migration, MigrationSpec, MigrationStatus},
     resources::{
-        Attachment, AttachmentSpec, AttachmentStatus, ImageFormat, ImageSpec, ImageStatus,
+        Attachment, AttachmentSpec, AttachmentStatus, Image, ImageFormat, ImageSpec, ImageStatus,
         Instance, InstanceSpec, InstanceStatus, NODE_RELEASE_FINALIZER, NetworkSpec, NetworkStatus,
         Node, NodeSpec, NodeStatus, Port, PortSpec, PortStatus, Resource, SubnetSpec, SubnetStatus,
     },
@@ -139,7 +139,7 @@ pub fn node_agent(
     )
 }
 
-fn meta(name: &str) -> Meta {
+pub fn meta(name: &str) -> Meta {
     let mut meta = Meta::new(
         ResourceName::parse(name).unwrap(),
         Placement::new(REGION, CELL),
@@ -515,4 +515,147 @@ pub async fn create_port_in_groups(
     );
     ports(store).create(&port).await.unwrap();
     port
+}
+
+/// A reader shaped like the API rather than like the store.
+///
+/// ## Why this exists
+///
+/// Every agent test builds its agent over [`velstra_cloud_nodeagent::StoreCell`],
+/// which hands the whole cell over unfiltered. Production, through
+/// [`velstra_cloud_nodeagent::ApiCell`], does not: the API hands a node **its
+/// own** ports and computes group membership centrally, putting it on the group
+/// as `status.members`.
+///
+/// That difference is not cosmetic. A node that works membership out from the
+/// ports it can see gets the right answer against the store and a *silently
+/// narrower* one against the API — a rule naming a group whose members live on
+/// other machines expands to nothing, and a guest loses traffic its tenant
+/// allowed with no error anywhere. Testing only against the store is what let
+/// that sit there: the test that should have caught it was green, because it
+/// was asking the wrong reader.
+///
+/// So this reproduces the two real differences and nothing else:
+///
+/// * `ports()` returns only ports this node holds or has been given.
+/// * `security_groups()` returns groups with `status.members` filled in from
+///   **all** ports, which is what the API computes.
+///
+/// `nodes()` and `ceph_clusters()` delegate unfiltered, and that is not an
+/// omission: they are cell-wide collections, and a cell-wide list is served
+/// whole to a cell operator — which the node agent's identity has to be, since
+/// nothing else may read a node. The case that is *not* covered here is the
+/// misconfigured one, where the agent authenticates as an ordinary subject and
+/// the API narrows both lists to nothing rather than refusing them. That has no
+/// test double because it has no interesting behaviour to model: everything
+/// simply comes back empty. It is caught at run time instead, by the agent
+/// noticing that a node list came back without the agent's own node in it,
+/// which cannot happen in a healthy cell.
+pub struct ApiShaped {
+    inner: velstra_cloud_nodeagent::StoreCell,
+    ports: TypedStore<PortSpec, PortStatus>,
+    groups: TypedStore<
+        velstra_cloud_model::security::SecurityGroupSpec,
+        velstra_cloud_model::security::SecurityGroupStatus,
+    >,
+    node: String,
+}
+
+impl ApiShaped {
+    pub fn new(store: Arc<dyn Store>, node: &str) -> Self {
+        Self {
+            inner: velstra_cloud_nodeagent::StoreCell::new(store.clone(), CELL, node),
+            ports: ports(&store),
+            groups: TypedStore::new(store.clone(), CELL, "security-groups"),
+            node: node.to_string(),
+        }
+    }
+
+    async fn all_ports(&self) -> Vec<Port> {
+        self.ports.list().await.unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl velstra_cloud_nodeagent::CellReader for ApiShaped {
+    async fn ports(&self) -> velstra_cloud_nodeagent::HostResult<Vec<Port>> {
+        let me = self.node.as_str();
+        Ok(self
+            .all_ports()
+            .await
+            .into_iter()
+            .filter(|p| p.status.node.as_deref() == Some(me) || p.spec.node.as_deref() == Some(me))
+            .collect())
+    }
+
+    async fn security_groups(
+        &self,
+    ) -> velstra_cloud_nodeagent::HostResult<Vec<velstra_cloud_model::security::SecurityGroup>>
+    {
+        let specs: std::collections::BTreeMap<String, PortSpec> = self
+            .all_ports()
+            .await
+            .into_iter()
+            .map(|p| (p.meta.name.to_string(), p.spec))
+            .collect();
+        let mut groups = self.groups.list().await.unwrap_or_default();
+        for group in &mut groups {
+            group.status.members =
+                velstra_cloud_model::security::members_in(&group.meta.name.to_string(), &specs);
+        }
+        Ok(groups)
+    }
+
+    async fn instances(&self) -> velstra_cloud_nodeagent::HostResult<Vec<Instance>> {
+        self.inner.instances().await
+    }
+    async fn attachments(&self) -> velstra_cloud_nodeagent::HostResult<Vec<Attachment>> {
+        self.inner.attachments().await
+    }
+    async fn migrations(&self) -> velstra_cloud_nodeagent::HostResult<Vec<Migration>> {
+        self.inner.migrations().await
+    }
+    async fn subnets(
+        &self,
+    ) -> velstra_cloud_nodeagent::HostResult<Vec<velstra_cloud_model::resources::Subnet>> {
+        self.inner.subnets().await
+    }
+    async fn networks(
+        &self,
+    ) -> velstra_cloud_nodeagent::HostResult<Vec<velstra_cloud_model::resources::Network>> {
+        self.inner.networks().await
+    }
+    async fn images(&self) -> velstra_cloud_nodeagent::HostResult<Vec<Image>> {
+        self.inner.images().await
+    }
+    async fn nodes(&self) -> velstra_cloud_nodeagent::HostResult<Vec<Node>> {
+        self.inner.nodes().await
+    }
+    async fn ceph_clusters(
+        &self,
+    ) -> velstra_cloud_nodeagent::HostResult<Vec<velstra_cloud_model::ceph::CephCluster>> {
+        self.inner.ceph_clusters().await
+    }
+    async fn wake(&self) -> tokio::sync::mpsc::Receiver<()> {
+        self.inner.wake().await
+    }
+    fn describe(&self) -> String {
+        "shaped like the API: this node's ports, and membership computed centrally".to_string()
+    }
+}
+
+/// An agent that reads the cell the way production does.
+pub fn api_shaped_agent(
+    store: Arc<dyn Store>,
+    node: &str,
+    vmm: &FakeVmm,
+    datapath: &FakeDatapath,
+) -> Agent {
+    Agent::reading(
+        store.clone(),
+        AgentConfig::new(node, REGION, CELL),
+        Arc::new(vmm.clone()),
+        Arc::new(datapath.clone()),
+        Arc::new(ApiShaped::new(store, node)),
+    )
 }

@@ -266,6 +266,19 @@ impl Vmm for QemuVmm {
             host.images.insert(unslug(&digest));
         }
 
+        // The machine's disks, and what it runs of Ceph. Best-effort on both:
+        // a node without `lsblk` or without `cephadm` is an ordinary node that
+        // simply cannot be a Ceph host, and failing the whole observation over
+        // it would take that node's guests down for a feature it does not use.
+        match crate::devices::observe_devices().await {
+            Ok(devices) => host.devices = devices,
+            Err(e) => tracing::debug!("could not read this machine's disks: {e}"),
+        }
+        let ceph = crate::cephadm::CephAdmin::default().installed().await;
+        if ceph.installed {
+            host.ceph = Some(ceph);
+        }
+
         for entry in hostfs::read_dir_names(&self.layout.run_dir)? {
             let instance = unslug(&entry);
             let dir = self.layout.run_dir.join(&entry);

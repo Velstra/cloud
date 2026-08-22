@@ -8,9 +8,13 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use velstra_cloud_api::{Api, Filter, Identity, StaticTokenVerifier, TokenVerifier};
-use velstra_cloud_model::meta::ResourceName;
-use velstra_cloud_store::{MemoryStore, Store};
+use velstra_cloud_api::{Api, Code, Filter, Identity, StaticTokenVerifier, TokenVerifier};
+use velstra_cloud_model::{
+    access::Writer,
+    meta::ResourceName,
+    resources::{SnapshotSpec, SnapshotStatus, VolumeSpec, VolumeStatus},
+};
+use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
 const OPERATOR: &str = "ops";
 const ADA: &str = "ada";
@@ -26,9 +30,19 @@ fn name(text: &str) -> ResourceName {
 
 /// Two tenants: ada admins `p1`, bob admins `p2`, and neither is an operator.
 async fn cell() -> Api {
+    cell_and_store().await.0
+}
+
+/// The same cell, plus the store underneath it.
+///
+/// A snapshot that can be cloned from is one a pool has reported taking, and a
+/// pool reports through its own writes rather than through the API — so the
+/// tests about *following a reference into another project* need to reach past
+/// the API to set up the thing being reached for.
+async fn cell_and_store() -> (Api, Arc<dyn Store>) {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
-    let api = Api::new(store, "eu-central", "cell-1", verifier)
+    let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
         .with_cell_admins(vec![OPERATOR.to_string()]);
 
     for (project, admin) in [("p1", ADA), ("p2", BOB)] {
@@ -47,7 +61,7 @@ async fn cell() -> Api {
         .await
         .expect("an operator creates a project");
     }
-    api
+    (api, store)
 }
 
 #[tokio::test]
@@ -490,4 +504,234 @@ async fn a_tenant_does_not_see_another_tenants_operations() {
         operator_sees.items.len() > ada_sees.items.len(),
         "the operator saw no more than the tenant, so nothing is being filtered"
     );
+}
+
+/// A reference is a way to reach another object, and reaching has to be
+/// authorised like anything else.
+///
+/// This was open. A write was authorised against the project the new object
+/// lives in, and every reference in its spec was checked for *spelling* and
+/// nothing else — so bob could create a volume in `p2` whose `sourceSnapshot`
+/// named ada's snapshot in `p1`, and the pool would clone ada's bytes into a
+/// volume bob owns. Nothing in the platform would have recorded that it
+/// happened: the volume is bob's, the snapshot is untouched, and the only
+/// evidence is a resource name in a spec field.
+#[tokio::test]
+async fn a_tenant_cannot_make_a_volume_from_another_tenants_snapshot() {
+    let (api, store) = cell_and_store().await;
+
+    // Ada's volume, and her snapshot of it. Both halves of the pool's report
+    // are written the way the pool writes them, because a snapshot that has
+    // not been taken is refused for a different reason and would hide this one.
+    api.create(
+        "projects/p1",
+        "volumes",
+        &json!({"id": "data-1", "spec": {"size_gib": 100, "pool": "pool-a"}}),
+        &who(ADA),
+    )
+    .await
+    .expect("ada creates a volume in her own project");
+    provisioned(&store, "projects/p1/volumes/data-1", 100).await;
+
+    api.create(
+        "projects/p1/volumes/data-1",
+        "snapshots",
+        &json!({"id": "nightly"}),
+        &who(ADA),
+    )
+    .await
+    .expect("ada takes a copy of her own volume");
+    taken(&store, "projects/p1/volumes/data-1/snapshots/nightly", 100).await;
+
+    let refused = api
+        .create(
+            "projects/p2",
+            "volumes",
+            &json!({
+                "id": "stolen",
+                "spec": {"source_snapshot": "projects/p1/volumes/data-1/snapshots/nightly"}
+            }),
+            &who(BOB),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("bob cloned ada's snapshot into his own project");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+
+    // And the refusal says nothing about ada's snapshot being there: the same
+    // request naming something that does not exist is refused in the same
+    // words, so this cannot be used to find out what ada has.
+    let absent = api
+        .create(
+            "projects/p2",
+            "volumes",
+            &json!({
+                "id": "stolen",
+                "spec": {"source_snapshot": "projects/p1/volumes/nope/snapshots/nope"}
+            }),
+            &who(BOB),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("bob named a snapshot that does not exist");
+    assert_eq!(
+        refused.to_string(),
+        absent.to_string(),
+        "the two refusals can be told apart, which enumerates the other tenant"
+    );
+
+    // Nothing was written on the way to being refused.
+    api.get(&name("projects/p2/volumes/stolen"), &who(OPERATOR))
+        .await
+        .expect_err("the volume exists, so the refusal came too late to matter");
+}
+
+/// The same hole, on the field a machine boots from.
+///
+/// An image is smaller than a volume and worse to leak: it is the disk a guest
+/// starts from, so a tenant who may boot another tenant's image reads whatever
+/// that image was built with — keys baked into a golden image, a customer's
+/// data left in `/var`.
+#[tokio::test]
+async fn a_tenant_cannot_boot_another_tenants_image() {
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "images",
+        &json!({"id": "sha256-abc", "spec": {"digest": "sha256:abc"}}),
+        &who(ADA),
+    )
+    .await
+    .expect("ada uploads an image into her own project");
+
+    let refused = api
+        .create(
+            "projects/p2",
+            "instances",
+            &json!({
+                "id": "i1",
+                "spec": {"vcpus": 2, "image": "projects/p1/images/sha256-abc"}
+            }),
+            &who(BOB),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("bob booted a machine from ada's image");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+
+    let absent = api
+        .create(
+            "projects/p2",
+            "instances",
+            &json!({
+                "id": "i1",
+                "spec": {"vcpus": 2, "image": "projects/p1/images/sha256-nope"}
+            }),
+            &who(BOB),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("bob named an image that does not exist");
+    assert_eq!(
+        refused.to_string(),
+        absent.to_string(),
+        "the two refusals can be told apart, which enumerates the other tenant"
+    );
+
+    // The reference bob is entitled to is still ordinary: his own project's
+    // image, named the same way, from the same request shape. A check that
+    // refused this one would have made every reference in the system useless.
+    api.create(
+        "projects/p2",
+        "images",
+        &json!({"id": "sha256-def", "spec": {"digest": "sha256:def"}}),
+        &who(BOB),
+    )
+    .await
+    .expect("bob uploads an image into his own project");
+    api.create(
+        "projects/p2",
+        "instances",
+        &json!({
+            "id": "i1",
+            "spec": {"vcpus": 2, "image": "projects/p2/images/sha256-def"}
+        }),
+        &who(BOB),
+    )
+    .await
+    .expect("bob boots a machine from his own image");
+}
+
+/// A change is a write like any other, and it carries references too.
+#[tokio::test]
+async fn a_tenant_cannot_patch_a_reference_into_another_project() {
+    let api = cell().await;
+    api.create(
+        "projects/p2",
+        "networks",
+        &json!({"id": "n1", "spec": {"vni": 5001, "mtu": 1500}}),
+        &who(BOB),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "projects/p2",
+        "routers",
+        &json!({"id": "r1", "spec": {"networks": ["projects/p2/networks/n1"]}}),
+        &who(BOB),
+    )
+    .await
+    .expect("bob creates a router over his own network");
+
+    let refused = api
+        .patch(
+            &name("projects/p2/routers/r1"),
+            &json!({"spec": {"networks": ["projects/p1/networks/n1"]}}),
+            None,
+            &who(BOB),
+        )
+        .await
+        .expect_err("bob routed ada's network");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+
+    // Back to his own, unchanged, so the check bites the boundary rather than
+    // the field.
+    api.patch(
+        &name("projects/p2/routers/r1"),
+        &json!({"spec": {"networks": ["projects/p2/networks/n1"]}}),
+        None,
+        &who(BOB),
+    )
+    .await
+    .expect("bob may still route his own network");
+}
+
+/// The pool's half of a volume's life, written the way the pool writes it.
+async fn provisioned(store: &Arc<dyn Store>, name: &str, gib: u64) {
+    let volumes: TypedStore<VolumeSpec, VolumeStatus> =
+        TypedStore::new(store.clone(), "cell-1", "volumes");
+    let mut v = volumes.get(name).await.unwrap().unwrap();
+    v.status.pool = Some("pool-a".into());
+    v.status.provisioned = true;
+    v.status.actual_size_gib = gib;
+    v.status.observed_generation = v.meta.generation;
+    volumes
+        .update(&v, &Writer::agent("pool-a"))
+        .await
+        .expect("the pool claiming a volume assigned to it");
+}
+
+/// The pool reporting that it has made the copy.
+async fn taken(store: &Arc<dyn Store>, name: &str, gib: u64) {
+    let snapshots: TypedStore<SnapshotSpec, SnapshotStatus> =
+        TypedStore::new(store.clone(), "cell-1", "snapshots");
+    let mut s = snapshots.get(name).await.unwrap().unwrap();
+    s.status.pool = Some("pool-a".into());
+    s.status.taken = true;
+    s.status.size_gib = gib;
+    s.status.observed_generation = s.meta.generation;
+    snapshots
+        .update(&s, &Writer::agent("pool-a"))
+        .await
+        .expect("the pool claiming a snapshot assigned to it");
 }

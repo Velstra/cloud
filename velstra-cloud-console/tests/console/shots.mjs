@@ -60,7 +60,7 @@ await both("signin");
 
 // ---- the board --------------------------------------------------------------
 
-await signIn(page, TOKEN);
+await signIn(page, { username: process.env.CONSOLE_USER || "operator", password: process.env.CONSOLE_PASSWORD || "a test operator passphrase" });
 await both("board-instances", () => open(page, "instances"));
 await both("board-nodes", () => open(page, "nodes"));
 await both("board-subnets", () => open(page, "subnets"));

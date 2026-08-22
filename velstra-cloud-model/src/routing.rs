@@ -37,17 +37,26 @@ use crate::meta::{Placement, ResourceName};
 /// Collections that exist once for the whole installation rather than once per
 /// cell.
 ///
-/// Only projects, and the shortness of the list is the point: every global
-/// collection is one more thing that must be replicated everywhere and agreed
-/// on before a request can be routed. Projects earn it by being the thing
-/// routing is *keyed on* — a router that had to ask a cell where a project lives
-/// would need to know which cell to ask.
+/// Two, and the shortness of the list is the point: every global collection is
+/// one more thing that must be replicated everywhere and agreed on before a
+/// request can be routed.
 ///
-/// Everything else is a cell's own. `nodes` and `pools` are the cell's hardware
-/// and never leave it; `instances`, `volumes` and the rest belong to a project
-/// and live where it does.
+/// **Projects** earn it by being the thing routing is *keyed on* — a router that
+/// had to ask a cell where a project lives would need to know which cell to ask.
+///
+/// **Users** earn it by being what a binding names. `authz::may` compares a
+/// subject string, so per-cell user records would technically work — and would
+/// mean `alice` in one cell and `alice` in another are two different people with
+/// one name, discovered the first time somebody is granted a role in the wrong
+/// half of the installation. An identity that means different things in
+/// different places is not an identity.
+///
+/// Both are small and change rarely, which is what makes replicating them
+/// affordable. Everything else is a cell's own: `nodes` and `pools` are the
+/// cell's hardware and never leave it; `instances`, `volumes` and the rest belong
+/// to a project and live where it does.
 pub fn is_global_collection(kind: &str) -> bool {
-    kind == "projects"
+    matches!(kind, "projects" | "users")
 }
 
 /// The project a name belongs to, if it belongs to one.
@@ -75,8 +84,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn everything_but_projects_belongs_to_a_cell() {
+    fn everything_but_projects_and_users_belongs_to_a_cell() {
         assert!(is_global_collection("projects"));
+        // An identity that meant different things in different cells would not
+        // be an identity, and a binding names one.
+        assert!(is_global_collection("users"));
         for kind in [
             "instances",
             "volumes",

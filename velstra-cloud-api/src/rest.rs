@@ -23,7 +23,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{get, post},
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -47,17 +47,168 @@ pub fn router(api: Api) -> Router {
             "/api/v1/*name",
             get(read).post(create).patch(patch).delete(delete),
         )
+        // Signing out and asking who you are need a token, so they belong behind
+        // the layer with everything else. *Signing in* does not, and is added
+        // after it below.
+        .route("/api/v1/sessions/current", get(whoami).delete(sign_out))
+        .route(
+            "/api/v1/users/:id/password",
+            axum::routing::put(set_password),
+        )
         // The layer goes on before the console's routes, so only the API is
         // behind a token. The page itself is markup with no data in it — it
         // carries the sign-in form, and demanding a token to fetch the form
         // that asks for one is a locked door with the key inside.
         .layer(middleware::from_fn_with_state(api.clone(), authenticate))
+        // Outside the layer, and it has to be: this is the route that *issues*
+        // the token every other route demands. Behind the layer it would be a
+        // door whose key is on the other side of it.
+        .route("/api/v1/sessions", post(sign_in))
         .route("/", get(console))
         // A deep link into the console is a path this API does not serve and
         // the page does: reloading `/instances/i1` has to return the console
         // rather than a 404, because a single-page console routes it itself.
         .route("/*path", get(console))
         .with_state(api)
+}
+
+// --- signing in -----------------------------------------------------------
+
+/// What a sign-in request carries.
+#[derive(serde::Deserialize)]
+struct SignInBody {
+    username: String,
+    password: String,
+}
+
+/// Exchange a username and password for a bearer token.
+///
+/// Unauthenticated by construction — it is the route that issues what every
+/// other route requires. The refusal is deliberately the same sentence for every
+/// cause; see `crate::sessions`.
+async fn sign_in(State(api): State<Api>, Json(body): Json<SignInBody>) -> ApiResult<Response> {
+    let signed_in = api
+        .identity()
+        .sign_in(&body.username, &body.password)
+        .await?;
+    Ok((StatusCode::CREATED, Json(signed_in)).into_response())
+}
+
+/// End the session the caller presented.
+///
+/// Takes no body and names no session: a caller may only end the one they are
+/// holding, because a route that ended a session by *name* would be a way to
+/// sign somebody else out.
+async fn sign_out(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Extension(_who): Extension<Identity>,
+) -> ApiResult<StatusCode> {
+    let token = bearer(&headers).unwrap_or_default();
+    api.identity().sign_out(&token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Who the caller is, and what they may do at cell scope.
+///
+/// The console needs both to decide what to draw, and a console that decided
+/// from its own copy of the rules would show buttons the API then refuses. The
+/// answer comes from the same identity every other route is authorised against.
+async fn whoami(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Extension(who): Extension<Identity>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let record = api.identity().user(&who.subject).await?;
+    // Whether *this token* is a session, not whether a user record exists: a
+    // static token or a service account can share a subject with a stored user
+    // and still have no session behind it, and a sign-out for one of those ends
+    // nothing. The token itself is the only honest thing to ask.
+    let session = match bearer(&headers) {
+        Some(token) => api.identity().session_present(&token).await,
+        None => false,
+    };
+    Ok(Json(serde_json::json!({
+        "subject": who.subject,
+        "displayName": record
+            .as_ref()
+            .map(|u| u.spec.display_name.clone())
+            .unwrap_or_default(),
+        "cellAdmin": api.is_operator(&who),
+        // False for a service account or a static token: there is no session
+        // record behind those, so there is nothing for a sign-out to end and the
+        // console should not offer one.
+        "session": session,
+    })))
+}
+
+/// camelCase on the wire, like every other body this API serves: the field is
+/// `currentPassword`, and without the rename it would silently arrive as `None`
+/// — turning a self-service change that *did* prove the current password into a
+/// 403, or worse, letting one through that did not.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PasswordBody {
+    password: String,
+    /// The caller's current password, required only for a self-service change.
+    /// Absent — or wrong — is refused for that path; an operator resetting
+    /// someone else's account never sends it and is never asked.
+    #[serde(default)]
+    current_password: Option<String>,
+}
+
+/// Set a user's password.
+///
+/// A cell operator may set anyone's; anybody may set their own. Nobody else may
+/// set anyone's — a project administrator administers a *project*, and letting
+/// them take over an account would make project membership a route to the cell.
+///
+/// A self-service change must prove the *current* password. Without that, a
+/// stolen session is a permanent account takeover: the thief sets a new password
+/// (which revokes every other session, the owner's included) and the owner
+/// cannot take it back. Proving the old password is what separates the owner
+/// from whoever picked up their token. An operator resetting another account is
+/// the deliberate exception — the whole point of the reset is that nobody has
+/// the old password.
+async fn set_password(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<PasswordBody>,
+) -> ApiResult<StatusCode> {
+    let own = who.subject == id;
+    if !api.is_operator(&who) && !own {
+        return Err(ApiError::forbidden(
+            "only a cell operator may set another user's password",
+        ));
+    }
+    if own {
+        let current = body.current_password.as_deref().unwrap_or_default();
+        if !api.identity().verify_current(&id, current).await? {
+            return Err(ApiError::forbidden(
+                "the current password was not correct",
+            ));
+        }
+    }
+    // Changing your own password ends your other sessions and not the one you
+    // are sitting in. Somebody else changing it ends all of them, including any
+    // the account's owner is holding — which is the point when an operator is
+    // shutting a door.
+    let keep = own.then(|| bearer(&headers)).flatten();
+    api.identity()
+        .set_password_keeping(&id, &body.password, keep.as_deref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The bearer token on a request, if it carries one.
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(|t| t.trim().to_string())
 }
 
 /// The operator's console, held for the lifetime of the process rather than

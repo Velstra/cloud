@@ -84,6 +84,16 @@ pub struct HostState {
     /// Image digests present *and verified*. An unverified copy is not in here,
     /// because "cached" is what the agent boots from without asking again.
     pub images: BTreeSet<String>,
+    /// Block devices this machine has, and what each is being used for.
+    ///
+    /// Observed like everything else here, on every pass: a disk that was
+    /// plugged in, or one that stopped being spare because somebody put a
+    /// filesystem on it, is a change the next pass has to see. A cached list is
+    /// how a console offers a disk that is no longer free.
+    pub devices: Vec<velstra_cloud_model::ceph::BlockDevice>,
+    /// What this machine runs of Ceph, when it runs any. `None` on the nodes
+    /// that do not, which in most cells is most of them.
+    pub ceph: Option<velstra_cloud_model::ceph::NodeCeph>,
     /// Volume name to the device the guest sees, for the volumes this node
     /// currently holds open.
     pub volumes: BTreeMap<String, String>,
@@ -250,6 +260,28 @@ pub trait Datapath: Send + Sync + 'static {
     /// Port resource name to what the datapath has for it, for the ports
     /// programmed on this node right now.
     async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>>;
+
+    /// Whether what the datapath has for `port` is what `want` asks for.
+    ///
+    /// The default compares [`ProgrammedPort::rules`] and is right for any
+    /// datapath that can report the rules it holds in the same vocabulary they
+    /// were given in.
+    ///
+    /// It exists as a method because one implementation cannot. The fabric
+    /// keeps the rules, not this process — and it keeps them in *its* shape: a
+    /// cloud rule carrying a port range becomes one fabric rule per port, so
+    /// even a perfect inverse of that translation would not compare equal to
+    /// the range it came from. Asking the datapath the question instead of
+    /// asking it for its rules and comparing them here is the difference
+    /// between a check it can answer and one it always fails.
+    ///
+    /// Always failing is not a harmless conservatism: a port that never agrees
+    /// is a port that is re-programmed on every pass, and an instance whose
+    /// start is gated on its ports being programmed never starts at all.
+    fn agrees(&self, port: &str, have: &ProgrammedPort, want: &[ResolvedRule]) -> bool {
+        let _ = port;
+        have.rules == want
+    }
 
     /// Program a port and return its tap device. Idempotent: the fabric takes a
     /// desired map, not a delta, so asking twice is asking once.

@@ -37,7 +37,8 @@ mod schema;
 use std::sync::OnceLock;
 
 pub use schema::{
-    Agreement, COLLECTIONS, Cell, Check, Choice, Collection, Column, Field, Kind, Scale, Scope,
+    Agreement, COLLECTIONS, Cell, Check, Choice, Collection, Column, Field, Kind, Refusal, Scale,
+    Scope,
 };
 
 const SHELL: &str = include_str!("assets/shell.html");

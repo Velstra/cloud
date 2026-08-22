@@ -129,6 +129,19 @@ pub trait CellReader: Send + Sync + 'static {
     /// the console, and read by nothing.
     async fn images(&self) -> Result<Vec<Image>>;
 
+    /// Every node in the cell, and the Ceph cluster if the cell has one.
+    ///
+    /// Read by exactly one pass — the Ceph one — and read whole, because the
+    /// decision a node makes about Ceph is a function of what *every* node
+    /// reports. That is unusual here and it is the point: nothing hands a node
+    /// its step, so a node works out whether the step is its own by computing
+    /// the same answer everybody else computes, over the same facts.
+    ///
+    /// A cell with no Ceph cluster answers with an empty list on both, and the
+    /// pass does nothing at all.
+    async fn nodes(&self) -> Result<Vec<velstra_cloud_model::resources::Node>>;
+    async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>>;
+
     /// Woken whenever something this node has business with changes.
     ///
     /// A plain "look again", never the change itself. Every pass is
@@ -157,6 +170,14 @@ pub struct StoreCell {
     networks: TypedStore<NetworkSpec, NetworkStatus>,
     images: TypedStore<ImageSpec, ImageStatus>,
     migrations: TypedStore<MigrationSpec, MigrationStatus>,
+    all_nodes: TypedStore<
+        velstra_cloud_model::resources::NodeSpec,
+        velstra_cloud_model::resources::NodeStatus,
+    >,
+    ceph_clusters: TypedStore<
+        velstra_cloud_model::ceph::CephClusterSpec,
+        velstra_cloud_model::ceph::CephClusterStatus,
+    >,
 }
 
 impl StoreCell {
@@ -167,6 +188,8 @@ impl StoreCell {
             attachments: TypedStore::new(store.clone(), cell, "attachments"),
             ports: TypedStore::new(store.clone(), cell, "ports"),
             groups: TypedStore::new(store.clone(), cell, "security-groups"),
+            all_nodes: TypedStore::new(store.clone(), cell, "nodes"),
+            ceph_clusters: TypedStore::new(store.clone(), cell, "ceph-clusters"),
             subnets: TypedStore::new(store.clone(), cell, "subnets"),
             networks: TypedStore::new(store.clone(), cell, "networks"),
             images: TypedStore::new(store.clone(), cell, "images"),
@@ -219,6 +242,15 @@ impl CellReader for StoreCell {
     }
     async fn images(&self) -> Result<Vec<Image>> {
         self.images.list().await.map_err(|e| failed("images", e))
+    }
+    async fn nodes(&self) -> Result<Vec<velstra_cloud_model::resources::Node>> {
+        self.all_nodes.list().await.map_err(|e| failed("nodes", e))
+    }
+    async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>> {
+        self.ceph_clusters
+            .list()
+            .await
+            .map_err(|e| failed("ceph clusters", e))
     }
 
     async fn wake(&self) -> tokio::sync::mpsc::Receiver<()> {

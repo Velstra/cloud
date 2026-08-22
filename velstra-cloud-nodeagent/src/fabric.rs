@@ -98,9 +98,26 @@ pub struct Underlay {
     /// PMTUD's ICMP is filtered almost everywhere, which is the whole reason
     /// the clamp exists.
     pub mtu: u32,
+    /// This host's SRv6 locator as `prefix/len`, or `None` to stay on VXLAN.
+    ///
+    /// Stated, never read: unlike the MAC and the MTU, a locator is not a fact
+    /// about the interface. It is a slice of the operator's IPv6 address plan
+    /// that has to be routable in the underlay and unique per host, and a node
+    /// that invented one would build an overlay nothing routes to.
+    ///
+    /// Its presence is also what selects the wire family — there is no separate
+    /// encapsulation flag, because the two could then disagree, and a host whose
+    /// declared format and locator disagree is refused by the fabric anyway.
+    pub srv6_locator: Option<String>,
 }
 
 impl Underlay {
+    /// Put this host on the SRv6 wire family, or leave it on VXLAN for `None`.
+    pub fn with_srv6_locator(mut self, locator: Option<String>) -> Self {
+        self.srv6_locator = locator;
+        self
+    }
+
     /// Read the interface's MAC and MTU, so only the address and the name are
     /// stated.
     pub fn read(vtep: &str, iface: &str) -> Result<Self> {
@@ -116,6 +133,9 @@ impl Underlay {
             iface: iface.to_string(),
             mac,
             mtu,
+            // Not readable from the machine — see the field. `with_srv6_locator`
+            // is how a caller states one.
+            srv6_locator: None,
         })
     }
 
@@ -150,6 +170,15 @@ pub struct FabricDatapath {
     /// every port would be a round trip per port to say something that has not
     /// changed since the process started.
     declared: std::sync::atomic::AtomicBool,
+    /// What the fabric said its groups held, as of the last [`Datapath::observe`].
+    ///
+    /// Not a record of what this process programmed — that would be the thing
+    /// this crate refuses to keep, and it would go on claiming a port was
+    /// current after somebody changed it out from under the platform. It is the
+    /// *fabric's* answer, thrown away and asked for again on every pass, and it
+    /// lives here only because [`Datapath::agrees`] is asked the question
+    /// outside the call that can go and ask.
+    fabric_rules: std::sync::Mutex<BTreeMap<String, Vec<pb::PortRule>>>,
 }
 
 impl FabricDatapath {
@@ -160,6 +189,7 @@ impl FabricDatapath {
             host: host.to_string(),
             underlay,
             declared: std::sync::atomic::AtomicBool::new(false),
+            fabric_rules: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -184,10 +214,20 @@ impl FabricDatapath {
                 vtep: self.underlay.vtep.clone(),
                 underlay_iface: self.underlay.iface.clone(),
                 underlay_mac: self.underlay.mac.clone(),
-                // The fabric's own defaults for the rest: this agent has no
-                // opinion about the encapsulation or the MTU, and inventing one
-                // would be a per-host disagreement nobody asked for.
-                encap: 0,
+                // The wire family follows the locator rather than being its own
+                // flag: two fields can disagree, and the fabric refuses that
+                // disagreement, so a node with a locator would have to remember to
+                // set both or be rejected for a reason it did not cause. With no
+                // locator this stays at the fabric's default (VXLAN), which is
+                // what every existing deployment already runs.
+                encap: match self.underlay.srv6_locator {
+                    Some(_) => pb::Encap::Srv6 as i32,
+                    None => pb::Encap::Vxlan as i32,
+                },
+                srv6_locator: self.underlay.srv6_locator.clone().unwrap_or_default(),
+                // The fabric's own default for the port: this agent has no opinion
+                // about it, and inventing one would be a per-host disagreement
+                // nobody asked for.
                 udp_port: 0,
                 // Read from the interface, not left at the wire's 0 — which
                 // fabric reads as 1500 whatever the interface actually is.
@@ -217,6 +257,25 @@ impl FabricDatapath {
     /// be stable for the life of the port — which a resource name is.
     fn group_for(port: &str) -> String {
         format!("cloud:{port}")
+    }
+
+    /// What the fabric currently holds, by group name.
+    ///
+    /// One call for the whole node rather than one per port: the answer is a
+    /// property of the fabric, and asking it once per carried port would be the
+    /// same answer fetched many times.
+    async fn groups_in_fabric(&self) -> Result<BTreeMap<String, Vec<pb::PortRule>>> {
+        let mut client = self.client().await?;
+        let listed = client
+            .list_security_groups(pb::ListSecurityGroupsRequest {})
+            .await
+            .map_err(|e| HostError::failed(format!("listing the fabric's groups: {e}")))?
+            .into_inner();
+        Ok(listed
+            .groups
+            .into_iter()
+            .map(|g| (g.name, g.rules))
+            .collect())
     }
 }
 
@@ -311,6 +370,57 @@ pub fn translate(rule: &ResolvedRule) -> std::result::Result<Vec<pb::PortRule>, 
 }
 
 /// Everything a port's allowances come to, or the first one that cannot be said.
+/// Whether two sets of fabric rules are the same set.
+///
+/// Sorted copies rather than a `HashSet`, because `pb::PortRule` is generated
+/// and carries no `Hash`; and as a *set* rather than a sequence because nothing
+/// promises an order at either end — `translate` emits one rule per port of a
+/// range, and the fabric reports what it has in whatever order it has it.
+fn same_rules(a: &[pb::PortRule], b: &[pb::PortRule]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    // Destructured with **no** `..`, and that is the whole guard. Every field
+    // has to appear or this does not compile — because a comparison that
+    // skipped one would call two different rules the same, and a port would go
+    // on carrying something nobody asked for while this said it agreed.
+    //
+    // The proto has already shipped that failure once: `src_mac` was added to
+    // the message and not to the code that consumed it, and an operator
+    // quarantining a device got a green apply and an empty rule table. Field
+    // access spelled the same list out and would have compiled just as happily
+    // without the new one.
+    //
+    // A string rather than a tuple because a tuple of this width has no `Ord`,
+    // and the generated type has no `Hash`.
+    let key = |r: &pb::PortRule| {
+        let pb::PortRule {
+            proto,
+            port,
+            action,
+            log,
+            src,
+            dst,
+            limit,
+            burst,
+            icmp_type,
+            family,
+            direction,
+            in_interface,
+            src_mac,
+        } = r;
+        format!(
+            "{proto}|{port}|{action}|{log}|{src}|{dst}|{limit}|{burst}|{icmp_type}|{family}|\
+             {direction}|{in_interface}|{src_mac}"
+        )
+    };
+    let mut a: Vec<_> = a.iter().map(key).collect();
+    let mut b: Vec<_> = b.iter().map(key).collect();
+    a.sort();
+    b.sort();
+    a == b
+}
+
 fn translate_all(rules: &[ResolvedRule]) -> Result<Vec<pb::PortRule>> {
     let mut out = Vec::new();
     for rule in rules {
@@ -338,7 +448,50 @@ impl Datapath for FabricDatapath {
         // it — the same reason nothing else in this crate remembers what it did.
         // A port the fabric knows about and this host has no tap for is not a
         // port this host is carrying.
-        self.taps.observe().await
+        let carried = self.taps.observe().await?;
+
+        // The rules are a different question with a different answer-holder.
+        // The tap layer does not know them — it is deliberately programmed with
+        // none, because this datapath is what enforces them — so `rules` on
+        // what it returns is empty, and comparing that against what a port
+        // wants would say "out of date" for ever. What the fabric holds is the
+        // real answer, and it is fetched fresh here rather than remembered.
+        //
+        // A fabric that cannot be reached leaves the previous answer in place
+        // rather than emptying it: "I could not ask" is not "there are no
+        // rules", and treating it as such would reprogram every port on this
+        // node the moment the orchestrator restarted.
+        match self.groups_in_fabric().await {
+            Ok(groups) => *self.fabric_rules.lock().unwrap() = groups,
+            Err(e) => tracing::debug!(error = %e, "could not ask the fabric what it holds"),
+        }
+        Ok(carried)
+    }
+
+    /// Whether the fabric holds, for this port's group, exactly the rules this
+    /// pass wants — compared in the fabric's vocabulary, which is the only one
+    /// both sides can be spelled in.
+    ///
+    /// As a *set*: `translate` expands a port range into one rule per port, and
+    /// the fabric is free to report them in any order. Comparing sequences
+    /// would make the answer depend on ordering neither end promises.
+    fn agrees(&self, port: &str, have: &ProgrammedPort, want: &[ResolvedRule]) -> bool {
+        let _ = have;
+        let Ok(wanted) = translate_all(want) else {
+            // A rule that cannot be expressed is one `program` will refuse.
+            // Saying "agreed" here would leave the port quietly carrying
+            // whatever it had; saying "not agreed" sends it back through
+            // `program`, which refuses with the sentence that names the rule.
+            return false;
+        };
+        let held = self.fabric_rules.lock().unwrap();
+        let Some(there) = held.get(&Self::group_for(port)) else {
+            // Nothing under this port's name. Either the fabric has never been
+            // asked, or it does not have the group — and wanting nothing is
+            // then genuinely satisfied, while wanting something is not.
+            return wanted.is_empty();
+        };
+        same_rules(there, &wanted)
     }
 
     async fn program(
@@ -619,5 +772,96 @@ mod tests {
             FabricDatapath::group_for("projects/p1/ports/web"),
             "cloud:projects/p1/ports/web"
         );
+    }
+
+    // ---- same_rules ------------------------------------------------------
+    //
+    // Pure over two vectors, so it needs no fabric, no tap and no root — which
+    // matters, because the only other exercise of it is an integration test
+    // that *skips and reports ok* without `CAP_NET_ADMIN`. It went for a while
+    // with no coverage that actually ran anywhere, and replacing its body with
+    // `true` left every test in the crate green.
+
+    fn pb_rule(port: u32) -> pb::PortRule {
+        pb::PortRule {
+            proto: pb::Proto::Tcp as i32,
+            port,
+            action: pb::Action::Pass as i32,
+            log: false,
+            src: "10.0.0.0/24".into(),
+            dst: String::new(),
+            limit: 0,
+            burst: 0,
+            icmp_type: 0,
+            family: String::new(),
+            direction: "in".into(),
+            in_interface: String::new(),
+            src_mac: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_same_rules_in_a_different_order_are_the_same_rules() {
+        let a = vec![pb_rule(80), pb_rule(443), pb_rule(8080)];
+        let b = vec![pb_rule(8080), pb_rule(80), pb_rule(443)];
+        assert!(
+            same_rules(&a, &b),
+            "the order is nobody's promise: `translate` emits one rule per port \
+             of a range, and the fabric reports what it holds however it holds it"
+        );
+    }
+
+    #[test]
+    fn a_rule_that_is_missing_or_extra_is_a_difference() {
+        let want = vec![pb_rule(80), pb_rule(443)];
+        assert!(!same_rules(&want, &[pb_rule(80)]), "one fewer allowance");
+        assert!(
+            !same_rules(&want, &[pb_rule(80), pb_rule(443), pb_rule(22)]),
+            "an allowance nobody asked for — the direction that matters"
+        );
+        assert!(!same_rules(&want, &[]));
+        assert!(same_rules(&[], &[]));
+    }
+
+    /// A difference in **any** field is a difference.
+    ///
+    /// Not a style point. Two rules that differ only in `src_mac`, or only in
+    /// `direction`, are two different rules; a comparison that ignored one
+    /// would declare a port current while it carried something else, and
+    /// nothing would ever put it right. That exact omission has shipped once
+    /// already — `src_mac` reached the wire and not the code that read it, and
+    /// an operator quarantining a device got a green apply and an empty table.
+    #[test]
+    fn every_field_of_a_rule_is_compared() {
+        let base = pb_rule(80);
+        let mut differing = vec![];
+        for change in [
+            |r: &mut pb::PortRule| r.proto = pb::Proto::Udp as i32,
+            |r: &mut pb::PortRule| r.port = 81,
+            |r: &mut pb::PortRule| r.action = pb::Action::Drop as i32,
+            |r: &mut pb::PortRule| r.log = true,
+            |r: &mut pb::PortRule| r.src = "10.0.1.0/24".into(),
+            |r: &mut pb::PortRule| r.dst = "10.0.2.0/24".into(),
+            |r: &mut pb::PortRule| r.limit = 100,
+            |r: &mut pb::PortRule| r.burst = 10,
+            |r: &mut pb::PortRule| r.icmp_type = 8,
+            |r: &mut pb::PortRule| r.family = "ipv6".into(),
+            |r: &mut pb::PortRule| r.direction = "out".into(),
+            |r: &mut pb::PortRule| r.in_interface = "eth0".into(),
+            |r: &mut pb::PortRule| r.src_mac = "02:00:00:00:00:01".into(),
+        ] {
+            let mut other = base.clone();
+            change(&mut other);
+            assert!(
+                !same_rules(std::slice::from_ref(&base), std::slice::from_ref(&other)),
+                "two rules differing in one field compared equal: {other:?}"
+            );
+            differing.push(other);
+        }
+        // One case per field of `pb::PortRule`. The destructuring inside
+        // `same_rules` is what makes a new field a compile error there; this is
+        // what makes it a *test* failure here, so the number is asserted rather
+        // than trusted.
+        assert_eq!(differing.len(), 13, "a field of PortRule has no case here");
     }
 }

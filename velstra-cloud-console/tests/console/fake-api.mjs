@@ -19,6 +19,8 @@ import { readFileSync } from "node:fs";
 
 const PAGE = process.env.CONSOLE_PAGE;
 const TOKEN = process.env.CONSOLE_TOKEN || "testtoken";
+const USERNAME = process.env.CONSOLE_USER || "operator";
+const PASSWORD = process.env.CONSOLE_PASSWORD || "a test operator passphrase";
 const page = PAGE ? readFileSync(PAGE, "utf8") : "<!doctype html><p>no page";
 
 let clock = 400;
@@ -193,6 +195,24 @@ function decorate(r) {
   if (/\/security-groups\//.test(r.meta.name)) {
     return { ...r, status: { ...r.status, members: groupMembers(r) } };
   }
+  // A disk a Ceph cluster was given stops reporting as free — it is an OSD now,
+  // which is what the node would say and what `may_consume` refuses. Modelled
+  // here because it is the trap the console's disk picker has to survive: a
+  // control that believed the refusal would render every disk of a working
+  // cluster as unavailable, with no way left to take one back.
+  if (/^nodes\//.test(r.meta.name)) {
+    const node = r.meta.name.split("/").pop();
+    const claimed = new Map();
+    for (const c of store.values()) {
+      if (!/^ceph-clusters\//.test(c.meta.name)) continue;
+      (c.spec.osds || []).forEach((o, i) => claimed.set(o.node + " " + o.device, String(i)));
+    }
+    if (!claimed.size) return r;
+    return { ...r, status: { ...r.status, devices: (r.status.devices || []).map((d) => {
+      const osd = claimed.get(node + " " + d.path);
+      return osd === undefined ? d : { ...d, state: { kind: "Osd", id: osd } };
+    }) } };
+  }
   return r;
 }
 
@@ -200,6 +220,13 @@ function decorate(r) {
 //
 // Deliberately not all healthy. A console checked only against settled objects
 // is a console whose whole reason for existing was never exercised.
+
+// What a node reports about its own disks, and deliberately not all of it
+// usable. The console's disk picker exists to say *why* a disk cannot be had, so
+// a seed of nothing but empty disks would exercise the one half of it that never
+// goes wrong.
+const disk = (path, kernelName, sizeGib, rotational, model, state) =>
+  ({ path, kernelName, sizeGib, rotational, model, serial: "S" + kernelName, state });
 
 function seed() {
   store.clear();
@@ -216,12 +243,22 @@ function seed() {
     { observedGeneration: 1, conditions: ready(1),
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1Gi: 32 },
       allocated: { vcpus: 10, memoryMib: 20480, diskGib: 200, numaFreeMib: [], hugepages1Gi: 0 },
-      agentVersion: "0.1.0", lastHeartbeat: now() - 4000 });
+      agentVersion: "0.1.0", lastHeartbeat: now() - 4000,
+      devices: [
+        disk("/dev/disk/by-id/nvme-eui.0001", "nvme0n1", 931, false, "Samsung SSD 990", { kind: "Free" }),
+        disk("/dev/disk/by-id/ata-WDC-0002", "sda", 3726, true, "WDC WD40EFRX", { kind: "Filesystem", fstype: "ext4" }),
+        disk("/dev/disk/by-id/nvme-eui.0003", "nvme1n1", 16, false, "Kingston NV2", { kind: "Free" }),
+        disk("/dev/disk/by-id/ata-INTEL-0004", "sdb", 240, false, "INTEL SSDSC2", { kind: "System" }),
+        disk("/dev/disk/by-id/ata-SEAGATE-0005", "sdc", 1863, true, "ST2000DM008", { kind: "Mounted", at: "/var/lib/velstra" }),
+      ] });
   put("nodes/node-b", { schedulable: false, labels: ["nvme"] },
     { observedGeneration: 1, conditions: ready(1),
       capacity: { vcpus: 32, memoryMib: 65536, diskGib: 2048, numaFreeMib: [16384, 16384], hugepages1Gi: 0 },
       allocated: { vcpus: 30, memoryMib: 61440, diskGib: 1900, numaFreeMib: [], hugepages1Gi: 0 },
-      agentVersion: "0.1.0", lastHeartbeat: now() - 900_000 });
+      agentVersion: "0.1.0", lastHeartbeat: now() - 900_000,
+      devices: [
+        disk("/dev/disk/by-id/ata-CRUCIAL-0006", "sda", 894, false, "CT1000MX500", { kind: "Partitioned", partitions: 3 }),
+      ] });
   // Somewhere a guest can actually go. Without one, every migration answer is
   // "no", and a console checked only against that is a console whose picker was
   // never seen with anything in it.
@@ -229,15 +266,23 @@ function seed() {
     { observedGeneration: 1, conditions: ready(1),
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1Gi: 32 },
       allocated: { vcpus: 4, memoryMib: 8192, diskGib: 80, numaFreeMib: [], hugepages1Gi: 0 },
-      agentVersion: "0.1.0", lastHeartbeat: now() - 3000 });
+      agentVersion: "0.1.0", lastHeartbeat: now() - 3000,
+      devices: [
+        disk("/dev/disk/by-id/nvme-eui.0007", "nvme0n1", 1863, false, "WD Black SN850X", { kind: "Free" }),
+        disk("/dev/disk/by-id/ata-HGST-0008", "sda", 7452, true, "HUH721010ALE600", { kind: "Osd", id: "7" }),
+      ] });
 
+  // No `signature` on either: the API refuses one, because nothing in the
+  // platform verifies it. A fixture carrying a field the real API would reject
+  // is the drift this file exists to prevent — the console would be built
+  // against a shape that cannot exist.
   put("projects/p1/images/debian-13", {
     digest: "sha256:" + "a".repeat(64), format: "Qcow2", sizeBytes: 1_181_116_006,
-    sourceUrl: "https://images.invalid/debian-13.qcow2", signature: "MEUCIQ…" },
+    sourceUrl: "https://images.invalid/debian-13.qcow2" },
     { observedGeneration: 1, conditions: ready(1), cachedOn: ["node-a", "node-c"] });
   put("projects/p1/images/alpine-3", {
     digest: "sha256:" + "b".repeat(64), format: "Raw", sizeBytes: 62_914_560,
-    sourceUrl: "https://images.invalid/alpine-3.raw", signature: null },
+    sourceUrl: "https://images.invalid/alpine-3.raw" },
     { observedGeneration: 1, conditions: ready(1), cachedOn: [] });
 
   put("projects/p1/networks/prod", { vni: 4711, mtu: 9000 },
@@ -587,9 +632,66 @@ const server = createServer(async (req, res) => {
 
   if (!path.startsWith("/api/v1/")) return fail(res, 404, "NOT_FOUND", "no such path");
 
+  // Signing in is the one route that must answer without a token: it is what
+  // issues one. Modelled here as the real API does it, including the single
+  // refusal message for every cause — a fake that distinguished them would let
+  // the console grow a screen that shows the difference.
+  if (path === "/api/v1/sessions" && req.method === "POST") {
+    const body = await readBody(req);
+    const ok = body && body.username === USERNAME && body.password === PASSWORD;
+    if (!ok) {
+      return fail(res, 401, "UNAUTHENTICATED",
+        "that username and password were not accepted");
+    }
+    return json(res, 201, {
+      token: TOKEN,
+      subject: USERNAME,
+      displayName: "Test Operator",
+      cellAdmin: true,
+      expiresAt: Date.now() + 8 * 3600 * 1000,
+    });
+  }
+
   const auth = req.headers.authorization || "";
   if (auth !== "Bearer " + TOKEN) {
     return fail(res, 401, "UNAUTHENTICATED", "a bearer token is required");
+  }
+
+  if (path === "/api/v1/sessions/current") {
+    if (req.method === "DELETE") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    return json(res, 200, {
+      subject: USERNAME,
+      displayName: "Test Operator",
+      cellAdmin: true,
+      session: true,
+    });
+  }
+
+  // Setting a password touches no collection, so it is answered here rather
+  // than falling through to the object routes and 404ing.
+  //
+  // The one caller this fake authenticates is the operator, who may set any
+  // account's password — but a self-service change must prove the *current*
+  // one, exactly as the real API does, so a console that forgot to send it
+  // would fail here too rather than passing against a laxer fake.
+  const passwordRoute = path.match(/^\/api\/v1\/users\/([^/]+)\/password$/);
+  if (passwordRoute && req.method === "PUT") {
+    const id = decodeURIComponent(passwordRoute[1]);
+    const body = await readBody(req);
+    const own = id === USERNAME;
+    if (own && String((body && body.currentPassword) || "") !== PASSWORD) {
+      return fail(res, 403, "PERMISSION_DENIED", "the current password was not correct");
+    }
+    if (!body || String(body.password || "").length < 12) {
+      return fail(res, 400, "INVALID_ARGUMENT", "a password must be at least 12 characters");
+    }
+    res.writeHead(204);
+    res.end();
+    return;
   }
 
   // `…/i1:explainPlacement`
@@ -732,6 +834,16 @@ const server = createServer(async (req, res) => {
     if (!body || !body.id) return fail(res, 400, "INVALID_ARGUMENT", "an id is required", "id");
     if (!/^[a-z0-9][a-z0-9.-]*$/.test(body.id)) {
       return fail(res, 400, "INVALID_ARGUMENT", "an id may hold only a-z, 0-9, '-' and '.'", "id");
+    }
+    // The one refusal that is about a *security claim* rather than a shape.
+    // Nothing verifies a signature, so the API will not hold one — see
+    // `ImageSpec::signature`. Enforced here too, because a fake that accepted
+    // it would let the console grow a box for a field the real API rejects.
+    if (name.endsWith("/images") && body.spec && typeof body.spec.signature === "string" &&
+        body.spec.signature.trim() !== "") {
+      return fail(res, 400, "INVALID_ARGUMENT",
+        "spec.signature is not stored, because nothing in this platform verifies it",
+        "spec.signature");
     }
     const full = name + "/" + body.id;
     if (store.get(full)) return fail(res, 409, "ALREADY_EXISTS", "that name is taken", "id");

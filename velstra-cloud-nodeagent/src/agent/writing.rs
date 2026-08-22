@@ -29,12 +29,19 @@ impl Agent {
     /// total that is incremented and decremented drifts, and a count of what
     /// exists cannot.
     ///
-    /// **Known gap, and it is not in this crate:** `NodeStatus::owner()`
-    /// returns `None`, so [`velstra_cloud_model::access::judge`] refuses every
-    /// agent write to a node object — including this one. The code is written
-    /// the way it should work and the refusal is reported once, loudly, rather
-    /// than worked around; when the model gives a node an owner this starts
-    /// working with no change here.
+    /// A node is its own owner: [`NodeStatus::self_owned`] returns `true`, and
+    /// the typed store treats a self-owned object as owned by the id in its own
+    /// name (see `velstra-cloud-store` `typed.rs`), so
+    /// [`velstra_cloud_model::access::judge`] permits this agent's write to its
+    /// own node object. Nothing assigns a hypervisor to a hypervisor.
+    ///
+    /// The writer identity on that write is **self-declared**, and the agent
+    /// authenticates as a cell operator: in the current single-operator phase
+    /// there is no per-node credential, so this is a trust limit, not a
+    /// boundary — anything holding the operator token could write any node's
+    /// status. It is safe because that token is held only by the operator's own
+    /// agents. See `docs/rest-contract.md`, "Node agents write with the
+    /// operator's token".
     pub(super) async fn node_pass(&self, mine: &[&Instance], host: &HostState, pass: &mut Pass) {
         let name = format!("nodes/{}", self.config.node);
         let stored = match self.nodes.get(&name).await {
@@ -73,6 +80,13 @@ impl Agent {
         // nodes have an image can work it out from these reports rather than
         // from a shared list every node would have to write into.
         next.status.images = host.images.iter().cloned().collect();
+        // The disks this machine has, and what each is doing. Reported for the
+        // same reason the images are: nobody else can see them, and the console
+        // offers them for a Ceph OSD from this list. Which of them may be
+        // *chosen* is `ceph::may_consume`, never this list on its own — the list
+        // says what is there and the rule says what is safe.
+        next.status.devices = host.devices.clone();
+        next.status.ceph = host.ceph.clone();
         set_condition(
             &mut next.status.conditions,
             Condition::new(

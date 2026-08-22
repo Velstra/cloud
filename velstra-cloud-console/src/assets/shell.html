@@ -14,14 +14,39 @@
 <main id="signin">
   <div class="box">
     <h1>Velstra Cloud</h1>
-    <p class="prose">Sign in with an API token to see this cell.</p>
-    <form id="tokenform">
+    <p class="prose">Sign in to see this cell.</p>
+    <!-- `novalidate`: the username/password fields carry `required` for the
+         password path, but a service account signs in with a token alone and
+         leaves both blank. Native constraint validation would reject that form
+         before the submit handler (app.js) runs and can route to the token,
+         killing token-only sign-in. The handler validates whichever path the
+         operator actually used. -->
+    <form id="tokenform" novalidate>
       <div class="field">
-        <label for="token">API token</label>
-        <input id="token" type="password" autocomplete="off" spellcheck="false">
+        <label for="username">Username</label>
+        <!-- `autocomplete` on both fields and a real `name`: without them a
+             password manager cannot offer to fill or to save, and an operator
+             who cannot save a password picks one they can remember. -->
+        <input id="username" name="username" type="text" autocomplete="username"
+               spellcheck="false" autocapitalize="none" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password"
+               autocomplete="current-password" required>
       </div>
       <div><button class="btn primary" type="submit" id="signinbtn">Sign in</button></div>
       <p id="loginerr" class="err hidden"></p>
+      <!-- A service account or an automation holds a static token rather than a
+           password, and there is no session behind one. Kept, and kept second:
+           the common case is a person. -->
+      <details class="tokenalt">
+        <summary>Use an API token instead</summary>
+        <div class="field">
+          <label for="token">API token</label>
+          <input id="token" type="password" autocomplete="off" spellcheck="false">
+        </div>
+      </details>
     </form>
   </div>
 </main>
@@ -37,6 +62,10 @@
     <div id="fleet" class="summary"></div>
     <span class="grow"></span>
     <span id="watchstate"></span>
+    <!-- Who is signed in, and whether they hold the cell. An operator who
+         cannot tell which account they are using is an operator who eventually
+         does something as the wrong one. -->
+    <span id="whoami" class="who"></span>
     <button class="btn" id="theme" type="button">Light</button>
     <button class="btn" id="signout" type="button">Sign out</button>
   </header>

@@ -144,17 +144,33 @@ pub fn to_camel(key: &str) -> String {
 }
 
 fn to_snake(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
     let mut out = String::with_capacity(key.len() + 2);
-    let mut previous_alpha = false;
-    for c in key.chars() {
-        // A digit after a letter was an underscore on the way out — the model
-        // has exactly one such field (`hugepages_1gi`), and losing it would
-        // silently drop a host's hugepage count on every write.
-        if c.is_ascii_uppercase() || (c.is_ascii_digit() && previous_alpha) {
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_ascii_uppercase() {
             out.push('_');
+        } else if c.is_ascii_digit() && i > 0 && chars[i - 1].is_alphabetic() {
+            // A digit after a letter is ambiguous on its own: `hugepages1gi`
+            // came from `hugepages_1gi`, and `l3Vni` came from `l3_vni`. Camel
+            // case does distinguish them, though — what follows the digits does.
+            //
+            // `hugepages1gi`: lowercase after the digits, so the digits started
+            // a new word and there was an underscore before them.
+            // `l3Vni`: an uppercase after the digits, so the digits belong to
+            // the word before them and the uppercase is the next boundary.
+            //
+            // Without this the round trip is not a round trip: `l3_vni` came
+            // back as `l_3_vni`, and a field that does not survive its own wire
+            // is a field a client cannot write.
+            let next_is_upper = chars[i + 1..]
+                .iter()
+                .find(|n| !n.is_ascii_digit())
+                .is_some_and(|n| n.is_ascii_uppercase());
+            if !next_is_upper {
+                out.push('_');
+            }
         }
         out.extend(c.to_lowercase());
-        previous_alpha = c.is_alphabetic();
     }
     out
 }
@@ -215,6 +231,22 @@ mod tests {
                 agent_version: "0.1.0".into(),
                 last_heartbeat: Timestamp(1786732800000),
                 images: vec!["projects/p1/images/sha256-abc".into()],
+                // A busy disk, because the *reason* is what the console shows —
+                // and this test is about the wire keeping camelCase and the
+                // nested shape, which a tagged enum is the easiest thing to get
+                // wrong.
+                devices: vec![velstra_cloud_model::ceph::BlockDevice {
+                    path: "/dev/disk/by-id/wwn-0x5000".into(),
+                    kernel_name: "sdb".into(),
+                    size_gib: 500,
+                    rotational: true,
+                    model: "ST500".into(),
+                    serial: "X1".into(),
+                    state: velstra_cloud_model::ceph::DeviceUse::Filesystem {
+                        fstype: "ext4".into(),
+                    },
+                }],
+                ceph: None,
             },
         );
         round_trip(&node);

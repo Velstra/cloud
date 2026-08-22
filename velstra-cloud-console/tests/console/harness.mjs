@@ -211,8 +211,18 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
 
 /// Sign in through the form, not by writing the token into storage, so the
 /// sign-in path is covered too.
-export async function signIn(page, token) {
+///
+/// With a username and password by default, because that is what a person does.
+/// Passing a `token` instead exercises the service-account path, which is the
+/// same form and a different field.
+export async function signIn(page, credentials) {
+  const asToken = typeof credentials === "string";
+  const username = asToken ? "" : (credentials?.username ?? "operator");
+  const password = asToken ? "" : (credentials?.password ?? "a test operator passphrase");
+  const token = asToken ? credentials : "";
   await page.evaluate(`(() => {
+    document.getElementById("username").value = ${JSON.stringify(username)};
+    document.getElementById("password").value = ${JSON.stringify(password)};
     document.getElementById("token").value = ${JSON.stringify(token)};
     document.getElementById("tokenform").dispatchEvent(new Event("submit", { cancelable: true }));
     return 1;

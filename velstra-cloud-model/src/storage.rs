@@ -378,6 +378,26 @@ pub enum Refusal {
     },
     #[error("a volume is created from an image or from a snapshot, not from both")]
     TwoSources,
+    /// Cloning is a *copy of somebody's data*, and the copy lands under a name
+    /// its new owner controls. A volume in `p2` made from a snapshot in `p1` is
+    /// therefore an exfiltration with a `spec` field for a user interface: no
+    /// backend refuses it, nothing on either object records it, and the bytes
+    /// are simply in two projects afterwards.
+    ///
+    /// The API refuses this at the door — it authorises the caller against the
+    /// project that governs anything a spec points at, which also means a
+    /// refusal there never says whether the named object exists. This is the
+    /// guard behind that gate, and it is here rather than only there because
+    /// the model is what every write path goes through: the second one somebody
+    /// adds inherits the rule instead of having to remember it.
+    #[error(
+        "{origin} is in {origin_project} and this volume would be in {project}; a volume is made from an image or a snapshot in its own project"
+    )]
+    AnotherProject {
+        origin: String,
+        origin_project: String,
+        project: String,
+    },
 }
 
 /// Whether this volume may be copied.
@@ -400,10 +420,15 @@ pub fn may_snapshot(volume: &Volume) -> Result<(), Refusal> {
 
 /// Whether this volume may be created as asked, given the snapshot it names.
 ///
-/// `from` is the snapshot `spec.source_snapshot` points at, already read.
-/// Passing it in keeps this pure — and lets the API answer at the moment
-/// somebody clicks rather than after the object exists.
-pub fn may_create_volume(spec: &VolumeSpec, from: Option<&Snapshot>) -> Result<(), Refusal> {
+/// `volume` is the name it would be created under — what says which project is
+/// about to own the copy. `from` is the snapshot `spec.source_snapshot` points
+/// at, already read. Passing both in keeps this pure — and lets the API answer
+/// at the moment somebody clicks rather than after the object exists.
+pub fn may_create_volume(
+    volume: &ResourceName,
+    spec: &VolumeSpec,
+    from: Option<&Snapshot>,
+) -> Result<(), Refusal> {
     let has_image = spec.source_image.as_deref().is_some_and(|i| !i.is_empty());
     let has_snapshot = spec
         .source_snapshot
@@ -411,6 +436,30 @@ pub fn may_create_volume(spec: &VolumeSpec, from: Option<&Snapshot>) -> Result<(
         .is_some_and(|s| !s.is_empty());
     if has_image && has_snapshot {
         return Err(Refusal::TwoSources);
+    }
+    // Asked of both kinds of source, and before the snapshot itself is looked
+    // at, because a name is enough: which project a resource is in is written
+    // into its name, so an image nobody has read yet is checked exactly as well
+    // as a snapshot that has been.
+    let project = volume.project();
+    let sources = [
+        spec.source_image.as_deref(),
+        spec.source_snapshot.as_deref(),
+    ];
+    for source in sources.into_iter().flatten().filter(|s| !s.is_empty()) {
+        // Not a resource name at all is somebody else's refusal: the API says
+        // so, with the field and the spelling. Guessing at a project here would
+        // refuse it in words that do not describe what is wrong.
+        let Ok(named) = ResourceName::parse(source) else {
+            continue;
+        };
+        if named.project() != project {
+            return Err(Refusal::AnotherProject {
+                origin: source.to_string(),
+                origin_project: named.project().unwrap_or("no project").to_string(),
+                project: project.unwrap_or("no project").to_string(),
+            });
+        }
     }
     let Some(snapshot) = from else {
         return Ok(());
@@ -467,6 +516,12 @@ mod tests {
         v.meta.generation = 1;
         v.meta.finalizers = vec![POOL_RELEASE_FINALIZER.to_string()];
         v
+    }
+
+    /// The name a volume would be created under, in the project everything
+    /// else in these tests lives in.
+    fn in_p1(id: &str) -> ResourceName {
+        ResourceName::parse(&format!("projects/p1/volumes/{id}")).unwrap()
     }
 
     /// A snapshot of `data-1`, under it, as every stored one is.
@@ -791,22 +846,22 @@ mod tests {
         // Not taken yet: there is nothing to clone, and the pool would fail on
         // it one pass later with a sentence of its own.
         assert!(matches!(
-            may_create_volume(&spec, Some(&s)),
+            may_create_volume(&in_p1("data-2"), &spec, Some(&s)),
             Err(Refusal::NotTakenYet { .. })
         ));
 
         s.status.taken = true;
         s.status.size_gib = 100;
-        assert!(may_create_volume(&spec, Some(&s)).is_ok());
+        assert!(may_create_volume(&in_p1("data-2"), &spec, Some(&s)).is_ok());
 
         // Bigger is ordinary — a volume is grown.
         spec.size_gib = 200;
-        assert!(may_create_volume(&spec, Some(&s)).is_ok());
+        assert!(may_create_volume(&in_p1("data-2"), &spec, Some(&s)).is_ok());
 
         // Smaller is the clone not fitting in what it is written into.
         spec.size_gib = 50;
         assert_eq!(
-            may_create_volume(&spec, Some(&s)),
+            may_create_volume(&in_p1("data-2"), &spec, Some(&s)),
             Err(Refusal::SmallerThanItsSnapshot {
                 snapshot: "projects/p1/volumes/data-1/snapshots/nightly".into(),
                 snapshot_gib: 100,
@@ -818,7 +873,7 @@ mod tests {
         spec.pool = "pool-b".into();
         assert!(
             matches!(
-                may_create_volume(&spec, Some(&s)),
+                may_create_volume(&in_p1("data-2"), &spec, Some(&s)),
                 Err(Refusal::AnotherPool { .. })
             ),
             "a pool was asked to clone a snapshot it does not hold"
@@ -827,10 +882,51 @@ mod tests {
         spec.pool = "pool-a".into();
         spec.source_image = Some("projects/p1/images/sha256-abc".into());
         assert_eq!(
-            may_create_volume(&spec, Some(&s)),
+            may_create_volume(&in_p1("data-2"), &spec, Some(&s)),
             Err(Refusal::TwoSources),
             "a volume was asked to come from two places at once"
         );
+    }
+
+    #[test]
+    fn a_volume_is_not_made_from_another_projects_snapshot_or_image() {
+        // The API refuses this before it gets here, by authorising the caller
+        // against the project that governs whatever the spec points at. This is
+        // the guard behind that gate: a second write path that forgets to ask
+        // still cannot clone one tenant's bytes into another tenant's volume.
+        let mut s = snapshot("nightly");
+        s.status.taken = true;
+        s.status.size_gib = 100;
+        let mut spec = VolumeSpec {
+            size_gib: 100,
+            pool: "pool-a".into(),
+            source_snapshot: Some(s.meta.name.to_string()),
+            ..Default::default()
+        };
+
+        let stolen = ResourceName::parse("projects/p2/volumes/data-2").unwrap();
+        assert_eq!(
+            may_create_volume(&stolen, &spec, Some(&s)),
+            Err(Refusal::AnotherProject {
+                origin: "projects/p1/volumes/data-1/snapshots/nightly".into(),
+                origin_project: "p1".into(),
+                project: "p2".into(),
+            }),
+            "p2 cloned a snapshot of p1's"
+        );
+        // The same snapshot in its own project is the ordinary restore, and it
+        // is the case that has to keep working.
+        assert!(may_create_volume(&in_p1("data-2"), &spec, Some(&s)).is_ok());
+
+        // An image is checked the same way and from its name alone — nothing
+        // reads the image, so the refusal does not depend on it existing.
+        spec.source_snapshot = None;
+        spec.source_image = Some("projects/p1/images/sha256-abc".into());
+        assert!(matches!(
+            may_create_volume(&stolen, &spec, None),
+            Err(Refusal::AnotherProject { .. })
+        ));
+        assert!(may_create_volume(&in_p1("data-2"), &spec, None).is_ok());
     }
 
     #[test]
