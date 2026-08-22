@@ -299,10 +299,48 @@ survives_the_wire!(
         agent_version: "0.1.0".into(),
         last_heartbeat: meta::Timestamp(1_786_732_802_000),
         images: vec!["projects/p1/images/sha256-abc".into()],
+        // One free disk and one that is not, because the *reason* a disk is
+        // unavailable is what the console shows and what an operator acts on —
+        // a wire that carried "busy" and dropped "ext4" would be a screen that
+        // says no and cannot say why.
+        devices: vec![
+            velstra_cloud_model::ceph::BlockDevice {
+                path: "/dev/disk/by-id/wwn-0x5000".into(),
+                kernel_name: "sdb".into(),
+                size_gib: 500,
+                rotational: true,
+                model: "ST500".into(),
+                serial: "X1".into(),
+                state: velstra_cloud_model::ceph::DeviceUse::Free,
+            },
+            velstra_cloud_model::ceph::BlockDevice {
+                path: "/dev/disk/by-id/wwn-0x6000".into(),
+                kernel_name: "sdc".into(),
+                size_gib: 1000,
+                rotational: false,
+                model: String::new(),
+                serial: String::new(),
+                state: velstra_cloud_model::ceph::DeviceUse::Filesystem {
+                    fstype: "ext4".into(),
+                },
+            },
+        ],
+        ceph: Some(velstra_cloud_model::ceph::NodeCeph {
+            installed: true,
+            version: "19.2.0".into(),
+            monitor: true,
+            manager: false,
+            osd_devices: vec!["/dev/disk/by-id/wwn-0x7000".into()],
+            pools: vec!["velstra-volumes".into()],
+            cluster_hosts: vec!["hv-1".into(), "hv-2".into()],
+            address: "10.0.0.5".into(),
+            ssh_pubkey: "ssh-ed25519 AAAA cluster".into(),
+            trusts_key: true,
+        }),
     },
     {
         observed_generation, conditions, capacity, allocated, agent_version,
-        last_heartbeat, images,
+        last_heartbeat, images, devices, ceph,
     }
 );
 
@@ -695,6 +733,16 @@ whole_object_survives!(
         agent_version: "0.1.0".into(),
         last_heartbeat: meta::Timestamp(1_786_732_802_000),
         images: vec!["projects/p1/images/sha256-abc".into()],
+        devices: vec![velstra_cloud_model::ceph::BlockDevice {
+            path: "/dev/disk/by-id/wwn-0x5000".into(),
+            kernel_name: "sdb".into(),
+            size_gib: 500,
+            rotational: true,
+            model: "ST500".into(),
+            serial: "X1".into(),
+            state: velstra_cloud_model::ceph::DeviceUse::Free,
+        }],
+        ceph: None,
     }
 );
 
@@ -936,3 +984,56 @@ whole_object_survives!(
         transferred_mib: 2048,
     }
 );
+
+/// A device state this build does not recognise must never read as "free".
+///
+/// The wire carries the state as a tag plus a detail, which is what keeps the
+/// detail readable — and it means a peer running a newer build can send a tag
+/// this one has never seen. Defaulting that to `Free` would put an unknown disk
+/// in the list an operator picks OSDs from, and picking it erases it.
+///
+/// So the unknown case lands on `Unsuitable`, and this is the test that says so.
+/// It is the one conversion in this file where being wrong destroys data rather
+/// than dropping a field.
+#[test]
+fn a_device_state_from_the_future_is_never_read_as_empty() {
+    use velstra_cloud_model::ceph::{BlockDevice, DeviceUse};
+
+    let from_a_newer_peer = v1::BlockDevice {
+        path: "/dev/sdb".into(),
+        kernel_name: "sdb".into(),
+        size_gib: 500,
+        rotational: false,
+        model: String::new(),
+        serial: String::new(),
+        use_kind: "held-by-something-invented-next-year".into(),
+        use_detail: "it is part of a thing this build has not heard of".into(),
+    };
+    let device: BlockDevice = (&from_a_newer_peer).into();
+    assert!(
+        !device.state.is_free(),
+        "an unknown state was read as an empty disk: {:?}",
+        device.state
+    );
+    assert!(velstra_cloud_model::ceph::may_consume(&device).is_err());
+    // And the detail survives, so the console can say what it was told rather
+    // than "unknown".
+    match &device.state {
+        DeviceUse::Unsuitable { why } => assert!(why.contains("not heard of"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+
+    // An unknown tag with no detail still refuses, and says which tag.
+    let bare: BlockDevice = (&v1::BlockDevice {
+        use_kind: "mystery".into(),
+        use_detail: String::new(),
+        size_gib: 500,
+        ..from_a_newer_peer.clone()
+    })
+        .into();
+    assert!(!bare.state.is_free());
+    match &bare.state {
+        DeviceUse::Unsuitable { why } => assert!(why.contains("mystery"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}

@@ -2149,3 +2149,193 @@ async fn a_forged_page_token_is_refused() {
         .await;
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
 }
+
+// ---- ceph ----------------------------------------------------------------
+
+/// A cluster naming a disk the node will not give up is refused, with the
+/// reason and the field.
+///
+/// Nothing stands between this disk and being erased *anyway* — the console
+/// only offers disks the model accepts, and the deployment refuses again
+/// against the node's live inventory before any command runs. What this stands
+/// between is an operator and a silence: a hand-written spec naming the wrong
+/// disk would otherwise be accepted, and the only sign of the mistake would be
+/// a cluster that quietly never finishes.
+#[tokio::test]
+async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reason() {
+    use velstra_cloud_model::ceph::{BlockDevice, DeviceUse};
+
+    let h = Harness::new();
+    let node = Resource::new(
+        Meta::new(
+            ResourceName::parse("nodes/hv-1").unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        ),
+        NodeSpec {
+            schedulable: true,
+            labels: vec![],
+        },
+        NodeStatus {
+            devices: vec![
+                BlockDevice {
+                    path: "/dev/sdb".into(),
+                    kernel_name: "sdb".into(),
+                    size_gib: 512,
+                    rotational: false,
+                    state: DeviceUse::Filesystem {
+                        fstype: "ext4".into(),
+                    },
+                    ..Default::default()
+                },
+                BlockDevice {
+                    path: "/dev/sdc".into(),
+                    kernel_name: "sdc".into(),
+                    size_gib: 512,
+                    rotational: false,
+                    state: DeviceUse::Free,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    h.nodes().create(&node).await.unwrap();
+
+    let answer = h
+        .post(
+            "ceph-clusters",
+            json!({
+                "id": "ceph",
+                "spec": {
+                    "publicNetwork": "10.0.0.0/24",
+                    "monitors": ["hv-1"],
+                    "osds": [{ "node": "hv-1", "device": "/dev/sdb" }],
+                }
+            }),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
+    // The reason, in the words an operator can act on — "it has an ext4
+    // filesystem on it" is the whole of the help. And the field, so a console
+    // can point at the row rather than at the form.
+    let message = answer.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("ext4"), "{message}");
+    assert_eq!(answer.field(), "spec.osds[0].device");
+
+    // The empty one is accepted, so the refusal is about the disk and not about
+    // the shape of the request.
+    let answer = h
+        .post(
+            "ceph-clusters",
+            json!({
+                "id": "ceph",
+                "spec": {
+                    "publicNetwork": "10.0.0.0/24",
+                    "monitors": ["hv-1"],
+                    "osds": [{ "node": "hv-1", "device": "/dev/sdc" }],
+                }
+            }),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+}
+
+/// A disk on a machine that has not reported yet is not refused.
+///
+/// "I cannot see it" is not "it is not free". Refusing a cluster because a node
+/// is still booting would be wrong about the one thing this check is for, and
+/// would make the platform's answer depend on the order somebody did things in.
+#[tokio::test]
+async fn a_disk_on_a_node_that_has_not_reported_is_not_refused() {
+    let h = Harness::new();
+    let answer = h
+        .post(
+            "ceph-clusters",
+            json!({
+                "id": "ceph",
+                "spec": {
+                    "publicNetwork": "10.0.0.0/24",
+                    "monitors": ["hv-1"],
+                    "osds": [{ "node": "hv-1", "device": "/dev/sdb" }],
+                }
+            }),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+}
+
+// ---- images --------------------------------------------------------------
+
+/// An image carrying a signature is refused, with the reason.
+///
+/// The field was declared as "a cosign-style signature, verified before a node
+/// will boot it", and nothing has ever read it — while the console offered a
+/// box to type one into and a column headed *Signed*. An operator could paste
+/// anything and the platform reported, at a glance, that the image was signed.
+///
+/// Refused rather than stored and ignored, because storing it is where the
+/// claim comes from: every place an unchecked claim is displayed becomes
+/// evidence somebody will cite.
+#[tokio::test]
+async fn an_image_carrying_a_signature_nothing_verifies_is_refused() {
+    let h = Harness::new();
+    let answer = h
+        .post(
+            "projects/p1/images",
+            json!({
+                "id": "sha256-abc",
+                "spec": {
+                    "digest": "sha256:abc",
+                    "format": "Raw",
+                    "sizeBytes": 1024,
+                    "sourceUrl": "https://example.invalid/alpine.img",
+                    "signature": "MEUCIQD-not-checked-by-anything"
+                }
+            }),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
+    assert_eq!(answer.field(), "spec.signature");
+    let message = answer.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("verifies"),
+        "the refusal did not say why: {message}"
+    );
+
+    // The same image without one is accepted, so the refusal is about the
+    // claim and not about the shape of the request.
+    let answer = h
+        .post(
+            "projects/p1/images",
+            json!({
+                "id": "sha256-abc",
+                "spec": {
+                    "digest": "sha256:abc",
+                    "format": "Raw",
+                    "sizeBytes": 1024,
+                    "sourceUrl": "https://example.invalid/alpine.img"
+                }
+            }),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+
+    // And an explicitly empty one is not a claim: a client echoing back an
+    // object it read must not be told off for a field it did not touch.
+    let answer = h
+        .post(
+            "projects/p1/images",
+            json!({
+                "id": "sha256-def",
+                "spec": {
+                    "digest": "sha256:def",
+                    "format": "Raw",
+                    "sizeBytes": 1024,
+                    "sourceUrl": "https://example.invalid/other.img",
+                    "signature": ""
+                }
+            }),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+}

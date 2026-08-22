@@ -250,6 +250,59 @@ message NodeStatus {
   // aggregate, and an aggregate is not a fact anybody owns — so each node
   // reports its own and callers add them up.
   repeated string images = 7;
+  // Block devices this node can see, and what each is being used for. Here for
+  // the same reason `images` is: it is one node's observation of its own
+  // hardware, which nobody else can make.
+  repeated BlockDevice devices = 8;
+  // What this node runs of Ceph, when it runs any. Absent on the nodes that do
+  // not, which in most cells is most of them.
+  NodeCeph ceph = 9;
+}
+
+// One block device, as the node holding it sees it.
+message BlockDevice {
+  // `/dev/disk/by-id/…` where the machine offers one. A stable name matters:
+  // `/dev/sdb` is assigned in discovery order, so one extra disk renames every
+  // device after it — and an OSD that named `/dev/sdb` then points at somebody
+  // else's disk.
+  string path = 1;
+  string kernel_name = 2;
+  uint64 size_gib = 3;
+  bool rotational = 4;
+  string model = 5;
+  string serial = 6;
+  // Why it is not free, as a tag and a detail. Not an enum: the detail is the
+  // whole of what an operator needs — "ext4", "/srv", "osd.7" — and an enum
+  // would throw it away.
+  string use_kind = 7;
+  string use_detail = 8;
+}
+
+// What one node runs of Ceph.
+message NodeCeph {
+  bool installed = 1;
+  string version = 2;
+  bool monitor = 3;
+  bool manager = 4;
+  repeated string osd_devices = 5;
+  // The pools the cluster holds, as seen from here. Only a manager node reports
+  // any; a reader takes the union rather than an intersection, because "this
+  // node saw none" is not "there are none".
+  repeated string pools = 6;
+  // The hosts the orchestrator knows about, reported the same way and for the
+  // same reason as the pools.
+  repeated string cluster_hosts = 7;
+  // This node's own address inside the cluster's public network. The node picks
+  // it, because it is the only thing that can see its own interfaces.
+  string address = 8;
+  // The cluster's SSH public key, as reported by a node that can ask for it.
+  // cephadm drives every other host over SSH as root, so this has to reach each
+  // of them before anything can be placed there. A public key: nothing here is
+  // secret.
+  string ssh_pubkey = 9;
+  // Whether this node has that key installed for root. Only the destination can
+  // answer "did the key arrive".
+  bool trusts_key = 10;
 }
 
 message Node {

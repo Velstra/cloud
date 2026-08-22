@@ -18,6 +18,8 @@ use serde_json::{Map, Value, json};
 use velstra_cloud_model::{
     assignment::Assignee,
     authz::{Verb, governing_project, may},
+    ceph::{CephClusterSpec, CephClusterStatus},
+    identity::{UserSpec, UserStatus},
     meta::{Meta, Placement, ResourceName, Revision, Timestamp, set_condition},
     migration::{Migration, MigrationSpec, MigrationStatus, may_migrate, migration_condition},
     reconcile::place,
@@ -46,8 +48,10 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 16] = [
+pub const COLLECTIONS: [&str; 18] = [
     "projects",
+    "users",
+    "ceph-clusters",
     "instances",
     "migrations",
     "volumes",
@@ -232,6 +236,11 @@ struct Inner {
     served: RwLock<BTreeMap<&'static str, Served>>,
     placement: Placement,
     verifier: Arc<dyn TokenVerifier>,
+    /// The two collections the API stores and never serves — a user's password
+    /// and their live sessions. Held here so the sign-in routes can reach them
+    /// and nothing else can: they are not in `collections`, so there is no
+    /// route, no list, no watch and no proxy hop that arrives at them.
+    identity: crate::sessions::IdentityStore,
 }
 
 #[derive(Clone)]
@@ -260,6 +269,15 @@ impl Api {
         }
         let collections = BTreeMap::from([
             collection!("projects", ProjectSpec, ProjectStatus),
+            // Servable, unlike `credentials` and `sessions`, which are stored
+            // beside it and deliberately have no route at all — see
+            // `crate::sessions`. A user record holds no secret, so listing one
+            // is an ordinary read; the thing worth protecting is not in it.
+            collection!("users", UserSpec, UserStatus),
+            // Cell-scoped, and effectively a singleton: a cell has one Ceph
+            // cluster or none. Not enforced by the type — the refusal belongs
+            // where it can say why, which is `create` below.
+            collection!("ceph-clusters", CephClusterSpec, CephClusterStatus),
             collection!("instances", InstanceSpec, InstanceStatus),
             collection!("volumes", VolumeSpec, VolumeStatus),
             collection!("snapshots", SnapshotSpec, SnapshotStatus),
@@ -283,12 +301,25 @@ impl Api {
                 served: RwLock::new(BTreeMap::new()),
                 placement: Placement::new(region, cell),
                 verifier: verifier.clone(),
+                identity: crate::sessions::IdentityStore::new(store.clone(), region, cell),
             }),
         }
     }
 
     pub fn verifier(&self) -> &Arc<dyn TokenVerifier> {
         &self.inner.verifier
+    }
+
+    /// The sign-in surface. Everything that touches a password or a session goes
+    /// through this one handle, which is what keeps that list auditable.
+    pub fn identity(&self) -> &crate::sessions::IdentityStore {
+        &self.inner.identity
+    }
+
+    /// Whether `who` may administer the cell — either from the started-with
+    /// operator list or from their own user record.
+    pub fn is_operator(&self, who: &Identity) -> bool {
+        self.inner.cell_admins.contains(&who.subject) || crate::sessions::is_cell_admin(who)
     }
 
     fn collection(&self, kind: &str) -> ApiResult<Arc<dyn Collection>> {
@@ -343,7 +374,13 @@ impl Api {
     /// authorisation rule spread across eleven call sites is an authorisation
     /// rule with a hole in it.
     async fn authorize(&self, who: &Identity, verb: Verb, name: &ResourceName) -> ApiResult<()> {
-        if self.inner.cell_admins.contains(&who.subject) {
+        // Two ways to be an operator, and both are checked here so no call site
+        // has to remember either. The started-with list is configuration and
+        // cannot be revoked from inside the cell — it is the escape hatch for an
+        // installation whose stored administrators are all disabled. The scope
+        // is a fact about the signed-in user, resolved once at authentication,
+        // and it is what lets an operator be *appointed* without a restart.
+        if self.is_operator(who) {
             return Ok(());
         }
         let Some(project) = governing_project(name) else {
@@ -362,6 +399,52 @@ impl Api {
         };
         may(&who.subject, &self.inner.cell_admins, &bindings, verb)
             .map_err(|denied| ApiError::forbidden(denied.to_string()))
+    }
+
+    /// Whether `who` may follow the references a spec carries out of its own
+    /// project.
+    ///
+    /// [`crate::refs::check`] says a reference is *well-formed*. It says nothing
+    /// about who may follow it, and for a long time nothing else did either: a
+    /// write was authorised against the project the object lives in, and then
+    /// the object was allowed to name whatever it liked. A tenant could create a
+    /// volume in their own project whose `sourceSnapshot` pointed at another
+    /// tenant's snapshot — every check passed, and the pool then cloned somebody
+    /// else's bytes into a volume the caller owns. `image`, `volume` and
+    /// `instance` are the same shape.
+    ///
+    /// A reference that stays inside the object's own project costs nothing at
+    /// all: the projects match and no binding is read, which is every ordinary
+    /// request. Only crossing a boundary is a question worth asking.
+    ///
+    /// The question is asked of the *project*, never of the object being named:
+    /// [`Api::authorize`] reads the governing project's bindings and never goes
+    /// looking for the reference itself. So the fields that are deliberately
+    /// shape-only — a port's `security_groups`, a router's `networks`, a
+    /// floating IP's `port` — stay shape-only, and naming something that does
+    /// not exist yet is still allowed. It also means a caller who is refused is
+    /// refused in the same words whether the thing they named is there or not,
+    /// so this cannot be used to find out what another tenant has.
+    async fn authorize_references(
+        &self,
+        who: &Identity,
+        kind: &str,
+        spec: &Value,
+        home: Option<&str>,
+    ) -> ApiResult<()> {
+        for text in crate::refs::names_to_authorize(kind, spec) {
+            // Anything unparseable was already refused by `refs::check`, which
+            // says which field it was; re-refusing it here in worse words helps
+            // nobody.
+            let Ok(name) = ResourceName::parse(&text) else {
+                continue;
+            };
+            if governing_project(&name).as_deref() == home {
+                continue;
+            }
+            self.authorize(who, Verb::Read, &name).await?;
+        }
+        Ok(())
     }
 
     async fn typed_project(&self, name: &str) -> ApiResult<Option<Project>> {
@@ -448,7 +531,7 @@ impl Api {
         }
         // No parent: a cell-wide collection. An operator sees it whole;
         // everybody else sees the objects they may read, one decision each.
-        let gate = if self.inner.cell_admins.contains(&who.subject) {
+        let gate = if self.is_operator(who) {
             Gate::Everything
         } else {
             Gate::Readable(who.clone())
@@ -648,17 +731,19 @@ impl Api {
         // Authorised on the **parent**, because the object does not exist yet
         // and has no bindings of its own. Creating inside a project is a write
         // to that project; creating without one is a write to the cell.
-        if parent.is_empty() {
-            if !self.inner.cell_admins.contains(&who.subject) {
+        let home = if parent.is_empty() {
+            if !self.is_operator(who) {
                 return Err(ApiError::forbidden(
                     "creating a project, a node or a pool is a change to the cell; only a cell \
                      operator may make one",
                 ));
             }
+            None
         } else {
             let name = ResourceName::parse(parent).map_err(ApiError::from)?;
             self.authorize(who, Verb::Write, &name).await?;
-        }
+            governing_project(&name)
+        };
         if kind == "operations" {
             return Err(ApiError::invalid(
                 "operations are minted by the API when it accepts a change, never created directly",
@@ -677,6 +762,12 @@ impl Api {
         // one check that knows which field it was.
         collection.check_spec(&spec)?;
         crate::refs::check(kind, &spec)?;
+        // Before anything follows one of those references — `settle_volume_source`
+        // reads the snapshot, `settle_migration` reads the instance — so that a
+        // caller who may not read the thing they named is refused for that
+        // reason and learns nothing about whether it is there.
+        self.authorize_references(who, kind, &spec, home.as_deref())
+            .await?;
         check_rules(kind, &spec)?;
         if kind == "attachments" {
             self.settle_node(&mut spec, None).await?;
@@ -688,7 +779,14 @@ impl Api {
             self.settle_snapshot(&name, &mut spec).await?;
         }
         if kind == "volumes" {
-            self.settle_volume_source(&mut spec).await?;
+            self.settle_volume_source(&name, &mut spec).await?;
+        }
+        if kind == "ceph-clusters" {
+            self.refuse_a_second_ceph_cluster(&name).await?;
+            self.refuse_a_disk_that_is_not_free(&spec).await?;
+        }
+        if kind == "images" {
+            refuse_an_unverified_signature(&spec)?;
         }
         self.check_cell(&name, kind).await?;
         self.check_quota(&name, kind, &spec).await?;
@@ -744,9 +842,22 @@ impl Api {
         };
         if let Some(spec) = &mut patch.spec {
             crate::refs::check(name.collection(), spec)?;
+            self.authorize_references(
+                who,
+                name.collection(),
+                spec,
+                governing_project(name).as_deref(),
+            )
+            .await?;
             check_rules(name.collection(), spec)?;
             if name.collection() == "volumes" {
                 self.refuse_a_new_source(name, spec).await?;
+            }
+            if name.collection() == "ceph-clusters" {
+                self.refuse_a_disk_that_is_not_free(spec).await?;
+            }
+            if name.collection() == "images" {
+                refuse_an_unverified_signature(spec)?;
             }
             // A change may move an attachment's node — after a migration, to
             // agree with the instance again — but never away from it.
@@ -807,7 +918,27 @@ impl Api {
             ));
         }
         let collection = self.collection(name.collection())?;
-        collection.delete(&name.to_string(), expect).await
+        let deleted = collection.delete(&name.to_string(), expect).await?;
+        // A deleted user's password and live sessions go with them. Leaving
+        // either behind would mean the account is gone from every listing and
+        // still opens the door: the credential outlives its user, and a token
+        // issued before the deletion keeps authenticating until it expires.
+        //
+        // After the delete, not before: an object that could not be deleted —
+        // because something still names it, or because the revision moved — must
+        // not have had its credential destroyed on the way to finding out.
+        if name.collection() == "users" {
+            if let Err(e) = self.inner.identity.forget(name.id()).await {
+                // Loud, and not fatal. The user is gone either way; what is left
+                // is a credential nobody can reach through a route that exists,
+                // and a person has to know to clean it up.
+                tracing::error!(
+                    user = name.id(),
+                    "deleted the user but could not remove their credential or sessions: {e}"
+                );
+            }
+        }
+        Ok(deleted)
     }
 
     /// Everything that still names `target`.
@@ -922,7 +1053,7 @@ impl Api {
         let gate = if parent.is_empty() {
             // A cell-wide stream. An operator is asking about the cell on
             // purpose; anybody else is told about what they may read.
-            if self.inner.cell_admins.contains(&who.subject) {
+            if self.is_operator(who) {
                 Gate::Everything
             } else {
                 Gate::Readable(who.clone())
@@ -1581,7 +1712,7 @@ impl Api {
     ///   here: a volume is grown, so asking for a bigger one at the moment it is
     ///   made is an ordinary thing to want. Asking for a smaller one is the
     ///   clone not fitting in what it is written into.
-    async fn settle_volume_source(&self, spec: &mut Value) -> ApiResult<()> {
+    async fn settle_volume_source(&self, volume: &ResourceName, spec: &mut Value) -> ApiResult<()> {
         let named = spec
             .get("source_snapshot")
             .and_then(Value::as_str)
@@ -1624,11 +1755,18 @@ impl Api {
         }
 
         let wanted: VolumeSpec = serde_json::from_value(spec.clone())?;
-        if let Err(refusal) = may_create_volume(&wanted, from.as_ref()) {
+        if let Err(refusal) = may_create_volume(volume, &wanted, from.as_ref()) {
             use velstra_cloud_model::storage::Refusal;
             let field = match &refusal {
                 Refusal::SmallerThanItsSnapshot { .. } => "spec.sizeGib",
                 Refusal::AnotherPool { .. } => "spec.pool",
+                // Either source can be the one reaching out of the project, and
+                // an operator told the wrong field bisects a spec by hand.
+                Refusal::AnotherProject { origin, .. }
+                    if wanted.source_image.as_deref() == Some(origin.as_str()) =>
+                {
+                    "spec.sourceImage"
+                }
                 _ => "spec.sourceSnapshot",
             };
             return Err(ApiError::new(Code::FailedPrecondition, refusal.to_string()).at(field));
@@ -1650,6 +1788,91 @@ impl Api {
     /// Changing `sourceImage` is refused for the plainer reason: nothing is
     /// re-cloned, so the field would simply start describing a volume that does
     /// not exist.
+    /// Refuse a Ceph OSD on a disk the node holding it does not offer.
+    ///
+    /// The console only ever offers disks
+    /// [`velstra_cloud_model::ceph::may_consume`] accepts, and
+    /// [`velstra_cloud_model::ceph::next_step`] refuses again against the
+    /// node's current inventory before any command runs — so nothing here
+    /// stands between a disk and being erased. What it stands between is an
+    /// operator and a silence: a hand-written spec naming the wrong disk would
+    /// otherwise be accepted, and the only sign of the mistake would be a
+    /// cluster that quietly never finishes, with the reason on a condition
+    /// nobody is looking at yet.
+    ///
+    /// Answered from what the nodes report, so a disk on a node that has not
+    /// reported yet is *not* refused: "I cannot see it" is not "it is not
+    /// free", and refusing a cluster because a machine is booting would be
+    /// wrong about the one thing this is for.
+    /// A cell holds at most one Ceph cluster.
+    ///
+    /// The invariant is not carried by the type — `ceph-clusters` is an ordinary
+    /// collection — so create is the one place to state it, and the one place it
+    /// can say why it refused. Only on create: an update names the cluster that
+    /// already exists and is editing the singleton, not adding a second one.
+    async fn refuse_a_second_ceph_cluster(&self, name: &ResourceName) -> ApiResult<()> {
+        let this = name.to_string();
+        for existing in self.collection("ceph-clusters")?.list().await? {
+            let id = existing["meta"]["name"].as_str().unwrap_or_default();
+            // The name being created cannot already be in the list — the store
+            // refuses a duplicate create on its own — so anything here is a
+            // *different* cluster, and a second one is what the cell may not have.
+            if id != this {
+                return Err(ApiError::new(
+                    Code::AlreadyExists,
+                    format!(
+                        "this cell already has a Ceph cluster ({id}); a cell has at most one. \
+                         Edit that one, or delete it before creating another"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn refuse_a_disk_that_is_not_free(&self, spec: &Value) -> ApiResult<()> {
+        let Some(osds) = spec.get("osds").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        if osds.is_empty() {
+            return Ok(());
+        }
+        let nodes: Vec<Node> = self.typed_list("", "nodes").await?;
+        for (at, osd) in osds.iter().enumerate() {
+            let (Some(node), Some(device)) = (
+                osd.get("node").and_then(Value::as_str),
+                osd.get("device").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let Some(reporting) = nodes.iter().find(|n| n.meta.name.id() == node) else {
+                continue;
+            };
+            // Already an OSD is the answer "this one is doing the job", not a
+            // refusal — and it is the ordinary state of every disk in a cluster
+            // that is already up, so refusing it would make a settled spec
+            // un-editable.
+            let Some(disk) = reporting
+                .status
+                .devices
+                .iter()
+                .find(|d| d.path == device || d.kernel_name == device)
+            else {
+                continue;
+            };
+            if matches!(disk.state, velstra_cloud_model::ceph::DeviceUse::Osd { .. }) {
+                continue;
+            }
+            if let Err(why) = velstra_cloud_model::ceph::may_consume(disk) {
+                return Err(
+                    ApiError::invalid(format!("{node} will not give up {device}: {why}"))
+                        .at(format!("spec.osds[{at}].device")),
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn refuse_a_new_source(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
         let asked = |field: &str| -> Option<Option<String>> {
             spec.get(field).map(|value| match value {
@@ -2136,6 +2359,30 @@ fn under(document: &Value, parent: &str) -> bool {
 /// a uid it did not mint, a generation it did not earn, a finalizer it does not
 /// hold. Naming the field is the whole point — "invalid request" on a body with
 /// forty fields is a guessing game.
+/// Refuse an image that arrives carrying a signature nothing will check.
+///
+/// The reason is on the field itself
+/// ([`velstra_cloud_model::resources::ImageSpec::signature`]); the short version
+/// is that the platform will not hold a security claim it cannot verify,
+/// because everywhere it is displayed becomes evidence somebody will cite.
+///
+/// An explicitly *empty* signature is not a claim and is not refused: a client
+/// echoing back an object it read, or clearing the field, must not be told off
+/// for it.
+fn refuse_an_unverified_signature(spec: &Value) -> ApiResult<()> {
+    let carried = spec
+        .get("signature")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    if carried {
+        return Err(
+            ApiError::invalid(velstra_cloud_model::resources::UNVERIFIED_SIGNATURE)
+                .at("spec.signature"),
+        );
+    }
+    Ok(())
+}
+
 fn refuse_unwritable(body: &Value) -> ApiResult<()> {
     if body.get("status").is_some() {
         return Err(ApiError::invalid(

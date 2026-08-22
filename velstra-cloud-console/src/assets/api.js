@@ -8,6 +8,10 @@ const PROJECT_KEY = "velstra-cloud-project";
 const session = {
   token: sessionStorage.getItem(TOKEN_KEY) || "",
   project: sessionStorage.getItem(PROJECT_KEY) || "",
+  // Who the API says is signed in, filled in on entry. Never persisted: it is
+  // the server's answer about the current token, and a stale copy from a
+  // previous session would be a claim about the wrong person.
+  who: null,
 };
 
 const collections = () => SCHEMA;

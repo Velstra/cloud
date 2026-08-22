@@ -27,6 +27,33 @@ use velstra_cloud_nodeagent::{
 const VNI: u32 = 5001;
 const PORT: &str = "projects/p1/ports/web";
 
+/// Fails when the SRv6 end-to-end case could not run at all, unless somebody
+/// said that is fine.
+///
+/// The other skips in this file guard a *datapath* the unit tests in
+/// `src/fabric.rs` already cover from the cloud side. SRv6 is different: the
+/// config served back — with its derived service SIDs — is the fabric's own
+/// logic, reachable only over gRPC, so there is no unit fallback for it. A CI
+/// that never built the fabric would skip
+/// [`a_node_that_states_a_locator_is_served_an_srv6_overlay`] and go green,
+/// which looks exactly like a run that proved SRv6 works. This turns that into
+/// one loud failure. Set `VELSTRA_FABRIC_OPTIONAL=1` to accept the gap
+/// deliberately.
+#[test]
+fn the_srv6_overlay_was_actually_tested() {
+    if controller_binary().is_some() {
+        return;
+    }
+    assert!(
+        std::env::var("VELSTRA_FABRIC_OPTIONAL").is_ok(),
+        "the fabric controller is not built, so the SRv6 end-to-end case skipped \
+         and nothing exercised the served SRv6 config or its derived SIDs. A green \
+         run here would look identical to one that proved SRv6 works, which is why \
+         this one is red. Build it (cargo build --manifest-path ../fabric/Cargo.toml), \
+         or set VELSTRA_FABRIC_OPTIONAL=1 to accept the gap."
+    );
+}
+
 fn controller_binary() -> Option<PathBuf> {
     for candidate in [
         "../../fabric/target/debug/velstra-controller",
@@ -187,6 +214,7 @@ async fn a_port_with_rules_reaches_the_fabric() {
         iface: "lo".into(),
         mac: "02:00:00:00:00:01".into(),
         mtu: 1450,
+        srv6_locator: None,
     };
     let datapath = FabricDatapath::new(
         TapDatapath::new("vt", None),
@@ -356,6 +384,48 @@ async fn a_port_with_rules_reaches_the_fabric() {
         group.rules
     );
 
+    // ---- and now the question the agent actually asks every pass ----------
+    //
+    // "Is this port still current?" The agent used to answer it by comparing
+    // the rules the datapath *reported* with the ones it wanted. This datapath
+    // cannot report them: it observes through the tap layer, which is programmed
+    // with no rules on purpose because the fabric is what enforces them. So the
+    // comparison was `[] == [something]` on every pass, for ever — and starting
+    // a guest is gated on its ports being current, so an instance with any
+    // security group never started on a real fabric.
+    let observed = datapath.observe().await.expect("observing this machine");
+    let mine = observed
+        .get(PORT)
+        .expect("the port this machine is carrying");
+    assert!(
+        mine.rules.is_empty(),
+        "this datapath cannot report its rules, and a test that expected it to would be \
+         testing a datapath that does not exist"
+    );
+    assert!(
+        datapath.agrees(PORT, mine, &fewer),
+        "the fabric holds exactly these rules and the datapath said otherwise"
+    );
+
+    // The range is the case a naive inverse could never get right: two rules in
+    // become three out, so comparing what the fabric holds against what was
+    // asked for has to happen in the fabric's vocabulary.
+    datapath
+        .program(PORT, &spec, &network, &rules)
+        .await
+        .expect("restating with a range");
+    let observed = datapath.observe().await.expect("observing again");
+    let mine = observed.get(PORT).expect("still carried");
+    assert!(
+        datapath.agrees(PORT, mine, &rules),
+        "a rule carrying a port range never compares equal to the rules it became"
+    );
+    // And a different set is *not* agreed, or the answer would be worthless.
+    assert!(
+        !datapath.agrees(PORT, mine, &fewer),
+        "this datapath agrees with anything"
+    );
+
     let _ = datapath.unprogram(PORT).await;
 }
 
@@ -380,6 +450,7 @@ async fn a_rule_the_fabric_cannot_key_leaves_no_port_behind() {
             iface: "lo".into(),
             mac: "02:00:00:00:00:01".into(),
             mtu: 1450,
+            srv6_locator: None,
         },
     );
     let unsayable = ResolvedRule {
@@ -461,6 +532,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
             underlay_iface: "lo".into(),
             underlay_mac: "02:00:00:00:00:01".into(),
             encap: 0,
+            srv6_locator: String::new(),
             udp_port: 0,
             underlay_mtu: 0,
         })
@@ -506,6 +578,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
             iface: "lo".into(),
             mac: "02:00:00:00:00:01".into(),
             mtu: 1450,
+            srv6_locator: None,
         },
     );
     datapath
@@ -540,4 +613,136 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
         .unprogram(PORT)
         .await
         .expect("tearing down an already-torn-down port was an error");
+}
+
+/// A node that states an SRv6 locator is served an SRv6 overlay, end to end
+/// through a real fabric controller.
+///
+/// The path this walks is the one that was previously impossible: the node agent
+/// declares its wire family, the fabric stores it, and the config the node is
+/// served back carries an SRv6 endpoint with derived service SIDs. Before this,
+/// `NodeConfig` had no SRv6 message at all and the agent's own config conversion
+/// hardcoded `srv6: None` on the way back in — so a fabric could not have served
+/// an SRv6 config even if something had asked for one.
+///
+/// The two assertions that matter most are the negative ones. An SRv6 node must
+/// get *no* VXLAN endpoint (two overlays at once is refused by the config's own
+/// validation, so a node served both would fail to apply anything at all), and
+/// its two service SIDs for one segment must differ (one SID means one behaviour;
+/// equal SIDs would have every broadcast bridged to a single MAC).
+#[tokio::test]
+async fn a_node_that_states_a_locator_is_served_an_srv6_overlay() {
+    let Some(binary) = controller_binary() else {
+        eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
+        return;
+    };
+    let Some(fabric) = Fabric::start_on(&binary, 50971).await else {
+        eprintln!("skipped: the fabric controller did not come up");
+        return;
+    };
+    let mut client = fabric.client().await.expect("a client");
+
+    const VNI: u32 = 5003;
+    client
+        .add_network(pb::NetworkSpec {
+            vni: VNI,
+            name: "srv6".into(),
+            subnet: "10.40.0.0/24".into(),
+            default_action: pb::Action::Drop as i32,
+            drop_icmp: false,
+        })
+        .await
+        .expect("declaring the network");
+
+    // Exactly what `FabricDatapath::declare_host` sends for a node started with
+    // `--fabric-srv6-locator`: the family follows the locator, never a separate
+    // flag the two could disagree about.
+    let underlay = Underlay {
+        vtep: "127.0.0.1".into(),
+        iface: "lo".into(),
+        mac: "02:00:00:00:00:01".into(),
+        mtu: 1450,
+        srv6_locator: Some("fc00:0:7::/64".into()),
+    };
+    client
+        .add_host(pb::HostSpec {
+            id: "node-s".into(),
+            vtep: underlay.vtep.clone(),
+            underlay_iface: underlay.iface.clone(),
+            underlay_mac: underlay.mac.clone(),
+            encap: pb::Encap::Srv6 as i32,
+            srv6_locator: underlay.srv6_locator.clone().unwrap_or_default(),
+            udp_port: 0,
+            underlay_mtu: underlay.mtu,
+        })
+        .await
+        .expect("declaring the srv6 host");
+
+    // A port is what makes the host *serve* the segment, and therefore what makes
+    // it instantiate any SIDs at all.
+    client
+        .create_port(pb::CreatePortRequest {
+            network: VNI,
+            host: "node-s".into(),
+            tap: "vs0".into(),
+            ip: "10.40.0.9".into(),
+            policy: None,
+            mac: Some("02:ab:cd:ef:00:09".into()),
+        })
+        .await
+        .expect("creating the port");
+
+    let config = fabric
+        .control()
+        .await
+        .expect("the agent-facing channel")
+        .get_config(pb::NodeRequest {
+            node_id: "node-s".into(),
+        })
+        .await
+        .expect("asking for this node's config")
+        .into_inner();
+
+    let srv6 = config
+        .srv6
+        .as_ref()
+        .expect("an srv6 host must be served an srv6 endpoint");
+    // Derived from the locator, not stated anywhere: a peer computes the same
+    // value from the same locator, which is what lets both ends agree with
+    // nothing exchanged.
+    assert_eq!(srv6.local_src, "fc00:0:7::");
+    assert_eq!(srv6.underlay_iface, "lo");
+    assert_eq!(srv6.underlay_mtu, 1450);
+
+    assert!(
+        config.overlay.is_none(),
+        "an srv6 node must not also be served a VXLAN endpoint: the config refuses both at \
+         once, so it would fail to apply anything at all"
+    );
+
+    // Both behaviours for the one segment served, on two distinct SIDs.
+    let mut sids: Vec<(&str, u32, &str)> = config
+        .srv6_local_sids
+        .iter()
+        .map(|ls| (ls.sid.as_str(), ls.vni, ls.behavior.as_str()))
+        .collect();
+    sids.sort_unstable();
+    assert_eq!(sids.len(), 2, "{sids:?}");
+    assert_eq!(sids[0].1, VNI);
+    assert_eq!(sids[1].1, VNI);
+    assert_ne!(
+        sids[0].0, sids[1].0,
+        "the unicast and flood SIDs of one segment must differ: RFC 9252 binds a SID to one \
+         behaviour, and equal SIDs bridge every broadcast to a single MAC"
+    );
+    let behaviors: Vec<&str> = sids.iter().map(|s| s.2).collect();
+    assert!(behaviors.contains(&"end.dt2u"), "{sids:?}");
+    assert!(behaviors.contains(&"end.dt2m"), "{sids:?}");
+
+    // A single-host fabric has nobody to talk to yet, and says so by omission
+    // rather than by trusting the underlay: an empty peer set is fail-closed
+    // decap, which is the correct state for a host no peer is sending to.
+    assert!(srv6.peers.is_empty(), "{:?}", srv6.peers);
+    assert!(config.srv6_routes.is_empty());
+    assert!(config.srv6_floods.is_empty());
 }

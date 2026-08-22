@@ -24,9 +24,16 @@ PATCH  /api/v1/projects/p1/instances/i1         # change spec
 DELETE /api/v1/projects/p1/instances/i1
 ```
 
-Collections: `projects`, `instances`, `migrations`, `volumes`, `snapshots`,
-`pools`, `attachments`, `networks`, `subnets`, `ports`, `security-groups`,
-`images`, `nodes`, `operations`.
+Collections, in the order the API serves them: `projects`, `users`,
+`ceph-clusters`, `instances`, `migrations`, `volumes`, `snapshots`,
+`attachments`, `networks`, `routers`, `floatingips`, `subnets`, `ports`,
+`security-groups`, `images`, `nodes`, `pools`, `operations`.
+
+Two collections stored beside these are deliberately **not** served and are on
+no path here: `credentials` (a password hash) and `sessions` (a live bearer
+token). A route that does not exist cannot leak what it would have returned;
+signing in and out reach them through the session endpoints below, never as
+collections.
 
 One of them hangs off another object rather than off a project: a snapshot is
 created under the volume it copies, at
@@ -538,11 +545,16 @@ governed by them. `viewer` reads, `editor` also writes, `admin` also changes the
 bindings themselves; the last is kept apart so an editor cannot grant themselves
 more than they were given.
 
-Resources outside every project — nodes, pools, and the projects collection
-itself — belong to the cell, and only a subject named in the API's
-`--cell-admin` may touch them. That list is configuration, not data: it is what a
+Resources outside every project — nodes, pools, `ceph-clusters`, the `users`
+collection, and the projects collection itself — belong to the cell, and only a
+**cell operator** may touch them. A subject is a cell operator two ways: named
+in the API's `--cell-admin`, **or** holding a user record whose
+`spec.cellAdmin` is true. The first is configuration, not data: it is what a
 fresh cell is bootstrapped from, and a permission stored inside the thing it
-protects has no answer for the first request.
+protects has no answer for the first request. The second is the ordinary,
+storable grant, checked from the record the same way the config list is — so a
+cell administers its own operators once it has a first one, without editing the
+API's flags. `whoami` (below) reports the combined answer as `cellAdmin`.
 
 A refused request is `403 PERMISSION_DENIED` with the same sentence whether the
 resource is yours and forbidden or somebody else's and invisible — an error that
@@ -551,8 +563,74 @@ that proves it: it is filtered rather than refused, because a caller has no
 permission on a collection as a whole and answering `403` would leave nobody able
 to find the projects they do have.
 
+**An agent must be a cell operator, and the consequence of getting that wrong is
+silence.** A node agent reads two cell-wide collections — `nodes` and
+`ceph-clusters` — and, by the rule above, a cell-wide list is *filtered* rather
+than refused. So an agent authenticating as an ordinary subject is not told it
+may not read them: it is handed `{"items": []}` and reads that as "there is
+nothing to do". No error, no refusal, every node quiet, and a Ceph cluster stuck
+at `Bootstrapping` for ever.
 
-`Authorization: Bearer <token>`. In development the API accepts a static token
-from `--token-file`; in production the token is an OIDC-issued JWT and the
-verifier is a trait implementation. The console only ever sees a bearer token
-and must not care which kind it is.
+That is a configuration mistake this document cannot prevent, so the agent looks
+for it instead: a node always exists for *itself*, so a node list that comes back
+without the agent's own node in it has been filtered, and the agent says so once
+at that point. The contract line is here because it is the thing to check first;
+the run-time detector is what helps somebody who has already got it wrong.
+
+
+`Authorization: Bearer <token>`. A token is verified one of two ways, tried in
+order: it may be a **session token** minted by a password sign-in (below), or a
+**static token** a service account or an agent holds — accepted by a fallback
+verifier (a `--token-file` in development, an OIDC-issued JWT in production). The
+console only ever sees a bearer token and must not care which kind it is; the
+difference shows only at `whoami`, which reports whether a *session* stands
+behind the token.
+
+### Sessions and passwords
+
+Passwords are exchanged for tokens, never sent on every request. The
+`credentials` and `sessions` collections are unserved (above); these four routes
+are the only way to reach them.
+
+```
+POST   /api/v1/sessions              # sign in: {username, password} -> {token, …}
+GET    /api/v1/sessions/current      # whoami: who this token is, and what it may do
+DELETE /api/v1/sessions/current      # sign out: end the session this token names
+PUT    /api/v1/users/{id}/password   # set a password
+```
+
+- **`POST /sessions`** is the one route with no `Authorization` — it is what
+  issues the token every other route requires. Body `{username, password}`; on
+  success `201` with `{token, subject, displayName, cellAdmin, expiresAt}`. The
+  `token` is returned **once** and only its digest is stored, so it cannot be
+  recovered from the cell afterwards. Every failure — no such user, wrong
+  password, disabled account — is the same `401` sentence, so the response is not
+  an oracle for which usernames exist.
+- **`GET /sessions/current`** (`whoami`) returns `{subject, displayName,
+  cellAdmin, session}`. `cellAdmin` is the combined operator answer (config list
+  or stored flag). `session` is true only when *this token* is a live session —
+  a static token or service account reads `false`, because there is no session
+  behind it for a sign-out to end.
+- **`DELETE /sessions/current`** ends the session the caller presented, and only
+  that one. It names no session: a route that ended a session by name would be a
+  way to sign somebody else out. Idempotent — a token already gone is not an
+  error.
+- **`PUT /users/{id}/password`** sets a password. A cell operator may set
+  anyone's; a subject may set their **own**, and only then must prove the
+  *current* password in the body as `currentPassword` — without that, a stolen
+  session would be a permanent account takeover. A project admin may set no
+  one's: project membership is not a route to the cell. Changing your own
+  password ends every *other* session you hold and keeps the one you are sitting
+  in; an operator changing someone else's ends all of theirs, which is the point
+  when an operator is shutting a door.
+
+### Node agents write with the operator's token
+
+A node agent authenticates as a **cell operator** and writes its own node object
+directly — there is no per-node credential, and the writer identity on a node
+report is self-declared. This is a deliberate limit of the current
+single-operator phase, **not** a trust boundary: anything holding the operator
+token can write any node's status. It is safe only because the operator token is
+held by the operator's own agents. Per-node identities are the shape that would
+make it a boundary; until then, do not read the writer field on a node object as
+proof of which machine wrote it.

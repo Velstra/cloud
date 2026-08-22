@@ -15,6 +15,7 @@ use velstra_cloud_controller::{
     LoopConfig, Metrics,
     address::AddressController,
     attachment::AttachmentController,
+    ceph::CephController,
     drift,
     election::{ElectionConfig, elect},
     floating_ip::FloatingIpController,
@@ -32,6 +33,7 @@ use velstra_cloud_controller::{
     volume::VolumeController,
 };
 use velstra_cloud_model::{
+    ceph::{CephClusterSpec, CephClusterStatus},
     meta::Timestamp,
     migration::{MigrationSpec, MigrationStatus},
     resources::{
@@ -148,6 +150,8 @@ async fn main() {
     let instances: TypedStore<InstanceSpec, InstanceStatus> =
         TypedStore::new(store.clone(), cell, "instances");
     let nodes: TypedStore<NodeSpec, NodeStatus> = TypedStore::new(store.clone(), cell, "nodes");
+    let ceph_clusters: TypedStore<CephClusterSpec, CephClusterStatus> =
+        TypedStore::new(store.clone(), cell, "ceph-clusters");
     let volumes: TypedStore<VolumeSpec, VolumeStatus> =
         TypedStore::new(store.clone(), cell, "volumes");
     let attachments: TypedStore<AttachmentSpec, AttachmentStatus> =
@@ -375,6 +379,23 @@ async fn main() {
             args.fabric.clone(),
         )),
         routers.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // And the Ceph cluster, if there is one. It runs unconditionally and costs
+    // nothing in a cell without one: no object, no reconcile.
+    //
+    // It runs no commands. Every step of a deployment happens on the machine the
+    // daemon will live on, driven by that machine's own agent from the same
+    // stored spec — this assembles what the nodes report into "the cluster is
+    // what was asked for", which is a judgement about other objects and so
+    // belongs to a controller rather than to any one of them.
+    tasks.spawn(run_when_leading(
+        Arc::new(CephController::new(store.clone(), cell, nodes.clone())),
+        ceph_clusters.clone(),
         store.clone(),
         config,
         metrics.clone(),

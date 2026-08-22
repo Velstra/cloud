@@ -803,3 +803,193 @@ async fn an_unregistered_image_is_named_on_the_object() {
         "the object does not say why it cannot boot: {said}"
     );
 }
+
+/// The same thing again, read the way production reads it.
+///
+/// ## Why this test is a near-duplicate on purpose
+///
+/// `a_group_naming_another_follows_its_members_as_they_arrive` above builds its
+/// agent over the store, which hands it every port in the cell — so working out
+/// "who is in group web" from the ports is a question it can answer. Through the
+/// API a node is handed **only its own** ports, and the same working-out yields
+/// nothing: the web server is on `node-b`, whose port this node never sees.
+///
+/// The API computes that membership centrally and puts it on the group for
+/// exactly this reason. The agent used to drop it — it kept `g.spec` and threw
+/// the status away — so against a real API a rule naming another group expanded
+/// to nothing, silently, and a guest lost traffic its tenant had allowed. Every
+/// test was green, because every test was asking the wrong reader.
+#[tokio::test]
+async fn a_group_naming_another_expands_through_the_api_shaped_reader_too() {
+    let store = store();
+    create_security_group(
+        &store,
+        "projects/p1/security-groups/db",
+        vec![SecurityRule {
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            ports: Some(PortRange {
+                from: 5432,
+                to: 5432,
+            }),
+            remote: Remote::Group("projects/p1/security-groups/web".into()),
+        }],
+    )
+    .await;
+    create_port_in_groups(
+        &store,
+        PORT_A,
+        "10.0.0.20/24",
+        "node-a",
+        &["projects/p1/security-groups/db"],
+    )
+    .await;
+    create_instance(&store, I1, Some("node-a"), Some("node-a"), &[PORT_A]).await;
+
+    // The referenced group exists as an object, which is what the API computes
+    // membership *for*. A group that is only ever named by ports and never
+    // created is a different case, and one the API cannot answer either — there
+    // is no object to put a `status` on.
+    create_security_group(&store, "projects/p1/security-groups/web", vec![]).await;
+
+    // The member is on another node, so this agent never sees its port object.
+    // That is the whole point of the test.
+    create_port_in_groups(
+        &store,
+        "projects/p1/ports/port-web",
+        "10.0.0.5/24",
+        "node-b",
+        &["projects/p1/security-groups/web"],
+    )
+    .await;
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = common::api_shaped_agent(store.clone(), "node-a", &vmm, &datapath);
+    agent.resync().await;
+
+    let rules = datapath.rules_programmed(PORT_A).unwrap();
+    assert_eq!(
+        rules.iter().map(|r| r.remote.as_str()).collect::<Vec<_>>(),
+        vec!["10.0.0.5/24"],
+        "a member on another machine never reached the datapath: the node worked membership \
+         out from the ports it can see instead of reading what the API computed"
+    );
+}
+
+/// A member that is not bound to any node still counts.
+///
+/// The filter the API applies rejects a port with neither `spec.node` nor
+/// `status.node`, so a node that recomputed membership from what it was handed
+/// would miss one even in a single-machine cell — which is the case that makes
+/// this a bug about *correctness* and not about topology.
+#[tokio::test]
+async fn an_unbound_member_of_a_referenced_group_still_expands() {
+    let store = store();
+    create_security_group(
+        &store,
+        "projects/p1/security-groups/db",
+        vec![SecurityRule {
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            ports: Some(PortRange {
+                from: 5432,
+                to: 5432,
+            }),
+            remote: Remote::Group("projects/p1/security-groups/web".into()),
+        }],
+    )
+    .await;
+    create_port_in_groups(
+        &store,
+        PORT_A,
+        "10.0.0.20/24",
+        "node-a",
+        &["projects/p1/security-groups/db"],
+    )
+    .await;
+    create_instance(&store, I1, Some("node-a"), Some("node-a"), &[PORT_A]).await;
+    create_security_group(&store, "projects/p1/security-groups/web", vec![]).await;
+    // Created, addressed, and not yet placed anywhere.
+    create_port_in_groups(
+        &store,
+        "projects/p1/ports/port-web",
+        "10.0.0.9/24",
+        "",
+        &["projects/p1/security-groups/web"],
+    )
+    .await;
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = common::api_shaped_agent(store.clone(), "node-a", &vmm, &datapath);
+    agent.resync().await;
+
+    let rules = datapath.rules_programmed(PORT_A).unwrap();
+    assert_eq!(
+        rules.iter().map(|r| r.remote.as_str()).collect::<Vec<_>>(),
+        vec!["10.0.0.9/24"],
+        "an unbound member of the referenced group was dropped"
+    );
+}
+
+/// A datapath that keeps its rules somewhere this process cannot read back
+/// still converges.
+///
+/// ## The bug this pins
+///
+/// The check for "is this port current" used to compare the rules the datapath
+/// *reported* against the rules this pass wanted. The fabric datapath cannot
+/// report them: it observes through the tap layer, which is deliberately
+/// programmed with no rules because the fabric is what enforces them. So the
+/// comparison was `[] == [something]` on every pass, for ever.
+///
+/// The consequence was not a warning. `reconcile_instance` gates starting a
+/// guest on its ports being current, so an instance with any security group at
+/// all never reached `StartVm` on a real fabric — the pass returned `Ok`, the
+/// port was re-programmed, and the instance sat at `Ready=False` beside a host
+/// that had done everything it was asked.
+#[tokio::test]
+async fn a_datapath_that_cannot_report_its_rules_still_converges() {
+    let store = store();
+    create_security_group(
+        &store,
+        "projects/p1/security-groups/web",
+        vec![SecurityRule {
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            ports: Some(PortRange { from: 80, to: 82 }),
+            remote: Remote::Cidr("0.0.0.0/0".into()),
+        }],
+    )
+    .await;
+    create_port_in_groups(
+        &store,
+        PORT_A,
+        "10.0.0.5/24",
+        "node-a",
+        &["projects/p1/security-groups/web"],
+    )
+    .await;
+    create_instance(&store, I1, Some("node-a"), Some("node-a"), &[PORT_A]).await;
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new().holding_rules_elsewhere();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+
+    agent.resync().await;
+    assert!(
+        vmm.is_running(I1),
+        "the guest never started: its port read as out of date because the datapath cannot \
+         report the rules it holds"
+    );
+
+    // And the second pass is quiet. Re-programming a port that is already right,
+    // every pass, for ever, is the other half of the same bug — and the half
+    // that would keep a converged node permanently busy.
+    let settled = agent.resync().await;
+    assert_eq!(
+        settled.actions, 0,
+        "a converged node kept working: {settled:?}"
+    );
+}

@@ -151,6 +151,7 @@ async fn a_tenant_network_reaches_the_fabric_without_anybody_declaring_it() {
             underlay_iface: "eth0".into(),
             underlay_mac: "02:00:00:00:00:01".into(),
             encap: pb::Encap::Vxlan as i32,
+            srv6_locator: String::new(),
             udp_port: 0,
             underlay_mtu: 0,
         })

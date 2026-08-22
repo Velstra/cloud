@@ -181,6 +181,23 @@ pub struct NodeStatus {
     pub allocated: Capacity,
     pub agent_version: String,
     pub last_heartbeat: Timestamp,
+    /// Block devices this node can see, and what each is being used for.
+    ///
+    /// Here for the same reason `images` is: it is one node's observation of its
+    /// own hardware, which nobody else can make. The console reads it to offer
+    /// disks for a Ceph OSD, and
+    /// [`ceph::may_consume`](crate::ceph::may_consume) decides which of them may
+    /// be offered — never this list on its own, because a list is a list and the
+    /// rule is the rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<crate::ceph::BlockDevice>,
+
+    /// Whether this node has what it takes to run a Ceph daemon, and what it is
+    /// already running. Reported rather than assumed: a cell may have Ceph on
+    /// three nodes out of twenty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceph: Option<crate::ceph::NodeCeph>,
+
     /// Images this node holds a verified copy of, by resource name.
     ///
     /// It lives here, and not as `cached_on` on the image, for the reason that
@@ -244,9 +261,38 @@ pub struct ImageSpec {
     pub format: ImageFormat,
     pub size_bytes: u64,
     pub source_url: String,
-    /// Cosign-style signature; verified before a node will boot it.
+    /// **Nothing verifies this, and the API refuses to store it.**
+    ///
+    /// It was declared as "a cosign-style signature, verified before a node will
+    /// boot it". No code has ever read it: not the node that pulls the image,
+    /// not the one that boots it, not the API. What did read it was the
+    /// console, which offered a box to type one into and a column headed
+    /// *Signed* showing yes or no — so an operator could paste anything at all
+    /// and the platform would report, at a glance, that the image was signed.
+    ///
+    /// A field that is merely unused is dead weight. One that is unused while
+    /// something reports a security property from it is worse than not having
+    /// it, because every place it is displayed becomes evidence somebody will
+    /// cite. So it is refused on the way in
+    /// ([`crate::resources::UNVERIFIED_SIGNATURE`]) rather than stored and
+    /// ignored: the platform will not hold a claim it cannot check.
+    ///
+    /// The field stays on the type and on the wire so that implementing
+    /// verification is a change in one direction rather than a schema
+    /// migration. When it lands, the refusal goes with it, in the same commit.
     pub signature: Option<String>,
 }
+
+/// What the API says when an image arrives carrying a signature.
+///
+/// Here rather than in the API crate because it is a statement about the model:
+/// the reason is a property of the field, and a caller reading this type should
+/// find out why without going looking.
+pub const UNVERIFIED_SIGNATURE: &str = "spec.signature is not stored, because nothing in this platform verifies it. It was \
+     declared as a cosign-style signature checked before boot, and no code has ever read it — \
+     while the console showed a `Signed` column derived from it. An unchecked claim that is \
+     displayed as a checked one is worse than no field at all, so it is refused rather than \
+     kept. Publish the image without it; when verification exists this will accept it again.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImageFormat {
@@ -442,7 +488,6 @@ pub const POOL_RELEASE_FINALIZER: &str = "pool.velstra.io/release";
 /// would be two answers to "where does this subnet's traffic go", and the fabric
 /// refuses it for the same reason.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RouterSpec {
     /// The networks that route to each other, by resource name.
     ///
@@ -453,19 +498,26 @@ pub struct RouterSpec {
     pub networks: Vec<String>,
 }
 
+// The `alias`es carry objects written under the old `rename_all = "camelCase"`
+// representation. Dropping the rename was needed to fix the API write path, but
+// it changed how these fields spell on the wire and in the store; without the
+// aliases an already-stored router would fail to deserialise and read back as
+// `TypedError::Corrupt`. New writes use the snake_case field names.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RouterStatus {
+    #[serde(alias = "observedGeneration")]
     pub observed_generation: u64,
     pub conditions: Vec<Condition>,
     /// The routed VNI the platform gave this router, in its own number space.
     ///
     /// Assigned rather than asked for, like a network's VNI: a tenant choosing
     /// one would be choosing whether it collides.
+    #[serde(alias = "l3Vni")]
     pub l3_vni: u32,
     /// The anycast gateway's hardware address, identical on every host serving
     /// this tenant. Recorded because a person debugging an ARP table needs to
     /// recognise it, and derived from the VNI so it is stable across a restart.
+    #[serde(alias = "gatewayMac")]
     pub gateway_mac: String,
 }
 
@@ -500,7 +552,6 @@ pub type Router = Resource<RouterSpec, RouterStatus>;
 /// address. That is the whole reason [`crate::ipam`] counts both: two
 /// allocators over one range is the defect this design exists to not have.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct FloatingIpSpec {
     /// The subnet the address comes from, by resource name.
     pub subnet: String,
@@ -518,15 +569,18 @@ pub struct FloatingIpSpec {
     pub port: String,
 }
 
+// Same as `RouterStatus`: `alias`es keep objects stored under the old
+// camelCase representation deserialisable after the `rename_all` was dropped.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct FloatingIpStatus {
+    #[serde(alias = "observedGeneration")]
     pub observed_generation: u64,
     pub conditions: Vec<Condition>,
     /// The id the fabric gave this address. Recorded because every later call
     /// about it — associate, disassociate, release — is keyed on that id and
     /// not on the address, so losing it would strand the allocation in the
     /// fabric with nothing able to name it.
+    #[serde(alias = "fabricId")]
     pub fabric_id: String,
     /// The port's fixed address this is forwarding to right now, as the fabric
     /// has it. Empty means not associated. It is the *observed* half of

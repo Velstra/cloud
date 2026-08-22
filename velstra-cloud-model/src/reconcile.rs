@@ -80,8 +80,6 @@ pub enum ControllerAction {
     /// Bind the instance to a node (a spec write — the scheduler is a
     /// controller).
     Assign { instance: String, node: String },
-    /// Say why nothing could be done, on the object.
-    SetCondition { condition: Condition },
     /// The object may finally go.
     Delete { name: String },
 }

@@ -275,6 +275,52 @@ button.link:hover { text-decoration: underline; }
 .rowlist .row button { padding: 4px 8px; }
 /* The row inputs fill the list; the button that adds one is a button. */
 .rowlist > button.btn { align-self: flex-start; }
+/* Wider than `.idx`, because it carries a word rather than a row number. */
+.rowlist .row .lab { color: var(--text-faint); font-size: var(--text-xs); white-space: nowrap; }
+
+/* ---- picking disks ------------------------------------------------------ */
+/* The one control on this page that destroys something, so it is the one
+   control that does not look like the others: every disk each node can see is
+   listed, and the ones that cannot be taken carry the reason in words. A greyed
+   row would answer "why not this one" with silence. */
+.disks { display: flex; flex-direction: column; gap: var(--space-5); max-width: 640px; }
+.disks .disknode { display: flex; flex-direction: column; gap: var(--space-2); }
+.disks .diskhost {
+  font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
+  letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
+  padding-bottom: var(--space-2); border-bottom: 1px solid var(--border);
+  display: flex; gap: var(--space-3); align-items: baseline;
+}
+.disks .diskrows { display: flex; flex-direction: column; }
+.disks .disk {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-1) var(--space-4);
+  align-items: center; padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.disks .disk .mono { font-family: var(--font-mono); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.disks .disk .note, .disks .diskhost .note, .disks > .note {
+  color: var(--text-muted); font-size: var(--text-xs); letter-spacing: 0; text-transform: none;
+  font-weight: var(--fw-regular);
+}
+.disks .disk .note { grid-column: 1; }
+.disks .disk button.btn { grid-column: 2; grid-row: 1 / span 2; }
+/* The sentence takes the row under the path rather than a column beside it:
+   squeezed into a column it wraps one word per line, which is a sentence nobody
+   reads — and this is the sentence the control exists for. */
+.disks .disk .why {
+  grid-column: 1 / -1; color: var(--text-muted); font-size: var(--text-xs);
+  line-height: 1.45; max-width: 60ch;
+}
+.disks .disk.refused .mono { color: var(--text-muted); }
+.disks .disk.chosen { background: color-mix(in srgb, var(--settled) 10%, transparent); }
+
+/* Not a hint. A hint is what a field says about itself; this is what happens to
+   somebody's data if they get it wrong. */
+.warn {
+  color: var(--failing); border-left: 3px solid var(--failing);
+  padding-left: var(--space-4); max-width: 60ch; font-size: var(--text-sm);
+  margin-bottom: var(--space-2);
+}
 .fields + .fields, .fields + .disclose { margin-top: var(--space-5); }
 
 /* ---- fields ------------------------------------------------------------- */
@@ -598,3 +644,44 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
   font-variant-numeric: tabular-nums;
 }
 .summary .state { font-size: var(--text-xs); }
+
+/* Who is signed in, in the header beside the controls that act as them. Quiet
+   by default: it is orientation, not a message, and it should read as part of
+   the chrome until somebody looks for it. */
+.who {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  /* An operator's name is the one thing here that can be arbitrarily long, and
+     a header that reflows because of it moves every control beside it. */
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The token alternative on the sign-in form. Present, and second: a person
+   signs in with a password, an automation holds a token, and putting them side
+   by side would suggest the choice matters more than it does. */
+.tokenalt {
+  margin-top: var(--space-4);
+  font-size: var(--text-xs);
+}
+.tokenalt > summary {
+  color: var(--text-muted);
+  cursor: pointer;
+  /* The default marker is a triangle that sits on the text baseline and looks
+     like a bullet at this size. */
+  list-style: none;
+}
+.tokenalt > summary::-webkit-details-marker { display: none; }
+.tokenalt > summary::before {
+  content: "+ ";
+  font-variant-numeric: tabular-nums;
+}
+.tokenalt[open] > summary::before { content: "− "; }
+.tokenalt > summary:hover { color: var(--text-body); }
+.tokenalt > summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}

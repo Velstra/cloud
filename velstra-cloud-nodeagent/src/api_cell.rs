@@ -95,8 +95,16 @@ impl ApiCell {
 
     /// Read every object of a kind that this node has business with.
     async fn list<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>> {
-        let path = self.path(kind, false);
-        let body = self.get(&path).await?;
+        self.list_at(kind, &self.path(kind, false)).await
+    }
+
+    /// Read a cell-wide collection whole: no project in the path, no filter.
+    async fn list_cell<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>> {
+        self.list_at(kind, &format!("/api/v1/{kind}")).await
+    }
+
+    async fn list_at<T: DeserializeOwned>(&self, kind: &str, path: &str) -> Result<Vec<T>> {
+        let body = self.get(path).await?;
         let document: Value = serde_json::from_slice(&body)
             .map_err(|e| HostError::failed(format!("{kind}: unreadable answer: {e}")))?;
         let items = document
@@ -259,6 +267,18 @@ impl CellReader for ApiCell {
 
     async fn images(&self) -> Result<Vec<Image>> {
         self.list("images").await
+    }
+
+    /// Cell-wide, so no project in the path and no `?node=` filter: these are
+    /// the two collections a node reads whole. Filtering the node list to this
+    /// node would defeat the point of reading it — the Ceph pass decides
+    /// whether a step is this node's by computing it over *everybody's*
+    /// reports.
+    async fn nodes(&self) -> Result<Vec<velstra_cloud_model::resources::Node>> {
+        self.list_cell("nodes").await
+    }
+    async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>> {
+        self.list_cell("ceph-clusters").await
     }
 
     async fn wake(&self) -> tokio::sync::mpsc::Receiver<()> {

@@ -85,7 +85,8 @@ const DERIVE = {
 };
 
 function fieldControl(form, f) {
-  const box = el("div.field" + (f.kind === "lines" || f.kind === "refList" || f.kind === "textList" || f.kind === "ruleList" ? ".wide" : ""));
+  const WIDE = ["lines", "refList", "textList", "ruleList", "diskList", "poolList"];
+  const box = el("div.field" + (WIDE.includes(f.kind) ? ".wide" : ""));
   const id = "f-" + f.key.replace(/\./g, "-");
   form.boxes[f.key] = box;
   box.appendChild(el("label", { for: id }, f.label, f.required ? el("span.req", " ·") : null));
@@ -220,6 +221,26 @@ function fieldControl(form, f) {
         render: () => renderRuleList(form, f, host, setErr),
       });
       renderRuleList(form, f, host, setErr);
+      box.appendChild(host);
+      break;
+    }
+    case "diskList": {
+      const host = el("div.disks", { id });
+      // Through the picker machinery, like the rule list's remote groups: the
+      // nodes whose disks are on offer are fetched exactly the way every other
+      // reference is, rather than this control growing a loader of its own.
+      form.pickers.push({
+        field: { key: f.key, collection: f.collection, spelling: "id" },
+        list: host,
+        render: () => renderDiskList(form, f, host, setErr),
+      });
+      renderDiskList(form, f, host, setErr);
+      box.appendChild(host);
+      break;
+    }
+    case "poolList": {
+      const host = el("div.rowlist", { id });
+      renderPoolList(form, f, host, setErr);
       box.appendChild(host);
       break;
     }
@@ -369,6 +390,197 @@ function renderRuleList(form, f, host, setErr) {
 
   host.appendChild(el("button.btn", { type: "button", id: "addrule", onclick: () => { rules.push(blankRule()); redraw(); } },
     "Add" + (rules.length ? " another" : " a rule")));
+}
+
+// Picking disks for Ceph, which is the one control on this page that destroys
+// something.
+//
+// It is inverted from every other picker here. The rest offer what exists and
+// let the API refuse the rest; this one lists *everything* each node can see,
+// offers only what is provably empty, and prints the reason beside every row it
+// will not take. Greying a row out answers "why can I not select this disk" with
+// silence, and silence is what sends somebody to a terminal to find out
+// something the platform already knew.
+
+/// The refusal for one device, in the model's own words, or "" if it may be had.
+///
+/// None of the wording is written here. It arrives in the schema, word for word
+/// from `ceph::may_consume`, pinned to it by a test in the API crate — so the
+/// script does substitution and nothing else, and there is no second opinion in
+/// JavaScript about what a filesystem on a disk means.
+function diskRefusal(f, device) {
+  const state = pick(device, "state") || { kind: "Free" };
+  const kind = pick(state, "kind") || "Free";
+  const say = (text) => String(text).replace(/\{(\w+)\}/g, (_, key) => {
+    const v = key === "minGib" ? f.minGib
+      : key === "sizeGib" ? pick(device, "sizeGib")
+        : pick(state, key);
+    return v === undefined || v === null ? "?" : String(v);
+  });
+  const template = (f.refusals || []).find((r) => r.kind === kind);
+  if (template) return say(template.text);
+  // Not free, and nothing here has a sentence for it: a node running a newer
+  // agent than this page. Refused rather than offered, because the safe
+  // direction when the answer is unknown is the conservative one and this is
+  // the one control where being wrong erases somebody's data.
+  if (kind !== "Free") return say(f.unknown);
+  if (Number(pick(device, "sizeGib") || 0) < Number(f.minGib)) return say(f.tooSmall);
+  return "";
+}
+
+/// What tells two disks apart at a glance. Spinning versus solid state is here
+/// because mixing them in one pool is a decision rather than an accident, and
+/// the kernel name because that is what an operator is holding an `lsblk`
+/// against.
+function diskNote(device) {
+  return [
+    (pick(device, "sizeGib") || 0) + " GiB",
+    pick(device, "rotational") ? "spinning" : "solid state",
+    pick(device, "model") || null,
+    pick(device, "kernelName") || null,
+  ].filter(Boolean).join(" · ");
+}
+
+function renderDiskList(form, f, host, setErr) {
+  // The array lives on the form for the same reason the rule list's does: this
+  // control redraws itself after every change, and a disk pushed into a local
+  // copy would be gone by the time the redraw read the values back.
+  if (!Array.isArray(form.values[f.key])) form.values[f.key] = [];
+  const chosen = form.values[f.key];
+  // Filled in a moment later by the picker; the control is drawn once before
+  // that, so it must not assume the fetch has happened.
+  const nodes = (form.refs || {})[f.collection] || [];
+  clear(host);
+
+  const where = (node, device) =>
+    chosen.findIndex((o) => pick(o, "node") === node && pick(o, "device") === device);
+  const commit = () => {
+    form.values[f.key] = chosen;
+    // Only what the platform could not carry out. Two OSDs cannot be made from
+    // one disk, and a spec that asks for it is one the second step fails on
+    // with an error about a device that is already in use.
+    const seen = new Set();
+    let bad = "";
+    for (const o of chosen) {
+      const key = pick(o, "node") + " " + pick(o, "device");
+      if (seen.has(key)) bad = pick(o, "device") + " on " + pick(o, "node") + " is listed twice, and one disk makes one OSD";
+      seen.add(key);
+    }
+    setErr(bad);
+  };
+  const redraw = () => { renderDiskList(form, f, host, setErr); commit(); };
+  const add = (node, device) => { chosen.push({ node, device }); redraw(); };
+  const drop = (node, device) => {
+    const i = where(node, device);
+    if (i >= 0) chosen.splice(i, 1);
+    redraw();
+  };
+
+  // Above the list, not under it. A warning below a list of buttons is a
+  // warning read after the click.
+  host.appendChild(el("p.warn", f.warning));
+
+  for (const n of nodes) {
+    const node = idOf(n);
+    const devices = at(status(n), "devices") || [];
+    const rows = el("div.diskrows");
+    for (const d of devices) {
+      const device = pick(d, "path") || "";
+      const taken = where(node, device) >= 0;
+      // A disk already in the spec reads as taken whatever it reports now.
+      // Ceph reports its own disks as OSDs, which `may_consume` refuses — and a
+      // control that believed the refusal would render every disk of a working
+      // cluster as unavailable, with no way left to remove one.
+      const why = taken ? "" : diskRefusal(f, d);
+      const row = el("div.disk" + (taken ? ".chosen" : why ? ".refused" : ""),
+        { "data-node": node, "data-device": device });
+      row.appendChild(el("span.mono", device));
+      row.appendChild(el("span.note", diskNote(d)));
+      row.appendChild(why
+        ? el("span.why", "Not offered: " + why)
+        : el("button.btn" + (taken ? "" : ".primary"), {
+          type: "button", "data-disk": taken ? "remove" : "add",
+          onclick: () => (taken ? drop(node, device) : add(node, device)),
+        }, taken ? "Remove" : "Add"));
+      rows.appendChild(row);
+    }
+    host.appendChild(el("div.disknode",
+      el("div.diskhost", node,
+        devices.length ? null : el("span.note", "reports no disks")),
+      rows));
+  }
+
+  // Chosen, and no node is reporting it. A node that is down looks exactly like
+  // this, and dropping these rows from the screen would let an edit that never
+  // touched them silently look like it had removed them.
+  const stray = chosen.filter((o) => !nodes.some((n) => idOf(n) === pick(o, "node") &&
+    (at(status(n), "devices") || []).some((d) => pick(d, "path") === pick(o, "device"))));
+  if (stray.length) {
+    host.appendChild(el("div.disknode",
+      el("div.diskhost", "Not reported",
+        el("span.note", "asked for, and no node is reporting the disk — a node that is down looks like this")),
+      el("div.diskrows", stray.map((o) => {
+        const node = pick(o, "node"), device = pick(o, "device");
+        return el("div.disk.chosen", { "data-node": node, "data-device": device },
+          el("span.mono", device),
+          el("span.note", "on " + node),
+          el("button.btn", { type: "button", "data-disk": "remove", onclick: () => drop(node, device) }, "Remove"));
+      }))));
+  }
+
+  if (!nodes.length) host.appendChild(el("div.note", "No node has reported its disks yet."));
+}
+
+/// A pool is a name and the two numbers that decide what it survives, and they
+/// are rendered together because the second only means anything against the
+/// first: a floor equal to the copies is a pool that stops taking writes the
+/// moment any node reboots.
+function blankPool(f) {
+  return { pool: "", size: Number(f.defaultSize), minSize: Number(f.defaultMinSize) };
+}
+
+function renderPoolList(form, f, host, setErr) {
+  if (!Array.isArray(form.values[f.key])) form.values[f.key] = [];
+  const pools = form.values[f.key];
+  clear(host);
+
+  const commit = () => {
+    form.values[f.key] = pools;
+    let bad = "";
+    for (const p of pools) {
+      if (!p.pool) bad = "a pool needs a name";
+      else if (CHECKS.id(p.pool)) bad = "a pool's name is " + CHECKS.id(p.pool);
+      else if (Number(p.size) < 1 || Number(p.minSize) < 1) bad = "a pool keeps at least one copy and writes at least one";
+      else if (Number(p.minSize) > Number(p.size)) {
+        bad = "the floor is higher than the number of copies, so nothing could ever be written to " + p.pool;
+      }
+    }
+    setErr(bad);
+  };
+  const redraw = () => { renderPoolList(form, f, host, setErr); commit(); };
+
+  pools.forEach((p, i) => {
+    const name = el("input", { type: "text", value: p.pool || "", placeholder: "volumes",
+      spellcheck: "false", "aria-label": "pool name" });
+    name.addEventListener("input", () => {
+      p.pool = name.value;
+      name.classList.toggle("bad", !!(name.value && CHECKS.id(name.value)));
+      commit();
+    });
+    const copies = el("input", { type: "number", min: "1", max: "10", value: String(p.size), "aria-label": "copies" });
+    copies.addEventListener("input", () => { p.size = Number(copies.value); commit(); });
+    const floor = el("input", { type: "number", min: "1", max: "10", value: String(p.minSize), "aria-label": "write floor" });
+    floor.addEventListener("input", () => { p.minSize = Number(floor.value); commit(); });
+    host.appendChild(el("div.row", name,
+      el("span.lab", "copies"), copies,
+      el("span.lab", "floor"), floor,
+      el("button.btn", { type: "button", "aria-label": "remove",
+        onclick: () => { pools.splice(i, 1); redraw(); } }, "−")));
+  });
+
+  host.appendChild(el("button.btn", { type: "button", id: "addpool",
+    onclick: () => { pools.push(blankPool(f)); redraw(); } },
+  "Add" + (pools.length ? " another" : " a pool")));
 }
 
 function renderRefList(form, f, host) {
@@ -785,4 +997,97 @@ function openEdit(coll, r) {
       show(coll.id);
     },
   });
+}
+
+// ---- setting a password -----------------------------------------------------
+
+/// Ask for a new password, twice, and put it.
+///
+/// Deliberately **not** built from the schema form. That form writes `spec`, and
+/// a password is not on a spec — it lives in a collection the API never serves,
+/// which is the whole reason it cannot leak through a listing. A dialog that
+/// went through the same path would be one refactor away from putting it there.
+///
+/// Two fields rather than one: a password nobody can read back cannot be
+/// corrected later, so a typo here is an account its owner cannot sign into and
+/// an operator cannot diagnose.
+///
+/// Changing your **own** password asks for the current one as well, because the
+/// API refuses a self-change that does not carry it: a stolen session that could
+/// set a new password with no proof of the old one would be a permanent account
+/// takeover. An operator resetting *someone else's* is the deliberate exception
+/// — the whole point of a reset is that nobody has the old password — so that
+/// field is only there when it is your own account.
+function openPasswordDialog(user) {
+  const own = !!(session.who && session.who.subject === user);
+  // No scrim `onclick`: a mis-click outside must not discard a half-typed
+  // password. Escape still leaves (handled once, globally, in app.js), and
+  // Cancel is right there.
+  const scrim = el("div", { id: "dialogscrim" });
+  const dialog = el("div", { id: "dialog", role: "dialog", "aria-label": "Set password" });
+  const problems = el("p.err.hidden", { role: "alert" });
+
+  const current = el("input", {
+    type: "password", id: "currentpassword", autocomplete: "current-password", required: "",
+  });
+  const first = el("input", {
+    type: "password", id: "newpassword", autocomplete: "new-password", required: "",
+  });
+  const again = el("input", {
+    type: "password", id: "newpasswordagain", autocomplete: "new-password", required: "",
+  });
+
+  dialog.appendChild(el("h2", "Set password"));
+  dialog.appendChild(el("p.prose", own
+    ? "Changing your own password ends your other sessions, not this one. Confirm "
+      + "the current password to make the change."
+    : "For " + user + ". Every session this account holds ends when the password "
+      + "changes, which is the point of changing it."));
+  dialog.appendChild(el("div", { style: "height:var(--space-6)" }));
+  dialog.appendChild(el("div.fields",
+    own ? el("div.field", el("label", { for: "currentpassword" }, "Current password"), current) : null,
+    el("div.field", el("label", { for: "newpassword" }, "New password"), first),
+    el("div.field", el("label", { for: "newpasswordagain" }, "Again"), again)));
+  dialog.appendChild(problems);
+
+  const stop = (message) => {
+    fill(problems, message);
+    problems.classList.remove("hidden");
+  };
+
+  const submit = el("button.btn.primary", { type: "button", id: "submitpassword" }, "Set password");
+  submit.addEventListener("click", async () => {
+    if (own && !current.value) return stop("Enter your current password to confirm the change.");
+    if (first.value !== again.value) return stop("The two entries do not match.");
+    problems.classList.add("hidden");
+    submit.setAttribute("disabled", "");
+    try {
+      // The current password rides along only for a self-change — that is the
+      // one the API demands it for, and the one where the field exists.
+      const body = own
+        ? { currentPassword: current.value, password: first.value }
+        : { password: first.value };
+      await request("PUT", "/api/v1/users/" + encodeURIComponent(user) + "/password", { body });
+      // Cleared before the dialog closes rather than left for the removal to
+      // take with it: the node lives until the next frame either way.
+      current.value = ""; first.value = ""; again.value = "";
+      closeDialog();
+      toast(own ? "Your password was changed." : "Password set for " + user + ".");
+    } catch (e) {
+      submit.removeAttribute("disabled");
+      // The API's own words — a wrong current password, or a length rule that is
+      // public anyway. Shown in the dialog rather than swallowed, so the operator
+      // learns why and can try again.
+      stop(e.message);
+    }
+  });
+
+  dialog.appendChild(el("div.dialogacts",
+    el("span.grow"),
+    el("button.btn", { type: "button", id: "cancelpassword", onclick: closeDialog }, "Cancel"),
+    submit));
+
+  document.body.appendChild(scrim);
+  document.body.appendChild(dialog);
+  (own ? current : first).focus();
 }

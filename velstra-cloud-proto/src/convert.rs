@@ -15,7 +15,7 @@
 //!   honest value — `Unknown` for a condition, `Unknown` for an instance state
 //!   — never to a plausible-looking one.
 
-use velstra_cloud_model::{meta, migration, resources};
+use velstra_cloud_model::{ceph, meta, migration, resources};
 
 use crate::v1;
 
@@ -293,6 +293,126 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             agent_version: s.agent_version.clone(),
             last_heartbeat: millis(s.last_heartbeat),
             images: s.images.clone(),
+            devices: s.devices.iter().map(Into::into).collect(),
+            ceph: s.ceph.as_ref().map(Into::into),
+        }
+    }
+}
+
+// ---- block devices and ceph ------------------------------------------------
+
+/// The tag and the detail a [`DeviceUse`] carries, flattened for the wire.
+///
+/// A pair of strings rather than an enum with a payload per variant: the detail
+/// is the whole of what an operator needs — `ext4`, `/srv`, `osd.7` — and every
+/// scheme that put it in a typed field would have to grow one per variant and
+/// then be extended in lockstep on both sides. The tag stays parseable; the
+/// detail stays readable.
+fn use_parts(state: &ceph::DeviceUse) -> (&'static str, String) {
+    match state {
+        ceph::DeviceUse::Free => ("free", String::new()),
+        ceph::DeviceUse::Partitioned { partitions } => ("partitioned", partitions.to_string()),
+        ceph::DeviceUse::Filesystem { fstype } => ("filesystem", fstype.clone()),
+        ceph::DeviceUse::Mounted { at } => ("mounted", at.clone()),
+        ceph::DeviceUse::System => ("system", String::new()),
+        ceph::DeviceUse::Osd { id } => ("osd", id.clone()),
+        ceph::DeviceUse::Volume { of } => ("volume", of.clone()),
+        ceph::DeviceUse::Unsuitable { why } => ("unsuitable", why.clone()),
+    }
+}
+
+/// The inverse. An unknown tag becomes `Unsuitable` and **never** `Free`: a
+/// wire from a newer peer that added a state this build does not know must not
+/// have that state read as "this disk is empty".
+fn use_of(kind: &str, detail: &str) -> ceph::DeviceUse {
+    match kind {
+        "free" => ceph::DeviceUse::Free,
+        "partitioned" => ceph::DeviceUse::Partitioned {
+            partitions: detail.parse().unwrap_or(1),
+        },
+        "filesystem" => ceph::DeviceUse::Filesystem {
+            fstype: detail.to_string(),
+        },
+        "mounted" => ceph::DeviceUse::Mounted {
+            at: detail.to_string(),
+        },
+        "system" => ceph::DeviceUse::System,
+        "osd" => ceph::DeviceUse::Osd {
+            id: detail.to_string(),
+        },
+        "volume" => ceph::DeviceUse::Volume {
+            of: detail.to_string(),
+        },
+        other => ceph::DeviceUse::Unsuitable {
+            why: if detail.is_empty() {
+                format!("this build does not know the state {other:?}")
+            } else {
+                detail.to_string()
+            },
+        },
+    }
+}
+
+impl From<&ceph::BlockDevice> for v1::BlockDevice {
+    fn from(d: &ceph::BlockDevice) -> Self {
+        let (use_kind, use_detail) = use_parts(&d.state);
+        Self {
+            path: d.path.clone(),
+            kernel_name: d.kernel_name.clone(),
+            size_gib: d.size_gib,
+            rotational: d.rotational,
+            model: d.model.clone(),
+            serial: d.serial.clone(),
+            use_kind: use_kind.to_string(),
+            use_detail,
+        }
+    }
+}
+
+impl From<&v1::BlockDevice> for ceph::BlockDevice {
+    fn from(d: &v1::BlockDevice) -> Self {
+        Self {
+            path: d.path.clone(),
+            kernel_name: d.kernel_name.clone(),
+            size_gib: d.size_gib,
+            rotational: d.rotational,
+            model: d.model.clone(),
+            serial: d.serial.clone(),
+            state: use_of(&d.use_kind, &d.use_detail),
+        }
+    }
+}
+
+impl From<&ceph::NodeCeph> for v1::NodeCeph {
+    fn from(c: &ceph::NodeCeph) -> Self {
+        Self {
+            installed: c.installed,
+            version: c.version.clone(),
+            monitor: c.monitor,
+            manager: c.manager,
+            osd_devices: c.osd_devices.clone(),
+            pools: c.pools.clone(),
+            cluster_hosts: c.cluster_hosts.clone(),
+            address: c.address.clone(),
+            ssh_pubkey: c.ssh_pubkey.clone(),
+            trusts_key: c.trusts_key,
+        }
+    }
+}
+
+impl From<&v1::NodeCeph> for ceph::NodeCeph {
+    fn from(c: &v1::NodeCeph) -> Self {
+        Self {
+            installed: c.installed,
+            version: c.version.clone(),
+            monitor: c.monitor,
+            manager: c.manager,
+            osd_devices: c.osd_devices.clone(),
+            pools: c.pools.clone(),
+            cluster_hosts: c.cluster_hosts.clone(),
+            address: c.address.clone(),
+            ssh_pubkey: c.ssh_pubkey.clone(),
+            trusts_key: c.trusts_key,
         }
     }
 }
@@ -307,6 +427,8 @@ impl From<&v1::NodeStatus> for resources::NodeStatus {
             agent_version: s.agent_version.clone(),
             last_heartbeat: timestamp(s.last_heartbeat),
             images: s.images.clone(),
+            devices: s.devices.iter().map(Into::into).collect(),
+            ceph: s.ceph.as_ref().map(Into::into),
         }
     }
 }

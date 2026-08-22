@@ -245,6 +245,20 @@ struct Args {
     /// The interface that address is on. Its MAC is read from the machine.
     #[arg(long)]
     fabric_underlay: Option<String>,
+
+    /// This host's SRv6 locator, as `prefix/len` (e.g. `fc00:0:1::/64`).
+    ///
+    /// Setting it puts the host on the SRv6 wire family instead of VXLAN. Stated
+    /// rather than derived, and for a different reason than `--fabric-vtep`: a
+    /// locator is a slice of the operator's own IPv6 address plan, has to be
+    /// routable in the underlay, and has to be unique per host. Nothing on the
+    /// machine knows any of that.
+    ///
+    /// Everything else SRv6 needs — this host's tunnel source, and the service
+    /// SID of every segment it serves — is derived from this one value, so it is
+    /// the only SRv6 knob a node has.
+    #[arg(long)]
+    fabric_srv6_locator: Option<String>,
 }
 
 /// Which systemd scope guests run in.
@@ -334,10 +348,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .into(),
                 );
             };
-            let underlay = Underlay::read(vtep, iface)?;
+            let underlay =
+                Underlay::read(vtep, iface)?.with_srv6_locator(args.fabric_srv6_locator.clone());
             tracing::info!(
                 vtep = %underlay.vtep, iface = %underlay.iface, mac = %underlay.mac,
                 mtu = underlay.mtu,
+                srv6_locator = underlay.srv6_locator.as_deref().unwrap_or("-"),
                 "declaring this host to the fabric"
             );
             Arc::new(FabricDatapath::new(

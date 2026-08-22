@@ -179,6 +179,7 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
             underlay_iface: "eth0".into(),
             underlay_mac: "02:00:00:00:00:01".into(),
             encap: pb::Encap::Vxlan as i32,
+            srv6_locator: String::new(),
             udp_port: 0,
             underlay_mtu: 0,
         })

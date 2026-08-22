@@ -24,6 +24,7 @@
 pub mod address;
 pub mod attachment;
 pub mod backoff;
+pub mod ceph;
 pub mod drift;
 pub mod election;
 pub mod floating_ip;

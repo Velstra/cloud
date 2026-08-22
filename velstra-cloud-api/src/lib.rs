@@ -25,6 +25,7 @@ pub mod proxy;
 pub mod refs;
 pub mod rest;
 pub mod served;
+pub mod sessions;
 
 pub use core::{Api, COLLECTIONS, Filter, WatchEvent};
 use std::sync::Arc;

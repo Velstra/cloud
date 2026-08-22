@@ -48,7 +48,7 @@ use velstra_cloud_model::{
         InstanceStatus, NODE_RELEASE_FINALIZER, NetworkSpec, NodeSpec, NodeStatus, Port, PortSpec,
         PortStatus,
     },
-    security::{ResolvedRule, SecurityGroupSpec, effective_rules},
+    security::{ResolvedRule, SecurityGroup, SecurityGroupSpec, effective_rules_with, members_in},
 };
 use velstra_cloud_store::{Store, TypedStore};
 
@@ -58,6 +58,7 @@ use crate::{
     host::{Datapath, HostState, Nic, ProgrammedPort, VmRequest, Vmm},
 };
 
+mod ceph;
 mod migrate;
 mod status;
 mod writing;
@@ -146,7 +147,18 @@ fn taps_of(programmed: &BTreeMap<String, ProgrammedPort>) -> BTreeMap<String, St
 /// without the other cannot answer the question anyway.
 pub(super) struct CellView<'a> {
     pub ports: &'a BTreeMap<String, Port>,
-    pub groups: &'a BTreeMap<String, SecurityGroupSpec>,
+    /// The whole group object, not just its spec.
+    ///
+    /// `status.members` is the part that matters and it is easy to drop: the
+    /// API computes, once and centrally, every address in a group, precisely so
+    /// a node does not have to read every port in the cell to expand a rule
+    /// that names another group. Keeping only the spec here threw that away —
+    /// and the fallback (work it out from the ports this node can see) is
+    /// *silently narrower* through the API, which hands a node only its own
+    /// ports. A rule naming a group whose members are on other machines then
+    /// expanded to nothing, and a guest lost traffic its tenant had allowed
+    /// with no error anywhere.
+    pub groups: &'a BTreeMap<String, SecurityGroup>,
     /// Read once per pass and handed down, for the same reason the groups are:
     /// a port's segment is a fact about the cell, and looking it up again per
     /// port would be the same answer fetched many times. It also replaces a
@@ -179,6 +191,16 @@ pub struct Agent {
     vmm: Arc<dyn Vmm>,
     datapath: Arc<dyn Datapath>,
     guests: GuestRegistry,
+    /// How this node runs Ceph's own tools. A field so a test can point it at
+    /// something that is not `cephadm`, and so the pass does not construct one
+    /// per call.
+    cephadm: crate::cephadm::CephAdmin,
+    /// An agent whose Ceph reads come back filtered says so once. A
+    /// configuration mistake repeated every resync would bury everything else.
+    warned_about_ceph_reads: AtomicBool,
+    /// Whether the "can this agent read the cell at all" probe has been made.
+    /// Once per process: it tests a configuration fact, not a runtime one.
+    probed_ceph_reads: AtomicBool,
     /// An agent that cannot write its own node object says so once. Repeating
     /// it every resync would bury everything else in the journal.
     warned_about_node: AtomicBool,
@@ -222,7 +244,76 @@ impl Agent {
             vmm,
             datapath,
             guests: GuestRegistry::new(),
+            cephadm: crate::cephadm::CephAdmin::default(),
+            warned_about_ceph_reads: AtomicBool::new(false),
+            probed_ceph_reads: AtomicBool::new(false),
             warned_about_node: AtomicBool::new(false),
+        }
+    }
+
+    /// Point the Ceph pass at different binaries.
+    ///
+    /// Exists for the tests, and it is the honest seam: `cephadm` and `ceph` are
+    /// the entire interface to Ceph, so a test that substitutes them is testing
+    /// the real argv the real pass builds — rather than a trait that could
+    /// drift from what the commands actually are.
+    pub fn with_ceph_tools(mut self, admin: crate::cephadm::CephAdmin) -> Self {
+        self.cephadm = admin;
+        self
+    }
+
+    /// How often this node writes its heartbeat, which is **not** how often it
+    /// reconciles.
+    ///
+    /// The two used to be the same number, and that was the bug. A node's
+    /// heartbeat happens to be written by the reconcile pass, and the platform
+    /// judges a node gone after
+    /// [`velstra_cloud_model::ceph::NODE_STALE_AFTER_MS`] — so an operator who
+    /// lengthened the interval to quieten a large cell made every node in it
+    /// permanently dead. The Ceph deployment then blocks on the first stale
+    /// node it walks, and a blocked step halts everything behind it: total,
+    /// silent, and survivable only on a single-node cluster, so it fails in
+    /// exactly the configuration least likely to be tested.
+    ///
+    /// The first fix was to shorten the reconcile interval to match, which is
+    /// the wrong end. An operator who asked for a long interval asked to cut
+    /// *list* load, and overriding that would hand them twenty times the load
+    /// they were avoiding — in a cell that may have no Ceph cluster and never
+    /// will. So the cadences are separate instead: the reconcile keeps the
+    /// interval it was given, and the heartbeat runs at whatever is short
+    /// enough to stay true, which is O(1) — one read and one write of this
+    /// node's own object, and none of the list calls that make a pass cost
+    /// anything.
+    pub fn heartbeat_interval(&self) -> std::time::Duration {
+        let longest =
+            std::time::Duration::from_millis(velstra_cloud_model::ceph::longest_useful_resync_ms());
+        self.config.resync.min(longest)
+    }
+
+    /// Say this node is still here, and nothing else.
+    ///
+    /// Deliberately not a small reconcile: it reads one object and writes one
+    /// field. A conflict is not worth reporting — the other writer is this same
+    /// agent's own pass, which has just written a fresher heartbeat than this
+    /// one would have.
+    async fn touch_heartbeat(&self) {
+        let name = format!("nodes/{}", self.config.node);
+        let stored = match self.nodes.get(&name).await {
+            Ok(Some(stored)) => stored,
+            // A node that is not there is not this agent's to invent, and is
+            // silent by design. A read that *failed* is different — the store is
+            // unreachable and the heartbeat is missed — so it gets a line rather
+            // than passing for "nothing to do".
+            Ok(None) => return,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read this node's own object for a heartbeat");
+                return;
+            }
+        };
+        let mut next = stored.clone();
+        next.status.last_heartbeat = velstra_cloud_model::meta::Timestamp::now();
+        if let Err(e) = self.nodes.update(&next, &self.writer).await {
+            tracing::debug!(error = %e, "could not write this node's heartbeat");
         }
     }
 
@@ -232,6 +323,12 @@ impl Agent {
     /// it has is a guest nobody can debug.
     pub fn guests(&self) -> GuestRegistry {
         self.guests.clone()
+    }
+
+    /// The interval this agent reconciles at — exactly what it was asked for.
+    /// The heartbeat runs separately; see [`Agent::heartbeat_interval`].
+    pub fn resync_interval(&self) -> std::time::Duration {
+        self.config.resync
     }
 
     pub fn node(&self) -> &str {
@@ -254,20 +351,50 @@ impl Agent {
 
         self.resync().await;
 
-        let mut ticker = tokio::time::interval(self.config.resync);
+        // The ticker runs at the *heartbeat* cadence, which is the shorter of
+        // the two, and a full pass happens when the reconcile interval has
+        // elapsed. One task and one writer for this node's object — a second
+        // timer writing it concurrently would be two writers of one object,
+        // which is the thing this platform does not do.
+        let tick = self.heartbeat_interval();
+        let mut ticker = tokio::time::interval(tick);
         ticker.tick().await; // the first tick is immediate, and we just swept
+        let mut since_swept = std::time::Duration::ZERO;
         let mut shutdown = std::pin::pin!(shutdown);
         loop {
-            let woken = tokio::select! {
+            enum Next {
+                Tick,
+                Woken,
+                Nothing,
+            }
+            let next = tokio::select! {
                 _ = &mut shutdown => return,
-                _ = ticker.tick() => true,
-                woken = wake.recv() => woken.is_some(),
+                _ = ticker.tick() => Next::Tick,
+                woken = wake.recv() => {
+                    if woken.is_some() { Next::Woken } else { Next::Nothing }
+                }
             };
             // A pass is level-triggered, so a burst collapses into one sweep
             // rather than one sweep each.
             while wake.try_recv().is_ok() {}
-            if woken {
-                self.resync().await;
+            match next {
+                Next::Woken => {
+                    self.resync().await;
+                    since_swept = std::time::Duration::ZERO;
+                }
+                Next::Tick => {
+                    since_swept += tick;
+                    if since_swept >= self.config.resync {
+                        self.resync().await;
+                        since_swept = std::time::Duration::ZERO;
+                    } else {
+                        // Between sweeps, say this node is still here. One read
+                        // and one write; none of the list calls that are what a
+                        // long interval was chosen to avoid.
+                        self.touch_heartbeat().await;
+                    }
+                }
+                Next::Nothing => {}
             }
         }
     }
@@ -317,7 +444,7 @@ impl Agent {
         let groups = match self.cell.security_groups().await {
             Ok(list) => list
                 .into_iter()
-                .map(|g| (g.meta.name.to_string(), g.spec))
+                .map(|g| (g.meta.name.to_string(), g))
                 .collect::<BTreeMap<_, _>>(),
             Err(e) => {
                 // Fewer allowances, never more: a port is still programmed, with
@@ -515,6 +642,10 @@ impl Agent {
             .await;
 
         self.refresh_guests(&mine, &ports, &taps, &mut pass).await;
+        // Before the node status is written, because the status is where this
+        // node's Ceph report goes and the pass fills it in.
+        let mut host = host;
+        self.ceph_pass(&mut host, &mut pass).await;
         self.node_pass(&mine, &host, &mut pass).await;
         pass
     }
@@ -590,7 +721,14 @@ impl Agent {
                     .iter()
                     .map(|p| match (programmed.get(p.as_str()), ports.get(p)) {
                         (Some(have), Some(port)) => {
-                            have.rules == self.rules_for(&port.spec, groups, ports)
+                            // Asked of the datapath rather than compared here:
+                            // the fabric holds the rules in its own shape and a
+                            // comparison in this one can never come out equal.
+                            self.datapath.agrees(
+                                p,
+                                have,
+                                &self.rules_for(&port.spec, groups, ports),
+                            )
                         }
                         // Carried, but its object has not reached this cell yet:
                         // there is nothing to compare against, and asking for it
@@ -719,7 +857,7 @@ impl Agent {
     fn rules_for(
         &self,
         spec: &PortSpec,
-        groups: &BTreeMap<String, SecurityGroupSpec>,
+        groups: &BTreeMap<String, SecurityGroup>,
         ports: &BTreeMap<String, Port>,
     ) -> Vec<ResolvedRule> {
         if spec.security_groups.is_empty() {
@@ -729,7 +867,28 @@ impl Agent {
             .iter()
             .map(|(name, p)| (name.clone(), p.spec.clone()))
             .collect();
-        let effective = effective_rules(spec, groups, &specs);
+        let group_specs: BTreeMap<String, SecurityGroupSpec> = groups
+            .iter()
+            .map(|(name, g)| (name.clone(), g.spec.clone()))
+            .collect();
+        // Membership comes from the group where the group has it, and is worked
+        // out from the ports only where it does not.
+        //
+        // Which source answers is not a detail. Reading the store directly, a
+        // node sees every port in the cell and can work it out; reading the
+        // API, it sees only its own — so working it out there yields *fewer*
+        // members, and a rule naming a group whose members live on other
+        // machines quietly expands to nothing. The API computes this centrally
+        // and puts it on the group for exactly that reason. An empty
+        // `status.members` is not evidence of an empty group, so it falls
+        // through to counting rather than being taken as an answer.
+        let members = |group: &str| -> Vec<String> {
+            match groups.get(group) {
+                Some(g) if !g.status.members.is_empty() => g.status.members.clone(),
+                _ => members_in(group, &specs),
+            }
+        };
+        let effective = effective_rules_with(spec, &group_specs, &members);
         if !effective.unknown_groups.is_empty() {
             tracing::warn!(
                 "port names security groups that do not exist: {}",

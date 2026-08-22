@@ -16,6 +16,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use clap::{Parser, ValueEnum};
 use velstra_cloud_nodeagent::{
     api_cell::ApiCell,
+    ceph_pool::{CephConfig, CephPool},
     directory_pool::DirectoryPool,
     pool::{FakePool, PoolAgent, PoolConfig, Storage},
 };
@@ -26,6 +27,10 @@ enum Backend {
     /// A directory of qcow2 files, made with `qemu-img`. Needs a writable
     /// directory and nothing else.
     Directory,
+    /// An RBD pool in a Ceph cluster. Volumes are copy-on-write clones of an
+    /// image that lives once in the cluster, so nothing is copied per node and
+    /// every node reaches every image.
+    Ceph,
     /// A pool in a process. Everything it holds dies with it — useful for
     /// exercising the loop and for nothing else.
     Fake,
@@ -66,6 +71,42 @@ struct Args {
     /// one copy rather than keeping two.
     #[arg(long, default_value = "/var/lib/velstra/images")]
     images: PathBuf,
+
+    /// The RBD pool volumes and their snapshots live in, for the ceph backend.
+    #[arg(long, default_value = "velstra-volumes")]
+    ceph_pool: String,
+
+    /// The RBD pool images live in.
+    ///
+    /// Separate from `--ceph-pool` on purpose: an image is written once and read
+    /// for years, a volume is written constantly, and the two want different
+    /// replication, placement and quota. Clones across pools cost nothing.
+    #[arg(long, default_value = "velstra-images")]
+    ceph_image_pool: String,
+
+    /// The Ceph client to act as. Its keyring has to be where `rbd` looks —
+    /// this agent does not manage credentials, because a process that could
+    /// write its own keyring could grant itself a cluster.
+    #[arg(long, default_value = "client.admin")]
+    ceph_user: String,
+
+    /// `ceph.conf`, when it is not in the default place.
+    #[arg(long)]
+    ceph_conf: Option<String>,
+
+    /// Publish an image into the cluster and exit, instead of running the agent.
+    ///
+    /// The image service, such as it is. Takes the resource name — which carries
+    /// the digest — and the file, verifies the second against the first, and
+    /// leaves a protected `@base` snapshot every volume can clone from.
+    ///
+    ///   --import-image projects/p1/images/sha256-… --from ./noble.raw
+    #[arg(long, requires = "import_from")]
+    import_image: Option<String>,
+
+    /// The file `--import-image` publishes.
+    #[arg(long = "from")]
+    import_from: Option<PathBuf>,
 
     /// What the fake backend claims to hold. Ignored by every real one, which
     /// measures the filesystem instead.
@@ -108,6 +149,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
+    // Publishing an image is a one-shot act, not a loop, so it happens here and
+    // exits rather than being a mode the agent runs in.
+    if let (Some(image), Some(file)) = (&args.import_image, &args.import_from) {
+        let ceph = CephPool::new(ceph_config(&args));
+        return match ceph.import_image(image, file).await {
+            Ok(true) => {
+                tracing::info!(image, pool = %args.ceph_image_pool, "published");
+                Ok(())
+            }
+            Ok(false) => {
+                tracing::info!(image, "already in the cluster and clonable; nothing to do");
+                Ok(())
+            }
+            Err(e) => Err(format!("{e}").into()),
+        };
+    }
+
     let storage: Arc<dyn Storage> = match args.backend {
         Backend::Directory => {
             // Said out loud and early: a pool agent that cannot write where it
@@ -117,6 +176,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("cannot use {} as a pool: {e}", args.dir.display()))?;
             tracing::info!(dir = %args.dir.display(), images = %args.images.display(), "directory pool");
             Arc::new(DirectoryPool::new(args.dir.clone(), args.images.clone()))
+        }
+        Backend::Ceph => {
+            tracing::info!(
+                pool = %args.ceph_pool,
+                images = %args.ceph_image_pool,
+                user = %args.ceph_user,
+                "ceph pool"
+            );
+            Arc::new(CephPool::new(ceph_config(&args)))
         }
         Backend::Fake => {
             tracing::warn!(
@@ -181,4 +249,15 @@ async fn open_store(spec: &str) -> Result<Arc<dyn Store>, velstra_cloud_store::S
     let store = EtcdStore::connect(&endpoints).await?;
     tracing::info!(endpoints = %spec, "state store connected");
     Ok(Arc::new(store))
+}
+
+/// The cluster this agent was pointed at.
+///
+/// One place, because the import path and the agent path both need it and two
+/// copies would be two chances to point them at different pools.
+fn ceph_config(args: &Args) -> CephConfig {
+    let mut config = CephConfig::new(&args.ceph_pool, &args.ceph_image_pool);
+    config.user = args.ceph_user.clone();
+    config.conf = args.ceph_conf.clone();
+    config
 }

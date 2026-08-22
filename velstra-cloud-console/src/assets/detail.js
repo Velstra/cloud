@@ -389,6 +389,14 @@ function renderSheet(coll, r) {
     acts.appendChild(el("button.btn", { type: "button", id: "explainbtn",
       onclick: () => explainInto($("explain"), coll, r) }, "Explain placement"));
   }
+  // A password is not a field on this sheet and cannot be: the platform stores
+  // a hash and cannot show one. Setting it is therefore an *action*, next to the
+  // others, rather than a control that would have to render a value it has no
+  // way to read.
+  if (coll.id === "users") {
+    acts.appendChild(el("button.btn", { type: "button", id: "setpasswordbtn",
+      onclick: () => openPasswordDialog(idOf(r)) }, "Set password"));
+  }
   // Abandoning a migration is not deleting a row: what it costs depends on the
   // mode, and the sentence is different enough that it is written where the
   // modes are.

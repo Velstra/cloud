@@ -140,6 +140,49 @@ pub fn names_referenced(kind: &str, spec: &Value) -> Vec<String> {
     out
 }
 
+/// Every resource this spec names that a caller can be asked a permission
+/// question about.
+///
+/// The difference from [`names_referenced`] is the node, and it is not a
+/// detail. That one rewrites a bare `node-a` into `nodes/node-a` so a caller
+/// asking "who holds this" does not have to know which spelling each field
+/// uses — but a node lives outside every project, so its governing project is
+/// `None` and the only subject who may read one is a cell operator. Asking the
+/// authorisation question about a node reference would therefore refuse every
+/// tenant who sets `spec.node`, which is every tenant who pins a machine to a
+/// host. Only a reference that names an object *inside a project* is a
+/// permission question at all, so only those come back here.
+pub fn names_to_authorize(kind: &str, spec: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for (field, form) in fields(kind) {
+        if *form != Form::Name {
+            continue;
+        }
+        let Some(value) = spec.get(field) else {
+            continue;
+        };
+        let mut push = |text: &str| {
+            // An unset reference names nothing, and nobody needs permission for
+            // nothing.
+            if !text.is_empty() {
+                out.push(text.to_string());
+            }
+        };
+        match value {
+            Value::String(one) => push(one),
+            Value::Array(many) => {
+                for item in many {
+                    if let Value::String(one) = item {
+                        push(one);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Check every reference in a spec — whole or partial, since a change carries
 /// only what it changes and that is exactly what needs checking.
 pub fn check(kind: &str, spec: &Value) -> ApiResult<()> {
@@ -305,5 +348,43 @@ mod referrer_tests {
         // A port held by an instance's second NIC is as held as the first.
         let spec = serde_json::json!({"ports": ["projects/p1/ports/a", "projects/p1/ports/b"]});
         assert_eq!(names_referenced("instances", &spec).len(), 2);
+    }
+
+    #[test]
+    fn a_node_is_not_a_permission_question() {
+        // The one that would have broken every tenant: `nodes/node-a` has no
+        // governing project, so authorising a caller against it asks whether
+        // they are a cell operator — and pinning a machine to a host is an
+        // ordinary thing for a tenant to do.
+        let spec = serde_json::json!({"node": "node-a", "image": "projects/p1/images/i"});
+        assert_eq!(
+            names_to_authorize("instances", &spec),
+            vec!["projects/p1/images/i"]
+        );
+    }
+
+    #[test]
+    fn every_full_name_in_a_list_is_a_permission_question() {
+        // A group named by a port's second entry reaches into another project
+        // exactly as far as the first does.
+        let spec = serde_json::json!({
+            "network": "projects/p1/networks/n",
+            "security_groups": ["projects/p1/securitygroups/a", "projects/p2/securitygroups/b"],
+        });
+        assert_eq!(
+            names_to_authorize("ports", &spec),
+            vec![
+                "projects/p1/networks/n",
+                "projects/p1/securitygroups/a",
+                "projects/p2/securitygroups/b"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unset_reference_is_nobodys_permission_question() {
+        let spec = serde_json::json!({"node": "", "image": "", "ports": []});
+        assert!(names_to_authorize("instances", &spec).is_empty());
+        assert!(names_to_authorize("networks", &serde_json::json!({"vni": 5001})).is_empty());
     }
 }

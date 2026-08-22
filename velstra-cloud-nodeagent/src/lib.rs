@@ -58,8 +58,12 @@
 pub mod agent;
 pub mod api_cell;
 pub mod cell;
+pub mod ceph_deploy;
+pub mod ceph_pool;
+pub mod cephadm;
 pub mod cloud_hypervisor;
 pub mod datapath;
+pub mod devices;
 pub mod dhcp;
 pub mod directory_pool;
 pub mod fabric;
@@ -73,11 +77,13 @@ pub mod qemu;
 pub(crate) mod reporting;
 
 pub use agent::{Agent, AgentConfig, Pass};
+pub use cell::{CellReader, StoreCell};
 pub use cloud_hypervisor::CloudHypervisorVmm;
 pub use fake::{FakeDatapath, FakeNetwork, FakeVmm, Fault};
 pub use guests::{GuestRegistry, GuestView, Interface};
 pub use host::{
-    Datapath, HostError, HostState, Nic, Receiver, Transfer, VmObservation, VmRequest, Vmm,
+    Datapath, HostError, HostState, Nic, Receiver, Result as HostResult, Transfer, VmObservation,
+    VmRequest, Vmm,
 };
 pub use hostfs::{Boot, Layout, Scope};
 pub use pool::{FakePool, PoolAgent, PoolConfig, PoolState, Storage};

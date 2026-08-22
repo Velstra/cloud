@@ -31,6 +31,7 @@ velstra-cloud-wire = { path = "velstra-cloud-wire" }
 velstra-cloud-controller = { path = "velstra-cloud-controller" }
 
 anyhow = "1"
+argon2 = "0.5"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"

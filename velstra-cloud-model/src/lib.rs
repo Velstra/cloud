@@ -10,6 +10,8 @@
 pub mod access;
 pub mod assignment;
 pub mod authz;
+pub mod ceph;
+pub mod identity;
 pub mod ipam;
 pub mod meta;
 pub mod migration;
