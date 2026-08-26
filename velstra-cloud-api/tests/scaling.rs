@@ -153,7 +153,11 @@ async fn cell_of(n: usize) -> (Arc<Counting>, Api) {
             &json!({"id": format!("pt{i}"), "spec": {
                 "network": "projects/p1/networks/n1",
                 "subnet": format!("projects/p1/subnets/s{}", i % subnets),
-                "securityGroups": ["projects/p1/securityGroups/g1"]
+                // `security-groups`, as the collection is actually called. This read
+                // `securityGroups` under a key the model does not have, so the
+                // whole field was dropped and this fixture measured the cost of
+                // listing groups over ports that were in none of them.
+                "security_groups": ["projects/p1/security-groups/g1"]
             }}),
             &who,
         )
@@ -272,7 +276,7 @@ async fn cell_on_nodes(n: usize, nodes: usize) -> (Arc<Counting>, Api) {
                 "network": "projects/p1/networks/n1",
                 "subnet": "projects/p1/subnets/s1",
                 "node": node,
-                "securityGroups": []
+                "security_groups": []
             }}),
             &who,
         )
@@ -282,8 +286,8 @@ async fn cell_on_nodes(n: usize, nodes: usize) -> (Arc<Counting>, Api) {
             "projects/p1",
             "instances",
             &json!({"id": format!("i{i}"), "spec": {
-                "vcpus": 1, "memoryMib": 512, "rootDiskGib": 1,
-                "desiredState": "Running",
+                "vcpus": 1, "memory_mib": 512, "root_disk_gib": 1,
+                "desired_state": "Running",
                 "node": node,
                 "ports": [format!("projects/p1/ports/pt{i}")]
             }}),
@@ -509,7 +513,7 @@ async fn volumes_on_pools(n: usize, pools: usize) -> (Arc<Counting>, Api) {
         api.create(
             "projects/p1",
             "volumes",
-            &json!({"id": format!("v{i}"), "spec": {"sizeGib": 1, "pool": pool}}),
+            &json!({"id": format!("v{i}"), "spec": {"size_gib": 1, "pool": pool}}),
             &who,
         )
         .await

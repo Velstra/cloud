@@ -13,7 +13,7 @@ use velstra_cloud_api::{
 };
 use velstra_cloud_model::{
     identity::{User, UserSpec, UserStatus},
-    meta::{Meta, Placement, ResourceName},
+    meta::{Meta, Placement, ResourceName, Timestamp},
 };
 use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
@@ -35,7 +35,13 @@ async fn make_user(store: &Arc<dyn Store>, name: &str, spec: UserSpec) {
         spec,
         status: UserStatus::default(),
     };
-    users.create(&user).await.unwrap();
+    users
+        .create(
+            &user,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 }
 
 async fn user_with_password(store: &Arc<dyn Store>, identity: &IdentityStore, name: &str) {
@@ -368,4 +374,56 @@ async fn changing_your_own_password_keeps_the_session_you_are_in() {
         .unwrap();
     assert!(verifier.verify(&ada_again).await.is_err());
     assert!(verifier.verify(&here).await.is_err());
+}
+
+/// The periodic sweeper deletes a session once it has expired, and not before.
+///
+/// The request path only sweeps a token that is presented again; a token issued
+/// and never used once more is exactly what this reaper exists to reach, so the
+/// property worth pinning is that it deletes an expired record and leaves a live
+/// one alone. The clock is injected — the moment a session stops being accepted
+/// (`now >= expires_at`) is the moment it becomes sweepable, and the two must
+/// agree or a live session is reaped or a dead one lingers.
+#[tokio::test]
+async fn the_sweeper_reaps_expired_sessions_and_keeps_live_ones() {
+    let (store, identity) = identity_store();
+    user_with_password(&store, &identity, "ada").await;
+    let signed_in = identity.sign_in("ada", PASSWORD).await.unwrap();
+    let expires_at = signed_in.expires_at;
+
+    // A second, still-live session that must survive every sweep below — so the
+    // reaper is shown deleting one record and not simply emptying the store.
+    let live = identity.sign_in("ada", PASSWORD).await.unwrap();
+
+    // One tick before expiry: nothing is swept, and the token still stands.
+    let swept = identity
+        .sweep_expired_sessions(Timestamp(expires_at - 1))
+        .await
+        .unwrap();
+    assert_eq!(swept, 0, "a session was reaped while it was still live");
+    assert!(identity.session_present(&signed_in.token).await);
+
+    // At expiry — the same instant the request path stops accepting it — the
+    // record is deleted and the token is gone from the store.
+    let swept = identity
+        .sweep_expired_sessions(Timestamp(expires_at))
+        .await
+        .unwrap();
+    assert_eq!(swept, 1, "the expired session was not reaped");
+    assert!(!identity.session_present(&signed_in.token).await);
+    // The live session, issued a moment later, is untouched.
+    assert!(
+        identity.session_present(&live.token).await,
+        "the reaper took a live session with the expired one"
+    );
+
+    // Idempotent: with the expired record gone, a second sweep at the same clock
+    // finds nothing to do.
+    assert_eq!(
+        identity
+            .sweep_expired_sessions(Timestamp(expires_at))
+            .await
+            .unwrap(),
+        0
+    );
 }

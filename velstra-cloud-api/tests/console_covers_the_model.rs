@@ -20,6 +20,7 @@
 use velstra_cloud_console::{COLLECTIONS, Kind};
 use velstra_cloud_model::{
     ceph::{BlockDevice, CephClusterSpec, DeviceUse, MIN_OSD_GIB, may_consume},
+    loadbalancer::LoadBalancerSpec,
     resources::{ImageSpec, InstanceSpec, ProjectSpec, VolumeSpec},
 };
 
@@ -42,6 +43,23 @@ fn exempt(collection: &str, field: &str) -> Option<&'static str> {
         ("instances", "node") => Some(
             "where a guest runs is the scheduler's answer, not an operator's \
              request; forcing it is a separate deliberate action",
+        ),
+        ("backup-targets", "kind") => Some(
+            "there is exactly one kind of target, and a control with one \
+             option is a question with one answer. It comes back the day a \
+             second kind does",
+        ),
+        ("backups", "pool") => Some(
+            "derived: the API reads it off the volume being copied, so a box \
+             for it would be a second answer to a question already settled — \
+             and a wrong one would assign the copy to a pool that cannot see \
+             the source",
+        ),
+        ("backups", "schedule") => Some(
+            "written by the schedule that created the copy, and the reason it \
+             exists is that retention must never expire a backup somebody took \
+             by hand. A person setting it could hand their own copy to a \
+             schedule to delete",
         ),
         _ => None,
     }
@@ -73,10 +91,12 @@ mod complete {
             display_name: "Payments".into(),
             parent: "organizations/o1".into(),
             quota: Quota {
+                devices: 0,
                 instances: 1,
                 vcpus: 1,
                 memory_mib: 1,
                 volume_gib: 1,
+                ..Quota::default()
             },
             bindings: vec![Binding {
                 role: Role::Admin,
@@ -88,6 +108,11 @@ mod complete {
 
     pub fn instance() -> InstanceSpec {
         InstanceSpec {
+            start_order: 0,
+            start_delay_s: 0,
+            on_node_loss: Default::default(),
+            console: false,
+            devices: Vec::new(),
             vcpus: 1,
             memory_mib: 1,
             image: "projects/p1/images/sha256-abc".into(),
@@ -100,12 +125,17 @@ mod complete {
             placement_policy: PlacementPolicy {
                 anti_affinity_group: Some("web".into()),
                 required_labels: vec!["gpu".into()],
+                min_cpu_level: None,
+                affinity_group: Some("cache".into()),
+                spread: velstra_cloud_model::resources::Strength::Preferred,
+                affinity: velstra_cloud_model::resources::Strength::Preferred,
             },
         }
     }
 
     pub fn volume() -> VolumeSpec {
         VolumeSpec {
+            source_backup: None,
             size_gib: 1,
             pool: "pools/p".into(),
             encryption_key: Some("projects/p1/keys/k".into()),
@@ -134,11 +164,54 @@ mod complete {
 
     pub fn image() -> ImageSpec {
         ImageSpec {
+            source_instance: None,
             digest: "sha256-abc".into(),
             format: ImageFormat::Qcow2,
             size_bytes: 1,
             source_url: "http://images.invalid/x".into(),
             signature: Some("sig".into()),
+        }
+    }
+
+    pub fn backup_target() -> velstra_cloud_model::backup::BackupTargetSpec {
+        velstra_cloud_model::backup::BackupTargetSpec {
+            kind: velstra_cloud_model::backup::TargetKind::Directory,
+            path: "/srv/archive".into(),
+            accepting: true,
+            agent: "nvme".into(),
+        }
+    }
+
+    pub fn maintenance_window() -> velstra_cloud_model::maintenance::MaintenanceWindowSpec {
+        velstra_cloud_model::maintenance::MaintenanceWindowSpec {
+            node: "node-a".into(),
+            starts_at: velstra_cloud_model::meta::Timestamp(1),
+            minutes: 60,
+            drain: true,
+            note: "swapping the failed DIMM in slot 3".into(),
+        }
+    }
+
+    pub fn backup() -> velstra_cloud_model::backup::BackupSpec {
+        velstra_cloud_model::backup::BackupSpec {
+            volume: "projects/p1/volumes/v1".into(),
+            target: "backup-targets/archive".into(),
+            pool: "nvme".into(),
+            schedule: Some("projects/p1/backup-schedules/nightly".into()),
+        }
+    }
+
+    pub fn load_balancer() -> LoadBalancerSpec {
+        LoadBalancerSpec {
+            network: "projects/p1/networks/n1".into(),
+            subnet: "projects/p1/subnets/s1".into(),
+            vip: Some("10.20.0.100".into()),
+            listeners: vec![velstra_cloud_model::loadbalancer::Listener {
+                protocol: velstra_cloud_model::loadbalancer::Protocol::Tcp,
+                port: 443,
+                member_port: 8080,
+            }],
+            members: vec!["projects/p1/ports/pt1".into()],
         }
     }
 }
@@ -149,8 +222,24 @@ fn spec_keys<T: serde::Serialize>(spec: &T) -> Vec<String> {
     value
         .as_object()
         .expect("a spec is an object")
-        .keys()
-        .map(|k| velstra_cloud_wire::to_camel(k))
+        .iter()
+        // One level in, so that a nested object is not a place fields can be
+        // added without this noticing. `placementPolicy` was exactly that: it
+        // counted as covered because *one* of its fields had a control, and
+        // three more were added underneath it without a word.
+        .flat_map(|(key, value)| match value.as_object() {
+            Some(inner) if !inner.is_empty() => inner
+                .keys()
+                .map(|sub| {
+                    format!(
+                        "{}.{}",
+                        velstra_cloud_wire::to_camel(key),
+                        velstra_cloud_wire::to_camel(sub)
+                    )
+                })
+                .collect::<Vec<_>>(),
+            _ => vec![velstra_cloud_wire::to_camel(key)],
+        })
         .collect()
 }
 
@@ -208,6 +297,29 @@ fn the_console_can_express_every_volume_field() {
 #[test]
 fn the_console_can_express_every_image_field() {
     assert_covered("images", &complete::image());
+}
+
+/// The three that were added this year and never checked. `backup-targets` in
+/// particular grew a field — which pool agent reports on it — that an operator
+/// has to set and had no way to.
+#[test]
+fn the_console_can_express_every_backup_target_field() {
+    assert_covered("backup-targets", &complete::backup_target());
+}
+
+#[test]
+fn the_console_can_express_every_backup_field() {
+    assert_covered("backups", &complete::backup());
+}
+
+#[test]
+fn the_console_can_express_every_maintenance_window_field() {
+    assert_covered("maintenance-windows", &complete::maintenance_window());
+}
+
+#[test]
+fn the_console_can_express_every_load_balancer_field() {
+    assert_covered("load-balancers", &complete::load_balancer());
 }
 
 #[test]
@@ -659,16 +771,23 @@ mod settled {
             observed_generation: 1,
             conditions: vec![],
             used: Quota {
+                devices: 0,
                 instances: 1,
                 vcpus: 2,
                 memory_mib: 3,
                 volume_gib: 4,
+                ..Quota::default()
             },
         }
     }
 
     pub fn instance() -> InstanceStatus {
         InstanceStatus {
+            running_size: None,
+            console_tail: String::new(),
+            console_bytes: 0,
+            devices: Vec::new(),
+            cpu: None,
             observed_generation: 1,
             conditions: vec![],
             state: InstanceState::Running,
@@ -693,6 +812,19 @@ mod settled {
         ImageStatus {
             observed_generation: 1,
             conditions: vec![],
+        }
+    }
+
+    pub fn load_balancer() -> velstra_cloud_model::loadbalancer::LoadBalancerStatus {
+        velstra_cloud_model::loadbalancer::LoadBalancerStatus {
+            observed_generation: 1,
+            conditions: vec![],
+            vip: "10.20.0.100".into(),
+            listeners: vec![velstra_cloud_model::loadbalancer::ObservedListener {
+                protocol: velstra_cloud_model::loadbalancer::Protocol::Tcp,
+                port: 443,
+                members: 1,
+            }],
         }
     }
 
@@ -755,4 +887,10 @@ nothing_points_nowhere!(
     "ceph-clusters",
     complete::ceph_cluster(),
     settled::ceph_cluster()
+);
+nothing_points_nowhere!(
+    no_load_balancer_column_points_at_something_the_model_does_not_have,
+    "load-balancers",
+    complete::load_balancer(),
+    settled::load_balancer()
 );

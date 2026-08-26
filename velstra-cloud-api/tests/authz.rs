@@ -64,6 +64,77 @@ async fn cell_and_store() -> (Api, Arc<dyn Store>) {
     (api, store)
 }
 
+/// The person whose request was refused can read the sentence explaining it.
+///
+/// Backwards until now: "I clicked delete and nothing happened" was answered by
+/// a record only a cell operator could open. A record is readable by whoever
+/// may read **what it is about**, and by **the person it is about** — neither
+/// of which leaks anything, and everything else about the cell stays the
+/// operator's.
+#[tokio::test]
+async fn a_tenant_reads_the_refusals_about_their_own_objects_and_nobody_elses() {
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({"id": "n1", "spec": {"vni": 5001, "mtu": 1500}}),
+        &who(ADA),
+    )
+    .await
+    .unwrap();
+
+    // Bob reaches into ada's project and is refused. That refusal is the
+    // record this test is about.
+    api.get(&name("projects/p1/networks/n1"), &who(BOB))
+        .await
+        .expect_err("bob read ada's network");
+
+    // The operator sees the whole cell, so this checks the fixture rather than
+    // the rule: something was recorded to read.
+    let all = api
+        .list_for("", "audit", &Default::default(), &who(OPERATOR))
+        .await
+        .unwrap();
+    assert!(
+        all.items
+            .iter()
+            .any(|r| r["spec"]["target"] == json!("projects/p1/networks/n1")),
+        "nothing was recorded, so this test would pass without checking anything"
+    );
+
+    // Ada may read the object, so she may read the refusals about it — and
+    // that is how she finds out somebody has been reaching for her network.
+    let hers = api
+        .list_for("", "audit", &Default::default(), &who(ADA))
+        .await
+        .unwrap();
+    assert!(
+        hers.items
+            .iter()
+            .any(|r| r["spec"]["target"] == json!("projects/p1/networks/n1")),
+        "the owner of the object cannot read what was refused about it"
+    );
+
+    // Bob may read neither the object nor ada's project — but he is the
+    // subject, so his own refusal is his to read, and nothing else in the cell
+    // is.
+    let his = api
+        .list_for("", "audit", &Default::default(), &who(BOB))
+        .await
+        .unwrap();
+    assert!(
+        !his.items.is_empty(),
+        "the person who was refused cannot read the sentence they were given"
+    );
+    assert!(
+        his.items
+            .iter()
+            .all(|r| r["spec"]["subject"] == json!(BOB)),
+        "somebody else's refusals were handed to a tenant: {:?}",
+        his.items
+    );
+}
+
 #[tokio::test]
 async fn a_tenant_cannot_read_another_tenants_object() {
     // The question the whole feature exists for. Before this, any accepted
@@ -734,4 +805,375 @@ async fn taken(store: &Arc<dyn Store>, name: &str, gib: u64) {
         .update(&s, &Writer::agent("pool-a"))
         .await
         .expect("the pool claiming a snapshot assigned to it");
+}
+
+// ---- quota ----------------------------------------------------------------
+
+/// A quota is enforced at admission, counted from what exists, and freed by a
+/// delete — the three properties that make it a bound rather than a suggestion.
+#[tokio::test]
+async fn a_project_at_its_instance_limit_refuses_the_next_create() {
+    let api = cell().await;
+    // Only an operator may set the limit; ada admins the project but not the
+    // cell (the refusal for that is its own test below).
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "quota": { "instances": 1 } } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator sets a quota");
+
+    // The first fits.
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "i1", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        &who(ADA),
+    )
+    .await
+    .expect("the first instance is within the limit");
+
+    // The second is refused, and named as a quota exhaustion rather than any
+    // other kind of no.
+    let err = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "i2", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("a create past the limit was admitted");
+    assert_eq!(err.code, Code::ResourceExhausted, "{}", err.message);
+
+    // Deleting the first frees the count — quota is counted from what exists,
+    // so the room comes back the moment the object is gone.
+    api.delete(&name("projects/p1/instances/i1"), None, &who(ADA))
+        .await
+        .expect("ada deletes her own instance");
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "i3", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        &who(ADA),
+    )
+    .await
+    .expect("a delete freed the quota and the next create fits");
+}
+
+/// An unset limit is unlimited, which is the early-phase default: a project
+/// nobody has decided limits for must not be a project that can do nothing.
+#[tokio::test]
+async fn an_unset_quota_is_unlimited() {
+    let api = cell().await;
+    // p1 was created with `"quota": {}` — every field zero, which means unset.
+    for i in 0..5 {
+        api.create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": format!("i{i}"), "spec": { "vcpus": 4, "memory_mib": 4096 } }),
+            &who(ADA),
+        )
+        .await
+        .expect("an unset quota admits everything");
+    }
+}
+
+/// A floating IP count is a quota dimension of its own, and the same admission
+/// rule reaches it.
+#[tokio::test]
+async fn a_floating_ip_limit_is_enforced() {
+    let (api, store) = cell_and_store().await;
+    // A subnet for the addresses to come from, seeded past the API the way the
+    // other reference-following tests do — the create only needs the count.
+    let subnets: TypedStore<
+        velstra_cloud_model::resources::SubnetSpec,
+        velstra_cloud_model::resources::SubnetStatus,
+    > = TypedStore::new(store.clone(), "cell-1", "subnets");
+    subnets
+        .create(
+            &velstra_cloud_model::resources::Subnet::new(
+                velstra_cloud_model::meta::Meta::new(
+                    name("projects/p1/subnets/s1"),
+                    velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+                ),
+                velstra_cloud_model::resources::SubnetSpec {
+                    network: "projects/p1/networks/n1".into(),
+                    cidr: "10.0.0.0/24".into(),
+                    gateway: "10.0.0.1".into(),
+                    dns: vec![],
+                    reserved: vec![],
+                },
+                velstra_cloud_model::resources::SubnetStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "quota": { "floating_ips": 1 } } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+
+    api.create(
+        "projects/p1",
+        "floatingips",
+        &json!({ "id": "f1", "spec": { "subnet": "projects/p1/subnets/s1" } }),
+        &who(ADA),
+    )
+    .await
+    .expect("the first floating IP is within the limit");
+    let err = api
+        .create(
+            "projects/p1",
+            "floatingips",
+            &json!({ "id": "f2", "spec": { "subnet": "projects/p1/subnets/s1" } }),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("a second floating IP past the limit was admitted");
+    assert_eq!(err.code, Code::ResourceExhausted, "{}", err.message);
+}
+
+/// A tenant may not raise their own quota — the property that makes a quota a
+/// bound at all. ada admins her project, which lets her change its spec; the
+/// quota is the one field on that spec she cannot touch, because it is the
+/// cell's decision about her and not hers about herself.
+#[tokio::test]
+async fn a_tenant_cannot_raise_their_own_quota() {
+    let api = cell().await;
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "quota": { "instances": 1 } } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator sets the initial quota");
+
+    // ada is an admin of p1 — she can change its display name...
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "display_name": "Ada's project" } }),
+        None,
+        &who(ADA),
+    )
+    .await
+    .expect("a project admin may edit the project");
+
+    // ...but not lift her own limit.
+    let err = api
+        .patch(
+            &name("projects/p1"),
+            &json!({ "spec": { "quota": { "instances": 1000 } } }),
+            None,
+            &who(ADA),
+        )
+        .await
+        .expect_err("a tenant raised their own quota");
+    assert_eq!(err.code, Code::PermissionDenied, "{}", err.message);
+
+    // And the limit still bites: the refusal was not cosmetic.
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "i1", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        &who(ADA),
+    )
+    .await
+    .expect("the first fits");
+    let err = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "i2", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("the quota ada tried to raise did not hold");
+    assert_eq!(err.code, Code::ResourceExhausted, "{}", err.message);
+}
+
+/// A refusal leaves a record, carrying the sentence the person was given.
+///
+/// The event a multi-tenant cell is asked about afterwards. Nothing else marks
+/// it: no object is created, nothing changes, and the only other trace is a
+/// status code somebody else received.
+#[tokio::test]
+async fn a_refusal_is_recorded_with_who_what_and_the_same_sentence() {
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({"id": "n1", "spec": {"vni": 5001, "mtu": 1500}}),
+        &who(ADA),
+    )
+    .await
+    .expect("ada may create in her own project");
+
+    let refused = api
+        .get(&name("projects/p1/networks/n1"), &who(BOB))
+        .await
+        .expect_err("bob read ada's network");
+
+    let records = api
+        .list_for("", "audit", &Filter::none(), &who(OPERATOR))
+        .await
+        .expect("an operator reads the audit");
+    let mine: Vec<&serde_json::Value> = records
+        .items
+        .iter()
+        .filter(|r| r["spec"]["subject"] == json!(BOB))
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "bob's refusal was not recorded: {:?}",
+        records.items
+    );
+
+    let it = mine[0];
+    assert_eq!(it["spec"]["kind"], json!("refused"));
+    assert_eq!(it["spec"]["verb"], json!("read"));
+    assert_eq!(it["spec"]["target"], json!("projects/p1/networks/n1"));
+    // The same sentence, not a paraphrase: an audit line an operator has to
+    // correlate by hand against what somebody actually saw is one they stop
+    // trusting.
+    assert_eq!(
+        it["spec"]["detail"].as_str().unwrap_or_default(),
+        refused.to_string(),
+    );
+}
+
+/// Hammering a forbidden path does not fill the store.
+///
+/// A refusal is something an attacker can cause at will, so a record per
+/// refusal would be a way to fill somebody's store from the outside. The id
+/// collapses repeats within a minute: the exact count is lost and the fact is
+/// not, which is the right way round.
+#[tokio::test]
+async fn a_burst_of_refusals_leaves_one_record_rather_than_a_thousand() {
+    let api = cell().await;
+    for _ in 0..50 {
+        let _ = api.get(&name("projects/p1/networks/n1"), &who(BOB)).await;
+    }
+
+    let records = api
+        .list_for("", "audit", &Filter::none(), &who(OPERATOR))
+        .await
+        .expect("an operator reads the audit");
+    let mine = records
+        .items
+        .iter()
+        .filter(|r| r["spec"]["subject"] == json!(BOB))
+        .count();
+    assert_eq!(mine, 1, "fifty attempts left {mine} records");
+}
+
+/// A tenant sees nothing in the audit.
+///
+/// It carries the names of projects and people that are not theirs, which is
+/// the opposite of what an audit trail is for.
+///
+/// The exception, and its two exact edges, are in
+/// `a_tenant_reads_the_refusals_about_their_own_objects_and_nobody_elses`: a
+/// record is readable by whoever may read **what it is about**, and by **the
+/// person it is about**. This is the other side of that rule — everything
+/// else stays the operator's, including a refusal about somebody else's
+/// project and a sign-in, which is about no object at all.
+///
+/// **Empty rather than refused**, and that is this API's rule for every list:
+/// a `403` on a collection would be an oracle for what is in it, and a caller
+/// who may see none of it is told the same thing as one looking at a cell
+/// where nothing has happened.
+#[tokio::test]
+async fn a_tenant_sees_nothing_in_the_audit() {
+    let api = cell().await;
+    // A refusal in *bob's* project, and one about nobody's object at all. Ada
+    // may read neither, and is neither.
+    let _ = api.get(&name("projects/p2/networks/n1"), &who(ADA)).await;
+    let _ = api.get(&name("nodes/node-a"), &who(BOB)).await;
+    assert!(
+        !api.list_for("", "audit", &Filter::none(), &who(OPERATOR))
+            .await
+            .expect("an operator reads the audit")
+            .items
+            .is_empty(),
+        "nothing was recorded, so this check proves nothing"
+    );
+
+    let seen = api
+        .list_for("", "audit", &Filter::none(), &who(ADA))
+        .await
+        .expect("a list is filtered, never refused");
+    assert!(
+        seen.items
+            .iter()
+            .all(|r| r["spec"]["subject"] == json!(ADA)),
+        "a tenant was shown refusals that are neither theirs nor about their \
+         own objects: {:?}",
+        seen.items
+    );
+    // And what she does see is only her own reaching, never bob's.
+    assert!(
+        !seen.items
+            .iter()
+            .any(|r| r["spec"]["target"] == json!("nodes/node-a")),
+        "a tenant was shown a refusal about a cell-wide object: {:?}",
+        seen.items
+    );
+}
+
+/// Listing a collection does not write an audit record per object.
+///
+/// A regression this suite exists to catch. The audit records refusals, and a
+/// list filters rather than refusing — but the list path once ran every object
+/// through the same gate that records. One tenant listing a cell of four
+/// hundred guests would have written four hundred records about objects they
+/// never asked for by name, and the collection this is meant to make readable
+/// would have been the first thing to become unreadable.
+#[tokio::test]
+async fn listing_a_collection_does_not_fill_the_audit_with_what_was_filtered() {
+    let api = cell().await;
+    for i in 1..=6 {
+        api.create(
+            "projects/p1",
+            "networks",
+            &json!({"id": format!("n{i}"), "spec": {"vni": 5000 + i, "mtu": 1500}}),
+            &who(ADA),
+        )
+        .await
+        .expect("ada may create in her own project");
+    }
+
+    // Bob may see none of them. He gets an empty list, not six refusals.
+    let seen = api
+        .list_for("", "networks", &Filter::none(), &who(BOB))
+        .await
+        .expect("a list is filtered, never refused");
+    assert!(seen.items.is_empty(), "{:?}", seen.items);
+
+    let records = api
+        .list_for("", "audit", &Filter::none(), &who(OPERATOR))
+        .await
+        .expect("an operator reads the audit");
+    let about_bob = records
+        .items
+        .iter()
+        .filter(|r| r["spec"]["subject"] == json!(BOB))
+        .count();
+    assert_eq!(
+        about_bob, 0,
+        "listing wrote {about_bob} audit records about objects nobody asked for by name"
+    );
 }

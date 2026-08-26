@@ -34,6 +34,7 @@ struct Answer {
     body: Value,
     etag: Option<String>,
     revision_header: Option<String>,
+    headers: Vec<(String, String)>,
 }
 
 impl Answer {
@@ -44,9 +45,31 @@ impl Answer {
     fn field(&self) -> &str {
         self.body["error"]["field"].as_str().unwrap_or("")
     }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 impl Harness {
+    /// The same cell, with a cap on how fast one caller may write. Off in every
+    /// other test here: a limiter is about one tenant taking the write path
+    /// from another, and these tests have one caller.
+    fn with_write_rate(rate: velstra_cloud_model::limit::Rate) -> Self {
+        let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single(TOKEN));
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+            .with_cell_admins(vec!["dev".into()])
+            .with_write_rate(rate);
+        Self {
+            router: velstra_cloud_api::server(api),
+            store,
+        }
+    }
+
     fn new() -> Self {
         let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single(TOKEN));
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
@@ -87,6 +110,11 @@ impl Harness {
         };
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+            .collect();
         let etag = header_of(&response, header::ETAG.as_str());
         let revision_header = header_of(&response, velstra_cloud_api::rest::REVISION_HEADER);
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -102,6 +130,7 @@ impl Harness {
             body,
             etag,
             revision_header,
+            headers,
         }
     }
 
@@ -131,6 +160,52 @@ impl Harness {
 
     fn nodes(&self) -> TypedStore<NodeSpec, NodeStatus> {
         TypedStore::new(self.store.clone(), "cell-1", "nodes")
+    }
+
+    fn pools(
+        &self,
+    ) -> TypedStore<
+        velstra_cloud_model::resources::PoolSpec,
+        velstra_cloud_model::resources::PoolStatus,
+    > {
+        TypedStore::new(self.store.clone(), "cell-1", "pools")
+    }
+
+    fn backup_targets(
+        &self,
+    ) -> TypedStore<
+        velstra_cloud_model::backup::BackupTargetSpec,
+        velstra_cloud_model::backup::BackupTargetStatus,
+    > {
+        TypedStore::new(self.store.clone(), "cell-1", "backup-targets")
+    }
+}
+
+/// Seeding a fixture straight into the store, as a controller would.
+fn writer() -> velstra_cloud_model::access::Writer {
+    velstra_cloud_model::access::Writer::controller("test")
+}
+
+
+/// The processor every node in these fixtures has.
+///
+/// One machine, repeated: these tests are about migrations, quotas and the
+/// REST surface, and a cell whose nodes differ would make each of them also a
+/// test of the CPU rules — which live in the model and are tested there.
+fn a_cpu() -> velstra_cloud_model::cpu::NodeCpu {
+    let flags: std::collections::BTreeSet<String> =
+        ["cx16", "lahf_lm", "popcnt", "sse3", "sse4_1", "sse4_2", "ssse3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    velstra_cloud_model::cpu::NodeCpu {
+        arch: "x86_64".into(),
+        vendor: "GenuineIntel".into(),
+        presents: "host".into(),
+        presented_flags: flags.clone(),
+        flags,
+        can_mask: true,
+        ..Default::default()
     }
 }
 
@@ -473,10 +548,17 @@ async fn explain_placement_answers_with_the_chain_of_rejections() {
             Placement::new("eu-central", "cell-1"),
         ),
         NodeSpec {
+            evacuate: false,
+            vcpu_overcommit: 0,
+                fence_after_s: 0,
             schedulable: true,
             labels: vec![],
-        },
-        NodeStatus {
+            cpu_baseline: None,
+                gateway: false,
+            },
+            NodeStatus {
+            pci_devices: Vec::new(),
+            cpu: Some(a_cpu()),
             capacity: Capacity {
                 vcpus: 8,
                 memory_mib: 16384,
@@ -488,7 +570,13 @@ async fn explain_placement_answers_with_the_chain_of_rejections() {
         },
     );
     velstra_cloud_model::meta::set_condition(&mut node.status.conditions, Condition::ready(1));
-    h.nodes().create(&node).await.unwrap();
+    h.nodes()
+        .create(
+            &node,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     let name = h
         .instance("p1", "i1", json!({ "vcpus": 2, "memory_mib": 99999 }))
@@ -1006,10 +1094,17 @@ async fn two_nodes(h: &Harness) {
                 Placement::new("eu-central", "cell-1"),
             ),
             NodeSpec {
+                evacuate: false,
+                vcpu_overcommit: 0,
+                fence_after_s: 0,
                 schedulable: true,
                 labels: vec![],
+                cpu_baseline: None,
+                gateway: false,
             },
             NodeStatus {
+                pci_devices: Vec::new(),
+                cpu: Some(a_cpu()),
                 capacity: Capacity {
                     vcpus: 16,
                     memory_mib: memory,
@@ -1029,7 +1124,13 @@ async fn two_nodes(h: &Harness) {
             },
         );
         velstra_cloud_model::meta::set_condition(&mut node.status.conditions, Condition::ready(1));
-        h.nodes().create(&node).await.unwrap();
+        h.nodes()
+            .create(
+                &node,
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
     }
     // A small node nothing will fit on, so a refusal has numbers behind it.
     let mut small = Resource::new(
@@ -1038,10 +1139,17 @@ async fn two_nodes(h: &Harness) {
             Placement::new("eu-central", "cell-1"),
         ),
         NodeSpec {
+            evacuate: false,
+            vcpu_overcommit: 0,
+                fence_after_s: 0,
             schedulable: true,
             labels: vec![],
-        },
-        NodeStatus {
+            cpu_baseline: None,
+                gateway: false,
+            },
+            NodeStatus {
+            pci_devices: Vec::new(),
+            cpu: Some(a_cpu()),
             capacity: Capacity {
                 vcpus: 2,
                 memory_mib: 1024,
@@ -1054,7 +1162,13 @@ async fn two_nodes(h: &Harness) {
         },
     );
     velstra_cloud_model::meta::set_condition(&mut small.status.conditions, Condition::ready(1));
-    h.nodes().create(&small).await.unwrap();
+    h.nodes()
+        .create(
+            &small,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 }
 
 /// An instance running on `node-a`, with its image cached on both real nodes.
@@ -1064,17 +1178,21 @@ async fn running_guest(h: &Harness) -> String {
         velstra_cloud_model::resources::ImageStatus,
     > = TypedStore::new(h.store.clone(), "cell-1", "images");
     image
-        .create(&Resource::new(
-            Meta::new(
-                ResourceName::parse("projects/p1/images/sha256-abc").unwrap(),
-                Placement::new("eu-central", "cell-1"),
+        .create(
+            &Resource::new(
+                Meta::new(
+                    ResourceName::parse("projects/p1/images/sha256-abc").unwrap(),
+                    Placement::new("eu-central", "cell-1"),
+                ),
+                velstra_cloud_model::resources::ImageSpec {
+                    source_instance: None,
+                    digest: "sha256:abc".into(),
+                    ..Default::default()
+                },
+                velstra_cloud_model::resources::ImageStatus::default(),
             ),
-            velstra_cloud_model::resources::ImageSpec {
-                digest: "sha256:abc".into(),
-                ..Default::default()
-            },
-            velstra_cloud_model::resources::ImageStatus::default(),
-        ))
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 
@@ -1422,10 +1540,17 @@ async fn a_destination_without_the_image_is_refused_with_the_sentence() {
             Placement::new("eu-central", "cell-1"),
         ),
         NodeSpec {
+            evacuate: false,
+            vcpu_overcommit: 0,
+                fence_after_s: 0,
             schedulable: true,
             labels: vec![],
-        },
-        NodeStatus {
+            cpu_baseline: None,
+                gateway: false,
+            },
+            NodeStatus {
+            pci_devices: Vec::new(),
+            cpu: Some(a_cpu()),
             capacity: Capacity {
                 vcpus: 16,
                 memory_mib: 16384,
@@ -1438,7 +1563,13 @@ async fn a_destination_without_the_image_is_refused_with_the_sentence() {
         },
     );
     velstra_cloud_model::meta::set_condition(&mut bare.status.conditions, Condition::ready(1));
-    h.nodes().create(&bare).await.unwrap();
+    h.nodes()
+        .create(
+            &bare,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     let refused = h
         .post(
@@ -2172,9 +2303,14 @@ async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reaso
             Placement::new("eu-central", "cell-1"),
         ),
         NodeSpec {
+            evacuate: false,
+            vcpu_overcommit: 0,
+                fence_after_s: 0,
             schedulable: true,
             labels: vec![],
-        },
+            cpu_baseline: None,
+                gateway: false,
+            },
         NodeStatus {
             devices: vec![
                 BlockDevice {
@@ -2199,7 +2335,13 @@ async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reaso
             ..Default::default()
         },
     );
-    h.nodes().create(&node).await.unwrap();
+    h.nodes()
+        .create(
+            &node,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     let answer = h
         .post(
@@ -2338,4 +2480,798 @@ async fn an_image_carrying_a_signature_nothing_verifies_is_refused() {
         )
         .await;
     assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+}
+
+/// Keeping a group apart can be a rule or a wish, and so can keeping it
+/// together. Both are right answers to different questions.
+#[tokio::test]
+async fn a_guest_can_ask_to_be_near_its_group_and_be_told_where_the_group_is() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+
+    // One guest of the group, already placed by the fixture's own scheduler
+    // path — read back rather than assumed.
+    let first = h
+        .instance(
+            "p1",
+            "web-1",
+            json!({ "vcpus": 1, "memory_mib": 512,
+                    "placement_policy": { "affinity_group": "checkout" } }),
+        )
+        .await;
+    let placed = h.get(&first).await;
+    assert_eq!(placed.status, StatusCode::OK, "{:?}", placed.body);
+
+    // A second, too large for any machine, asking to be with the first. The
+    // rejection names where the group is rather than answering "no valid host".
+    let second = h
+        .instance(
+            "p1",
+            "cache-1",
+            json!({ "vcpus": 1, "memory_mib": 99999,
+                    "placement_policy": { "affinity_group": "checkout" } }),
+        )
+        .await;
+    let why = h.get(&format!("{second}:explainPlacement")).await;
+    assert_eq!(why.status, StatusCode::OK, "{:?}", why.body);
+    let rejected = why.body["rejected"].as_array().unwrap();
+    assert!(!rejected.is_empty(), "nothing was even considered");
+
+    // A wish rather than a rule places it anyway, given room.
+    let loose = h
+        .instance(
+            "p1",
+            "cache-2",
+            json!({ "vcpus": 1, "memory_mib": 512,
+                    "placement_policy": {
+                        "affinity_group": "checkout",
+                        "affinity": "Preferred",
+                    } }),
+        )
+        .await;
+    let answer = h.get(&format!("{loose}:explainPlacement")).await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+    assert!(
+        !answer.body["placed"].is_null(),
+        "a preferred affinity refused a placement it should have taken: {:?}",
+        answer.body
+    );
+
+    // And an unreadable strength is not invented: it reads as `Required`,
+    // which is the value the field has when nobody set it.
+    let typo = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "cache-3", "spec": { "vcpus": 1, "memory_mib": 512,
+                    "placement_policy": { "affinity_group": "checkout", "affinity": "prefered" } } }),
+        )
+        .await;
+    assert_ne!(
+        typo.status,
+        StatusCode::ACCEPTED,
+        "a misspelled strength was accepted and silently read as something: {:?}",
+        typo.body
+    );
+}
+
+/// The address the guest actually holds, end to end through the API: which
+/// network it may come from, who may declare one, who announces it, and what
+/// the guest is told to configure.
+#[tokio::test]
+async fn a_routed_public_address_is_the_guests_own_and_says_where_it_is_announced() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+
+    // A tenant range, and a real one. The difference is a flag only an
+    // operator may set.
+    for (id, external, vni) in [("tenant", false, 5001u32), ("public", true, 5002)] {
+        let made = h
+            .post(
+                "projects/p1/networks",
+                json!({ "id": id, "spec": { "vni": vni, "mtu": 1450, "external": external }}),
+            )
+            .await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    }
+    h.post(
+        "projects/p1/subnets",
+        json!({ "id": "tenant", "spec": {
+            "network": "projects/p1/networks/tenant",
+            "cidr": "10.20.0.0/24", "gateway": "10.20.0.1", "dns": [], "reserved": [],
+        }}),
+    )
+    .await;
+    h.post(
+        "projects/p1/subnets",
+        json!({ "id": "public", "spec": {
+            "network": "projects/p1/networks/public",
+            "cidr": "203.0.113.0/24", "gateway": "203.0.113.1", "dns": [], "reserved": [],
+        }}),
+    )
+    .await;
+
+    // A routed address from a tenant range is refused, in words that say why
+    // it could never work.
+    let inside = h
+        .post(
+            "projects/p1/floatingips",
+            json!({ "id": "wrong", "spec": {
+                "subnet": "projects/p1/subnets/tenant", "delivery": "Routed",
+            }}),
+        )
+        .await;
+    assert_eq!(inside.status, StatusCode::BAD_REQUEST, "{:?}", inside.body);
+    let said = inside.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.contains("real nowhere"), "{said}");
+
+    // From the external one, announced from the host holding the guest.
+    let made = h
+        .post(
+            "projects/p1/floatingips",
+            json!({ "id": "web", "spec": {
+                "subnet": "projects/p1/subnets/public",
+                "delivery": "Routed", "announce": "FromHost",
+                "address": "203.0.113.7",
+            }}),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    let reach = h.get("projects/p1/floatingips/web:explainReach").await;
+    assert_eq!(reach.status, StatusCode::OK, "{:?}", reach.body);
+    assert_eq!(reach.body["delivery"], json!("Routed"));
+    assert_eq!(reach.body["external"], json!(true));
+    // Bound to nothing yet, which is a held address and not a fault — and the
+    // answer says which of the four reasons it is.
+    assert_eq!(reach.body["announced"]["from"], json!(null));
+    assert!(
+        reach.body["announced"]["why"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("held for later"),
+        "{:?}",
+        reach.body["announced"]
+    );
+
+    // What the guest must have: a host route through a next hop in no subnet,
+    // and the default route through it.
+    let guest = &reach.body["guest"];
+    assert_eq!(guest["address"], json!("203.0.113.7/32"));
+    assert_eq!(guest["via"], json!("169.254.1.1"));
+    assert_eq!(guest["onLink"], json!(true));
+    assert_eq!(guest["defaultRoute"], json!(true));
+}
+
+/// Announcing from a gateway in a cell that has none is refused where it is
+/// asked for, and the refusal names both ways out.
+#[tokio::test]
+async fn a_gateway_announcement_in_a_cell_with_no_gateway_is_refused() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    h.post(
+        "projects/p1/networks",
+        json!({ "id": "public", "spec": { "vni": 5002, "mtu": 1450, "external": true }}),
+    )
+    .await;
+    h.post(
+        "projects/p1/subnets",
+        json!({ "id": "public", "spec": {
+            "network": "projects/p1/networks/public",
+            "cidr": "203.0.113.0/24", "gateway": "203.0.113.1", "dns": [], "reserved": [],
+        }}),
+    )
+    .await;
+    let port = h
+        .post(
+            "projects/p1/ports",
+            json!({ "id": "pt1", "spec": {
+                "network": "projects/p1/networks/public",
+                "subnet": "projects/p1/subnets/public",
+            }}),
+        )
+        .await;
+    assert_eq!(port.status, StatusCode::ACCEPTED, "{:?}", port.body);
+
+    let asked = h
+        .post(
+            "projects/p1/floatingips",
+            json!({ "id": "web", "spec": {
+                "subnet": "projects/p1/subnets/public",
+                "port": "projects/p1/ports/pt1",
+                "delivery": "Routed", "announce": "FromGateway",
+            }}),
+        )
+        .await;
+    assert_eq!(asked.status, StatusCode::BAD_REQUEST, "{:?}", asked.body);
+    let said = asked.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.contains("Mark one"), "{said}");
+    assert!(said.contains("peer with the network above"), "{said}");
+}
+
+/// A place copies are kept, created the way an operator creates one — and the
+/// spelling of `kind`, which is the one thing about this object somebody typing
+/// JSON gets wrong.
+///
+/// `directory`, lowercase. It reads as an odd exception beside `Running` and
+/// `Stopped`, and it is: the enum is kebab-cased, and a contract that is silent
+/// about which convention a field follows is one people guess at. The refusal
+/// at least says both spellings.
+#[tokio::test]
+async fn a_backup_target_is_created_with_the_fields_the_contract_names() {
+    let h = Harness::new();
+    let answer = h
+        .post(
+            "backup-targets",
+            json!({ "id": "archive", "spec": {
+                "kind": "directory", "path": "/srv/archive", "accepting": true,
+            }}),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+
+    // And the guess, refused in a sentence that names what was expected.
+    let wrong = h
+        .post(
+            "backup-targets",
+            json!({ "id": "other", "spec": { "kind": "Directory", "path": "/srv/other" }}),
+        )
+        .await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{:?}", wrong.body);
+    let said = wrong.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.contains("expected `directory`"), "{said}");
+}
+
+/// One tenant in a loop does not take the write path from everybody else — and
+/// the refusal says exactly how long to wait, so a client that reads it stops
+/// spinning.
+#[tokio::test]
+async fn a_caller_writing_in_a_loop_is_slowed_down_and_told_for_how_long() {
+    let h = Harness::with_write_rate(velstra_cloud_model::limit::Rate {
+        per_second: 2,
+        burst: 4,
+    });
+    h.post("projects", json!({ "id": "p1", "spec": { "quota": {} } }))
+        .await;
+
+    // The burst is real work somebody may legitimately do at once, minus the
+    // project above.
+    let mut refused = None;
+    for i in 0..12 {
+        let answer = h
+            .post(
+                "projects/p1/instances",
+                json!({ "id": format!("i{i}"), "spec": { "vcpus": 1, "memory_mib": 512 } }),
+            )
+            .await;
+        if answer.status == StatusCode::TOO_MANY_REQUESTS {
+            refused = Some(answer);
+            break;
+        }
+    }
+    let refused = refused.expect("a caller writing as fast as it could was never slowed down");
+    assert_eq!(refused.error_code(), "RESOURCE_EXHAUSTED", "{:?}", refused.body);
+    let said = refused.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.contains("Try again in"), "{said}");
+    // The header, because that is what a client library reads — and at least
+    // one second, so a client that obeys it to the letter is never turned away
+    // twice for the same reason.
+    let after = refused
+        .header("retry-after")
+        .expect("a rate limit says when to come back");
+    assert!(after.parse::<u64>().is_ok_and(|s| s >= 1), "{after}");
+
+    // Reads are not counted. A caller reading in a loop is only slowing
+    // themselves down, and a limiter that refused them would make a console
+    // that polls look broken.
+    for _ in 0..20 {
+        let read = h.get("projects/p1/instances").await;
+        assert_eq!(read.status, StatusCode::OK, "a read was rate limited");
+    }
+}
+
+/// Sharing a processor is a trade an operator makes on purpose; sharing memory
+/// is not that trade, and there is deliberately no ratio for it.
+#[tokio::test]
+async fn a_node_can_be_told_to_share_its_cores_but_never_its_memory() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+
+    let ok = h
+        .patch("nodes/node-a", json!({ "spec": { "vcpuOvercommit": 4 } }))
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+
+    // The cell now offers more processor than it has silicon, and says both
+    // numbers: one without the other reads as though it had grown a processor.
+    let room = h.get("nodes:explainCapacity").await;
+    assert_eq!(room.status, StatusCode::OK, "{:?}", room.body);
+    let cores = room.body["total"]["vcpus"].as_u64().unwrap();
+    let offered = room.body["offeredVcpus"].as_u64().unwrap();
+    assert!(offered > cores, "the ratio did not reach the capacity report: {offered} of {cores}");
+
+    // And a ratio past the point where it stops being a trade is refused with
+    // the reason, rather than accepted as a way of hiding that a cell is full.
+    let absurd = h
+        .patch("nodes/node-a", json!({ "spec": { "vcpuOvercommit": 500 } }))
+        .await;
+    assert_eq!(absurd.status, StatusCode::BAD_REQUEST, "{:?}", absurd.body);
+    let said = absurd.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.contains("hiding that the cell is full"), "{said}");
+
+    // There is no memory ratio to set, and a body inventing one is refused as
+    // an unknown field rather than quietly ignored.
+    let memory = h
+        .patch("nodes/node-a", json!({ "spec": { "memoryOvercommit": 2 } }))
+        .await;
+    assert_ne!(memory.status, StatusCode::OK, "a memory ratio was accepted: {:?}", memory.body);
+}
+
+/// "What has happened to this guest" — the question every console user has and
+/// no listing answered.
+#[tokio::test]
+async fn the_records_about_one_object_can_be_asked_for_without_reading_the_cell() {
+    let h = Harness::new();
+    let one = h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+    let other = h.instance("p1", "i2", json!({ "vcpus": 2 })).await;
+
+    let all = h.get("projects/p1/operations").await;
+    assert_eq!(all.status, StatusCode::OK, "{:?}", all.body);
+    assert!(
+        all.body["items"].as_array().unwrap().len() >= 2,
+        "the fixture produced no operations to narrow"
+    );
+
+    let mine = h.get(&format!("projects/p1/operations?target={one}")).await;
+    assert_eq!(mine.status, StatusCode::OK, "{:?}", mine.body);
+    let items = mine.body["items"].as_array().unwrap();
+    assert!(!items.is_empty(), "the object's own history came back empty");
+    assert!(
+        items.iter().all(|o| o["spec"]["target"] == json!(one)),
+        "somebody else's history came back: {items:?}"
+    );
+    assert!(
+        !items.iter().any(|o| o["spec"]["target"] == json!(other)),
+        "the filter let another object's records through"
+    );
+
+    // A selector that matches nothing is an empty list, not an error: "nothing
+    // has happened to it" is an answer.
+    let none = h
+        .get("projects/p1/operations?target=projects/p1/instances/never")
+        .await;
+    assert_eq!(none.status, StatusCode::OK, "{:?}", none.body);
+    assert_eq!(none.body["items"], json!([]));
+
+    // And a collection that carries no target says so, rather than answering
+    // with the whole cell as though the filter had been applied.
+    let wrong = h.get(&format!("projects/p1/instances?target={one}")).await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{:?}", wrong.body);
+}
+
+/// What a project has left and what it can actually start — and which of the
+/// two is standing in the way, which is the whole reason both halves are in one
+/// answer.
+#[tokio::test]
+async fn a_projects_allowance_says_whether_the_quota_or_the_cell_is_in_the_way() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let created = h
+        .post(
+            "projects",
+            json!({ "id": "p1", "spec": { "quota": { "instances": 10, "vcpus": 40 } } }),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+
+    let answer = h.get("projects/p1:explainQuota").await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+
+    // Every dimension, in a fixed order, whether or not it is in use: a page
+    // that showed only the interesting ones would rearrange itself between two
+    // reads of the same screen.
+    let dims = answer.body["dimensions"].as_array().unwrap();
+    assert_eq!(dims.len(), 8, "{dims:?}");
+    assert_eq!(dims[0]["name"], json!("instances"));
+    assert!(dims.iter().any(|d| d["name"] == json!("devices")));
+
+    // Nobody set a memory quota, so `left` is null rather than zero — the two
+    // are different answers and a screen must not render one as the other.
+    let memory = dims.iter().find(|d| d["name"] == json!("memoryMib")).unwrap();
+    assert_eq!(memory["unlimited"], json!(true), "{memory:?}");
+    assert_eq!(memory["left"], json!(null), "{memory:?}");
+    assert_eq!(memory["exhausted"], json!(false), "{memory:?}");
+
+    // The fixture's nodes are 16 GiB each and nothing caps memory, so the
+    // machines are what is in the way — and the answer says so rather than
+    // sending this tenant to ask for allowance they already have without bound.
+    let most = &answer.body["largestStartable"];
+    assert_eq!(most["memoryLimitedBy"], json!("cell"), "{most:?}");
+    assert_eq!(most["none"], json!(false), "{most:?}");
+
+    // And a machine out of service does not lend its memory to that promise.
+    let now = velstra_cloud_model::meta::Timestamp::now().0;
+    for id in ["node-a", "node-b", "node-tiny"] {
+        let answer = h
+            .post(
+                "maintenance-windows",
+                json!({ "id": format!("out-{id}"), "spec": {
+                    "node": id, "startsAt": now - 60_000, "minutes": 60, "drain": false,
+                }}),
+            )
+            .await;
+        assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+    }
+    let answer = h.get("projects/p1:explainQuota").await;
+    let most = &answer.body["largestStartable"];
+    assert_eq!(
+        most["none"],
+        json!(true),
+        "a cell with every machine out of service still promised a guest: {most:?}"
+    );
+}
+
+/// A window is a declaration, and the four ways of declaring a meaningless one
+/// are refused at the door — because all four are knowable then, and the
+/// alternative is finding out at three in the morning.
+#[tokio::test]
+async fn a_maintenance_window_that_could_never_take_effect_is_refused() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let hour = 3_600_000u64;
+    let now = velstra_cloud_model::meta::Timestamp::now().0;
+
+    let declare = |id: &str, node: &str, starts: u64, minutes: u64| {
+        json!({ "id": id, "spec": {
+            "node": node, "startsAt": starts, "minutes": minutes, "drain": false,
+        }})
+    };
+
+    // Zero minutes: it would sit in the list looking like a plan.
+    let answer = h
+        .post("maintenance-windows", declare("nothing", "node-a", now + hour, 0))
+        .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
+
+    // Already over. Declared for last night by somebody in the wrong timezone.
+    let answer = h
+        .post("maintenance-windows", declare("gone", "node-a", now - 2 * hour, 30))
+        .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
+
+    // A start in the past is *accepted*: work that has already begun is a true
+    // thing to declare, and refusing it teaches people to lie about the time.
+    let answer = h
+        .post("maintenance-windows", declare("started", "node-a", now - 600_000, 60))
+        .await;
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+
+    // And a second window over the same node and the same hour is two answers
+    // to one question, so it is refused by name.
+    let answer = h
+        .post("maintenance-windows", declare("again", "node-a", now, 60))
+        .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
+    let said = answer.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(said.contains("started"), "the refusal did not name which one: {said}");
+
+    // The same hour on another machine is the ordinary case, not a conflict.
+    let answer = h
+        .post("maintenance-windows", declare("elsewhere", "node-b", now, 60))
+        .await;
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+}
+
+/// What an open window costs, answered before anybody commits to it — and the
+/// node stops being a candidate for new work while it is open.
+#[tokio::test]
+async fn a_node_in_an_open_window_is_explained_and_no_longer_placed_on() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let now = velstra_cloud_model::meta::Timestamp::now().0;
+
+    // node-b is out for the next hour, with the operator's own words on it.
+    let answer = h
+        .post(
+            "maintenance-windows",
+            json!({ "id": "dimm-swap", "spec": {
+                "node": "node-b",
+                "startsAt": now - 600_000,
+                "minutes": 60,
+                "drain": false,
+                "note": "swapping the failed DIMM in slot 3",
+            }}),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
+
+    let answer = h.get("nodes/node-b:explainMaintenance").await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+    assert_eq!(answer.body["open"]["window"], json!("maintenance-windows/dimm-swap"));
+    assert_eq!(answer.body["open"]["drain"], json!(false));
+    // Nothing is being asked to leave: that is what `drain: false` means, and
+    // a console reading this must not warn about a fleet that is staying put.
+    assert_eq!(answer.body["draining"], json!(false));
+    assert_eq!(answer.body["willMove"], json!([]));
+
+    // A machine nobody scheduled anything for says so plainly rather than
+    // answering with an error.
+    let answer = h.get("nodes/node-a:explainMaintenance").await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+    assert_eq!(answer.body["open"], json!(null));
+    assert_eq!(answer.body["next"], json!(null));
+
+    // And placement now refuses it, in the operator's own words rather than
+    // as "no valid host". Sized past node-a on purpose: a guest that fits
+    // somewhere is simply placed, and the rejection chain is only written when
+    // nothing took it.
+    let name = h
+        .instance("p1", "big", json!({ "vcpus": 2, "memory_mib": 99999 }))
+        .await;
+    let answer = h.get(&format!("{name}:explainPlacement")).await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+    let rejected = answer.body["rejected"].as_array().unwrap();
+    let out = rejected
+        .iter()
+        .find(|r| r["node"] == json!("node-b"))
+        .unwrap_or_else(|| panic!("node-b was not even considered: {rejected:?}"));
+    assert_eq!(out["why"], json!("InMaintenance"));
+    let detail = out["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("DIMM"), "{detail}");
+    // Relative, because this is read hours after it was written.
+    assert!(detail.contains("another"), "{detail}");
+}
+
+/// The fleet's CPU report, against the scenario it exists for: a cell that was
+/// baselined, then had a machine added that stands outside the aggregate.
+#[tokio::test]
+async fn the_cpu_report_names_the_stray_node_and_says_whether_it_can_join() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+
+    // node-a and node-b are the fixture's identical machines. Give them a
+    // declared baseline, and add a third that presents its own processor.
+    for id in ["node-a", "node-b"] {
+        let key = velstra_cloud_store::key_for("cell-1", "nodes", &format!("nodes/{id}"));
+        let raw = h.store.get(&key).await.unwrap().unwrap();
+        let mut node: velstra_cloud_model::resources::Node =
+            serde_json::from_slice(&raw.value).unwrap();
+        node.spec.cpu_baseline = Some(velstra_cloud_model::cpu::CpuLevel::V2);
+        let cpu = node.status.cpu.as_mut().unwrap();
+        cpu.presents = "x86-64-v2".into();
+        cpu.presented_flags = velstra_cloud_model::cpu::CpuLevel::V2.flags();
+        h.store
+            .put(
+                &key,
+                serde_json::to_vec(&node).unwrap(),
+                velstra_cloud_store::Expect::Revision(raw.revision),
+            )
+            .await
+            .unwrap();
+    }
+
+    let answer = h.get("nodes:explainCpu").await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+
+    // Two identical baselined machines: one domain, and it can be baselined.
+    let domains = answer.body["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1, "{domains:?}");
+    assert_eq!(domains[0]["level"], json!("x86-64-v2"));
+    assert_eq!(domains[0]["canBaseline"], json!(true));
+
+    // Nothing is pending: no guest has been started against the new baseline
+    // and none is running with a different one.
+    assert_eq!(answer.body["pendingAdoption"], json!([]));
+
+    // And a uniform fleet says so rather than answering with silence, which
+    // reads the same as a broken report.
+    let advice = answer.body["advice"].as_array().unwrap();
+    assert!(
+        advice.iter().any(|a| a["kind"] == "AlreadyUniform"),
+        "{advice:?}"
+    );
+}
+
+/// Declaring a baseline a machine cannot reach is refused at the door, with
+/// the shortfall named.
+#[tokio::test]
+async fn a_baseline_a_node_cannot_reach_is_refused_before_it_is_declared() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+
+    // The fixture's nodes are x86-64-v2. Ask for v3.
+    let answer = h
+        .patch(
+            "nodes/node-a",
+            json!({ "spec": { "cpuBaseline": "x86-64-v3" } }),
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
+    let message = answer.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("cannot present x86-64-v3") && message.contains("avx2"),
+        "the refusal does not name what the machine is short of: {message}"
+    );
+    assert_eq!(answer.body["error"]["field"], json!("spec.cpuBaseline"));
+
+    // The level it *can* reach is accepted.
+    let ok = h
+        .patch(
+            "nodes/node-a",
+            json!({ "spec": { "cpuBaseline": "x86-64-v2" } }),
+        )
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+}
+
+/// A backup into the volume's own pool is refused, and the reason says why it
+/// would not have been a backup.
+///
+/// The one rule the collection exists for. A copy beside the original is lost
+/// with the pool it is in — which is the single failure anybody buys a backup
+/// to survive — so a platform that accepted it would be selling a promise it
+/// does not keep, and the operator would find out at the worst moment there is.
+#[tokio::test]
+async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
+    let h = Harness::new();
+
+    // A pool, a volume in it, and a target pointed at that same pool's path.
+    // The pool publishes where it is, which is how the API can tell — a flag on
+    // the target would be a claim, and this has to be a fact.
+    let mut pool: velstra_cloud_model::resources::Pool = Resource::new(
+        Meta::new(
+            ResourceName::parse("pools/fast").unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: true,
+            labels: vec![],
+        },
+        velstra_cloud_model::resources::PoolStatus {
+            backend: "directory".into(),
+            ..Default::default()
+        },
+    );
+    velstra_cloud_model::meta::set_condition(
+        &mut pool.status.conditions,
+        velstra_cloud_model::meta::Condition::new(
+            "Located",
+            velstra_cloud_model::meta::ConditionStatus::True,
+            "PathIs",
+            "/srv/pool-fast",
+            1,
+        ),
+    );
+    h.pools().create(&pool, &writer()).await.unwrap();
+
+    let volume: velstra_cloud_model::resources::Volume = Resource::new(
+        Meta::new(
+            ResourceName::parse("projects/p1/volumes/data-1").unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::VolumeSpec {
+            source_backup: None,
+            size_gib: 40,
+            pool: "pools/fast".into(),
+            encryption_key: None,
+            source_image: None,
+            source_snapshot: None,
+        },
+        Default::default(),
+    );
+    h.volumes().create(&volume, &writer()).await.unwrap();
+
+    for (id, path) in [("same-pool", "/srv/pool-fast"), ("elsewhere", "/srv/backups")] {
+        let t: velstra_cloud_model::resources::BackupTarget = Resource::new(
+            Meta::new(
+                ResourceName::parse(&format!("backup-targets/{id}")).unwrap(),
+                Placement::new("eu-central", "cell-1"),
+            ),
+            velstra_cloud_model::backup::BackupTargetSpec {
+                kind: velstra_cloud_model::backup::TargetKind::Directory,
+                path: path.into(),
+                accepting: true,
+                agent: String::new(),
+            },
+            velstra_cloud_model::backup::BackupTargetStatus {
+                writable: Some(true),
+                ..Default::default()
+            },
+        );
+        h.backup_targets().create(&t, &writer()).await.unwrap();
+    }
+
+    let refused = h
+        .post(
+            "projects/p1/backups",
+            json!({ "meta": { "name": "projects/p1/backups/b1" },
+                    "spec": { "volume": "projects/p1/volumes/data-1",
+                              "target": "backup-targets/same-pool" } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
+    let message = refused.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("lost with the pool"),
+        "the refusal does not say why it would not be a backup: {message}"
+    );
+    assert_eq!(refused.body["error"]["field"], json!("spec.target"));
+
+    // A target somewhere else is the ordinary case, and the pool holding the
+    // source is filled in — without it the object is assigned to nobody and no
+    // agent could ever claim it.
+    let made = h
+        .post(
+            "projects/p1/backups",
+            json!({ "meta": { "name": "projects/p1/backups/b2" },
+                    "spec": { "volume": "projects/p1/volumes/data-1",
+                              "target": "backup-targets/elsewhere" } }),
+        )
+        .await;
+    // Accepted, with an operation naming what it will become — this API's
+    // shape for every create.
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    let target = made.body["target"].as_str().unwrap();
+
+    let read = h.get(target).await;
+    assert_eq!(read.status, StatusCode::OK, "{:?}", read.body);
+    assert_eq!(
+        read.body["spec"]["pool"],
+        json!("pools/fast"),
+        "the pool holding the source was not filled in, so no agent could ever claim this copy"
+    );
+}
+
+/// A list can be narrowed by label, and clearing the filter shows everything
+/// again.
+///
+/// The second half is the one worth pinning: an empty selector that matched
+/// nothing would make a cleared filter box read as "nothing here" instead of
+/// "no filter", which is how somebody concludes their guests are gone.
+#[tokio::test]
+async fn a_list_is_narrowed_by_label_and_an_empty_selector_narrows_nothing() {
+    let h = Harness::new();
+
+    for (id, env) in [("web-1", "prod"), ("web-2", "prod"), ("db-1", "staging")] {
+        let made = h
+            .post(
+                "projects/p1/networks",
+                json!({ "meta": { "name": format!("projects/p1/networks/{id}"),
+                                  "labels": { "env": env } },
+                        "spec": { "vni": 5000 + id.len(), "mtu": 1500 } }),
+            )
+            .await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    }
+
+    let ids = |answer: &Answer| -> Vec<String> {
+        let mut out: Vec<String> = answer.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["meta"]["name"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+
+    let all = h.get("projects/p1/networks").await;
+    assert_eq!(ids(&all), ["db-1", "web-1", "web-2"]);
+
+    let prod = h.get("projects/p1/networks?labels=env=prod").await;
+    assert_eq!(ids(&prod), ["web-1", "web-2"]);
+
+    // A bare key asks whether the label is there at all.
+    let tagged = h.get("projects/p1/networks?labels=env").await;
+    assert_eq!(ids(&tagged), ["db-1", "web-1", "web-2"]);
+
+    // Nothing matching is an empty list, not an error: "no networks are tagged
+    // that" is an answer, and refusing would make a typo look like a broken
+    // endpoint.
+    let none = h.get("projects/p1/networks?labels=env=nowhere").await;
+    assert_eq!(none.status, StatusCode::OK);
+    assert!(ids(&none).is_empty());
+
+    // And cleared shows everything again.
+    let cleared = h.get("projects/p1/networks?labels=").await;
+    assert_eq!(ids(&cleared), ["db-1", "web-1", "web-2"]);
 }

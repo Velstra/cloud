@@ -20,6 +20,7 @@ use velstra_cloud_model::{
     authz::{Verb, governing_project, may},
     ceph::{CephClusterSpec, CephClusterStatus},
     identity::{UserSpec, UserStatus},
+    loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
     meta::{Meta, Placement, ResourceName, Revision, Timestamp, set_condition},
     migration::{Migration, MigrationSpec, MigrationStatus, may_migrate, migration_condition},
     reconcile::place,
@@ -48,7 +49,7 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 18] = [
+pub const COLLECTIONS: [&str; 27] = [
     "projects",
     "users",
     "ceph-clusters",
@@ -60,14 +61,48 @@ pub const COLLECTIONS: [&str; 18] = [
     "networks",
     "routers",
     "floatingips",
+    "load-balancers",
     "subnets",
     "ports",
     "security-groups",
     "images",
     "nodes",
     "pools",
+    "device-classes",
+    "backup-targets",
+    "backups",
+    "backup-schedules",
+    "audit",
+    "captures",
+    "snapshot-schedules",
+    "maintenance-windows",
     "operations",
 ];
+
+/// One stored maintenance window as the model's decisions see it.
+fn window_view(
+    w: &velstra_cloud_model::resources::MaintenanceWindow,
+) -> velstra_cloud_model::maintenance::WindowView {
+    velstra_cloud_model::maintenance::WindowView {
+        name: w.meta.name.to_string(),
+        node: w.spec.node.clone(),
+        starts_at: w.spec.starts_at,
+        minutes: w.spec.minutes,
+        drain: w.spec.drain,
+        note: w.spec.note.clone(),
+    }
+}
+
+/// How often the background reaper deletes expired sessions.
+///
+/// An hour: a session lives eight (see
+/// [`velstra_cloud_model::identity::SESSION_LIFETIME_MS`]), so this is well
+/// inside the lifetime and an expired record lingers at most one interval past
+/// the moment it stopped being accepted. Longer would let dead rows accumulate
+/// between sweeps; shorter would list the collection more often to reclaim
+/// almost nothing. The bound this protects against is slow growth, not a leak
+/// that matters within the hour.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// One event on a watch, in the two shapes the contract defines.
 #[derive(Clone, Debug, PartialEq)]
@@ -93,6 +128,13 @@ pub struct Listing {
 pub struct Created {
     pub operation: Value,
     pub target: String,
+    /// The per-node agent token, present only when the created object is a node.
+    ///
+    /// Returned **once**, here and nowhere else: only its digest is stored, so it
+    /// cannot be recovered from the cell afterwards. A node agent registered with
+    /// `--api` presents this token, and the API serves it only its own objects
+    /// and accepts status writes only for them.
+    pub node_token: Option<String>,
 }
 
 /// Which objects a caller is asking for.
@@ -117,6 +159,19 @@ pub struct Filter {
     /// [`velstra_cloud_model::assignment`] for what that means and why it is not
     /// simply the assignment.
     pub assignee: Option<Assignee>,
+    /// Only objects carrying these labels. Empty matches everything, which is
+    /// what "no filter" has to mean — the alternative is a filter box that
+    /// empties the list when it is cleared.
+    pub labels: Vec<velstra_cloud_model::meta::LabelTerm>,
+    /// Only records *about* this resource: operations whose `spec.target` is
+    /// it, audit lines whose `spec.target` is it.
+    ///
+    /// The one filter that is about a field rather than about who is asking,
+    /// and it exists because "what has happened to this guest" is the question
+    /// every console user has and no listing answered. Without it a console
+    /// would fetch every operation in the cell to show six lines about one
+    /// object — which is the cost these filters exist to avoid.
+    pub target: Option<String>,
 }
 
 impl Filter {
@@ -124,16 +179,52 @@ impl Filter {
         Self::default()
     }
 
+    /// Whether this object carries the labels asked for.
+    ///
+    /// Read off the document rather than the typed object: this runs before
+    /// the expensive half of a listing, and parsing an object to reject it
+    /// would be paying exactly the cost this ordering exists to avoid.
+    fn labels_admit(&self, document: &Value) -> bool {
+        if self.labels.is_empty() {
+            return true;
+        }
+        let labels: std::collections::BTreeMap<String, String> = document
+            .get("meta")
+            .and_then(|m| m.get("labels"))
+            .and_then(|l| serde_json::from_value(l.clone()).ok())
+            .unwrap_or_default();
+        velstra_cloud_model::meta::labels_match(&labels, &self.labels)
+    }
+
     pub fn for_node(node: impl Into<String>) -> Self {
         Self {
+            labels: Vec::new(),
+            target: None,
             assignee: Some(Assignee::Node(node.into())),
         }
     }
 
     pub fn for_pool(pool: impl Into<String>) -> Self {
         Self {
+            labels: Vec::new(),
+            target: None,
             assignee: Some(Assignee::Pool(pool.into())),
         }
+    }
+
+    /// Whether this record is about the resource that was asked about.
+    ///
+    /// Read off the document, like the label check and for the same reason:
+    /// this runs before the expensive half of a listing.
+    fn target_admits(&self, document: &Value) -> bool {
+        let Some(wanted) = &self.target else {
+            return true;
+        };
+        document
+            .get("spec")
+            .and_then(|s| s.get("target"))
+            .and_then(Value::as_str)
+            == Some(wanted.as_str())
     }
 
     /// Whether this object passes.
@@ -176,6 +267,7 @@ struct Scratch {
     ports: Option<Arc<Vec<velstra_cloud_model::resources::Port>>>,
     nodes: Option<Arc<Vec<Node>>>,
     floating: Option<Arc<Vec<velstra_cloud_model::resources::FloatingIp>>>,
+    balancers: Option<Arc<Vec<velstra_cloud_model::loadbalancer::LoadBalancer>>>,
 }
 
 impl Scratch {
@@ -201,6 +293,18 @@ impl Scratch {
         let floating = Arc::new(api.typed_list("", "floatingips").await?);
         self.floating = Some(floating.clone());
         Ok(floating)
+    }
+
+    async fn balancers(
+        &mut self,
+        api: &Api,
+    ) -> ApiResult<Arc<Vec<velstra_cloud_model::loadbalancer::LoadBalancer>>> {
+        if let Some(balancers) = &self.balancers {
+            return Ok(balancers.clone());
+        }
+        let balancers = Arc::new(api.typed_list("", "load-balancers").await?);
+        self.balancers = Some(balancers.clone());
+        Ok(balancers)
     }
 
     async fn nodes(&mut self, api: &Api) -> ApiResult<Arc<Vec<Node>>> {
@@ -241,6 +345,17 @@ struct Inner {
     /// and nothing else can: they are not in `collections`, so there is no
     /// route, no list, no watch and no proxy hop that arrives at them.
     identity: crate::sessions::IdentityStore,
+    /// One allowance per caller, for **writes**.
+    ///
+    /// A mutex rather than anything cleverer: taking a token is a few integer
+    /// operations, and a lock held for that long is not the thing that will
+    /// ever be slow here. See [`velstra_cloud_model::limit`] for what this is
+    /// and — more to the point — what it is not.
+    limiter: std::sync::Mutex<velstra_cloud_model::limit::Limiter>,
+    /// `None` turns it off entirely, which is what a single-tenant cell and
+    /// every test wants: a limiter is about one tenant taking the write path
+    /// from another, and a cell with one tenant has no such problem.
+    write_rate: Option<velstra_cloud_model::limit::Rate>,
 }
 
 #[derive(Clone)]
@@ -285,11 +400,52 @@ impl Api {
             collection!("networks", NetworkSpec, NetworkStatus),
             collection!("routers", RouterSpec, RouterStatus),
             collection!("floatingips", FloatingIpSpec, FloatingIpStatus),
+            collection!("load-balancers", LoadBalancerSpec, LoadBalancerStatus),
             collection!("subnets", SubnetSpec, SubnetStatus),
             collection!("ports", PortSpec, PortStatus),
             collection!("security-groups", SecurityGroupSpec, SecurityGroupStatus),
             collection!("images", ImageSpec, ImageStatus),
             collection!("nodes", NodeSpec, NodeStatus),
+            collection!(
+                "device-classes",
+                velstra_cloud_model::pci::DeviceClassSpec,
+                velstra_cloud_model::resources::DeviceClassStatus
+            ),
+            collection!(
+                "backup-targets",
+                velstra_cloud_model::backup::BackupTargetSpec,
+                velstra_cloud_model::backup::BackupTargetStatus
+            ),
+            collection!(
+                "backups",
+                velstra_cloud_model::backup::BackupSpec,
+                velstra_cloud_model::backup::BackupStatus
+            ),
+            collection!(
+                "snapshot-schedules",
+                velstra_cloud_model::storage::SnapshotScheduleSpec,
+                velstra_cloud_model::storage::SnapshotScheduleStatus
+            ),
+            collection!(
+                "captures",
+                velstra_cloud_model::capture::CaptureSpec,
+                velstra_cloud_model::capture::CaptureStatus
+            ),
+            collection!(
+                "audit",
+                velstra_cloud_model::audit::AuditSpec,
+                velstra_cloud_model::audit::AuditStatus
+            ),
+            collection!(
+                "backup-schedules",
+                velstra_cloud_model::backup::BackupScheduleSpec,
+                velstra_cloud_model::backup::BackupScheduleStatus
+            ),
+            collection!(
+                "maintenance-windows",
+                velstra_cloud_model::maintenance::MaintenanceWindowSpec,
+                velstra_cloud_model::maintenance::MaintenanceWindowStatus
+            ),
             collection!("pools", PoolSpec, PoolStatus),
             collection!("operations", OperationSpec, OperationStatus),
             collection!("migrations", MigrationSpec, MigrationStatus),
@@ -302,6 +458,11 @@ impl Api {
                 placement: Placement::new(region, cell),
                 verifier: verifier.clone(),
                 identity: crate::sessions::IdentityStore::new(store.clone(), region, cell),
+                limiter: std::sync::Mutex::new(velstra_cloud_model::limit::Limiter::new()),
+                // Off unless a caller asks for it: a limiter is about one
+                // tenant taking the write path from another, and a cell with
+                // one tenant has no such problem.
+                write_rate: None,
             }),
         }
     }
@@ -335,8 +496,24 @@ impl Api {
 
     /// One object, by name.
     pub async fn get(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
-        self.authorize(who, Verb::Read, name).await?;
+        // An audit record is judged by what it is about, so the decision needs
+        // the record — see `may_read`. Reading it first is safe: a refusal is
+        // still a refusal, and the object's existence was already implied by
+        // the caller naming it.
         let collection = self.collection(name.collection())?;
+        if name.collection() == "audit" {
+            let document = collection
+                .get(&name.to_string())
+                .await?
+                .ok_or_else(|| ApiError::not_found(name))?;
+            if !self.may_read(who, name, &document).await {
+                return Err(self.refuse_a_read(who, name).await);
+            }
+            let mut document = document;
+            self.answer(&mut document, &mut Scratch::default()).await?;
+            return Ok(document);
+        }
+        self.authorize(who, Verb::Read, name).await?;
         let mut document = collection
             .get(&name.to_string())
             .await?
@@ -366,6 +543,54 @@ impl Api {
         self
     }
 
+    /// Cap how fast one caller may **write**.
+    ///
+    /// Off unless asked for. What it stops is the ordinary accident — a script
+    /// in a loop, a controller with no backoff — taking the cell's write path
+    /// from everybody else; it is not a security boundary and does not pretend
+    /// to be one.
+    pub fn with_write_rate(mut self, rate: velstra_cloud_model::limit::Rate) -> Self {
+        let inner =
+            Arc::get_mut(&mut self.inner).expect("a write rate is set before the API is shared");
+        inner.write_rate = Some(rate);
+        self
+    }
+
+    /// Take one caller's write token, or say how long to wait.
+    ///
+    /// Node agents are exempt, and that is not a convenience: an agent reports
+    /// when something changed, and something changing is not something it can
+    /// defer. Refusing one would make it retry, fall behind, and eventually be
+    /// judged unreachable by the control plane that was itself the reason.
+    pub fn may_write_now(&self, who: &Identity) -> ApiResult<()> {
+        let Some(rate) = self.inner.write_rate else {
+            return Ok(());
+        };
+        if crate::sessions::agent_node(who).is_some() {
+            return Ok(());
+        }
+        let now = velstra_cloud_model::meta::Timestamp::now();
+        let verdict = {
+            let mut limiter = self.inner.limiter.lock().unwrap();
+            // Swept here rather than on a timer: the map only grows when
+            // somebody is spending, and this runs exactly then.
+            limiter.forget_idle(rate, now);
+            limiter.take(&who.subject, rate, now)
+        };
+        match verdict {
+            velstra_cloud_model::limit::Verdict::Allowed => Ok(()),
+            velstra_cloud_model::limit::Verdict::Wait { millis } => Err(ApiError::new(
+                Code::ResourceExhausted,
+                format!(
+                    "too many writes at once; this one would be the {} in a second. Try again in \
+                     {millis} ms — the same request, unchanged, will be accepted then.",
+                    rate.per_second + 1
+                ),
+            )
+            .retry_after(millis)),
+        }
+    }
+
     /// Whether `who` may `verb` `name`, from the bindings on the project that
     /// governs it — or from the operator list, for anything outside every
     /// project.
@@ -373,7 +598,130 @@ impl Api {
     /// One function, called at the top of every entry point, because an
     /// authorisation rule spread across eleven call sites is an authorisation
     /// rule with a hole in it.
+    /// The gate every request passes, and the one place a refusal is recorded.
+    ///
+    /// Wrapped rather than scattered: a refusal written at each call site is a
+    /// refusal somebody forgets to write at the next one, and the call site
+    /// that forgets is the one an audit is eventually about.
     async fn authorize(&self, who: &Identity, verb: Verb, name: &ResourceName) -> ApiResult<()> {
+        let verdict = self.judge(who, verb, name).await;
+        if let Err(refusal) = &verdict {
+            self.record_refusal(who, verb, name, &refusal.to_string())
+                .await;
+        }
+        verdict
+    }
+
+    /// Note that somebody was told no.
+    ///
+    /// Best-effort on purpose. A refusal that could not be written is still a
+    /// refusal, and failing the request because the record failed would turn a
+    /// full disk into an outage — while *granting* it would be worse. So the
+    /// answer is unchanged either way and the miss is logged.
+    ///
+    /// The id collapses repeats within a minute (see
+    /// [`velstra_cloud_model::audit::record_id`]), which is what stops somebody
+    /// filling the store by hammering a forbidden path.
+    async fn record_refusal(&self, who: &Identity, verb: Verb, name: &ResourceName, detail: &str) {
+        use velstra_cloud_model::audit::{AuditKind, AuditSpec, AuditStatus, record_id};
+
+        let at = velstra_cloud_model::meta::Timestamp::now();
+        let spelled = match verb {
+            Verb::Read => "read",
+            Verb::Write => "write",
+            Verb::Administer => "administer",
+        };
+        let id = record_id(
+            AuditKind::Refused,
+            &who.subject,
+            spelled,
+            &name.to_string(),
+            at,
+        );
+        let Ok(record_name) = ResourceName::parse(&format!("audit/{id}")) else {
+            return;
+        };
+        let Ok(collection) = self.collection("audit") else {
+            return;
+        };
+        let spec = AuditSpec {
+            kind: AuditKind::Refused,
+            subject: who.subject.clone(),
+            target: name.to_string(),
+            verb: spelled.to_string(),
+            // The same sentence the caller was given. A paraphrase is one an
+            // operator has to correlate by hand against what the person
+            // actually saw.
+            detail: detail.to_string(),
+            at,
+        };
+        let meta = velstra_cloud_model::meta::Meta::new(
+            record_name,
+            self.inner.placement.clone(),
+        );
+        let (Ok(meta), Ok(spec)) = (serde_json::to_value(&meta), serde_json::to_value(&spec))
+        else {
+            return;
+        };
+        // An id already taken means this was noted within the last minute.
+        // That is the flood defence working, not a failure.
+        if let Err(e) = collection.create(meta, spec).await {
+            if e.code != Code::AlreadyExists {
+                tracing::warn!(error = %e.message, "could not record a refusal");
+            }
+        }
+        let _ = AuditStatus::default();
+    }
+
+    /// The refusal a read gets, recorded as one — the same sentence `authorize`
+    /// would have produced, so a caller cannot tell the two paths apart and the
+    /// audit carries one shape of line for "was told no".
+    async fn refuse_a_read(&self, who: &Identity, name: &ResourceName) -> ApiError {
+        match self.authorize(who, Verb::Read, name).await {
+            Err(e) => e,
+            // Reached only if the ordinary rule would have allowed it, which
+            // `may_read` already tried. Refusing anyway would be a lie; this is
+            // the branch that cannot happen, spelled out rather than unwrapped.
+            Ok(()) => ApiError::forbidden("this record is not yours to read"),
+        }
+    }
+
+    /// Whether this caller may read this object, given the object itself.
+    ///
+    /// Ordinarily this is `judge` on the name and nothing more. The exception
+    /// is an **audit record**, which is a cell-wide object *about* something
+    /// else — and judging it by its own name means only a cell operator ever
+    /// sees one. That left the person whose request was refused unable to read
+    /// the sentence explaining it, which is precisely backwards: "I clicked
+    /// delete and nothing happened" is answered by a record they may not open.
+    ///
+    /// So a record is readable by anyone who may read **what it is about**, and
+    /// by **the person it is about**. Neither leaks: the first already reads
+    /// the target, and the second is their own refusal. Everything else about
+    /// the cell — who else was refused what — stays an operator's.
+    async fn may_read(&self, who: &Identity, name: &ResourceName, document: &Value) -> bool {
+        if self.judge(who, Verb::Read, name).await.is_ok() {
+            return true;
+        }
+        if name.collection() != "audit" {
+            return false;
+        }
+        let spec = &document["spec"];
+        if spec.get("subject").and_then(Value::as_str) == Some(who.subject.as_str())
+            && !who.subject.is_empty()
+        {
+            return true;
+        }
+        let Some(target) = spec.get("target").and_then(Value::as_str) else {
+            return false;
+        };
+        let Ok(target) = ResourceName::parse(target) else {
+            return false;
+        };
+        self.judge(who, Verb::Read, &target).await.is_ok()
+    }
+
+    async fn judge(&self, who: &Identity, verb: Verb, name: &ResourceName) -> ApiResult<()> {
         // Two ways to be an operator, and both are checked here so no call site
         // has to remember either. The started-with list is configuration and
         // cannot be revoked from inside the cell — it is the escape hatch for an
@@ -381,6 +729,18 @@ impl Api {
         // is a fact about the signed-in user, resolved once at authentication,
         // and it is what lets an operator be *appointed* without a restart.
         if self.is_operator(who) {
+            return Ok(());
+        }
+        // A node agent may **read** the cell, and only read it. A node needs
+        // tenant network config, images and the node list to run its guests, and
+        // it reads all of that the way it always has — the change per-node
+        // identity makes is not to what a node may see but to what it may write.
+        // Its one write is a status report, which does not come through here at
+        // all: it goes through `report_status`, authorised by the ownership rule
+        // in `judge` rather than by a project binding. So a node's `Read` is
+        // granted and its `Write`/`Administer` fall through to the ordinary rules
+        // below, which refuse it — a node holds no binding anywhere.
+        if verb == Verb::Read && crate::sessions::agent_node(who).is_some() {
             return Ok(());
         }
         let Some(project) = governing_project(name) else {
@@ -471,6 +831,35 @@ impl Api {
                 served.insert(kind, Served::start(collection.clone()));
             }
         }
+    }
+
+    /// Start a background task that deletes expired sessions on a timer.
+    ///
+    /// The request path sweeps a session the moment it is presented past its
+    /// expiry, but a token never presented again leaves a record nothing ever
+    /// reads — so without this the store grows one row per such sign-in for ever.
+    /// This is the periodic reaper for exactly those; see
+    /// [`crate::sessions::IdentityStore::sweep_expired_sessions`] for why it is
+    /// expiry-only.
+    ///
+    /// Spawned by the server process and not by [`Api::new`], for the same reason
+    /// [`Api::serve_agents`] is: a test or a one-shot tool that builds an `Api`
+    /// pays for none of it. The clock lives here, so the swept-against time is
+    /// real in production and injectable in a test that calls
+    /// `sweep_expired_sessions` directly.
+    pub fn spawn_session_sweeper(&self) {
+        let identity = self.inner.identity.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SESSION_SWEEP_INTERVAL);
+            // The first tick is immediate; a fresh cell has nothing to sweep, and
+            // sweeping an empty collection costs one list.
+            loop {
+                ticker.tick().await;
+                if let Err(e) = identity.sweep_expired_sessions(Timestamp::now()).await {
+                    tracing::warn!(error = %e, "the session sweep could not run this round");
+                }
+            }
+        });
     }
 
     /// The cache for a collection, if a filtered caller may be served from one.
@@ -657,6 +1046,16 @@ impl Api {
                 if !filter.admits(kind, &document) {
                     continue;
                 }
+                // Labels next, and before the computed fields for the same
+                // reason: an object nobody asked for should cost nothing.
+                if !filter.labels_admit(&document) {
+                    continue;
+                }
+                // "What has happened to this guest": a record about something
+                // else costs nothing beyond this line.
+                if !filter.target_admits(&document) {
+                    continue;
+                }
                 // Before `answer`, for the same reason `admits` is: the derived
                 // fields are the expensive part, and an object the caller may
                 // not see is an object nobody should pay for.
@@ -665,7 +1064,15 @@ impl Api {
                     else {
                         continue;
                     };
-                    if self.authorize(who, Verb::Read, &name).await.is_err() {
+                    // `judge`, not `authorize`: filtering a list is not
+                    // refusing a request, which is what this function's own
+                    // doc says two screens up — and `authorize` records a
+                    // refusal in the audit. One tenant listing a cell of four
+                    // hundred guests would have written four hundred audit
+                    // records, one per object they were never asking for by
+                    // name. The audit is for somebody who reached for a thing
+                    // and was told no.
+                    if !self.may_read(who, &name, &document).await {
                         continue;
                     }
                 }
@@ -728,6 +1135,13 @@ impl Api {
         body: &Value,
         who: &Identity,
     ) -> ApiResult<Created> {
+        // Before the authorisation, deliberately: cutting the work is the whole
+        // point of a limiter, and the cost of the other order is that a script
+        // in a loop pays for a permission check on every pass. The trade is
+        // that somebody who would have been refused anyway is told they are
+        // going too fast first — which is true, and which they discover the
+        // moment they slow down.
+        self.may_write_now(who)?;
         // Authorised on the **parent**, because the object does not exist yet
         // and has no bindings of its own. Creating inside a project is a write
         // to that project; creating without one is a write to the cell.
@@ -761,6 +1175,9 @@ impl Api {
         // and gibibytes — so that a field of the wrong shape is reported by the
         // one check that knows which field it was.
         collection.check_spec(&spec)?;
+        if let Some(sent) = body.get("spec") {
+            collection.check_known(sent)?;
+        }
         crate::refs::check(kind, &spec)?;
         // Before anything follows one of those references — `settle_volume_source`
         // reads the snapshot, `settle_migration` reads the instance — so that a
@@ -778,6 +1195,12 @@ impl Api {
         if kind == "snapshots" {
             self.settle_snapshot(&name, &mut spec).await?;
         }
+        if kind == "backups" {
+            self.settle_backup(&mut spec).await?;
+        }
+        if kind == "captures" {
+            self.settle_capture(&mut spec).await?;
+        }
         if kind == "volumes" {
             self.settle_volume_source(&name, &mut spec).await?;
         }
@@ -787,6 +1210,18 @@ impl Api {
         }
         if kind == "images" {
             refuse_an_unverified_signature(&spec)?;
+        }
+        if kind == "nodes" {
+            refuse_an_unusable_overcommit(&spec)?;
+        }
+        if kind == "floatingips" {
+            self.refuse_an_address_that_reaches_nothing(&name, &spec).await?;
+        }
+        if kind == "networks" {
+            refuse_an_external_network_from_a_tenant(&spec, who, self.is_operator(who))?;
+        }
+        if kind == "maintenance-windows" {
+            self.refuse_a_window_that_would_do_nothing(&name, &spec).await?;
         }
         self.check_cell(&name, kind).await?;
         self.check_quota(&name, kind, &spec).await?;
@@ -808,9 +1243,20 @@ impl Api {
         let operation = self
             .mint_operation(&name, generation, "create", who)
             .await?;
+        // Registering a node mints its per-node agent token, returned once. The
+        // node object exists first, so a mint that fails leaves a node an
+        // operator can see and re-issue a token for rather than a half-registered
+        // ghost — and only a cell operator reaches this path (a node is a
+        // cell-wide resource), so nobody but an operator ever receives a token.
+        let node_token = if kind == "nodes" {
+            Some(self.inner.identity.mint_node_credential(name.id()).await?)
+        } else {
+            None
+        };
         Ok(Created {
             operation,
             target: name.to_string(),
+            node_token,
         })
     }
 
@@ -822,6 +1268,7 @@ impl Api {
         expect: Option<Revision>,
         who: &Identity,
     ) -> ApiResult<Value> {
+        self.may_write_now(who)?;
         // Changing who else may is a different permission from changing
         // anything else, or an editor is an admin one request later.
         let verb = if body
@@ -834,6 +1281,18 @@ impl Api {
             Verb::Write
         };
         self.authorize(who, verb, name).await?;
+        // A project's quota is the cell operator's to set, and a project admin
+        // may not raise their own. It lives in `spec.quota` only because a
+        // project is where a quota applies — changing it is a change to the cell,
+        // not to the project, and a tenant who could lift their own limit would
+        // make the limit advice rather than a bound. Checked after `authorize`,
+        // so a caller who may not touch the project at all is refused in the same
+        // words as for any other field and learns nothing extra.
+        if body.get("spec").and_then(|s| s.get("quota")).is_some() && !self.is_operator(who) {
+            return Err(ApiError::forbidden(
+                "a project's quota is set by a cell operator; a project admin may not change it",
+            ));
+        }
         let collection = self.collection(name.collection())?;
         refuse_unwritable(body)?;
         let mut patch = Patch {
@@ -859,6 +1318,42 @@ impl Api {
             if name.collection() == "images" {
                 refuse_an_unverified_signature(spec)?;
             }
+            if name.collection() == "instances" && spec.get("root_disk_gib").is_some() {
+                self.refuse_a_smaller_disk(name, spec, who).await?;
+            }
+            // `cpu_baseline`, not `cpuBaseline`: the body was converted out of
+            // its wire spelling before it got here.
+            if name.collection() == "floatingips" {
+                let stored: Value = self.get(name, who).await?;
+                let mut merged = stored["spec"].clone();
+                merge(&mut merged, spec);
+                self.refuse_an_address_that_reaches_nothing(name, &merged)
+                    .await?;
+            }
+            if name.collection() == "networks" && spec.get("external").is_some() {
+                refuse_an_external_network_from_a_tenant(spec, who, self.is_operator(who))?;
+            }
+            if name.collection() == "maintenance-windows" {
+                // Merged onto what is stored, because a change that moves only
+                // the start time must still be judged as the whole window it
+                // leaves behind.
+                let stored: Value = self.get(name, who).await?;
+                let mut merged = stored["spec"].clone();
+                merge(&mut merged, spec);
+                self.refuse_a_window_that_would_do_nothing(name, &merged)
+                    .await?;
+            }
+            // Before anything reads the change: a field nobody has is a change
+            // that will not happen, and answering `200` to one is agreeing to
+            // something that will not be done.
+            collection.check_known(spec)?;
+            if name.collection() == "nodes" && spec.get("vcpu_overcommit").is_some() {
+                refuse_an_unusable_overcommit(spec)?;
+            }
+            if name.collection() == "nodes" && spec.get("cpu_baseline").is_some() {
+                self.refuse_a_baseline_this_node_cannot_present(name, spec, who)
+                    .await?;
+            }
             // A change may move an attachment's node — after a migration, to
             // agree with the instance again — but never away from it.
             if name.collection() == "attachments" && spec.get("node").is_some() {
@@ -881,6 +1376,47 @@ impl Api {
         Ok(document)
     }
 
+    /// Report the status of an object, as the node agent that owns it.
+    ///
+    /// This is the write half of `--api` mode, and the reason a node token is a
+    /// trust boundary rather than a shared operator key. Only a caller that
+    /// authenticated with a per-node token may reach it, and only for an object
+    /// that token's node owns or was assigned — but neither of those checks lives
+    /// here. The caller being an *agent at all* is the gate this function keeps;
+    /// **which** objects it may write is [`velstra_cloud_model::access::judge`]'s,
+    /// applied inside `store.update` exactly as it is for a direct-store report,
+    /// so there is one answer to "may this node write this status" and it is not
+    /// re-derived on the API path.
+    ///
+    /// A caller who is not a node agent — a person, an operator, a service
+    /// account — has no agent scope and is refused here, because status is not a
+    /// thing any of them writes: it is the agent's half, and the API does not get
+    /// to be more permissive than the store.
+    pub async fn report_status(
+        &self,
+        name: &ResourceName,
+        body: &Value,
+        expect: Option<Revision>,
+        who: &Identity,
+    ) -> ApiResult<Value> {
+        let Some(node) = crate::sessions::agent_node(who) else {
+            return Err(ApiError::forbidden(
+                "status is written by the node agent that owns the object; this token is not a \
+                 node agent",
+            ));
+        };
+        let Some(status) = body.get("status") else {
+            return Err(ApiError::invalid("a status report carries a status").at("status"));
+        };
+        let collection = self.collection(name.collection())?;
+        let writer = velstra_cloud_model::Writer::agent(node);
+        let mut document = collection
+            .report_status(&name.to_string(), status, expect, &writer)
+            .await?;
+        self.answer(&mut document, &mut Scratch::default()).await?;
+        Ok(document)
+    }
+
     /// Ask for a deletion. Two-phase and visible: the object stays readable,
     /// carrying its `deletedAt` and its finalizers, until the last holder lets
     /// go.
@@ -890,6 +1426,7 @@ impl Api {
         expect: Option<Revision>,
         who: &Identity,
     ) -> ApiResult<Deleted> {
+        self.may_write_now(who)?;
         self.authorize(who, Verb::Write, name).await?;
         // Asked before anything is written down. Deleting an object something
         // still names does not fail loudly anywhere: the reference simply stops
@@ -935,6 +1472,18 @@ impl Api {
                 tracing::error!(
                     user = name.id(),
                     "deleted the user but could not remove their credential or sessions: {e}"
+                );
+            }
+        }
+        // A deleted node's agent token goes with it, for the same reason a
+        // deleted user's does: a token that outlived the node it speaks for is a
+        // credential for an object that no longer exists, and the only honest
+        // lifetime for it is the node's.
+        if name.collection() == "nodes" {
+            if let Err(e) = self.inner.identity.forget_node(name.id()).await {
+                tracing::error!(
+                    node = name.id(),
+                    "deleted the node but could not remove its agent credential: {e}"
                 );
             }
         }
@@ -1217,7 +1766,33 @@ impl Api {
             })
             .collect();
 
-        let (candidate, rejected) = match place(&instance, &nodes, &occupied) {
+        // The cell's device classes, so that an instance asking for hardware
+        // gets the same answer here as the scheduler will give it. Two
+        // explanations that disagree would be worse than one that is late.
+        let classes: std::collections::BTreeMap<String, velstra_cloud_model::pci::DeviceClassSpec> =
+            {
+                let all: Vec<velstra_cloud_model::resources::DeviceClass> = self
+                    .typed_list("", "device-classes")
+                    .await
+                    .unwrap_or_default();
+                all.into_iter()
+                    .map(|c| (c.meta.name.id().to_string(), c.spec))
+                    .collect()
+            };
+        let closed = self.closed_nodes().await?;
+        // The opposite ask, read the same way and from the same objects.
+        let with_group: Vec<(String, String)> = instances
+            .iter()
+            .filter(|other| other.meta.name != instance.meta.name)
+            .filter_map(|i| {
+                Some((
+                    i.spec.placement_policy.affinity_group.clone()?,
+                    i.spec.node.clone()?,
+                ))
+            })
+            .collect();
+        let (candidate, rejected) =
+            match place(&instance, &nodes, &occupied, &with_group, &classes, &closed) {
             Ok(node) => (Some(node), Vec::new()),
             Err(chain) => (None, chain),
         };
@@ -1304,10 +1879,13 @@ impl Api {
             return Ok(());
         };
         let ports = scratch.ports(self).await?;
-        // Floating addresses come out of this same range, so a count that saw
-        // only ports would tell an operator a full subnet had room.
+        // Floating addresses and load balancer VIPs come out of this same
+        // range, so a count that saw only ports would tell an operator a full
+        // subnet had room.
         let floating = scratch.floating(self).await?;
-        let (allocated, available) = velstra_cloud_model::ipam::counts(&subnet, &ports, &floating);
+        let balancers = scratch.balancers(self).await?;
+        let (allocated, available) =
+            velstra_cloud_model::ipam::counts(&subnet, &ports, &floating, &balancers);
         document["status"]["allocated"] = json!(allocated);
         document["status"]["available"] = json!(available);
         Ok(())
@@ -1651,6 +2229,179 @@ impl Api {
 
     // ---- snapshots --------------------------------------------------------
 
+
+
+    /// A root disk may grow. It may not shrink.
+    ///
+    /// Shrinking is not a resize, it is a truncation: the bytes past the new
+    /// end are gone, and the filesystem that was using them finds out at the
+    /// worst possible moment. No backend asks the guest first, and none can —
+    /// so the only honest answer is to refuse, and to say what does work.
+    ///
+    /// Growing is allowed and takes effect when the guest next starts, like
+    /// every other size change. What the running guest actually has is on its
+    /// status, so nothing here reads as applied while it is not.
+    async fn refuse_a_smaller_disk(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+        who: &Identity,
+    ) -> ApiResult<()> {
+        let Some(asked) = spec.get("root_disk_gib").and_then(Value::as_u64) else {
+            return Ok(());
+        };
+        let _ = who;
+        let stored: Instance = self.typed(name).await?;
+        if asked >= stored.spec.root_disk_gib {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            format!(
+                "{name} has a {} GiB root disk and cannot be shrunk to {asked}: the bytes past \
+                 the new end would be gone and the filesystem using them would find out later. \
+                 Make a smaller guest from a backup instead.",
+                stored.spec.root_disk_gib
+            ),
+        )
+        .at("spec.rootDiskGib"))
+    }
+
+
+    /// Fill in a capture's node from its guest, and refuse the one thing that
+    /// makes a template untrustworthy.
+    ///
+    /// A disk copied from under a running machine is crash-consistent at best.
+    /// That is survivable for a backup — read once, in an emergency, by
+    /// somebody who knows what happened — and not survivable for a template
+    /// that will be stamped out a hundred times by people who assume it is
+    /// clean. The corruption then arrives a hundred times, later, with nothing
+    /// pointing back at this moment.
+    async fn settle_capture(&self, spec: &mut Value) -> ApiResult<()> {
+        let instance_name = spec
+            .get("instance")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let instance: Instance = self
+            .typed(&ResourceName::parse(&instance_name).map_err(|e| {
+                ApiError::invalid(format!("spec.instance: {e}")).at("spec.instance")
+            })?)
+            .await?;
+
+        let target_name = spec
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let target: velstra_cloud_model::resources::BackupTarget = self
+            .typed(&ResourceName::parse(&target_name).map_err(|e| {
+                ApiError::invalid(format!("spec.target: {e}")).at("spec.target")
+            })?)
+            .await?;
+
+        let guest = velstra_cloud_model::capture::GuestView {
+            name: instance_name.clone(),
+            running: instance.status.state
+                == velstra_cloud_model::resources::InstanceState::Running,
+            node: instance.status.node.clone().filter(|n| !n.is_empty()),
+            deleting: instance.meta.is_deleting(),
+        };
+        // `None` is "nobody is looking", which is not "no": a target whose
+        // spec names no reporting agent may be perfectly good, and turning
+        // silence into a refusal would make every capture wait for a field an
+        // operator has to know to set. A path that cannot be written fails on
+        // the copy, loudly, where it can be seen.
+        let usable = target.spec.accepting && target.status.writable != Some(false);
+        if let Err(refusal) =
+            velstra_cloud_model::capture::may_capture(&guest, usable, &target_name)
+        {
+            // The field is the control somebody can act on: a running guest is
+            // a different problem from a target that has gone.
+            let field = match &refusal {
+                velstra_cloud_model::capture::Refusal::TargetUnusable { .. } => "spec.target",
+                _ => "spec.instance",
+            };
+            return Err(
+                ApiError::new(Code::FailedPrecondition, refusal.to_string()).at(field)
+            );
+        }
+
+        // The node holding the disk, derived rather than asked for. Without it
+        // the object is assigned to nobody and no agent may ever claim it —
+        // the same hole the backup schedule had.
+        spec["node"] = Value::String(guest.node.unwrap_or_default());
+        Ok(())
+    }
+
+    /// Fill in a backup's pool from its volume, and refuse the one target that
+    /// makes it not a backup.
+    ///
+    /// The refusal is the whole point of the collection. A copy in the source's
+    /// own pool is a snapshot wearing a backup's name: it is lost with the pool
+    /// it is in, which is the one failure a backup is bought to survive. A
+    /// platform that accepted it would be selling a promise it does not keep,
+    /// and the operator finds out at the worst possible moment.
+    async fn settle_backup(&self, spec: &mut Value) -> ApiResult<()> {
+        let volume_name = spec
+            .get("volume")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let volume: Volume = self
+            .typed(&ResourceName::parse(&volume_name).map_err(|e| {
+                ApiError::invalid(format!("spec.volume: {e}")).at("spec.volume")
+            })?)
+            .await?;
+
+        let target_name = spec
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let target: velstra_cloud_model::resources::BackupTarget = self
+            .typed(&ResourceName::parse(&target_name).map_err(|e| {
+                ApiError::invalid(format!("spec.target: {e}")).at("spec.target")
+            })?)
+            .await?;
+
+        // Whether this target's path is a pool's. Answered from the pools
+        // themselves rather than from a flag somebody set on the target: a
+        // flag is a claim, and the thing that matters here is a fact.
+        let pools: Vec<velstra_cloud_model::resources::Pool> =
+            self.typed_list("", "pools").await.unwrap_or_default();
+        let same_pool_as = pools
+            .iter()
+            .find(|p| {
+                p.status
+                    .conditions
+                    .iter()
+                    .any(|c| c.reason == "PathIs" && c.message == target.spec.path)
+            })
+            .map(|p| p.meta.name.to_string());
+
+        let view = velstra_cloud_model::backup::TargetView {
+            name: target.meta.name.to_string(),
+            path: target.spec.path.clone(),
+            accepting: target.spec.accepting,
+            writable: target.status.writable,
+            same_pool_as,
+        };
+        if let Err(refusal) =
+            velstra_cloud_model::backup::may_back_up(&volume_name, &volume.spec.pool, &view)
+        {
+            return Err(
+                ApiError::new(Code::FailedPrecondition, refusal.to_string()).at("spec.target")
+            );
+        }
+
+        // The pool holding the source, derived rather than asked for — the same
+        // reason a snapshot's is. Without it the object is assigned to nobody
+        // and no agent may ever claim it.
+        spec["pool"] = Value::String(volume.spec.pool.clone());
+        Ok(())
+    }
+
     /// Fill in the pool a copy is made in, and refuse a copy that cannot work.
     ///
     /// A snapshot's source is its **parent**: `projects/p1/volumes/data-1/
@@ -1830,6 +2581,366 @@ impl Api {
         Ok(())
     }
 
+    /// A baseline a machine cannot reach is refused here rather than at boot.
+    ///
+    /// `-cpu <level>,enforce` would catch it: QEMU refuses to start a guest it
+    /// cannot give the promised processor. That is the right behaviour and the
+    /// wrong moment to find out — "the guests on node-c stopped booting" is a
+    /// long way from "node-c is a generation too old for the level you typed".
+    ///
+    /// Reads the node's *reported* flags, which is why this cannot be a plain
+    /// spec check: the answer depends on what the machine said about itself.
+    /// A node that has not reported a CPU yet is refused too — nothing about
+    /// it can be shown, and a baseline set on a machine nobody has heard from
+    /// is a promise with no basis.
+    async fn refuse_a_baseline_this_node_cannot_present(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+        who: &Identity,
+    ) -> ApiResult<()> {
+        let Some(level) = spec.get("cpu_baseline") else {
+            return Ok(());
+        };
+        // Clearing it is always allowed: going back to the host's own
+        // processor asks nothing of the machine.
+        if level.is_null() {
+            return Ok(());
+        }
+        let level: velstra_cloud_model::cpu::CpuLevel = serde_json::from_value(level.clone())
+            .map_err(|_| {
+                ApiError::invalid(
+                    "a cpu baseline is one of x86-64-v1, x86-64-v2, x86-64-v3, x86-64-v4",
+                )
+                .at("spec.cpuBaseline")
+            })?;
+
+        let _ = who;
+        let stored: Node = self.typed(name).await?;
+        let Some(reported) = stored.status.cpu else {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{} has not reported a cpu yet, so it cannot be shown to present {level}",
+                    name.id()
+                ),
+            )
+            .at("spec.cpuBaseline"));
+        };
+        if let Err(missing) = velstra_cloud_model::cpu::can_present(&reported, level) {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{} cannot present {level}: it lacks {}",
+                    name.id(),
+                    missing.join(", ")
+                ),
+            )
+            .at("spec.cpuBaseline"));
+        }
+        Ok(())
+    }
+
+    /// An address that could not reach anything is refused where it is asked
+    /// for, not discovered by somebody's customer.
+    ///
+    /// Two of the three refusals need the rest of the cell — whether the subnet
+    /// is on an external network, and whether any machine is a gateway — so
+    /// this reads both rather than deciding from the body alone.
+    async fn refuse_an_address_that_reaches_nothing(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let asked: velstra_cloud_model::resources::FloatingIpSpec =
+            serde_json::from_value(spec.clone()).map_err(|e| {
+                ApiError::invalid(format!("that is not a floating address: {e}")).at("spec")
+            })?;
+
+        // The subnet, and the network it is on. A subnet that is not there is
+        // somebody else's refusal — `refs::check` and the address controller
+        // both say so — and inventing a second sentence for it here would be
+        // two answers to one mistake.
+        let (external, network_announce) = match self.external_of(&asked.subnet).await {
+            Some(pair) => pair,
+            None => return Ok(()),
+        };
+
+        let nodes: Vec<Node> = self.typed_list("", "nodes").await.unwrap_or_default();
+        let gateways = nodes.iter().filter(|n| n.spec.gateway).count();
+
+        let view = velstra_cloud_model::public::AddressView {
+            name: name.to_string(),
+            address: asked.address.as_deref().and_then(|a| a.parse().ok()),
+            subnet: asked.subnet.clone(),
+            subnet_is_external: external,
+            delivery: asked.delivery,
+            announce: asked.announce,
+            port: asked.port.clone(),
+        };
+        velstra_cloud_model::public::may_publish(&view, network_announce, gateways)
+            .map_err(|why| ApiError::new(Code::FailedPrecondition, why.to_string()).at("spec"))
+    }
+
+    /// Whether this subnet is on an external network, and what that network
+    /// says about announcements.
+    async fn external_of(
+        &self,
+        subnet: &str,
+    ) -> Option<(bool, velstra_cloud_model::public::Announce)> {
+        let name = ResourceName::parse(subnet).ok()?;
+        let subnet: velstra_cloud_model::resources::Subnet = self.typed(&name).await.ok()?;
+        let network = ResourceName::parse(&subnet.spec.network).ok()?;
+        let network: velstra_cloud_model::resources::Network = self.typed(&network).await.ok()?;
+        Some((network.spec.external, network.spec.announce))
+    }
+
+    /// A maintenance window that could never take effect is refused now.
+    ///
+    /// Every one of these is knowable at the moment it is declared, and the
+    /// alternative is finding out at three in the morning: a window of zero
+    /// minutes sits in the list looking like a plan, and two overlapping
+    /// windows are two answers to "may this node take work at four o'clock"
+    /// where whoever declared the second believes theirs is the answer.
+    async fn refuse_a_window_that_would_do_nothing(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let asked: velstra_cloud_model::maintenance::MaintenanceWindowSpec =
+            serde_json::from_value(spec.clone()).map_err(|e| {
+                ApiError::invalid(format!("that is not a maintenance window: {e}")).at("spec")
+            })?;
+        let existing: Vec<velstra_cloud_model::resources::MaintenanceWindow> =
+            self.typed_list("", "maintenance-windows").await?;
+        let view = |name: String,
+                    spec: &velstra_cloud_model::maintenance::MaintenanceWindowSpec| {
+            velstra_cloud_model::maintenance::WindowView {
+                name,
+                node: spec.node.clone(),
+                starts_at: spec.starts_at,
+                minutes: spec.minutes,
+                drain: spec.drain,
+                note: spec.note.clone(),
+            }
+        };
+        let others: Vec<_> = existing
+            .iter()
+            .map(|w| view(w.meta.name.to_string(), &w.spec))
+            .collect();
+        velstra_cloud_model::maintenance::may_declare(
+            &view(name.to_string(), &asked),
+            &others,
+            velstra_cloud_model::meta::Timestamp::now(),
+        )
+        .map_err(|why| ApiError::new(Code::FailedPrecondition, why.to_string()).at("spec"))
+    }
+
+    /// The nodes that are out of service this instant.
+    ///
+    /// Read wherever placement is computed, so that "no valid host" says which
+    /// machines are out and when they come back rather than leaving an operator
+    /// to work out that the node they can see is deliberately unavailable.
+    async fn closed_nodes(&self) -> ApiResult<Vec<velstra_cloud_model::maintenance::Closed>> {
+        let windows: Vec<velstra_cloud_model::resources::MaintenanceWindow> =
+            self.typed_list("", "maintenance-windows").await?;
+        Ok(velstra_cloud_model::maintenance::closed_now(
+            &windows.iter().map(window_view).collect::<Vec<_>>(),
+            velstra_cloud_model::meta::Timestamp::now(),
+        ))
+    }
+
+    /// Where this address is, who says so, and what the guest should have.
+    ///
+    /// The question somebody asks when an address does not answer, and every
+    /// part of it is knowable without touching a packet: which machine is
+    /// announcing it (or why nothing is), what the guest must have configured,
+    /// and what the guest would have to do differently if it were moved.
+    pub async fn explain_reach(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+        self.authorize(who, Verb::Read, name).await?;
+        let fip: velstra_cloud_model::resources::FloatingIp = self.typed(name).await?;
+        let (external, network_announce) = self
+            .external_of(&fip.spec.subnet)
+            .await
+            .unwrap_or((false, Default::default()));
+
+        // Where the guest holding the port actually is — not where it was
+        // assigned. An address is reachable where the guest *is*, and
+        // announcing from an assignment is how a migration's last moments
+        // become a black hole.
+        let port_node = match ResourceName::parse(&fip.spec.port) {
+            Ok(port_name) if !fip.spec.port.is_empty() => {
+                let port: velstra_cloud_model::resources::Port = self.typed(&port_name).await?;
+                let instances: Vec<Instance> = self.typed_list("", "instances").await?;
+                instances
+                    .iter()
+                    .find(|i| i.spec.ports.iter().any(|p| p == &fip.spec.port))
+                    .and_then(|i| i.status.node.clone())
+                    .or(port.spec.node.clone())
+            }
+            _ => None,
+        };
+
+        let nodes: Vec<Node> = self.typed_list("", "nodes").await?;
+        let gateways: Vec<String> = nodes
+            .iter()
+            .filter(|n| n.spec.gateway)
+            .map(|n| n.meta.name.id().to_string())
+            .collect();
+
+        let view = velstra_cloud_model::public::AddressView {
+            name: name.to_string(),
+            address: fip.spec.address.as_deref().and_then(|a| a.parse().ok()),
+            subnet: fip.spec.subnet.clone(),
+            subnet_is_external: external,
+            delivery: fip.spec.delivery,
+            announce: fip.spec.announce,
+            port: fip.spec.port.clone(),
+        };
+        let who_announces = velstra_cloud_model::public::announcer(
+            &view,
+            network_announce,
+            port_node.as_deref(),
+            &gateways,
+        );
+
+        use velstra_cloud_model::public::{Announcer, Delivery};
+        let announced = match &who_announces {
+            Announcer::Host(node) => json!({ "from": "host", "nodes": [node] }),
+            Announcer::Gateways(nodes) => json!({ "from": "gateway", "nodes": nodes }),
+            Announcer::Nowhere(why) => json!({
+                "from": null, "nodes": [], "why": why.to_string(),
+            }),
+        };
+
+        // What the guest must have. Rendered from the same function the
+        // metadata service renders from, so what an operator is told here and
+        // what the guest was told cannot disagree.
+        let guest = view.address.filter(|_| view.delivery == Delivery::Routed).map(|address| {
+            let route = velstra_cloud_model::public::guest_route(address);
+            json!({
+                "address": format!("{}/{}", route.address, route.prefix_len),
+                "via": route.via.to_string(),
+                "onLink": route.on_link,
+                "defaultRoute": true,
+            })
+        });
+
+        Ok(json!({
+            "address": fip.spec.address,
+            "delivery": match view.delivery {
+                Delivery::Routed => "Routed",
+                Delivery::Nat => "Nat",
+            },
+            "external": external,
+            "port": fip.spec.port,
+            "on": port_node,
+            "announced": announced,
+            // `null` for a translated address: there is nothing for the guest
+            // to configure, which is the whole difference between the two.
+            "guest": guest,
+        }))
+    }
+
+    /// What maintenance is planned for one node, and what it will cost.
+    ///
+    /// The question an operator asks *before* the window opens: is anything
+    /// scheduled, will the guests move, and — the one that matters — which of
+    /// them cannot. A guest holding a passed-through device is bound to this
+    /// machine and will be stopped rather than moved, and finding that out
+    /// while the machine is on a trolley is finding it out too late.
+    pub async fn explain_maintenance(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+        self.authorize(who, Verb::Read, name).await?;
+        let node: Node = self.typed(name).await?;
+        let here = node.meta.name.id().to_string();
+        let now = velstra_cloud_model::meta::Timestamp::now();
+
+        let windows: Vec<velstra_cloud_model::resources::MaintenanceWindow> =
+            self.typed_list("", "maintenance-windows").await?;
+        let views: Vec<_> = windows.iter().map(window_view).collect();
+        let open = velstra_cloud_model::maintenance::open_on(&here, &views, now);
+        let next = velstra_cloud_model::maintenance::next_on(&here, &views, now);
+
+        let describe = |w: &velstra_cloud_model::maintenance::WindowView| {
+            json!({
+                "window": w.name,
+                "startsAt": w.starts_at.0,
+                "endsAt": w.ends_at().0,
+                "minutes": w.minutes,
+                "drain": w.drain,
+                "note": w.note,
+                "opensInMinutes": velstra_cloud_model::maintenance::opens_in_minutes(w, now),
+            })
+        };
+
+        // What the drain would cost, computed whether or not one is running:
+        // the answer is only useful *before* somebody commits to the window,
+        // and after it has opened it is too late to be told.
+        let draining = open.map(|w| w.drain).unwrap_or(false)
+            || next.map(|w| w.drain).unwrap_or(false)
+            || node.spec.evacuate;
+        let (going, stranded) = if draining {
+            let all: Vec<Instance> = self.typed_list("", "instances").await?;
+            let nodes: Vec<Node> = self.typed_list("", "nodes").await?;
+            let mine: Vec<&Instance> = all
+                .iter()
+                .filter(|i| {
+                    i.status.node.as_deref() == Some(here.as_str())
+                        && i.status.state == velstra_cloud_model::resources::InstanceState::Running
+                        && !i.meta.is_deleting()
+                })
+                .collect();
+            let others: Vec<&Node> = nodes
+                .iter()
+                .filter(|n| n.meta.name.id() != here && !n.meta.is_deleting())
+                .collect();
+            let cached =
+                |image: &str| velstra_cloud_model::resources::nodes_holding(image, &nodes);
+            let migrations: Vec<
+                velstra_cloud_model::resources::Resource<
+                    velstra_cloud_model::migration::MigrationSpec,
+                    velstra_cloud_model::migration::MigrationStatus,
+                >,
+            > =
+                self.typed_list("", "migrations").await?;
+            let moving: Vec<String> = migrations
+                .iter()
+                .filter(|m| !m.meta.is_deleting())
+                .map(|m| m.spec.instance.clone())
+                .collect();
+            velstra_cloud_model::migration::evacuate(&node, &mine, &others, &cached, &moving)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        Ok(json!({
+            "node": here,
+            "open": open.map(&describe),
+            "next": next.map(&describe),
+            // Whether the guests are being asked to leave right now, from
+            // either source: the switch an operator flipped, or a window that
+            // is open with `drain` set.
+            "draining": open.map(|w| w.drain).unwrap_or(false) || node.spec.evacuate,
+            "willMove": going.iter().map(|h| json!({
+                "instance": h.instance,
+                "to": h.to_node,
+            })).collect::<Vec<_>>(),
+            // The half that decides whether tonight goes well. A guest that
+            // cannot move will be stopped when the machine is, and the reason
+            // is on each line rather than in a footnote.
+            "cannotMove": stranded.iter().map(|s| json!({
+                "instance": s.instance,
+                // Every node's verdict, not a flattened "no host found": the
+                // remedy for "node-b is a generation too old" and the remedy
+                // for "it holds a GPU" are nothing like each other.
+                "why": s.refusals.iter().map(|(node, why)| json!({
+                    "node": node,
+                    "detail": why.to_string(),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
     async fn refuse_a_disk_that_is_not_free(&self, spec: &Value) -> ApiResult<()> {
         let Some(osds) = spec.get("osds").and_then(Value::as_array) else {
             return Ok(());
@@ -1996,7 +3107,15 @@ impl Api {
         let cached = self
             .image_cached_on(&instance.spec.image, &mut Scratch::default())
             .await?;
-        if let Err(refusal) = may_migrate(&instance, &source, &destination, &cached) {
+        // The mode the caller asked for, because it decides one of the
+        // refusals: only `Reboot` can carry a guest that holds hardware, and
+        // answering as though every migration were live would refuse a move
+        // the platform can actually make.
+        let mode: velstra_cloud_model::migration::MigrationMode = spec
+            .get("mode")
+            .and_then(|m| serde_json::from_value(m.clone()).ok())
+            .unwrap_or_default();
+        if let Err(refusal) = may_migrate(&instance, &source, &destination, &cached, mode) {
             // The field is the control an operator can act on: a destination
             // that cannot receive is a different problem from a guest that is
             // not running.
@@ -2012,6 +3131,255 @@ impl Api {
             .at(field));
         }
         Ok(())
+    }
+
+
+    /// What this cell has, what is spoken for, and what would actually fit.
+    ///
+    /// A verb on the node collection, like `:explainCpu`: it is a property of
+    /// the fleet, and hanging it off one node would read as that node's answer.
+    ///
+    /// The field worth pointing at is `largestFit`. Free memory does **not**
+    /// add up into a guest — sixty-four gibibytes spread over eight nodes fits
+    /// no sixteen-gibibyte guest — and a summary that showed only the sum would
+    /// tell somebody a guest fits when it does not. That is the whole reason
+    /// this is computed here rather than left to whoever draws the dashboard.
+    pub async fn explain_capacity(&self, who: &Identity) -> ApiResult<Value> {
+        let _ = who;
+        let nodes: Vec<velstra_cloud_model::resources::Node> =
+            self.typed_list("", "nodes").await?;
+        let h = velstra_cloud_model::reconcile::headroom(&nodes, &self.closed_nodes().await?);
+
+        let cap = |c: &velstra_cloud_model::resources::Capacity| {
+            json!({
+                "vcpus": c.vcpus,
+                "memoryMib": c.memory_mib,
+                "diskGib": c.disk_gib,
+            })
+        };
+        Ok(json!({
+            "usableNodes": h.usable_nodes,
+            // Silicon and promise, side by side. They differ exactly where an
+            // operator has set a ratio, and one without the other reads as
+            // though the cell had grown a processor.
+            "offeredVcpus": h.offered_vcpus,
+            // Named rather than folded into a total: "we have twelve nodes"
+            // and "eight will take a guest" are different sentences, and the
+            // second is the one somebody planning capacity needs.
+            "unusableNodes": h.unusable_nodes,
+            "total": cap(&h.total),
+            "allocated": cap(&h.allocated),
+            // Across the usable nodes only, so this and `total` disagree by
+            // exactly the drained capacity — on purpose.
+            "free": cap(&h.free),
+            "largestFit": cap(&h.largest_fit),
+        }))
+    }
+
+    /// What a project has left, and what it could actually start with it.
+    ///
+    /// Both halves in one answer, because either alone answers the wrong
+    /// question. "24 vCPUs of quota left" is what a tenant reads before
+    /// creating a guest that will never be placed; "no valid host" is what they
+    /// get afterwards, from a scheduler that knows nothing about quotas. The
+    /// binding side is named, because "your quota" and "the cell" are two
+    /// different afternoons: one is a message to an operator, the other is
+    /// waiting or picking a smaller shape.
+    pub async fn explain_quota(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+        // A read of the project, which is exactly what it is — so a tenant sees
+        // their own allowance and nobody sees somebody else's.
+        self.authorize(who, Verb::Read, name).await?;
+        let project: velstra_cloud_model::resources::Resource<ProjectSpec, ProjectStatus> =
+            self.typed(name).await?;
+
+        let dimensions = velstra_cloud_model::allowance::dimensions(
+            &project.spec.quota,
+            // Counted by the quota controller from the objects that exist,
+            // never from a running total: a total incremented on create and
+            // decremented on delete is wrong the first time either half is
+            // missed, and it fails closed.
+            &project.status.used,
+        );
+        let nodes: Vec<velstra_cloud_model::resources::Node> =
+            self.typed_list("", "nodes").await?;
+        let room = velstra_cloud_model::reconcile::headroom(&nodes, &self.closed_nodes().await?);
+        let startable =
+            velstra_cloud_model::allowance::largest_startable(&dimensions, &room);
+
+        Ok(json!({
+            "project": name.to_string(),
+            "dimensions": dimensions.iter().map(|d| json!({
+                "name": d.name,
+                "limit": d.limit,
+                "used": d.used,
+                // `null` where nobody set a limit, which is not the same
+                // answer as zero and must not render as one.
+                "left": d.left(),
+                "unlimited": d.unlimited(),
+                "exhausted": d.exhausted(),
+            })).collect::<Vec<_>>(),
+            "largestStartable": startable,
+        }))
+    }
+
+    /// What the fleet's processors look like, and what to do about them.
+    ///
+    /// One answer rather than three endpoints, because the three parts are only
+    /// useful together: the domains say what you have, the advice says what
+    /// could change, and the pending list says what the last change is still
+    /// working through. An operator asking "can this cell migrate freely" is
+    /// asking all three at once.
+    ///
+    /// Computed on every read and stored nowhere. A cached answer about a fleet
+    /// outlives the fleet that justified it, and this one is cheap: it is set
+    /// arithmetic over what the nodes already report.
+    pub async fn explain_cpu(&self, who: &Identity) -> ApiResult<Value> {
+        // Every node in the cell, because a migration domain is a property of
+        // the whole set. Authorised as a read of the node collection, which is
+        // what it is.
+        let _ = who;
+        let nodes: Vec<Node> = self.typed_list("", "nodes").await?;
+        let entries: Vec<velstra_cloud_model::cpu::NodeEntry> = nodes
+            .iter()
+            .filter_map(|n| {
+                Some(velstra_cloud_model::cpu::NodeEntry {
+                    node: n.meta.name.id().to_string(),
+                    cpu: n.status.cpu.clone()?,
+                })
+            })
+            .collect();
+
+        // Only running guests have a CPU to be pending about; a stopped one
+        // adopts whatever it is given when it next starts, so listing it would
+        // be inventing work.
+        let instances: Vec<Instance> = self.typed_list("", "instances").await?;
+        let guests: Vec<(String, String, velstra_cloud_model::cpu::GuestCpu)> = instances
+            .iter()
+            .filter_map(|i| {
+                Some((
+                    i.meta.name.to_string(),
+                    i.status.node.clone()?,
+                    i.status.cpu.clone()?,
+                ))
+            })
+            .collect();
+
+        let domains = velstra_cloud_model::cpu::migration_domains(&entries);
+        let advice = velstra_cloud_model::cpu::advise(&entries, &guests);
+        let pending = velstra_cloud_model::cpu::pending_adoption(&guests, &entries);
+
+        Ok(json!({
+            // Nodes that have not reported a CPU are named rather than
+            // silently dropped: "3 of 5 nodes" with no list is how an operator
+            // concludes the report is broken.
+            "unreported": nodes
+                .iter()
+                .filter(|n| n.status.cpu.is_none())
+                .map(|n| n.meta.name.id().to_string())
+                .collect::<Vec<_>>(),
+            "domains": domains.iter().map(|d| json!({
+                "nodes": d.nodes,
+                "arch": d.arch,
+                "level": d.level.map(|l| l.as_str()),
+                "canBaseline": d.can_mask,
+            })).collect::<Vec<_>>(),
+            "advice": advice.iter().map(advice_json).collect::<Vec<_>>(),
+            "pendingAdoption": pending.iter().map(|p| json!({
+                "instance": p.instance,
+                "node": p.node,
+                "running": p.running.map(|l| l.as_str()),
+                "wouldGet": p.would_get.map(|l| l.as_str()),
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+
+
+    /// Why a guest has, or has not, been brought back from a node that stopped
+    /// answering.
+    ///
+    /// Computed on demand rather than written onto the instance, and that is
+    /// not a nicety. The agent on the node owns that status — the access rule
+    /// refuses a controller writing it — so a note about recovery could only
+    /// exist by having two parties write one object, which is the thing this
+    /// platform is built to prevent.
+    ///
+    /// The same function the recovery controller runs, on the same objects, so
+    /// the two can never tell different stories about one guest.
+    pub async fn explain_recovery(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+        self.authorize(who, Verb::Read, name).await?;
+        if name.collection() != "instances" {
+            return Err(ApiError::invalid("only a guest is recovered"));
+        }
+        let instance: Instance = self.typed(name).await?;
+        let Some(node_name) = instance.spec.node.clone().filter(|n| !n.is_empty()) else {
+            return Ok(json!({
+                "node": null,
+                "recoverable": false,
+                "why": "NotPlaced",
+                "detail": "it is not on a node, so there is nothing to recover it from",
+            }));
+        };
+        // `spec.node` is a **bare id** — `node-a` — as every node reference in
+        // this API is, for the reason `crate::refs` states: a node is a
+        // cell-wide object under no parent, so there is no parent to spell.
+        // Parsing it as a whole resource name answered `500` for every guest
+        // that was actually placed, which is every guest this method exists
+        // for. Found by the recorded-shape test on its first run.
+        let node: velstra_cloud_model::resources::Node = self
+            .typed(&ResourceName::parse(&format!("nodes/{node_name}")).map_err(|e| {
+                ApiError::internal(format!("a guest names {node_name}, which is not an id: {e}"))
+            })?)
+            .await?;
+
+        let guest = velstra_cloud_model::ha::GuestView {
+            name: name.to_string(),
+            on_node_loss: instance.spec.on_node_loss,
+            was_running: instance.status.state
+                == velstra_cloud_model::resources::InstanceState::Running,
+            devices: instance.status.devices.clone(),
+            deleting: instance.meta.is_deleting(),
+        };
+        let view = velstra_cloud_model::ha::NodeView {
+            name: node_name.clone(),
+            last_heartbeat: node.status.last_heartbeat,
+            fence_after_s: node.spec.fence_after_s,
+            ready: velstra_cloud_model::meta::condition(&node.status.conditions, "Ready")
+                .is_some_and(|c| c.status == velstra_cloud_model::meta::ConditionStatus::True),
+        };
+
+        let verdict = velstra_cloud_model::ha::may_recover(
+            &guest,
+            &view,
+            velstra_cloud_model::meta::Timestamp::now(),
+            velstra_cloud_model::ha::RECOVERY_MARGIN_S,
+        );
+        Ok(match verdict {
+            Ok(()) => json!({
+                "node": node_name,
+                "recoverable": true,
+                "why": "",
+                "detail": "",
+            }),
+            Err(why) => {
+                use velstra_cloud_model::ha::NotRecoverable as N;
+                // A stable token beside the sentence, because the four reasons
+                // are four different actions and a console branches on which.
+                let token = match &why {
+                    N::PolicyIsLeave => "PolicyIsLeave",
+                    N::NotQuietLongEnough { .. } => "WaitingForFencing",
+                    N::NodeDoesNotFence { .. } => "NodeDoesNotFence",
+                    N::HoldsDevices { .. } => "HoldsDevices",
+                    N::NotRunning => "NotRunning",
+                };
+                json!({
+                    "node": node_name,
+                    "recoverable": false,
+                    "why": token,
+                    "detail": why.to_string(),
+                })
+            }
+        })
     }
 
     /// Where this guest could go, with a verdict for **every** node.
@@ -2055,7 +3423,17 @@ impl Api {
             .iter()
             .map(|to| {
                 let id = to.meta.name.id();
-                let verdict = may_migrate(&instance, source, to, &cached);
+                // Answered for a live migration, which is the default and
+                // what a console's picker is about. A guest holding hardware
+                // is therefore shown as unmovable here, and the refusal names
+                // `Reboot` as the way to move it anyway.
+                let verdict = may_migrate(
+                    &instance,
+                    source,
+                    to,
+                    &cached,
+                    velstra_cloud_model::migration::MigrationMode::Live,
+                );
                 let d = velstra_cloud_proto::convert::destination_of(id, verdict.as_ref().err());
                 json!({ "node": d.node, "allowed": d.allowed, "why": d.why, "detail": d.detail })
             })
@@ -2162,7 +3540,15 @@ impl Api {
     }
 
     async fn check_quota(&self, name: &ResourceName, kind: &str, spec: &Value) -> ApiResult<()> {
-        if kind != "instances" && kind != "volumes" {
+        if kind != "instances"
+            && kind != "volumes"
+            && kind != "floatingips"
+            && kind != "load-balancers"
+        {
+            // `device-classes` is deliberately absent: a class is a definition
+            // of what hardware exists, not a thing a project holds. What is
+            // capped is how many devices an *instance* asks for, which is
+            // counted on the instance above.
             return Ok(());
         }
         let Some(project) = name.project() else {
@@ -2180,21 +3566,48 @@ impl Api {
         let quota = &project.spec.quota;
         let parent = project_name.to_string();
 
-        if kind == "instances" {
-            let wanted: InstanceSpec = serde_json::from_value(spec.clone())?;
-            let existing: Vec<Instance> = self.typed_list(&parent, "instances").await?;
-            let count = existing.len() as u32 + 1;
-            let vcpus = existing.iter().map(|i| i.spec.vcpus).sum::<u32>() + wanted.vcpus;
-            let memory =
-                existing.iter().map(|i| i.spec.memory_mib).sum::<u64>() + wanted.memory_mib;
-            exceeded(quota.instances as u64, count as u64, "instances", "spec")?;
-            exceeded(quota.vcpus as u64, vcpus as u64, "vCPUs", "spec.vcpus")?;
-            exceeded(quota.memory_mib, memory, "MiB of memory", "spec.memoryMib")?;
-        } else {
-            let wanted: VolumeSpec = serde_json::from_value(spec.clone())?;
-            let existing: Vec<Volume> = self.typed_list(&parent, "volumes").await?;
-            let gib = existing.iter().map(|v| v.spec.size_gib).sum::<u64>() + wanted.size_gib;
-            exceeded(quota.volume_gib, gib, "GiB of volume", "spec.sizeGib")?;
+        // Counted from what is stored each time, never from a running total, for
+        // the reason the whole quota system is: a total that is incremented on
+        // create and decremented on delete is wrong the first time either half
+        // is missed, and it fails closed — a project that slowly loses capacity
+        // it never used. So every dimension here is a fresh sum over the objects
+        // that exist plus the one being created.
+        match kind {
+            "instances" => {
+                let wanted: InstanceSpec = serde_json::from_value(spec.clone())?;
+                let existing: Vec<Instance> = self.typed_list(&parent, "instances").await?;
+                let count = existing.len() as u32 + 1;
+                let vcpus = existing.iter().map(|i| i.spec.vcpus).sum::<u32>() + wanted.vcpus;
+                let memory =
+                    existing.iter().map(|i| i.spec.memory_mib).sum::<u64>() + wanted.memory_mib;
+                exceeded(quota.instances as u64, count as u64, "instances", "spec")?;
+                exceeded(quota.vcpus as u64, vcpus as u64, "vCPUs", "spec.vcpus")?;
+                exceeded(quota.memory_mib, memory, "MiB of memory", "spec.memoryMib")?;
+            }
+            "volumes" => {
+                let wanted: VolumeSpec = serde_json::from_value(spec.clone())?;
+                let existing: Vec<Volume> = self.typed_list(&parent, "volumes").await?;
+                let count = existing.len() as u32 + 1;
+                let gib = existing.iter().map(|v| v.spec.size_gib).sum::<u64>() + wanted.size_gib;
+                // Two independent limits on the same collection: a count of
+                // objects and a sum of gibibytes. Either can be the one a
+                // project hits, so both are checked and the one that fails names
+                // itself.
+                exceeded(quota.volumes as u64, count as u64, "volumes", "spec")?;
+                exceeded(quota.volume_gib, gib, "GiB of volume", "spec.sizeGib")?;
+            }
+            "floatingips" => {
+                let existing: Vec<velstra_cloud_model::resources::FloatingIp> =
+                    self.typed_list(&parent, "floatingips").await?;
+                let count = existing.len() as u64 + 1;
+                exceeded(quota.floating_ips as u64, count, "floating IPs", "spec")?;
+            }
+            _ => {
+                let existing: Vec<velstra_cloud_model::loadbalancer::LoadBalancer> =
+                    self.typed_list(&parent, "load-balancers").await?;
+                let count = existing.len() as u64 + 1;
+                exceeded(quota.load_balancers as u64, count, "load balancers", "spec")?;
+            }
         }
         Ok(())
     }
@@ -2366,6 +3779,58 @@ fn under(document: &Value, parent: &str) -> bool {
 /// is that the platform will not hold a security claim it cannot verify,
 /// because everywhere it is displayed becomes evidence somebody will cite.
 ///
+/// A tenant that could mark a network external could mint itself a public
+/// range by writing a CIDR into a subnet.
+///
+/// So the flag is an operator's, and it is refused rather than ignored: a
+/// silently dropped `external: true` would leave somebody believing they had a
+/// public network and wondering why nothing reaches it.
+fn refuse_an_external_network_from_a_tenant(
+    spec: &Value,
+    who: &Identity,
+    is_operator: bool,
+) -> ApiResult<()> {
+    let _ = who;
+    if spec.get("external").and_then(Value::as_bool) == Some(true) && !is_operator {
+        return Err(ApiError::forbidden(
+            "only a cell operator may mark a network external. What the flag means is that the \
+             prefixes on its subnets are real — routed to this cell by whoever is above it — and \
+             that is not a claim a tenant can make about their own range.",
+        )
+        .at("spec.external"));
+    }
+    Ok(())
+}
+
+/// A ratio that would promise a cell's worth of processor out of one machine.
+///
+/// There is no correct number here and the platform does not pretend to know
+/// one — four is ordinary, sixteen is a lab, and the right answer depends on
+/// what the guests do all day. What is refused is the range where the ratio has
+/// stopped being a trade and become a way of hiding that a cell is full: past
+/// thirty-two, a machine's guests are getting a thirty-second of a core each
+/// and "it is slow" stops being diagnosable from anything the platform reports.
+const MOST_VCPUS_PER_CORE: u64 = 32;
+
+fn refuse_an_unusable_overcommit(spec: &Value) -> ApiResult<()> {
+    let Some(ratio) = spec.get("vcpu_overcommit") else {
+        return Ok(());
+    };
+    let Some(ratio) = ratio.as_u64() else {
+        return Err(
+            ApiError::invalid("a vcpu overcommit is a whole number of vcpus per core")
+                .at("spec.vcpuOvercommit"),
+        );
+    };
+    if ratio > MOST_VCPUS_PER_CORE {
+        return Err(ApiError::invalid(format!(
+            "{ratio} vcpus per core is past {MOST_VCPUS_PER_CORE}, where the ratio stops being a              trade and becomes a way of hiding that the cell is full — every guest on the machine              would get a fraction of a core and being slow would stop being diagnosable"
+        ))
+        .at("spec.vcpuOvercommit"));
+    }
+    Ok(())
+}
+
 /// An explicitly *empty* signature is not a claim and is not refused: a client
 /// echoing back an object it read, or clearing the field, must not be told off
 /// for it.
@@ -2412,6 +3877,11 @@ pub fn created_body(created: &Created) -> Value {
         Value::String(joined(&created.operation["meta"]["name"]).unwrap_or_default()),
     );
     body.insert("target".into(), Value::String(created.target.clone()));
+    // Present only when a node was registered, and even then it is the one field
+    // in this API returned once and never again — the node's agent token.
+    if let Some(token) = &created.node_token {
+        body.insert("nodeToken".into(), Value::String(token.clone()));
+    }
     Value::Object(body)
 }
 
@@ -2423,6 +3893,9 @@ pub fn created_body(created: &Created) -> Value {
 /// miniature. The agent skips such a rule too, but only as the belt to this
 /// brace, for a group written by an older version of this software.
 fn check_rules(kind: &str, spec: &Value) -> ApiResult<()> {
+    if kind == "load-balancers" {
+        return check_listeners(spec);
+    }
     if kind != "security-groups" {
         return Ok(());
     }
@@ -2437,4 +3910,102 @@ fn check_rules(kind: &str, spec: &Value) -> ApiResult<()> {
             .map_err(|e| ApiError::invalid(e.to_string()).at(format!("spec.rules[{i}]")))?;
     }
     Ok(())
+}
+
+/// Refuse a listener that cannot mean what it says, at the edge and by index.
+///
+/// The same reasoning as a security-group rule: the alternative is a spec that
+/// is accepted, shown back on read, and then quietly refused by the fabric
+/// with an error naming a service id nobody typed. The controller checks again
+/// for an object written by an older version of this software — belt to this
+/// brace.
+fn check_listeners(spec: &Value) -> ApiResult<()> {
+    let Some(listeners) = spec.get("listeners").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut parsed = Vec::with_capacity(listeners.len());
+    for (i, listener) in listeners.iter().enumerate() {
+        let one: velstra_cloud_model::loadbalancer::Listener =
+            serde_json::from_value(listener.clone()).map_err(|e| {
+                ApiError::invalid(format!("{e}")).at(format!("spec.listeners[{i}]"))
+            })?;
+        parsed.push(one);
+    }
+    velstra_cloud_model::loadbalancer::validate_listeners(&parsed).map_err(|why| {
+        ApiError::invalid(why.to_string()).at(format!("spec.listeners[{}]", why.at()))
+    })
+}
+
+/// One piece of advice as JSON.
+///
+/// A tagged shape — every variant carries `kind` — so a console can branch on
+/// what it is rather than sniffing which fields are present. The cost of each
+/// recommendation travels with it: a suggestion that names only the benefit
+/// arrives wearing the platform's authority.
+fn advice_json(a: &velstra_cloud_model::cpu::Advice) -> Value {
+    use velstra_cloud_model::cpu::{Advice, CannotMerge};
+    match a {
+        Advice::AlreadyUniform { nodes, level } => json!({
+            "kind": "AlreadyUniform",
+            "nodes": nodes,
+            "level": level.map(|l| l.as_str()),
+        }),
+        Advice::BaselineWouldMerge {
+            nodes,
+            level,
+            features_lost,
+        } => json!({
+            "kind": "BaselineWouldMerge",
+            "nodes": nodes,
+            "level": level.as_str(),
+            // Per node, and only for the nodes that pay. A single number here
+            // would be a decision nobody can make.
+            "featuresLost": features_lost.iter().map(|(node, lost)| json!({
+                "node": node,
+                "flags": lost,
+            })).collect::<Vec<_>>(),
+        }),
+        Advice::CannotMerge { nodes, reason } => json!({
+            "kind": "CannotMerge",
+            "nodes": nodes,
+            "reason": match reason {
+                CannotMerge::VmmCannotMask { nodes } => json!({
+                    "kind": "VmmCannotMask",
+                    "nodes": nodes,
+                }),
+                CannotMerge::WouldDropBelow { level } => json!({
+                    "kind": "WouldDropBelow",
+                    "level": level.as_str(),
+                }),
+            },
+        }),
+        Advice::SplitByArch { groups } => json!({
+            "kind": "SplitByArch",
+            "groups": groups.iter().map(|(arch, nodes)| json!({
+                "arch": arch,
+                "nodes": nodes,
+            })).collect::<Vec<_>>(),
+        }),
+        Advice::NodeOutsideTheAggregate {
+            node,
+            presents,
+            aggregate,
+            aggregate_nodes,
+            missing,
+        } => json!({
+            "kind": "NodeOutsideTheAggregate",
+            "node": node,
+            "presents": presents,
+            "aggregate": aggregate,
+            "aggregateNodes": aggregate_nodes,
+            // Empty means it could join and simply has not been told. Non-empty
+            // means it never can, and the honest remedy is a second aggregate.
+            "missing": missing,
+        }),
+        Advice::AdoptionPending { guests, target } => json!({
+            "kind": "AdoptionPending",
+            "guests": guests,
+            "target": target.map(|l| l.as_str()),
+        }),
+    }
 }

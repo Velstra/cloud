@@ -36,9 +36,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use velstra_cloud_model::{
     identity::{
-        Credential, CredentialSpec, CredentialStatus, SESSION_LIFETIME_MS, SessionSpec,
-        SessionStatus, User, UserSpec, UserStatus, check_password_strength, hash_password,
-        new_session_token, session_is_live, token_digest, verify_password,
+        Credential, CredentialSpec, CredentialStatus, NodeCredential, NodeCredentialSpec,
+        NodeCredentialStatus, SESSION_LIFETIME_MS, SessionSpec, SessionStatus, User, UserSpec,
+        UserStatus, check_password_strength, hash_password, new_node_token, new_session_token,
+        session_is_live, token_digest, verify_password,
     },
     meta::{Meta, Placement, Timestamp},
     resources::Resource,
@@ -62,6 +63,25 @@ pub const CELL_ADMIN_SCOPE: &str = "cell-admin";
 /// Whether an authenticated caller holds cell-wide authority.
 pub fn is_cell_admin(who: &Identity) -> bool {
     who.scopes.iter().any(|s| s == CELL_ADMIN_SCOPE)
+}
+
+/// The prefix of the scope a per-node agent token carries: `agent:node-a`.
+///
+/// A node token is not a cell operator and not a project subject — it is *the
+/// agent for one node*, and that is the only thing it may act as. Carrying the
+/// node in the scope, resolved once at authentication, is what lets the write
+/// path build `Writer::agent(node)` without a second store read.
+pub const AGENT_SCOPE_PREFIX: &str = "agent:";
+
+/// The node an identity is the agent for, if it authenticated with a node token.
+///
+/// `None` for a person, a service account or an operator — none of which may
+/// write status, and all of which read `None` here so the status path refuses
+/// them by construction rather than by a second check.
+pub fn agent_node(who: &Identity) -> Option<&str> {
+    who.scopes
+        .iter()
+        .find_map(|s| s.strip_prefix(AGENT_SCOPE_PREFIX))
 }
 
 /// What a successful sign-in hands back.
@@ -91,6 +111,9 @@ pub struct IdentityStore {
     users: TypedStore<UserSpec, UserStatus>,
     credentials: TypedStore<CredentialSpec, CredentialStatus>,
     sessions: TypedStore<SessionSpec, SessionStatus>,
+    /// Per-node agent tokens, keyed by digest — the third collection the API
+    /// stores and never serves, beside `credentials` and `sessions`.
+    node_credentials: TypedStore<NodeCredentialSpec, NodeCredentialStatus>,
     placement: Placement,
 }
 
@@ -99,7 +122,8 @@ impl IdentityStore {
         Self {
             users: TypedStore::new(store.clone(), cell, "users"),
             credentials: TypedStore::new(store.clone(), cell, "credentials"),
-            sessions: TypedStore::new(store, cell, "sessions"),
+            sessions: TypedStore::new(store.clone(), cell, "sessions"),
+            node_credentials: TypedStore::new(store, cell, "node-credentials"),
             placement: Placement::new(region, cell),
         }
     }
@@ -170,7 +194,13 @@ impl IdentityStore {
             },
             status: SessionStatus::default(),
         };
-        self.sessions.create(&session).await.map_err(store_error)?;
+        self.sessions
+            .create(
+                &session,
+                &velstra_cloud_model::access::Writer::controller("sessions"),
+            )
+            .await
+            .map_err(store_error)?;
 
         // Best-effort: a sign-in that worked must not fail because the record of
         // it could not be written.
@@ -209,7 +239,11 @@ impl IdentityStore {
             .map_err(store_error)?;
         if let Some(session) = existing {
             self.sessions
-                .delete(&stored("sessions", &digest), session.meta.revision)
+                .delete(
+                    &stored("sessions", &digest),
+                    session.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller("sessions"),
+                )
                 .await
                 .map_err(store_error)?;
             tracing::info!(user = session.spec.subject, "signed out");
@@ -217,9 +251,138 @@ impl IdentityStore {
         Ok(())
     }
 
+    /// Mint a per-node agent token, store its digest, and return the token once.
+    ///
+    /// Called when a node is registered. The token is 256 bits from the OS,
+    /// returned to the caller a single time; only its digest reaches the store,
+    /// keyed under `node-credentials/<digest>` with the node's name in the spec.
+    /// So a node's credential cannot be recovered from the cell afterwards, and a
+    /// store dump yields digests nobody can present.
+    ///
+    /// The record is written as a controller: it is a `spec`, which the node
+    /// itself may never write, in a collection with no route — which is what
+    /// makes it a credential the node cannot rotate.
+    pub async fn mint_node_credential(&self, node: &str) -> ApiResult<String> {
+        let token = new_node_token();
+        let now = Self::now();
+        let credential = NodeCredential {
+            meta: Meta::new(
+                name_of("node-credentials", &token_digest(&token))?,
+                self.placement.clone(),
+            ),
+            spec: NodeCredentialSpec {
+                node: node.to_string(),
+                issued_at: now,
+            },
+            status: NodeCredentialStatus::default(),
+        };
+        self.node_credentials
+            .create(
+                &credential,
+                &velstra_cloud_model::Writer::controller("register-node"),
+            )
+            .await
+            .map_err(store_error)?;
+        tracing::info!(node, "minted a per-node agent token");
+        Ok(token)
+    }
+
+    /// The node a bearer token is the agent for, if it is a node token.
+    ///
+    /// A single keyed read on the digest — the same O(1) shape as a session
+    /// lookup, and the reason the credential is keyed by digest rather than by
+    /// node id. The identity carries the node in its scope so the write path can
+    /// build `Writer::agent(node)` without reading anything again.
+    pub async fn identify_node(&self, token: &str) -> ApiResult<Identity> {
+        let digest = token_digest(token);
+        let Some(credential) = self
+            .node_credentials
+            .get(&stored("node-credentials", &digest))
+            .await
+            .map_err(store_error)?
+        else {
+            return Err(ApiError::new(
+                Code::Unauthenticated,
+                "the bearer token was not accepted",
+            ));
+        };
+        let node = credential.spec.node;
+        let mut identity = Identity::new(format!("node:{node}"));
+        identity.scopes.push(format!("{AGENT_SCOPE_PREFIX}{node}"));
+        Ok(identity)
+    }
+
+    /// Remove a node's credentials. Called when the node is deleted, so a token
+    /// keeps working no longer than the node it speaks for.
+    ///
+    /// Listed and filtered by node rather than keyed, because the store key is
+    /// the token digest and a deletion names the node — the rare, deliberate cost
+    /// of keying by digest for a fast verify. There is normally one.
+    pub async fn forget_node(&self, node: &str) -> ApiResult<()> {
+        let all = self.node_credentials.list().await.map_err(store_error)?;
+        for credential in all.iter().filter(|c| c.spec.node == node) {
+            let _ = self
+                .node_credentials
+                .delete(
+                    &credential.meta.name.to_string(),
+                    credential.meta.revision,
+                    &velstra_cloud_model::Writer::controller("forget-node"),
+                )
+                .await;
+        }
+        Ok(())
+    }
+
     /// Revoke every session a subject holds.
     pub async fn revoke_all(&self, subject: &str) -> ApiResult<usize> {
         self.revoke_all_except(subject, None).await
+    }
+
+    /// Delete every session that has expired as of `now`.
+    ///
+    /// The request path already sweeps a session it is handed once it has
+    /// expired — see [`Self::identify`] — but that only reaches a token that is
+    /// presented again. A token issued and never used once more, a tab closed
+    /// without a sign-out, leaves a record that expires and is then read by
+    /// nothing, so without this the store grows one row per such sign-in for
+    /// ever. This is the periodic counterpart: it lists the sessions and deletes
+    /// the ones past their `expires_at`.
+    ///
+    /// **Expiry only, and deliberately.** A live session belonging to a disabled
+    /// account is already refused on every request by
+    /// [`session_is_live`], which reads the user; sweeping it here would mean
+    /// this loop reading a user per session to second-guess a decision the
+    /// request path already makes. What actually leaks without a sweeper is
+    /// *expired* tokens, and that is exactly what this reaches — nothing more, so
+    /// it stays a one-list-one-delete pass and needs no user read at all.
+    ///
+    /// Takes `now` rather than reading the clock, so the decision is a pure
+    /// function of the sessions and the time — testable with an injected clock,
+    /// with the periodic task the only thing that has to know what time it is.
+    pub async fn sweep_expired_sessions(&self, now: Timestamp) -> ApiResult<usize> {
+        let sessions = self.sessions.list().await.map_err(store_error)?;
+        let mut swept = 0;
+        for session in sessions.iter().filter(|s| s.spec.expires_at.0 <= now.0) {
+            // A delete that lost a race — the token was presented and swept on
+            // the request path in between — is not a failure of this sweep: the
+            // row is gone, which is all it wanted.
+            if self
+                .sessions
+                .delete(
+                    &session.meta.name.to_string(),
+                    session.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller("sessions"),
+                )
+                .await
+                .is_ok()
+            {
+                swept += 1;
+            }
+        }
+        if swept > 0 {
+            tracing::info!(swept, "swept expired sessions");
+        }
+        Ok(swept)
     }
 
     /// Revoke every session a subject holds **except** the one presented.
@@ -243,7 +406,11 @@ impl IdentityStore {
         {
             if self
                 .sessions
-                .delete(&session.meta.name.to_string(), session.meta.revision)
+                .delete(
+                    &session.meta.name.to_string(),
+                    session.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller("sessions"),
+                )
                 .await
                 .is_ok()
             {
@@ -312,7 +479,10 @@ impl IdentityStore {
                     status: CredentialStatus::default(),
                 };
                 self.credentials
-                    .create(&credential)
+                    .create(
+                        &credential,
+                        &velstra_cloud_model::access::Writer::controller("sessions"),
+                    )
                     .await
                     .map_err(store_error)?;
             }
@@ -334,7 +504,11 @@ impl IdentityStore {
         {
             let _ = self
                 .credentials
-                .delete(&stored("credentials", username), credential.meta.revision)
+                .delete(
+                    &stored("credentials", username),
+                    credential.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller("sessions"),
+                )
                 .await;
         }
         self.revoke_all(username).await?;
@@ -365,7 +539,14 @@ impl IdentityStore {
             },
             status: UserStatus::default(),
         };
-        match self.users.create(&user).await {
+        match self
+            .users
+            .create(
+                &user,
+                &velstra_cloud_model::access::Writer::controller("sessions"),
+            )
+            .await
+        {
             Ok(_) => {}
             // Two API replicas can both find the cell empty and both try to
             // create the first administrator; the store lets exactly one win.
@@ -413,7 +594,11 @@ impl IdentityStore {
             // change to this path.
             let _ = self
                 .sessions
-                .delete(&stored("sessions", &digest), session.meta.revision)
+                .delete(
+                    &stored("sessions", &digest),
+                    session.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller("sessions"),
+                )
                 .await;
             return Err(refused());
         }
@@ -542,13 +727,24 @@ impl StoreTokenVerifier {
 #[async_trait::async_trait]
 impl TokenVerifier for StoreTokenVerifier {
     async fn verify(&self, token: &str) -> ApiResult<Identity> {
+        // Three sources, tried in order, and every one that does not recognise
+        // the token answers `Unauthenticated` so the next gets a turn: a session
+        // (a person), then a per-node agent credential (a node), then whatever
+        // static verifier is configured (a service account, a test). A caller
+        // cannot tell which recognised it — the difference shows only in what the
+        // identity may then do.
         match self.identity.identify(token).await {
-            Ok(identity) => Ok(identity),
-            Err(e) if e.code == Code::Unauthenticated => match &self.fallback {
+            Ok(identity) => return Ok(identity),
+            Err(e) if e.code != Code::Unauthenticated => return Err(e),
+            Err(_) => {}
+        }
+        match self.identity.identify_node(token).await {
+            Ok(identity) => return Ok(identity),
+            Err(e) if e.code != Code::Unauthenticated => return Err(e),
+            Err(e) => match &self.fallback {
                 Some(fallback) => fallback.verify(token).await,
                 None => Err(e),
             },
-            Err(e) => Err(e),
         }
     }
 }
