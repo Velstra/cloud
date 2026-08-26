@@ -387,7 +387,7 @@ same way it waits for anything else here — there is no `ALLOCATING` state.
 
 ## Computed fields
 
-Four fields are answered on every read and stored nowhere, so none of them can
+Six fields are answered on every read and stored nowhere, so none of them can
 disagree with the world they describe:
 
 - **`operation.status.done`** — from the target's convergence.
@@ -401,6 +401,20 @@ disagree with the world they describe:
   in the cell writing into one field, which is the shared mutable list the
   one-writer rule exists to forbid. Each node says what it holds; the API adds
   them up.
+- **`instance.status.pendingChanges`** — what a running guest has been asked for
+  and will only get at its next start, from `spec` against `status.runningSize`.
+  Absent, not empty, when there is nothing pending. Resizing a running machine
+  is ordinary; what was not ordinary is that nothing said so, and a spec reading
+  as applied while the guest ran on the old numbers is a disagreement no screen
+  showed.
+- **`node.status.pciDevices[].groupWith`** — every device sharing an IOMMU
+  group with this one, from `pci::group_members`. Passing one device through
+  takes its whole group; `pci::offerable` already refuses an unsafe assignment,
+  and this is the sentence before the decision. Computed rather than left to a
+  client because a device with **no** group is answered as being alone: grouping
+  by equal group number would instead collect every un-isolatable device into
+  one imaginary group, which reads as "these come together" when the truth is
+  that none of them can be passed at all.
 - **`securityGroup.status.conditions[Applied]`** — from the ports that name the
   group. Same shape as the one above: nothing about a group is a fact any single
   writer owns. Each port reports whether its own node has it in force, and the

@@ -210,6 +210,86 @@ A capture refuses a running guest, and the refusal says why: a disk copied from
 under a running machine is crash-consistent, which a template stamped out a
 hundred times must not be.
 
+### When a pool's backend is unreachable
+
+Nothing on it is provisioned, and the pool says so: `Ready` goes false with
+**`BackendUnreachable`** and the backend's own words. It is written on the
+**pool**, once — one backend being down is one fact, not a hundred identical
+conditions on the volumes waiting for it.
+
+Two things are deliberately preserved while it lasts:
+
+* **The capacity numbers stay**, stale, rather than dropping to zero. Zeroes
+  would tell the scheduler the pool is full, turning "we cannot see it" into a
+  claim nobody made.
+* **The heartbeat keeps moving.** The agent *is* alive; it is the storage behind
+  it that is not, and the condition is where that is said. Silence would be
+  indistinguishable from a dead agent, which is a different problem with a
+  different fix.
+
+Nothing is acted on until the backend can be read again — a pass that worked
+from the last known picture is how a volume gets created twice.
+
+### Moving a volume to another disk
+
+You added an SSD and want a guest's disk on it. **Changing `spec.pool` is
+refused**, and the refusal says why: it moves no bytes. A pool agent watches for
+its own name in that field, so editing it makes the pool holding the volume let
+go and the named pool decline something it does not own — the volume then
+converges on nothing, its data intact on a disk nobody watches any more.
+
+The way that works is the one the refusal points at, and it is four steps
+because each of them is a decision:
+
+1. Back the volume up to a target.
+2. Create a volume in the new pool with `spec.sourceBackup` set to that copy.
+3. Point whatever uses it at the new volume.
+4. Delete the old one.
+
+A first-class "move this volume" does not exist yet, and the reason is not
+oversight: across two machines it is a byte transfer between agents, which is
+the hard half of instance migration all over again. On one machine with two
+disks it would be a copy — worth having, and not yet built.
+
+### Has anybody read it?
+
+"Copied" says an agent once wrote bytes. That is a weaker claim than it looks:
+bit rot, a filesystem that lied about a flush, a target quietly remounted over
+an older copy of itself — none of them change the fact that a write once
+succeeded, and all of them are found at restore time, which is the worst moment
+to find anything.
+
+Set **`verifyEveryHours`** on a target and the copies there are read back and
+checked against what they hashed to when they were written. `0` — the default —
+checks nothing, because reading every byte of every copy is real I/O somebody
+has to decide to spend.
+
+| Column | Means |
+|---|---|
+| Copied | bytes were written |
+| Read back | somebody has since read them and they matched |
+| Trouble | what the last read-back found, when it did not match |
+
+Three things worth knowing about how it behaves:
+
+* **One copy per target per pass**, the one whose check is stalest. The same
+  pass provisions volumes and takes snapshots, and those are not optional — a
+  target with a hundred copies checks each less often rather than starving the
+  work somebody is waiting on.
+* **A failed check never deletes anything.** It may be the copy that rotted, or
+  the filesystem under it, or a restore already running from that very file.
+  The platform says so loudly and leaves the artefact; that decision is yours.
+* **A copy made before this existed reads as `Unverifiable`**, not as good. Its
+  digest was never recorded, and recording one now would only certify whatever
+  is on the target today — which is exactly what is being questioned. `Ready`
+  stays true: the copy is there and restorable, and what is unknown is whether
+  it is intact.
+
+One thing it does **not** do, and is worth holding in your head: retention keeps
+the newest N copies and knows nothing about verification. A run of corrupt
+copies will still push good older ones out. Verify often enough that you find
+out before retention does.
+
 ---
 
 ## 7. When somebody says "I clicked it and nothing happened"

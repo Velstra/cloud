@@ -156,6 +156,10 @@ To run the same things here, install `etcd`, `qemu-system-x86_64`,
 
 ## Documents
 
+Start with the first one if you have never run this.
+
+- `docs/quickstart.md` — one machine, from nothing to a guest you can log into,
+  with pictures of the console it is describing.
 - `docs/rest-contract.md` — the HTTP surface, fixed. The API serves it and the
   console consumes it; neither changes it alone.
 - `docs/deployment-and-devices.md` — how a node is installed and what hardware
