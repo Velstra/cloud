@@ -96,6 +96,24 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Cross-repo and cross-document drift, run as a named gate so a broken
+      # contract is legible in the log rather than buried in the workspace run.
+      # `--nocapture` is deliberate: the fabric byte-for-byte check skips when the
+      # fabric repository is not checked out beside this one — which it is not
+      # here — and the skip must be *visible* rather than passing for a silent
+      # green. The digest check and the route-in-contract checks are hard gates
+      # and run regardless.
+      #
+      #   - fabric_proto:    the vendored data-plane proto matches its recorded
+      #                      sha256, and fabric's own copy when both repos are
+      #                      colocated (skips loudly otherwise).
+      #   - contract_routes: every collection, route and verb the API serves is
+      #                      named in docs/rest-contract.md.
+      - name: contract drift
+        run: |
+          cargo test -p velstra-cloud-fabric --test fabric_proto --locked -- --nocapture
+          cargo test -p velstra-cloud-api --test contract_routes --locked
+
       # `--locked` on purpose: a Cargo.lock that no longer matches the manifests
       # is a change nobody made on purpose, and it is better found here than in
       # a release build.

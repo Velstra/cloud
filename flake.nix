@@ -1,0 +1,1226 @@
+{
+  description = "Velstra Cloud — control plane packaging, the immutable compute-node image, and a one-command development cell";
+
+  # Verify with Nix:
+  #   nix run   .#dev                      # a whole cell in one process, seeded
+  #   nix build .#node-image               # the flashable compute-node appliance
+  #   nix build .#node-iso                 # the installer ISO (first-boot wizard)
+  #   nix build .#api-image                # OCI image, velstra-cloud-api
+  #   nix build .#deb                      # the Debian package (roles chosen at setup)
+  #   nix build .#checks.x86_64-linux.register -L      # a node registers over a token
+  #   nix build .#checks.x86_64-linux.maintenance -L   # a window closes a node, and expiry reopens it
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    # Rust only: the workspace's tonic 0.14 needs rustc >= 1.88, which 25.05
+    # (1.86) does not carry. The OS side of every image stays on 25.05 — this
+    # input supplies nothing but the toolchain that builds the binaries.
+    nixpkgs-rust.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # The Sentinel appliance factory: A/B slots, dm-verity store, Secure Boot,
+    # installer ISO — the node image is a different package set in the SAME
+    # machinery (docs/deployment-and-devices.md §2A), so the machinery is an
+    # input, not a copy. While both repos move together this points at the
+    # sibling checkout (git+file uses the working tree, so unreleased factory
+    # changes are visible; `nix flake update sentinel` after editing it); a
+    # release replaces it with the pinned public URL, e.g.
+    # github:Velstra/sentinel.
+    sentinel = {
+      url = "git+file:///home/mbrandt/01_repositories/velstra/sentinel";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      nixpkgs-rust,
+      sentinel,
+    }:
+    let
+      system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
+      rustPlatform = nixpkgs-rust.legacyPackages.${system}.rustPlatform;
+      lib = nixpkgs.lib;
+
+      # From the api crate's Cargo.toml, so the image tag and `--version`
+      # cannot disagree.
+      version =
+        (builtins.fromTOML (builtins.readFile ./velstra-cloud-api/Cargo.toml)).package.version;
+
+      # --- the workspace binaries -------------------------------------------
+      # One build for all six: api, controller, nodeagent, poolagent, the
+      # node installer, and the dev cell. protoc for the tonic build scripts.
+      velstra-cloud = rustPlatform.buildRustPackage {
+        pname = "velstra-cloud";
+        inherit version;
+        src = self;
+        cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [ pkgs.protobuf ];
+        PROTOC = "${pkgs.protobuf}/bin/protoc";
+        # The workspace tests need etcd, QEMU, /dev/kvm and a user session bus
+        # — they are the repository's CI gate (`cargo test --workspace`), not a
+        # sandbox's. This derivation exists for the binaries.
+        doCheck = false;
+      };
+
+      # The fabric eBPF/XDP agent that runs on a compute node, built by the
+      # Sentinel flake (which pins the fabric revision and the nightly
+      # toolchain its eBPF needs). Reusing that build is the point: one pinned
+      # data plane across both products.
+      fabricAgent = sentinel.packages.${system}.velstra;
+
+      # --- the compute-node appliance ---------------------------------------
+      # Identity + sizing for the shared appliance factory. Everything here is
+      # the `velstra.appliance.*` counterpart of what the installer's
+      # `product.rs` hardcodes — the two must agree.
+      nodeIdentity = {
+        velstra.appliance = {
+          productName = "Velstra Cloud Node";
+          osId = "velstra-cloud-node";
+          slotPrefix = "velstra-node";
+          defaultHostname = "velstra-node";
+          stateDir = "/var/lib/velstra";
+          unlockUnit = "velstra-node-unlock.service";
+          stateDirServices = [
+            "velstra-node-boot"
+            "velstra-cloud-nodeagent"
+          ];
+          slotTypesEnvFile = "velstra-node/slot-types.env";
+          # The node closure carries two hypervisors; roomier slots than
+          # Sentinel's. Both slots reserve this, so the disk floor is
+          # ~2×(store+verity)+data.
+          storeSize = "4096M";
+          veritySize = "320M";
+          secureBootCommonName = "Velstra Cloud Node Secure Boot";
+        };
+        velstra.cloud.node = {
+          enable = true;
+          package = velstra-cloud;
+          fabricAgent = fabricAgent;
+        };
+        system.stateVersion = "25.05";
+      };
+
+      nodeImageRaw =
+        let
+          c = self.nixosConfigurations.node-image.config;
+        in
+        "${c.system.build.finalImageSigned}/${c.image.filePath}";
+
+      # --- OCI images for the control plane ---------------------------------
+      ociImage =
+        {
+          name,
+          binary,
+          env ? [ ],
+          ports ? { },
+        }:
+        pkgs.dockerTools.buildLayeredImage {
+          inherit name;
+          tag = version;
+          # The full workspace package: both control-plane binaries are in one
+          # closure anyway, and a debugging `docker exec` that finds the other
+          # binary present is worth more than a few shaved megabytes.
+          contents = [
+            velstra-cloud
+            pkgs.cacert
+          ];
+          config = {
+            Entrypoint = [ "${velstra-cloud}/bin/${binary}" ];
+            Env = env;
+            ExposedPorts = ports;
+          };
+        };
+
+      # --- the development cell ---------------------------------------------
+      # `nix run .#dev` — THE onboarding path. The binary itself is the honest
+      # one (one process, one store, seeded); the wrapper's job is to make the
+      # two ways it can fail loud before they look like a hang.
+      dev = pkgs.writeShellApplication {
+        name = "dev";
+        text = ''
+          listen="''${1:-127.0.0.1:8080}"
+          host="''${listen%:*}"
+          port="''${listen##*:}"
+          # A used port surfaces as a bind error eventually — but say it up
+          # front, with the fix in the sentence.
+          if { exec 3<>"/dev/tcp/$host/$port"; } 2>/dev/null; then
+            exec 3>&-
+            echo "error: $listen is already in use — pass a free address, e.g.:  nix run .#dev -- 127.0.0.1:9090" >&2
+            exit 1
+          fi
+          echo "starting the Velstra Cloud development cell on $listen"
+          echo "(no /dev/kvm needed — the dev cell's hypervisor is fake and no guest is real)"
+          echo
+          echo "Open the console URL below and sign in with the printed token."
+          echo
+          exec ${velstra-cloud}/bin/velstra-cloud-dev "$listen"
+        '';
+      };
+
+      # Chromium in a sandbox has no fonts, and it aborts rather than degrade
+      # when fontconfig can supply nothing at all (Sentinel's console check
+      # found this the hard way). One family pins the existence of a fallback.
+      sandboxFonts = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
+
+      # The ISO's product config, shared by `nixosConfigurations.node-iso` and
+      # the wizard check so the check drives the medium that actually ships.
+      nodeIsoConfig = {
+        velstra.iso = {
+          productName = "Velstra Cloud Node";
+          brandId = "velstra-node";
+          installerPackage = velstra-cloud;
+          installCommand = "velstra-cloud-node install";
+          imageSource = nodeImageRaw;
+          sourceEnvVar = "VELSTRA_NODE_INSTALL_SOURCE";
+          label = version;
+          isoBaseName = "velstra-cloud-node-installer";
+          volumeId = "VELSTRA_NODE";
+          hostname = "velstra-node-installer";
+          tagline = "Installs the immutable compute-node appliance onto internal storage";
+        };
+        # The installer resolves its disk tools by name on PATH (unlike
+        # Sentinel's wrapped CLI) — the live system must carry them.
+        environment.systemPackages = [
+          pkgs.gptfdisk
+          pkgs.parted
+          pkgs.mdadm
+          pkgs.cryptsetup
+          pkgs.e2fsprogs
+        ];
+      };
+
+      # A VM node running the full control plane with a static operator token —
+      # the shared base of the register and guest checks.
+      controlPlaneNode = {
+        imports = [ self.nixosModules.controlPlane ];
+        velstra.cloud.controlPlane = {
+          enable = true;
+          package = velstra-cloud;
+          listen = "0.0.0.0:8443";
+          tokenFile = pkgs.writeText "dev-tokens" ''
+            opstoken ops
+          '';
+          cellAdmins = [ "ops" ];
+        };
+        networking.firewall.allowedTCPPorts = [ 8443 ];
+        # The test scripts talk to the API with curl; a minimal test VM does
+        # not carry it.
+        environment.systemPackages = [ pkgs.curl ];
+      };
+    in
+    {
+      packages.${system} = {
+        default = velstra-cloud;
+        inherit velstra-cloud dev;
+
+        # The flashable verified-boot compute-node image (A/B slots, dm-verity
+        # store, Secure Boot demo keys — the Sentinel factory).
+        #   nix build .#node-image
+        node-image = self.nixosConfigurations.node-image.config.system.build.finalImageSigned;
+
+        # The live installer ISO: boots into the first-boot wizard
+        # (`velstra-cloud-node install`), which clones the bundled image and
+        # seeds the control-plane URL + registration token.
+        #   nix build .#node-iso
+        node-iso = self.nixosConfigurations.node-iso.config.system.build.isoImage;
+
+        # Control-plane OCI images (`docker load < result`).
+        api-image = ociImage {
+          name = "velstra-cloud-api";
+          binary = "velstra-cloud-api";
+          env = [ "VELSTRA_LISTEN=0.0.0.0:8443" ];
+          ports."8443/tcp" = { };
+        };
+        # The Debian package: the same binaries, the same wizard, the same
+        # seed — for a fleet that already runs Debian and is not going to be
+        # told to install NixOS first.
+        #   nix build .#deb
+        deb = import ./nix/debian.nix {
+          inherit pkgs lib velstra-cloud version;
+        };
+
+        controller-image = ociImage {
+          name = "velstra-cloud-controller";
+          binary = "velstra-cloud-controller";
+          env = [ "VELSTRA_METRICS=0.0.0.0:9310" ];
+          ports."9310/tcp" = { };
+        };
+      };
+
+      apps.${system}.dev = {
+        type = "app";
+        program = "${dev}/bin/dev";
+      };
+
+      nixosModules.node = ./nix/node.nix;
+      nixosModules.controlPlane = ./nix/control-plane.nix;
+      # Storage, as its own module and not part of the node: a pool is not a
+      # machine. A box that is both a hypervisor and a pool imports both and
+      # says so.
+      nixosModules.pool = ./nix/pool.nix;
+
+      nixosConfigurations.node-image = lib.nixosSystem {
+        inherit system;
+        modules = [
+          sentinel.nixosModules.applianceImage
+          self.nixosModules.node
+          nodeIdentity
+          { nixpkgs.hostPlatform = system; }
+        ];
+      };
+
+      nixosConfigurations.node-iso = lib.nixosSystem {
+        inherit system;
+        modules = [
+          sentinel.nixosModules.applianceIso
+          nodeIsoConfig
+          { nixpkgs.hostPlatform = system; }
+        ];
+      };
+
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [
+          pkgs.cargo
+          pkgs.rustc
+          pkgs.clippy
+          pkgs.rustfmt
+          pkgs.protobuf
+          pkgs.etcd
+          pkgs.nodejs
+        ];
+        PROTOC = "${pkgs.protobuf}/bin/protoc";
+      };
+
+      checks.${system} = {
+        # The development cell actually develops: it comes up, is seeded, and
+        # answers as itself — API, console, and the fake node. This is the
+        # `nix run .#dev` promise, checked.
+        #   nix build .#checks.x86_64-linux.dev-smoke -L
+        dev-smoke =
+          pkgs.runCommand "velstra-cloud-dev-smoke"
+            {
+              nativeBuildInputs = [
+                velstra-cloud
+                pkgs.curl
+              ];
+            }
+            ''
+              set -eu
+              velstra-cloud-dev 127.0.0.1:18080 > dev.log 2>&1 &
+              pid=$!
+              auth="Authorization: Bearer devtoken"
+              up=0
+              for _ in $(seq 150); do
+                if curl -fsS -H "$auth" http://127.0.0.1:18080/api/v1/nodes >/dev/null 2>&1; then
+                  up=1; break
+                fi
+                sleep 0.2
+              done
+              if [ "$up" != 1 ]; then
+                echo "the dev cell never answered:"; cat dev.log; exit 1
+              fi
+              # Downloads land in files first: `curl | grep -q` dies of SIGPIPE
+              # when grep quits at the first match, and set -e calls that a
+              # failed check.
+              curl -fsS -H "$auth" http://127.0.0.1:18080/api/v1/nodes > nodes.json
+              grep -q node-a nodes.json
+              curl -fsS -H "$auth" http://127.0.0.1:18080/api/v1/projects/p1/instances > instances.json
+              grep -q web-1 instances.json
+              # The console ships on the same port, as itself.
+              curl -fsS http://127.0.0.1:18080/ > console.html
+              grep -qi velstra console.html
+              # …and the startup banner tells the operator how to get in.
+              grep -q "token" dev.log
+              kill $pid
+              cp dev.log $out
+            '';
+
+        # The console suite in a real browser, against the in-repo contract
+        # server — Sentinel's console-check pattern, minus its cargo step (the
+        # page generator is already built).
+        #   nix build .#checks.x86_64-linux.console -L
+        console =
+          pkgs.runCommand "velstra-cloud-console"
+            {
+              nativeBuildInputs = [
+                velstra-cloud
+                pkgs.nodejs
+                pkgs.chromium
+              ];
+              HOME = "/build";
+              FONTCONFIG_FILE = sandboxFonts;
+            }
+            ''
+              set -eu
+              cp -r ${./velstra-cloud-console/tests/console} tests-console
+              chmod -R u+w tests-console
+              velstra-console-page > console.html
+              # The whole console is one script in one scope; a stray brace is
+              # a page that parses to nothing. Same early tripwire as run.sh.
+              sed -n '/^<script>$/,/^<\/script>$/p' console.html | sed '1d;$d' > console.js
+              node --check console.js
+              export CHROMIUM=${pkgs.chromium}/bin/chromium
+              export CONSOLE_TOKEN=testtoken
+              CONSOLE_PAGE=$PWD/console.html FAKE_PORT=0 node tests-console/fake-api.mjs > fake.log 2>&1 &
+              port=""
+              for _ in $(seq 100); do
+                port=$(sed -n 's/^listening //p' fake.log | head -1)
+                [ -n "$port" ] && break
+                sleep 0.2
+              done
+              if [ -z "$port" ]; then
+                echo "the contract server never came up:"; cat fake.log; exit 1
+              fi
+              export CONSOLE_URL="http://127.0.0.1:$port/"
+              node tests-console/console.test.mjs | tee output
+              grep -Eq "^[1-9][0-9]*/[1-9][0-9]* passed" output
+              cp output $out
+            '';
+
+        # The node image boots as the sealed appliance it claims to be:
+        # verity-backed store, volatile root, the agent parked (not
+        # crash-looping) until a seed exists, the metadata address bindable,
+        # and the IOMMU-ready cmdline present. Boots via a qcow2 overlay of
+        # the actual built image — Sentinel's verified-boot pattern.
+        #   nix build .#checks.x86_64-linux.node-image-boots -L
+        node-image-boots = pkgs.testers.runNixOSTest {
+          name = "velstra-node-image-boots";
+          nodes.machine = {
+            imports = [
+              sentinel.nixosModules.applianceImage
+              self.nixosModules.node
+              nodeIdentity
+            ];
+            virtualisation = {
+              directBoot.enable = false;
+              mountHostNixStore = false;
+              useEFIBoot = true;
+              memorySize = 2048;
+              fileSystems = lib.mkVMOverride { };
+            };
+            # `dmsetup` for the test's own verity assertion.
+            environment.systemPackages = [ pkgs.lvm2 ];
+          };
+          testScript =
+            { nodes, ... }:
+            ''
+              import os
+              import subprocess
+              import tempfile
+
+              tmp = tempfile.NamedTemporaryFile()
+              subprocess.run([
+                "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
+                "create", "-f", "qcow2",
+                "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+                "-F", "raw", tmp.name,
+              ], check=True)
+              os.environ["NIX_DISK_IMAGE"] = tmp.name
+
+              machine.wait_for_unit("multi-user.target")
+
+              with subtest("verified boot: volatile root + dm-verity store"):
+                  machine.succeed("findmnt --kernel --type tmpfs /")
+                  verity = machine.succeed("dmsetup info --target verity usr")
+                  assert "ACTIVE" in verity, verity
+                  backing = machine.succeed("df --output=source /nix/store | tail -n1").strip()
+                  assert backing == "/dev/mapper/usr", backing
+
+              with subtest("an unseeded node is parked, not crash-looping"):
+                  # No node.env on a fresh image: the agent's condition holds it
+                  # off, and `systemctl status` names the file to create.
+                  machine.succeed("test ! -f /var/lib/velstra/node.env")
+                  out = machine.succeed(
+                      "systemctl show velstra-cloud-nodeagent"
+                      " -p ActiveState -p ConditionResult"
+                  )
+                  assert "ActiveState=inactive" in out, out
+                  assert "ConditionResult=no" in out, out
+
+              with subtest("the unlock unit is a no-op on a plaintext install"):
+                  machine.wait_for_unit("velstra-node-unlock.service")
+
+              with subtest("the compute-node kernel and metadata plumbing are in place"):
+                  cmdline = machine.succeed("cat /proc/cmdline")
+                  for param in ["intel_iommu=on", "amd_iommu=on", "iommu=pt"]:
+                      assert param in cmdline, cmdline
+                  # The dummy interface that makes the agent's fatal
+                  # 169.254.169.254:80 bind possible.
+                  machine.wait_until_succeeds("ip addr show vmeta0 | grep -q 169.254.169.254")
+
+              with subtest("both hypervisors and the fabric agent ship on the image"):
+                  machine.succeed("command -v qemu-system-x86_64")
+                  machine.succeed("command -v cloud-hypervisor")
+                  machine.succeed("command -v ch-remote")
+                  machine.succeed("command -v velstra")
+                  machine.succeed("command -v velstra-cloud-node")
+
+              with subtest("state persists on a real data partition, not the volatile root"):
+                  src = machine.succeed("findmnt -no SOURCE /var/lib/velstra").strip()
+                  assert src.startswith("/dev/"), src
+                  machine.succeed("echo persisted > /var/lib/velstra/marker")
+                  machine.succeed("grep -qx persisted /var/lib/velstra/marker")
+            '';
+        };
+
+        # The management story end to end: an operator creates the node at the
+        # API and gets the one-time token; the node is seeded exactly the way
+        # the ISO wizard seeds it; the agent comes up and the node starts
+        # reporting. Two machines, a real network between them.
+        #   nix build .#checks.x86_64-linux.register -L
+        register = pkgs.testers.runNixOSTest {
+          name = "velstra-node-register";
+          nodes.cell = controlPlaneNode;
+          nodes.node = {
+            imports = [ self.nixosModules.node ];
+            velstra.cloud.node = {
+              enable = true;
+              package = velstra-cloud;
+            };
+          };
+          testScript = ''
+            import json
+
+            cell.wait_for_unit("velstra-cloud-api.service")
+            cell.wait_for_unit("velstra-cloud-controller.service")
+            auth = "-H 'Authorization: Bearer opstoken'"
+            api = "http://127.0.0.1:8443/api/v1"
+            cell.wait_until_succeeds(f"curl -fsS {auth} {api}/nodes")
+
+            with subtest("an operator registers the node and is shown the token once"):
+                created = json.loads(cell.succeed(
+                    f"curl -fsS -X POST {auth} -H 'Content-Type: application/json'"
+                    f" -d '{{\"id\": \"node-1\", \"spec\": {{\"schedulable\": true}}}}'"
+                    f" {api}/nodes"
+                ))
+                assert created["target"] == "nodes/node-1", created
+                token = created["nodeToken"]
+                assert len(token) == 64, created
+
+            with subtest("the wizard's seed brings the agent up"):
+                node.wait_for_unit("multi-user.target")
+                # Exactly the files `velstra-cloud-node install` writes.
+                node.succeed("mkdir -p /var/lib/velstra")
+                node.succeed(
+                    "printf 'VELSTRA_NODE=node-1\nVELSTRA_CELL=cell-1\n"
+                    "VELSTRA_REGION=eu-central\nVELSTRA_API_URL=http://cell:8443\n"
+                    "VELSTRA_VMM=fake\nVELSTRA_HOSTNAME=node-t1\n'"
+                    " > /var/lib/velstra/node.env"
+                )
+                node.succeed(f"echo {token} > /var/lib/velstra/node-token")
+                node.succeed("chmod 600 /var/lib/velstra/node-token")
+                node.succeed("systemctl start velstra-cloud-nodeagent")
+                node.wait_for_unit("velstra-cloud-nodeagent.service")
+
+            with subtest("the node reports itself to the cell"):
+                # The agent's first status report carries its capacity — that
+                # arriving over the node token IS the registration working.
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/nodes/node-1 | grep -q vcpus",
+                    timeout=120,
+                )
+          '';
+        };
+
+        # The installer ISO's first-boot wizard, driven prompt by prompt the
+        # way an operator answers it, onto a blank disk — then the seed it
+        # wrote is read back. The control plane is deliberately unreachable
+        # during the install: the wizard records, the first boot registers.
+        #   nix build .#checks.x86_64-linux.wizard -L
+        wizard = pkgs.testers.runNixOSTest {
+          name = "velstra-node-wizard";
+          nodes.machine = {
+            imports = [
+              sentinel.nixosModules.applianceIso
+              nodeIsoConfig
+            ];
+            virtualisation = {
+              memorySize = 2048;
+              mountHostNixStore = true;
+              # vdb — the install target. Comfortably larger than the layout
+              # the installer clones onto it (ESP + verity store + data);
+              # sized at 8000 it was refused, correctly and by name, for being
+              # 7.8 GiB against a layout needing 8.9.
+              emptyDiskImages = [ 12000 ];
+            };
+            environment.systemPackages = [ pkgs.expect ];
+          };
+          testScript = ''
+            import re
+
+            token = "ab" * 32
+
+            machine.wait_for_unit("multi-user.target")
+
+            # The wizard's own candidate listing decides the pick — a
+            # hardcoded disk number slides out of step on a machine with a
+            # different disk set.
+            listing = machine.succeed("velstra-cloud-node install </dev/null 2>&1 || true")
+            m = re.search(r"\[(\d+)\] /dev/vdb ", listing)
+            assert m, "the candidate listing does not offer /dev/vdb:\n" + listing
+            pick = m.group(1)
+
+            # Run it detached from the assertion so a failure can show the
+            # transcript. `machine.succeed` would raise with nothing but an
+            # exit code, and "the installer exited 1" is not a diagnosis of an
+            # installer that had just printed the reason.
+            status, _ = machine.execute(
+                f"API_URL=http://cell.example:8443 TOKEN={token} PICK={pick}"
+                f" expect ${./nix/node-wizard.exp} >/tmp/transcript 2>&1"
+            )
+            if status != 0:
+                print(machine.succeed("cat -v /tmp/transcript"))
+                raise Exception(f"the wizard did not finish: exit {status}")
+
+            with subtest("the token never appears in the transcript"):
+                machine.fail(f"grep -q {token} /tmp/transcript")
+
+            with subtest("the wizard's seed is on the data partition, ready for first boot"):
+                machine.succeed("mkdir -p /mnt && mount /dev/vdb6 /mnt")
+                env = machine.succeed("cat /mnt/node.env")
+                for line in [
+                    "VELSTRA_NODE=node-1",
+                    "VELSTRA_CELL=cell-1",
+                    "VELSTRA_REGION=eu-central",
+                    "VELSTRA_API_URL=http://cell.example:8443",
+                    "VELSTRA_VMM=qemu",
+                    "VELSTRA_HOSTNAME=node-t1",
+                ]:
+                    assert line in env, f"node.env is missing {line}:\n{env}"
+                mode = machine.succeed("stat -c %a /mnt/node-token").strip()
+                assert mode == "600", f"the token file is {mode}, not 600"
+                machine.succeed(f"grep -qx {token} /mnt/node-token")
+                # DHCP was chosen: no static units, so nothing to drift from
+                # the image's networkd default.
+                machine.fail("test -d /mnt/network")
+
+            with subtest("the clone is a real sealed system, not just a seed"):
+                # ESP + both slot-A partitions came over; slot B stayed empty.
+                parts = machine.succeed("lsblk -rno NAME /dev/vdb")
+                assert "vdb6" in parts, parts
+                machine.succeed("sgdisk -p /dev/vdb | grep -q esp")
+          '';
+        };
+
+        # A guest actually starts: the operator path (API → scheduler → agent)
+        # ends in a real QEMU/KVM guest printing a kernel banner on its serial
+        # console. Needs nested KVM — the agent's QEMU backend is accel=kvm by
+        # design, so if /dev/kvm is missing inside the VM this fails loudly
+        # rather than proving something weaker.
+        #   nix build .#checks.x86_64-linux.guest -L
+        guest = pkgs.testers.runNixOSTest {
+          name = "velstra-cloud-guest";
+          nodes.cell = {
+            imports = [
+              controlPlaneNode
+              self.nixosModules.node
+            ];
+            velstra.cloud.node = {
+              enable = true;
+              package = velstra-cloud;
+            };
+            virtualisation = {
+              memorySize = 4096;
+              cores = 2;
+              # Expose the host CPU's virtualisation extension to this VM so
+              # the guest-of-a-guest can be KVM, matching the agent's backend.
+              qemu.options = [
+                "-cpu"
+                "max"
+              ];
+            };
+          };
+          testScript = ''
+            import json
+
+            kernel = "${pkgs.linuxPackages.kernel}/bzImage"
+
+            cell.wait_for_unit("velstra-cloud-api.service")
+            cell.wait_for_unit("velstra-cloud-controller.service")
+
+            with subtest("nested KVM is available (the agent's QEMU is accel=kvm)"):
+                cell.succeed("test -c /dev/kvm")
+
+            auth = "-H 'Authorization: Bearer opstoken'"
+            ct = "-H 'Content-Type: application/json'"
+            api = "http://127.0.0.1:8443/api/v1"
+            cell.wait_until_succeeds(f"curl -fsS {auth} {api}/nodes")
+
+            with subtest("node registered over its token, QEMU backend"):
+                created = json.loads(cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"node-1\", \"spec\": {{\"schedulable\": true}}}}'"
+                    f" {api}/nodes"
+                ))
+                token = created["nodeToken"]
+                cell.succeed("mkdir -p /var/lib/velstra")
+                cell.succeed(f"echo {token} > /var/lib/velstra/node-token")
+                cell.succeed("chmod 600 /var/lib/velstra/node-token")
+                # Seeded for QEMU with a direct kernel boot: the check's guest
+                # payload is a bare kernel whose banner on the serial console
+                # is the proof of life — no distribution image to fetch.
+                cell.succeed(
+                    "mkdir -p /run/systemd/system/velstra-cloud-nodeagent.service.d && "
+                    "printf '[Service]\nExecStart=\nExecStart=${velstra-cloud}/bin/velstra-cloud-nodeagent "
+                    "--node node-1 --cell cell-1 --region eu-central "
+                    "--api http://127.0.0.1:8443 --api-token-file /var/lib/velstra/node-token "
+                    "--vmm qemu --vmm-binary ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "
+                    "--state-dir /var/lib/velstra "
+                    f"--boot-kernel {kernel} --boot-cmdline console=ttyS0\n'"
+                    " > /run/systemd/system/velstra-cloud-nodeagent.service.d/boot.conf"
+                )
+                cell.succeed(
+                    "printf 'VELSTRA_NODE=node-1\nVELSTRA_CELL=cell-1\n"
+                    "VELSTRA_REGION=eu-central\nVELSTRA_API_URL=http://127.0.0.1:8443\n"
+                    "VELSTRA_VMM=qemu\nVELSTRA_HOSTNAME=cell\n'"
+                    " > /var/lib/velstra/node.env"
+                )
+                cell.succeed("systemctl daemon-reload")
+                cell.succeed("systemctl start velstra-cloud-nodeagent")
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/nodes/node-1 | grep -q vcpus",
+                    timeout=120,
+                )
+
+            with subtest("project, image and instance via the API"):
+                # Pre-placed under its published slug: content-addressed means
+                # "already here" is a complete answer, so the agent skips the
+                # fetch (hostfs::fetch_image's first check).
+                cell.succeed("dd if=/dev/zero of=/root/guest.raw bs=1M count=8")
+                cell.succeed(
+                    "mkdir -p /var/lib/velstra/images && "
+                    "cp /root/guest.raw"
+                    " '/var/lib/velstra/images/projects~p1~images~sha256-${lib.concatStrings (lib.replicate 32 "ab")}'"
+                )
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d @${pkgs.writeText "project.json" (builtins.toJSON {
+                      id = "p1";
+                      # An empty quota is the api tests' own idiom for "not the
+                      # thing under test" (delete_guards.rs) — spec fields all
+                      # default.
+                      spec.quota = { };
+                    })}"
+                    f" {api}/projects"
+                )
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d @${pkgs.writeText "image.json" (builtins.toJSON {
+                      id = "sha256-${lib.concatStrings (lib.replicate 32 "ab")}";
+                      spec = {
+                        digest = "sha256:${lib.concatStrings (lib.replicate 32 "ab")}";
+                        format = "Raw";
+                        sizeBytes = 8388608;
+                        sourceUrl = "file:///root/guest.raw";
+                      };
+                    })}"
+                    f" {api}/projects/p1/images"
+                )
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d @${pkgs.writeText "instance.json" (builtins.toJSON {
+                      id = "g1";
+                      spec = {
+                        vcpus = 1;
+                        memoryMib = 512;
+                        image = "projects/p1/images/sha256-${lib.concatStrings (lib.replicate 32 "ab")}";
+                        rootDiskGib = 1;
+                        desiredState = "Running";
+                        ports = [ ];
+                      };
+                    })}"
+                    f" {api}/projects/p1/instances"
+                )
+
+            with subtest("the guest runs, and really booted a kernel"):
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/p1/instances/g1"
+                    " | grep -qi running",
+                    timeout=300,
+                )
+                console = "/var/lib/velstra/instances/projects~p1~instances~g1/console.log"
+                cell.wait_until_succeeds(
+                    f"grep -q 'Linux version' {console}",
+                    timeout=300,
+                )
+          '';
+        };
+        # A machine taken out of service on purpose, end to end: the API accepts
+        # a window, the scheduler stops placing on the node while it is open,
+        # and — the claim the whole design rests on — service comes back when
+        # the window *expires*, with nobody having flipped anything back.
+        #
+        # Nothing here is faked but the hypervisor: a real API, a real
+        # controller and a real node agent, on a real clock. The guest is left
+        # `Stopped`, so this needs no nested KVM and no image bytes — what is
+        # under test is placement, not boot.
+        #   nix build .#checks.x86_64-linux.maintenance -L
+        maintenance = pkgs.testers.runNixOSTest {
+          name = "velstra-cloud-maintenance";
+          nodes.cell = {
+            imports = [
+              controlPlaneNode
+              self.nixosModules.node
+            ];
+            velstra.cloud.node = {
+              enable = true;
+              package = velstra-cloud;
+            };
+            # A window closing is not a write, so nothing announces it: the
+            # scheduler notices on its next pass. Five seconds rather than the
+            # default three hundred — what is being shown is that one pass is
+            # all it takes, not what the default happens to be.
+            velstra.cloud.controlPlane.resyncSeconds = 5;
+            virtualisation = {
+              memorySize = 2048;
+              cores = 2;
+            };
+          };
+          testScript = ''
+            import json
+            import time
+
+            cell.wait_for_unit("velstra-cloud-api.service")
+            cell.wait_for_unit("velstra-cloud-controller.service")
+
+            auth = "-H 'Authorization: Bearer opstoken'"
+            ct = "-H 'Content-Type: application/json'"
+            api = "http://127.0.0.1:8443/api/v1"
+            cell.wait_until_succeeds(f"curl -fsS {auth} {api}/nodes")
+
+            with subtest("a node registers and reports itself"):
+                created = json.loads(cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"node-1\", \"spec\": {{\"schedulable\": true}}}}'"
+                    f" {api}/nodes"
+                ))
+                token = created["nodeToken"]
+                cell.succeed("mkdir -p /var/lib/velstra")
+                cell.succeed(f"echo {token} > /var/lib/velstra/node-token")
+                cell.succeed("chmod 600 /var/lib/velstra/node-token")
+                cell.succeed(
+                    "printf 'VELSTRA_NODE=node-1\nVELSTRA_CELL=cell-1\n"
+                    "VELSTRA_REGION=eu-central\nVELSTRA_API_URL=http://127.0.0.1:8443\n"
+                    "VELSTRA_VMM=fake\nVELSTRA_HOSTNAME=cell\n'"
+                    " > /var/lib/velstra/node.env"
+                )
+                cell.succeed("systemctl start velstra-cloud-nodeagent")
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/nodes/node-1 | grep -q vcpus",
+                    timeout=120,
+                )
+
+            with subtest("a project and an image to point a guest at"):
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct} -d '{{\"id\": \"p1\","
+                    f" \"spec\": {{\"quota\": {{}}}}}}' {api}/projects"
+                )
+                slug = "sha256-" + "ab" * 32
+                digest = "sha256:" + "ab" * 32
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"{slug}\", \"spec\": {{"
+                    f"\"digest\": \"{digest}\", \"format\": \"Raw\","
+                    f" \"sizeBytes\": 8388608,"
+                    f" \"sourceUrl\": \"file:///dev/null\"}}}}'"
+                    f" {api}/projects/p1/images"
+                )
+
+            with subtest("the node is declared out of service for a minute"):
+                # The *cell's* clock, not the test driver's. They are two
+                # machines, and a window is arithmetic on the clock of whoever
+                # is reading it — taking the host's would make the window open
+                # or expire at a time the API does not agree with.
+                now = int(cell.succeed("date +%s%3N").strip())
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"dimm-swap\", \"spec\": {{"
+                    f"\"node\": \"node-1\", \"startsAt\": {now},"
+                    f" \"minutes\": 1, \"drain\": false,"
+                    f" \"note\": \"swapping the failed DIMM in slot 3\"}}}}'"
+                    f" {api}/maintenance-windows"
+                )
+                said = json.loads(cell.succeed(
+                    f"curl -fsS {auth} {api}/nodes/node-1:explainMaintenance"
+                ))
+                assert said["open"] is not None, said
+                assert said["open"]["note"].startswith("swapping"), said
+                # Nothing is being asked to leave: that is what `drain: false`
+                # means, and a fleet moving here would be the bug.
+                assert said["draining"] is False, said
+
+            with subtest("nothing new is placed there, in the operator's own words"):
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"g1\", \"spec\": {{"
+                    f"\"vcpus\": 1, \"memoryMib\": 512,"
+                    f" \"image\": \"projects/p1/images/{slug}\","
+                    f" \"rootDiskGib\": 1, \"desiredState\": \"Stopped\","
+                    f" \"ports\": []}}}}'"
+                    f" {api}/projects/p1/instances"
+                )
+
+                def rejection():
+                    answer = json.loads(cell.succeed(
+                        f"curl -fsS {auth}"
+                        f" {api}/projects/p1/instances/g1:explainPlacement"
+                    ))
+                    if answer["placed"] is not None:
+                        return None
+                    for r in answer["rejected"]:
+                        if r["node"] == "node-1":
+                            return r
+                    return None
+
+                deadline = time.time() + 60
+                seen = None
+                while time.time() < deadline:
+                    seen = rejection()
+                    if seen:
+                        break
+                    time.sleep(2)
+                assert seen is not None, "a guest was placed on a node that is out of service"
+                assert seen["why"] == "InMaintenance", seen
+                # Relative, and carrying what the operator typed: "no valid
+                # host" is not a sentence anybody can act on.
+                assert "another" in seen["detail"], seen
+                assert "DIMM" in seen["detail"], seen
+
+                # And the operator's own two switches were never touched. That
+                # is the whole design: a window is a declaration, and nothing
+                # writes `schedulable` or `evacuate` on their behalf.
+                node = json.loads(cell.succeed(f"curl -fsS {auth} {api}/nodes/node-1"))
+                assert node["spec"]["schedulable"] is True, node
+                assert node["spec"]["evacuate"] is False, node
+
+            with subtest("the window ends and the machine takes work again"):
+                # Nothing is flipped back and nothing is deleted: the window is
+                # still there, it has simply stopped being open.
+                #
+                # Read as JSON rather than grepped. `grep node-1` over the whole
+                # object passes the moment the guest is *refused*, because the
+                # rejection chain on its condition names every node it was
+                # refused by — so the loose version reported a placement that
+                # had not happened, and the assertions below then ran while the
+                # window was still open.
+                def placed():
+                    guest = json.loads(cell.succeed(
+                        f"curl -fsS {auth} {api}/projects/p1/instances/g1"
+                    ))
+                    return guest["spec"]["node"]
+
+                deadline = time.time() + 240
+                where = None
+                while time.time() < deadline:
+                    where = placed()
+                    if where:
+                        break
+                    time.sleep(3)
+                assert where == "node-1", (
+                    f"the guest was not placed once the window closed: {where!r}"
+                )
+                still = json.loads(cell.succeed(
+                    f"curl -fsS {auth} {api}/maintenance-windows/dimm-swap"
+                ))
+                assert still["spec"]["node"] == "node-1", still
+                after = json.loads(cell.succeed(
+                    f"curl -fsS {auth} {api}/nodes/node-1:explainMaintenance"
+                ))
+                assert after["open"] is None, after
+                node = json.loads(cell.succeed(f"curl -fsS {auth} {api}/nodes/node-1"))
+                assert node["spec"]["schedulable"] is True, node
+          '';
+        };
+        # Storage, end to end, on a real filesystem: a volume asked for through
+        # the API is provisioned by a pool agent as a qcow2 file, a backup of it
+        # lands on a target as real bytes, and a second volume is restored from
+        # that copy.
+        #
+        # Until the pool module existed there was no process in any deployment
+        # that would put a byte on a disk — the agent was a binary nothing
+        # started. This is what makes that a property rather than a claim.
+        #   nix build .#checks.x86_64-linux.storage -L
+        storage = pkgs.testers.runNixOSTest {
+          name = "velstra-cloud-storage";
+          nodes.cell = {
+            imports = [
+              controlPlaneNode
+              self.nixosModules.pool
+            ];
+            velstra.cloud.pool = {
+              enable = true;
+              package = velstra-cloud;
+              id = "nvme";
+              # The cell's own etcd, which the control plane brings up here.
+              # `memory` would give this agent a store of its very own — it
+              # would come up, report a pool nobody can see, and provision
+              # nothing, which is a shape worth *not* writing a test around.
+              store = "127.0.0.1:2379";
+              resyncSeconds = 2;
+            };
+            virtualisation = {
+              memorySize = 2048;
+              diskSize = 4096;
+            };
+          };
+          testScript = ''
+            import json
+            import time
+
+            cell.wait_for_unit("velstra-cloud-api.service")
+            cell.wait_for_unit("velstra-cloud-poolagent.service")
+
+            auth = "-H 'Authorization: Bearer opstoken'"
+            ct = "-H 'Content-Type: application/json'"
+            api = "http://127.0.0.1:8443/api/v1"
+            cell.wait_until_succeeds(f"curl -fsS {auth} {api}/pools")
+
+            with subtest("the pool registers itself and reports what it has"):
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"nvme\", \"spec\": {{\"accepting\": true}}}}'"
+                    f" {api}/pools"
+                )
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/pools/nvme | grep -q capacityGib",
+                    timeout=120,
+                )
+
+            with subtest("a volume asked for becomes a file on the disk"):
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct} -d '{{\"id\": \"p1\","
+                    f" \"spec\": {{\"quota\": {{}}}}}}' {api}/projects"
+                )
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"v1\", \"spec\": {{\"sizeGib\": 1,"
+                    f" \"pool\": \"nvme\"}}}}'"
+                    f" {api}/projects/p1/volumes"
+                )
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/p1/volumes/v1"
+                    " | grep -q '\"provisioned\":true'",
+                    timeout=120,
+                )
+                # The bytes, not the object: a status that said `provisioned`
+                # over an empty directory is exactly what this check exists to
+                # rule out.
+                cell.succeed("ls /var/lib/velstra/pool | grep -q qcow2")
+
+            with subtest("a backup of it is real bytes on a target"):
+                cell.succeed("mkdir -p /srv/archive")
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"archive\", \"spec\": {{\"kind\": \"directory\","
+                    f" \"path\": \"/srv/archive\", \"accepting\": true,"
+                    f" \"agent\": \"nvme\"}}}}'"
+                    f" {api}/backup-targets"
+                )
+                # A target reports whether it is writable, and a backup is
+                # refused until it has: the platform does not assume a path it
+                # has never touched is one it can write.
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/backup-targets/archive | grep -q '\"writable\":true'",
+                    timeout=120,
+                )
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"b1\", \"spec\": {{"
+                    f"\"volume\": \"projects/p1/volumes/v1\","
+                    f" \"target\": \"backup-targets/archive\"}}}}'"
+                    f" {api}/projects/p1/backups"
+                )
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/p1/backups/b1 | grep -q '\"taken\":true'",
+                    timeout=180,
+                )
+                # Named for the backup with its slashes flattened, so a person
+                # can read the target with `ls` and two cells sharing one cannot
+                # collide.
+                cell.succeed("test -s /srv/archive/projects~p1~backups~b1")
+
+            with subtest("a volume is restored from that copy"):
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"v2\", \"spec\": {{\"sizeGib\": 1,"
+                    f" \"pool\": \"nvme\","
+                    f" \"sourceBackup\": \"projects/p1/backups/b1\"}}}}'"
+                    f" {api}/projects/p1/volumes"
+                )
+                cell.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/p1/volumes/v2"
+                    " | grep -q '\"provisioned\":true'",
+                    timeout=180,
+                )
+
+            with subtest("a restore with no copy to read is refused, never made blank"):
+                cell.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"v3\", \"spec\": {{\"sizeGib\": 1,"
+                    f" \"pool\": \"nvme\","
+                    f" \"sourceBackup\": \"projects/p1/backups/never\"}}}}'"
+                    f" {api}/projects/p1/volumes"
+                )
+                # Given several passes to get it wrong, then asked.
+                time.sleep(10)
+                v3 = json.loads(cell.succeed(
+                    f"curl -fsS {auth} {api}/projects/p1/volumes/v3"
+                ))
+                assert v3["status"].get("provisioned") is not True, (
+                    f"a volume asked to be a restore was made blank: {v3['status']}"
+                )
+                ready = [c for c in v3["status"]["conditions"] if c["kind"] == "Ready"]
+                assert ready and ready[0]["status"] == "False", v3["status"]
+                assert "nothing to restore from" in ready[0]["message"], ready[0]
+          '';
+        };
+        # What is actually in the .deb, asked of the .deb.
+        #
+        # A package is a claim about a machine somebody else will run, and the
+        # cheapest way for it to be wrong is silently: a unit that did not make
+        # it in, a postinst that is not executable, a binary that is a dangling
+        # symlink into a /nix that is not there.
+        #   nix build .#checks.x86_64-linux.deb -L
+        deb =
+          pkgs.runCommand "velstra-cloud-deb-check"
+            {
+              nativeBuildInputs = [ pkgs.dpkg ];
+            }
+            ''
+              deb=${self.packages.${system}.deb}
+              contents=$(dpkg-deb --contents "$deb")
+
+              for want in \
+                ./usr/bin/velstra-cloud-api \
+                ./usr/bin/velstra-cloud-controller \
+                ./usr/bin/velstra-cloud-nodeagent \
+                ./usr/bin/velstra-cloud-poolagent \
+                ./usr/bin/velstra-cloud-node \
+                ./lib/systemd/system/velstra-cloud-api.service \
+                ./lib/systemd/system/velstra-cloud-controller.service \
+                ./lib/systemd/system/velstra-cloud-nodeagent.service \
+                ./lib/systemd/system/velstra-cloud-poolagent.service; do
+                echo "$contents" | grep -q " $want\$" || {
+                  echo "the package is missing $want" >&2
+                  echo "$contents" >&2
+                  exit 1
+                }
+              done
+
+              # Real files, not symlinks into a /nix that is not on the target.
+              # A .deb that depended on the store existing would be a Nix
+              # installation wearing a Debian filename.
+              if echo "$contents" | grep -E "^l.* \./usr/bin/" ; then
+                echo "a binary in the package is a symlink" >&2
+                exit 1
+              fi
+
+              # And nothing *inside* a unit may name the store either. The
+              # binaries being copied is only half of it: the first build of
+              # this package interpolated `''${velstra-cloud}/bin/…` into every
+              # `ExecStart`, which installs cleanly and then fails on a machine
+              # with no /nix — a package that is wrong only where nobody
+              # building it can see.
+              mkdir -p units
+              dpkg-deb --fsys-tarfile "$deb" | tar -x -C units ./lib/systemd/system
+              if grep -rn "/nix/store" units; then
+                echo "a unit points into the Nix store, which is not on a Debian machine" >&2
+                exit 1
+              fi
+              grep -q "ExecStart=/usr/bin/velstra-cloud-poolagent" \
+                units/lib/systemd/system/velstra-cloud-poolagent.service
+
+              # Every unit is conditional on its own role, and starts nothing on
+              # a machine that has not been told what it is for.
+              dpkg-deb --fsys-tarfile "$deb" | tar -xO ./lib/systemd/system/velstra-cloud-poolagent.service > unit
+              grep -q "ExecCondition=.*has-role pool" unit || {
+                echo "the pool unit is not conditional on the pool role:" >&2
+                cat unit >&2
+                exit 1
+              }
+              grep -q "EnvironmentFile=-/var/lib/velstra/node.env" unit
+
+              # `postinst` runs as root on somebody else's machine. One that is
+              # not executable is a package that half-installs.
+              dpkg-deb --control "$deb" ctrl
+              test -x ctrl/postinst
+              test -x ctrl/prerm
+              grep -q "velstra-cloud-node setup" ctrl/postinst
+              # And it deliberately enables nothing: a unit started before the
+              # seed exists is an agent pointing at no cell, retrying for ever.
+              #
+              # Anchored to the start of a line, because the script *says* it
+              # does not enable anything — and a grep for the bare string
+              # matches the sentence explaining its own absence. Which it did,
+              # on the first run of this check.
+              if grep -qE "^[[:space:]]*systemctl enable" ctrl/postinst; then
+                echo "postinst enables units; nothing may start before there is a seed" >&2
+                exit 1
+              fi
+
+              touch $out
+            '';
+        # The setup wizard, driven answer by answer, with the seed read back.
+        #
+        # No VM: this wizard writes one file and touches nothing else, which is
+        # the whole reason it is separate from the appliance installer. So the
+        # check is a pipe and a `grep` — a second, and it exercises the thing an
+        # operator actually types.
+        #   nix build .#checks.x86_64-linux.setup -L
+        setup =
+          pkgs.runCommand "velstra-cloud-setup-check" { } ''
+            mkdir -p seed
+            # region, cell, roles (control-plane + hypervisor + pool), API url,
+            # node id, token, hypervisor, pool id, backend, store, other cells,
+            # confirm.
+            ${velstra-cloud}/bin/velstra-cloud-node setup --dir "$PWD/seed" --nixos false <<'ANSWERS' > out 2>&1
+            eu-north
+            cell-7
+            1 2 3
+            https://cell-7.example:8443
+            node-a
+            ${lib.concatStrings (lib.replicate 32 "ab")}
+            2
+            nvme
+            1
+            10.0.0.1:2379
+            cell-8=https://cell-8.example:8443
+            y
+            ANSWERS
+
+            seed=$(cat seed/node.env)
+            echo "$seed"
+
+            # Every answer, in the file, spelled the way a unit reads it.
+            grep -qx "VELSTRA_REGION=eu-north" seed/node.env
+            grep -qx "VELSTRA_CELL=cell-7" seed/node.env
+            grep -qx "VELSTRA_ROLES=control-plane,hypervisor,pool" seed/node.env
+            grep -qx "VELSTRA_NODE=node-a" seed/node.env
+            grep -qx "VELSTRA_VMM=cloud-hypervisor" seed/node.env
+            grep -qx "VELSTRA_POOL=nvme" seed/node.env
+            grep -qx "VELSTRA_POOL_BACKEND=directory" seed/node.env
+            grep -qx "VELSTRA_STORE=10.0.0.1:2379" seed/node.env
+            grep -qx "VELSTRA_CELLS=cell-8=https://cell-8.example:8443" seed/node.env
+
+            # The token is the one secret here, and it is not in the file every
+            # unit reads.
+            if grep -q "${lib.concatStrings (lib.replicate 32 "ab")}" seed/node.env; then
+              echo "the token is in the world-readable seed" >&2
+              exit 1
+            fi
+            grep -q "${lib.concatStrings (lib.replicate 32 "ab")}" seed/node-token
+            test "$(stat -c %a seed/node-token)" = 600
+            test "$(stat -c %a seed/node.env)" = 644
+
+            # Told what to enable, and told what it cannot do for them.
+            grep -q "systemctl enable --now velstra-cloud-nodeagent" out
+            grep -q "systemctl enable --now velstra-cloud-poolagent" out
+            grep -q "cannot mark itself a gateway" out
+
+            touch $out
+          '';
+      };
+    };
+}

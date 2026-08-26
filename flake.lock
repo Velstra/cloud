@@ -1,0 +1,139 @@
+{
+  "nodes": {
+    "fabric": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787733053,
+        "narHash": "sha256-7kvKUrR+CQ243f3ilI++kXTOtmgzM+eoNzXmahcZUgc=",
+        "owner": "Velstra",
+        "repo": "fabric",
+        "rev": "e64a1e3e691952b5e5a1a22c4b638dc6d029b307",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Velstra",
+        "repo": "fabric",
+        "type": "github"
+      }
+    },
+    "fenix": {
+      "inputs": {
+        "nixpkgs": [
+          "sentinel",
+          "nixpkgs"
+        ],
+        "rust-analyzer-src": "rust-analyzer-src"
+      },
+      "locked": {
+        "lastModified": 1782208688,
+        "narHash": "sha256-oEax2Unvaq0wD8tZs+Kk3zzeUduOegVYW8R9nM5S3Os=",
+        "owner": "nix-community",
+        "repo": "fenix",
+        "rev": "5d0542f6ba83f9366095b0e9966b0377c4c1cb31",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "fenix",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1767313136,
+        "narHash": "sha256-16KkgfdYqjaeRGBaYsNrhPRRENs0qzkQVUooNHtoy2w=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "ac62194c3917d5f474c1a844b6fd6da2db95077d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-25.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs-rust": {
+      "locked": {
+        "lastModified": 1787498568,
+        "narHash": "sha256-9i/VTdusq/+NM/tz+J1Re+ojkMB8MBf0QshnYfzHz30=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "56c02bc00adcf003215cc4bd996d6efaf4cff188",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "nixpkgs-rust": "nixpkgs-rust",
+        "sentinel": "sentinel"
+      }
+    },
+    "rust-analyzer-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782126558,
+        "narHash": "sha256-HLXplzCGoc5mBVXdJriEsfX0gLDNXZ+O5urcdTmLP+E=",
+        "owner": "rust-lang",
+        "repo": "rust-analyzer",
+        "rev": "ff5fcc70d9bcdc54db365114e2f7b1c18056ed4f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rust-lang",
+        "ref": "nightly",
+        "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "sentinel": {
+      "inputs": {
+        "fabric": "fabric",
+        "fenix": "fenix",
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "wren": "wren"
+      },
+      "locked": {
+        "lastModified": 1787734468,
+        "narHash": "sha256-iY4huVdv2Bwq0JqGi6OUJQDVG7gWKhdrYKyi9em01tM=",
+        "ref": "refs/heads/main",
+        "rev": "3cf3905170adcb7cd18b633d6eeacc9c6056577c",
+        "revCount": 213,
+        "type": "git",
+        "url": "file:///home/mbrandt/01_repositories/velstra/sentinel"
+      },
+      "original": {
+        "type": "git",
+        "url": "file:///home/mbrandt/01_repositories/velstra/sentinel"
+      }
+    },
+    "wren": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786816762,
+        "narHash": "sha256-JZy/6pqHiUaCPGzWHR/TNbk8ar3EwzUsOYMUJyu8UhU=",
+        "owner": "Velstra",
+        "repo": "wren",
+        "rev": "5d84755ccbb31bb29e8651e5e886a06df0d51889",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Velstra",
+        "repo": "wren",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

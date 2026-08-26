@@ -86,6 +86,7 @@ async fn main() {
         ports.clone(),
         TypedStore::new(store.clone(), CELL, "subnets"),
         TypedStore::new(store.clone(), CELL, "floatingips"),
+        TypedStore::new(store.clone(), CELL, "load-balancers"),
         StatusWriter::new(store.clone(), CELL, "ports", "address"),
         CELL,
     ));
@@ -138,6 +139,22 @@ async fn main() {
             TypedStore::new(store.clone(), CELL, "volumes"),
             store.clone(),
             velstra_cloud_store::prefix_for(CELL, "volumes"),
+        ),
+        velstra_cloud_store::Cached::start(
+            TypedStore::<
+                velstra_cloud_model::resources::FloatingIpSpec,
+                velstra_cloud_model::resources::FloatingIpStatus,
+            >::new(store.clone(), CELL, "floatingips"),
+            store.clone(),
+            velstra_cloud_store::prefix_for(CELL, "floatingips"),
+        ),
+        velstra_cloud_store::Cached::start(
+            TypedStore::<
+                velstra_cloud_model::loadbalancer::LoadBalancerSpec,
+                velstra_cloud_model::loadbalancer::LoadBalancerStatus,
+            >::new(store.clone(), CELL, "load-balancers"),
+            store.clone(),
+            velstra_cloud_store::prefix_for(CELL, "load-balancers"),
         ),
         StatusWriter::new(store.clone(), CELL, "projects", "quota"),
         CELL,
@@ -274,7 +291,13 @@ async fn register_pool(store: Arc<dyn Store>, id: &str) {
         },
         PoolStatus::default(),
     );
-    if let Err(e) = pools.create(&pool).await {
+    if let Err(e) = pools
+        .create(
+            &pool,
+            &velstra_cloud_model::access::Writer::controller("dev"),
+        )
+        .await
+    {
         eprintln!("warning: could not register {id}: {e}");
     }
 }
@@ -292,12 +315,23 @@ async fn register_node(store: Arc<dyn Store>, id: &str) {
             Placement::new(REGION, CELL),
         ),
         NodeSpec {
+            evacuate: false,
+            vcpu_overcommit: 0,
+                fence_after_s: 0,
             schedulable: true,
             labels: vec!["dev".to_string()],
-        },
+            cpu_baseline: None,
+                gateway: false,
+            },
         NodeStatus::default(),
     );
-    if let Err(e) = nodes.create(&node).await {
+    if let Err(e) = nodes
+        .create(
+            &node,
+            &velstra_cloud_model::access::Writer::controller("dev"),
+        )
+        .await
+    {
         eprintln!("warning: could not register {id}: {e}");
     }
     // Give the agent a moment to claim it before the first request arrives, so
@@ -348,7 +382,13 @@ async fn seed(store: Arc<dyn Store>) {
             + Sync,
     {
         let collection: TypedStore<S, T> = TypedStore::new(store.clone(), CELL, kind);
-        if let Err(e) = collection.create(&object).await {
+        if let Err(e) = collection
+            .create(
+                &object,
+                &velstra_cloud_model::access::Writer::controller("dev"),
+            )
+            .await
+        {
             eprintln!("warning: seeding {}: {e}", object.meta.name);
         }
     }
@@ -362,10 +402,12 @@ async fn seed(store: Arc<dyn Store>) {
                 display_name: "Demo".into(),
                 parent: "organizations/o1".into(),
                 quota: Quota {
+                    devices: 0,
                     instances: 50,
                     vcpus: 200,
                     memory_mib: 409_600,
                     volume_gib: 10_000,
+                    ..Quota::default()
                 },
                 // Left empty on purpose: a dev cell is one cell, and an empty
                 // home resolves to whichever cell is reading. Naming it here
@@ -392,6 +434,7 @@ async fn seed(store: Arc<dyn Store>) {
         Resource::new(
             meta(image),
             ImageSpec {
+                source_instance: None,
                 digest: "sha256:3f9a2b".into(),
                 format: ImageFormat::Raw,
                 size_bytes: 1_073_741_824,
@@ -414,6 +457,8 @@ async fn seed(store: Arc<dyn Store>) {
             NetworkSpec {
                 vni: 4711,
                 mtu: 1450,
+                external: false,
+                announce: Default::default(),
             },
             NetworkStatus::default(),
         ),
@@ -464,6 +509,7 @@ async fn seed(store: Arc<dyn Store>) {
         Resource::new(
             meta("projects/p1/volumes/data-1"),
             VolumeSpec {
+                source_backup: None,
                 size_gib: 100,
                 pool: "rbd-standard".into(),
                 encryption_key: None,
@@ -502,6 +548,11 @@ async fn seed(store: Arc<dyn Store>) {
         Resource::new(
             meta("projects/p1/instances/web-1"),
             InstanceSpec {
+                start_order: 0,
+                start_delay_s: 0,
+                on_node_loss: Default::default(),
+                console: false,
+                devices: Vec::new(),
                 vcpus: 2,
                 memory_mib: 4096,
                 image: image.into(),
@@ -524,6 +575,11 @@ async fn seed(store: Arc<dyn Store>) {
         Resource::new(
             meta("projects/p1/instances/too-big"),
             InstanceSpec {
+                start_order: 0,
+                start_delay_s: 0,
+                on_node_loss: Default::default(),
+                console: false,
+                devices: Vec::new(),
                 vcpus: 64,
                 memory_mib: 262_144,
                 image: image.into(),
@@ -585,7 +641,13 @@ async fn attach_once_placed(store: Arc<dyn Store>) {
         },
         AttachmentStatus::default(),
     );
-    if let Err(e) = attachments.create(&attachment).await {
+    if let Err(e) = attachments
+        .create(
+            &attachment,
+            &velstra_cloud_model::access::Writer::controller("dev"),
+        )
+        .await
+    {
         eprintln!("warning: seeding the attachment: {e}");
     }
 }
