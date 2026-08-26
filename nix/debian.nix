@@ -235,5 +235,50 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
 
     cp ${../docs/install.md} "$root/usr/share/doc/velstra-cloud/install.md"
 
+    # `copyright`, which Debian Policy §12.5 makes mandatory: every package must
+    # carry a verbatim copy of its licence, in this file, at this path. It was
+    # missing, and lintian errors on that — but the real point is smaller and
+    # older than lintian: the AGPL is only conveyed if the person who receives
+    # the software receives its terms with it.
+    #
+    # Machine-readable format 1.0, so the archive tooling can read it, and with
+    # the vendored proto called out separately: it is MIT OR Apache-2.0 and a
+    # copyright file that swept it under the package licence would be stating
+    # something untrue about somebody else's file.
+    cat > "$root/usr/share/doc/velstra-cloud/copyright" <<'COPYRIGHT'
+    Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+    Upstream-Name: velstra-cloud
+    Source: https://github.com/Velstra/cloud
+
+    Files: *
+    Copyright: 2026 Maximilian Brandt and contributors
+    License: AGPL-3.0-or-later
+
+    Files: velstra-cloud-fabric/proto/vendor/velstra.proto
+    Copyright: 2026 Maximilian Brandt and contributors
+    License: MIT or Apache-2.0
+     The wire contract is vendored from the Velstra Fabric repository, where it
+     is published under permissive terms because it is linked into both a
+     GPL-licensed eBPF object and an AGPL control plane. Vendoring it here does
+     not change that.
+
+    License: AGPL-3.0-or-later
+     This program is free software: you can redistribute it and/or modify it
+     under the terms of the GNU Affero General Public License as published by
+     the Free Software Foundation, either version 3 of the License, or (at your
+     option) any later version.
+     .
+     This program is distributed in the hope that it will be useful, but
+     WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+     or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+     License for more details.
+     .
+     You should have received a copy of the GNU Affero General Public License
+     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+     .
+     On Debian systems, the complete text of the GNU Affero General Public
+     License version 3 can be found in "/usr/share/common-licenses/AGPL-3".
+    COPYRIGHT
+
     dpkg-deb --root-owner-group --build "$root" "$out"
   ''

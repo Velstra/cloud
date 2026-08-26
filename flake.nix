@@ -1421,7 +1421,8 @@
                 ./lib/systemd/system/velstra-cloud-controller.service \
                 ./lib/systemd/system/velstra-cloud-nodeagent.service \
                 ./lib/systemd/system/velstra-cloud-poolagent.service \
-                ./lib/systemd/system/velstra-fabric-agent.service; do
+                ./lib/systemd/system/velstra-fabric-agent.service \
+                ./usr/share/doc/velstra-cloud/copyright; do
                 echo "$contents" | grep -q " $want\$" || {
                   echo "the package is missing $want" >&2
                   echo "$contents" >&2
@@ -1493,6 +1494,28 @@
               grep -q "Before=velstra-cloud-nodeagent.service" fab || {
                 echo "the fabric unit does not order itself before the node agent:" >&2
                 cat fab >&2
+                exit 1
+              }
+
+              # The licence travels with the software or it has not been
+              # conveyed. Debian Policy §12.5 makes this file mandatory and
+              # lintian errors on its absence, but the older reason is the one
+              # that matters: the AGPL binds whoever receives the program, and
+              # somebody who receives it without its terms has been given no
+              # terms.
+              dpkg-deb --fsys-tarfile "$deb" | tar -xO ./usr/share/doc/velstra-cloud/copyright > cr
+              grep -q "^Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/" cr
+              grep -q "AGPL-3.0-or-later" cr || {
+                echo "the copyright file does not name the package licence:" >&2
+                cat cr >&2
+                exit 1
+              }
+              # And the vendored wire contract, which is somebody else's file
+              # under somebody else's terms. Sweeping it under the package
+              # licence would be stating something untrue about it.
+              grep -q "velstra-cloud-fabric/proto/vendor/velstra.proto" cr || {
+                echo "the copyright file does not carry the vendored proto's own terms:" >&2
+                cat cr >&2
                 exit 1
               }
 
