@@ -341,9 +341,7 @@ where
             .ok()
             .and_then(|s| serde_json::to_value(s).ok())
             .unwrap_or_else(|| json!({}));
-        let known = |key: &str| {
-            echoed.get(key).is_some() || self.empty_spec().get(key).is_some()
-        };
+        let known = |key: &str| echoed.get(key).is_some() || self.empty_spec().get(key).is_some();
 
         for (key, value) in fields {
             if known(key) {

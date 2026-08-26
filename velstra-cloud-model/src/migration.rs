@@ -295,7 +295,8 @@ pub fn may_migrate(
     // about.
     match &instance.status.cpu {
         Some(guest_cpu) => {
-            if let Err(why) = crate::cpu::may_run_on(guest_cpu, &to.status.cpu.clone().unwrap_or_default())
+            if let Err(why) =
+                crate::cpu::may_run_on(guest_cpu, &to.status.cpu.clone().unwrap_or_default())
             {
                 return Err(Refusal::DestinationCpuIncompatible {
                     node: to_id.to_string(),
@@ -736,15 +737,19 @@ mod tests {
                 // something else.
                 cpu: Some(crate::cpu::NodeCpu {
                     arch: "x86_64".into(),
-                    flags: ["sse3", "ssse3", "sse4_1", "sse4_2", "popcnt", "cx16", "lahf_lm"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
+                    flags: [
+                        "sse3", "ssse3", "sse4_1", "sse4_2", "popcnt", "cx16", "lahf_lm",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                     presents: "host".into(),
-                    presented_flags: ["sse3", "ssse3", "sse4_1", "sse4_2", "popcnt", "cx16", "lahf_lm"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
+                    presented_flags: [
+                        "sse3", "ssse3", "sse4_1", "sse4_2", "popcnt", "cx16", "lahf_lm",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                     can_mask: true,
                     ..Default::default()
                 }),
@@ -779,7 +784,16 @@ mod tests {
         let a = node("node-a", 16384, "0.1.0");
         let cached = vec!["node-a".to_string(), "node-b".to_string()];
 
-        assert!(may_migrate(&i, &a, &node("node-b", 16384, "0.1.0"), &cached, MigrationMode::Live).is_ok());
+        assert!(
+            may_migrate(
+                &i,
+                &a,
+                &node("node-b", 16384, "0.1.0"),
+                &cached,
+                MigrationMode::Live
+            )
+            .is_ok()
+        );
 
         // Every one of these is knowable without touching a hypervisor, and
         // every one of them would otherwise fail after the memory was copied.
@@ -790,7 +804,13 @@ mod tests {
             })
         );
         assert!(matches!(
-            may_migrate(&i, &a, &node("node-b", 1024, "0.1.0"), &cached, MigrationMode::Live),
+            may_migrate(
+                &i,
+                &a,
+                &node("node-b", 1024, "0.1.0"),
+                &cached,
+                MigrationMode::Live
+            ),
             Err(Refusal::DestinationTooSmall { .. })
         ));
         assert!(matches!(
@@ -823,7 +843,10 @@ mod tests {
         i.status.cpu = Some(crate::cpu::GuestCpu {
             model: "host".into(),
             arch: "x86_64".into(),
-            flags: ["sse4_2", "avx", "avx2"].iter().map(|s| s.to_string()).collect(),
+            flags: ["sse4_2", "avx", "avx2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         });
         let cached = vec!["node-a".to_string(), "node-b".to_string()];
 
@@ -837,9 +860,13 @@ mod tests {
             ..Default::default()
         });
 
-        let Err(Refusal::DestinationCpuIncompatible { why, .. }) =
-            may_migrate(&i, &node("node-a", 16384, "1.0.0"), &smaller, &cached, MigrationMode::Live)
-        else {
+        let Err(Refusal::DestinationCpuIncompatible { why, .. }) = may_migrate(
+            &i,
+            &node("node-a", 16384, "1.0.0"),
+            &smaller,
+            &cached,
+            MigrationMode::Live,
+        ) else {
             panic!("a guest using avx2 was allowed onto a node without it");
         };
         assert_eq!(
@@ -870,15 +897,25 @@ mod tests {
         let mut bigger = node("node-b", 16384, "1.0.0");
         bigger.status.cpu = Some(crate::cpu::NodeCpu {
             arch: "x86_64".into(),
-            flags: ["sse4_2", "avx", "avx2"].iter().map(|s| s.to_string()).collect(),
+            flags: ["sse4_2", "avx", "avx2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             presents: "host".into(),
-            presented_flags: ["sse4_2", "avx", "avx2"].iter().map(|s| s.to_string()).collect(),
+            presented_flags: ["sse4_2", "avx", "avx2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             can_mask: true,
             ..Default::default()
         });
-        let Err(Refusal::DestinationCpuIncompatible { why, .. }) =
-            may_migrate(&i, &node("node-a", 16384, "1.0.0"), &bigger, &cached, MigrationMode::Live)
-        else {
+        let Err(Refusal::DestinationCpuIncompatible { why, .. }) = may_migrate(
+            &i,
+            &node("node-a", 16384, "1.0.0"),
+            &bigger,
+            &cached,
+            MigrationMode::Live,
+        ) else {
             panic!("a running guest was moved onto a cpu it had not been given");
         };
         assert!(
@@ -922,7 +959,13 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(
-            may_migrate(&i, &node("node-a", 16384, "1.0.0"), &other, &cached, MigrationMode::Live),
+            may_migrate(
+                &i,
+                &node("node-a", 16384, "1.0.0"),
+                &other,
+                &cached,
+                MigrationMode::Live
+            ),
             Err(Refusal::GuestCpuUnknown { .. })
         ));
     }
@@ -952,9 +995,13 @@ mod tests {
             can_mask: false,
             ..Default::default()
         });
-        let Err(Refusal::DestinationCpuIncompatible { why, .. }) =
-            may_migrate(&i, &node("node-a", 16384, "1.0.0"), &ch, &cached, MigrationMode::Live)
-        else {
+        let Err(Refusal::DestinationCpuIncompatible { why, .. }) = may_migrate(
+            &i,
+            &node("node-a", 16384, "1.0.0"),
+            &ch,
+            &cached,
+            MigrationMode::Live,
+        ) else {
             panic!("a cloud-hypervisor node took a guest it cannot reproduce");
         };
         assert!(matches!(why, crate::cpu::CpuMismatch::CannotMask { .. }));
@@ -1017,7 +1064,6 @@ mod tests {
         ));
     }
 
-
     /// A guest holding passed-through hardware is not live-migrated, and the
     /// refusal says what would work instead.
     ///
@@ -1059,7 +1105,6 @@ mod tests {
         );
     }
 
-
     /// Emptying a node fills the emptiest neighbour, not the first one.
     ///
     /// The trap this pins: first-fit moves every guest to the same machine, so
@@ -1078,7 +1123,13 @@ mod tests {
         let mut two = instance(InstanceState::Running, Some("node-a"));
         two.meta.name = ResourceName::parse("projects/p1/instances/i2").unwrap();
 
-        let cached = |_: &str| vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()];
+        let cached = |_: &str| {
+            vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+            ]
+        };
         let (going, stuck) = evacuate(&from, &[&one, &two], &[&tight, &roomy], &cached, &[]);
 
         assert!(stuck.is_empty(), "{stuck:?}");

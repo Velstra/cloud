@@ -87,7 +87,9 @@ pub enum NotRecoverable {
     #[error("its policy is to leave it where it is")]
     PolicyIsLeave,
     /// The node has not been quiet long enough to be sure.
-    #[error("{node} was last heard from {quiet_s}s ago; {need_s}s is when its guests are certainly stopped")]
+    #[error(
+        "{node} was last heard from {quiet_s}s ago; {need_s}s is when its guests are certainly stopped"
+    )]
     NotQuietLongEnough {
         node: String,
         quiet_s: u64,
@@ -203,13 +205,8 @@ pub fn is_fenced(node: &NodeView, now: Timestamp, margin_s: u32) -> bool {
 /// The deadline is the node's own, without the margin — the margin belongs to
 /// the control plane, which must wait *longer* than this so that by the time it
 /// acts, this has already happened.
-pub fn should_self_fence(
-    fence_after_s: u32,
-    last_report: Timestamp,
-    now: Timestamp,
-) -> bool {
-    fence_after_s > 0
-        && now.0.saturating_sub(last_report.0) >= u64::from(fence_after_s) * 1000
+pub fn should_self_fence(fence_after_s: u32, last_report: Timestamp, now: Timestamp) -> bool {
+    fence_after_s > 0 && now.0.saturating_sub(last_report.0) >= u64::from(fence_after_s) * 1000
 }
 
 #[cfg(test)]

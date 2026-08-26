@@ -213,7 +213,10 @@ async fn a_volume_asked_for_becomes_an_rbd_create_in_the_right_pool() {
     // The volume pool, not the image pool: they are the design, and a create
     // that landed in the wrong one would make a volume nothing can find.
     assert!(create.contains(POOL), "{create}");
-    assert!(!create.contains(IMAGES), "created in the image pool: {create}");
+    assert!(
+        !create.contains(IMAGES),
+        "created in the image pool: {create}"
+    );
     // The name with its slashes flattened, so a person can read the pool with
     // `rbd ls` and two cells sharing one cannot collide.
     assert!(create.contains("projects~p1~volumes~v1"), "{create}");
@@ -241,7 +244,10 @@ async fn what_the_cluster_holds_is_what_the_volume_reports() {
     agent.resync().await;
 
     let v = reload(&store, "v1").await;
-    assert!(v.status.provisioned, "the volume never came back provisioned");
+    assert!(
+        v.status.provisioned,
+        "the volume never came back provisioned"
+    );
     assert_eq!(v.status.actual_size_gib, 10);
     assert_eq!(v.status.pool.as_deref(), Some(POOL));
 }
@@ -273,7 +279,10 @@ async fn a_cluster_that_cannot_be_reached_is_reported_rather_than_read_as_empty(
     > = TypedStore::new(store.clone(), CELL, "pools");
     let registered: velstra_cloud_model::resources::Pool = Resource::new(
         meta(&format!("pools/{POOL}")),
-        velstra_cloud_model::resources::PoolSpec { accepting: true, labels: Vec::new() },
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: true,
+            labels: Vec::new(),
+        },
         velstra_cloud_model::resources::PoolStatus::default(),
     );
     pools
@@ -288,7 +297,10 @@ async fn a_cluster_that_cannot_be_reached_is_reported_rather_than_read_as_empty(
         agent.resync().await;
     }
     let healthy = pools.get(&format!("pools/{POOL}")).await.unwrap().unwrap();
-    assert!(healthy.status.capacity_gib > 0, "nothing was read to begin with");
+    assert!(
+        healthy.status.capacity_gib > 0,
+        "nothing was read to begin with"
+    );
 
     cluster.is_unreachable();
     agent.resync().await;
@@ -354,7 +366,8 @@ async fn a_volume_grows_and_is_never_shrunk() {
 
     let argv = cluster.recorded();
     assert!(
-        argv.lines().any(|l| l.contains("resize") && l.contains("20")),
+        argv.lines()
+            .any(|l| l.contains("resize") && l.contains("20")),
         "it never grew:\n{argv}"
     );
 
@@ -379,7 +392,12 @@ async fn a_volume_grows_and_is_never_shrunk() {
         "it ran a resize that would have discarded the tail of the volume:\n{ran}"
     );
     let v = reload(&store, "v1").await;
-    let ready = v.status.conditions.iter().find(|c| c.kind == "Ready").unwrap();
+    let ready = v
+        .status
+        .conditions
+        .iter()
+        .find(|c| c.kind == "Ready")
+        .unwrap();
     assert_eq!(ready.reason, "WillNotShrink", "{ready:?}");
 }
 
@@ -407,7 +425,8 @@ async fn observing_costs_one_snapshot_listing_per_volume() {
         .filter(|l| l.contains("snap ls"))
         .count();
     assert_eq!(
-        listings, 3,
+        listings,
+        3,
         "one per volume in the pool, not per volume this cell knows about:\n{}",
         cluster.recorded()
     );

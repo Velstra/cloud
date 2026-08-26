@@ -485,7 +485,10 @@ mod selector_tests {
     fn a_bare_key_matches_whatever_the_value_says() {
         let marked = labels(&[("deprecated", "")]);
         assert!(labels_match(&marked, &parse_selector("deprecated")));
-        assert!(!labels_match(&labels(&[("env", "prod")]), &parse_selector("deprecated")));
+        assert!(!labels_match(
+            &labels(&[("env", "prod")]),
+            &parse_selector("deprecated")
+        ));
     }
 
     /// An empty selector matches everything.
@@ -495,15 +498,24 @@ mod selector_tests {
     #[test]
     fn no_selector_matches_everything() {
         assert!(labels_match(&labels(&[]), &parse_selector("")));
-        assert!(labels_match(&labels(&[("env", "prod")]), &parse_selector("  ")));
-        assert!(labels_match(&labels(&[("env", "prod")]), &parse_selector(",,")));
+        assert!(labels_match(
+            &labels(&[("env", "prod")]),
+            &parse_selector("  ")
+        ));
+        assert!(labels_match(
+            &labels(&[("env", "prod")]),
+            &parse_selector(",,")
+        ));
     }
 
     /// Typing is forgiven where forgiving it cannot change the meaning.
     #[test]
     fn spaces_and_a_trailing_comma_do_not_break_a_working_filter() {
         let it = labels(&[("env", "prod"), ("tier", "web")]);
-        assert!(labels_match(&it, &parse_selector(" env = prod , tier=web ,")));
+        assert!(labels_match(
+            &it,
+            &parse_selector(" env = prod , tier=web ,")
+        ));
     }
 
     /// A value that itself contains `=` survives.
@@ -523,9 +535,18 @@ mod selector_tests {
     /// An empty value is a value, and is not the same as asking for presence.
     #[test]
     fn an_empty_value_is_different_from_no_value() {
-        assert!(labels_match(&labels(&[("env", "")]), &parse_selector("env=")));
-        assert!(!labels_match(&labels(&[("env", "prod")]), &parse_selector("env=")));
+        assert!(labels_match(
+            &labels(&[("env", "")]),
+            &parse_selector("env=")
+        ));
+        assert!(!labels_match(
+            &labels(&[("env", "prod")]),
+            &parse_selector("env=")
+        ));
         // Whereas the bare key matches either.
-        assert!(labels_match(&labels(&[("env", "prod")]), &parse_selector("env")));
+        assert!(labels_match(
+            &labels(&[("env", "prod")]),
+            &parse_selector("env")
+        ));
     }
 }

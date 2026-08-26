@@ -32,7 +32,7 @@ use velstra_cloud_model::{
     meta::{Meta, ResourceName},
     migration::{MigrationMode, MigrationSpec, MigrationStatus, evacuate},
     resources::{
-        Instance, InstanceSpec, InstanceStatus, InstanceState, Node, NodeSpec, NodeStatus, Resource,
+        Instance, InstanceSpec, InstanceState, InstanceStatus, Node, NodeSpec, NodeStatus, Resource,
     },
 };
 use velstra_cloud_store::TypedStore;
@@ -97,7 +97,9 @@ impl EvacuationController {
         match store.list().await {
             Ok(all) => velstra_cloud_model::maintenance::draining(
                 node,
-                &all.iter().map(crate::scheduler::window_view).collect::<Vec<_>>(),
+                &all.iter()
+                    .map(crate::scheduler::window_view)
+                    .collect::<Vec<_>>(),
                 velstra_cloud_model::meta::Timestamp::now(),
             ),
             Err(e) => {
@@ -163,9 +165,7 @@ impl Reconciler for EvacuationController {
         // Which nodes hold which image, added up from what each node reports
         // about itself. Never the image collection: which nodes hold a copy is
         // an aggregate, and an aggregate is not a fact anybody owns.
-        let cached = |image: &str| {
-            velstra_cloud_model::resources::nodes_holding(image, &nodes)
-        };
+        let cached = |image: &str| velstra_cloud_model::resources::nodes_holding(image, &nodes);
 
         let migrations = self.migrations.list().await?;
         let moving: Vec<String> = migrations
@@ -203,7 +203,11 @@ impl Reconciler for EvacuationController {
                 },
                 MigrationStatus::default(),
             );
-            match self.migrations.create(&asked, &Writer::controller(WHO)).await {
+            match self
+                .migrations
+                .create(&asked, &Writer::controller(WHO))
+                .await
+            {
                 Ok(_) => info!(
                     node = %name,
                     instance = %handover.instance,
@@ -281,12 +285,12 @@ mod tests {
                 NodeSpec {
                     evacuate: evac,
                     vcpu_overcommit: 0,
-                fence_after_s: 0,
+                    fence_after_s: 0,
                     schedulable: !evac,
                     labels: vec![],
                     cpu_baseline: None,
-                gateway: false,
-            },
+                    gateway: false,
+                },
                 NodeStatus {
                     capacity: Capacity {
                         vcpus: 32,
@@ -382,7 +386,10 @@ mod tests {
             },
             Default::default(),
         );
-        f.windows.create(&w, &Writer::controller("test")).await.unwrap();
+        f.windows
+            .create(&w, &Writer::controller("test"))
+            .await
+            .unwrap();
     }
 
     impl Fixture {

@@ -127,9 +127,7 @@ async fn a_tenant_reads_the_refusals_about_their_own_objects_and_nobody_elses() 
         "the person who was refused cannot read the sentence they were given"
     );
     assert!(
-        his.items
-            .iter()
-            .all(|r| r["spec"]["subject"] == json!(BOB)),
+        his.items.iter().all(|r| r["spec"]["subject"] == json!(BOB)),
         "somebody else's refusals were handed to a tenant: {:?}",
         his.items
     );
@@ -1126,7 +1124,8 @@ async fn a_tenant_sees_nothing_in_the_audit() {
     );
     // And what she does see is only her own reaching, never bob's.
     assert!(
-        !seen.items
+        !seen
+            .items
             .iter()
             .any(|r| r["spec"]["target"] == json!("nodes/node-a")),
         "a tenant was shown a refusal about a cell-wide object: {:?}",

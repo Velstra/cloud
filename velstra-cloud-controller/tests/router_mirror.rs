@@ -150,10 +150,12 @@ async fn a_router_makes_two_tenant_networks_route_on_the_real_fabric() {
             .create(
                 &Resource::new(
                     meta(name),
-                    NetworkSpec { vni, mtu: 1500,
-                external: false,
-                announce: Default::default(),
-            },
+                    NetworkSpec {
+                        vni,
+                        mtu: 1500,
+                        external: false,
+                        announce: Default::default(),
+                    },
                     NetworkStatus::default(),
                 ),
                 &velstra_cloud_model::access::Writer::controller("test"),

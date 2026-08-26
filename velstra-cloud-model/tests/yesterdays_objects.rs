@@ -88,7 +88,10 @@ fn a_node_from_before_half_of_this_platform_reads_conservatively() {
     assert_eq!(node.spec.cpu_baseline, None);
     // Nothing is claimed about hardware nobody reported.
     assert!(node.status.pci_devices.is_empty());
-    assert!(node.status.cpu.is_none(), "a cpu was invented for a node that never sent one");
+    assert!(
+        node.status.cpu.is_none(),
+        "a cpu was invented for a node that never sent one"
+    );
     // And what it did say is still there.
     assert_eq!(node.spec.labels, vec!["ssd".to_string()]);
     assert_eq!(node.status.capacity.vcpus, 16);
@@ -148,7 +151,10 @@ fn a_guest_from_before_all_of_that_reads_conservatively_too() {
     assert_eq!(guest.spec.placement_policy.spread, Strength::Required);
     assert_eq!(guest.spec.placement_policy.affinity, Strength::Required);
     assert_eq!(guest.spec.placement_policy.affinity_group, None);
-    assert!(!guest.spec.console, "a console was opened on a guest that never asked for one");
+    assert!(
+        !guest.spec.console,
+        "a console was opened on a guest that never asked for one"
+    );
     assert!(guest.spec.devices.is_empty());
     assert_eq!(guest.spec.start_order, 0);
     assert_eq!(guest.spec.start_delay_s, 0);
@@ -158,7 +164,10 @@ fn a_guest_from_before_all_of_that_reads_conservatively_too() {
     assert_eq!(guest.status.console_bytes, 0);
     // And what it said is intact, labels and all.
     assert_eq!(guest.spec.vcpus, 2);
-    assert_eq!(guest.meta.labels.get("env").map(String::as_str), Some("prod"));
+    assert_eq!(
+        guest.meta.labels.get("env").map(String::as_str),
+        Some("prod")
+    );
 }
 
 /// A project from before three of its quota dimensions existed.
@@ -211,7 +220,10 @@ fn a_volume_and_an_image_from_before_their_new_sources_still_read() {
     }))
     .expect("a stored volume still reads");
     assert_eq!(volume.size_gib, 40);
-    assert_eq!(volume.source_backup, None, "a volume was given a backup it never had");
+    assert_eq!(
+        volume.source_backup, None,
+        "a volume was given a backup it never had"
+    );
 
     let image: ImageSpec = serde_json::from_value(serde_json::json!({
         "digest": "sha256:abc",
@@ -270,6 +282,9 @@ fn the_shapes_a_controller_reads_on_every_pass_still_read() {
         "placement_policy": { "anti_affinity_group": null, "required_labels": [] }
     }))
     .expect("an instance spec from before this session still reads");
-    assert_eq!(spec.desired_state, velstra_cloud_model::resources::DesiredState::Stopped);
+    assert_eq!(
+        spec.desired_state,
+        velstra_cloud_model::resources::DesiredState::Stopped
+    );
     assert_eq!(spec.placement_policy.spread, Strength::Required);
 }

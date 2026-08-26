@@ -59,12 +59,12 @@ pub async fn create_node(store: &Arc<dyn Store>, id: &str) {
         NodeSpec {
             evacuate: false,
             vcpu_overcommit: 0,
-                fence_after_s: 0,
+            fence_after_s: 0,
             schedulable: true,
             labels: vec![],
             cpu_baseline: None,
-                gateway: false,
-            },
+            gateway: false,
+        },
         NodeStatus::default(),
     );
     nodes(store)
@@ -278,9 +278,9 @@ pub async fn create_network(store: &Arc<dyn Store>, cidr: &str, gateway: &str) {
                 NetworkSpec {
                     vni: 4711,
                     mtu: 1450,
-                external: false,
-                announce: Default::default(),
-            },
+                    external: false,
+                    announce: Default::default(),
+                },
                 NetworkStatus::default(),
             ),
             &velstra_cloud_model::access::Writer::controller("test"),
@@ -327,9 +327,9 @@ async fn ensure_segment(store: &Arc<dyn Store>) {
                 NetworkSpec {
                     vni: 4711,
                     mtu: 1450,
-                external: false,
-                announce: Default::default(),
-            },
+                    external: false,
+                    announce: Default::default(),
+                },
                 NetworkStatus::default(),
             ),
             &velstra_cloud_model::access::Writer::controller("test"),
@@ -420,7 +420,10 @@ pub async fn create_target(store: &Arc<dyn Store>, id: &str, path: &str) {
         Default::default(),
     );
     targets
-        .create(&target, &velstra_cloud_model::access::Writer::controller("test"))
+        .create(
+            &target,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 }
@@ -442,7 +445,10 @@ pub async fn create_capture(store: &Arc<dyn Store>, id: &str, instance: &str, no
         Default::default(),
     );
     captures
-        .create(&capture, &velstra_cloud_model::access::Writer::controller("test"))
+        .create(
+            &capture,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 }
@@ -469,7 +475,10 @@ pub async fn stop_instance(store: &Arc<dyn Store>, name: &str) {
     next.spec.desired_state = velstra_cloud_model::resources::DesiredState::Stopped;
     next.meta.generation += 1;
     store_i
-        .update(&next, &velstra_cloud_model::access::Writer::controller("test"))
+        .update(
+            &next,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 }

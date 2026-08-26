@@ -376,9 +376,9 @@ mod tests {
                 NetworkSpec {
                     vni: 4711,
                     mtu: 1450,
-                external: false,
-                announce: Default::default(),
-            },
+                    external: false,
+                    announce: Default::default(),
+                },
                 NetworkStatus::default(),
             ),
         )])
@@ -442,7 +442,14 @@ mod tests {
             "vt-port-a".to_string(),
         )]);
         let i = instance("projects/p1/instances/i1", &["projects/p1/ports/port-a"]);
-        derive(&[&i], &ports, &subnet(), &network(), &taps, &Default::default())
+        derive(
+            &[&i],
+            &ports,
+            &subnet(),
+            &network(),
+            &taps,
+            &Default::default(),
+        )
     }
 
     #[test]
@@ -476,7 +483,14 @@ mod tests {
             ),
         )]);
         let i = instance("projects/p1/instances/i1", &["projects/p1/ports/port-a"]);
-        let views = derive(&[&i], &ports, &subnet(), &network(), &BTreeMap::new(), &Default::default());
+        let views = derive(
+            &[&i],
+            &ports,
+            &subnet(),
+            &network(),
+            &BTreeMap::new(),
+            &Default::default(),
+        );
         assert_eq!(views[0].interfaces[0].cidr, None);
     }
 
@@ -488,7 +502,17 @@ mod tests {
         )]);
         let mut i = instance("projects/p1/instances/i1", &["projects/p1/ports/port-a"]);
         i.meta.deleted_at = Some(velstra_cloud_model::Timestamp::now());
-        assert!(derive(&[&i], &ports, &subnet(), &network(), &BTreeMap::new(), &Default::default()).is_empty());
+        assert!(
+            derive(
+                &[&i],
+                &ports,
+                &subnet(),
+                &network(),
+                &BTreeMap::new(),
+                &Default::default()
+            )
+            .is_empty()
+        );
     }
 
     #[test]

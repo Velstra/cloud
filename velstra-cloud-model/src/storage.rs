@@ -87,7 +87,11 @@ impl VolumeSource {
     /// can only ever mean *more* recent bytes, never a silent regression to an
     /// installer image.
     pub fn of(spec: &VolumeSpec) -> Self {
-        match (&spec.source_snapshot, &spec.source_backup, &spec.source_image) {
+        match (
+            &spec.source_snapshot,
+            &spec.source_backup,
+            &spec.source_image,
+        ) {
             (Some(snapshot), _, _) if !snapshot.is_empty() => Self::Snapshot(snapshot.clone()),
             // Before the image and after the snapshot, on the same reasoning:
             // both are more recent bytes than an installer image, and a

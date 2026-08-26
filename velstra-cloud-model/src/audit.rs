@@ -90,7 +90,13 @@ pub struct AuditStatus {
 /// target is a resource name — both carry characters a resource id may not, and
 /// a name built by mangling them would collide in ways nobody could predict.
 /// The fields are all on the object; the id only has to be stable and unique.
-pub fn record_id(kind: AuditKind, subject: &str, verb: &str, target: &str, at: Timestamp) -> String {
+pub fn record_id(
+    kind: AuditKind,
+    subject: &str,
+    verb: &str,
+    target: &str,
+    at: Timestamp,
+) -> String {
     use std::hash::{DefaultHasher, Hash, Hasher};
 
     let minute = at.0 / 60_000;
@@ -154,7 +160,13 @@ mod tests {
     #[test]
     fn who_what_and_which_verb_each_make_a_record_of_their_own() {
         let base = |subject, verb, target| {
-            record_id(AuditKind::Refused, subject, verb, target, Timestamp(10 * MIN))
+            record_id(
+                AuditKind::Refused,
+                subject,
+                verb,
+                target,
+                Timestamp(10 * MIN),
+            )
         };
         let one = base("alice", "read", "projects/p2/instances/i1");
         assert_ne!(one, base("bob", "read", "projects/p2/instances/i1"));
@@ -188,8 +200,7 @@ mod tests {
             Timestamp(10 * MIN),
         );
         assert!(
-            id.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "{id}"
         );
     }

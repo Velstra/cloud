@@ -142,7 +142,6 @@ pub fn governing_project(name: &ResourceName) -> Option<String> {
     name.project().map(|p| format!("projects/{p}"))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

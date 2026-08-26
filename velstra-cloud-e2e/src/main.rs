@@ -317,12 +317,12 @@ async fn register_node(store: Arc<dyn Store>, id: &str) {
         NodeSpec {
             evacuate: false,
             vcpu_overcommit: 0,
-                fence_after_s: 0,
+            fence_after_s: 0,
             schedulable: true,
             labels: vec!["dev".to_string()],
             cpu_baseline: None,
-                gateway: false,
-            },
+            gateway: false,
+        },
         NodeStatus::default(),
     );
     if let Err(e) = nodes

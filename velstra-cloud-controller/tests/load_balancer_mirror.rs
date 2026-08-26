@@ -156,9 +156,9 @@ async fn a_load_balancer_is_programmed_follows_its_spec_and_is_torn_down() {
                 NetworkSpec {
                     vni: VNI,
                     mtu: 1500,
-                external: false,
-                announce: Default::default(),
-            },
+                    external: false,
+                    announce: Default::default(),
+                },
                 NetworkStatus::default(),
             ),
             &velstra_cloud_model::access::Writer::controller("test"),

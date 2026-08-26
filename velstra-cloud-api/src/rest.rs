@@ -236,9 +236,15 @@ async fn authenticate(
 /// even number of `collection/id` pairs is one object, an odd number ends in a
 /// collection.
 enum Target {
-    Collection { parent: String, kind: String },
+    Collection {
+        parent: String,
+        kind: String,
+    },
     Object(ResourceName),
-    Verb { name: ResourceName, verb: String },
+    Verb {
+        name: ResourceName,
+        verb: String,
+    },
     /// A custom method on a whole collection: `nodes:explainCpu`.
     ///
     /// Some answers are about a set rather than a member. Which nodes can
@@ -354,13 +360,13 @@ async fn read(
         {
             Ok(Json(api.explain_capacity(&who).await?).into_response())
         }
-        Target::CollectionVerb { parent, kind, verb } => Err(ApiError::invalid(if parent
-            .is_empty()
-        {
-            format!("{kind} has no method {verb:?}")
-        } else {
-            format!("{parent}/{kind} has no method {verb:?}")
-        })),
+        Target::CollectionVerb { parent, kind, verb } => {
+            Err(ApiError::invalid(if parent.is_empty() {
+                format!("{kind} has no method {verb:?}")
+            } else {
+                format!("{parent}/{kind} has no method {verb:?}")
+            }))
+        }
         Target::Verb { verb, .. } => Err(ApiError::invalid(format!(
             "there is no method called {verb}"
         ))),

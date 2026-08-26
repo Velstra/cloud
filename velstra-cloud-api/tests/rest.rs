@@ -186,18 +186,18 @@ fn writer() -> velstra_cloud_model::access::Writer {
     velstra_cloud_model::access::Writer::controller("test")
 }
 
-
 /// The processor every node in these fixtures has.
 ///
 /// One machine, repeated: these tests are about migrations, quotas and the
 /// REST surface, and a cell whose nodes differ would make each of them also a
 /// test of the CPU rules — which live in the model and are tested there.
 fn a_cpu() -> velstra_cloud_model::cpu::NodeCpu {
-    let flags: std::collections::BTreeSet<String> =
-        ["cx16", "lahf_lm", "popcnt", "sse3", "sse4_1", "sse4_2", "ssse3"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+    let flags: std::collections::BTreeSet<String> = [
+        "cx16", "lahf_lm", "popcnt", "sse3", "sse4_1", "sse4_2", "ssse3",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     velstra_cloud_model::cpu::NodeCpu {
         arch: "x86_64".into(),
         vendor: "GenuineIntel".into(),
@@ -550,13 +550,13 @@ async fn explain_placement_answers_with_the_chain_of_rejections() {
         NodeSpec {
             evacuate: false,
             vcpu_overcommit: 0,
-                fence_after_s: 0,
+            fence_after_s: 0,
             schedulable: true,
             labels: vec![],
             cpu_baseline: None,
-                gateway: false,
-            },
-            NodeStatus {
+            gateway: false,
+        },
+        NodeStatus {
             pci_devices: Vec::new(),
             cpu: Some(a_cpu()),
             capacity: Capacity {
@@ -1141,13 +1141,13 @@ async fn two_nodes(h: &Harness) {
         NodeSpec {
             evacuate: false,
             vcpu_overcommit: 0,
-                fence_after_s: 0,
+            fence_after_s: 0,
             schedulable: true,
             labels: vec![],
             cpu_baseline: None,
-                gateway: false,
-            },
-            NodeStatus {
+            gateway: false,
+        },
+        NodeStatus {
             pci_devices: Vec::new(),
             cpu: Some(a_cpu()),
             capacity: Capacity {
@@ -1542,13 +1542,13 @@ async fn a_destination_without_the_image_is_refused_with_the_sentence() {
         NodeSpec {
             evacuate: false,
             vcpu_overcommit: 0,
-                fence_after_s: 0,
+            fence_after_s: 0,
             schedulable: true,
             labels: vec![],
             cpu_baseline: None,
-                gateway: false,
-            },
-            NodeStatus {
+            gateway: false,
+        },
+        NodeStatus {
             pci_devices: Vec::new(),
             cpu: Some(a_cpu()),
             capacity: Capacity {
@@ -1977,7 +1977,10 @@ async fn a_volume_is_not_moved_between_pools_by_editing_its_pool() {
     );
 
     // And nothing moved, including the record of where it is.
-    assert_ne!(h.get(&volume).await.body["spec"]["pool"], json!("spinning-rust"));
+    assert_ne!(
+        h.get(&volume).await.body["spec"]["pool"],
+        json!("spinning-rust")
+    );
 }
 
 /// Writing back the pool it already has is not a change. A client that read an
@@ -1987,7 +1990,10 @@ async fn a_volume_is_not_moved_between_pools_by_editing_its_pool() {
 async fn sending_back_the_pool_a_volume_already_has_is_not_a_move() {
     let h = Harness::new();
     let volume = h.volume("data-1", 100).await;
-    let same = h.get(&volume).await.body["spec"]["pool"].as_str().unwrap().to_string();
+    let same = h.get(&volume).await.body["spec"]["pool"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let accepted = h
         .patch(&volume, json!({ "spec": { "pool": same, "sizeGib": 200 } }))
@@ -2347,12 +2353,12 @@ async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reaso
         NodeSpec {
             evacuate: false,
             vcpu_overcommit: 0,
-                fence_after_s: 0,
+            fence_after_s: 0,
             schedulable: true,
             labels: vec![],
             cpu_baseline: None,
-                gateway: false,
-            },
+            gateway: false,
+        },
         NodeStatus {
             devices: vec![
                 BlockDevice {
@@ -2791,8 +2797,15 @@ async fn a_caller_writing_in_a_loop_is_slowed_down_and_told_for_how_long() {
         }
     }
     let refused = refused.expect("a caller writing as fast as it could was never slowed down");
-    assert_eq!(refused.error_code(), "RESOURCE_EXHAUSTED", "{:?}", refused.body);
-    let said = refused.body["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        refused.error_code(),
+        "RESOURCE_EXHAUSTED",
+        "{:?}",
+        refused.body
+    );
+    let said = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
     assert!(said.contains("Try again in"), "{said}");
     // The header, because that is what a client library reads — and at least
     // one second, so a client that obeys it to the letter is never turned away
@@ -2829,7 +2842,10 @@ async fn a_node_can_be_told_to_share_its_cores_but_never_its_memory() {
     assert_eq!(room.status, StatusCode::OK, "{:?}", room.body);
     let cores = room.body["total"]["vcpus"].as_u64().unwrap();
     let offered = room.body["offeredVcpus"].as_u64().unwrap();
-    assert!(offered > cores, "the ratio did not reach the capacity report: {offered} of {cores}");
+    assert!(
+        offered > cores,
+        "the ratio did not reach the capacity report: {offered} of {cores}"
+    );
 
     // And a ratio past the point where it stops being a trade is refused with
     // the reason, rather than accepted as a way of hiding that a cell is full.
@@ -2845,7 +2861,12 @@ async fn a_node_can_be_told_to_share_its_cores_but_never_its_memory() {
     let memory = h
         .patch("nodes/node-a", json!({ "spec": { "memoryOvercommit": 2 } }))
         .await;
-    assert_ne!(memory.status, StatusCode::OK, "a memory ratio was accepted: {:?}", memory.body);
+    assert_ne!(
+        memory.status,
+        StatusCode::OK,
+        "a memory ratio was accepted: {:?}",
+        memory.body
+    );
 }
 
 /// "What has happened to this guest" — the question every console user has and
@@ -2866,7 +2887,10 @@ async fn the_records_about_one_object_can_be_asked_for_without_reading_the_cell(
     let mine = h.get(&format!("projects/p1/operations?target={one}")).await;
     assert_eq!(mine.status, StatusCode::OK, "{:?}", mine.body);
     let items = mine.body["items"].as_array().unwrap();
-    assert!(!items.is_empty(), "the object's own history came back empty");
+    assert!(
+        !items.is_empty(),
+        "the object's own history came back empty"
+    );
     assert!(
         items.iter().all(|o| o["spec"]["target"] == json!(one)),
         "somebody else's history came back: {items:?}"
@@ -2918,7 +2942,10 @@ async fn a_projects_allowance_says_whether_the_quota_or_the_cell_is_in_the_way()
 
     // Nobody set a memory quota, so `left` is null rather than zero — the two
     // are different answers and a screen must not render one as the other.
-    let memory = dims.iter().find(|d| d["name"] == json!("memoryMib")).unwrap();
+    let memory = dims
+        .iter()
+        .find(|d| d["name"] == json!("memoryMib"))
+        .unwrap();
     assert_eq!(memory["unlimited"], json!(true), "{memory:?}");
     assert_eq!(memory["left"], json!(null), "{memory:?}");
     assert_eq!(memory["exhausted"], json!(false), "{memory:?}");
@@ -2970,20 +2997,29 @@ async fn a_maintenance_window_that_could_never_take_effect_is_refused() {
 
     // Zero minutes: it would sit in the list looking like a plan.
     let answer = h
-        .post("maintenance-windows", declare("nothing", "node-a", now + hour, 0))
+        .post(
+            "maintenance-windows",
+            declare("nothing", "node-a", now + hour, 0),
+        )
         .await;
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
 
     // Already over. Declared for last night by somebody in the wrong timezone.
     let answer = h
-        .post("maintenance-windows", declare("gone", "node-a", now - 2 * hour, 30))
+        .post(
+            "maintenance-windows",
+            declare("gone", "node-a", now - 2 * hour, 30),
+        )
         .await;
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
 
     // A start in the past is *accepted*: work that has already begun is a true
     // thing to declare, and refusing it teaches people to lie about the time.
     let answer = h
-        .post("maintenance-windows", declare("started", "node-a", now - 600_000, 60))
+        .post(
+            "maintenance-windows",
+            declare("started", "node-a", now - 600_000, 60),
+        )
         .await;
     assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
 
@@ -2994,11 +3030,17 @@ async fn a_maintenance_window_that_could_never_take_effect_is_refused() {
         .await;
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
     let said = answer.body["error"]["message"].as_str().unwrap_or_default();
-    assert!(said.contains("started"), "the refusal did not name which one: {said}");
+    assert!(
+        said.contains("started"),
+        "the refusal did not name which one: {said}"
+    );
 
     // The same hour on another machine is the ordinary case, not a conflict.
     let answer = h
-        .post("maintenance-windows", declare("elsewhere", "node-b", now, 60))
+        .post(
+            "maintenance-windows",
+            declare("elsewhere", "node-b", now, 60),
+        )
         .await;
     assert_eq!(answer.status, StatusCode::ACCEPTED, "{:?}", answer.body);
 }
@@ -3028,7 +3070,10 @@ async fn a_node_in_an_open_window_is_explained_and_no_longer_placed_on() {
 
     let answer = h.get("nodes/node-b:explainMaintenance").await;
     assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
-    assert_eq!(answer.body["open"]["window"], json!("maintenance-windows/dimm-swap"));
+    assert_eq!(
+        answer.body["open"]["window"],
+        json!("maintenance-windows/dimm-swap")
+    );
     assert_eq!(answer.body["open"]["drain"], json!(false));
     // Nothing is being asked to leave: that is what `drain: false` means, and
     // a console reading this must not warn about a fleet that is staying put.
@@ -3202,7 +3247,10 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
     );
     h.volumes().create(&volume, &writer()).await.unwrap();
 
-    for (id, path) in [("same-pool", "/srv/pool-fast"), ("elsewhere", "/srv/backups")] {
+    for (id, path) in [
+        ("same-pool", "/srv/pool-fast"),
+        ("elsewhere", "/srv/backups"),
+    ] {
         let t: velstra_cloud_model::resources::BackupTarget = Resource::new(
             Meta::new(
                 ResourceName::parse(&format!("backup-targets/{id}")).unwrap(),
@@ -3231,7 +3279,12 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
                               "target": "backup-targets/same-pool" } }),
         )
         .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
     let message = refused.body["error"]["message"].as_str().unwrap();
     assert!(
         message.contains("lost with the pool"),
@@ -3291,7 +3344,15 @@ async fn a_list_is_narrowed_by_label_and_an_empty_selector_narrows_nothing() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|i| i["meta"]["name"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+            .map(|i| {
+                i["meta"]["name"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         out.sort();
         out
@@ -3368,7 +3429,11 @@ async fn a_running_guest_says_what_it_will_only_get_when_it_restarts() {
 
     let after = h.get(&name).await;
     let pending = &after.body["status"]["pendingChanges"];
-    assert!(!pending.is_null(), "the resize reads as applied: {}", after.body["status"]);
+    assert!(
+        !pending.is_null(),
+        "the resize reads as applied: {}",
+        after.body["status"]
+    );
     assert_eq!(pending[0]["field"], json!("vcpus"));
     assert_eq!(pending[0]["from"], json!("2"), "{pending}");
     assert_eq!(pending[0]["to"], json!("8"), "{pending}");
@@ -3377,7 +3442,11 @@ async fn a_running_guest_says_what_it_will_only_get_when_it_restarts() {
     // status could disagree with both, and asking must not be a write.
     let before = h.store.revision().await.unwrap();
     let _ = h.get(&name).await;
-    assert_eq!(h.store.revision().await.unwrap(), before, "reading wrote something");
+    assert_eq!(
+        h.store.revision().await.unwrap(),
+        before,
+        "reading wrote something"
+    );
 
     // And a listing says the same thing a read does — a console that learns
     // about an object from a list must not see a different object.
@@ -3462,5 +3531,9 @@ async fn a_nodes_devices_say_what_comes_with_them() {
     // Computed, never stored: asking must not be a write.
     let before = h.store.revision().await.unwrap();
     let _ = h.get("nodes/node-a").await;
-    assert_eq!(h.store.revision().await.unwrap(), before, "reading wrote something");
+    assert_eq!(
+        h.store.revision().await.unwrap(),
+        before,
+        "reading wrote something"
+    );
 }

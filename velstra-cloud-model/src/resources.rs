@@ -159,7 +159,8 @@ impl Assigned for crate::audit::AuditSpec {}
 // ---- backups -------------------------------------------------------------
 
 /// A place backups are kept, and the agent that reports on it.
-pub type BackupTarget = Resource<crate::backup::BackupTargetSpec, crate::backup::BackupTargetStatus>;
+pub type BackupTarget =
+    Resource<crate::backup::BackupTargetSpec, crate::backup::BackupTargetStatus>;
 
 /// One copy of one volume, at one moment, on one target.
 pub type Backup = Resource<crate::backup::BackupSpec, crate::backup::BackupStatus>;

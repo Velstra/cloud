@@ -111,8 +111,9 @@ fn parse(text: &str) -> NodeCpu {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use velstra_cloud_model::cpu::CpuLevel;
+
+    use super::*;
 
     /// Two cores, the second missing a flag the first has.
     const ASYMMETRIC: &str = "\

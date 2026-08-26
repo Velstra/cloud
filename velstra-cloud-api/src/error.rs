@@ -181,9 +181,12 @@ impl IntoResponse for ApiError {
         // that obeys it to the letter is never turned away a second time. The
         // millisecond figure is in the sentence for anybody who wants to wait
         // exactly as long as they have to.
-        let retry_after = self
-            .retry_after_ms
-            .map(|ms| [(axum::http::header::RETRY_AFTER, ms.div_ceil(1000).max(1).to_string())]);
+        let retry_after = self.retry_after_ms.map(|ms| {
+            [(
+                axum::http::header::RETRY_AFTER,
+                ms.div_ceil(1000).max(1).to_string(),
+            )]
+        });
         let body = Body {
             error: Envelope {
                 code: self.code.as_str(),

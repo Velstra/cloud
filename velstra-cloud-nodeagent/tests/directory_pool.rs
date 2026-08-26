@@ -8,8 +8,10 @@
 //! Skips loudly without `qemu-img` rather than failing. A red test on a machine
 //! that simply lacks a tool is a test people learn to scroll past.
 
-use velstra_cloud_nodeagent::pool::Origin;
-use velstra_cloud_nodeagent::{directory_pool::DirectoryPool, pool::Storage};
+use velstra_cloud_nodeagent::{
+    directory_pool::DirectoryPool,
+    pool::{Origin, Storage},
+};
 
 const VOLUME: &str = "projects/p1/volumes/data-1";
 const SNAPSHOT: &str = "projects/p1/volumes/data-1/snapshots/s1";

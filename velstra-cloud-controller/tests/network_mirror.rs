@@ -143,9 +143,9 @@ async fn a_tenant_network_reaches_the_fabric_without_anybody_declaring_it() {
                 NetworkSpec {
                     vni: VNI,
                     mtu: 1500,
-                external: false,
-                announce: Default::default(),
-            },
+                    external: false,
+                    announce: Default::default(),
+                },
                 NetworkStatus::default(),
             ),
             &velstra_cloud_model::access::Writer::controller("test"),

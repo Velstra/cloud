@@ -380,7 +380,10 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
     // arbitrary answer rather than whichever a map happened to yield first —
     // and this file re-derived it by hand. Two spellings of one rule agree
     // until the day somebody changes one of them.
-    let routed: Vec<_> = usable.iter().flat_map(|nic| nic.public.iter().cloned()).collect();
+    let routed: Vec<_> = usable
+        .iter()
+        .flat_map(|nic| nic.public.iter().cloned())
+        .collect();
     let public_default = velstra_cloud_model::public::defaults_through_public(&routed).cloned();
     for (n, nic) in usable.iter().enumerate() {
         let mac = format_mac(&nic.mac.expect("filtered"));
@@ -615,7 +618,10 @@ mod tests {
             )
         };
         let held = crate::guests::public_addresses(&[fip("nat", Delivery::Nat)]);
-        assert!(held.is_empty(), "a translated address was handed to the guest");
+        assert!(
+            held.is_empty(),
+            "a translated address was handed to the guest"
+        );
 
         let routed = crate::guests::public_addresses(&[fip("routed", Delivery::Routed)]);
         assert_eq!(routed["projects/p1/ports/port-a"].len(), 1);
