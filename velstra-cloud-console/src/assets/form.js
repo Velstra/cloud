@@ -56,6 +56,26 @@ function v4Inside(addr, cidr) {
   return (n(addr) & mask) >>> 0 === (n(net) & mask) >>> 0;
 }
 
+/// An epoch millisecond as `datetime-local` wants it: the operator's own
+/// timezone, and no seconds. Built by hand rather than with `toISOString`,
+/// which would hand back UTC and quietly move every window by the offset.
+function localMoment(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+    "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
+
+/// "40 minutes", "3 hours", "2 days" — the granularity somebody is deciding at,
+/// not the one the number happens to be in.
+function minutesAsWords(m) {
+  if (m < 90) return m + (m === 1 ? " minute" : " minutes");
+  const h = Math.round(m / 60);
+  if (h < 48) return h + (h === 1 ? " hour" : " hours");
+  const d = Math.round(h / 24);
+  return d + (d === 1 ? " day" : " days");
+}
+
 /// A locally administered address, so the console can offer one rather than ask
 /// somebody to invent it. The second nibble is 2: unicast, locally assigned.
 function generateMac() {
@@ -85,7 +105,7 @@ const DERIVE = {
 };
 
 function fieldControl(form, f) {
-  const WIDE = ["lines", "refList", "textList", "ruleList", "diskList", "poolList"];
+  const WIDE = ["lines", "refList", "textList", "ruleList", "diskList", "poolList", "listenerList"];
   const box = el("div.field" + (WIDE.includes(f.kind) ? ".wide" : ""));
   const id = "f-" + f.key.replace(/\./g, "-");
   form.boxes[f.key] = box;
@@ -138,6 +158,39 @@ function fieldControl(form, f) {
         input,
         el("button", { type: "button", tabindex: "-1", "aria-label": "more", onclick: () => nudge(f.step) }, "+"),
         f.unit ? el("span.unit", f.unit) : null));
+      box.appendChild(also);
+      reread();
+      break;
+    }
+    case "moment": {
+      // A calendar and a clock, in the operator's own timezone. What is stored
+      // is milliseconds since the epoch, and a person asked to type one of
+      // those either pastes the wrong number or works one out by hand — both
+      // of which end with a machine going out of service at the wrong hour.
+      const input = el("input", { id, type: "datetime-local" });
+      const also = el("div.also");
+      // Empty means "in an hour" rather than "never": that is what most
+      // windows want, and it is arithmetic somebody would otherwise do.
+      const start = typeof current === "number" && current
+        ? current
+        : Date.now() + (f.defaultInMinutes || 0) * 60_000;
+      input.value = localMoment(start);
+      commit(start, input);
+      const reread = () => {
+        const at = input.value ? new Date(input.value).getTime() : NaN;
+        if (Number.isNaN(at)) { also.textContent = ""; return; }
+        // Said back in plain words, because a datetime box is read as digits
+        // and "in 40 minutes" is what somebody is actually deciding about.
+        const away = Math.round((at - Date.now()) / 60_000);
+        also.textContent = away >= 0 ? "in " + minutesAsWords(away) : minutesAsWords(-away) + " ago";
+      };
+      input.addEventListener("input", () => {
+        const at = input.value ? new Date(input.value).getTime() : NaN;
+        commit(Number.isNaN(at) ? "" : at, input);
+        setErr(input.value && Number.isNaN(at) ? "not a moment in time" : "");
+        reread();
+      });
+      box.appendChild(input);
       box.appendChild(also);
       reread();
       break;
@@ -241,6 +294,12 @@ function fieldControl(form, f) {
     case "poolList": {
       const host = el("div.rowlist", { id });
       renderPoolList(form, f, host, setErr);
+      box.appendChild(host);
+      break;
+    }
+    case "listenerList": {
+      const host = el("div.rowlist", { id });
+      renderListenerList(form, f, host, setErr);
       box.appendChild(host);
       break;
     }
@@ -390,6 +449,69 @@ function renderRuleList(form, f, host, setErr) {
 
   host.appendChild(el("button.btn", { type: "button", id: "addrule", onclick: () => { rules.push(blankRule()); redraw(); } },
     "Add" + (rules.length ? " another" : " a rule")));
+}
+
+// One listener is a protocol, the port the address answers on, and the port
+// the members answer on. Rendered together, like a rule, because three
+// parallel list fields would let somebody assemble a listener out of rows that
+// do not line up. TCP and UDP only: the fabric's datapath balances no others,
+// and a wider choice is a control that produces an error.
+const LISTENER_PROTOCOLS = ["Tcp", "Udp"];
+
+function blankListener() {
+  return { protocol: "Tcp", port: 443, memberPort: 0 };
+}
+
+function renderListenerList(form, f, host, setErr) {
+  if (!Array.isArray(form.values[f.key])) form.values[f.key] = [];
+  const listeners = form.values[f.key];
+  clear(host);
+
+  const commit = () => {
+    form.values[f.key] = listeners;
+    // Only what the API would refuse: a port of zero, or one address
+    // answering one port twice.
+    let bad = "";
+    const seen = new Set();
+    for (const l of listeners) {
+      if (!l.port) bad = "say which port the address answers on";
+      const claim = l.protocol + "/" + l.port;
+      if (seen.has(claim)) bad = "two listeners claim " + claim;
+      seen.add(claim);
+    }
+    setErr(bad);
+    form.revalidate(f.key);
+  };
+
+  const redraw = () => { renderListenerList(form, f, host, setErr); commit(); };
+
+  listeners.forEach((listener, i) => {
+    const protocol = el("select", { "aria-label": "protocol" });
+    for (const p of LISTENER_PROTOCOLS) {
+      protocol.appendChild(el("option", { value: p, selected: listener.protocol === p ? "" : null }, p.toUpperCase()));
+    }
+    protocol.addEventListener("change", () => { listener.protocol = protocol.value; commit(); });
+
+    const port = el("input", { type: "number", min: "1", max: "65535", value: String(listener.port || ""), "aria-label": "port" });
+    port.addEventListener("input", () => { listener.port = Number(port.value); commit(); });
+
+    // Zero keeps the client's own destination port, which is what forwarding
+    // 443 to 443 wants and what the placeholder says.
+    const member = el("input", { type: "number", min: "0", max: "65535", placeholder: "same",
+      value: listener.memberPort ? String(listener.memberPort) : "", "aria-label": "member port" });
+    member.addEventListener("input", () => { listener.memberPort = Number(member.value || 0); commit(); });
+
+    host.appendChild(el("div.row",
+      protocol,
+      el("span.idx", "port"),
+      port,
+      el("span.idx", "members on"),
+      member,
+      el("button.btn", { type: "button", "aria-label": "remove", onclick: () => { listeners.splice(i, 1); redraw(); } }, "−")));
+  });
+
+  host.appendChild(el("button.btn", { type: "button", id: "addlistener", onclick: () => { listeners.push(blankListener()); redraw(); } },
+    "Add" + (listeners.length ? " another" : " a listener")));
 }
 
 // Picking disks for Ceph, which is the one control on this page that destroys
@@ -927,6 +1049,19 @@ function openCreate(coll, opts = {}) {
       const body = createBody(id, nest(settable(coll, f.values)));
       const answer = await create(coll, body);
       forgetOptions(coll.id);
+      // A registration token comes back exactly once — the platform keeps a
+      // hash and cannot show it again — so it gets a panel of its own rather
+      // than a toast that scrolls away, with the one command it is for.
+      if (answer && answer.nodeToken) {
+        await show(coll.id);
+        // After the form's own dialog is gone, which the caller closes the
+        // moment this returns. `queueMicrotask` is not enough — the close is
+        // in the caller's next statement, not in a task — so the panel is
+        // opened from a timer that runs after it.
+        const token = answer.nodeToken;
+        setTimeout(() => showNodeToken(id, token), 0);
+        return;
+      }
       toast(answer && answer.operation
         ? "Asked for. Operation " + shortName(answer.operation) + " is following it."
         : "Asked for. Watch it converge below.");
@@ -966,6 +1101,48 @@ function openCreate(coll, opts = {}) {
   dialog.insertBefore(el("div.fields", idField), dialog.querySelector(".fields"));
   input.focus();
   return form;
+}
+
+/// The one-time registration token, and what to do with it.
+///
+/// Shown once and never again: the platform keeps a hash of it, so a dialog
+/// that could be reopened would be a dialog that lies. That is also why this is
+/// a panel somebody has to dismiss rather than a toast — a credential that
+/// scrolls away while an operator is looking at the board is a node that has to
+/// be deleted and made again.
+///
+/// The command is here rather than in a document because this is the moment it
+/// is needed: the token is on the screen, the node id is known, and the URL is
+/// the one this console is talking to.
+function showNodeToken(id, token) {
+  const line =
+    "sudo velstra-cloud-node setup   # node id: " + id + ", control plane: " + location.origin;
+  // Its own dialog, opened after the form's has closed — the form closes on a
+  // successful submit, so filling that one would put a credential into a panel
+  // that is about to be removed. The scrim has no `onclick`: a mis-click
+  // outside must not be how a once-only token disappears.
+  const scrim = el("div", { id: "dialogscrim" });
+  const dialog = el("div", { id: "dialog", role: "dialog", "aria-label": "Registration token" });
+  document.body.appendChild(scrim);
+  document.body.appendChild(dialog);
+  fill(dialog,
+    el("h2", "Registration token for " + id),
+    el("p.prose",
+      "Shown once. The platform keeps a hash of it and cannot show it again — " +
+      "if it is lost, delete this node and add it back."),
+    el("pre.logblock", { id: "nodetoken" }, token),
+    el("p.prose", "On the machine, with the token to hand:"),
+    el("pre.logblock", line),
+    el("p.prose",
+      "The wizard asks which cell and as what — control plane, hypervisor, pool, " +
+      "or several. Whether this machine carries external traffic is not its own " +
+      "answer: set it here, on the node, once it has registered."),
+    el("div.formacts",
+      el("button.btn", { type: "button", id: "copytoken",
+        onclick: () => navigator.clipboard && navigator.clipboard.writeText(token) },
+        "Copy the token"),
+      el("button.btn.primary", { type: "button", id: "tokendone",
+        onclick: () => closeDialog() }, "I have written it down")));
 }
 
 /// What the form may send: not the id, which is not part of the spec, and not

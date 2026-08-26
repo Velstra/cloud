@@ -173,11 +173,30 @@ const ACRONYMS = {
 /// Keys whose shape survives the mechanical translation but whose meaning does
 /// not. Kept short on purpose: it is a list of exceptions, not a second schema.
 const LABELS = {
-  hugepages1Gi: "1 GiB hugepages",
+  // Named so the pair reads as what it is: a tail, and how much there was.
+  // "Console output" beside a byte count is how somebody works out that the
+  // panic they are looking for scrolled off an hour ago.
+  consoleTail: "Console output",
+  consoleBytes: "Console written",
+  console: "Show console output",
+  // `hugepages1gi`, all lowercase, because that is what the wire says: the
+  // field is `hugepages_1gi` and a digit cannot be capitalised. Spelled
+  // `hugepages1Gi` here, this row silently showed nothing.
+  hugepages1gi: "1 GiB hugepages",
   hugepages1gi: "1 GiB hugepages",
   numaFreeMib: "Free per NUMA node",
   vmmPid: "VMM process",
   observedGeneration: "Observed at generation",
+  // Acronyms the humaniser cannot know: it title-cases each word, which turns
+  // an initialism into a word ("Vip") and reads as a mistake.
+  vip: "Address",
+  memberPort: "Member port",
+  cidr: "CIDR",
+  mac: "MAC",
+  dns: "DNS",
+  fsid: "FSID",
+  osd: "OSD",
+  rd: "RD",
 };
 
 const label = (key) => LABELS[key] || humanise(key);

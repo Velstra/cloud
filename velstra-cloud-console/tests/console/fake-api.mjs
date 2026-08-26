@@ -32,7 +32,60 @@ const now = () => Date.now();
 const store = new Map();
 const watchers = new Set();
 
+/// What every object of a kind carries before anybody sets anything.
+///
+/// The real API builds a document the same way — a default spec, with the
+/// caller's fields merged onto it — so a fixture that omitted the untouched
+/// fields answered a shape the API never answers, and the console was tested
+/// against objects thinner than the ones it will meet. Kept here rather than
+/// spelled into every literal below, because the failure mode is a field added
+/// to the model and to seven fixtures out of eight.
+const DEFAULTS = {
+  instances: {
+    vcpus: 0, memoryMib: 0, image: "", rootDiskGib: 0, desiredState: "Running",
+    // No `devices` and no `affinityGroup`: the API leaves out what is empty,
+    // and a fixture that answers a key the API omits is the same drift one
+    // direction over.
+    ports: [], sshKeys: [], userData: null, node: null,
+    console: false, onNodeLoss: "leave", startOrder: 0, startDelayS: 0,
+    placementPolicy: {
+      antiAffinityGroup: null, requiredLabels: [],
+      spread: "Required", affinity: "Required",
+    },
+  },
+  nodes: {
+    schedulable: true, evacuate: false, labels: [], fenceAfterS: 0,
+    vcpuOvercommit: 0, gateway: false,
+  },
+  networks: { vni: 0, mtu: 1450, external: false, announce: "FromGateway" },
+  floatingips: { subnet: "", port: "", delivery: "Nat" },
+};
+
+const STATUS_DEFAULTS = {
+  instances: { consoleBytes: 0, addresses: [] },
+  nodes: { images: [], devices: [] },
+};
+
+/// Which collection a name is in: `projects/p1/instances/web-1` → `instances`.
+const kindOf = (name) => name.split("/").slice(-2)[0];
+
+function withDefaults(table, name, given) {
+  const base = table[kindOf(name)];
+  if (!base) return given;
+  const out = { ...base, ...given };
+  // One level in, so a nested object with one field set does not lose the rest
+  // — `placementPolicy` was exactly that.
+  for (const [key, value] of Object.entries(base)) {
+    if (value && typeof value === "object" && !Array.isArray(value) && given[key]) {
+      out[key] = { ...value, ...given[key] };
+    }
+  }
+  return out;
+}
+
 function put(name, spec, status, extra = {}) {
+  spec = withDefaults(DEFAULTS, name, spec);
+  status = withDefaults(STATUS_DEFAULTS, name, status);
   const r = {
     meta: {
       name,
@@ -228,6 +281,29 @@ function decorate(r) {
 const disk = (path, kernelName, sizeGib, rotational, model, state) =>
   ({ path, kernelName, sizeGib, rotational, model, serial: "S" + kernelName, state });
 
+
+/// A processor, as a node reports one.
+///
+/// The fixture's machines are deliberately *not* identical: node-b is a
+/// generation behind. A console checked only against a uniform cell is a
+/// console whose CPU strip was never seen with anything in it, and the whole
+/// point of that strip is the mixed case.
+function cpu(level, extra = []) {
+  const v2 = ["cx16", "lahf_lm", "popcnt", "sse3", "sse4_1", "sse4_2", "ssse3"];
+  const v3 = [...v2, "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe"];
+  const flags = [...(level === "v3" ? v3 : v2), ...extra].sort();
+  return {
+    arch: "x86_64",
+    vendor: "GenuineIntel",
+    modelName: level === "v3" ? "Intel(R) Xeon(R) Gold 6248R" : "Intel(R) Xeon(R) E5-2670",
+    family: 6, model: 85, stepping: 7,
+    flags,
+    presents: "host",
+    presentedFlags: flags,
+    canMask: true,
+  };
+}
+
 function seed() {
   store.clear();
   put("projects/p1", { displayName: "Platform", parent: "organizations/o1",
@@ -241,9 +317,10 @@ function seed() {
 
   put("nodes/node-a", { schedulable: true, labels: ["nvme", "gen4"] },
     { observedGeneration: 1, conditions: ready(1),
-      capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1Gi: 32 },
-      allocated: { vcpus: 10, memoryMib: 20480, diskGib: 200, numaFreeMib: [], hugepages1Gi: 0 },
+      capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
+      allocated: { vcpus: 10, memoryMib: 20480, diskGib: 200, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 4000,
+      cpu: cpu("v3"),
       devices: [
         disk("/dev/disk/by-id/nvme-eui.0001", "nvme0n1", 931, false, "Samsung SSD 990", { kind: "Free" }),
         disk("/dev/disk/by-id/ata-WDC-0002", "sda", 3726, true, "WDC WD40EFRX", { kind: "Filesystem", fstype: "ext4" }),
@@ -253,24 +330,39 @@ function seed() {
       ] });
   put("nodes/node-b", { schedulable: false, labels: ["nvme"] },
     { observedGeneration: 1, conditions: ready(1),
-      capacity: { vcpus: 32, memoryMib: 65536, diskGib: 2048, numaFreeMib: [16384, 16384], hugepages1Gi: 0 },
-      allocated: { vcpus: 30, memoryMib: 61440, diskGib: 1900, numaFreeMib: [], hugepages1Gi: 0 },
+      capacity: { vcpus: 32, memoryMib: 65536, diskGib: 2048, numaFreeMib: [16384, 16384], hugepages1gi: 0 },
+      allocated: { vcpus: 30, memoryMib: 61440, diskGib: 1900, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 900_000,
+      // A generation behind the other two: this is what makes the cell mixed.
+      cpu: cpu("v2"),
       devices: [
         disk("/dev/disk/by-id/ata-CRUCIAL-0006", "sda", 894, false, "CT1000MX500", { kind: "Partitioned", partitions: 3 }),
       ] });
   // Somewhere a guest can actually go. Without one, every migration answer is
   // "no", and a console checked only against that is a console whose picker was
   // never seen with anything in it.
-  put("nodes/node-c", { schedulable: true, labels: ["nvme", "gen4"] },
+  put("nodes/node-c", { schedulable: true, labels: ["nvme", "gen4"], vcpuOvercommit: 4 },
     { observedGeneration: 1, conditions: ready(1),
-      capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1Gi: 32 },
-      allocated: { vcpus: 4, memoryMib: 8192, diskGib: 80, numaFreeMib: [], hugepages1Gi: 0 },
+      capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
+      allocated: { vcpus: 4, memoryMib: 8192, diskGib: 80, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 3000,
+      cpu: cpu("v3"),
       devices: [
         disk("/dev/disk/by-id/nvme-eui.0007", "nvme0n1", 1863, false, "WD Black SN850X", { kind: "Free" }),
         disk("/dev/disk/by-id/ata-HGST-0008", "sda", 7452, true, "HUH721010ALE600", { kind: "Osd", id: "7" }),
       ] });
+
+  // Two windows: one open over node-b right now, one still to come on node-c.
+  // Both are needed — the open one is what an operator is looking at, and the
+  // upcoming one is the thing they would otherwise be surprised by.
+  put("maintenance-windows/dimm-swap", {
+    node: "node-b", startsAt: now() - 20 * 60_000, minutes: 60, drain: false,
+    note: "swapping the failed DIMM in slot 3" },
+    { observedGeneration: 1, conditions: [] });
+  put("maintenance-windows/rack-move", {
+    node: "node-c", startsAt: now() + 3 * 60 * 60_000, minutes: 120, drain: true,
+    note: "moving it to rack 4" },
+    { observedGeneration: 1, conditions: [] });
 
   // No `signature` on either: the API refuses one, because nothing in the
   // platform verifies it. A fixture carrying a field the real API would reject
@@ -290,6 +382,16 @@ function seed() {
   put("projects/p1/subnets/prod-a", { network: "projects/p1/networks/prod", cidr: "10.20.0.0/24",
     gateway: "10.20.0.1", dns: ["10.20.0.2"], reserved: ["10.20.0.5"] },
     { observedGeneration: 1, conditions: ready(1), allocated: 12, available: 241 });
+  // One address in front of the web pool. Settled: the fabric serves the
+  // address that was asked for, and the observed listeners carry the pool.
+  put("projects/p1/load-balancers/web", {
+    network: "projects/p1/networks/prod", subnet: "projects/p1/subnets/prod-a",
+    vip: "10.20.0.20",
+    listeners: [{ protocol: "Tcp", port: 443, memberPort: 8080 }],
+    members: ["projects/p1/ports/web-1-eth0"] },
+    { observedGeneration: 1, conditions: ready(1), vip: "10.20.0.20",
+      listeners: [{ protocol: "Tcp", port: 443, members: 1 }] });
+
   put("projects/p1/ports/web-1-eth0", { network: "projects/p1/networks/prod",
     subnet: "projects/p1/subnets/prod-a", address: "10.20.0.11", mac: "02:1a:4b:00:11:22",
     // A full resource name, which is how the platform spells a reference to
@@ -306,7 +408,7 @@ function seed() {
     userData: null, node: "node-a", placementPolicy: { antiAffinityGroup: "web", requiredLabels: [] } },
     { observedGeneration: 2, conditions: ready(2), state: "Running", node: "node-a",
       addresses: ["10.20.0.11"], vmmPid: 4711, startedAt: now() - 7_200_000 },
-    { generation: 2 });
+    { generation: 2, labels: { env: "prod", tier: "web" } });
 
   // Drifting: the ask moved and nothing has reported on it yet. The Ready
   // condition it carries was written about the older generation.
@@ -319,7 +421,7 @@ function seed() {
         "the node has not reported on this change yet", 2)],
       state: "Running", node: "node-a", addresses: ["10.20.0.12"],
       vmmPid: 5120, startedAt: now() - 86_400_000 },
-    { generation: 3 });
+    { generation: 3, labels: { env: "staging", tier: "web" } });
 
   // Converged on a spec it cannot satisfy: nothing is in flight, it is simply
   // not placed, and the reason is on the object.
@@ -340,6 +442,36 @@ function seed() {
     placementPolicy: { antiAffinityGroup: "web", requiredLabels: [] } },
     { observedGeneration: 1, conditions: ready(1), state: "Running", node: "node-a",
       addresses: ["10.20.0.13"], vmmPid: 6144, startedAt: now() - 3_600_000 });
+
+  // A guest that will not boot, with its last words attached. This is the case
+  // the console capture exists for: a failed guest is the one with the most to
+  // say and the least chance of being heard, and a console that showed only
+  // "Failed" would be the reason somebody ssh'd into a hypervisor.
+  //
+  // Named to sort *after* the healthy guests, and that is not cosmetic. Several
+  // migration checks take "the first placed guest" off the board; a broken one
+  // at the front of the list is refused by every destination, which reads to
+  // those checks as "this cell can receive nothing" and skips them silently.
+  // One of them now asks for a *running* guest instead, which is the real fix;
+  // the name keeps the others honest until they do the same.
+  put("projects/p1/instances/web-9", {
+    vcpus: 4, memoryMib: 8192, image: "projects/p1/images/debian-13", rootDiskGib: 40,
+    desiredState: "Running", ports: [], sshKeys: [], userData: null, node: "node-a",
+    console: false,
+    placementPolicy: { antiAffinityGroup: null, requiredLabels: [] } },
+    { observedGeneration: 1,
+      conditions: [condition("Ready", "False", "HostActions",
+        "the guest exited without being asked to", 1)],
+      state: "Failed", node: "node-a", addresses: [], vmmPid: null,
+      startedAt: now() - 120_000,
+      // Not switched on, and shown anyway — the second half of the rule.
+      consoleTail:
+        "[    0.000000] Linux version 6.12.63 (velstra@build)\n" +
+        "[    1.204411] EXT4-fs (vda1): mounted filesystem\n" +
+        "[    2.881900] systemd[1]: Starting Journal Service...\n" +
+        "[    3.104222] EXT4-fs error (device vda1): ext4_lookup:1855: inode #131074\n" +
+        "[    3.104980] Kernel panic - not syncing: Attempted to kill init!\n",
+      consoleBytes: 240_128 });
 
   // Two migrations, deliberately at different moments of the same dance. One
   // where the destination has claimed the object and has not got a receiver up
@@ -392,6 +524,25 @@ function seed() {
   put("projects/p1/operations/op-7", { target: "projects/p1/instances/web-2",
     targetGeneration: 3, verb: "update", requestedBy: "operator" },
     { observedGeneration: 1, conditions: ready(1), done: false, error: null, finishedAt: null });
+  // Two more about web-1, so one object has a history worth reading: a change
+  // that landed, and one that did not.
+  put("projects/p1/operations/op-3", { target: "projects/p1/instances/web-1",
+    targetGeneration: 1, verb: "create", requestedBy: "alice" },
+    { observedGeneration: 1, conditions: ready(1), done: true, error: null,
+      finishedAt: now() - 7_100_000 });
+  put("projects/p1/operations/op-5", { target: "projects/p1/instances/web-1",
+    targetGeneration: 2, verb: "update", requestedBy: "alice" },
+    { observedGeneration: 1, conditions: ready(1), done: true,
+      error: "the node refused the change", finishedAt: now() - 3_000_000 });
+  // And a refusal, which lives where a tenant never looks — reading only the
+  // accepted half is how somebody concludes their click did nothing.
+  put("audit/rec-1", { kind: "Refused", subject: "bob", verb: "delete",
+    target: "projects/p1/instances/web-1",
+    // `detail`, and the same sentence the person was given: a line that
+    // paraphrases the refusal is one an operator has to correlate by hand
+    // against what they actually saw.
+    detail: "bob is a viewer on projects/p1", at: now() - 600_000 },
+    { observedGeneration: 1, conditions: [] });
 }
 
 // ---- the wire --------------------------------------------------------------
@@ -413,6 +564,28 @@ function nameFrom(path) {
 }
 
 const isCollectionName = (name) => name.split("/").length % 2 === 1;
+
+/// Apply a label selector, exactly as the model's `labels_match` does.
+function narrow(items, selector) {
+  const terms = String(selector || "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map((t) => {
+      const at = t.indexOf("=");
+      return at < 0
+        ? { key: t, value: null }
+        : { key: t.slice(0, at).trim(), value: t.slice(at + 1).trim() };
+    });
+  if (!terms.length) return items;
+  return items.filter((r) => {
+    const labels = (r.meta && r.meta.labels) || {};
+    return terms.every((t) =>
+      t.value === null
+        ? Object.prototype.hasOwnProperty.call(labels, t.key)
+        : labels[t.key] === t.value);
+  });
+}
 
 function listUnder(name) {
   // `projects/p1/instances` selects every resource whose name is that plus one
@@ -709,6 +882,152 @@ const server = createServer(async (req, res) => {
     });
   }
 
+  // `projects/p1:explainQuota` — what is left, and what could actually start.
+  // Both halves, because either alone answers the wrong question.
+  if (path.includes(":explainQuota")) {
+    if (req.method !== "GET") {
+      return fail(res, 405, "INVALID_ARGUMENT", "that method is not allowed here");
+    }
+    const project = store.get(nameFrom(path.replace(":explainQuota", "")));
+    if (!project) return fail(res, 404, "NOT_FOUND", "no such object");
+    const limit = project.spec.quota || {};
+    const used = project.status.used || {};
+    const names = ["instances", "vcpus", "memoryMib", "volumes", "volumeGib",
+      "floatingIps", "loadBalancers", "devices"];
+    const dimensions = names.map((name) => {
+      const cap = Number(limit[name] || 0);
+      const now = Number(used[name] || 0);
+      // A zero is a limit nobody set, not a limit of nothing — the same
+      // convention the quota checker itself follows.
+      const unlimited = cap === 0;
+      return {
+        name, limit: cap, used: now, unlimited,
+        left: unlimited ? null : Math.max(0, cap - now),
+        exhausted: !unlimited && now >= cap,
+      };
+    });
+
+    // The cell's side: the largest single machine, never a sum. Free memory
+    // does not add up into a guest.
+    const at = Date.now();
+    const shut = new Set([...store.values()]
+      .filter((r) => r.meta.name.startsWith("maintenance-windows/") &&
+        r.spec.startsAt <= at && at < r.spec.startsAt + r.spec.minutes * 60_000)
+      .map((r) => r.spec.node));
+    let fitV = 0, fitM = 0;
+    for (const n of [...store.values()].filter((r) => r.meta.name.startsWith("nodes/"))) {
+      if (!n.spec.schedulable || n.spec.evacuate) continue;
+      if (shut.has(n.meta.name.split("/").pop())) continue;
+      // Defensive as well, because a reader that adds machines up must not be
+      // the thing that falls over when one of them has said nothing yet.
+      fitV = Math.max(fitV, (n.status.capacity?.vcpus || 0) - (n.status.allocated?.vcpus || 0));
+      fitM = Math.max(
+        fitM,
+        (n.status.capacity?.memoryMib || 0) - (n.status.allocated?.memoryMib || 0),
+      );
+    }
+    const left = (name) => (dimensions.find((d) => d.name === name) || {}).left;
+    const pick = (q, cell) => q === null || q === undefined
+      ? [cell, "cell"]
+      : q < cell ? [q, "quota"] : q > cell ? [cell, "cell"] : [q, "both"];
+    const [vcpus, vcpusLimitedBy] = pick(left("vcpus"), fitV);
+    const [memoryMib, memoryLimitedBy] = pick(left("memoryMib"), fitM);
+    const out = dimensions.find((d) => d.name === "instances").exhausted;
+    return json(res, 200, {
+      project: project.meta.name,
+      dimensions,
+      largestStartable: {
+        vcpus, memoryMib, vcpusLimitedBy, memoryLimitedBy,
+        none: out || vcpus === 0 || memoryMib === 0,
+      },
+    });
+  }
+
+  // `…/i1:explainRecovery` — why a guest has, or has not, been brought back
+  // from a node that stopped answering. Computed, never written onto the
+  // guest: the agent on its node owns that status.
+  if (path.includes(":explainRecovery")) {
+    if (req.method !== "GET") {
+      return fail(res, 405, "INVALID_ARGUMENT", "that method is not allowed here");
+    }
+    const guest = store.get(nameFrom(path.replace(":explainRecovery", "")));
+    if (!guest) return fail(res, 404, "NOT_FOUND", "no such object");
+    const on = guest.spec.node;
+    if (!on) {
+      return json(res, 200, {
+        node: null, recoverable: false, why: "NotPlaced",
+        detail: "it is not on a node, so there is nothing to recover it from",
+      });
+    }
+    const node = store.get("nodes/" + on);
+    const fences = node && Number(node.spec.fenceAfterS || 0) > 0;
+    if ((guest.spec.onNodeLoss || "leave") !== "restart") {
+      return json(res, 200, {
+        node: on, recoverable: false, why: "PolicyIsLeave",
+        detail: "it is set to be left where it is when its node goes quiet",
+      });
+    }
+    if (!fences) {
+      return json(res, 200, {
+        node: on, recoverable: false, why: "NodeDoesNotFence",
+        detail: on + " does not stop its own guests, so nothing can tell unreachable from stopped",
+      });
+    }
+    return json(res, 200, {
+      node: on, recoverable: true, why: "Recoverable",
+      detail: "its node fences and it is set to restart elsewhere",
+    });
+  }
+
+  // `…/node-b:explainMaintenance` — what is scheduled for one machine, and
+  // what the drain would cost. Computed from the windows in the store, so a
+  // window created through the console changes this answer the same way the
+  // real API's would.
+  if (path.includes(":explainMaintenance")) {
+    if (req.method !== "GET") {
+      return fail(res, 405, "INVALID_ARGUMENT", "that method is not allowed here");
+    }
+    const node = store.get(nameFrom(path.replace(":explainMaintenance", "")));
+    if (!node) return fail(res, 404, "NOT_FOUND", "no such object");
+    const id = node.meta.name.split("/").pop();
+    const at = Date.now();
+    const mine = [...store.values()]
+      .filter((r) => r.meta.name.startsWith("maintenance-windows/") && r.spec.node === id)
+      .map((w) => ({
+        window: w.meta.name,
+        startsAt: w.spec.startsAt,
+        endsAt: w.spec.startsAt + w.spec.minutes * 60_000,
+        minutes: w.spec.minutes,
+        drain: !!w.spec.drain,
+        note: w.spec.note || "",
+        opensInMinutes: w.spec.startsAt > at
+          ? Math.floor((w.spec.startsAt - at) / 60_000)
+          : null,
+      }));
+    const open = mine.find((w) => w.startsAt <= at && at < w.endsAt) || null;
+    const next = mine.filter((w) => w.startsAt > at).sort((a, b) => a.startsAt - b.startsAt)[0] || null;
+    const here = [...store.values()].filter((r) =>
+      r.meta.name.includes("/instances/") && r.status.node === id);
+    const draining = (open && open.drain) || !!node.spec.evacuate;
+    return json(res, 200, {
+      node: id,
+      open,
+      next,
+      draining,
+      // A guest holding a passed-through device is bound to this machine; the
+      // rest would move. The same split the real evacuation makes.
+      willMove: !draining ? [] : here
+        .filter((i) => !(i.status.devices || []).length)
+        .map((i) => ({ instance: i.meta.name, to: "node-a" })),
+      cannotMove: !draining ? [] : here
+        .filter((i) => (i.status.devices || []).length)
+        .map((i) => ({
+          instance: i.meta.name,
+          why: [{ node: "node-a", detail: "it holds a passed-through device" }],
+        })),
+    });
+  }
+
   // `…/i1:explainMigration` — every node in the cell with its own verdict.
   //
   // A GET, like its sibling `:explainPlacement`: it reads and creates nothing.
@@ -738,10 +1057,117 @@ const server = createServer(async (req, res) => {
     });
   }
 
+  // `nodes:explainCapacity` — what the cell has room for.
+  //
+  // The fixture is deliberately the misleading shape: plenty free in total,
+  // spread thin. A console that showed only the sum would say a large guest
+  // fits, and this cell has no room for one anywhere.
+  if (path.includes("nodes:explainCapacity")) {
+    if (req.method !== "GET") {
+      return fail(res, 405, "INVALID_ARGUMENT", "that method is not allowed here");
+    }
+    const nodes = [...store.values()].filter((r) => r.meta.name.startsWith("nodes/"));
+    const usable = nodes.filter(
+      (n) => n.spec.schedulable && !n.spec.evacuate,
+    );
+    const sum = (list, pick) => list.reduce((a, n) => a + pick(n), 0);
+    const freeOf = (n) =>
+      (n.status.capacity?.memoryMib || 0) - (n.status.allocated?.memoryMib || 0);
+    // What a node is prepared to hand out, which is silicon unless somebody
+    // set a ratio. Zero and one both mean one for one.
+    const offeredOf = (n) =>
+      (n.status.capacity?.vcpus || 0) * Math.max(1, n.spec.vcpuOvercommit || 0);
+    const freeVcpus = (n) => offeredOf(n) - (n.status.allocated?.vcpus || 0);
+    return json(res, 200, {
+      usableNodes: usable.length,
+      unusableNodes: nodes.length - usable.length,
+      offeredVcpus: sum(usable, offeredOf),
+      total: {
+        vcpus: sum(nodes, (n) => n.status.capacity?.vcpus || 0),
+        memoryMib: sum(nodes, (n) => n.status.capacity?.memoryMib || 0),
+        diskGib: sum(nodes, (n) => n.status.capacity?.diskGib || 0),
+      },
+      allocated: {
+        vcpus: sum(nodes, (n) => n.status.allocated?.vcpus || 0),
+        memoryMib: sum(nodes, (n) => n.status.allocated?.memoryMib || 0),
+        diskGib: sum(nodes, (n) => n.status.allocated?.diskGib || 0),
+      },
+      free: {
+        vcpus: sum(usable, freeVcpus),
+        memoryMib: sum(usable, freeOf),
+        diskGib: 0,
+      },
+      // The largest single node's free memory — never the sum.
+      largestFit: {
+        vcpus: Math.max(0, ...usable.map(freeVcpus)),
+        memoryMib: Math.max(0, ...usable.map(freeOf)),
+        diskGib: 0,
+      },
+    });
+  }
+
+  // `nodes:explainCpu` — the fleet's processors, computed from what the nodes
+  // report. A verb on the collection, because who can exchange guests with
+  // whom is a property of the set rather than of any member.
+  if (path.includes("nodes:explainCpu")) {
+    if (req.method !== "GET") {
+      return fail(res, 405, "INVALID_ARGUMENT", "that method is not allowed here");
+    }
+    const nodes = [...store.values()].filter((r) => r.meta.name.startsWith("nodes/"));
+    const reported = nodes.filter((n) => n.status && n.status.cpu);
+    const byPresented = new Map();
+    for (const n of reported) {
+      const key = (n.status.cpu.presentedFlags || []).slice().sort().join(",");
+      if (!byPresented.has(key)) byPresented.set(key, []);
+      byPresented.get(key).push(n.meta.name.split("/").pop());
+    }
+    const domains = [...byPresented.entries()].map(([, ids]) => {
+      const node = reported.find((n) => n.meta.name.endsWith("/" + ids[0]));
+      return {
+        nodes: ids.slice().sort(),
+        arch: node.status.cpu.arch || "x86_64",
+        level: node.status.cpu.presents === "host" ? "x86-64-v2" : node.status.cpu.presents,
+        canBaseline: node.status.cpu.canMask !== false,
+      };
+    });
+    const advice = domains.length > 1
+      ? [{
+          kind: "BaselineWouldMerge",
+          nodes: reported.map((n) => n.meta.name.split("/").pop()).sort(),
+          level: "x86-64-v2",
+          featuresLost: [{ node: domains[1].nodes[0], flags: ["avx2"] }],
+        }]
+      : [{ kind: "AlreadyUniform", nodes: reported.length, level: domains[0]?.level || null }];
+    return json(res, 200, {
+      unreported: nodes
+        .filter((n) => !(n.status && n.status.cpu))
+        .map((n) => n.meta.name.split("/").pop()),
+      domains,
+      advice,
+      pendingAdoption: [],
+    });
+  }
+
   const name = nameFrom(path);
 
   if (req.method === "GET" && isCollectionName(name)) {
-    const all = listUnder(name);
+    // `?labels=env=prod,tier=web` — every term must match, a bare key asks
+    // whether the label is there at all, and an empty selector narrows
+    // nothing. The server does this so a console never fetches a cell to show
+    // six rows of it.
+    let all = narrow(listUnder(name), url.searchParams.get("labels"));
+    // `?target=` — the records *about* one object. Only operations and audit
+    // carry one; anything else asking has misunderstood, and answering with
+    // the whole collection would look as though the filter had been applied.
+    const target = url.searchParams.get("target");
+    if (target) {
+      const kind = name.split("/").pop();
+      if (kind !== "operations" && kind !== "audit") {
+        return fail(res, 400, "INVALID_ARGUMENT",
+          kind + " are not records about another object");
+      }
+      all = all.filter((r) => r.spec.target === target);
+    }
     if (url.searchParams.get("watch") === "true") {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -875,7 +1301,15 @@ const server = createServer(async (req, res) => {
       { target: full, targetGeneration: 1, verb: "create", requestedBy: "console" },
       { observedGeneration: 1, conditions: ready(1), done: false, error: null, finishedAt: null });
     announce("PUT", op);
-    return json(res, 202, { operation: op.meta.name, target: full });
+    // Registering a node mints its one-time token, returned exactly once —
+    // the API keeps a hash and cannot show it again. A console that did not
+    // catch it here would leave an operator with a node object and no way to
+    // register the machine.
+    const created = { operation: op.meta.name, target: full };
+    if (full.startsWith("nodes/")) {
+      created.nodeToken = "b".repeat(64);
+    }
+    return json(res, 202, created);
   }
 
   if (req.method === "PATCH") {
@@ -1043,6 +1477,22 @@ function blankStatus(collectionName) {
     return { node: null, receiverUrl: null, receiverReady: false, transferredMib: 0 };
   }
   if (kind === "projects") return { used: { instances: 0, vcpus: 0, memoryMib: 0, volumeGib: 0 } };
+  // A node that has just been registered and has not reported yet: zeroes, not
+  // absence. The real API's status is a typed struct, so `capacity` is always
+  // there — and a fixture that left it out crashed every reader that adds a
+  // machine up, which is what happened the first time a node was created from
+  // the console.
+  if (kind === "nodes") {
+    const zero = { vcpus: 0, memoryMib: 0, diskGib: 0, numaFreeMib: [], hugepages1gi: 0 };
+    return {
+      capacity: zero,
+      allocated: { ...zero },
+      agentVersion: "",
+      lastHeartbeat: 0,
+      images: [],
+      devices: [],
+    };
+  }
   return {};
 }
 

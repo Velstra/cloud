@@ -66,6 +66,10 @@
          cannot tell which account they are using is an operator who eventually
          does something as the wrong one. -->
     <span id="whoami" class="who"></span>
+    <!-- The way into the jump palette for a hand that reaches for the pointer.
+         The keystroke is the fast path; this is the one that teaches it. -->
+    <button class="btn jump" id="jump" type="button"
+            aria-keyshortcuts="Meta+K Control+K">Jump<kbd>⌘K</kbd></button>
     <button class="btn" id="theme" type="button">Light</button>
     <button class="btn" id="signout" type="button">Sign out</button>
   </header>
@@ -80,7 +84,20 @@
     <h1 id="listtitle"></h1>
     <p class="prose" id="listblurb"></p>
     <div class="sheetacts" id="listacts"></div>
+    <!-- Narrowing, on the boards where a cell gets long enough to need it. -->
+    <div id="listfilter" class="listfilter hidden"></div>
     <p id="listerr" class="err hidden"></p>
+    <!-- The cell's CPU picture, on the nodes board only. Hidden until there is
+         something to say, so a cell of identical machines carries no chrome
+         for a problem it does not have. -->
+    <div id="cpuadvisory" class="cpuadvisory hidden"></div>
+    <!-- The cell at a glance. Not a board: nothing here is a row of one
+         collection, and the whole point is that it crosses all of them. -->
+    <div id="overviewbox" class="overview hidden"></div>
+    <!-- Appears when rows are selected. Above the board rather than floating
+         over it: it is about the rows below, and a bar that covers them is a
+         bar that hides what is about to be changed. -->
+    <div id="picked" class="picked hidden"></div>
     <div class="boardwrap"><table class="board" id="board">
       <thead><tr id="boardhead"></tr></thead>
       <tbody id="boardbody"></tbody>
