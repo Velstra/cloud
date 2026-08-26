@@ -46,8 +46,8 @@ use anyhow::{Context, Result, bail};
 use crate::{
     roles::{Role, render_list},
     wizard::{
-        ask_valid, ask_yes, prompt, validate_interface, validate_ip, validate_node_name,
-        validate_srv6_locator, validate_token, validate_url,
+        ask_valid, ask_yes, prompt, prompt_secret, validate_interface, validate_ip,
+        validate_node_name, validate_srv6_locator, validate_token, validate_url,
     },
 };
 
@@ -80,6 +80,15 @@ pub struct Machine {
     pub cells: Vec<String>,
     /// The fabric, if this cell has one. See [`Fabric`].
     pub fabric: Option<Fabric>,
+    /// The cell's first administrator, for a control plane.
+    ///
+    /// Without one the API comes up, serves the console, and refuses every
+    /// sign-in — and it says so in a warning nobody reading a browser sees.
+    /// A fresh cell that cannot be signed into is not a cell.
+    pub admin: String,
+    /// That administrator's initial password. Never written into the seed: the
+    /// seed is 0644 because nothing in it is secret, and this is.
+    pub admin_password: String,
 }
 
 /// Where the data plane is, from this machine's point of view.
@@ -141,6 +150,11 @@ pub fn render(m: &Machine) -> String {
     }
     if m.roles.contains(&Role::ControlPlane) {
         out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
+        // A username is not a secret; the password beside it is, and goes to a
+        // 0600 file of its own — the same split the node token already makes.
+        if !m.admin.is_empty() {
+            out.push_str(&format!("VELSTRA_BOOTSTRAP_ADMIN={}\n", m.admin));
+        }
         if !m.cells.is_empty() {
             out.push_str(&format!("VELSTRA_CELLS={}\n", m.cells.join(",")));
         }
@@ -226,6 +240,8 @@ pub fn parse(text: &str) -> Result<Machine> {
             })
             .unwrap_or_default(),
         fabric: None,
+        admin: or("VELSTRA_BOOTSTRAP_ADMIN", ""),
+        admin_password: std::env::var("VELSTRA_BOOTSTRAP_PASSWORD").unwrap_or_default(),
     };
     // Only what the named roles actually need. A file for a pool that had to
     // carry a node id would be a file with a value nobody reads, and the first
@@ -397,6 +413,17 @@ fn write(dir: &Path, m: &Machine) -> Result<()> {
         // that read it do not all run as root.
         write_with_mode(&dir.join("node-token"), &format!("{}\n", m.token), 0o600)?;
     }
+    if m.roles.contains(&Role::ControlPlane) && !m.admin_password.is_empty() {
+        // Its own file, its own mode, for the same reason the token has one.
+        // The API unit reads it into the environment at start rather than
+        // taking it on a command line: an argument is visible in `ps` to every
+        // user on the machine, and this one is the cell's first administrator.
+        write_with_mode(
+            &dir.join("bootstrap-password"),
+            &format!("{}\n", m.admin_password),
+            0o600,
+        )?;
+    }
     println!("\nWrote {}/node.env", dir.display());
     Ok(())
 }
@@ -468,6 +495,8 @@ fn collect() -> Result<Option<Machine>> {
         store: "127.0.0.1:2379".into(),
         cells: Vec::new(),
         fabric: None,
+        admin: String::new(),
+        admin_password: String::new(),
     };
 
     // Everything that is not the control plane has to be told where the API is.
@@ -536,6 +565,38 @@ fn collect() -> Result<Option<Machine>> {
                 bail!("{pair:?} is not cell=url");
             }
         }
+
+        // The first administrator. Asked, not optional, and asked *here*
+        // because this is the only role that can answer it.
+        //
+        // Without one the API starts, serves the console, and refuses every
+        // sign-in. It warns about that in its log — which is not where somebody
+        // looking at a login form is looking. A cell nobody can sign into is
+        // not a cell, and finding that out after the install is finding it out
+        // in the worst place.
+        println!("\nThe first administrator for this cell. Everything else is created by");
+        println!("signing in as somebody: registering a node, making a project, all of it.");
+        m.admin = ask_valid(
+            "Username [admin]: ",
+            validate_node_name,
+            "lowercase letters, digits and '-'",
+        )
+        .map(|s| if s.is_empty() { "admin".into() } else { s })?;
+        m.admin_password = loop {
+            let first = prompt_secret("Password: ")?;
+            if first.trim().len() < 12 {
+                println!(
+                    "  at least 12 characters — this one credential is the way into everything"
+                );
+                continue;
+            }
+            let again = prompt_secret("Repeat it: ")?;
+            if first != again {
+                println!("  they do not match");
+                continue;
+            }
+            break first;
+        };
     }
 
     // The overlay. Asked last because it is the one answer a cell can honestly
@@ -644,6 +705,8 @@ mod tests {
             store: "127.0.0.1:2379".into(),
             cells: Vec::new(),
             fabric: None,
+            admin: String::new(),
+            admin_password: String::new(),
         }
     }
 

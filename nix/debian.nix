@@ -79,10 +79,18 @@ let
     '';
 
   units = {
+    # The API reads the bootstrap password out of its own 0600 file rather than
+    # taking it on a command line: an argument is visible in `ps` to every user
+    # on the machine, and this one is the cell's first administrator. `-f` so a
+    # cell whose administrator already exists — every start after the first —
+    # simply starts.
     "velstra-cloud-api.service" = unit {
       role = "control-plane";
       description = "Velstra Cloud API";
-      exec = bin "velstra-cloud-api";
+      exec = ''
+        /bin/sh -c 'if [ -f /var/lib/velstra/bootstrap-password ]; then \
+          VELSTRA_BOOTSTRAP_PASSWORD="$(cat /var/lib/velstra/bootstrap-password)"; \
+          export VELSTRA_BOOTSTRAP_PASSWORD; fi; exec ${bin "velstra-cloud-api"}' '';
     };
     "velstra-cloud-controller.service" = unit {
       role = "control-plane";
