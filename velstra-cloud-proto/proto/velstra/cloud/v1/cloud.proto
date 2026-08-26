@@ -153,6 +153,17 @@ message Quota {
   uint32 vcpus = 2;
   uint64 memory_mib = 3;
   uint64 volume_gib = 4;
+  // A count of volume objects, distinct from volume_gib: one caps overhead,
+  // the other caps capacity.
+  uint32 volumes = 5;
+  // A count of floating IP objects a project may hold.
+  uint32 floating_ips = 6;
+  // A count of load balancer objects a project may hold.
+  uint32 load_balancers = 7;
+  // A count of passed-through PCI devices a project may hold. Hardware exists
+  // once and cannot be oversubscribed, so without a cap one project takes
+  // every accelerator in the cell.
+  uint32 devices = 8;
 }
 
 message ProjectSpec {
@@ -235,6 +246,32 @@ message NodeSpec {
   // cannot lose it half way.
   bool schedulable = 1;
   repeated string labels = 2;
+  // The CPU this node presents to guests, if it has been told to present
+  // something other than its own: `x86-64-v2`..`x86-64-v4`. Absent means the
+  // host's own processor.
+  //
+  // A change governs guests started after it; guests already running keep the
+  // CPU they booted with until they are restarted.
+  optional string cpu_baseline = 3;
+  // How long this node may fail to report before it stops its own guests.
+  // Zero — the default — means it does not, and a node that does not stop its
+  // own guests is never recovered from: "unreachable" and "stopped" are
+  // different statements, and acting on the first as though it were the second
+  // is how two guests come to write to one volume.
+  uint32 fence_after_s = 4;
+  // Move what is already running here, somewhere else. Separate from
+  // `schedulable`: draining says "nothing new", evacuating says "and none of
+  // the old either", and an operator taking a machine out for an hour wants
+  // the first without the second.
+  bool evacuate = 5;
+  // How many vCPUs this node may hand out per real core. Zero — the default —
+  // means one for one. There is deliberately no memory ratio: a processor can
+  // be shared and being wrong costs speed, while a guest promised 8 GiB and
+  // handed 4 is killed rather than slowed.
+  uint32 vcpu_overcommit = 6;
+  // This machine carries traffic between the cell and the world: a public
+  // address whose network announces `FromGateway` is announced from here.
+  bool gateway = 7;
 }
 
 message NodeStatus {
@@ -257,6 +294,92 @@ message NodeStatus {
   // What this node runs of Ceph, when it runs any. Absent on the nodes that do
   // not, which in most cells is most of them.
   NodeCeph ceph = 9;
+  // This node's processor, and what it presents to guests. One node's
+  // observation of its own hardware, like `devices`. Absent from a node whose
+  // agent is too old to report, which every caller treats as "cannot be shown
+  // compatible" rather than as "compatible".
+  NodeCpu cpu = 10;
+  // PCI devices this machine has, and what each is being used for. One node's
+  // observation of its own hardware. Which of them may be *offered* is a rule
+  // over the whole list — a device whose IOMMU group holds something busy is
+  // present and not available.
+  repeated PciDevice pci_devices = 11;
+}
+
+// One PCI device, as the node holding it sees it.
+message PciDevice {
+  // `0000:41:00.0`. Node-specific, which is why an instance never names one.
+  string address = 1;
+  // `10de:2204` — the stable identity of *what* this is, and what a device
+  // class matches on.
+  string vendor_device = 2;
+  string description = 3;
+  // `gpu`, `network`, `storage`, `audio`, `other`.
+  string kind = 4;
+  // The IOMMU group. Absent means the machine cannot isolate this device at
+  // all — no IOMMU, or it is off in the firmware or on the kernel command
+  // line — and such a device is never offerable.
+  optional uint32 iommu_group = 5;
+  // `free`, `host-driver`, or `guest`.
+  string state = 6;
+  // Set when `state` is `host-driver`: which driver holds it.
+  string driver = 7;
+  // Set when `state` is `guest`: which instance holds it.
+  string instance = 8;
+}
+
+// A named set of interchangeable PCI devices, across the whole cell.
+message DeviceClassSpec {
+  // `vendor:device` values a member may have. Several, because a fleet buys
+  // the same accelerator across board revisions.
+  repeated string matches = 1;
+  string description = 2;
+}
+
+message DeviceClassStatus {
+  uint64 observed_generation = 1;
+  repeated Condition conditions = 2;
+}
+
+message DeviceClass {
+  Meta meta = 1;
+  DeviceClassSpec spec = 2;
+  DeviceClassStatus status = 3;
+}
+
+// What a node reports about its processor. See `docs/cpu-heterogeneity.md`.
+message NodeCpu {
+  // `x86_64` or `aarch64`. The one difference no baseline can bridge.
+  string arch = 1;
+  string vendor = 2;
+  string model_name = 3;
+  uint32 family = 4;
+  uint32 model = 5;
+  uint32 stepping = 6;
+  // What the silicon has. Decides what a baseline *could* be.
+  repeated string flags = 7;
+  // What guests started here are given: `host`, or a declared baseline such as
+  // `x86-64-v3`. Distinct from `flags`, and that distinction is the point of a
+  // baseline: a bigger machine offering guests less, on purpose, so its guests
+  // can move to a smaller one.
+  string presents = 8;
+  // The flags a guest started here actually sees. This — not `flags` — decides
+  // who may exchange guests with whom.
+  repeated string presented_flags = 9;
+  // Whether this node's VMM can present a CPU other than its own. False for
+  // Cloud Hypervisor, which has no CPU model, and on architectures where
+  // neither VMM has one. Reported rather than inferred from the VMM's name so
+  // the answer can change without this platform changing.
+  bool can_mask = 10;
+}
+
+// What a guest was actually given, recorded when it started. Never derived
+// from the node it sits on: a baseline declared later does not change what an
+// already-running guest can see.
+message GuestCpu {
+  string model = 1;
+  string arch = 2;
+  repeated string flags = 3;
 }
 
 // One block device, as the node holding it sees it.
@@ -358,6 +481,11 @@ message ImageSpec {
   string source_url = 4;
   // Cosign-style signature, verified by the node before it will boot the image.
   optional string signature = 5;
+  // The guest this was captured from, when it came from one rather than from
+  // a URL somebody typed. An image made from a guest that has since been
+  // deleted still says where it came from, which is what somebody looking at a
+  // list of near-identical templates actually needs.
+  optional string source_instance = 6;
 }
 
 message ImageStatus {
@@ -427,6 +555,19 @@ message PlacementPolicy {
   optional string anti_affinity_group = 1;
   // Only nodes carrying all of these labels.
   repeated string required_labels = 2;
+  // Only nodes whose processor is at least this psABI level: `x86-64-v2`..
+  // `x86-64-v4`. A level and never a model name — a level is what a
+  // distribution states as its requirement and stays meaningful across vendors.
+  optional string min_cpu_level = 3;
+  // Instances that should share a node — the opposite ask, for a pair that
+  // talks constantly and where a hop between machines is the latency budget.
+  optional string affinity_group = 4;
+  // Whether keeping the anti-affinity group apart is a rule or a wish:
+  // `Required` (the default) refuses a node that already runs a member,
+  // `Preferred` takes one over not running at all.
+  string spread = 5;
+  // The same, for keeping the affinity group together.
+  string affinity = 6;
 }
 
 message InstanceSpec {
@@ -446,6 +587,32 @@ message InstanceSpec {
   // with its own resource, never a silent re-place.
   optional string node = 9;
   PlacementPolicy placement_policy = 10;
+  // PCI device classes this guest wants passed through, by resource id. A
+  // class and never an address: an address is node-specific, so an instance
+  // naming one could only ever run on the machine that has it. Two entries of
+  // the same class mean two different devices.
+  //
+  // A guest holding one of these cannot be live-migrated.
+  repeated string devices = 11;
+  // Publish this guest's console output on its status. A desired state, not a
+  // command: "I am watching this guest's console". Off by default, because a
+  // console tail on every healthy guest would turn every chatty one into a
+  // status write per pass. A guest that is not running publishes regardless.
+  bool console = 12;
+  // What to do if this guest's node stops answering: `leave` (the default) or
+  // `restart`. Only for a guest whose storage every node can reach — one on
+  // local storage that is "recovered" elsewhere is an empty machine wearing a
+  // familiar name.
+  string on_node_loss = 13;
+  // When this guest starts, relative to others on the same node. Lower first;
+  // the same number is a group that starts together. The case it exists for:
+  // power comes back, a node starts forty guests at once, and the database
+  // everything else needs loses the race for disk to a dozen web servers.
+  uint32 start_order = 14;
+  // How long to let the group ahead settle first. Measured from the newest
+  // start in that group, not each member in turn — otherwise a fleet's boot is
+  // the sum of every delay rather than the longest one.
+  uint32 start_delay_s = 15;
 }
 
 message InstanceStatus {
@@ -457,6 +624,28 @@ message InstanceStatus {
   repeated string addresses = 5;
   optional uint32 vmm_pid = 6;
   optional int64 started_at = 7;
+  // The CPU this guest is running with, present only while it runs. Cleared
+  // when it stops, because the field means "what this live guest may not be
+  // parted from" and a stale one would over-constrain its next placement.
+  GuestCpu cpu = 8;
+  // PCI addresses this guest holds on its node, recorded when it started.
+  repeated string devices = 9;
+  // The last of what this guest wrote to its serial console — a tail, capped,
+  // never the whole log.
+  string console_tail = 10;
+  // How much it wrote in total, so a reader can tell a tail from everything.
+  uint64 console_bytes = 11;
+  // The size this guest is actually running with, recorded when it started.
+  // Absent while it is not running. Its difference from the spec is what a
+  // "pending change" is — the alternative, which this platform shipped, is a
+  // resize that reads as applied while the guest runs on the old numbers.
+  RunningSize running_size = 12;
+}
+
+message RunningSize {
+  uint32 vcpus = 1;
+  uint64 memory_mib = 2;
+  uint64 root_disk_gib = 3;
 }
 
 message Instance {
@@ -527,6 +716,10 @@ message VolumeSpec {
   // command in a spec is carried out again on every resync — undoing whatever
   // the guest wrote in between.
   optional string source_snapshot = 5;
+  // The backup this volume was restored from, if it came from one. The third
+  // of the same statement, and a field for the same reason: restoring is
+  // making a new volume from a copy, never writing one back in place.
+  optional string source_backup = 6;
 }
 
 message VolumeStatus {
@@ -708,6 +901,14 @@ message NetworkSpec {
   // range and never chosen by a tenant.
   uint32 vni = 1;
   uint32 mtu = 2;
+  // This network carries addresses the world can reach: the prefixes on its
+  // subnets are real, routed to this cell by whoever is above it. An operator's
+  // declaration and never a tenant's.
+  bool external = 3;
+  // How this cell tells the network above it where an address is:
+  // `FromGateway` (the default) or `FromHost`. An individual address may
+  // override it. Meaningless on a network that is not external.
+  string announce = 4;
 }
 
 message NetworkStatus {
@@ -821,6 +1022,13 @@ message FloatingIpSpec {
   // The port this address forwards to, by resource name. Empty means allocated
   // and pointing at nothing, which is a held address and the reason to have one.
   string port = 3;
+  // Whether the guest holds this address itself (`Routed`) or something
+  // translates it at the edge (`Nat`, the default). `Routed` binds it to the
+  // port as a second address and nothing rewrites a packet.
+  string delivery = 4;
+  // Who announces it, when the network's own answer is not the one this address
+  // wants. Empty is "whatever the network says".
+  string announce = 5;
 }
 
 message FloatingIpStatus {

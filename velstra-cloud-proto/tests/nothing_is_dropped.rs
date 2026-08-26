@@ -158,12 +158,16 @@ survives_the_wire!(
     resources::Quota,
     v1::Quota,
     resources::Quota {
+        devices: 4,
         instances: 40,
         vcpus: 200,
         memory_mib: 512_000,
+        volumes: 60,
         volume_gib: 20_000,
+        floating_ips: 12,
+        load_balancers: 6,
     },
-    { instances, vcpus, memory_mib, volume_gib }
+    { instances, vcpus, memory_mib, volumes, volume_gib, floating_ips, load_balancers, devices }
 );
 
 #[test]
@@ -186,10 +190,14 @@ fn a_project_spec_survives_the_wire_except_its_bindings() {
         display_name: "Payments".into(),
         parent: "organizations/o1".into(),
         quota: resources::Quota {
+            devices: 0,
             instances: 40,
             vcpus: 200,
             memory_mib: 512_000,
+            volumes: 60,
             volume_gib: 20_000,
+            floating_ips: 12,
+            load_balancers: 6,
         },
         bindings: vec![velstra_cloud_model::authz::Binding {
             role: velstra_cloud_model::authz::Role::Admin,
@@ -237,10 +245,14 @@ survives_the_wire!(
         observed_generation: 6,
         conditions: vec![a_condition()],
         used: resources::Quota {
+            devices: 0,
             instances: 3,
             vcpus: 12,
             memory_mib: 24_576,
+            volumes: 5,
             volume_gib: 300,
+            floating_ips: 2,
+            load_balancers: 2,
         },
     },
     { observed_generation, conditions, used }
@@ -271,8 +283,15 @@ survives_the_wire!(
         // which is also the safe direction for a node nobody has vouched for.
         schedulable: true,
         labels: vec!["ssd".into(), "gpu".into()],
+        cpu_baseline: Some(velstra_cloud_model::cpu::CpuLevel::V3),
+        // Not the default: a field that crosses the wire as its zero value is
+        // a field this test cannot tell from one that was dropped.
+        vcpu_overcommit: 4,
+        fence_after_s: 60,
+        evacuate: true,
+        gateway: true,
     },
-    { schedulable, labels }
+    { schedulable, labels, cpu_baseline, fence_after_s, evacuate, vcpu_overcommit, gateway }
 );
 
 survives_the_wire!(
@@ -280,6 +299,19 @@ survives_the_wire!(
     resources::NodeStatus,
     v1::NodeStatus,
     resources::NodeStatus {
+        pci_devices: vec![velstra_cloud_model::pci::PciDevice {
+            address: "0000:41:00.0".into(),
+            vendor_device: "10de:2204".into(),
+            description: "NVIDIA GA102".into(),
+            kind: velstra_cloud_model::pci::DeviceKind::Gpu,
+            iommu_group: Some(17),
+            // A held device, not a free one: `Free` is the default, and a
+            // round trip that only ever carried the default proves nothing
+            // about the flattening this conversion does.
+            state: velstra_cloud_model::pci::DeviceUse::HostDriver {
+                driver: "nvidia".into(),
+            },
+        }],
         observed_generation: 4,
         conditions: vec![a_condition()],
         capacity: resources::Capacity {
@@ -337,10 +369,25 @@ survives_the_wire!(
             ssh_pubkey: "ssh-ed25519 AAAA cluster".into(),
             trusts_key: true,
         }),
+        cpu: Some(velstra_cloud_model::cpu::NodeCpu {
+            arch: "x86_64".into(),
+            vendor: "GenuineIntel".into(),
+            model_name: "Intel(R) Xeon(R) Gold 6248R".into(),
+            family: 6,
+            model: 85,
+            stepping: 7,
+            flags: ["avx", "avx2", "sse4_2"].iter().map(|s| s.to_string()).collect(),
+            // Deliberately different from `flags`: a baselined node presents
+            // less than it holds, and a conversion that carried one field into
+            // both would pass a test where the two were equal.
+            presents: "x86-64-v3".into(),
+            presented_flags: ["avx", "sse4_2"].iter().map(|s| s.to_string()).collect(),
+            can_mask: true,
+        }),
     },
     {
         observed_generation, conditions, capacity, allocated, agent_version,
-        last_heartbeat, images, devices, ceph,
+        last_heartbeat, images, devices, ceph, cpu, pci_devices,
     }
 );
 
@@ -351,13 +398,14 @@ survives_the_wire!(
     resources::ImageSpec,
     v1::ImageSpec,
     resources::ImageSpec {
+        source_instance: Some("projects/p1/instances/golden".into()),
         digest: "sha256:abc".into(),
         format: resources::ImageFormat::Qcow2,
         size_bytes: 4_294_967_296,
         source_url: "https://example.invalid/img.qcow2".into(),
         signature: Some("base64-signature".into()),
     },
-    { digest, format, size_bytes, source_url, signature }
+    { digest, format, size_bytes, source_url, signature, source_instance }
 );
 
 survives_the_wire!(
@@ -380,8 +428,14 @@ survives_the_wire!(
     resources::PlacementPolicy {
         anti_affinity_group: Some("web".into()),
         required_labels: vec!["ssd".into()],
+        min_cpu_level: Some(velstra_cloud_model::cpu::CpuLevel::V3),
+        affinity_group: Some("cache".into()),
+        // Not the default: a field that crosses the wire as its zero value is
+        // a field this test cannot tell from one that was dropped.
+        spread: resources::Strength::Preferred,
+        affinity: resources::Strength::Preferred,
     },
-    { anti_affinity_group, required_labels }
+    { anti_affinity_group, required_labels, min_cpu_level, affinity_group, spread, affinity }
 );
 
 survives_the_wire!(
@@ -389,6 +443,11 @@ survives_the_wire!(
     resources::InstanceSpec,
     v1::InstanceSpec,
     resources::InstanceSpec {
+        start_order: 2,
+        start_delay_s: 30,
+        on_node_loss: velstra_cloud_model::ha::OnNodeLoss::Restart,
+        console: true,
+        devices: vec!["gpu-a100".into()],
         vcpus: 4,
         memory_mib: 8192,
         image: "projects/p1/images/sha256-abc".into(),
@@ -402,11 +461,16 @@ survives_the_wire!(
         placement_policy: resources::PlacementPolicy {
             anti_affinity_group: Some("web".into()),
             required_labels: vec!["ssd".into()],
+            min_cpu_level: None,
+            affinity_group: None,
+            spread: resources::Strength::Required,
+            affinity: resources::Strength::Required,
         },
     },
     {
         vcpus, memory_mib, image, root_disk_gib, desired_state, ports, ssh_keys,
-        user_data, node, placement_policy,
+        user_data, node, placement_policy, devices, console, on_node_loss,
+        start_order, start_delay_s,
     }
 );
 
@@ -415,6 +479,19 @@ survives_the_wire!(
     resources::InstanceStatus,
     v1::InstanceStatus,
     resources::InstanceStatus {
+        running_size: Some(velstra_cloud_model::resources::RunningSize {
+            vcpus: 4,
+            memory_mib: 8192,
+            root_disk_gib: 40,
+        }),
+        console_tail: "[    0.000000] Linux version 6.12.63\n".into(),
+        console_bytes: 4096,
+        devices: vec!["0000:41:00.0".into()],
+        cpu: Some(velstra_cloud_model::cpu::GuestCpu {
+            model: "x86-64-v3".into(),
+            arch: "x86_64".into(),
+            flags: ["avx", "sse4_2"].iter().map(|s| s.to_string()).collect(),
+        }),
         observed_generation: 6,
         conditions: vec![a_condition()],
         state: resources::InstanceState::Failed,
@@ -423,7 +500,10 @@ survives_the_wire!(
         vmm_pid: Some(4242),
         started_at: Some(meta::Timestamp(1_786_732_801_000)),
     },
-    { observed_generation, conditions, state, node, addresses, vmm_pid, started_at }
+    {
+        observed_generation, conditions, state, node, addresses, vmm_pid, started_at,
+        cpu, devices, console_tail, console_bytes, running_size,
+    }
 );
 
 // ---- storage --------------------------------------------------------------
@@ -433,13 +513,14 @@ survives_the_wire!(
     resources::VolumeSpec,
     v1::VolumeSpec,
     resources::VolumeSpec {
+        source_backup: Some("projects/p1/backups/nightly-1787687886".into()),
         size_gib: 100,
         pool: "rbd-standard".into(),
         encryption_key: Some("projects/p1/keys/k1".into()),
         source_image: Some("projects/p1/images/sha256-abc".into()),
         source_snapshot: Some("projects/p1/volumes/v1/snapshots/nightly".into()),
     },
-    { size_gib, pool, encryption_key, source_image, source_snapshot }
+    { size_gib, pool, encryption_key, source_image, source_snapshot, source_backup }
 );
 
 survives_the_wire!(
@@ -516,9 +597,13 @@ survives_the_wire!(
     v1::NetworkSpec,
     resources::NetworkSpec {
         vni: 5001,
-        mtu: 1450
+        mtu: 1450,
+        external: true,
+        // Not the default, so a field crossing as its zero value cannot be told
+        // from one that was dropped.
+        announce: velstra_cloud_model::public::Announce::FromHost,
     },
-    { vni, mtu }
+    { vni, mtu, external, announce }
 );
 
 survives_the_wire!(
@@ -690,10 +775,14 @@ whole_object_survives!(
         display_name: "Payments".into(),
         parent: "organizations/o1".into(),
         quota: resources::Quota {
+            devices: 0,
             instances: 40,
             vcpus: 200,
             memory_mib: 512_000,
+            volumes: 60,
             volume_gib: 20_000,
+            floating_ips: 12,
+            load_balancers: 6,
         },
         // Not carried on the wire; see the spec test above.
         bindings: Vec::new(),
@@ -703,10 +792,14 @@ whole_object_survives!(
         observed_generation: 6,
         conditions: vec![a_condition()],
         used: resources::Quota {
+            devices: 0,
             instances: 3,
             vcpus: 12,
             memory_mib: 24_576,
+            volumes: 5,
             volume_gib: 300,
+            floating_ips: 2,
+            load_balancers: 2,
         },
     }
 );
@@ -716,10 +809,17 @@ whole_object_survives!(
     resources::Node,
     v1::Node,
     resources::NodeSpec {
+        evacuate: false,
+        vcpu_overcommit: 0,
+                fence_after_s: 0,
         schedulable: false,
         labels: vec!["ssd".into()],
-    },
+        cpu_baseline: None,
+                gateway: false,
+            },
     resources::NodeStatus {
+        pci_devices: Vec::new(),
+        cpu: None,
         observed_generation: 4,
         conditions: vec![a_condition()],
         capacity: resources::Capacity {
@@ -751,6 +851,7 @@ whole_object_survives!(
     resources::Image,
     v1::Image,
     resources::ImageSpec {
+        source_instance: None,
         digest: "sha256:abc".into(),
         format: resources::ImageFormat::Qcow2,
         size_bytes: 4_294_967_296,
@@ -768,6 +869,7 @@ whole_object_survives!(
     resources::Volume,
     v1::Volume,
     resources::VolumeSpec {
+        source_backup: None,
         size_gib: 100,
         pool: "rbd-standard".into(),
         encryption_key: Some("projects/p1/keys/k1".into()),
@@ -825,8 +927,10 @@ whole_object_survives!(
     v1::Network,
     resources::NetworkSpec {
         vni: 5001,
-        mtu: 1450
-    },
+        mtu: 1450,
+                external: false,
+                announce: Default::default(),
+            },
     resources::NetworkStatus {
         observed_generation: 1,
         conditions: vec![a_condition()],
@@ -863,7 +967,9 @@ whole_object_survives!(
         // round-trip of the default proves only that nothing was written.
         address: Some("203.0.113.7".into()),
         port: "projects/p1/ports/web".into(),
-    },
+                delivery: Default::default(),
+                announce: None,
+            },
     resources::FloatingIpStatus {
         observed_generation: 2,
         conditions: vec![a_condition()],
@@ -937,6 +1043,11 @@ whole_object_survives!(
     resources::Instance,
     v1::Instance,
     resources::InstanceSpec {
+        start_order: 0,
+        start_delay_s: 0,
+        on_node_loss: Default::default(),
+        console: false,
+        devices: Vec::new(),
         vcpus: 4,
         memory_mib: 8192,
         image: "projects/p1/images/sha256-abc".into(),
@@ -949,9 +1060,18 @@ whole_object_survives!(
         placement_policy: resources::PlacementPolicy {
             anti_affinity_group: Some("web".into()),
             required_labels: vec!["ssd".into()],
+            min_cpu_level: None,
+            affinity_group: None,
+            spread: resources::Strength::Required,
+            affinity: resources::Strength::Required,
         },
     },
     resources::InstanceStatus {
+        running_size: None,
+        console_tail: String::new(),
+        console_bytes: 0,
+        devices: Vec::new(),
+        cpu: None,
         observed_generation: 6,
         conditions: vec![a_condition()],
         state: resources::InstanceState::Failed,

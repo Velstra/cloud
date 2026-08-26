@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 
 use serde::{Serialize, de::DeserializeOwned};
 use velstra_cloud_model::{
-    access::{Changed, Ownership, Writer, judge},
+    access::{Changed, Ownership, Writer, judge, judge_create, judge_delete},
     meta::Revision,
     resources::{Assigned, Observed, Resource},
 };
@@ -82,6 +82,13 @@ where
             kind,
             _marker: PhantomData,
         }
+    }
+
+    /// Which collection this is — `instances`, `nodes`, … Exposed so a writer
+    /// that routes a report through the API rather than the store can name the
+    /// collection it is writing to without a second source of that string.
+    pub fn kind(&self) -> &'static str {
+        self.kind
     }
 
     fn key(&self, name: &str) -> String {
@@ -179,9 +186,18 @@ where
         Ok(r)
     }
 
-    /// Create. Fails if it already exists, so two racing creates cannot both
-    /// believe they won.
-    pub async fn create(&self, resource: &Resource<S, T>) -> Result<Revision> {
+    /// Create, as `writer`. Fails if it already exists, so two racing creates
+    /// cannot both believe they won.
+    ///
+    /// Judged like every other write rather than trusted: this used to write
+    /// straight to the backend, so an agent could bring an object into being,
+    /// which it never legitimately does — and which is the one way it could hand
+    /// itself an object whose status already named it as owner, bypassing the
+    /// claim ownership is otherwise earned through. That is now refused by
+    /// [`velstra_cloud_model::access::judge_create`]: an agent cannot create, so
+    /// it cannot create a pre-owned object either.
+    pub async fn create(&self, resource: &Resource<S, T>, writer: &Writer) -> Result<Revision> {
+        judge_create(writer)?;
         let key = self.key(&resource.meta.name.to_string());
         let bytes = serde_json::to_vec(resource).expect("a resource always serialises");
         Ok(self.store.put(&key, bytes, Expect::Absent).await?)
@@ -247,7 +263,17 @@ where
             .await?)
     }
 
-    pub async fn delete(&self, name: &str, revision: Revision) -> Result<Revision> {
+    /// Delete, as `writer`. Judged like every other write: a delete is a
+    /// metadata decision, so only a controller may make one — an agent reports
+    /// on objects and never asks for one to be gone, even the objects it runs.
+    /// See [`velstra_cloud_model::access::judge_delete`].
+    pub async fn delete(
+        &self,
+        name: &str,
+        revision: Revision,
+        writer: &Writer,
+    ) -> Result<Revision> {
+        judge_delete(writer)?;
         Ok(self
             .store
             .delete(&self.key(name), Expect::Revision(revision))
@@ -302,6 +328,11 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             InstanceSpec {
+                start_order: 0,
+                start_delay_s: 0,
+                on_node_loss: Default::default(),
+                console: false,
+                devices: Vec::new(),
                 vcpus: 2,
                 ..Default::default()
             },
@@ -325,7 +356,13 @@ mod tests {
         let elsewhere: Instances = TypedStore::new(raw.clone(), "cell-2", "instances");
         let mut theirs = instance();
         theirs.meta.placement = Placement::new("eu", "cell-2");
-        elsewhere.create(&theirs).await.unwrap();
+        elsewhere
+            .create(
+                &theirs,
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
 
         // Now read it back through a store that believes it is cell-2's — the
         // key matches, so nothing but the body says otherwise. It is served.
@@ -344,7 +381,12 @@ mod tests {
         let mut also_ours = instance();
         also_ours.meta.name = ResourceName::parse("projects/p1/instances/i2").unwrap();
         also_ours.meta.placement = Placement::new("eu", "cell-2");
-        ours.create(&also_ours).await.unwrap();
+        ours.create(
+            &also_ours,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
         let error = ours
             .get("projects/p1/instances/i2")
@@ -361,7 +403,9 @@ mod tests {
     async fn a_resource_round_trips_with_its_revision() {
         let s = store();
         let i = instance();
-        s.create(&i).await.unwrap();
+        s.create(&i, &velstra_cloud_model::access::Writer::controller("test"))
+            .await
+            .unwrap();
         let back = s.get("projects/p1/instances/i1").await.unwrap().unwrap();
         assert_eq!(back.spec, i.spec);
         assert!(
@@ -374,7 +418,9 @@ mod tests {
     async fn a_controller_may_change_spec_and_an_agent_may_not() {
         let s = store();
         let mut i = instance();
-        s.create(&i).await.unwrap();
+        s.create(&i, &velstra_cloud_model::access::Writer::controller("test"))
+            .await
+            .unwrap();
         i = s.get("projects/p1/instances/i1").await.unwrap().unwrap();
 
         let mut edit = i.clone();
@@ -403,7 +449,9 @@ mod tests {
         // *stored* status, so this must be established by a controller
         // assignment, not by the agent asserting it.
         i.status.node = Some("node-a".into());
-        s.create(&i).await.unwrap();
+        s.create(&i, &velstra_cloud_model::access::Writer::controller("test"))
+            .await
+            .unwrap();
         let stored = s.get("projects/p1/instances/i1").await.unwrap().unwrap();
 
         let mut mine = stored.clone();
@@ -428,7 +476,9 @@ mod tests {
     async fn a_writer_holding_a_stale_copy_is_refused() {
         let s = store();
         let i = instance();
-        s.create(&i).await.unwrap();
+        s.create(&i, &velstra_cloud_model::access::Writer::controller("test"))
+            .await
+            .unwrap();
         let first = s.get("projects/p1/instances/i1").await.unwrap().unwrap();
 
         let mut a = first.clone();
@@ -452,7 +502,9 @@ mod tests {
         let s = store();
         let mut i = instance();
         i.status.node = Some("node-a".into());
-        s.create(&i).await.unwrap();
+        s.create(&i, &velstra_cloud_model::access::Writer::controller("test"))
+            .await
+            .unwrap();
         let stored = s.get("projects/p1/instances/i1").await.unwrap().unwrap();
 
         let mut agent_delete = stored.clone();
@@ -469,5 +521,61 @@ mod tests {
         s.update(&controller_delete, &Writer::controller("api"))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_agent_may_neither_create_nor_delete() {
+        // The two write paths that used to bypass the judgement entirely. An
+        // agent reports status on objects a controller made and assigned; it
+        // never brings one into being and never asks for one to be gone. Both
+        // are refused here, at the single write path, rather than trusted not to
+        // happen — which is what makes a per-node token a boundary and not a note.
+        let s = store();
+        let i = instance();
+
+        // Create as an agent: refused, and named as such. This is also the whole
+        // of "a node cannot smuggle an ownership claim by creating a pre-owned
+        // object" — it cannot create an object at all.
+        let err = s.create(&i, &Writer::agent("node-a")).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TypedError::Refused(
+                    velstra_cloud_model::access::WriteRefused::CreateIsNotYours { .. }
+                )
+            ),
+            "an agent created an object: {err}"
+        );
+
+        // A controller makes it, and then an agent tries to delete it: refused.
+        s.create(&i, &Writer::controller("api")).await.unwrap();
+        let stored = s.get("projects/p1/instances/i1").await.unwrap().unwrap();
+        let err = s
+            .delete(
+                "projects/p1/instances/i1",
+                stored.meta.revision,
+                &Writer::agent("node-a"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TypedError::Refused(
+                    velstra_cloud_model::access::WriteRefused::DeleteIsNotYours { .. }
+                )
+            ),
+            "an agent deleted an object: {err}"
+        );
+
+        // And the controller may, so the object is not simply undeletable.
+        let stored = s.get("projects/p1/instances/i1").await.unwrap().unwrap();
+        s.delete(
+            "projects/p1/instances/i1",
+            stored.meta.revision,
+            &Writer::controller("api"),
+        )
+        .await
+        .unwrap();
     }
 }
