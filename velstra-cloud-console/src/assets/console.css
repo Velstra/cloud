@@ -5,8 +5,6 @@
 html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0; background: var(--bg-app); color: var(--text-body);
-  background-image: var(--wash); background-repeat: no-repeat;
-  background-attachment: fixed;
   font: var(--fw-regular) var(--text-base)/var(--leading-normal) var(--font-sans);
   letter-spacing: var(--tracking-body);
 }
@@ -36,14 +34,11 @@ body {
   -webkit-backdrop-filter: var(--blur-chrome);
   position: sticky; top: 0; z-index: 30;
 }
-#top::after {
-  content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 20px;
-  background: linear-gradient(to bottom, var(--bg-app), transparent);
-  pointer-events: none; opacity: .7;
-}
+/* The bar is opaque now, so it separates with an edge rather than a fade. */
+#top { border-bottom: 1px solid var(--border); }
 #brand {
-  font: var(--fw-semibold) var(--text-sm)/1 var(--font-display);
-  letter-spacing: var(--tracking-caps); text-transform: uppercase;
+  font: var(--fw-semibold) var(--text-base)/1 var(--font-display);
+  letter-spacing: var(--tracking-tight);
   color: var(--text-strong); white-space: nowrap;
 }
 /* The tenancy switch. It was a 300px box holding two characters, which made the
@@ -80,8 +75,8 @@ aside#rail {
    filled rounded item. The bar marked the *edge of the rail*; the fill marks the
    item, which is the thing that is actually selected. */
 .railgroup {
-  font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
-  letter-spacing: var(--tracking-caps); text-transform: uppercase;
+  font: var(--fw-medium) var(--text-xs)/1 var(--font-sans);
+  letter-spacing: var(--tracking-body);
   /* `--text-faint` on the rail's own background is roughly 3.5:1, which is
      under AA for text this small. These are the only words that say what part
      of the platform a section belongs to; they have to be readable. */
@@ -131,8 +126,8 @@ aside#rail {
    is the whole of "vibrancy": the foreground gets stronger, the material does
    not get more opaque. */
 .margin {
-  font: var(--fw-semibold) var(--text-2xs)/1.4 var(--font-sans);
-  letter-spacing: var(--tracking-caps); text-transform: uppercase;
+  font: var(--fw-medium) var(--text-xs)/1.4 var(--font-sans);
+  letter-spacing: var(--tracking-body);
   color: var(--text-muted); padding-top: 6px;
 }
 .margin .sub {
@@ -286,8 +281,8 @@ button.link:hover { text-decoration: underline; }
 .disks { display: flex; flex-direction: column; gap: var(--space-5); max-width: 640px; }
 .disks .disknode { display: flex; flex-direction: column; gap: var(--space-2); }
 .disks .diskhost {
-  font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
-  letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
+  font: var(--fw-medium) var(--text-xs)/1 var(--font-sans);
+  letter-spacing: var(--tracking-body); color: var(--text-faint);
   padding-bottom: var(--space-2); border-bottom: 1px solid var(--border);
   display: flex; gap: var(--space-3); align-items: baseline;
 }
@@ -348,13 +343,15 @@ button.link:hover { text-decoration: underline; }
    board does not. */
 table.board { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: var(--space-5); }
 table.board th {
-  text-align: left; font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
-  letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
-  padding: 0 var(--space-3) var(--space-3); border-bottom: 1px solid var(--border);
+  text-align: left; font: var(--fw-medium) var(--text-xs)/1 var(--font-sans);
+  letter-spacing: var(--tracking-body); color: var(--text-faint);
+  padding: 0 var(--space-4) var(--space-3); border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
 table.board td {
-  padding: var(--space-4) var(--space-3); border-bottom: 1px solid var(--border-subtle);
+  /* The calmer sibling of the appliance console: taller rows, wider gutters.
+     The operator here compares resources rather than watching protocol state. */
+  padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--border-subtle);
   vertical-align: middle; font-size: var(--text-sm);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   /* Every figure in a column shares a width, so the eye compares magnitudes
@@ -406,19 +403,20 @@ table.board td.blank { color: var(--text-faint); }
    pill is a different shape at a glance, and the tint carries the meaning
    before any word is resolved. The mark and the word both stay inside it —
    colour is never the only channel. */
+/* A filled chip per cell turned every table into a field of coloured tablets,
+   and the colour stopped meaning anything because everything had some. The dot
+   and the word carry it now — the mark keeps colour from being the only
+   channel, and an unfilled row lets the eye find the one row that is wrong. */
 .state {
   display: inline-flex; align-items: center; white-space: nowrap;
-  padding: 3px var(--space-3) 3px var(--space-2);
-  border-radius: var(--radius-pill);
-  font-size: var(--text-xs); font-weight: var(--fw-medium);
-  letter-spacing: var(--tracking-small);
-  background: color-mix(in srgb, var(--text-muted) 12%, transparent);
+  font-size: var(--text-sm); font-weight: var(--fw-medium);
+  letter-spacing: var(--tracking-body);
   color: var(--text-muted);
 }
 .state .mark { margin-right: var(--space-2); }
-.state.settled { color: var(--settled); background: color-mix(in srgb, var(--settled) 15%, transparent); }
-.state.failing { color: var(--failing); background: color-mix(in srgb, var(--failing) 15%, transparent); }
-.state.drifting { color: var(--drifting); background: color-mix(in srgb, var(--drifting) 15%, transparent); }
+.state.settled { color: var(--green-300); }
+.state.failing { color: var(--red-300); }
+.state.drifting { color: var(--amber-300); }
 .state.unreported, .state.deleting { color: var(--text-muted); }
 
 /* ---- the sheet ---------------------------------------------------------- */
@@ -499,16 +497,16 @@ table.board td.blank { color: var(--text-faint); }
   display: flex; flex-wrap: wrap; gap: var(--space-4) var(--space-6); margin-top: var(--space-4);
   font-family: var(--font-mono); font-size: var(--text-sm);
 }
-.gens .k { display: block; font-family: var(--font-sans); font-size: var(--text-2xs);
-  letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint); }
+.gens .k { display: block; font-family: var(--font-sans); font-size: var(--text-xs);
+  letter-spacing: var(--tracking-body); color: var(--text-faint); }
 .gens .behind { color: var(--drifting); }
 
 table.pairs, table.conds, table.kv, table.reject {
   width: 100%; border-collapse: separate; border-spacing: 0;
 }
 table.pairs th, table.conds th, table.reject th {
-  text-align: left; font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
-  letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
+  text-align: left; font: var(--fw-medium) var(--text-xs)/1 var(--font-sans);
+  letter-spacing: var(--tracking-body); color: var(--text-faint);
   padding: 0 var(--space-3) var(--space-2) 0; border-bottom: 1px solid var(--border);
 }
 table.pairs td, table.conds td, table.kv td, table.reject td {
@@ -543,24 +541,27 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
 
 /* ---- dialog ------------------------------------------------------------- */
 
+/* The scrim and the drawer both stop under the top bar: the operator keeps
+   the header — where they are, and who they are — while they create or edit. */
 #dialogscrim {
-  position: fixed; inset: 0; background: var(--scrim); z-index: 49;
+  position: fixed; inset: 60px 0 0 0; background: var(--scrim); z-index: 49;
   animation: fade var(--dur-base) var(--ease-out);
 }
+/* Create and edit are a drawer at the right edge, like everywhere in this
+   product family: the list being extended stays readable behind a light scrim,
+   and the form arrives from the side it belongs to. */
 #dialog {
-  position: fixed; z-index: 50; top: 8vh; left: 50%; transform: translateX(-50%);
-  width: min(680px, calc(100% - 32px)); max-height: 84vh; overflow-y: auto;
+  position: fixed; z-index: 50; top: 60px; right: 0; bottom: 0;
+  width: min(680px, calc(100% - 32px)); max-height: none; overflow-y: auto;
   background: var(--material-panel);
-  backdrop-filter: var(--blur-panel);
-  -webkit-backdrop-filter: var(--blur-panel);
-  border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg), var(--material-edge);
+  border: 0; border-left: 1px solid var(--border-strong); border-radius: 0;
+  box-shadow: var(--shadow-lg);
   padding: var(--space-7);
-  animation: dialogin var(--dur-slow) var(--ease-settle);
+  animation: dialogin var(--dur-base) var(--ease-settle);
 }
 @keyframes dialogin {
-  from { transform: translateX(-50%) translateY(10px) scale(.985); opacity: 0; }
-  to { transform: translateX(-50%); opacity: 1; }
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
 }
 #dialog h2 { margin-bottom: var(--space-2); }
 .dialogacts {
@@ -568,6 +569,54 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
   margin-top: var(--space-7); padding-top: var(--space-5); border-top: 1px solid var(--border-subtle);
 }
 .dialogacts .grow { flex: 1; }
+
+/* ---- the jump palette --------------------------------------------------- */
+/* The flat way to any collection, opened with Cmd/Ctrl-K. The rail groups the
+   collections; this is for the operator who knows the collection's name and not
+   its group. It rides where the dialog does — high and centred, on the same
+   glass — because it is the same kind of arrival: a thing that covers the board
+   while you aim, then leaves. */
+#palettescrim {
+  position: fixed; inset: 0; background: var(--scrim); z-index: 59;
+  animation: fade var(--dur-base) var(--ease-out);
+}
+#palette {
+  position: fixed; z-index: 60; top: 8vh; left: 50%; transform: translateX(-50%);
+  width: min(560px, calc(100% - 32px));
+  background: var(--material-panel);
+  backdrop-filter: var(--blur-panel); -webkit-backdrop-filter: var(--blur-panel);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg), var(--material-edge); overflow: hidden;
+  animation: dialogin var(--dur-slow) var(--ease-settle);
+}
+#paletteq {
+  width: 100%; box-sizing: border-box; border: 0;
+  border-bottom: 1px solid var(--border-subtle); background: transparent;
+  color: var(--text-strong); font: inherit; font-size: var(--text-base);
+  padding: var(--space-5) var(--space-6); outline: none;
+}
+#palettelist {
+  max-height: 48vh; overflow-y: auto; padding: var(--space-2);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.palitem {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-4);
+  width: 100%; text-align: left; cursor: pointer; font: inherit;
+  padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm);
+  border: 1px solid transparent; background: transparent; color: var(--text-body);
+}
+.palitem:hover { background: var(--surface-hover); }
+/* Keyboard selection and pointer hover are one highlight: arrowing and hovering
+   point at the same thing. */
+.palitem.on { background: var(--surface-hover); border-color: var(--border-strong); }
+.palt { color: var(--text-strong); font-weight: var(--fw-medium); }
+.palg { color: var(--text-muted); font-size: var(--text-sm); white-space: nowrap; }
+.palempty { padding: var(--space-4) var(--space-3); }
+.jump kbd {
+  margin-left: var(--space-2); font: inherit; font-size: var(--text-xs);
+  padding: 0 var(--space-2); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xs); color: var(--text-muted);
+}
 /* The way to the rest of the form, and it has to look like a way rather than a
    footnote. A rule above it and a filled row make it an object to press, not a
    sentence somebody might read past — the common path is only short if the
@@ -684,4 +733,202 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
   border-radius: var(--radius-sm);
+}
+
+/* The CPU advisory strip on the nodes board.
+   A divided strip rather than a card: it is a set of statements about the
+   fleet, not an object, and boxing it would make it read as one more thing to
+   manage. No accent colour — nothing here is interactive, and accent means
+   interaction everywhere else in this console. */
+.cpuadvisory {
+  margin: var(--space-4) 0 0 0;
+  border-top: 1px solid var(--border);
+}
+.cpuline {
+  display: grid;
+  grid-template-columns: minmax(11rem, max-content) 1fr;
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border);
+  align-items: baseline;
+}
+.cpukey {
+  color: var(--text-dim);
+}
+.cpuval {
+  color: var(--text);
+  /* A recommendation is prose and wraps like prose; a node list forced onto
+     one line is a horizontal scrollbar on the page body. */
+  overflow-wrap: anywhere;
+}
+@media (max-width: 40rem) {
+  .cpuline { grid-template-columns: 1fr; gap: var(--space-1); }
+}
+
+/* A document inside a detail sheet: console output, cloud-init, a key blob.
+   Scrolls inside itself rather than stretching the page — a guest that logged
+   a stack trace must not turn the sheet into something you scroll sideways. */
+.logblock {
+  margin: 0;
+  padding: var(--space-3);
+  max-height: 22rem;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  /* Console output is already wrapped by whatever wrote it; wrapping it again
+     hides where the guest actually put its line breaks. */
+  white-space: pre;
+  tab-size: 8;
+}
+
+/* Asked for, not yet running. Deliberately not a warning colour: nothing is
+   wrong, the guest is simply up with the old numbers, and painting that amber
+   would train people to ignore amber. */
+.pending .why {
+  margin-bottom: var(--space-3);
+}
+
+/* Narrowing a board. Sits under the actions rather than beside them: it is
+   about the list below it, and a control that reads as a page action is one
+   people click expecting a page to change. */
+.listfilter {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-3) 0 0 0;
+  flex-wrap: wrap;
+}
+.filterlabel {
+  color: var(--text-dim);
+}
+.filterbox {
+  flex: 0 1 22rem;
+  min-width: 12rem;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.filterbox:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.filternote {
+  font-size: 13px;
+}
+
+/* The overview. Panels rather than a table: nothing on it is a row of one
+   collection, and giving it the board's chrome would say it was. */
+.overview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  margin-top: var(--space-4);
+}
+.overpanel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4) var(--space-5);
+}
+.overpanel h2 {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin: 0 0 var(--space-3) 0;
+}
+.overpanel h2 + * {
+  margin-top: 0;
+}
+.overrow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border-faint, var(--border));
+}
+.overpanel .overrow:first-of-type {
+  border-top: 0;
+}
+/* Reads as text until it is hovered: it is a way through, not an action. */
+.linky {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+.linky:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.railhome {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+.railhome:hover {
+  background: var(--surface-hover, var(--surface));
+}
+.railhome.on {
+  background: var(--surface-hover, var(--surface));
+  color: var(--accent);
+}
+
+/* Doing one thing to several. */
+.picked {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin: var(--space-3) 0 0 0;
+  padding: var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.pickcount {
+  font-weight: 600;
+}
+.pickcol {
+  width: 36px;
+  text-align: center;
+}
+.bulkresult {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+/* Every refusal, in the API's own words: a count of failures is a message that
+   sends somebody to try them one at a time to find out why. */
+.bulkfails {
+  flex-basis: 100%;
+  margin-top: var(--space-2);
+  font-size: 13px;
 }

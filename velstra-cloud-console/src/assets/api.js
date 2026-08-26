@@ -12,6 +12,13 @@ const session = {
   // the server's answer about the current token, and a stale copy from a
   // previous session would be a claim about the wrong person.
   who: null,
+  // The label filter in force, as typed: `env=prod,tier=web`.
+  //
+  // Not persisted, deliberately. A filter that outlived the session would greet
+  // somebody with a short list and no visible reason — and "where did my guests
+  // go" is a bad first question. It lives for as long as the board it was typed
+  // on is open.
+  labels: "",
 };
 
 const collections = () => SCHEMA;
@@ -121,13 +128,22 @@ const PAGE_SIZE = 1000;
 /// — see `complete` below.
 const MOST_PAGES = 200;
 
-function pagePath(coll, scope, token) {
+function pagePath(coll, scope, token, narrow) {
   const q = "pageSize=" + PAGE_SIZE + (token ? "&pageToken=" + encodeURIComponent(token) : "");
-  return basePath(coll, scope) + "?" + q;
+  // Narrowed by the API rather than here. Filtering client-side would mean
+  // fetching the whole cell to show six rows of it, which is exactly the cost
+  // a filter exists to avoid on the boards where anybody needs one.
+  //
+  // Passed in rather than read off the session, because only one caller wants
+  // it. A filter is about the board somebody typed it on; a picker inside a
+  // form is not that board, and one that quietly offered two of the eleven
+  // volumes in the project would be a wrong answer with no visible cause.
+  const labels = narrow ? "&labels=" + encodeURIComponent(narrow) : "";
+  return basePath(coll, scope) + "?" + q + labels;
 }
 
 /// Follow `nextPageToken` from a first page already in hand.
-async function walk(coll, scope, first) {
+async function walk(coll, scope, first, narrow) {
   const items = first.items.slice();
   let token = first.next;
   let pages = 1;
@@ -139,7 +155,7 @@ async function walk(coll, scope, first) {
       // false and the board says so.
       return { items, revision: first.revision, complete: false };
     }
-    const r = await request("GET", pagePath(coll, scope, token));
+    const r = await request("GET", pagePath(coll, scope, token, narrow));
     const page = itemsOf(r.body, coll);
     const next = r.body && r.body.nextPageToken;
     // A server that answers a token with the same token would spin here for
@@ -156,8 +172,8 @@ async function walk(coll, scope, first) {
 }
 
 /// One page, and what the contract said about it.
-async function firstPage(coll, scope) {
-  const r = await request("GET", pagePath(coll, scope, null));
+async function firstPage(coll, scope, narrow) {
+  const r = await request("GET", pagePath(coll, scope, null, narrow));
   const items = itemsOf(r.body, coll);
   return {
     items,
@@ -170,7 +186,7 @@ async function firstPage(coll, scope) {
   };
 }
 
-async function list(coll) {
+async function list(coll, narrow) {
   const tries = scopeFound[coll.id]
     ? [scopeFound[coll.id]]
     : [coll.scope, coll.scope === "project" ? "global" : "project"];
@@ -181,8 +197,8 @@ async function list(coll) {
       // Probed one page at a time: whether this is the right address is
       // answered by the first page, and walking the wrong one to the end before
       // finding out would be the whole cell fetched under a parent nobody meant.
-      const first = await firstPage(coll, scope);
-      if (first.items.length) { scopeFound[coll.id] = scope; return walk(coll, scope, first); }
+      const first = await firstPage(coll, scope, narrow);
+      if (first.items.length) { scopeFound[coll.id] = scope; return walk(coll, scope, first, narrow); }
       // An empty answer is not proof of the right address: a collection asked
       // for under the wrong parent answers 200 with nothing in it, which reads
       // as "you have no nodes" rather than as a mistake. So the other scope is
@@ -195,7 +211,7 @@ async function list(coll) {
       if (!(e instanceof ApiError) || e.status !== 404) throw e;
     }
   }
-  if (empty) { scopeFound[coll.id] = empty.scope; return walk(coll, empty.scope, empty.first); }
+  if (empty) { scopeFound[coll.id] = empty.scope; return walk(coll, empty.scope, empty.first, narrow); }
   throw last || new ApiError(404, null);
 }
 
@@ -211,6 +227,45 @@ function newestRevision(items) {
   }
   return best;
 }
+
+/// Every record *about* one object: the changes that were accepted, and — for
+/// a cell operator, who is the only one allowed to read them — the ones that
+/// were refused.
+///
+/// Narrowed by the API. Fetching every operation in the cell to show six lines
+/// about one guest is exactly the cost these filters exist to avoid.
+async function historyOf(name) {
+  const at = name.lastIndexOf("/", name.lastIndexOf("/") - 1);
+  const parent = at > 0 ? name.slice(0, at) : "";
+  const under = (kind) =>
+    "/api/v1/" + (parent ? parent + "/" : "") + kind + "?target=" + encodeURIComponent(name) +
+    "&pageSize=" + PAGE_SIZE;
+  const operations = request("GET", under("operations"))
+    .then((r) => r.body.items || [])
+    .catch(() => []);
+  // Asked for by everybody, not only by operators. A record is readable by
+  // whoever may read what it is about — so the person whose click did nothing
+  // is handed the sentence explaining it, which is the whole point of the
+  // panel. A caller who may read none of them gets an empty list rather than a
+  // refusal, so there is nothing to branch on here.
+  const refusals = request(
+    "GET", "/api/v1/audit?target=" + encodeURIComponent(name) + "&pageSize=" + PAGE_SIZE,
+  )
+    .then((r) => r.body.items || [])
+    .catch(() => []);
+  const [done, refused] = await Promise.all([operations, refusals]);
+  return { operations: done, refusals: refused };
+}
+
+/// What a project has left, and what it could actually start with it.
+const explainQuota = (project) =>
+  request("GET", "/api/v1/projects/" + encodeURIComponent(project) + ":explainQuota")
+    .then((r) => r.body);
+
+/// What maintenance is planned for one node, and what it will cost.
+const explainMaintenance = (id) =>
+  request("GET", basePath(collection("nodes")) + "/" + encodeURIComponent(id) + ":explainMaintenance")
+    .then((r) => r.body);
 
 const get = (coll, id) => request("GET", basePath(coll) + "/" + encodeURIComponent(id)).then((r) => r.body);
 
@@ -238,6 +293,18 @@ const explainPlacement = (coll, id) =>
 const explainMigration = (instances, id) =>
   request("GET", basePath(instances) + "/" + encodeURIComponent(id) + ":explainMigration")
     .then((r) => r.body);
+
+/// What the cell's processors look like, and what to do about them.
+///
+/// A verb on the collection rather than on a node, because which machines can
+/// exchange guests is a property of the fleet: hung off one node it would read
+/// as that node's answer while being the same for every one of them.
+const explainCpu = () =>
+  request("GET", "/api/v1/nodes:explainCpu").then((r) => r.body);
+
+/// What the cell has, what is spoken for, and what would actually still fit.
+const explainCapacity = () =>
+  request("GET", "/api/v1/nodes:explainCapacity").then((r) => r.body);
 
 // ---- watching --------------------------------------------------------------
 
@@ -354,5 +421,6 @@ function forgetSession() {
   optionCache.clear();
   for (const key of Object.keys(scopeFound)) delete scopeFound[key];
   session.project = "";
+  session.labels = "";
   sessionStorage.removeItem(PROJECT_KEY);
 }

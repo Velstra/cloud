@@ -238,7 +238,14 @@ export async function signIn(page, credentials) {
   // after that, so a check made in between reads a board that has not been
   // filled and reports "no instances at all" about a cell that has plenty. That
   // was a fixed 900 ms, which is a guess about a round trip.
+  // Signing in now lands on the overview rather than on a collection, so what
+  // is waited for is "the console has finished putting something on screen" —
+  // either the overview's own panels, or a board when a link asked for one.
   const board = await waitFor(page, `(() => {
+    if (view.home) {
+      const box = document.getElementById("overviewbox");
+      return box && !box.classList.contains("hidden") && box.textContent ? "overview" : null;
+    }
     if (!view.coll) return null;
     if (document.querySelectorAll("#boardbody tr").length) return "rows";
     for (const id of ["listempty", "listerr"]) {
@@ -247,7 +254,7 @@ export async function signIn(page, credentials) {
     }
     return null;
   })()`, { timeout: 20000 });
-  if (!board) throw new Error("signing in never produced a board to look at");
+  if (!board) throw new Error("signing in never produced anything to look at");
 }
 
 /// Wait for something to become true, rather than sleeping and hoping.

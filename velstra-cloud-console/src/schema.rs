@@ -57,6 +57,20 @@ pub enum Kind {
     },
     /// A boolean is a switch. It is never a checkbox with a sentence beside it.
     Switch,
+    /// A moment in time, in the operator's own timezone.
+    ///
+    /// Never a number box. What is stored is milliseconds since the epoch, and
+    /// a person asked to type one of those either pastes the wrong number or
+    /// works one out by hand — both of which end with a machine going out of
+    /// service at the wrong hour. The control offers a calendar and a clock and
+    /// does the arithmetic itself.
+    Moment {
+        /// Offered when the field is empty, as a nudge rather than a default:
+        /// "in an hour" is the answer most maintenance windows want, and one
+        /// somebody would otherwise compute.
+        #[serde(rename = "defaultInMinutes")]
+        default_in_minutes: u64,
+    },
     /// One of a fixed set, shown as a segmented control when short.
     Choice { options: &'static [Choice] },
     /// One of the objects that exist, fetched live. `filter_by` narrows the
@@ -146,6 +160,16 @@ pub enum Kind {
         /// action in the platform that nothing undoes.
         warning: &'static str,
     },
+    /// The ports a load balancer answers on: protocol, the port on the VIP,
+    /// and the port the members answer on.
+    ///
+    /// Rendered together like a security-group rule, and for the same reason:
+    /// the three only mean anything together, and three parallel list fields
+    /// would let somebody assemble a listener out of rows that do not line up.
+    /// The protocols on offer are TCP and UDP and nothing else, because the
+    /// fabric's datapath balances no others — a wider choice would be a
+    /// control that produces an error.
+    ListenerList,
     /// The pools to create once the cluster is up: a name and its two
     /// replication numbers.
     ///
@@ -697,6 +721,74 @@ const PROJECT_FIELDS: &[Field] = &[
         help: "",
         derived: false,
     },
+    // The four the API has always enforced and this screen could not set. A
+    // dimension a cell operator cannot cap is a dimension that is capped at
+    // whatever somebody typed into the API by hand, or not at all.
+    Field {
+        key: "quota.volumes",
+        label: "Volumes",
+        kind: Kind::Number {
+            unit: "volumes",
+            min: 0,
+            max: 100_000,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "A count, separate from the space: per-volume overhead is a \
+               different worry from capacity, and the two are capped apart.",
+        derived: false,
+    },
+    Field {
+        key: "quota.floatingIps",
+        label: "Floating IPs",
+        kind: Kind::Number {
+            unit: "addresses",
+            min: 0,
+            max: 100_000,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "An address that outlives the machine answering on it is scarce \
+               and externally routable.",
+        derived: false,
+    },
+    Field {
+        key: "quota.loadBalancers",
+        label: "Load balancers",
+        kind: Kind::Number {
+            unit: "balancers",
+            min: 0,
+            max: 100_000,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Each one takes an address out of a subnet and datapath entries \
+               on every ingress host.",
+        derived: false,
+    },
+    Field {
+        key: "quota.devices",
+        label: "Passed-through devices",
+        kind: Kind::Number {
+            unit: "devices",
+            min: 0,
+            max: 10_000,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Each one is a piece of hardware that exists once and cannot be \
+               oversubscribed, so without a cap one project can take every \
+               accelerator in the cell.",
+        derived: false,
+    },
 ];
 
 const INSTANCE_FIELDS: &[Field] = &[
@@ -832,7 +924,56 @@ const INSTANCE_FIELDS: &[Field] = &[
         },
         required: false,
         advanced: true,
-        help: "Instances in one group are never placed on the same node.",
+        help: "Instances in one group are kept off the same node — what keeps \
+               a service alive when a machine dies.",
+        derived: false,
+    },
+    Field {
+        key: "placementPolicy.spread",
+        label: "Keeping them apart is",
+        kind: Kind::Choice {
+            options: &[
+                Choice { value: "Required", label: "a rule" },
+                Choice { value: "Preferred", label: "a wish" },
+            ],
+        },
+        required: false,
+        advanced: true,
+        help: "A rule refuses a node that already runs a member — three \
+               replicas of a database must not share a machine even if that \
+               means one stays down. A wish takes a crowded node over not \
+               running at all, which is what twelve web servers want.",
+        derived: false,
+    },
+    Field {
+        key: "placementPolicy.affinityGroup",
+        label: "Affinity group",
+        kind: Kind::Text {
+            placeholder: "checkout",
+            check: Check::Id,
+        },
+        required: false,
+        advanced: true,
+        help: "The opposite ask: instances in one group are placed together. \
+               For a pair that talks constantly — an application and the cache \
+               it reads on every request — where a hop between machines is the \
+               whole latency budget.",
+        derived: false,
+    },
+    Field {
+        key: "placementPolicy.affinity",
+        label: "Keeping them together is",
+        kind: Kind::Choice {
+            options: &[
+                Choice { value: "Required", label: "a rule" },
+                Choice { value: "Preferred", label: "a wish" },
+            ],
+        },
+        required: false,
+        advanced: true,
+        help: "A rule refuses every node but the one the group is already on, \
+               and says which that is. A wish places elsewhere rather than not \
+               at all.",
         derived: false,
     },
     Field {
@@ -845,6 +986,106 @@ const INSTANCE_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "Only nodes carrying all of these.",
+        derived: false,
+    },
+    Field {
+        key: "startOrder",
+        label: "Start order",
+        kind: Kind::Number {
+            unit: "",
+            min: 0,
+            max: 999,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Lower starts first; the same number is a group that starts \
+               together. Matters after a power cut, when a node brings back \
+               everything it holds at once and the database loses the race for \
+               disk to a dozen web servers.",
+        derived: false,
+    },
+    Field {
+        key: "startDelayS",
+        label: "Let the group ahead settle",
+        kind: Kind::Number {
+            unit: "s",
+            min: 0,
+            max: 3600,
+            step: 5,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Measured from the newest start in that group, not each member \
+               in turn — a hundred guests at thirty seconds each would be \
+               fifty minutes of nothing happening.",
+        derived: false,
+    },
+    Field {
+        key: "onNodeLoss",
+        label: "If its node stops answering",
+        kind: Kind::Choice {
+            options: &[
+                choice("leave", "Leave it where it is"),
+                choice("restart", "Start it on another node"),
+            ],
+        },
+        required: false,
+        advanced: true,
+        help: "Only for a guest whose storage every node can reach. One on \
+               local storage that is started elsewhere is an empty machine \
+               wearing a familiar name. Nothing is moved until the node has \
+               been quiet long enough that its own agent has certainly stopped \
+               its guests — a node with no fencing deadline is never recovered \
+               from.",
+        derived: false,
+    },
+    Field {
+        key: "console",
+        label: "Show console output",
+        kind: Kind::Switch,
+        required: false,
+        // Advanced, and not by concession to a rule. Nobody decides this while
+        // *creating* a guest — it is reached for when one is misbehaving, which
+        // is a different visit to the same object.
+        advanced: true,
+        help: "Publishes what the guest writes to its serial console, so it \
+               can be read here. Off by default because it costs a report \
+               every time the guest logs a line. A guest that is not running \
+               shows its last output whether this is on or not.",
+        derived: false,
+    },
+    Field {
+        key: "devices",
+        label: "Passed-through devices",
+        kind: Kind::RefList {
+            collection: "device-classes",
+            spelling: Spelling::Id,
+        },
+        required: false,
+        advanced: true,
+        help: "A class, not a machine's address. Two of the same class means \
+               two devices. A guest holding one cannot be live-migrated — a \
+               device's state is in hardware and cannot be transferred.",
+        derived: false,
+    },
+    Field {
+        key: "placementPolicy.minCpuLevel",
+        label: "Minimum CPU level",
+        kind: Kind::Choice {
+            options: &[
+                choice("", "Any"),
+                choice("x86-64-v2", "x86-64-v2"),
+                choice("x86-64-v3", "x86-64-v3"),
+                choice("x86-64-v4", "x86-64-v4"),
+            ],
+        },
+        required: false,
+        advanced: true,
+        help: "What the image needs to run. RHEL 9 and CentOS Stream 9 need \
+               x86-64-v2 or they will not boot.",
         derived: false,
     },
 ];
@@ -988,6 +1229,34 @@ const ATTACHMENT_FIELDS: &[Field] = &[
 ];
 
 const NETWORK_FIELDS: &[Field] = &[
+    Field {
+        key: "external",
+        label: "Carries real addresses",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "The prefixes on this network's subnets are routed to this cell \
+               by whoever is above it, so an address from one is an address \
+               the world can reach. Only a cell operator may say so — a tenant \
+               who could would mint themselves a public range by typing a CIDR.",
+        derived: false,
+    },
+    Field {
+        key: "announce",
+        label: "Addresses announced by",
+        kind: Kind::Choice {
+            options: &[
+                Choice { value: "FromGateway", label: "a gateway node" },
+                Choice { value: "FromHost", label: "the machine holding the guest" },
+            ],
+        },
+        required: false,
+        advanced: true,
+        help: "What this cell does by default for addresses from this network. \
+               An individual address may say otherwise. Meaningless on a \
+               network that carries no real addresses.",
+        derived: false,
+    },
     Field {
         key: "mtu",
         label: "MTU",
@@ -1278,6 +1547,89 @@ const NODE_FIELDS: &[Field] = &[
         help: "What placement policies match on.",
         derived: false,
     },
+    Field {
+        key: "evacuate",
+        label: "Move its guests away",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "Separate from draining. Draining says nothing new comes here; \
+               this says none of the old stays either. One migration is started \
+               per guest that can move — a guest holding a passed-through \
+               device cannot, and stays with the reason on it.",
+        derived: false,
+    },
+    Field {
+        key: "fenceAfterS",
+        label: "Stop own guests after",
+        kind: Kind::Number {
+            unit: "s",
+            min: 0,
+            max: 3600,
+            step: 10,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "How long this node may fail to report before it stops the \
+               guests it holds. Zero means it never does — and a node that \
+               never does is never recovered from, because nothing can tell \
+               \"unreachable\" from \"stopped\". Set it and guests marked for \
+               restart can be brought up elsewhere.",
+        derived: false,
+    },
+    Field {
+        key: "gateway",
+        label: "Carries external traffic",
+        kind: Kind::Switch,
+        required: false,
+        advanced: true,
+        help: "A public address whose network says so is announced from here, \
+               and packets for it reach the guest over the overlay. Several \
+               machines may carry it — the network above sees them as equal \
+               next hops — and a cell with none simply cannot use that mode.",
+        derived: false,
+    },
+    Field {
+        key: "vcpuOvercommit",
+        label: "vCPUs per core",
+        kind: Kind::Number {
+            unit: "per core",
+            min: 0,
+            max: 32,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "How many vCPUs this machine may hand out per real core. Zero \
+               or one means one for one. A processor can be shared — two \
+               guests that both want a core get one each in turn, and being \
+               wrong costs speed — which is how nearly every fleet in the \
+               world is run. There is deliberately no setting for memory: a \
+               guest promised 8 GiB and handed 4 is not slow, it is killed.",
+        derived: false,
+    },
+    Field {
+        key: "cpuBaseline",
+        label: "CPU baseline",
+        kind: Kind::Choice {
+            options: &[
+                choice("", "The host's own CPU"),
+                choice("x86-64-v2", "x86-64-v2"),
+                choice("x86-64-v3", "x86-64-v3"),
+                choice("x86-64-v4", "x86-64-v4"),
+            ],
+        },
+        required: false,
+        // Advanced because most cells never touch it, and because the sentence
+        // below is not one to meet while filling in a name.
+        advanced: true,
+        help: "Present the same CPU as other nodes so guests can migrate \
+               between them. Guests already running keep the CPU they started \
+               with and adopt this one when they next restart.",
+        derived: false,
+    },
 ];
 
 /// A tenant's router: which of its networks reach each other.
@@ -1343,6 +1695,474 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         advanced: false,
         help: "The port this address reaches. Clearing it holds the address \
                while the machine behind it is replaced.",
+        derived: false,
+    },
+    Field {
+        key: "delivery",
+        label: "The guest",
+        kind: Kind::Choice {
+            options: &[
+                Choice { value: "Nat", label: "never sees it" },
+                Choice { value: "Routed", label: "holds it itself" },
+            ],
+        },
+        required: false,
+        advanced: false,
+        help: "Held by the guest means the address is bound to its port and \
+               configured inside the machine — nothing rewrites a packet, and \
+               the guest can tell anybody its own address, which SIP, FTP, \
+               IPsec and mDNS all need. Translated means the edge answers for \
+               it and the guest never knows. A held address has to come from \
+               an external network.",
+        derived: false,
+    },
+    Field {
+        key: "announce",
+        label: "Announced by",
+        kind: Kind::Choice {
+            options: &[
+                Choice { value: "", label: "as the network says" },
+                Choice { value: "FromHost", label: "the machine holding the guest" },
+                Choice { value: "FromGateway", label: "a gateway node" },
+            ],
+        },
+        required: false,
+        advanced: true,
+        help: "The machine holding the guest is the shortest path: nothing is \
+               encapsulated for traffic to and from the world, and the route \
+               follows a live migration by itself. It needs every hypervisor \
+               to be allowed to peer with the router above it. A gateway node \
+               needs only that one machine to peer, and costs a detour in both \
+               directions.",
+        derived: false,
+    },
+];
+
+
+/// "This node is out of service from then, for that long."
+const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
+    Field {
+        key: "node",
+        label: "Node",
+        kind: Kind::Ref {
+            collection: "nodes",
+            filter_by: None,
+            spelling: Spelling::Id,
+        },
+        required: true,
+        advanced: false,
+        help: "The machine going out of service.",
+        derived: false,
+    },
+    Field {
+        key: "startsAt",
+        label: "Starts",
+        kind: Kind::Moment {
+            default_in_minutes: 60,
+        },
+        required: true,
+        advanced: false,
+        help: "In your own timezone. A start already past means now — work \
+               that has already begun is a true thing to declare.",
+        derived: false,
+    },
+    Field {
+        key: "minutes",
+        label: "For",
+        kind: Kind::Number {
+            unit: "minutes",
+            min: 1,
+            max: 20_160,
+            step: 15,
+            scale: Scale::None,
+        },
+        required: true,
+        advanced: false,
+        help: "How long it stays open. There is no end time to keep in step \
+               with this one: two fields that can disagree about the same \
+               fact are one field too many.",
+        derived: false,
+    },
+    Field {
+        key: "drain",
+        label: "Move the guests off",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "Off — nothing new is placed here and everything already \
+               running stays put, which is what a four-minute firmware update \
+               wants. On — the guests are migrated away as well, which is \
+               what pulling the machine wants. A guest that cannot move is \
+               left where it is, and :explainMaintenance says which.",
+        derived: false,
+    },
+    Field {
+        key: "note",
+        label: "What it is for",
+        kind: Kind::Text {
+            placeholder: "swapping the failed DIMM in slot 3",
+            check: Check::None,
+        },
+        required: false,
+        // One disclosure deeper than the four decisions that make a window: a
+        // window declared without a note is still correct, and a form that
+        // asks five things before it asks anything advanced is a wall of
+        // boxes. It is the first thing under "More", not buried.
+        advanced: true,
+        help: "Shown wherever this window is the reason something was \
+               refused, so \"no capacity\" reads as \"node-b is out until \
+               03:00 for the memory swap\" instead.",
+        derived: false,
+    },
+];
+
+/// "Keep a recent snapshot of this volume, and the last few."
+const SNAPSHOT_SCHEDULE_FIELDS: &[Field] = &[
+    Field {
+        key: "volume",
+        label: "Volume",
+        kind: Kind::Ref {
+            collection: "volumes",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: true,
+        advanced: false,
+        help: "What is snapshotted.",
+        derived: false,
+    },
+    Field {
+        key: "everyHours",
+        label: "Snapshot every",
+        kind: Kind::Number {
+            unit: "hours",
+            min: 1,
+            max: 168,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: true,
+        advanced: false,
+        help: "Cheap enough to run hourly. A snapshot lives in the volume's \
+               own pool: it is the right tool for going back an hour, and it \
+               is lost with the pool — which is what backups are for.",
+        derived: false,
+    },
+    Field {
+        key: "keep",
+        label: "Keep",
+        kind: Kind::Number {
+            unit: "snapshots",
+            min: 1,
+            max: 336,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: true,
+        advanced: false,
+        help: "Only finished ones count, so a run of failures never expires \
+               the last one that worked. Snapshots taken by hand are never \
+               expired.",
+        derived: false,
+    },
+];
+
+/// "Make an image out of this guest." The template workflow: build one by
+/// hand, get it right, capture it, stamp out copies.
+const CAPTURE_FIELDS: &[Field] = &[
+    Field {
+        key: "instance",
+        label: "Guest",
+        kind: Kind::Ref {
+            collection: "instances",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: true,
+        advanced: false,
+        help: "It must be stopped. A disk copied from under a running machine \
+               is crash-consistent, which a template stamped out a hundred \
+               times must not be — if you want a copy of a live guest, take a \
+               backup instead.",
+        derived: false,
+    },
+    Field {
+        key: "label",
+        label: "Name it",
+        kind: Kind::Text {
+            placeholder: "debian-13-golden",
+            check: Check::Id,
+        },
+        required: true,
+        advanced: false,
+        help: "What the resulting image is called. Its digest is added to \
+               this — a list of hashes is not something anybody chooses from.",
+        derived: false,
+    },
+    Field {
+        key: "target",
+        label: "Keep it on",
+        kind: Kind::Ref {
+            collection: "backup-targets",
+            filter_by: None,
+            spelling: Spelling::Id,
+        },
+        required: true,
+        advanced: false,
+        help: "Where the bytes go. Any node that can reach the same path can \
+               then boot guests from the image.",
+        derived: false,
+    },
+];
+
+/// Where backups are kept. Not a pool: the whole point is that it is somewhere
+/// else, so that losing a pool does not lose its copies with it.
+const BACKUP_TARGET_FIELDS: &[Field] = &[
+    Field {
+        key: "path",
+        label: "Path",
+        kind: Kind::Text {
+            placeholder: "/srv/backups",
+            check: Check::None,
+        },
+        required: true,
+        advanced: false,
+        help: "An absolute path the agent can already write to. Mounting an \
+               NFS or CIFS share is the host's job, not this platform's — one \
+               that managed its own mounts would be a second, worse copy of \
+               what init already does.",
+        derived: false,
+    },
+    Field {
+        key: "accepting",
+        label: "Accepts backups",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "Turning this off stops new copies going here. What is already \
+               here stays, and can still be restored from.",
+        derived: false,
+    },
+    Field {
+        key: "agent",
+        label: "Reported on by",
+        kind: Kind::Ref {
+            collection: "pools",
+            filter_by: None,
+            spelling: Spelling::Id,
+        },
+        required: false,
+        advanced: false,
+        help: "The pool agent that says whether this path is there, whether it \
+               can be written, and how much room is left. Named rather than \
+               claimed by whoever gets there first — a target assigned to \
+               nobody is one any agent could report on. Leave it empty and \
+               nobody looks: copies are still written by the pool holding the \
+               volume, and a path it cannot reach fails on the backup instead.",
+        derived: false,
+    },
+];
+
+/// One copy of one volume, at one moment.
+const BACKUP_FIELDS: &[Field] = &[
+    Field {
+        key: "volume",
+        label: "Volume",
+        kind: Kind::Ref {
+            collection: "volumes",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: true,
+        advanced: false,
+        help: "What is copied.",
+        derived: false,
+    },
+    Field {
+        key: "target",
+        label: "Target",
+        kind: Kind::Ref {
+            collection: "backup-targets",
+            filter_by: None,
+            spelling: Spelling::Id,
+        },
+        required: true,
+        advanced: false,
+        help: "Where the copy goes. A target in the volume's own pool is \
+               refused: a copy beside the original is a snapshot, and is lost \
+               with the pool it is in.",
+        derived: false,
+    },
+];
+
+/// "Keep a copy of this volume on that target, no older than this."
+const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
+    Field {
+        key: "volume",
+        label: "Volume",
+        kind: Kind::Ref {
+            collection: "volumes",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: true,
+        advanced: false,
+        help: "What is copied.",
+        derived: false,
+    },
+    Field {
+        key: "target",
+        label: "Target",
+        kind: Kind::Ref {
+            collection: "backup-targets",
+            filter_by: None,
+            spelling: Spelling::Id,
+        },
+        required: true,
+        advanced: false,
+        help: "Where the copies go.",
+        derived: false,
+    },
+    Field {
+        key: "everyHours",
+        label: "Copy every",
+        kind: Kind::Number {
+            unit: "hours",
+            min: 1,
+            max: 8760,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: true,
+        advanced: false,
+        help: "How stale the newest copy may get before another is made. An \
+               interval rather than a cron line, because the only question \
+               anybody asks a schedule is when it will next run.",
+        derived: false,
+    },
+    Field {
+        key: "keep",
+        label: "Keep",
+        kind: Kind::Number {
+            unit: "copies",
+            min: 1,
+            max: 365,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: true,
+        advanced: false,
+        help: "How many of this schedule's copies to keep. Only finished \
+               copies count, so a run of failures never expires the last one \
+               that worked. Copies taken by hand are never expired.",
+        derived: false,
+    },
+];
+
+/// A named set of interchangeable PCI devices, across the cell.
+const DEVICE_CLASS_FIELDS: &[Field] = &[
+    Field {
+        key: "matches",
+        label: "PCI ids",
+        kind: Kind::TextList {
+            placeholder: "10de:2204",
+            check: Check::None,
+        },
+        required: true,
+        advanced: false,
+        help: "vendor:device, as `lspci -n` prints it. Several, because a \
+               fleet buys the same accelerator across board revisions.",
+        derived: false,
+    },
+    Field {
+        key: "description",
+        label: "Description",
+        kind: Kind::Text {
+            placeholder: "NVIDIA A100 80GB",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        help: "What to call it in this console.",
+        derived: false,
+    },
+];
+
+/// A load balancer: one address in front of many ports. What most operators
+/// set is which network it fronts and what it answers on; the VIP itself has a
+/// defensible default (the lowest free address) and lives one level deeper.
+const LOAD_BALANCER_FIELDS: &[Field] = &[
+    Field {
+        key: "network",
+        label: "Network",
+        kind: Kind::Ref {
+            collection: "networks",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: true,
+        advanced: false,
+        help: "The network the address lives on. It scopes the service, so two \
+               projects may front the same address on different networks.",
+        derived: false,
+    },
+    Field {
+        key: "subnet",
+        label: "Subnet",
+        kind: Kind::Ref {
+            collection: "subnets",
+            filter_by: Some("network"),
+            spelling: Spelling::Name,
+        },
+        required: true,
+        advanced: false,
+        help: "Where the address comes from. The same counting as a port's \
+               address and a floating IP's, so no two of them are ever the \
+               same address.",
+        derived: false,
+    },
+    Field {
+        key: "listeners",
+        label: "Listeners",
+        kind: Kind::ListenerList,
+        required: true,
+        // The decision a load balancer exists to state. One with no listeners
+        // answers on nothing, so asking for them is not an advanced variation
+        // on making one — it is making one.
+        advanced: false,
+        help: "The ports the address answers on. Traffic is spread across the \
+               pool by connection, so one client's connection stays on one \
+               member.",
+        derived: false,
+    },
+    Field {
+        key: "members",
+        label: "Members",
+        kind: Kind::RefList {
+            collection: "ports",
+            spelling: Spelling::Name,
+        },
+        required: false,
+        // Not required on purpose: an empty pool is a drained pool, which is a
+        // legitimate state to hold an address in while the machines behind it
+        // are replaced.
+        advanced: false,
+        help: "The ports behind the address — ports, not addresses, so a \
+               migrated guest stays in the pool. Empty holds the address and \
+               forwards to nothing.",
+        derived: false,
+    },
+    Field {
+        key: "vip",
+        label: "Address",
+        kind: Kind::Text {
+            placeholder: "the lowest free one",
+            check: Check::Address,
+        },
+        required: false,
+        // Pinning one is the unusual case, exactly as it is for a floating IP.
+        advanced: true,
+        help: "Leave empty to be given the lowest address nothing else holds.",
         derived: false,
     },
 ];
@@ -2021,7 +2841,10 @@ pub const COLLECTIONS: &[Collection] = &[
         group: "Fleet",
         scope: Scope::Global,
         blurb: "Hypervisors. The spec is what an operator decided about one; \
-                the status is what its agent last reported.",
+                the status is what its agent last reported. Adding one here \
+                creates the object and mints its registration token — shown \
+                once, because the platform keeps a hash and cannot show it \
+                again.",
         fields: NODE_FIELDS,
         columns: &[
             Column {
@@ -2065,9 +2888,400 @@ pub const COLLECTIONS: &[Collection] = &[
             },
         ],
         agreements: &[],
-        creatable: false,
+        creatable: true,
         editable: true,
         deletable: false,
+        explainable: false,
+    },
+    Collection {
+        id: "maintenance-windows",
+        title: "Maintenance",
+        singular: "maintenance window",
+        // Nothing about a window changes without somebody writing it, and the
+        // watch delivers writes. Whether it is open right now is arithmetic a
+        // browser can do on numbers it already has — asking the API again would
+        // be polling for an answer nobody is going to write down.
+        recheck: 0,
+        condition: "Ready",
+        group: "Cell",
+        scope: Scope::Global,
+        blurb: "Say in advance that a machine is going out of service, and the \
+                cell stops placing work on it when the time comes — without \
+                anybody being awake to flip a switch, and without anything to \
+                flip back afterwards. Whether a window is upcoming, open or \
+                over is read off the clock, so a window that ends puts \
+                everything back by ceasing to be open.",
+        fields: MAINTENANCE_WINDOW_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.node",
+                label: "Node",
+                cell: Cell::Mono,
+                width: 160,
+            },
+            Column {
+                path: "spec.startsAt",
+                label: "Starts",
+                cell: Cell::Ago,
+                width: 128,
+            },
+            Column {
+                path: "spec.minutes",
+                label: "For",
+                cell: Cell::Number { unit: "min" },
+                width: 96,
+            },
+            Column {
+                path: "spec.drain",
+                label: "Guests",
+                cell: Cell::Yes {
+                    yes: "moved off",
+                    no: "stay put",
+                },
+                width: 112,
+            },
+            Column {
+                path: "spec.note",
+                label: "For",
+                cell: Cell::Text,
+                width: 260,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "snapshot-schedules",
+        title: "Snapshot schedules",
+        singular: "snapshot schedule",
+        recheck: 0,
+        condition: "Ready",
+        group: "Storage",
+        scope: Scope::Project,
+        blurb: "The cheap half of the pair. A snapshot lives in the volume's \
+                own pool — taken in a moment, costs almost nothing, and lost \
+                with the pool it is in. For a copy that survives losing the \
+                pool, use a backup schedule.",
+        fields: SNAPSHOT_SCHEDULE_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.volume",
+                label: "Volume",
+                cell: Cell::Mono,
+                width: 224,
+            },
+            Column {
+                path: "spec.everyHours",
+                label: "Every",
+                cell: Cell::Number { unit: "h" },
+                width: 96,
+            },
+            Column {
+                path: "spec.keep",
+                label: "Keep",
+                cell: Cell::Number { unit: "" },
+                width: 88,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "captures",
+        title: "Captures",
+        singular: "capture",
+        recheck: 0,
+        condition: "Ready",
+        group: "Storage",
+        scope: Scope::Project,
+        blurb: "Build a guest by hand, get it right, capture it — then every \
+                guest made from the result starts where that one left off. The \
+                guest must be stopped: a disk copied from under a running \
+                machine is crash-consistent, and a template is stamped out by \
+                people who assume it is clean.",
+        fields: CAPTURE_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.instance",
+                label: "Guest",
+                cell: Cell::Mono,
+                width: 200,
+            },
+            Column {
+                path: "spec.label",
+                label: "Name",
+                cell: Cell::Text,
+                width: 176,
+            },
+            Column {
+                // The observed half, and the only "in progress" there is: a
+                // capture with no digest is one still being copied.
+                path: "status.digest",
+                label: "Digest",
+                cell: Cell::Mono,
+                width: 200,
+            },
+            Column {
+                path: "status.finishedAt",
+                label: "Finished",
+                cell: Cell::Ago,
+                width: 112,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: false,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "backup-targets",
+        title: "Backup targets",
+        singular: "backup target",
+        recheck: 0,
+        condition: "Ready",
+        group: "Storage",
+        scope: Scope::Global,
+        blurb: "Where backups are kept. Deliberately not a pool: a copy that \
+                lives beside the original is a snapshot, and is lost with the \
+                pool it is in. A target in a volume's own pool is refused.",
+        fields: BACKUP_TARGET_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.path",
+                label: "Path",
+                cell: Cell::Mono,
+                width: 240,
+            },
+            Column {
+                path: "spec.accepting",
+                label: "Accepts",
+                cell: Cell::Yes {
+                    yes: "yes",
+                    no: "closed",
+                },
+                width: 96,
+            },
+            Column {
+                // The observed half. A target whose mount has gone is a target
+                // whose backups are silently not happening, and that is the one
+                // thing worth a column of its own.
+                path: "status.writable",
+                label: "Writable",
+                cell: Cell::Yes {
+                    yes: "yes",
+                    no: "unreachable",
+                },
+                width: 120,
+            },
+            Column {
+                path: "status.freeGib",
+                label: "Free",
+                cell: Cell::Number { unit: "GiB" },
+                width: 112,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "backups",
+        title: "Backups",
+        singular: "backup",
+        recheck: 0,
+        condition: "Ready",
+        group: "Storage",
+        scope: Scope::Project,
+        blurb: "One copy of one volume, at one moment. Restoring makes a new \
+                volume from a copy — never writing one back over the original, \
+                which would be a command living in a spec and carried out again \
+                on every resync.",
+        fields: BACKUP_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.volume",
+                label: "Volume",
+                cell: Cell::Mono,
+                width: 200,
+            },
+            Column {
+                path: "spec.target",
+                label: "Target",
+                cell: Cell::Mono,
+                width: 152,
+            },
+            Column {
+                path: "status.taken",
+                label: "Copied",
+                cell: Cell::Yes {
+                    yes: "yes",
+                    no: "not yet",
+                },
+                width: 96,
+            },
+            Column {
+                path: "status.sizeGib",
+                label: "Source size",
+                cell: Cell::Number { unit: "GiB" },
+                width: 120,
+            },
+            Column {
+                path: "status.takenAt",
+                label: "Taken",
+                cell: Cell::Ago,
+                width: 112,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: false,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "backup-schedules",
+        title: "Backup schedules",
+        singular: "backup schedule",
+        recheck: 0,
+        condition: "Ready",
+        group: "Storage",
+        scope: Scope::Project,
+        blurb: "An intention, not a job queue: there should be a copy of this \
+                volume no older than the interval, and the last few kept. What \
+                exists is what decides — a copy still being made holds the \
+                schedule, and a stuck one holds it for one interval and no \
+                longer.",
+        fields: BACKUP_SCHEDULE_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.volume",
+                label: "Volume",
+                cell: Cell::Mono,
+                width: 200,
+            },
+            Column {
+                path: "spec.target",
+                label: "Target",
+                cell: Cell::Mono,
+                width: 152,
+            },
+            Column {
+                path: "spec.everyHours",
+                label: "Every",
+                cell: Cell::Number { unit: "h" },
+                width: 96,
+            },
+            Column {
+                path: "spec.keep",
+                label: "Keep",
+                cell: Cell::Number { unit: "" },
+                width: 88,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "audit",
+        title: "Audit",
+        singular: "audit record",
+        recheck: 0,
+        condition: "Ready",
+        group: "Fleet",
+        scope: Scope::Global,
+        blurb: "What was refused, and who signed in. Not a log of everything \
+                that happened — every successful write already leaves an \
+                operation carrying its target, its verb and who asked. What no \
+                operation exists for is a request that was turned down, and \
+                that is the one a multi-tenant cell gets asked about later.",
+        // Nothing here is settable. A record of something that already
+        // happened that somebody could edit is not a record.
+        fields: &[],
+        columns: &[
+            Column {
+                path: "spec.at",
+                label: "When",
+                cell: Cell::Ago,
+                width: 112,
+            },
+            Column {
+                path: "spec.kind",
+                label: "What",
+                cell: Cell::Text,
+                width: 96,
+            },
+            Column {
+                path: "spec.subject",
+                label: "Who",
+                cell: Cell::Mono,
+                width: 200,
+            },
+            Column {
+                path: "spec.verb",
+                label: "Verb",
+                cell: Cell::Text,
+                width: 88,
+            },
+            Column {
+                path: "spec.target",
+                label: "Reaching for",
+                cell: Cell::Mono,
+                width: 240,
+            },
+        ],
+        agreements: &[],
+        creatable: false,
+        editable: false,
+        // Kept, and not expired by anything. A record that quietly went away
+        // before somebody came looking is worse than a disk they can see
+        // filling — but an operator who has read it may still remove it.
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "device-classes",
+        title: "Device classes",
+        singular: "device class",
+        recheck: 0,
+        condition: "Ready",
+        group: "Fleet",
+        scope: Scope::Global,
+        blurb: "Names for interchangeable hardware. An instance asks for a \
+                class, never an address: an address belongs to one machine, so \
+                an instance naming one could only ever run there. A device is \
+                offered only when everything in its IOMMU group is free — a \
+                group is passed through whole or not at all.",
+        fields: DEVICE_CLASS_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.matches",
+                label: "PCI ids",
+                cell: Cell::Mono,
+                width: 176,
+            },
+            Column {
+                path: "spec.description",
+                label: "Description",
+                cell: Cell::Text,
+                width: 240,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
         explainable: false,
     },
     Collection {
@@ -2148,6 +3362,61 @@ pub const COLLECTIONS: &[Collection] = &[
             },
         ],
         agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "load-balancers",
+        title: "Load balancers",
+        singular: "load balancer",
+        recheck: 0,
+        condition: "Ready",
+        group: "Network",
+        scope: Scope::Project,
+        blurb: "One address in front of many ports. The fabric balances by \
+                connection on whichever host traffic arrives at — there is no \
+                appliance to place and nothing to fail over. Nothing here \
+                probes a member's health: the pool is what was declared, not a \
+                judgement about it.",
+        fields: LOAD_BALANCER_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.vip",
+                label: "Address",
+                cell: Cell::Mono,
+                width: 152,
+            },
+            Column {
+                path: "spec.listeners",
+                label: "Listeners",
+                cell: Cell::Count,
+                width: 96,
+            },
+            Column {
+                path: "spec.members",
+                label: "Members",
+                cell: Cell::Count,
+                width: 96,
+            },
+            Column {
+                // The *observed* half. It differing from the address beside it
+                // is a reconcile in flight, or one that could not finish.
+                path: "status.vip",
+                label: "Serving",
+                cell: Cell::Mono,
+                width: 152,
+            },
+        ],
+        agreements: &[Agreement {
+            label: "Address",
+            asked: "vip",
+            is: "vip",
+            note: "The address asked for is not the one the fabric serves yet. \
+                   Usually the world catching up; if it stays, the Ready \
+                   condition says what is in the way.",
+        }],
         creatable: true,
         editable: true,
         deletable: true,
@@ -2455,14 +3724,23 @@ mod tests {
             "operations",
             "migrations",
             "floatingips",
+            "load-balancers",
+            "device-classes",
+            "backup-targets",
+            "backups",
+            "backup-schedules",
+            "captures",
+            "snapshot-schedules",
+            "audit",
             "users",
             "ceph-clusters",
+            "maintenance-windows",
         ] {
             assert!(find(id).is_some(), "no screen for {id}");
         }
         assert_eq!(
             COLLECTIONS.len(),
-            17,
+            26,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:
@@ -2642,10 +3920,18 @@ mod tests {
                     } => (collection, spelling),
                     _ => continue,
                 };
-                let want = if collection == "nodes" {
-                    Spelling::Id
-                } else {
-                    Spelling::Name
+                // A cell-scoped root object is referred to by its bare id —
+                // `hv-1`, not `nodes/hv-1`; `gpu-a100`, not
+                // `device-classes/gpu-a100`. Everything else lives under a
+                // project and is named in full.
+                //
+                // Expressed as the rule rather than as a list of collections,
+                // because the list was the accident: the reason has always
+                // been the scope, and hardcoding one name meant the second
+                // cell-scoped collection to arrive looked like a mistake.
+                let want = match find(collection).map(|t| t.scope) {
+                    Some(Scope::Global) => Spelling::Id,
+                    _ => Spelling::Name,
                 };
                 assert_eq!(
                     spelling, want,

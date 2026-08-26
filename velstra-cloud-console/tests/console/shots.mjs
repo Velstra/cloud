@@ -87,6 +87,43 @@ await both("sheet-failing", async () => {
 });
 await page.evaluate(`closeSheet()`);
 
+// ---- the load balancer ------------------------------------------------------
+//
+// The newest kind, and the one with a control nothing else has: a listener is
+// three fields on one line, so the list and the form both have to prove they
+// still read as a table rather than as a row of boxes.
+
+await both("board-loadbalancers", () => open(page, "load-balancers"));
+
+await both("sheet-loadbalancer", async () => {
+  await open(page, "load-balancers");
+  await openRow(page, "web");
+  await sleep(400);
+});
+await page.evaluate(`closeSheet()`);
+
+await both("create-loadbalancer", async () => {
+  await open(page, "load-balancers");
+  await page.evaluate(`document.getElementById("newbtn").click()`);
+  await sleep(500);
+});
+await page.evaluate(`closeDialog()`);
+
+// ---- ceph -------------------------------------------------------------------
+//
+// The other two bespoke list controls live here: disks are {node, device} pairs
+// and pools carry two replication numbers. Both were affected by the same
+// array-of-objects defect the listeners exposed, so both are photographed.
+
+await both("board-ceph", () => open(page, "ceph-clusters"));
+
+await both("create-ceph", async () => {
+  await open(page, "ceph-clusters");
+  await page.evaluate(`document.getElementById("newbtn").click()`);
+  await sleep(500);
+});
+await page.evaluate(`closeDialog()`);
+
 // ---- creating ---------------------------------------------------------------
 //
 // The one the user's complaint is about: "crowded with input boxes".

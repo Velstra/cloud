@@ -28,6 +28,29 @@ sed -n '/^<script>$/,/^<\/script>$/p' "$work/console.html" | sed '1d;$d' > "$wor
 node --check "$work/console.js"
 echo "the script parses ($(wc -l < "$work/console.js") lines)" >&2
 
+# One scope means one namespace, and a second top-level `function pick` does not
+# collide loudly — it silently replaces the first, everywhere, including inside
+# code written months earlier that has no idea the name was taken. That happened:
+# a selection helper called `pick` replaced the accessor every model reader uses,
+# and the console listed two projects whose names were both the empty string.
+#
+# `node --check` cannot see it (a redeclared function is legal JavaScript), so
+# it is checked here, where the files are already concatenated.
+# `-a`: the page carries mark glyphs, and grep calls a file with those bytes
+# binary and prints "binary file matches" instead of the matches — which would
+# make this check quietly pass for ever.
+dupes=$(grep -haoE '^(function|const|let) [A-Za-z_$][A-Za-z0-9_$]*' "$work/console.js" \
+  | awk '{print $2}' | sort | uniq -d)
+if [ -n "$dupes" ]; then
+  echo "two top-level declarations share a name, and the second wins everywhere:" >&2
+  echo "$dupes" | sed 's/^/  /' >&2
+  exit 1
+fi
+echo "no two top-level names collide" >&2
+# The suite checks the names the page reads out of an object against the
+# recorded shape of the API's answers — see `shapes.mjs`.
+export CONSOLE_JS="$work/console.js"
+
 if [ -z "${CONSOLE_URL:-}" ]; then
   export CONSOLE_TOKEN=${CONSOLE_TOKEN:-testtoken}
   CONSOLE_PAGE="$work/console.html" FAKE_PORT=0 node "$here/fake-api.mjs" > "$work/fake.log" 2>&1 &

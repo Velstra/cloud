@@ -7,6 +7,7 @@
 // quietly wrong or the button quietly does nothing.
 
 import { browser, signIn, open, openRow, sheetText, sleep, waitFor, test, check, equal, skip, summary } from "./harness.mjs";
+import { checkShapes } from "./shapes.mjs";
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:18100/";
 const TOKEN = process.env.CONSOLE_TOKEN || "testtoken";
@@ -19,6 +20,20 @@ const SCAFFOLDED = process.env.CONSOLE_SCAFFOLD !== "0";
 const api = (path, init) => fetch(new globalThis.URL(path, URL), {
   ...init,
   headers: { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json", ...(init || {}).headers },
+});
+
+// Before a browser is started, because it is not about the browser: it asks
+// whether the fixture below still answers what the real API answers. A console
+// tested against a fixture that has drifted is a console tested against
+// nothing.
+await test("the fixture answers the shapes the real API was recorded answering", async () => {
+  const outcome = await checkShapes(URL, TOKEN);
+  if (outcome.skipped) return skip(outcome.skipped);
+  check(outcome.checked > 0, "the recording is empty, so this checked nothing");
+  check(outcome.gaps.length === 0,
+    "the fixture and the API no longer answer the same shape:\n  " + outcome.gaps.join("\n  ") +
+    "\n  Re-record with UPDATE_SHAPES=1 cargo test -p velstra-cloud-api --test contract_shapes " +
+    "if the API is what changed.");
 });
 
 const page = await browser();
@@ -216,24 +231,55 @@ await test("the password dialog shows the API's refusal for a wrong current pass
   await page.evaluate(`closeDialog()`);
 });
 
-await test("signing in lands on a collection, with the rail beside it", async () => {
+await test("signing in lands on the overview, with the rail beside it", async () => {
   const seen = await page.evaluate(`({
     rail: [...document.querySelectorAll(".railitem")].map((b) => b.dataset.collection),
+    schema: SCHEMA.map((c) => c.id),
     title: document.getElementById("listtitle").textContent,
     rows: document.querySelectorAll("#boardbody tr").length,
   })`);
-  // Counted rather than named, so a collection added to the schema and not to
-  // the rail is caught. The number moves when a screen is added — pools took it
-  // from 12 to 13, then routers and floating IPs to 15, users to 16, and Ceph
-  // to 17.
+  // Compared against the schema rather than against a number.
   //
-  // It sat at 13 for two of those, which says something about the check rather
-  // than about the console: a hand-kept number is only a guard if somebody runs
-  // it, and this suite is not in `cargo test`. What it caught in the end was
-  // itself.
-  equal(seen.rail.length, 17, "the rail does not list every collection");
-  check(seen.title === "Instances", `landed on ${seen.title}`);
-  check(seen.rows >= 1, "the board showed no instances at all");
+  // It used to be a hand-kept count — 12, then 13, then 15, 16, 17, 18 as
+  // screens arrived — and it sat at 13 through two of those. The comment here
+  // said so: "a hand-kept number is only a guard if somebody runs it, and this
+  // suite is not in `cargo test`. What it caught in the end was itself." It
+  // then went stale a third time, which is enough evidence.
+  //
+  // The schema is in scope in the page, so the check can ask what *should* be
+  // there instead of being told. Now a collection added without a rail entry
+  // fails by name, and nobody has to remember a number.
+  const missing = seen.schema.filter((id) => !seen.rail.includes(id));
+  const extra = seen.rail.filter((id) => !seen.schema.includes(id));
+  check(
+    missing.length === 0 && extra.length === 0,
+    `the rail does not match the schema — missing ${JSON.stringify(missing)}, ` +
+      `unexpected ${JSON.stringify(extra)}`,
+  );
+  // The overview, not a board. Landing on one collection was landing on one
+  // answer to a question nobody had asked yet — "is anything wrong" crosses
+  // every collection there is.
+  check(seen.title === "Overview", `landed on ${seen.title}`);
+  const home = await page.evaluate(`({
+    shown: !document.getElementById("overviewbox").classList.contains("hidden"),
+    boardHidden: document.querySelector(".boardwrap").classList.contains("hidden"),
+    text: document.getElementById("overviewbox").textContent,
+    rail: !!document.getElementById("railhome"),
+  })`);
+  check(home.shown && home.boardHidden, "the overview is not what is on screen");
+  check(home.rail, "there is no way back to the overview from the rail");
+  // Whatever the cell's state, the page says which it is — an empty panel
+  // reads as a page that failed to load.
+  check(/Everything has settled/.test(home.text) ||
+    (await page.evaluate(`document.querySelectorAll("#overviewbox .overrow").length`)) > 0,
+    `the attention panel says nothing at all: ${home.text}`);
+  // And the answers no listing carries: room, and what this tenant may start.
+  await waitFor(page, `document.getElementById("overviewreports").textContent.includes("Largest")`);
+
+  // A board is still one click away, and still full.
+  await open(page, "instances");
+  const rows = await page.evaluate(`document.querySelectorAll("#boardbody tr").length`);
+  check(rows >= 1, "the board showed no instances at all");
 });
 
 // --- wayfinding -------------------------------------------------------------
@@ -253,7 +299,10 @@ await test("every section opens and shows its own board", async () => {
     })`);
     if (seen.err) wrong.push(`${id}: ${seen.err}`);
     if (!seen.blurb) wrong.push(`${id}: no blurb`);
-    if (seen.head[1] !== "Convergence") wrong.push(`${id}: no convergence column`);
+    // The name column, then convergence. On a board that offers a bulk action
+    // there is a picker column in front of both, and it carries no label.
+    const named = seen.head.filter((t) => t !== "");
+    if (named[1] !== "Convergence") wrong.push(`${id}: no convergence column`);
     if (!seen.rows) empty.push(id);
   }
   check(!wrong.length, "sections that did not render:\n  " + wrong.join("\n  "));
@@ -488,7 +537,6 @@ await test("attaching to an instance that was never placed says why, at the choi
     `(x) => !at(status(x), "node") && !at(spec(x), "node")`);
   await open(page, "attachments");
   await page.evaluate(`document.getElementById("newbtn").click()`);
-  await sleep(600);
   const said = await page.evaluate(`(async () => {
     const s = document.getElementById("f-instance");
     if (!s || ![...s.options].some((o) => o.value === ${JSON.stringify(unplaced.name)})) return null;
@@ -843,7 +891,12 @@ const ownMigration = async () => {
   await page.evaluate(`closeSheet()`);
   await open(page, "instances");
   const guest = await page.evaluate(`(() => {
-    const r = view.items.find((x) => at(status(x), "node"));
+    // Placed *and running*. A guest that is merely placed can be one that
+    // failed, and a failed guest is refused by every destination — which
+    // reads as "this cell can receive nothing" and skips the whole test.
+    const r = view.items.find(
+      (x) => at(status(x), "node") && at(status(x), "state") === "Running",
+    );
     return r ? { name: nameOf(r), node: at(status(r), "node") } : null;
   })()`);
   if (!guest) skip("this cell holds no placed guest to move");
@@ -1447,6 +1500,74 @@ await test("a security group can be built out of rules, not just named", async (
   equal(stored[0].remote.cidr, "0.0.0.0/0", "the remote did not survive");
 });
 
+await test("a load balancer can be built with its listeners, not just named", async () => {
+  // The same half that was once missing from security groups: a form that
+  // could only produce a load balancer with no listeners would make something
+  // the platform accepts and that answers on nothing.
+  await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
+  await open(page, "load-balancers");
+  const seeded = await page.evaluate(`({
+    rows: document.querySelectorAll("#boardbody tr").length,
+    text: document.querySelector("#boardbody tr").innerText,
+  })`);
+  check(seeded.rows >= 1, "the seeded load balancer is not on the board");
+  check(/10\.20\.0\.20/.test(seeded.text), "the VIP is not in the row: " + seeded.text);
+
+  await page.evaluate(`document.getElementById("newbtn").click()`);
+  await sleep(400);
+  await page.evaluate(`(() => {
+    const id = document.getElementById("f-id");
+    id.value = "api"; id.dispatchEvent(new Event("input"));
+    const network = document.getElementById("f-network");
+    network.value = "projects/p1/networks/prod"; network.dispatchEvent(new Event("change"));
+  })()`);
+  await sleep(300);
+  await page.evaluate(`(() => {
+    const subnet = document.getElementById("f-subnet");
+    subnet.value = "projects/p1/subnets/prod-a"; subnet.dispatchEvent(new Event("change"));
+    document.getElementById("addlistener").click();
+  })()`);
+  await sleep(200);
+  const built = await page.evaluate(`(() => {
+    const row = document.getElementById("f-listeners").querySelector(".row");
+    const protocol = row.querySelector("select");
+    const numbers = [...row.querySelectorAll("input[type=number]")];
+    return {
+      // A listener offered blank would be one somebody fills in three times
+      // before it means anything; it starts as the commonest one instead.
+      protocol: protocol.value,
+      port: numbers[0].value,
+      member: numbers[1].value,
+      memberSays: numbers[1].placeholder,
+    };
+  })()`);
+  equal(built.protocol, "Tcp", "a new listener does not start as TCP");
+  equal(built.port, "443", "a new listener does not start on 443");
+  check(built.member === "" && /same/.test(built.memberSays),
+    "an empty member port does not say it keeps the client's own");
+
+  await page.evaluate(`document.getElementById("submitform").click()`);
+  await sleep(1500);
+  const seen = await page.evaluate(`({
+    dialog: !!document.getElementById("dialog"),
+    rows: [...document.querySelectorAll("#boardbody tr")].map((r) => r.dataset.name.split("/").pop()),
+  })`);
+  check(!seen.dialog, "the form stayed open after a successful create");
+  check(seen.rows.includes("api"), "the new load balancer is not on the board: " + seen.rows.join(", "));
+
+  // Read back through the API rather than off the screen: what matters is the
+  // shape the platform stored, in the contract's spelling.
+  const stored = await page.evaluate(`(async () => {
+    const r = await fetch("/api/v1/projects/p1/load-balancers/api",
+      { headers: { authorization: "Bearer " + sessionStorage.getItem("velstra-cloud-token") } });
+    return (await r.json()).spec;
+  })()`);
+  equal(stored.listeners.length, 1, "the load balancer was created without its listener");
+  equal(stored.listeners[0].protocol, "Tcp", "the protocol reached the API as something else");
+  equal(stored.listeners[0].port, 443, "the port did not survive");
+  equal(stored.network, "projects/p1/networks/prod", "the network did not survive");
+});
+
 // ---- picking disks ---------------------------------------------------------
 //
 // The one control on the page that destroys something. Everything below is
@@ -1846,6 +1967,493 @@ await test("a subnet's occupancy follows the ports, with no event to announce it
     "the board is showing a count from whenever it was opened");
 });
 
+// The read sheet folds its advanced settings the way the create form does, and
+// keeps one honesty rule the form does not need: a field the object actually
+// set stays in view, only the unset advanced ones fold.
+await test("the sheet folds unset advanced settings but keeps the set ones", async () => {
+  await open(page, "projects");
+  // A project that sets an advanced field (parent) and leaves another advanced
+  // field (cell) unset — so one of each is on screen at once.
+  const proj = await pick("project with a set parent and an unset cell",
+    `(x) => spec(x).parent && !spec(x).cell`);
+  await openRow(page, proj.id);
+  const r = await page.evaluate(`(() => {
+    const sheet = document.getElementById("sheet");
+    const spread = [...sheet.querySelectorAll(".spread")]
+      .find((s) => /Specification/.test((s.querySelector(".margin") || {}).textContent || ""));
+    if (!spread) return { error: "no Specification section" };
+    const fold = spread.querySelector("#specmorefields");
+    const toggle = spread.querySelector("#specmore");
+    const label = (td) => td.textContent.replace(/·.*/, "").trim();
+    const first = (root) => [...root.querySelectorAll("td:first-child")].map(label);
+    const foldLabels = fold ? first(fold) : [];
+    const mainLabels = [...spread.querySelectorAll("td:first-child")]
+      .filter((td) => !fold || !fold.contains(td)).map(label);
+    const hiddenBefore = fold ? fold.classList.contains("hidden") : null;
+    const expandedBefore = toggle ? toggle.getAttribute("aria-expanded") : null;
+    const toggleText = toggle ? toggle.textContent : "";
+    if (toggle) toggle.click();
+    const hiddenAfter = fold ? fold.classList.contains("hidden") : null;
+    const expandedAfter = toggle ? toggle.getAttribute("aria-expanded") : null;
+    return { hasToggle: !!toggle, toggleText,
+             foldLabels, mainLabels, hiddenBefore, hiddenAfter, expandedBefore, expandedAfter };
+  })()`);
+  check(!r.error, r.error || "");
+  check(r.hasToggle, "the sheet offers no \"More settings\" disclosure");
+  check(/More settings \(\d+\)/.test(r.toggleText), `the disclosure is not labelled like the form: "${r.toggleText}"`);
+  check(r.foldLabels.includes("Cell"), `an unset advanced field is not folded: fold has ${JSON.stringify(r.foldLabels)}`);
+  check(!r.mainLabels.includes("Cell"), "an unset advanced field is also shown in the main list");
+  check(r.mainLabels.includes("Parent"), `a set advanced field was folded away: main has ${JSON.stringify(r.mainLabels)}`);
+  check(r.hiddenBefore === true && r.hiddenAfter === false, "the disclosure does not reveal the folded fields");
+  check(r.expandedBefore === "false" && r.expandedAfter === "true", "aria-expanded does not track the disclosure");
+});
+
+// The jump palette: a flat search over every collection, so one an operator can
+// name is a keystroke away rather than a hunt through the rail's groups.
+await test("the jump palette reaches a collection by name", async () => {
+  await open(page, "instances");
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 200));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    await wait(150);
+    const opened = !!document.getElementById("palette");
+    const q = document.getElementById("paletteq");
+    q.value = "project";
+    q.dispatchEvent(new Event("input"));
+    await wait(120);
+    const rows = [...document.querySelectorAll("#palettelist .palitem .palt")].map((n) => n.textContent.trim());
+    q.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await wait(350);
+    const closed = !document.getElementById("palette");
+    return { opened, rows, closed, coll: view.coll ? view.coll.id : null };
+  })()`);
+  check(r.opened, "Ctrl/Cmd-K did not open the palette");
+  check(r.rows.some((t) => /project/i.test(t)), "the palette did not find Projects: " + JSON.stringify(r.rows));
+  check(r.closed, "the palette stayed open after Enter");
+  equal(r.coll, "projects", "Enter did not navigate to the named collection (coll=" + r.coll + ")");
+});
+
+/// "Where is db-1" — the question an operator actually has, whose only answer
+/// used to be guessing which board it was on and looking.
+await test("the palette finds an object by name and opens it where it lives", async () => {
+  await open(page, "nodes");
+  await page.evaluate(`closeSheet()`);
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 200));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    await wait(150);
+    const q = document.getElementById("paletteq");
+    q.value = "db-1";
+    q.dispatchEvent(new Event("input"));
+    await wait(150);
+    const rows = [...document.querySelectorAll("#palettelist .palitem")]
+      .map((n) => n.textContent.trim());
+    // Down once: the collections that match come first, and here none do, so
+    // the first row is already the object. Enter opens it.
+    q.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await wait(600);
+    return { rows, coll: view.coll ? view.coll.id : null, sheet: sheet.name || "" };
+  })()`);
+  check(r.rows.some((t) => t.includes("db-1")),
+    `the palette did not find the guest: ${JSON.stringify(r.rows)}`);
+  // The row says which collection it is in, because "db-1" alone does not say
+  // whether it is a guest, a volume or a port.
+  check(r.rows.some((t) => t.includes("db-1") && /instance/i.test(t)),
+    `the palette does not say what kind of thing it found: ${JSON.stringify(r.rows)}`);
+  equal(r.coll, "instances", "the palette did not go to the board the object is on");
+  check(r.sheet.endsWith("/db-1"), `the object was not opened: ${r.sheet}`);
+  await page.evaluate(`closeSheet()`);
+});
+
+/// Sharing a processor is a trade an operator makes on purpose — and a
+/// capacity line that reported only one of the two numbers would say the cell
+/// had grown a processor.
+await test("the cell says how much processor it is promising over what it has", async () => {
+  await open(page, "nodes");
+  const strip = await waitFor(page, `(() => {
+    const box = document.getElementById("cpuadvisory");
+    return box && box.textContent.includes("Largest guest") ? box.textContent : null;
+  })()`);
+  check(/\d+ cores, offered as \d+/.test(strip),
+    `the strip does not say what is promised over the silicon: ${strip}`);
+  check(strip.includes("sharing theirs"), `it does not say why the two differ: ${strip}`);
+});
+
+await test("the nodes board says the cell is split and what a baseline would cost", async () => {
+  // The fixture's cell is deliberately mixed: node-a and node-c are a
+  // generation ahead of node-b. That is the case the strip exists for, and a
+  // console only ever checked against identical machines is one whose strip
+  // was never seen with anything in it.
+  await page.evaluate(`show("nodes")`);
+  const strip = await waitFor(page, `(() => {
+    const box = document.getElementById("cpuadvisory");
+    if (!box || box.classList.contains("hidden")) return null;
+    return {
+      text: box.textContent,
+      lines: box.querySelectorAll(".cpuline").length,
+    };
+  })()`);
+  check(strip, "the nodes board showed no CPU strip for a cell with two domains");
+  check(strip.lines >= 2, `the strip carried ${strip.lines} lines`);
+  check(
+    /2 migration domains/.test(strip.text),
+    "the strip does not say how many domains the cell has: " + strip.text,
+  );
+  // The price, named. A recommendation carrying only the benefit is the one
+  // thing this surface must never be.
+  check(
+    /Cost:/.test(strip.text) && /avx2/.test(strip.text),
+    "the baseline recommendation does not say what it costs: " + strip.text,
+  );
+
+  // And it is only on the nodes board: a strip about processors above a list
+  // of volumes is chrome for a question nobody asked.
+  await page.evaluate(`show("volumes")`);
+  const elsewhere = await waitFor(page, `(() => {
+    const box = document.getElementById("cpuadvisory");
+    return box && box.classList.contains("hidden") ? 1 : null;
+  })()`);
+  check(elsewhere, "the CPU strip followed the operator off the nodes board");
+});
+
+await test("a guest that will not boot shows its last words, readably", async () => {
+  // The whole point of capturing a console: a failed guest is the one with the
+  // most to say. A console that showed only "Failed" is the reason somebody
+  // ssh's into a hypervisor.
+  await page.evaluate(`show("instances")`);
+  const opened = await waitFor(page, `(() => {
+    const row = [...document.querySelectorAll("#boardbody tr")]
+      .find((r) => (r.dataset.name || "").endsWith("/web-9"));
+    if (!row) return null;
+    row.click();
+    return 1;
+  })()`);
+  check(opened, "the failed guest never reached the board");
+
+  const seen = await waitFor(page, `(() => {
+    const pre = document.querySelector("#sheet .logblock");
+    if (!pre) return null;
+    return {
+      text: pre.textContent,
+      lines: pre.textContent.split("\\n").length,
+      // A document is preformatted, not a truncated line with a tooltip.
+      tag: pre.tagName,
+      sheet: document.getElementById("sheet").textContent,
+    };
+  })()`);
+  check(seen, "the console output is not shown on the sheet at all");
+  equal(seen.tag, "PRE", "the console output is not preformatted");
+  check(
+    /Kernel panic/.test(seen.text),
+    "the panic is not in what was rendered: " + seen.text,
+  );
+  check(seen.lines >= 5, `the output collapsed to ${seen.lines} lines`);
+  // And the size beside it, so nobody takes a tail for the whole log.
+  check(
+    /Console written/.test(seen.sheet),
+    "the sheet does not say how much the guest wrote, so a tail reads as everything",
+  );
+});
+
+await test("the nodes board leads with what fits, not with what is free", async () => {
+  // Free memory does not add up into a guest. A strip that showed only the
+  // sum would tell somebody a large machine fits a cell that has no room for
+  // one anywhere — which is the mistake this line exists to prevent.
+  await page.evaluate(`show("nodes")`);
+  const strip = await waitFor(page, `(() => {
+    const box = document.getElementById("cpuadvisory");
+    if (!box || box.classList.contains("hidden")) return null;
+    const room = [...box.querySelectorAll(".cpuline")]
+      .find((l) => l.textContent.startsWith("Room"));
+    return room ? room.textContent : null;
+  })()`);
+  check(strip, "the nodes board shows nothing about what would fit");
+  check(
+    /Largest guest that fits anywhere/.test(strip),
+    "the strip does not lead with what fits: " + strip,
+  );
+  check(
+    /does not add up into one guest/.test(strip),
+    "the strip shows a free total without saying it cannot be used as one: " + strip,
+  );
+});
+
+/// Narrowing a long board by label, and the two things that make it honest:
+/// the API does the narrowing, and the filter does not follow you elsewhere.
+/// Doing one thing to several — and the half that decides whether the control
+/// is trustworthy: what happens when some of them are refused.
+await test("several guests can be stopped at once, and every refusal is named", async () => {
+  await open(page, "instances");
+  await page.evaluate(`closeSheet()`);
+  // Clicked, not assigned: a checkbox that is set in script and never clicked
+  // proves nothing about the control an operator uses.
+  await page.evaluate(`[...document.querySelectorAll("[data-picks]")].slice(0, 2).forEach((b) => b.click())`);
+  const picked = await page.evaluate(`JSON.stringify({
+    count: document.querySelector(".pickcount") ? document.querySelector(".pickcount").textContent : "",
+    names: [...view.picked],
+    sheet: !!document.getElementById("sheet"),
+  })`).then(JSON.parse);
+  equal(picked.names.length, 2, `ticking two rows selected ${picked.names.length}`);
+  check(picked.count.includes("2 selected"), `the bar does not say what is selected: ${picked.count}`);
+  check(!picked.sheet, "ticking a row opened its sheet over the board");
+
+  await page.evaluate(`document.querySelector('[data-bulk="stop"]').click()`);
+  const outcome = await waitFor(page, `(() => {
+    const box = document.getElementById("bulkresult");
+    const t = box ? box.textContent : "";
+    return t && !t.includes("Working") ? t : null;
+  })()`, { timeout: 15000 });
+  check(/\d+ done/.test(outcome), `the result does not say what happened: ${outcome}`);
+  // Partial success is the normal case, so the panel must say which is which —
+  // but for two guests nobody else is touching, both should land.
+  check(!/refused/.test(outcome), `the API refused the change: ${outcome}`);
+
+  // What landed, landed: the guests really were asked to stop.
+  const asked = await page.evaluate(`(async () => {
+    const r = await request("GET", "/api/v1/projects/p1/instances?pageSize=1000");
+    const want = ${JSON.stringify(picked.names)};
+    return (r.body.items || [])
+      .filter((i) => want.includes(i.meta.name))
+      .map((i) => i.spec.desiredState);
+  })()`);
+  check(asked.every((s) => s === "Stopped"),
+    `the change did not reach the API: ${JSON.stringify(asked)}`);
+
+  // And the selection is emptied of what worked, so a second press retries the
+  // failures and nothing else.
+  const leftOver = await page.evaluate(`view.picked.size`);
+  check(leftOver < 2, `everything stayed selected after it was done: ${leftOver}`);
+
+  // A board without a bulk action offers no picker column at all: a column of
+  // checkboxes over a board with nothing to do with them is a control that
+  // does nothing.
+  // Nodes are neither created nor deleted from here — a machine joins a cell
+  // by being registered — so there is nothing a selection of them could do.
+  await open(page, "nodes");
+  const boxes = await page.evaluate(`document.querySelectorAll("[data-picks]").length`);
+  equal(boxes, 0, "a board with no bulk action still offered a selection column");
+});
+
+/// "What has happened to this thing" — including the half that lives where
+/// nobody looks.
+await test("an object's sheet shows what was asked of it, refusals included", async () => {
+  await open(page, "instances");
+  await openRow(page, "web-1");
+  const said = await waitFor(page, `(() => {
+    const box = document.getElementById("history");
+    return box && !box.textContent.includes("Asking") ? box.textContent : null;
+  })()`);
+
+  check(said.includes("create"), `the change that made it is not there: ${said}`);
+  check(said.includes("alice"), `who asked is not there: ${said}`);
+  // A change that was accepted and then failed is not a change that happened.
+  check(said.includes("the node refused the change"), `a failure is not shown: ${said}`);
+  // The refusal, which is the answer to "I clicked delete and nothing
+  // happened" and lives in a collection a tenant never opens.
+  check(said.includes("refused") && said.includes("viewer"),
+    `a refused request is not in the history: ${said}`);
+  // Somebody else's history is not in it.
+  check(!said.includes("web-2"), `another object's records leaked in: ${said}`);
+  await page.evaluate(`closeSheet()`);
+});
+
+/// The hunt an overview exists to end: something is wrong somewhere, and the
+/// answer used to be visiting eleven boards in turn.
+await test("the overview names what is drifting and goes there in one click", async () => {
+  await page.evaluate(`document.getElementById("railhome").click()`);
+  const shown = await waitFor(page, `(() => {
+    const box = document.getElementById("overviewbox");
+    return view.home && box.textContent ? box.textContent : null;
+  })()`);
+
+  // The fixture has a guest whose ask moved and one that cannot be placed, so
+  // the panel has something to say and must say it by name.
+  const rows = await page.evaluate(`[...document.querySelectorAll(".overrow .linky")]
+    .map((b) => b.dataset.goes)`);
+  check(rows.length > 0, `nothing was named as needing attention: ${shown}`);
+  check(rows.some((n) => n.includes("/instances/")),
+    `a drifting guest is not on the overview: ${JSON.stringify(rows)}`);
+
+  // Clicking one goes to the board it lives on *and* opens it. Opening a sheet
+  // over a page the object is not on would leave whoever closes it looking at
+  // the overview again, wondering whether they imagined it.
+  const target = rows.find((n) => n.includes("/instances/"));
+  await page.evaluate(`document.querySelector('.overrow .linky[data-goes=' + JSON.stringify(${JSON.stringify(target)}) + ']').click()`);
+  const landed = await waitFor(page, `(() => {
+    if (!sheet.open || !view.coll) return null;
+    return { coll: view.coll.id, name: sheet.name, board: !document.querySelector(".boardwrap").classList.contains("hidden") };
+  })()`);
+  equal(landed.coll, "instances", "the click did not open the board the object is on");
+  equal(landed.name, target, "the wrong object was opened");
+  check(landed.board, "the board is still hidden behind the overview");
+  await page.evaluate(`closeSheet()`);
+});
+
+/// Adding a machine to the cell from the console — and the one moment that
+/// cannot be repeated.
+await test("adding a node shows its registration token once, with what to do with it", async () => {
+  await open(page, "nodes");
+  const opened = await page.evaluate(`(() => {
+    const button = document.getElementById("newbtn");
+    if (!button) return "the nodes board offers no way to add one";
+    button.click();
+    return "";
+  })()`);
+  check(!opened, opened);
+
+  await page.evaluate(`(async () => {
+    const id = document.getElementById("f-id");
+    id.value = "node-new";
+    id.dispatchEvent(new Event("input"));
+    document.getElementById("submitform").click();
+  })()`);
+
+  const shown = await waitFor(page, `(() => {
+    const box = document.getElementById("nodetoken");
+    return box ? document.getElementById("dialog").textContent : null;
+  })()`, { timeout: 15000 });
+
+  // The token itself, and the sentence that stops somebody expecting to find
+  // it again later.
+  check(shown.includes("b".repeat(64)), "the token is not on screen");
+  check(/cannot show it again/.test(shown), `it does not say the token is once-only: ${shown}`);
+  // The command it is for, with this node's id — the moment it is needed is
+  // the moment it is on screen.
+  check(shown.includes("velstra-cloud-node setup"), `no command to run: ${shown}`);
+  check(shown.includes("node-new"), `the command does not name the node: ${shown}`);
+  // And what the machine cannot decide about itself.
+  check(/external traffic/.test(shown), `it does not say where the role is set: ${shown}`);
+
+  // It has to be dismissed deliberately: a credential that scrolls away is a
+  // node that has to be deleted and made again.
+  await page.evaluate(`document.getElementById("tokendone").click()`);
+  const gone = await page.evaluate(`!document.getElementById("nodetoken")`);
+  check(gone, "the token panel would not close");
+});
+
+/// A tenant's two questions in one answer: what am I allowed, and what would
+/// actually start.
+await test("a project's sheet says what is left and which limit is in the way", async () => {
+  await open(page, "projects");
+  await openRow(page, "p1");
+  const said = await waitFor(page, `(() => {
+    const box = document.getElementById("allowance");
+    return box && !box.textContent.includes("Asking") ? box.textContent : null;
+  })()`);
+
+  // The shape somebody could start, not a sum of free memory across the cell —
+  // a hundred nodes with 2 GiB each cannot run a 4 GiB machine.
+  check(said.includes("Largest guest that would start"), `no answer about what fits: ${said}`);
+  // And which of the two is in the way, because "your quota" and "the
+  // machines" are two entirely different afternoons.
+  check(/limited by (your quota|the machines|both)/.test(said), `it does not say why: ${said}`);
+
+  // An unset limit is not a limit of nothing.
+  check(said.includes("no limit"), `an unset dimension did not read as unlimited: ${said}`);
+  // And a dimension that was set reads as used-of-limit.
+  check(/10 of 200/.test(said), `the vCPU line is not there: ${said}`);
+});
+
+/// The question an operator asks before the machine goes on a trolley: what is
+/// scheduled, and which guests cannot leave.
+await test("a node's sheet says what its maintenance window will cost", async () => {
+  await open(page, "nodes");
+  await openRow(page, "node-b");
+  const said = await waitFor(page, `(() => {
+    const box = document.getElementById("maintenance");
+    return box && !box.textContent.includes("Asking") ? box.textContent : null;
+  })()`);
+  check(said.includes("Out of service"), `the sheet does not say it is out: ${said}`);
+  check(said.includes("DIMM"), `it does not say what for: ${said}`);
+
+  // node-c is not out yet, and the sheet says when it will be rather than
+  // saying nothing until the hour arrives.
+  await openRow(page, "node-c");
+  const soon = await waitFor(page, `(() => {
+    const box = document.getElementById("maintenance");
+    const t = box ? box.textContent : "";
+    return t && !t.includes("Asking") && !t.includes("Out of service") ? t : null;
+  })()`);
+  check(soon.includes("Scheduled"), `an upcoming window is not shown: ${soon}`);
+  check(soon.includes("rack 4"), `it does not say what for: ${soon}`);
+});
+
+/// A node that is deliberately out of service, said on the board where its
+/// absence would otherwise read as a fault.
+await test("the nodes board says which machines are out and when they come back", async () => {
+  await open(page, "nodes");
+  const strip = await waitFor(page, `(() => {
+    const box = document.getElementById("cpuadvisory");
+    return box && !box.classList.contains("hidden") && box.textContent.includes("out of service")
+      ? box.textContent : null;
+  })()`);
+
+  check(strip.includes("node-b"), `the open window does not name the node: ${strip}`);
+  // Relative, not a clock time: "back at 03:00" does not say whether that has
+  // happened, and the operator is deciding about the next forty minutes.
+  check(/for another \d+ minutes/.test(strip), `it does not say for how much longer: ${strip}`);
+  check(strip.includes("DIMM"), `it does not say what for: ${strip}`);
+
+  // And the one nobody has been surprised by yet.
+  check(strip.includes("Scheduled") && strip.includes("node-c"),
+    `the upcoming window is not on the board: ${strip}`);
+  check(strip.includes("in 3 hours"), `it does not say when: ${strip}`);
+});
+
+await test("a label filter narrows the board and says so", async () => {
+  await open(page, "instances");
+  const all = await page.evaluate(`view.items.length`);
+  check(all > 1, `there is nothing to narrow: ${all} rows`);
+
+  // The buffer fills up over a long run, and a full one records nothing new.
+  await page.evaluate(`performance.clearResourceTimings()`);
+  await page.evaluate(`
+    document.getElementById("labelfilter").value = "env=prod";
+    document.getElementById("applyfilter").click();
+  `);
+  await sleep(600);
+  await waitFor(page, `view.items.length < ${all}`);
+
+  const narrowed = await page.evaluate(`({
+    rows: view.items.length,
+    names: view.items.map((i) => i.meta.name),
+    note: document.querySelector(".filternote") ? document.querySelector(".filternote").textContent : "",
+    // What the console actually asked the network for. If no request carries
+    // the selector, the narrowing happened here — which means the whole cell
+    // was fetched to show two rows of it, the cost a filter exists to avoid.
+    asked: performance.getEntriesByType("resource").map((e) => e.name).join(" "),
+  })`);
+  check(narrowed.rows < all, `the filter kept every row: ${narrowed.rows} of ${all}`);
+  check(narrowed.names.every((n) => n.endsWith("/web-1")),
+    `something without env=prod survived: ${narrowed.names.join(", ")}`);
+  check(narrowed.asked.includes("labels=env"), "the API was never asked to narrow — the console fetched the whole cell");
+  // A short list with no visible reason is how somebody concludes their guests
+  // are gone.
+  check(narrowed.note.includes("env=prod"), `the board does not say why it is short: ${narrowed.note}`);
+
+  // The rail still counts the collection, not the board. A filter is a way of
+  // looking at a list; it does not change how many guests a tenant has, and a
+  // rail that said otherwise would be reporting the filter as an outage.
+  const railSays = await page.evaluate(`census.instances.total`);
+  equal(railSays, all, "the rail counted the filtered board instead of the collection");
+
+  // A picker is not that board. One that quietly offered two of the five
+  // guests in the project — because of something typed on a list elsewhere —
+  // would be a wrong answer with no visible cause.
+  const offered = await page.evaluate(`(async () => {
+    forgetOptions("instances");
+    return (await options("instances")).length;
+  })()`);
+  equal(offered, all, "the filter narrowed a picker as well as the board");
+
+  // Leaving the board drops it. A filter typed about guests that silently
+  // shortened the volumes board would be the same confusion, one screen later.
+  await open(page, "volumes");
+  const carried = await page.evaluate(`session.labels`);
+  equal(carried, "", "the filter followed us to another board");
+
+});
+
 await test("signing out leaves nothing behind", async () => {
   // "Nothing behind" used to mean the token and the panel, and that is what this
   // checked — an assertion that held while everything the session had read was
@@ -1869,6 +2477,8 @@ await test("signing out leaves nothing behind", async () => {
     items: view.items.length,
     scopes: Object.keys(scopeFound).length,
   })`);
+  // And a filter, which is the newest thing a session accumulates.
+  await page.evaluate(`session.labels = "env=prod"`);
   check(before.options > 0 && before.census > 0 && before.items > 0,
     `nothing was cached, so this test would pass without checking anything: ${JSON.stringify(before)}`);
 
@@ -1883,6 +2493,9 @@ await test("signing out leaves nothing behind", async () => {
     coll: view.coll ? view.coll.id : null,
     revision: view.revision,
     scopes: Object.keys(scopeFound).length,
+    labels: session.labels,
+    home: view.home,
+    overview: document.getElementById("overviewbox").textContent.trim(),
     rail: document.getElementById("rail").textContent.trim(),
     board: document.querySelectorAll("#boardbody tr").length,
   })`);
@@ -1895,6 +2508,9 @@ await test("signing out leaves nothing behind", async () => {
   equal(left.coll, null, "the console still believes it is showing a collection");
   check(!left.revision, "the watch revision survived signing out");
   equal(left.scopes, 0, "where each collection was found survived signing out");
+  equal(left.labels, "", "the previous session's label filter survived signing out");
+  equal(left.home, false, "the console still believes it is showing the overview");
+  equal(left.overview, "", "the previous session's overview is still on screen");
   equal(left.rail, "", "the rail still lists the previous session's collections");
   equal(left.board, 0, "the previous session's rows are still on screen");
 });
