@@ -15,7 +15,7 @@
 //!   honest value — `Unknown` for a condition, `Unknown` for an instance state
 //!   — never to a plausible-looking one.
 
-use velstra_cloud_model::{ceph, meta, migration, resources};
+use velstra_cloud_model::{ceph, cpu, meta, migration, pci, resources};
 
 use crate::v1;
 
@@ -176,6 +176,10 @@ impl From<&resources::Quota> for v1::Quota {
             vcpus: q.vcpus,
             memory_mib: q.memory_mib,
             volume_gib: q.volume_gib,
+            volumes: q.volumes,
+            floating_ips: q.floating_ips,
+            load_balancers: q.load_balancers,
+            devices: q.devices,
         }
     }
 }
@@ -187,6 +191,10 @@ impl From<&v1::Quota> for resources::Quota {
             vcpus: q.vcpus,
             memory_mib: q.memory_mib,
             volume_gib: q.volume_gib,
+            volumes: q.volumes,
+            floating_ips: q.floating_ips,
+            load_balancers: q.load_balancers,
+            devices: q.devices,
         }
     }
 }
@@ -270,6 +278,11 @@ impl From<&resources::NodeSpec> for v1::NodeSpec {
         Self {
             schedulable: s.schedulable,
             labels: s.labels.clone(),
+            cpu_baseline: s.cpu_baseline.map(|l| l.as_str().to_string()),
+            fence_after_s: s.fence_after_s,
+            evacuate: s.evacuate,
+            vcpu_overcommit: s.vcpu_overcommit,
+            gateway: s.gateway,
         }
     }
 }
@@ -279,7 +292,47 @@ impl From<&v1::NodeSpec> for resources::NodeSpec {
         Self {
             schedulable: s.schedulable,
             labels: s.labels.clone(),
+            cpu_baseline: s.cpu_baseline.as_deref().and_then(parse_cpu_level),
+            fence_after_s: s.fence_after_s,
+            evacuate: s.evacuate,
+            vcpu_overcommit: s.vcpu_overcommit,
+            gateway: s.gateway,
         }
+    }
+}
+
+/// `Routed` / `Nat`, and `FromHost` / `FromGateway`, as the wire spells them.
+///
+/// Strings rather than enums, matching how `spread` and `affinity` cross: an
+/// unreadable value reads as the default, which for every one of these is the
+/// conservative answer — translate rather than hand the guest an address, and
+/// announce from a gateway rather than from a machine that may not be allowed
+/// to peer.
+fn delivery_str(d: velstra_cloud_model::public::Delivery) -> &'static str {
+    match d {
+        velstra_cloud_model::public::Delivery::Nat => "Nat",
+        velstra_cloud_model::public::Delivery::Routed => "Routed",
+    }
+}
+
+fn parse_delivery(s: &str) -> velstra_cloud_model::public::Delivery {
+    match s {
+        "Routed" => velstra_cloud_model::public::Delivery::Routed,
+        _ => velstra_cloud_model::public::Delivery::Nat,
+    }
+}
+
+fn announce_str(a: velstra_cloud_model::public::Announce) -> &'static str {
+    match a {
+        velstra_cloud_model::public::Announce::FromGateway => "FromGateway",
+        velstra_cloud_model::public::Announce::FromHost => "FromHost",
+    }
+}
+
+fn parse_announce(s: &str) -> velstra_cloud_model::public::Announce {
+    match s {
+        "FromHost" => velstra_cloud_model::public::Announce::FromHost,
+        _ => velstra_cloud_model::public::Announce::FromGateway,
     }
 }
 
@@ -295,6 +348,215 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             images: s.images.clone(),
             devices: s.devices.iter().map(Into::into).collect(),
             ceph: s.ceph.as_ref().map(Into::into),
+            cpu: s.cpu.as_ref().map(Into::into),
+            pci_devices: s.pci_devices.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+
+
+impl From<&resources::RunningSize> for v1::RunningSize {
+    fn from(s: &resources::RunningSize) -> Self {
+        Self {
+            vcpus: s.vcpus,
+            memory_mib: s.memory_mib,
+            root_disk_gib: s.root_disk_gib,
+        }
+    }
+}
+
+impl From<&v1::RunningSize> for resources::RunningSize {
+    fn from(s: &v1::RunningSize) -> Self {
+        Self {
+            vcpus: s.vcpus,
+            memory_mib: s.memory_mib,
+            root_disk_gib: s.root_disk_gib,
+        }
+    }
+}
+
+// ---- pci -------------------------------------------------------------------
+
+/// A device's state, flattened for the wire and read back.
+///
+/// Three strings rather than a `oneof` because the state carries at most one
+/// extra value and a `oneof` here would make every reader match on a wrapper
+/// to reach it. The flattening is total: a `state` this build does not know
+/// reads back as `Free`, which is wrong in the safe direction only if nothing
+/// else checks — and [`pci::offerable`] checks the whole IOMMU group, so an
+/// unknown state on a group-mate still blocks the group.
+fn device_use_out(u: &pci::DeviceUse) -> (&'static str, String, String) {
+    match u {
+        pci::DeviceUse::Free => ("free", String::new(), String::new()),
+        pci::DeviceUse::HostDriver { driver } => ("host-driver", driver.clone(), String::new()),
+        pci::DeviceUse::Guest { instance } => ("guest", String::new(), instance.clone()),
+    }
+}
+
+fn device_use_in(state: &str, driver: &str, instance: &str) -> pci::DeviceUse {
+    match state {
+        "host-driver" => pci::DeviceUse::HostDriver {
+            driver: driver.to_string(),
+        },
+        "guest" => pci::DeviceUse::Guest {
+            instance: instance.to_string(),
+        },
+        _ => pci::DeviceUse::Free,
+    }
+}
+
+fn device_kind_out(k: pci::DeviceKind) -> &'static str {
+    match k {
+        pci::DeviceKind::Gpu => "gpu",
+        pci::DeviceKind::Network => "network",
+        pci::DeviceKind::Storage => "storage",
+        pci::DeviceKind::Audio => "audio",
+        pci::DeviceKind::Other => "other",
+    }
+}
+
+fn device_kind_in(k: &str) -> pci::DeviceKind {
+    match k {
+        "gpu" => pci::DeviceKind::Gpu,
+        "network" => pci::DeviceKind::Network,
+        "storage" => pci::DeviceKind::Storage,
+        "audio" => pci::DeviceKind::Audio,
+        _ => pci::DeviceKind::Other,
+    }
+}
+
+impl From<&pci::PciDevice> for v1::PciDevice {
+    fn from(d: &pci::PciDevice) -> Self {
+        let (state, driver, instance) = device_use_out(&d.state);
+        Self {
+            address: d.address.clone(),
+            vendor_device: d.vendor_device.clone(),
+            description: d.description.clone(),
+            kind: device_kind_out(d.kind).to_string(),
+            iommu_group: d.iommu_group,
+            state: state.to_string(),
+            driver,
+            instance,
+        }
+    }
+}
+
+impl From<&v1::PciDevice> for pci::PciDevice {
+    fn from(d: &v1::PciDevice) -> Self {
+        Self {
+            address: d.address.clone(),
+            vendor_device: d.vendor_device.clone(),
+            description: d.description.clone(),
+            kind: device_kind_in(&d.kind),
+            iommu_group: d.iommu_group,
+            state: device_use_in(&d.state, &d.driver, &d.instance),
+        }
+    }
+}
+
+impl From<&pci::DeviceClassSpec> for v1::DeviceClassSpec {
+    fn from(c: &pci::DeviceClassSpec) -> Self {
+        Self {
+            matches: c.matches.clone(),
+            description: c.description.clone(),
+        }
+    }
+}
+
+impl From<&v1::DeviceClassSpec> for pci::DeviceClassSpec {
+    fn from(c: &v1::DeviceClassSpec) -> Self {
+        Self {
+            matches: c.matches.clone(),
+            description: c.description.clone(),
+        }
+    }
+}
+
+impl From<&resources::DeviceClassStatus> for v1::DeviceClassStatus {
+    fn from(s: &resources::DeviceClassStatus) -> Self {
+        Self {
+            observed_generation: s.observed_generation,
+            conditions: conditions_out(&s.conditions),
+        }
+    }
+}
+
+impl From<&v1::DeviceClassStatus> for resources::DeviceClassStatus {
+    fn from(s: &v1::DeviceClassStatus) -> Self {
+        Self {
+            observed_generation: s.observed_generation,
+            conditions: conditions_in(&s.conditions),
+        }
+    }
+}
+
+// ---- cpu -------------------------------------------------------------------
+
+/// A level as it is written on the wire. Kept as a string rather than an enum
+/// so an older peer sending a level this build has never heard of is dropped
+/// on the floor by [`parse_cpu_level`] instead of decoded as whichever variant
+/// happened to share its number.
+fn parse_cpu_level(s: &str) -> Option<cpu::CpuLevel> {
+    match s {
+        "x86-64-v1" => Some(cpu::CpuLevel::V1),
+        "x86-64-v2" => Some(cpu::CpuLevel::V2),
+        "x86-64-v3" => Some(cpu::CpuLevel::V3),
+        "x86-64-v4" => Some(cpu::CpuLevel::V4),
+        _ => None,
+    }
+}
+
+impl From<&cpu::NodeCpu> for v1::NodeCpu {
+    fn from(c: &cpu::NodeCpu) -> Self {
+        Self {
+            arch: c.arch.clone(),
+            vendor: c.vendor.clone(),
+            model_name: c.model_name.clone(),
+            family: c.family,
+            model: c.model,
+            stepping: c.stepping,
+            flags: c.flags.iter().cloned().collect(),
+            presents: c.presents.clone(),
+            presented_flags: c.presented_flags.iter().cloned().collect(),
+            can_mask: c.can_mask,
+        }
+    }
+}
+
+impl From<&v1::NodeCpu> for cpu::NodeCpu {
+    fn from(c: &v1::NodeCpu) -> Self {
+        Self {
+            arch: c.arch.clone(),
+            vendor: c.vendor.clone(),
+            model_name: c.model_name.clone(),
+            family: c.family,
+            model: c.model,
+            stepping: c.stepping,
+            flags: c.flags.iter().cloned().collect(),
+            presents: c.presents.clone(),
+            presented_flags: c.presented_flags.iter().cloned().collect(),
+            can_mask: c.can_mask,
+        }
+    }
+}
+
+impl From<&cpu::GuestCpu> for v1::GuestCpu {
+    fn from(c: &cpu::GuestCpu) -> Self {
+        Self {
+            model: c.model.clone(),
+            arch: c.arch.clone(),
+            flags: c.flags.iter().cloned().collect(),
+        }
+    }
+}
+
+impl From<&v1::GuestCpu> for cpu::GuestCpu {
+    fn from(c: &v1::GuestCpu) -> Self {
+        Self {
+            model: c.model.clone(),
+            arch: c.arch.clone(),
+            flags: c.flags.iter().cloned().collect(),
         }
     }
 }
@@ -429,6 +691,8 @@ impl From<&v1::NodeStatus> for resources::NodeStatus {
             images: s.images.clone(),
             devices: s.devices.iter().map(Into::into).collect(),
             ceph: s.ceph.as_ref().map(Into::into),
+            cpu: s.cpu.as_ref().map(Into::into),
+            pci_devices: s.pci_devices.iter().map(Into::into).collect(),
         }
     }
 }
@@ -460,6 +724,7 @@ impl From<&resources::ImageSpec> for v1::ImageSpec {
             format: v1::ImageFormat::from(s.format) as i32,
             size_bytes: s.size_bytes,
             source_url: s.source_url.clone(),
+            source_instance: s.source_instance.clone(),
             signature: s.signature.clone(),
         }
     }
@@ -472,6 +737,7 @@ impl From<&v1::ImageSpec> for resources::ImageSpec {
             format: s.format().into(),
             size_bytes: s.size_bytes,
             source_url: s.source_url.clone(),
+            source_instance: s.source_instance.clone(),
             signature: s.signature.clone(),
         }
     }
@@ -544,6 +810,10 @@ impl From<&resources::PlacementPolicy> for v1::PlacementPolicy {
         Self {
             anti_affinity_group: p.anti_affinity_group.clone(),
             required_labels: p.required_labels.clone(),
+            min_cpu_level: p.min_cpu_level.map(|l| l.as_str().to_string()),
+            affinity_group: p.affinity_group.clone(),
+            spread: strength_str(p.spread).to_string(),
+            affinity: strength_str(p.affinity).to_string(),
         }
     }
 }
@@ -553,7 +823,33 @@ impl From<&v1::PlacementPolicy> for resources::PlacementPolicy {
         Self {
             anti_affinity_group: p.anti_affinity_group.clone(),
             required_labels: p.required_labels.clone(),
+            // An unparseable level is dropped rather than guessed at: a
+            // requirement nobody can read is not a requirement to invent a
+            // value for, and `None` places the instance without the
+            // constraint rather than refusing every node over a typo.
+            min_cpu_level: p.min_cpu_level.as_deref().and_then(parse_cpu_level),
+            affinity_group: p.affinity_group.clone(),
+            // An unreadable strength reads as `Required`, which is the value
+            // the field has when nobody set it and the safe direction for a
+            // rule: refusing is recoverable, quietly placing beside a sibling
+            // that was meant to be elsewhere is not.
+            spread: parse_strength(&p.spread),
+            affinity: parse_strength(&p.affinity),
         }
+    }
+}
+
+fn strength_str(s: resources::Strength) -> &'static str {
+    match s {
+        resources::Strength::Required => "Required",
+        resources::Strength::Preferred => "Preferred",
+    }
+}
+
+fn parse_strength(s: &str) -> resources::Strength {
+    match s {
+        "Preferred" => resources::Strength::Preferred,
+        _ => resources::Strength::Required,
     }
 }
 
@@ -570,6 +866,14 @@ impl From<&resources::InstanceSpec> for v1::InstanceSpec {
             user_data: s.user_data.clone(),
             node: s.node.clone(),
             placement_policy: Some((&s.placement_policy).into()),
+            devices: s.devices.clone(),
+            console: s.console,
+            start_order: s.start_order,
+            start_delay_s: s.start_delay_s,
+            on_node_loss: match s.on_node_loss {
+                velstra_cloud_model::ha::OnNodeLoss::Restart => "restart".to_string(),
+                velstra_cloud_model::ha::OnNodeLoss::Leave => "leave".to_string(),
+            },
         }
     }
 }
@@ -591,6 +895,17 @@ impl From<&v1::InstanceSpec> for resources::InstanceSpec {
                 .as_ref()
                 .map(Into::into)
                 .unwrap_or_default(),
+            devices: s.devices.clone(),
+            console: s.console,
+            start_order: s.start_order,
+            start_delay_s: s.start_delay_s,
+            // Anything this build does not recognise reads as `leave`, which
+            // is the answer that does nothing — a policy nobody can parse must
+            // not become a decision to move somebody's guest.
+            on_node_loss: match s.on_node_loss.as_str() {
+                "restart" => velstra_cloud_model::ha::OnNodeLoss::Restart,
+                _ => velstra_cloud_model::ha::OnNodeLoss::Leave,
+            },
         }
     }
 }
@@ -605,6 +920,11 @@ impl From<&resources::InstanceStatus> for v1::InstanceStatus {
             addresses: s.addresses.clone(),
             vmm_pid: s.vmm_pid,
             started_at: s.started_at.map(millis),
+            cpu: s.cpu.as_ref().map(Into::into),
+            devices: s.devices.clone(),
+            console_tail: s.console_tail.clone(),
+            console_bytes: s.console_bytes,
+            running_size: s.running_size.as_ref().map(Into::into),
         }
     }
 }
@@ -612,6 +932,10 @@ impl From<&resources::InstanceStatus> for v1::InstanceStatus {
 impl From<&v1::InstanceStatus> for resources::InstanceStatus {
     fn from(s: &v1::InstanceStatus) -> Self {
         Self {
+            devices: s.devices.clone(),
+            console_tail: s.console_tail.clone(),
+            console_bytes: s.console_bytes,
+            running_size: s.running_size.as_ref().map(Into::into),
             observed_generation: s.observed_generation,
             conditions: conditions_in(&s.conditions),
             state: s.state().into(),
@@ -619,6 +943,7 @@ impl From<&v1::InstanceStatus> for resources::InstanceStatus {
             addresses: s.addresses.clone(),
             vmm_pid: s.vmm_pid,
             started_at: s.started_at.map(timestamp),
+            cpu: s.cpu.as_ref().map(Into::into),
         }
     }
 }
@@ -633,6 +958,7 @@ impl From<&resources::VolumeSpec> for v1::VolumeSpec {
             encryption_key: s.encryption_key.clone(),
             source_image: s.source_image.clone(),
             source_snapshot: s.source_snapshot.clone(),
+            source_backup: s.source_backup.clone(),
         }
     }
 }
@@ -645,6 +971,7 @@ impl From<&v1::VolumeSpec> for resources::VolumeSpec {
             encryption_key: s.encryption_key.clone(),
             source_image: s.source_image.clone(),
             source_snapshot: s.source_snapshot.clone(),
+            source_backup: s.source_backup.clone(),
         }
     }
 }
@@ -768,6 +1095,8 @@ impl From<&resources::NetworkSpec> for v1::NetworkSpec {
         Self {
             vni: s.vni,
             mtu: s.mtu,
+            external: s.external,
+            announce: announce_str(s.announce).to_string(),
         }
     }
 }
@@ -777,6 +1106,8 @@ impl From<&v1::NetworkSpec> for resources::NetworkSpec {
         Self {
             vni: s.vni,
             mtu: s.mtu,
+            external: s.external,
+            announce: parse_announce(&s.announce),
         }
     }
 }
@@ -846,6 +1177,11 @@ impl From<&resources::FloatingIpSpec> for v1::FloatingIpSpec {
             // would mean two ways to say it.
             address: s.address.clone().unwrap_or_default(),
             port: s.port.clone(),
+            delivery: delivery_str(s.delivery).to_string(),
+            // Empty is "whatever the network says", which is a third state the
+            // wire can carry without inventing one: there is no announcement
+            // called the empty string.
+            announce: s.announce.map(announce_str).unwrap_or_default().to_string(),
         }
     }
 }
@@ -856,6 +1192,8 @@ impl From<&v1::FloatingIpSpec> for resources::FloatingIpSpec {
             subnet: s.subnet.clone(),
             address: (!s.address.is_empty()).then(|| s.address.clone()),
             port: s.port.clone(),
+            delivery: parse_delivery(&s.delivery),
+            announce: (!s.announce.is_empty()).then(|| parse_announce(&s.announce)),
         }
     }
 }
@@ -1142,6 +1480,13 @@ pub fn destination_of(node: &str, refusal: Option<&migration::Refusal>) -> v1::D
         Refusal::DestinationTooSmall { .. } => "DestinationTooSmall",
         Refusal::VersionsTooFarApart { .. } => "VersionsTooFarApart",
         Refusal::DestinationLacksImage { .. } => "DestinationLacksImage",
+        // Two reasons, not one. A console showing them the same way would send
+        // an operator to configure a baseline in the case where no baseline
+        // can help, and to restart a guest in the case where a baseline would
+        // have avoided the restart.
+        Refusal::DestinationCpuIncompatible { .. } => "DestinationCpuIncompatible",
+        Refusal::GuestCpuUnknown { .. } => "GuestCpuUnknown",
+        Refusal::HoldsDevices { .. } => "HoldsDevices",
     };
     v1::Destination {
         node: node.to_string(),
@@ -1235,6 +1580,39 @@ impl From<&velstra_cloud_model::reconcile::Explanation> for v1::Rejection {
                 "AntiAffinity",
                 format!("another member of {group} is already here"),
             ),
+            Rejected::CpuLevelTooLow { has, want } => (
+                "CpuLevelTooLow",
+                match has {
+                    Some(has) => format!("the node is {has}, {want} wanted"),
+                    None => format!("the node has not reported a cpu, {want} wanted"),
+                },
+            ),
+            // The mismatch already writes itself as a sentence that says what
+            // would help; re-summarising it here would produce a second, worse
+            // version of the same explanation.
+            Rejected::CpuIncompatible { why } => ("CpuIncompatible", why.to_string()),
+            // The shortfall already writes itself as a sentence that names the
+            // device standing in the way; re-summarising it here would produce
+            // a second, worse version of the same explanation.
+            Rejected::NoDevice { why } => ("NoDevice", why.to_string()),
+            // Where the rest of the group is, because one of those names is a
+            // machine to go and look at and "no valid host" is not.
+            Rejected::NotWithGroup { group, elsewhere } => (
+                "NotWithGroup",
+                format!("{group} is on {}", elsewhere.join(", ")),
+            ),
+            // "For another 40 minutes" rather than an absolute time: this
+            // detail is read out of an instance's condition hours after it was
+            // written, when "back at 03:00" no longer says whether that has
+            // happened.
+            Rejected::InMaintenance { minutes_left, note } => (
+                "InMaintenance",
+                if note.is_empty() {
+                    format!("out of service for another {minutes_left} minutes")
+                } else {
+                    format!("out of service for another {minutes_left} minutes: {note}")
+                },
+            ),
         };
         Self {
             node: e.node.clone(),
@@ -1271,6 +1649,11 @@ mod tests {
         let original = Resource::new(
             meta,
             InstanceSpec {
+                start_order: 0,
+                start_delay_s: 0,
+                on_node_loss: Default::default(),
+                console: false,
+                devices: Vec::new(),
                 vcpus: 4,
                 memory_mib: 8192,
                 image: "projects/p1/images/sha256-abc".into(),
@@ -1281,11 +1664,22 @@ mod tests {
                 user_data: Some("#cloud-config".into()),
                 node: Some("node-a".into()),
                 placement_policy: resources::PlacementPolicy {
+                    min_cpu_level: Some(cpu::CpuLevel::V3),
                     anti_affinity_group: Some("web".into()),
                     required_labels: vec!["ssd".into()],
+                    ..Default::default()
                 },
             },
             InstanceStatus {
+                running_size: None,
+                console_tail: String::new(),
+                console_bytes: 0,
+                devices: Vec::new(),
+                cpu: Some(cpu::GuestCpu {
+                    model: "x86-64-v3".into(),
+                    arch: "x86_64".into(),
+                    flags: ["sse4_2", "avx"].iter().map(|s| s.to_string()).collect(),
+                }),
                 observed_generation: 6,
                 conditions: vec![Condition::new(
                     "Ready",

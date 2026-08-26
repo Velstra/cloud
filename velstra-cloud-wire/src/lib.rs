@@ -208,10 +208,17 @@ mod tests {
         let node = Resource::new(
             meta,
             NodeSpec {
+                evacuate: false,
+                vcpu_overcommit: 0,
+                fence_after_s: 0,
                 schedulable: true,
                 labels: vec!["ssd".into()],
+                cpu_baseline: None,
+                gateway: false,
             },
             NodeStatus {
+                pci_devices: Vec::new(),
+                cpu: None,
                 observed_generation: 3,
                 conditions: vec![Condition::new(
                     "Ready",

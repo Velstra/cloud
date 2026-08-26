@@ -311,7 +311,13 @@ mod tests {
             "subscribing opened another watch on the store"
         );
 
-        typed.create(&instance("i1")).await.unwrap();
+        typed
+            .create(
+                &instance("i1"),
+                &velstra_cloud_model::access::Writer::controller("cache"),
+            )
+            .await
+            .unwrap();
         for (who, rx) in [("a", &mut a), ("b", &mut b), ("c", &mut c)] {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
                 .await
@@ -334,7 +340,13 @@ mod tests {
         cache.all().await;
         let mut events = cache.subscribe();
 
-        typed.create(&instance("i1")).await.unwrap();
+        typed
+            .create(
+                &instance("i1"),
+                &velstra_cloud_model::access::Writer::controller("cache"),
+            )
+            .await
+            .unwrap();
         events.recv().await.expect("no event");
         let (held, revision) = cache.all().await;
         assert_eq!(held.len(), 1, "woken about an object the read cannot see");
@@ -354,7 +366,13 @@ mod tests {
         assert_eq!(cache.subscribers(), 1);
         drop(listening);
 
-        typed.create(&instance("i1")).await.unwrap();
+        typed
+            .create(
+                &instance("i1"),
+                &velstra_cloud_model::access::Writer::controller("cache"),
+            )
+            .await
+            .unwrap();
         settle(|| cache.subscribers() == 0).await;
         assert_eq!(
             cache.subscribers(),
@@ -408,7 +426,13 @@ mod tests {
             raw.clone(),
             crate::prefix_for("cell-1", "instances"),
         );
-        typed.create(&instance("i1")).await.unwrap();
+        typed
+            .create(
+                &instance("i1"),
+                &velstra_cloud_model::access::Writer::controller("cache"),
+            )
+            .await
+            .unwrap();
         settle(|| true).await;
         cache.all().await;
         let mut events = cache.subscribe();
@@ -419,7 +443,11 @@ mod tests {
             .unwrap()
             .unwrap();
         typed
-            .delete("projects/p1/instances/i1", held.meta.revision)
+            .delete(
+                "projects/p1/instances/i1",
+                held.meta.revision,
+                &velstra_cloud_model::access::Writer::controller("cache"),
+            )
             .await
             .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())

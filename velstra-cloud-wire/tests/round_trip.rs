@@ -75,6 +75,7 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "NodeStatus",
         NodeStatus {
+            pci_devices: Vec::new(),
             observed_generation: 7,
             conditions: vec![],
             capacity: Capacity {
@@ -100,6 +101,18 @@ fn every_resource_survives_its_own_wire() {
                     fstype: "ext4".into(),
                 },
             }],
+            cpu: Some(velstra_cloud_model::cpu::NodeCpu {
+                arch: "x86_64".into(),
+                vendor: "GenuineIntel".into(),
+                model_name: "Intel(R) Xeon(R) Gold 6248R".into(),
+                family: 6,
+                model: 85,
+                stepping: 7,
+                flags: ["sse4_2", "avx", "avx2"].iter().map(|s| s.to_string()).collect(),
+                presents: "x86-64-v3".into(),
+                presented_flags: ["sse4_2", "avx"].iter().map(|s| s.to_string()).collect(),
+                can_mask: true,
+            }),
             ceph: Some(NodeCeph {
                 installed: true,
                 version: "19.2.0".into(),
@@ -216,6 +229,11 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "InstanceSpec",
         InstanceSpec {
+            start_order: 0,
+            start_delay_s: 0,
+            on_node_loss: Default::default(),
+            console: false,
+            devices: Vec::new(),
             vcpus: 2,
             memory_mib: 4096,
             image: "projects/p1/images/sha256-abc".into(),
@@ -244,6 +262,7 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "VolumeSpec",
         VolumeSpec {
+            source_backup: None,
             size_gib: 10,
             pool: "pools/p".into(),
             source_image: Some("projects/p1/images/sha256-abc".into()),
