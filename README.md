@@ -5,9 +5,59 @@ feel, hyperscaler mechanics underneath. The network is
 [Velstra fabric](https://github.com/Velstra/fabric), the eBPF/XDP SDN this is
 built around.
 
-**Status: early.** The model, the store and the reconciliation decisions are
-real and tested. The API, controllers, node agent and console are being built on
-top of them. Nothing here is production software yet.
+## Quickstart
+
+```
+git clone https://github.com/Velstra/cloud && cd cloud
+nix run .#dev
+```
+
+One process, one in-memory store, and a whole seeded cell in it: the command
+prints the console URL and the token to sign in with, and the console has a
+project, a network, volumes and instances to show — one of them deliberately
+unschedulable, so the *why not* surfaces are populated too. No `/dev/kvm`
+needed; the dev cell's hypervisor is fake and no guest is real, which the
+banner says out loud.
+
+Installing the real thing — the immutable compute-node image, its installer
+ISO with the first-boot registration wizard, and the control plane as OCI
+images or a systemd module — is `docs/install.md`.
+
+**Status: the invariants and the model are the settled foundation; the API,
+controllers, node agent and console are built on top and exercised by CI — but
+this is not yet production software proven on hardware.** The model, the store
+and the reconciliation decisions are real and tested (the three invariants
+below are enforced, not documented). Built on top of them today:
+
+- a **gRPC + REST API over one set of handlers** with bearer-token auth,
+  role-based authz (Read / Write / Administer, project as the tenancy unit),
+  **per-node identity** (a node token may only read its cell and write the
+  status of its own objects), **quotas** enforced at admission and only counted
+  (never incremented) thereafter, and an hourly **session sweeper**;
+- a **controller set** over the pure reconcile functions — instances, volumes,
+  snapshots, attachments, networks, routers, floating IPs, subnets, ports,
+  security groups, images, Ceph clusters, migrations, operations;
+- a **node agent** with a `Vmm` trait and **QEMU + Cloud Hypervisor** backends,
+  **Ceph/RBD** storage, and **live migration** (QMP pre-copy);
+- a self-contained **web console**.
+
+CI runs fmt/clippy/`cargo test`, a **contract-drift gate** (every served
+collection must appear in `docs/rest-contract.md`), the console in a real
+headless browser against the contract, and **two real-VM boot tests**, one per
+VMM backend, on a runner with `/dev/kvm`.
+
+Honest caveats. The default posture is a **single-operator trust model** —
+`docs/rest-contract.md` is explicit that Direct-mode agents holding the operator
+token are a trusted deployment, not an enforced boundary; the hardened per-node
+`--api` path is what scopes each node to its own objects. Image signatures are
+carried on the wire but **deliberately rejected** until something verifies them
+(a field kept for a future one-commit change, not a gap left open). And the
+real-hardware exercise so far is the two guest-boot backends in CI — live
+migration and a Ceph cluster are covered by unit/integration tests, not yet run
+on metal. The **LoadBalancer kind** fronts the fabric's own L4 balancer (a VIP
+DNAT-rewritten in XDP with connection tracking); it carries no weights, no
+algorithm knob and no health checks, deliberately, because the data plane has
+none — a field nothing reads is a claim the platform cannot keep.
 
 ## The one idea
 
@@ -108,6 +158,18 @@ To run the same things here, install `etcd`, `qemu-system-x86_64`,
 
 - `docs/rest-contract.md` — the HTTP surface, fixed. The API serves it and the
   console consumes it; neither changes it alone.
+- `docs/deployment-and-devices.md` — how a node is installed and what hardware
+  it can hand a guest: the decision record behind the flake.
+- `docs/setup-guide.md` — from nothing to a machine running guests, twice: by
+  hand through the console, and from a file with nobody watching.
+- `docs/install.md` — installing it: the node image, the installer ISO and its
+  wizard, the Debian package, machine roles, registration, and how several
+  cells answer at one address.
+- `docs/operating.md` — running it once it is up: which question to ask before
+  acting, taking a machine out of service, recovery, overcommit, placement
+  groups, and which copy survives which loss.
+- `docs/cpu-heterogeneity.md` — a cell of mixed processor generations: what can
+  migrate where, what baselining costs, and how a third generation is added.
 
 ## Licence
 

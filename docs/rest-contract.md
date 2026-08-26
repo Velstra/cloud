@@ -26,14 +26,231 @@ DELETE /api/v1/projects/p1/instances/i1
 
 Collections, in the order the API serves them: `projects`, `users`,
 `ceph-clusters`, `instances`, `migrations`, `volumes`, `snapshots`,
-`attachments`, `networks`, `routers`, `floatingips`, `subnets`, `ports`,
-`security-groups`, `images`, `nodes`, `pools`, `operations`.
+`attachments`, `networks`, `routers`, `floatingips`, `load-balancers`,
+`subnets`, `ports`, `security-groups`, `images`, `nodes`, `pools`,
+`device-classes`, `backup-targets`, `backups`, `backup-schedules`, `audit`,
+`captures`, `snapshot-schedules`, `maintenance-windows`, `operations`.
 
-Two collections stored beside these are deliberately **not** served and are on
-no path here: `credentials` (a password hash) and `sessions` (a live bearer
-token). A route that does not exist cannot leak what it would have returned;
-signing in and out reach them through the session endpoints below, never as
-collections.
+### Narrowing a list by label
+
+Every object carries `meta.labels`. A list can be narrowed by them:
+
+```
+GET /api/v1/projects/p1/instances?labels=env=prod,tier=web
+GET /api/v1/projects/p1/instances?labels=deprecated
+```
+
+Every term must match. There is no "or" — it would need precedence rules, and
+a filter whose meaning depends on precedence is one people get wrong silently.
+Somebody who needs "or" runs two searches and can see both answers.
+
+A bare key asks whether the label is there at all, whatever its value. An
+**empty** selector matches everything, because that is what "no filter" has to
+mean: the alternative is a filter box that empties the list when it is cleared,
+which reads as "nothing here" rather than "no filter".
+
+A selector matching nothing is an empty list and `200`, never an error — "no
+guests are tagged that" is an answer, and refusing it would make a typo look
+like a broken endpoint.
+
+Filtering is **not** refusing, and the audit reflects that: narrowing a list
+writes nothing, however many objects it skips. `audit` records somebody who
+reached for a thing by name and was told no.
+
+### Snapshot schedules
+
+The cheap half of the pair:
+
+```
+POST /api/v1/projects/p1/snapshot-schedules
+{ "spec": { "volume": "projects/p1/volumes/data-1", "everyHours": 1, "keep": 24 } }
+```
+
+A snapshot lives in the volume's **own pool**. It is taken in a moment, costs
+almost nothing, and is the right tool for "let me be able to go back an hour".
+It is not a backup: lose the pool and it goes with it. That is why these are
+two collections rather than one with a flag — a flag is a thing people set
+wrong, and the consequence only shows up on the day the pool is gone.
+
+The retention rules are the *same code* as `backup-schedules`, not a second
+copy of them: a snapshot still being taken holds the schedule, only finished
+ones count toward `keep`, at least one always survives, and ones taken by hand
+are never expired. A rule written twice is a rule that will eventually be two
+rules.
+
+### Templates: capture a guest, stamp out copies
+
+Build a guest by hand, get it right, stop it, capture it. Every guest made from
+the result starts where that one left off.
+
+```
+POST /api/v1/projects/p1/captures
+{ "spec": { "instance": "projects/p1/instances/golden",
+            "label": "debian-13-golden",
+            "target": "backup-targets/shared" } }
+```
+
+**The guest must be stopped.** A disk copied from under a running machine is
+crash-consistent at best — survivable for a backup, which is read once in an
+emergency by somebody who knows what happened, and not survivable for a
+template that will be stamped out a hundred times by people who assume it is
+clean:
+
+```
+409 { "error": { "code": "FAILED_PRECONDITION", "field": "spec.instance",
+                 "message": "…is running, and a disk copied from under a running machine is crash-consistent — which a template stamped out a hundred times must not be. Stop it first. If what you want is a copy of a live guest, take a backup: that is read once, by somebody who knows what happened." } }
+```
+
+It is a resource rather than a call, and that follows from something already
+true: **an image's name carries its digest**, which is what makes fetching one
+verifiable — the agent refuses any image whose name does not. So there is no
+name to hand back before the bytes exist. The node copies and reports
+`status.digest`; a controller then creates the image, named
+`<label>-sha256-<digest>` and pointing at `file://<target>/<digest>`. Any node
+that can reach that path can boot from it.
+
+Which image a capture became is **computed**, not stored: the node owns the
+capture's status and does not create the image, so a field saying "it is over
+there" would need a second writer on one object. `label` and `digest` are both
+on the capture, and a derived link cannot go stale — a capture whose image was
+deleted stops naming one instead of pointing at something gone.
+
+Cloning is then what it already was: create an instance with
+`spec.image` naming the captured image. `image.spec.sourceInstance` records
+which guest it came from, so a list of near-identical templates says which is
+which.
+
+### Audit
+
+`audit` is **not** a log of everything that happened. Every successful write
+already creates an `operation` carrying its target, its verb, who asked for it
+and when it finished — that is the record of what was done, and a second log
+beside it would eventually disagree with it about one afternoon.
+
+What no operation exists for is a request that was **refused**: nothing is
+created, nothing changes, and the only trace is a status code somebody else
+received. That is exactly what a multi-tenant cell is asked about afterwards —
+who tried to reach another tenant's guests, and from when. Sign-ins are here
+for the same reason.
+
+```
+GET /api/v1/audit
+{ "items": [ { "spec": { "kind": "refused", "subject": "alice@example.com",
+                         "verb": "read", "target": "projects/p2/instances/i1",
+                         "detail": "…", "at": 1787687886000 } } ] }
+```
+
+`detail` is the *same* sentence the caller was given, not a paraphrase — an
+audit line an operator has to correlate by hand against what somebody actually
+saw is one they stop trusting.
+
+Cell-scoped, and readable by cell operators only: a tenant who could read this
+would learn the names of projects and people that are not theirs, which is the
+opposite of what it is for.
+
+**It cannot be flooded.** A refusal is something an attacker can cause at will,
+so the record's id is derived from who, what, which verb and which *minute* — a
+thousand attempts in one minute collide on create and leave one record. The
+exact count is lost and the fact is not, which is the right way round.
+
+Nothing expires it. Refusals are rare in a working cell and sign-ins are bounded
+by how many people there are, so the volume is small — and a record that quietly
+went away before somebody came looking is worse than a disk they can see
+filling. Records can be deleted by an operator who has read them.
+
+### Backups
+
+A **snapshot** lives in the volume's own pool. It is the right tool for "let me
+be able to go back an hour" and it is not a backup: lose the pool and the
+snapshot goes with it, at exactly the moment somebody needs it.
+
+A **backup** is a copy on a `backup-target` — somewhere that is not the source
+pool. That single property is the reason the collection exists, and it is
+enforced rather than documented:
+
+```
+POST /api/v1/projects/p1/backups
+{ "spec": { "volume": "projects/p1/volumes/data-1", "target": "backup-targets/same-pool" } }
+409 { "error": { "code": "FAILED_PRECONDITION", "field": "spec.target",
+                 "message": "backup-targets/same-pool is pools/fast, which is where projects/p1/volumes/data-1 already lives — a copy in the same pool is a snapshot, and is lost with the pool it is in. Back up to a different target." } }
+```
+
+`backup-targets` is cell-scoped: the storage belongs to the cell. `backups` and
+`backup-schedules` are a project's.
+
+A **schedule** is an intention, never a job queue:
+
+```
+POST /api/v1/projects/p1/backup-schedules
+{ "spec": { "volume": "projects/p1/volumes/data-1", "target": "backup-targets/nightly",
+            "everyHours": 24, "keep": 7 } }
+```
+
+A controller creates a `backup` when nothing this schedule made is younger than
+`everyHours`, and deletes this schedule's oldest once more than `keep` have
+**finished**. Two rules that are not obvious and both matter:
+
+* A copy still being made counts toward "is one recent enough" — so a volume
+  that takes an hour to copy does not have a second asked for every pass, and a
+  copy that is *stuck* holds the schedule for one interval and no longer.
+* Only **finished** copies count toward `keep`, and at least one always
+  survives. A week of failed attempts must not expire the last copy that
+  worked, which is precisely the week somebody will need it.
+* Copies taken by hand carry no `schedule` and are never expired by one. They
+  are somebody's decision.
+
+**Restoring is making a new volume**, never writing one back:
+
+```
+POST /api/v1/projects/p1/volumes
+{ "spec": { "sizeGib": 40, "pool": "pools/fast",
+            "sourceBackup": "projects/p1/backups/nightly-1787687886" } }
+```
+
+`sourceBackup` sits beside `sourceImage` and `sourceSnapshot` — three spellings
+of one statement about where a volume came from. An in-place restore would be a
+command living in a spec, carried out again on every resync, undoing whatever
+the guest wrote in between, forever, with nothing on the object to say it
+happened.
+
+`device-classes` is cell-scoped, like `nodes`: a class names interchangeable
+PCI hardware across the fleet, and defining it per project would be a different
+name for the same silicon in every tenancy. What a project controls is
+`quota.devices` — how many passed-through devices its instances may hold.
+
+An instance asks for a class, never a PCI address:
+
+```
+POST /api/v1/projects/p1/instances
+{ "spec": { "devices": ["gpu-a100"], ... } }
+```
+
+An address (`0000:41:00.0`) belongs to one machine, so an instance naming one
+could only ever be scheduled there. Two entries of the same class mean two
+different devices. A device is offered only when **everything in its IOMMU
+group is free** — a group is the unit of isolation, so it is passed through
+whole or not at all — and `:explainPlacement` says which neighbouring device
+stands in the way:
+
+```
+{ "node": "node-b", "why": "NoDevice",
+  "detail": "no free gpu-a100 here — 0000:41:00.0: 0000:41:00.1 is in the same IOMMU group (17) and is bound to snd_hda_intel; a group is passed through whole or not at all" }
+```
+
+A guest holding one cannot be live-migrated — a device's state is in hardware
+and there is nothing to send — and the refusal names the alternative:
+
+```
+{ "node": "node-b", "allowed": false, "why": "HoldsDevices",
+  "detail": "it holds 0000:41:00.0 — a device's state is in hardware and cannot be transferred; move it with mode Reboot, which stops the guest and gives it the destination's devices" }
+```
+
+Three collections stored beside these are deliberately **not** served and are on
+no path here: `credentials` (a password hash), `sessions` (a live bearer token),
+and `node-credentials` (the digest of a per-node agent token). A route that does
+not exist cannot leak what it would have returned; signing in and out reach the
+first two through the session endpoints below, and a node token is minted at
+registration and verified on every request, never listed.
 
 One of them hangs off another object rather than off a project: a snapshot is
 created under the volume it copies, at
@@ -397,6 +614,66 @@ a `FAILED_PRECONDITION`. So is naming a snapshot that has not been taken yet, or
 one held by a different pool than the volume would live in — no backend clones
 between pools behind a single command.
 
+## Load balancers
+
+One address in front of many ports, served by the fabric's own L4 balancer:
+flows are DNAT-rewritten at the ingress host with connection tracking and
+reverse NAT, so there is no appliance to place and no machine that owns the
+object — its status is written by the controller, like a router's.
+
+```json
+{ "spec": {
+    "network": "projects/p1/networks/prod",
+    "subnet":  "projects/p1/subnets/prod-a",
+    "vip": "10.20.0.20",
+    "listeners": [ { "protocol": "Tcp", "port": 443, "memberPort": 8080 } ],
+    "members":   [ "projects/p1/ports/web-1-eth0" ] },
+  "status": {
+    "vip": "10.20.0.20",
+    "listeners": [ { "protocol": "Tcp", "port": 443, "members": 1 } ], … } }
+```
+
+What a client may rely on:
+
+- **`spec.vip` is derived like a floating IP's address.** Omitted, a controller
+  fills in the lowest address nothing else holds — the same counting the ports
+  and the floating IPs use, so no two holders ever share an address. Stated, it
+  is kept and never overruled. `status.vip` is the observed half: the address
+  the fabric actually serves, empty until it does.
+- **A listener is `protocol` (`Tcp` or `Udp` — the datapath balances no
+  others), the `port` the VIP answers on, and `memberPort`, the port the
+  members answer on; `0` or omitted keeps the client's own destination port.**
+  A listener on port 0, or two listeners claiming one `protocol/port`, is
+  refused on write with the index of the offending listener in the error's
+  `field`. A load balancer with **no** listeners is accepted and waits,
+  reporting `Ready=False` with reason `Incomplete` — the same shape as a router
+  with no networks.
+- **`members` names ports, not addresses**, so a migrated guest stays in the
+  pool, and a member can never point at an address nothing serves. Empty is a
+  drained pool — a legitimate state to hold an address in. A member that does
+  not resolve yet (no such port, not placed, not programmed) holds the whole
+  pool back with `Ready=False` reason `MembersNotReady` naming it; the fabric
+  is never programmed with part of a pool, because a pool serving three of its
+  four members looks balanced and silently leaves one out.
+- **There are no weights, no algorithm and no health checks — deliberately.**
+  The fabric spreads flows uniformly by connection hash and reports nothing
+  about a member's health, and this API does not carry a field nothing reads:
+  a weight the console displayed as if it biased traffic, or a health-check
+  policy nothing runs, would be the unverified-signature defect over again.
+  `status.listeners[].members` is a count of what is programmed, emphatically
+  not a health verdict. When the fabric grows any of these, the field arrives
+  with the code that honours it.
+- **Deleting waits for the fabric.** `DELETE` returns 202 and the object stays
+  listable, carrying `fabric.velstra.io/release`, until every fabric service
+  has been retired — an address that kept answering after its object vanished
+  would be traffic arriving somewhere nothing can explain.
+- **Quota**: a project's `quota.loadBalancers` caps how many a project may
+  hold, counted from what exists like every other dimension, and refused at
+  create with `RESOURCE_EXHAUSTED`.
+
+Like `security-groups`, this collection is served on the JSON surface only;
+there is no gRPC service for it yet.
+
 ## Long-running operations
 
 Anything that cannot finish inside the request returns an operation, AIP-151:
@@ -536,6 +813,605 @@ create runs, so the two can never disagree. `why` is a stable token
 `detail` is the sentence; both are empty on a destination that is allowed.
 Asking creates nothing and writes nothing.
 
+And so is the state of the cell's processors — the one question that is about
+the fleet rather than about any member of it, which is why it hangs off the
+collection:
+
+```
+GET /api/v1/nodes:explainCpu
+{ "unreported": [],
+  "domains": [ { "nodes": ["node-a","node-b"], "arch": "x86_64",
+                 "level": "x86-64-v2", "canBaseline": true },
+               { "nodes": ["node-c"], "arch": "x86_64",
+                 "level": "x86-64-v4", "canBaseline": true } ],
+  "advice": [ { "kind": "NodeOutsideTheAggregate", "node": "node-c",
+                "presents": "host", "aggregate": "x86-64-v2",
+                "aggregateNodes": 2, "missing": [] } ],
+  "pendingAdoption": [ { "instance": "projects/p1/instances/i1", "node": "node-a",
+                         "running": "x86-64-v4", "wouldGet": "x86-64-v2" } ] }
+```
+
+And what would actually still fit:
+
+```
+GET /api/v1/nodes:explainCapacity
+{ "usableNodes": 8, "unusableNodes": 2,
+  "total":      { "vcpus": 320, "memoryMib": 1310720, "diskGib": 40960 },
+  "allocated":  { "vcpus": 210, "memoryMib":  917504, "diskGib": 22000 },
+  "free":       { "vcpus":  88, "memoryMib":  262144, "diskGib": 14000 },
+  "largestFit": { "vcpus":  16, "memoryMib":   32768, "diskGib":  4000 } }
+```
+
+`largestFit` is the field worth having and the reason this is computed here
+rather than left to whoever draws the dashboard: **free memory does not add up
+into a guest.** Sixty-four gibibytes spread over eight nodes fits no
+sixteen-gibibyte guest, and a summary showing only `free` tells somebody one
+does.
+
+`free` counts the **usable** nodes only, so it and `total` disagree by exactly
+the drained capacity — on purpose. A node that is draining, being emptied, or
+not reporting still exists and still has memory; none of it is somewhere a
+guest can go. `unusableNodes` is named rather than folded in, because "we have
+twelve nodes" and "eight will take a guest" are different sentences and the
+second is the one somebody planning capacity needs.
+
+A **domain** is a set of nodes that can exchange a guest. Computed on every
+read, never stored: a stored grouping drifts from the fleet the moment a
+machine is replaced.
+
+`advice` is tagged by `kind`, so a console branches on what it is rather than
+sniffing which fields are present. Every recommendation carries its **cost**:
+`BaselineWouldMerge` lists `featuresLost` per node, because a suggestion that
+names only the benefit arrives wearing the platform's authority. On
+`NodeOutsideTheAggregate`, an empty `missing` means the machine could join and
+simply has not been told; a non-empty one means it never can, and the honest
+remedy is a second aggregate.
+
+`pendingAdoption` lists guests still running a CPU their node no longer hands
+out — the ordinary, self-clearing state after a baseline change. Each adopts
+on its next restart. Until then it can only move to a node still presenting
+what it booted with, which after a fleet-wide change may be nowhere.
+
+`unreported` names nodes whose agent has not said what processor they have.
+Named rather than dropped: "2 of 5 nodes" with no list reads as a broken
+report. Such a node is in no domain and is never shown as compatible with
+anything — the whole surface fails closed.
+
+Asking creates nothing and writes nothing.
+
+### Start order
+
+After a power cut a node brings back everything it holds at once, and the
+database everything else needs loses the race for disk to a dozen web servers.
+
+```
+PATCH /api/v1/projects/p1/instances/db-1  { "spec": { "startOrder": 1 } }
+PATCH /api/v1/projects/p1/instances/web-1 { "spec": { "startOrder": 2, "startDelayS": 30 } }
+```
+
+Lower starts first; the same number is a group that starts together. `0` — the
+default — is the first group. `startDelayS` is measured from the **newest**
+start in the group ahead, not from each member in turn: otherwise a fleet's
+boot is the sum of every delay rather than the longest one.
+
+Nothing is queued and there is no "starting" state. Every pass asks the same
+question of the same world, and a guest that may not start yet is simply not
+started this pass.
+
+What counts as *settled*, ahead of you, is where the deadlock would live:
+
+* `Running` — up.
+* `Failed` — it had its chance. Waiting forever for a guest that cannot start
+  would take a whole node down for one broken disk.
+* Anything whose `desiredState` is `Stopped` — it is not coming up.
+
+Everything else holds the guests behind it, and that is deliberate: the
+alternative is starting the application servers without the database and
+calling it success.
+
+### Resizing a guest
+
+`spec.vcpus`, `spec.memoryMib` and `spec.rootDiskGib` can be changed on a guest
+that is running. **Nothing changes on the running machine.** The guest gets what
+was asked for the next time it starts.
+
+That is said rather than implied, and this is the fix for a real hole: the
+platform used to accept such a change, do nothing, and report the object as
+converged — a spec that read as applied while the guest ran on the old numbers.
+
+What a running guest actually has is on its status:
+
+```
+GET /api/v1/projects/p1/instances/i1
+{ "spec":   { "vcpus": 8, "memoryMib": 8192, "rootDiskGib": 40, ... },
+  "status": { "runningSize": { "vcpus": 4, "memoryMib": 8192, "rootDiskGib": 40 }, ... } }
+```
+
+The difference between the two *is* the pending change; there is no separate
+flag, because a flag can be stale and a comparison cannot. `runningSize` is
+absent while the guest is not running — there is nothing to differ from, and
+its next start gives it the spec by construction.
+
+A root disk may grow. It may **not** shrink:
+
+```
+PATCH /api/v1/projects/p1/instances/i1   { "spec": { "rootDiskGib": 10 } }
+400 { "error": { "code": "FAILED_PRECONDITION", "field": "spec.rootDiskGib",
+                 "message": "…has a 40 GiB root disk and cannot be shrunk to 10: the bytes past the new end would be gone and the filesystem using them would find out later. Make a smaller guest from a backup instead." } }
+```
+
+Shrinking is not a resize, it is a truncation. No backend asks the guest first
+and none can.
+
+### Taking a node out of service
+
+Two fields, and they are separate because they are separate intentions:
+
+* `nodes/<id>.spec.schedulable: false` — **drain**. Nothing new is placed here;
+  what runs keeps running. This is what an operator wants for a reboot.
+* `nodes/<id>.spec.evacuate: true` — **empty it**. And none of the old stays
+  either.
+
+Evacuating creates one ordinary `migration` per guest that can move — nothing
+else, because the migration machinery already knows when moving a guest is
+safe, and a second path that also moved guests would be a second set of rules
+about that. The emptiest destination wins by free memory: first-fit would move
+every guest to the same machine, which is how emptying one node fills another.
+
+A guest that cannot move is left where it is, and the node still empties around
+it. Some never can — one holding a passed-through device is bound to that
+machine — and `:explainMigration` says which node refused for what. Turning
+`evacuate` off stops further moves; it does not bring anything back, because a
+transfer that has started is a thing to see through rather than a state to
+unwind.
+
+### When a node stops answering
+
+A node that has gone quiet is not a node that has stopped. It may be
+unreachable and still running every guest it holds, and starting those guests
+elsewhere then produces two of each writing to one volume — an outage turned
+into a restore from backup.
+
+So recovery rests on one mechanism: **the node's own agent stops its guests
+before anything may start them.** `nodes/<id>.spec.fenceAfterS` is how long the
+agent may fail to report before it does, decided against its own clock, needing
+nothing from anybody. The control plane then waits that long *again* before
+unplacing anything.
+
+A node whose `fenceAfterS` is zero — the default — is **never recovered from**.
+Nothing can tell "unreachable" from "stopped", so nothing is assumed.
+
+A guest opts in with `spec.onNodeLoss: "restart"` (default `"leave"`). Only for
+one whose storage every node can reach: a guest on local storage started
+elsewhere is an empty machine wearing a familiar name.
+
+Why a guest has or has not come back is answered, never written onto it — the
+agent on its node owns that status, and two writers on one object is the thing
+this platform is built to prevent:
+
+```
+GET /api/v1/projects/p1/instances/i1:explainRecovery
+{ "node": "nodes/node-b", "recoverable": false, "why": "WaitingForFencing",
+  "detail": "nodes/node-b was last heard from 30s ago; 120s is when its guests are certainly stopped" }
+```
+
+`why` is a stable token — `PolicyIsLeave`, `WaitingForFencing`,
+`NodeDoesNotFence`, `HoldsDevices`, `NotRunning`, `NotPlaced` — because the
+reasons are four different afternoons for whoever reads them. Recovery itself
+is one write: the controller clears `spec.node`, and the scheduler then places
+the guest exactly as it would any unplaced one.
+
+### Keeping guests apart, and keeping them together
+
+```
+"placementPolicy": {
+  "antiAffinityGroup": "web", "spread": "Required",
+  "affinityGroup": "checkout", "affinity": "Preferred"
+}
+```
+
+Anti-affinity keeps a service alive when a machine dies; affinity keeps it fast
+while they all live — an application and the cache it reads on every request,
+where a hop between machines is the whole latency budget. A platform with only
+the first can express half of what people actually run.
+
+`spread` and `affinity` are each `Required` (the default, and what this platform
+did before the fields existed) or `Preferred`. Both are right answers to
+different questions: three replicas of a database must not share a machine even
+if that means one stays down; twelve web servers would rather be crowded than
+short. A `Preferred` constraint is carried into the score instead of rejecting,
+where "beside its sibling" loses to "anywhere else" and still beats "not running
+at all". The order is lexicographic and not weighted — be with your group, then
+away from your siblings, then on the emptiest machine — because a weight is a
+number somebody has to tune and the first time it is wrong it is wrong silently.
+
+Affinity only bites once a member is placed: before that there is nothing to be
+near, and refusing every node would mean a group whose first member could never
+start. When it cannot be honoured, the rejection says where the group actually
+is:
+
+```
+"rejected": [ { "node": "node-a", "why": "NotWithGroup", "detail": "checkout is on node-b" } ]
+```
+
+### Sharing a processor, and never sharing memory
+
+```
+PATCH /api/v1/nodes/node-a   { "spec": { "vcpuOvercommit": 4 } }
+```
+
+Zero — the default — means one for one, the same reading a quota's zero gets, so
+a node stored before the field existed behaves exactly as it did. It applies to
+**placement only**: the guest still gets the vCPUs it asked for and the
+hypervisor still schedules them; what changes is how many the cell believes the
+node has room for.
+
+There is deliberately **no memory ratio**. A processor can be shared — two
+guests that both want a core get one each in turn, and being wrong costs speed —
+and that is a trade an operator makes on purpose. Memory cannot: a guest
+promised 8 GiB and handed 4 is not slow, it is killed, and the operator finds
+out from a guest that has vanished. There should be no such field until this
+platform can take a page back, which means ballooning, and which is a feature
+rather than a number.
+
+Past `32` vCPUs per core the ratio is refused: that is where it stops being a
+trade and becomes a way of hiding that a cell is full.
+
+`nodes:explainCapacity` reports both numbers — `total.vcpus` is silicon,
+`offeredVcpus` is what the usable nodes will hand out. Either alone reads as
+though the cell had grown a processor.
+
+### One recorded shape, two implementations
+
+The console is tested against `velstra-cloud-console/tests/console/fake-api.mjs`,
+which implements this document in memory — so a console can be written and
+tested before the server runs. The cost is that every custom method has two
+implementations with nothing between them.
+
+So the API records what it answers. `velstra-cloud-api/tests/contract_shapes.rs`
+writes `velstra-cloud-api/tests/contract/shapes.json` — the **shape** of each
+answer, keys and value kinds, never values — and the console's own suite holds
+its fixture to the same file. One artifact, generated by the implementation that
+ships.
+
+`null`, `[]` and `{}` on either side mean "this fixture had nothing here", which
+is a fact about a fixture and not about the contract. What is left is what
+breaks a screen: a key spelled differently, missing, or holding a number on one
+side and a string on the other. Re-record deliberately and read the diff:
+
+```
+UPDATE_SHAPES=1 cargo test -p velstra-cloud-api --test contract_shapes
+```
+
+**One spelling worth knowing about.** `hugepages1gi` is all lowercase on the
+wire. The field is `hugepages_1gi`, and `hugepages_1_gi` — which would read
+`hugepages1Gi` — cannot round-trip: coming back, a digit followed by an
+uppercase letter is how `l3Vni` is told from `hugepages1gi`, and one convention
+cannot serve both.
+
+### Public addresses: the ones the guest actually holds
+
+Two ways an address can reach a guest, and they are not variants of one thing:
+
+```
+POST /api/v1/projects/p1/floatingips
+{ "id": "web", "spec": { "subnet": "projects/p1/subnets/public",
+                         "port": "projects/p1/ports/web-1-eth0",
+                         "delivery": "Routed", "announce": "FromHost" } }
+```
+
+* `delivery: "Nat"` (the default, and what this object meant before there was a
+  choice) — translated at the edge; the guest never sees the address. The
+  datapath half of it is the fabric's and is deferred there.
+* `delivery: "Routed"` — the address is **bound to the port as a second address
+  and configured by the guest**. Nothing rewrites a packet. The guest gets it as
+  a `/32` (or `/128`) with an on-link next hop, `169.254.1.1`, which is in no
+  subnet anybody declared — that is what frees the address from any L2 segment,
+  so the same configuration is correct on every hypervisor and stays correct
+  across a live migration.
+
+A guest holding a public address **defaults out through it**. Leaving the
+default on the tenant gateway would send replies from the public address out of
+a door they cannot return through.
+
+A routed address must come from a subnet on a network an operator marked
+`external: true` — a tenant range is not an address the world can reach, and
+only a cell operator may set that flag (a tenant who could would mint themselves
+a public prefix by typing a CIDR).
+
+**Who announces it** is the second choice, and it is a real one:
+
+* `FromHost` — the hypervisor holding the guest announces the /32 itself.
+  Shortest path: for north-south traffic the overlay is not in the path at all,
+  and the route follows a migration by construction, because each host announces
+  the addresses of the ports it holds. Needs every hypervisor to peer with the
+  network above it.
+* `FromGateway` (the default) — a node with `spec.gateway: true` announces it and
+  traffic reaches the guest over the overlay. Few, stable next hops upstream; a
+  hairpin in both directions. A cell with no gateway node is refused by name
+  rather than silently doing nothing.
+
+The network says what the cell does (`network.spec.announce`); an address may
+disagree (`floatingip.spec.announce`). Those are two different questions — one
+about the wiring, one about a particular service — and an address that is silent
+takes the network's answer.
+
+```
+GET /api/v1/projects/p1/floatingips/web:explainReach
+{ "address": "203.0.113.7", "delivery": "Routed", "external": true,
+  "port": "projects/p1/ports/web-1-eth0", "on": "node-a",
+  "announced": { "from": "host", "nodes": ["node-a"] },
+  "guest": { "address": "203.0.113.7/32", "via": "169.254.1.1",
+             "onLink": true, "defaultRoute": true } }
+```
+
+`announced.from` is `null` with a `why` when nothing is announcing it — held and
+pointing at nothing, a guest not yet placed, a cell with no gateway, or a
+translated address, which has no route of its own to announce.
+
+### A capture is real bytes now
+
+The node holding the guest claims the capture, copies the disk to the target,
+hashes it, and reports the digest. Until then the object was created, assigned
+to that node, and nothing ever picked it up — so the controller that turns a
+finished capture into an image never had a finished one to act on.
+
+The copy is written under a temporary name and hashed *there*: the final name
+carries the digest, and a digest cannot be known before the bytes exist. That is
+the same reason `capture` is a resource rather than a call that hands back an
+image.
+
+A running guest is refused, in the model's own words — and the refusal names the
+tool that does what they wanted (a backup, which is read once by somebody who
+knows what happened, rather than stamped out a hundred times by people who
+assume it is clean).
+
+A guest whose root disk is a pool volume answers `NoDisk`: the node has no
+bytes to read, and the honest place to capture it from is the pool.
+
+### Where copies are kept
+
+```
+POST /api/v1/backup-targets
+{ "id": "archive",
+  "spec": { "kind": "directory", "path": "/srv/archive", "accepting": true,
+            "agent": "nvme" } }
+```
+
+`kind` is **`directory`**, lowercase — the one field on this object people
+mis-type, because it reads as an exception beside `Running` and `Stopped`. The
+refusal names the spelling it wanted.
+
+`agent` names the pool agent that **reports** on the target: whether the path is
+there, whether it can be written, how much room is left. Named by an operator
+rather than claimed by whoever gets there first, because a target assigned to
+nobody is one any agent could grab — and "an agent may only report on what it
+was given" is what makes a node token a boundary rather than a formality.
+
+Leaving it empty means nobody is looking. `status.writable` is then `null`,
+which is **not** the same as `false`: copies are still written there by the pool
+holding the volume, and a path it cannot reach fails loudly on the backup rather
+than quietly on the target.
+
+### Backups are real bytes now
+
+A `Backup` is claimed by the pool holding the volume, which copies the bytes out
+to the target's path under the backup's own name with its slashes flattened —
+`/srv/archive/projects~p1~backups~b1` — so a person can read a target with `ls`
+and two cells sharing one cannot collide.
+
+`status.taken` is **consulted**, not merely reported: a copy that exists is
+never made again, because a second one would be of a different moment under a
+name somebody trusts. A copy that failed is never reported as taken, and the
+reason lands on the backup itself — "why is there no copy" is asked months
+later by somebody looking at the backup, not at a log on whichever machine
+happened to run that pool.
+
+Restoring is creating a volume **from** a copy:
+
+```
+POST /api/v1/projects/p1/volumes
+{ "id": "restored", "spec": { "sizeGib": 40, "pool": "nvme",
+                              "sourceBackup": "projects/p1/backups/b1" } }
+```
+
+The backup's name, never a path: a path is a fact about one machine's
+filesystem. The pool resolves it — the backup says which target, the target says
+where — and if it cannot (the copy was never taken, or the target is not mounted
+on that machine) the volume is **refused rather than made blank**. A volume that
+was asked to be a restore and quietly came up empty is the worst outcome
+available: it boots, it is the right size, and everything that was on it is
+gone.
+
+### Writing too fast
+
+A cell may cap how fast one caller **writes** (`--writes-per-second`, off by
+default). Over the cap:
+
+```
+429 Retry-After: 1
+{ "error": { "code": "RESOURCE_EXHAUSTED",
+             "message": "too many writes at once; this one would be the 21st in a second. Try again in 50 ms — the same request, unchanged, will be accepted then." } }
+```
+
+The wait is on the response, in the header for a client library and in the
+sentence for a person, because a client that guesses either spins or backs off
+far longer than it needed to. `Retry-After` is rounded **up** to whole seconds,
+so a client that obeys it to the letter is never turned away twice for the same
+reason.
+
+Three properties worth relying on:
+
+* **Reads are never counted.** A caller reading in a loop is only slowing
+  themselves down.
+* **Node agents are never limited.** An agent reports when something changed,
+  and something changing is not something it can defer; refusing one would make
+  it fall behind and be judged unreachable by the control plane that was the
+  reason.
+* **It is a bucket, not a window.** Somebody who has been quiet may spend a
+  burst at once — creating twenty guests is a normal Tuesday — and a caller who
+  keeps going settles at the sustained rate.
+
+This is not a security boundary and does not pretend to be one. What it stops is
+the ordinary accident: one tenant taking the cell's write path from the rest
+without ever meaning to.
+
+### A field this platform does not have
+
+A spec field nobody has heard of is **refused**, not ignored:
+
+```
+PATCH /api/v1/nodes/node-a   { "spec": { "memoryOvercommit": 2 } }
+400 { "error": { "code": "INVALID_ARGUMENT", "field": "spec.memoryOvercommit",
+                 "message": "there is no field called memoryOvercommit on a nodes; nothing would have been done with it" } }
+```
+
+Serde ignores what it does not recognise, which is right for **reading stored
+objects** — a field removed from the code must not make yesterday's data
+unreadable — and wrong at the door: an operator answered `200` goes home
+believing memory is overcommitted. So the strictness is at the boundary and not
+on the types.
+
+An unknown field carrying *nothing* — `null`, `""`, `0`, `[]`, `{}` — is
+accepted in silence. That is somebody echoing back an object or clearing a
+field, and no intention is lost.
+
+### The records about one object
+
+```
+GET /api/v1/projects/p1/operations?target=projects/p1/instances/i1
+GET /api/v1/audit?target=projects/p1/instances/i1
+```
+
+Only `operations` and `audit` carry a target; any other collection asked for one
+is refused rather than answered with the whole cell as though the filter had
+applied. A target that matches nothing is an empty list — "nothing has happened
+to it" is an answer.
+
+The two together are the object's history, and reading only the first is how
+somebody concludes their click did nothing: the **refusal** is the answer.
+
+`audit` is cell-scoped, and a cell operator reads it whole. It is **not**
+operators-only, and the exception has two exact edges: a record is readable by
+whoever may read **what it is about**, and by **the person it is about**.
+Neither leaks — the first already reads the target, the second is their own
+refusal — and everything else about the cell stays the operator's, including a
+refusal about another project and a sign-in, which is about no object at all.
+
+As with every list, a caller who may see none of it gets an empty list rather
+than a `403`: a refusal on a collection would be an oracle for what is in it.
+
+### What a project has left, and what it could actually start
+
+Two halves in one answer, because either alone answers the wrong question. "24
+vCPUs of quota left" is what a tenant reads before creating a guest that will
+never be placed; "no valid host" is what they get afterwards, from a scheduler
+that knows nothing about quotas.
+
+```
+GET /api/v1/projects/p1:explainQuota
+{ "project": "projects/p1",
+  "dimensions": [
+    { "name": "instances", "limit": 10, "used": 3, "left": 7,
+      "unlimited": false, "exhausted": false },
+    { "name": "memoryMib", "limit": 0, "used": 20480, "left": null,
+      "unlimited": true, "exhausted": false }, … ],
+  "largestStartable": { "vcpus": 16, "memoryMib": 16384,
+                        "vcpusLimitedBy": "quota", "memoryLimitedBy": "cell",
+                        "none": false } }
+```
+
+`limitedBy` is the point: `quota` is a message to an operator, `cell` is
+waiting or picking a smaller shape, and `both` says that raising the quota
+alone would give this tenant nothing. A **limit of zero is a limit nobody set**,
+so `left` is `null` rather than `0` — the two are different answers and must not
+render as one.
+
+`largestStartable` is never a sum. The cell's free memory does not add up into a
+guest — a hundred nodes with 2 GiB each cannot run a 4 GiB machine — so its
+cell-side input is the largest single node, and a node inside an open
+maintenance window is not one of them.
+
+All eight dimensions are always present, in a fixed order: a list that showed
+only the interesting ones would rearrange itself between two reads of the same
+screen.
+
+### Taking a machine out of service on purpose
+
+A maintenance window is a declaration about a stretch of time. Nothing flips
+`schedulable` or `evacuate` on the operator's behalf — placement and evacuation
+ask "is this node inside an open window right now" and act, so the operator goes
+on being the only writer of those two fields, and a window that ends puts
+everything back by *ceasing to be open*:
+
+```
+POST /api/v1/maintenance-windows
+{ "id": "dimm-swap",
+  "spec": { "node": "node-b", "startsAt": 1755600000000, "minutes": 60,
+            "drain": false, "note": "swapping the failed DIMM in slot 3" } }
+```
+
+`drain: false` says nothing new is placed here and everything already running
+stays put — a four-minute firmware update. `drain: true` also migrates the
+guests away, by the ordinary evacuation machinery. One field, two intentions;
+conflating them would move a fleet for a reboot.
+
+Upcoming, open and over are **not stored**. They are arithmetic on `startsAt`,
+`minutes` and the clock — a stored `state` would be a transient state, right
+only while somebody was awake to write it.
+
+Four windows are refused at the moment they are declared, because all four are
+knowable then and the alternative is finding out at three in the morning: a
+length of zero, a length past `20160` minutes, a window whose end is already
+past, and one that overlaps another window on the same node. A start time in the
+past is *accepted* — work that has already begun is a true thing to declare.
+
+A node in an open window is rejected by placement like any other unsuitable
+node, with the reason on the instance:
+
+```
+"rejections": [ { "node": "node-b", "why": "InMaintenance",
+                  "detail": "out of service for another 40 minutes: swapping the failed DIMM in slot 3" } ]
+```
+
+Relative, not a clock time: this is read out of an instance's condition hours
+after it was written, when "back at 03:00" no longer says whether that has
+happened.
+
+What a window will cost is answerable **before** it opens, which is the only
+time the answer is any use:
+
+```
+GET /api/v1/nodes/node-b:explainMaintenance
+{ "node": "node-b",
+  "open": { "window": "maintenance-windows/dimm-swap", "startsAt": …, "endsAt": …,
+            "minutes": 60, "drain": false, "note": "…", "opensInMinutes": null },
+  "next": null,
+  "draining": false,
+  "willMove": [ { "instance": "projects/p1/instances/web-1", "to": "node-a" } ],
+  "cannotMove": [ { "instance": "projects/p1/instances/gpu-1",
+                    "why": [ { "node": "node-a", "detail": "…holds a passed-through device…" } ] } ] }
+```
+
+`cannotMove` is the half that decides whether tonight goes well: a guest that
+cannot move is stopped when the machine is, and every node's verdict is on the
+line rather than a flattened "no host found" — the remedy for "a generation too
+old" and the remedy for "it holds a GPU" are nothing like each other.
+
+A baseline is declared per node, and refused if the machine cannot reach it:
+
+```
+PATCH /api/v1/nodes/node-c   { "spec": { "cpuBaseline": "x86-64-v4" } }
+400 { "error": { "code": "FAILED_PRECONDITION", "field": "spec.cpuBaseline",
+                 "message": "node-c cannot present x86-64-v4: it lacks avx512f, avx512dq" } }
+```
+
+Refused here rather than at boot. `-cpu <level>,enforce` would catch it —
+QEMU refuses to start a guest it cannot give the promised processor — but "the
+guests on node-c stopped booting" is a long way from the sentence above.
+Clearing the field is always allowed: going back to the host's own processor
+asks nothing of the machine.
+
 ## Authentication
 
 **Who may do what.** Authentication says *who*; the bindings on a project say
@@ -624,13 +1500,57 @@ PUT    /api/v1/users/{id}/password   # set a password
   in; an operator changing someone else's ends all of theirs, which is the point
   when an operator is shutting a door.
 
-### Node agents write with the operator's token
+### Node agents, and the two ways they write
 
-A node agent authenticates as a **cell operator** and writes its own node object
-directly — there is no per-node credential, and the writer identity on a node
-report is self-declared. This is a deliberate limit of the current
-single-operator phase, **not** a trust boundary: anything holding the operator
-token can write any node's status. It is safe only because the operator token is
-held by the operator's own agents. Per-node identities are the shape that would
-make it a boundary; until then, do not read the writer field on a node object as
-proof of which machine wrote it.
+A node agent runs one of two ways, and the difference is a real trust boundary
+rather than a configuration preference.
+
+**Direct (the default).** The agent holds a cell-operator token and writes to the
+store directly. The store's one-writer rule still refuses a write that is not
+this node's, but the *identity* on that write is self-declared: anything holding
+the operator token could write any node's status, so this is safe only because
+the operator token is held by the operator's own agents. This is the
+single-operator phase — a trusted deployment, not an enforced boundary.
+
+**`--api` (per-node identity).** Each node is minted its own token when it is
+registered, and the agent reads and writes **through the API** with that token
+instead of touching the store. The token authenticates the caller as *that one
+node*, and the API enforces what it may do:
+
+- It may **read** the cell — a node needs tenant network config, images and the
+  node list to run its guests, and reads them as it always has.
+- It may **write status** only of objects it owns or was assigned — its own node
+  object, and the instances, ports and attachments placed on it. A write for
+  another node's object is refused `403 PERMISSION_DENIED`; it may not change any
+  `spec`, and it may not create or delete anything.
+
+So a compromised node holds a credential that can write only its own objects'
+status, which the operator token never was.
+
+**A node token is minted once, at registration.** A `POST` that creates a node
+returns, alongside the operation, a `nodeToken` field — the only time the token
+is shown. Only its digest is stored, in a collection the API does not serve
+(beside `credentials` and `sessions`), so it cannot be recovered from the cell
+afterwards, and a node cannot rotate its own credential: the digest is a `spec` a
+node may never write. Deleting the node deletes its credential with it.
+
+```
+POST /api/v1/nodes → 202
+{ "operation": "operations/op-3", "target": "nodes/node-a",
+  "nodeToken": "…64 hex chars, shown once…" }
+```
+
+**A node reports status with a custom method**, AIP-136's `:reportStatus`, which
+is the one write outside the `spec`-only PATCH surface because it is a different
+caller doing a different thing:
+
+```
+POST   /api/v1/projects/p1/instances/i1:reportStatus
+Authorization: Bearer <node token>
+If-Match: "412"                 # the revision the agent read, for a compare-and-swap
+{ "status": { … } }             # only the status is written; spec and meta are kept
+```
+
+A person, a service account or a cell operator has no node identity and so may
+not use it: `status` is the agent's half, and the API does not get to be more
+permissive than the store.
