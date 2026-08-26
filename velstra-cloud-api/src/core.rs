@@ -1311,6 +1311,7 @@ impl Api {
             check_rules(name.collection(), spec)?;
             if name.collection() == "volumes" {
                 self.refuse_a_new_source(name, spec).await?;
+                self.refuse_a_moved_pool(name, spec).await?;
             }
             if name.collection() == "ceph-clusters" {
                 self.refuse_a_disk_that_is_not_free(spec).await?;
@@ -1851,6 +1852,8 @@ impl Api {
         self.answer_migration(document).await?;
         self.answer_security_group(document, scratch).await?;
         self.answer_subnet(document, scratch).await?;
+        answer_instance(document);
+        answer_node(document);
         self.answer_image(document, scratch).await
     }
 
@@ -3025,6 +3028,43 @@ impl Api {
         Ok(())
     }
 
+    /// A volume's pool is where its bytes are, and re-pointing it moves none.
+    ///
+    /// This was accepted until now, and what it produced was worse than a
+    /// refusal. A pool agent watches for `spec.pool == its own name` and claims
+    /// what it finds by writing `status.pool`. Change the spec and the old
+    /// pool's filter stops matching, so it lets go without being asked; the new
+    /// pool's filter matches, sees a volume another pool still has claimed, and
+    /// declines to touch something that is not its own. The volume then sits
+    /// there converging on nothing, its bytes intact and unmanaged on a disk
+    /// nobody is looking at any more, with no condition, no event and no log
+    /// line saying so — because from every component's point of view it did
+    /// exactly the right thing.
+    ///
+    /// So it is refused here, where the answer is still a form somebody has
+    /// open, and the refusal names the way that does work.
+    async fn refuse_a_moved_pool(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
+        let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let stored: Volume = self.typed(name).await?;
+        // Writing back what is already there is not a change — the same rule
+        // every other field check here follows, so that a client echoing an
+        // object it read is never refused for a field it did not touch.
+        if asked == stored.spec.pool {
+            return Ok(());
+        }
+        Err(ApiError::invalid(format!(
+            "{name} has its bytes in {}, and changing spec.pool moves none of them: the \
+             pool that has it would stop watching and the named pool would decline a \
+             volume it does not own, leaving this converging on nothing. To put it on \
+             {asked}: back it up to a target, create a volume there with spec.sourceBackup \
+             set to that copy, point whatever uses this at the new one, and delete this",
+            stored.spec.pool
+        ))
+        .at("spec.pool"))
+    }
+
     // ---- migration --------------------------------------------------------
 
     /// Fill in where the guest is now, and refuse a move that cannot work.
@@ -3785,6 +3825,98 @@ fn under(document: &Value, parent: &str) -> bool {
 /// So the flag is an operator's, and it is refused rather than ignored: a
 /// silently dropped `external: true` would leave somebody believing they had a
 /// public network and wondering why nothing reaches it.
+/// What else comes with each of a node's passable devices.
+///
+/// Passing one device through takes its whole IOMMU group — the hardware cannot
+/// isolate less than that — and an operator who learns it afterwards learns it
+/// from an outage. [`velstra_cloud_model::pci::offerable`] already refuses a
+/// device whose group has a busy member, so nothing unsafe can be *assigned*;
+/// what was missing is the sentence before the decision.
+///
+/// Computed rather than reported, for one specific reason. The wire already
+/// carries every device's `iommuGroup`, so a console could group them itself —
+/// and would get the interesting case backwards. A device with no group means
+/// "this machine cannot isolate it", and `group_members` answers with the
+/// device alone; a client-side filter on equality would instead collect every
+/// IOMMU-less device on the node into one imaginary group, which reads as "all
+/// of these come together" when the truth is that none of them can be passed at
+/// all.
+fn answer_node(document: &mut Value) {
+    // `pci_devices`, not `devices` — the latter is this node's *block* devices,
+    // which the Ceph disk picker reads. Two inventories of one machine's
+    // hardware, and they are not the same list.
+    let Some(devices) = document
+        .get("status")
+        .and_then(|s| s.get("pci_devices"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let Ok(parsed) =
+        serde_json::from_value::<Vec<velstra_cloud_model::pci::PciDevice>>(json!(devices))
+    else {
+        return;
+    };
+    let with: Vec<Value> = parsed
+        .iter()
+        .map(|d| json!(velstra_cloud_model::pci::group_members(d, &parsed)))
+        .collect();
+    for (device, members) in document["status"]["pci_devices"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .zip(with)
+    {
+        device["group_with"] = members;
+    }
+}
+
+/// What a running guest has been asked for and will only get when it restarts.
+///
+/// The fifth computed field, and the one with the sharpest reason for existing.
+/// A guest that is resized while it runs takes the new numbers at its next
+/// start, not now — that is ordinary and correct. What was not correct is that
+/// nothing said so: the spec read 8 vCPUs, `observedGeneration` caught up
+/// because the agent had genuinely handled the change, `Ready` was true, and
+/// the guest went on running on 4. Every screen agreed it had converged.
+///
+/// The arithmetic and the reason were written down in
+/// [`velstra_cloud_model::resources::pending_changes`] — whose own comment says
+/// the alternative "is a spec that reads as applied while the guest runs on the
+/// old numbers", because that is what shipped — and then nothing ever called
+/// it. The agent already reports `status.runningSize`; this is the half that
+/// reads it.
+///
+/// Computed rather than stored, like the four above: it is a comparison between
+/// a spec and a status, and a third copy of it could disagree with both.
+/// Absent, rather than an empty list, when there is nothing pending — a field
+/// that is always there is one a reader has to inspect to learn nothing.
+fn answer_instance(document: &mut Value) {
+    // Only a guest has one, and only a running guest has it set: a stopped one
+    // has nothing to differ from, and its next start gives it the spec by
+    // construction.
+    if document
+        .get("status")
+        .and_then(|s| s.get("running_size"))
+        .is_none_or(Value::is_null)
+    {
+        return;
+    }
+    let Ok(instance) = serde_json::from_value::<velstra_cloud_model::resources::Instance>(
+        document.clone(),
+    ) else {
+        // A document that will not parse as an instance is not one. Reading it
+        // as a guest with nothing pending would be an answer about an object
+        // this function never understood.
+        return;
+    };
+    let pending = velstra_cloud_model::resources::pending_changes(&instance);
+    if pending.is_empty() {
+        return;
+    }
+    document["status"]["pending_changes"] = json!(pending);
+}
+
 fn refuse_an_external_network_from_a_tenant(
     spec: &Value,
     who: &Identity,
