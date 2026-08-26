@@ -2157,6 +2157,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "velstra-cloud-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+]
+
+[[package]]
 name = "velstra-cloud-nodeagent"
 version = "0.1.0"
 dependencies = [
@@ -2176,6 +2184,7 @@ dependencies = [
  "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
+ "velstra-cloud-api",
  "velstra-cloud-fabric",
  "velstra-cloud-model",
  "velstra-cloud-store",

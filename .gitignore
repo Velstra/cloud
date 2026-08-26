@@ -1,1 +1,5 @@
 /target
+
+# nix build output symlinks
+/result
+/result-*

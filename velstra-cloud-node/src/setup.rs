@@ -1,0 +1,591 @@
+//! The wizard for a machine that already has an operating system.
+//!
+//! ## Why this is not `install`
+//!
+//! [`crate::install`] makes an appliance: it partitions disks, clones a sealed
+//! image, and seeds the data partition of a machine that is not running yet.
+//! That is the right shape for a box you flash and forget, and the wrong shape
+//! for one that already runs Debian — or NixOS, where partitioning is somebody
+//! else's declaration entirely.
+//!
+//! So this asks the same questions and writes the same seed, and touches
+//! nothing else. What it does *not* do is as deliberate as what it does: no
+//! disks, no bootloader, no packages. The machine is already installed; what is
+//! missing is the answer to "which cell, as what, with which token".
+//!
+//! ## One seed, two packagings
+//!
+//! Debian and NixOS end up with the same file at the same path, and each
+//! packaging supplies the units. The unit is conditional on its role being in
+//! the seed, so on both systems the answer to "what is running here" is one
+//! file — readable, comparable, and the same thing the appliance writes.
+//!
+//! On Debian the wizard also *enables* what the roles say, because a package
+//! that installs units and starts none is a package where somebody has to know
+//! four unit names. On NixOS it does not: units there are a declaration, and a
+//! wizard reaching into them would be fighting the operating system. It prints
+//! the module snippet instead, and says why.
+//!
+//! ## What it cannot do, and the reason
+//!
+//! It cannot mark this machine a gateway, give it labels, or make it
+//! schedulable. Those live on the Node object and are an operator's to write —
+//! a registration token exists so a machine can *report*, and one that could
+//! also declare its holder a gateway would be a token that grants itself the
+//! cell's external traffic. The wizard says where they are set instead of
+//! pretending.
+
+use std::{fs, os::unix::fs::PermissionsExt, path::{Path, PathBuf}};
+
+use anyhow::{Context, Result, bail};
+
+use crate::{
+    roles::{Role, render_list},
+    wizard::{ask_valid, ask_yes, prompt, validate_node_name, validate_token, validate_url},
+};
+
+/// Where the seed lives, on every kind of machine.
+///
+/// The appliance decides this: its `/etc` is on a read-only verity store and
+/// its writable partition mounts here. One path on all three systems is worth
+/// more than the conventional one on two of them.
+pub const SEED_DIR: &str = "/var/lib/velstra";
+
+/// What this machine was told about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Machine {
+    pub region: String,
+    pub cell: String,
+    pub roles: Vec<Role>,
+    /// Where the API is. Empty on a control-plane-only machine, which *is* the
+    /// API — a URL pointing at itself would be a fact with two owners.
+    pub api_url: String,
+    /// The node's id and its one-time token, for a hypervisor.
+    pub node: String,
+    pub token: String,
+    pub vmm: String,
+    /// The pool's id and backend, for a pool.
+    pub pool: String,
+    pub pool_backend: String,
+    /// Where the store is, for a control plane.
+    pub store: String,
+    /// The other cells this installation can reach, as `cell=url` pairs.
+    pub cells: Vec<String>,
+}
+
+/// Render the seed. Exactly the keys that were answered, one per line.
+///
+/// Values are unquoted, and the wizard refuses anything that would need
+/// quoting — so this file is safe both for systemd's `EnvironmentFile` and for
+/// a person sourcing it in a shell to see what a machine thinks it is.
+pub fn render(m: &Machine) -> String {
+    let mut out = format!(
+        "VELSTRA_REGION={}\nVELSTRA_CELL={}\nVELSTRA_ROLES={}\n",
+        m.region,
+        m.cell,
+        render_list(&m.roles)
+    );
+    if !m.api_url.is_empty() {
+        out.push_str(&format!("VELSTRA_API_URL={}\n", m.api_url));
+    }
+    if m.roles.contains(&Role::Hypervisor) {
+        out.push_str(&format!(
+            "VELSTRA_NODE={}\nVELSTRA_VMM={}\n",
+            m.node, m.vmm
+        ));
+    }
+    if m.roles.contains(&Role::Pool) {
+        out.push_str(&format!(
+            "VELSTRA_POOL={}\nVELSTRA_POOL_BACKEND={}\n",
+            m.pool, m.pool_backend
+        ));
+    }
+    if m.roles.contains(&Role::ControlPlane) {
+        out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
+        if !m.cells.is_empty() {
+            out.push_str(&format!("VELSTRA_CELLS={}\n", m.cells.join(",")));
+        }
+    }
+    out
+}
+
+/// Read the answers from a file instead of asking for them.
+///
+/// The file **is a seed** — the same `KEY=value` lines this writes, and the same
+/// ones a machine already carries. One format rather than two: an operator can
+/// take the seed off a working machine, change two lines, and install the next
+/// one with it, and nobody has to learn a second spelling of the same facts.
+///
+/// Missing answers are an error naming the key, never a default. An unattended
+/// install that quietly guessed a cell name would produce a machine that comes
+/// up, registers nowhere, and is discovered weeks later.
+pub fn parse(text: &str) -> Result<Machine> {
+    let mut values: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .with_context(|| format!("line {}: {line:?} is not KEY=value", n + 1))?;
+        values.insert(key.trim(), value.trim());
+    }
+    let need = |key: &str| -> Result<String> {
+        values
+            .get(key)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .with_context(|| format!("{key} is missing, and there is no sensible default for it"))
+    };
+    let or = |key: &str, fallback: &str| -> String {
+        values
+            .get(key)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+
+    let roles = crate::roles::parse_list(&need("VELSTRA_ROLES")?);
+    if roles.is_empty() {
+        bail!("VELSTRA_ROLES names no role this version knows — one of control-plane, hypervisor, pool");
+    }
+    let mut m = Machine {
+        region: or("VELSTRA_REGION", "eu-central"),
+        cell: or("VELSTRA_CELL", "cell-1"),
+        roles: roles.clone(),
+        api_url: or("VELSTRA_API_URL", ""),
+        node: String::new(),
+        token: or("VELSTRA_TOKEN", ""),
+        vmm: or("VELSTRA_VMM", "qemu"),
+        pool: String::new(),
+        pool_backend: or("VELSTRA_POOL_BACKEND", "directory"),
+        store: or("VELSTRA_STORE", "127.0.0.1:2379"),
+        cells: values
+            .get("VELSTRA_CELLS")
+            .map(|v| v.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default(),
+    };
+    // Only what the named roles actually need. A file for a pool that had to
+    // carry a node id would be a file with a value nobody reads, and the first
+    // person to change it would be changing nothing.
+    if roles.contains(&Role::Hypervisor) {
+        m.node = need("VELSTRA_NODE")?;
+        if m.api_url.is_empty() {
+            m.api_url = need("VELSTRA_API_URL")?;
+        }
+    }
+    if roles.contains(&Role::Pool) {
+        m.pool = need("VELSTRA_POOL")?;
+        if m.api_url.is_empty() && !roles.contains(&Role::ControlPlane) {
+            m.api_url = need("VELSTRA_API_URL")?;
+        }
+    }
+    Ok(m)
+}
+
+/// Ask — or read a file — then write, then say what happens next.
+pub fn run_with(
+    dir: Option<PathBuf>,
+    assume_nixos: Option<bool>,
+    config: Option<PathBuf>,
+) -> Result<()> {
+    let dir = dir.unwrap_or_else(|| PathBuf::from(SEED_DIR));
+    let machine = match &config {
+        Some(path) => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            // The token is the one answer a file should not have to carry: it
+            // is a secret, and a file with a secret in it is a file somebody
+            // copies. It may be there — automation that already holds one has
+            // to put it somewhere — and it may also be handed separately.
+            let mut m = parse(&text)?;
+            if m.token.is_empty() {
+                if let Ok(token) = std::env::var("VELSTRA_TOKEN") {
+                    m.token = token;
+                }
+            }
+            Some(m)
+        }
+        None => collect()?,
+    };
+    let Some(machine) = machine else {
+        println!("Nothing was written.");
+        return Ok(());
+    };
+    write(&dir, &machine)?;
+
+    let nixos = assume_nixos.unwrap_or_else(|| Path::new("/etc/NIXOS").exists());
+    if nixos {
+        println!("\nThis is NixOS, so nothing was enabled.");
+        println!("Units there are a declaration, and a wizard reaching into them would be");
+        println!("fighting the operating system. Add this and rebuild:\n");
+        println!("{}", nix_snippet(&machine));
+    } else {
+        println!("\nEnable what the roles say:\n");
+        for role in &machine.roles {
+            for unit in role.units() {
+                println!("  systemctl enable --now {unit}");
+            }
+        }
+    }
+    if machine.roles.contains(&Role::Hypervisor) {
+        println!(
+            "\nThis machine cannot mark itself a gateway, give itself labels, or make itself"
+        );
+        println!("schedulable — those are the cell's answer about it, not its own. Set them on");
+        println!("the node object: PATCH /api/v1/nodes/{}", machine.node);
+    }
+    Ok(())
+}
+
+/// The NixOS module snippet for these answers.
+pub fn nix_snippet(m: &Machine) -> String {
+    let mut out = String::from("{\n  velstra.cloud = {\n");
+    if m.roles.contains(&Role::ControlPlane) {
+        out.push_str(&format!(
+            "    controlPlane = {{\n      enable = true;\n      cell = \"{}\";\n      region = \"{}\";\n",
+            m.cell, m.region
+        ));
+        if !m.cells.is_empty() {
+            out.push_str("      cells = {\n");
+            for pair in &m.cells {
+                if let Some((cell, endpoint)) = pair.split_once('=') {
+                    out.push_str(&format!("        \"{cell}\" = \"{endpoint}\";\n"));
+                }
+            }
+            out.push_str("      };\n");
+        }
+        out.push_str("    };\n");
+    }
+    if m.roles.contains(&Role::Hypervisor) {
+        out.push_str("    node.enable = true;\n");
+    }
+    if m.roles.contains(&Role::Pool) {
+        out.push_str(&format!(
+            "    pool = {{\n      enable = true;\n      id = \"{}\";\n      backend = \"{}\";\n      cell = \"{}\";\n      region = \"{}\";\n    }};\n",
+            m.pool, m.pool_backend, m.cell, m.region
+        ));
+    }
+    out.push_str("  };\n}\n");
+    out
+}
+
+fn write(dir: &Path, m: &Machine) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_with_mode(&dir.join("node.env"), &render(m), 0o644)?;
+    if m.roles.contains(&Role::Hypervisor) && !m.token.is_empty() {
+        // The one secret here, and it gets its own file with its own mode. The
+        // seed is world-readable because nothing in it is secret and the units
+        // that read it do not all run as root.
+        write_with_mode(&dir.join("node-token"), &format!("{}\n", m.token), 0o600)?;
+    }
+    println!("\nWrote {}/node.env", dir.display());
+    Ok(())
+}
+
+fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting the mode on {}", path.display()))
+}
+
+/// Ask everything. `None` when the operator declines the final confirmation —
+/// nothing has been written at that point.
+fn collect() -> Result<Option<Machine>> {
+    println!("Velstra Cloud — set up this machine\n");
+    println!("This writes {SEED_DIR}/node.env and nothing else: no disks, no bootloader,");
+    println!("no packages. The machine is already installed; what is missing is the answer");
+    println!("to which cell it belongs to, as what, and with which credential.\n");
+
+    let region = ask_valid(
+        "Region [eu-central]: ",
+        validate_node_name,
+        "lowercase letters, digits and '-'",
+    )
+    .map(|s| if s.is_empty() { "eu-central".into() } else { s })?;
+    let cell = ask_valid(
+        "Cell [cell-1]: ",
+        validate_node_name,
+        "lowercase letters, digits and '-'",
+    )
+    .map(|s| if s.is_empty() { "cell-1".into() } else { s })?;
+
+    println!("\nA cell is the failure domain: a machine belongs to exactly one.");
+    println!("Working across cells is several cells, each with its own control plane —");
+    println!("and one of them told where the others are, so a client reaches one address.\n");
+
+    println!("What does this machine do? Several are fine — the smallest real cell is one");
+    println!("box that is all of them.\n");
+    for (n, role) in Role::ALL.iter().enumerate() {
+        println!("  [{}] {:<14} {}", n + 1, role.as_str(), role.describes());
+    }
+    println!("\n  Carrying external traffic is not on this list: that is what the *cell*");
+    println!("  believes about this machine, set on the node object by an operator. A");
+    println!("  registration token exists so a machine can report, and one that could");
+    println!("  also declare its holder a gateway would grant itself the cell's traffic.\n");
+
+    let roles = loop {
+        let raw = prompt("Roles, space-separated [2]: ")?;
+        let raw = if raw.trim().is_empty() { "2".to_string() } else { raw };
+        match resolve_roles(raw.trim()) {
+            Ok(roles) => break roles,
+            Err(e) => println!("  {e}"),
+        }
+    };
+
+    let mut m = Machine {
+        region,
+        cell,
+        roles: roles.clone(),
+        api_url: String::new(),
+        node: String::new(),
+        token: String::new(),
+        vmm: "qemu".into(),
+        pool: String::new(),
+        pool_backend: "directory".into(),
+        store: "127.0.0.1:2379".into(),
+        cells: Vec::new(),
+    };
+
+    // Everything that is not the control plane has to be told where the API is.
+    // The control plane *is* the API, and a URL pointing at itself would be a
+    // fact with two owners.
+    if roles.iter().any(|r| *r != Role::ControlPlane) {
+        m.api_url = ask_valid(
+            "\nControl-plane URL (https://host:8443): ",
+            validate_url,
+            "a URL with a scheme and a host",
+        )?;
+    }
+
+    if roles.contains(&Role::Hypervisor) {
+        println!("\nThe node id has to match the node object an operator created — that object");
+        println!("is where the one-time token came from.");
+        m.node = ask_valid(
+            "Node id: ",
+            validate_node_name,
+            "lowercase letters, digits and '-'",
+        )?;
+        m.token = ask_valid(
+            "Registration token: ",
+            validate_token,
+            "64 lowercase hex characters",
+        )?;
+        m.vmm = loop {
+            match prompt("Hypervisor [1] qemu  [2] cloud-hypervisor: ")?.trim() {
+                "" | "1" => break "qemu".to_string(),
+                "2" => break "cloud-hypervisor".to_string(),
+                other => println!("  {other:?} is not a choice — 1 or 2."),
+            }
+        };
+    }
+
+    if roles.contains(&Role::Pool) {
+        println!("\nThe pool id has to match the pool object; every volume is written against it.");
+        m.pool = ask_valid("Pool id: ", validate_node_name, "lowercase letters, digits and '-'")?;
+        m.pool_backend = loop {
+            match prompt("Backend [1] directory  [2] ceph: ")?.trim() {
+                "" | "1" => break "directory".to_string(),
+                "2" => break "ceph".to_string(),
+                other => println!("  {other:?} is not a choice — 1 or 2."),
+            }
+        };
+    }
+
+    if roles.contains(&Role::ControlPlane) {
+        m.store = prompt("\nStore endpoints [127.0.0.1:2379]: ")
+            .map(|s| if s.trim().is_empty() { "127.0.0.1:2379".into() } else { s.trim().to_string() })?;
+        println!("\nOther cells this address should answer for, as `cell=url` pairs,");
+        println!("space-separated. Leave empty for a single-cell installation.");
+        let raw = prompt("Other cells: ")?;
+        m.cells = raw
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        for pair in &m.cells {
+            if !pair.contains('=') {
+                bail!("{pair:?} is not cell=url");
+            }
+        }
+    }
+
+    println!("\n{}", render(&m));
+    if !ask_yes("Write this?", true)? {
+        return Ok(None);
+    }
+    Ok(Some(m))
+}
+
+fn resolve_roles(raw: &str) -> Result<Vec<Role>, String> {
+    let mut out = Vec::new();
+    for token in raw.split_whitespace() {
+        let index: usize = token
+            .parse()
+            .map_err(|_| format!("{token:?} is not a number from 1 to {}", Role::ALL.len()))?;
+        let role = Role::ALL
+            .get(index.wrapping_sub(1))
+            .ok_or_else(|| format!("there is no role {index}"))?;
+        out.push(*role);
+    }
+    if out.is_empty() {
+        return Err("pick at least one — a machine with no role runs nothing".into());
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hypervisor() -> Machine {
+        Machine {
+            region: "eu-central".into(),
+            cell: "cell-1".into(),
+            roles: vec![Role::Hypervisor],
+            api_url: "https://cell-1:8443".into(),
+            node: "node-a".into(),
+            token: "a".repeat(64),
+            vmm: "qemu".into(),
+            pool: String::new(),
+            pool_backend: "directory".into(),
+            store: "127.0.0.1:2379".into(),
+            cells: Vec::new(),
+        }
+    }
+
+    /// The seed carries what was answered and nothing else. A key for a role
+    /// this machine does not have would be a value nobody set, read by a unit
+    /// that does not run.
+    #[test]
+    fn a_seed_carries_the_roles_answers_and_no_others() {
+        let rendered = render(&hypervisor());
+        assert!(rendered.contains("VELSTRA_ROLES=hypervisor\n"), "{rendered}");
+        assert!(rendered.contains("VELSTRA_NODE=node-a\n"), "{rendered}");
+        assert!(!rendered.contains("VELSTRA_POOL"), "{rendered}");
+        assert!(!rendered.contains("VELSTRA_STORE"), "{rendered}");
+        // The token is never in the seed: it is the one secret here and it gets
+        // its own file with its own mode.
+        assert!(!rendered.contains(&"a".repeat(64)), "the token is in a world-readable file");
+    }
+
+    #[test]
+    fn a_machine_that_is_everything_says_so_in_a_fixed_order() {
+        let mut m = hypervisor();
+        m.roles = vec![Role::Pool, Role::ControlPlane, Role::Hypervisor];
+        m.pool = "nvme".into();
+        m.cells = vec!["cell-2=https://cell-2:8443".into()];
+        let rendered = render(&m);
+        assert!(
+            rendered.contains("VELSTRA_ROLES=control-plane,hypervisor,pool\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("VELSTRA_POOL=nvme\n"), "{rendered}");
+        assert!(
+            rendered.contains("VELSTRA_CELLS=cell-2=https://cell-2:8443\n"),
+            "{rendered}"
+        );
+    }
+
+    /// A control-plane machine is not told where the API is: it *is* the API,
+    /// and a URL pointing at itself would be a fact with two owners.
+    #[test]
+    fn a_control_plane_is_not_given_a_url_to_itself() {
+        let mut m = hypervisor();
+        m.roles = vec![Role::ControlPlane];
+        m.api_url = String::new();
+        let rendered = render(&m);
+        assert!(!rendered.contains("VELSTRA_API_URL"), "{rendered}");
+    }
+
+    /// What NixOS gets instead of enabled units: the declaration, printed.
+    #[test]
+    fn the_nix_snippet_says_what_the_answers_mean() {
+        let mut m = hypervisor();
+        m.roles = vec![Role::ControlPlane, Role::Pool];
+        m.pool = "nvme".into();
+        m.cells = vec!["cell-2=https://cell-2:8443".into()];
+        let snippet = nix_snippet(&m);
+        assert!(snippet.contains("controlPlane = {"), "{snippet}");
+        assert!(snippet.contains("\"cell-2\" = \"https://cell-2:8443\";"), "{snippet}");
+        assert!(snippet.contains("pool = {"), "{snippet}");
+        assert!(snippet.contains("id = \"nvme\";"), "{snippet}");
+        // Not a hypervisor, so no node module — a snippet that enabled every
+        // module would be a machine running what nobody asked for.
+        assert!(!snippet.contains("node.enable"), "{snippet}");
+    }
+
+    /// The unattended path: the file is a seed, so what comes out of one
+    /// machine goes into the next with two lines changed.
+    #[test]
+    fn a_config_file_is_a_seed_and_round_trips() {
+        let mut m = hypervisor();
+        m.roles = vec![Role::Hypervisor, Role::Pool];
+        m.pool = "nvme".into();
+        let written = render(&m);
+        let read = parse(&written).expect("what this writes, it reads");
+        assert_eq!(read.region, m.region);
+        assert_eq!(read.cell, m.cell);
+        assert_eq!(read.roles, m.roles);
+        assert_eq!(read.node, m.node);
+        assert_eq!(read.pool, m.pool);
+        // Except the token, which is deliberately not in the file every unit
+        // reads — it comes from the environment or is written separately.
+        assert!(read.token.is_empty());
+    }
+
+    /// A missing answer is an error naming the key, never a default. An
+    /// unattended install that guessed a cell would make a machine that comes
+    /// up, registers nowhere, and is found weeks later.
+    #[test]
+    fn a_config_missing_something_a_role_needs_says_which_key() {
+        let missing = "VELSTRA_ROLES=hypervisor\nVELSTRA_API_URL=https://c:8443\n";
+        let why = parse(missing).unwrap_err().to_string();
+        assert!(why.contains("VELSTRA_NODE"), "{why}");
+        assert!(why.contains("no sensible default"), "{why}");
+
+        // And a pool needs its own id for the same reason.
+        let pool = "VELSTRA_ROLES=pool\nVELSTRA_API_URL=https://c:8443\n";
+        assert!(parse(pool).unwrap_err().to_string().contains("VELSTRA_POOL"));
+    }
+
+    /// A file for a control plane needs no URL to the API: it is the API.
+    #[test]
+    fn a_control_plane_config_needs_no_url_to_itself() {
+        let text = "VELSTRA_ROLES=control-plane\nVELSTRA_CELL=cell-7\n";
+        let m = parse(text).expect("a control plane says everything it needs in two lines");
+        assert_eq!(m.cell, "cell-7");
+        assert!(m.api_url.is_empty());
+        // And the defaults it does take are the ones with one sensible answer.
+        assert_eq!(m.region, "eu-central");
+        assert_eq!(m.store, "127.0.0.1:2379");
+    }
+
+    /// Comments and blank lines are a file people edit, and a parser that
+    /// choked on `# the London cell` would be one they stop commenting.
+    #[test]
+    fn a_config_may_be_commented() {
+        let text = "# the London cell\n\nVELSTRA_ROLES=control-plane\n  VELSTRA_CELL = cell-ldn \n";
+        let m = parse(text).unwrap();
+        assert_eq!(m.cell, "cell-ldn");
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_setting_says_which_line() {
+        let why = parse("VELSTRA_ROLES=pool\nnonsense\n").unwrap_err().to_string();
+        assert!(why.contains("line 2"), "{why}");
+    }
+
+    #[test]
+    fn picking_no_role_is_refused_with_the_reason() {
+        assert!(resolve_roles("").unwrap_err().contains("at least one"));
+        assert!(resolve_roles("9").unwrap_err().contains("no role 9"));
+        assert_eq!(resolve_roles("2 2").unwrap(), vec![Role::Hypervisor]);
+        assert_eq!(
+            resolve_roles("3 1").unwrap(),
+            vec![Role::ControlPlane, Role::Pool]
+        );
+    }
+}

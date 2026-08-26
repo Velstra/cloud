@@ -62,6 +62,10 @@ struct Cell {
     instances: TypedStore<InstanceSpec, InstanceStatus>,
     nodes: TypedStore<NodeSpec, NodeStatus>,
     migrations: TypedStore<MigrationSpec, MigrationStatus>,
+    windows: TypedStore<
+        velstra_cloud_model::maintenance::MaintenanceWindowSpec,
+        velstra_cloud_model::maintenance::MaintenanceWindowStatus,
+    >,
     images: TypedStore<ImageSpec, ImageStatus>,
     /// The wire between the machines. A migration is the one thing a node
     /// cannot do alone, so the fake hypervisors have to be able to reach each
@@ -107,6 +111,7 @@ impl Cell {
             instances: TypedStore::new(store.clone(), CELL, "instances"),
             nodes: TypedStore::new(store.clone(), CELL, "nodes"),
             migrations: TypedStore::new(store.clone(), CELL, "migrations"),
+            windows: TypedStore::new(store.clone(), CELL, "maintenance-windows"),
             images: TypedStore::new(store.clone(), CELL, "images"),
             store,
             address,
@@ -137,7 +142,22 @@ impl Cell {
 
     /// One turn of a cell that is moving a guest: the schedulers, the migration
     /// controller, then every node in turn.
+    ///
+    /// The evacuation controller runs here too, keyed on nodes rather than on
+    /// guests — it is what turns "this machine should be empty", however that
+    /// came to be true, into one migration per guest that can move.
     async fn turn_with(&self, others: &[&Agent]) {
+        sweep(
+            &velstra_cloud_controller::evacuation::EvacuationController::new(
+                self.instances.clone(),
+                self.nodes.clone(),
+                self.migrations.clone(),
+            )
+            .with_maintenance(self.windows.clone()),
+            &self.nodes,
+        )
+        .await
+        .unwrap();
         sweep(&self.scheduler(), &self.instances).await.unwrap();
         sweep(
             &InstanceController::new(self.instances.clone()),
@@ -176,6 +196,7 @@ impl Cell {
                 Placement::new(REGION, CELL),
             ),
             ImageSpec {
+                source_instance: None,
                 digest: "sha256-abc".into(),
                 format: ImageFormat::Raw,
                 size_bytes: 1024,
@@ -184,7 +205,13 @@ impl Cell {
             },
             ImageStatus::default(),
         );
-        self.images.create(&image).await.unwrap();
+        self.images
+            .create(
+                &image,
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
     }
 
     async fn add_node(&self, id: &str, vcpus: u32, memory_mib: u64) {
@@ -194,12 +221,23 @@ impl Cell {
                 Placement::new(REGION, CELL),
             ),
             NodeSpec {
+                evacuate: false,
+                vcpu_overcommit: 0,
+                fence_after_s: 0,
                 schedulable: true,
                 labels: vec![],
+                cpu_baseline: None,
+                gateway: false,
             },
             NodeStatus::default(),
         );
-        self.nodes.create(&node).await.unwrap();
+        self.nodes
+            .create(
+                &node,
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
 
         node = self
             .nodes
@@ -232,6 +270,10 @@ impl Cell {
             StatusWriter::new(self.store.clone(), CELL, "instances", "scheduler"),
             CELL,
         )
+        // Given the windows, because a machine inside an open one must stop
+        // taking work — and a scheduler that placed onto it would undo the
+        // evacuation in the same turn that emptied it.
+        .with_maintenance(self.windows.clone())
     }
 
     /// One turn of the whole cell: controllers reconcile, then the node does.
@@ -768,5 +810,95 @@ async fn deleting_an_instance_stops_the_guest() {
     assert!(
         !cell.vmm.is_running("projects/p1/instances/i1"),
         "the object is gone from the API and the guest is still running on the hypervisor"
+    );
+}
+
+/// A machine taken out of service empties itself, and nothing of the operator's
+/// is touched to make it happen.
+///
+/// The controller's own suite proves the decision; this proves the *cell*: a
+/// window somebody declared last week opens, a guest that was running on that
+/// machine ends up running on another one, and `spec.evacuate` — the field an
+/// operator would otherwise have had to flip at two in the morning and remember
+/// to flip back — is false at the start, false at the end, and false the whole
+/// way through.
+#[tokio::test]
+async fn an_open_window_empties_a_machine_without_anybody_flipping_a_switch() {
+    let cell = Cell::start("node-a").await;
+    cell.add_node("node-a", 8, 16384).await;
+    cell.add_node("node-b", 8, 16384).await;
+    let (node_b, vmm_b) = cell.join("node-b");
+    for vmm in [&cell.vmm, &vmm_b] {
+        vmm.cache_image(IMAGE);
+    }
+
+    create_instance(&cell, "i1").await;
+    for _ in 0..6 {
+        cell.turn_with(&[&node_b]).await;
+    }
+    assert_eq!(cell.instance("i1").await.status.node.as_deref(), Some("node-a"));
+    assert!(cell.vmm.is_running("projects/p1/instances/i1"));
+
+    // Declared through the API, as an operator would — open now, and asking
+    // for the guests to leave.
+    let (status, body) = cell
+        .post(
+            "/api/v1/maintenance-windows",
+            serde_json::json!({
+                "id": "rack-move",
+                "spec": {
+                    "node": "node-a",
+                    "startsAt": velstra_cloud_model::meta::Timestamp::now().0 - 60_000,
+                    "minutes": 60,
+                    "drain": true,
+                    "note": "moving it to rack 4",
+                }
+            }),
+        )
+        .await;
+    assert!(
+        (200..300).contains(&status),
+        "declaring a window answered {status}: {body}"
+    );
+
+    for turn in 1..=16 {
+        cell.turn_with(&[&node_b]).await;
+        let i = cell.instance("i1").await;
+        if i.status.node.as_deref() == Some("node-b") && i.status.state == InstanceState::Running {
+            break;
+        }
+        assert!(turn < 16, "the window opened and nothing moved: {:?}", i.status);
+    }
+
+    let moved = cell.instance("i1").await;
+    assert_eq!(moved.status.node.as_deref(), Some("node-b"));
+    assert!(
+        vmm_b.is_running("projects/p1/instances/i1"),
+        "the destination does not actually have the guest"
+    );
+    assert!(
+        !cell.vmm.is_running("projects/p1/instances/i1"),
+        "the machine being taken out of service is still running the guest"
+    );
+
+    // The point of the whole design: the operator's own two switches were never
+    // written. A window that closes therefore takes nothing of theirs with it,
+    // and a controller that died half way through left nothing flipped.
+    let node = cell.nodes.get("nodes/node-a").await.unwrap().unwrap();
+    assert!(!node.spec.evacuate, "a controller wrote the operator's own field");
+    assert!(node.spec.schedulable, "a controller drained the node behind their back");
+
+    // And nothing comes back onto it while the window is open: an emptied
+    // machine that the scheduler then fills again is a machine that never got
+    // emptied.
+    create_instance(&cell, "i2").await;
+    for _ in 0..6 {
+        cell.turn_with(&[&node_b]).await;
+    }
+    let second = cell.instance("i2").await;
+    assert_ne!(
+        second.spec.node.as_deref(),
+        Some("node-a"),
+        "a guest was placed onto a machine that is out of service"
     );
 }

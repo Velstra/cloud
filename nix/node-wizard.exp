@@ -1,0 +1,60 @@
+# Drive the compute-node installer the way an operator does: wait for each
+# question, then answer that question.
+#
+# A blind stream of answers into a pty cannot tell "the wizard asked something
+# else" from "the wizard asked nothing at all" — both look like a timeout with
+# no clue attached. This waits for every prompt in turn and, when one does not
+# come, says which one it was still waiting for (the pattern Sentinel's
+# drive-wizard.exp established).
+#
+# The disk number is not hardcoded: it comes from $PICK, which the test reads
+# off the wizard's own candidate listing. The control-plane URL and token come
+# from $API_URL and $TOKEN — the wizard records them for the first boot; no
+# control plane needs to be reachable during the install.
+
+# Prompts are instant; the install that follows the last answer is not.
+set timeout 120
+log_user 1
+
+proc answer {what reply} {
+    expect {
+        $what   { send -- "$reply\r" }
+        timeout { puts "\nSTALLED — no prompt matching: $what"; exit 3 }
+        eof     { puts "\nEXITED — while waiting for: $what"; exit 4 }
+    }
+}
+
+spawn velstra-cloud-node install
+
+# Where to install. Asked first on purpose: an operator who changes their mind
+# during the questions below has erased nothing yet.
+answer "Mode "              "1"
+answer "Select disk number" "$env(PICK)"
+
+# Plaintext data partition here; the encrypted flow shares the LUKS code the
+# unlock unit exercises.
+answer "Encrypt the data partition" "n"
+
+answer "Hostname"  "node-t1"
+answer "Use DHCP"  "y"
+
+# The registration hand-off: where the control plane is, who this node is, and
+# the one-time token the operator was shown when they created the node.
+answer "Control plane URL" "$env(API_URL)"
+answer "Node name"         "node-1"
+answer "Cell "             ""
+answer "Region "           ""
+answer "Node registration token" "$env(TOKEN)"
+answer "VMM "              "2"
+
+answer "Type YES to proceed" "YES"
+
+# From here it is cloning the image onto the target; wait on the process, not
+# a prompt.
+set timeout 900
+expect {
+    eof     {}
+    timeout { puts "\nSTALLED — the install itself never finished"; exit 5 }
+}
+catch wait result
+exit [lindex $result 3]
