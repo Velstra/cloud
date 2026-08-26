@@ -142,10 +142,6 @@ pub fn governing_project(name: &ResourceName) -> Option<String> {
     name.project().map(|p| format!("projects/{p}"))
 }
 
-/// Whether a resource is outside every project and therefore the operator's.
-pub fn is_cell_scoped(name: &ResourceName) -> bool {
-    governing_project(name).is_none()
-}
 
 #[cfg(test)]
 mod tests {
@@ -227,7 +223,6 @@ mod tests {
         assert_eq!(governing_project(&under).as_deref(), Some("projects/p1"));
         let itself = ResourceName::parse("projects/p1").unwrap();
         assert_eq!(governing_project(&itself).as_deref(), Some("projects/p1"));
-        assert!(!is_cell_scoped(&under));
     }
 
     #[test]
@@ -236,7 +231,7 @@ mod tests {
         // hypervisor, and a node is not inside anybody's project.
         for name in ["nodes/node-a", "pools/pool-a"] {
             let n = ResourceName::parse(name).unwrap();
-            assert!(is_cell_scoped(&n), "{name}");
+            // Outside every project, and therefore the cell operator's.
             assert_eq!(governing_project(&n), None, "{name}");
         }
     }

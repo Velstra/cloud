@@ -83,6 +83,27 @@ pub struct BackupTargetSpec {
     /// than quietly here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent: String,
+    /// How often each copy here is read back and checked. See [`never`].
+    #[serde(default = "never")]
+    pub verify_every_hours: u32,
+}
+
+/// How often a copy on this target should be read back and checked against the
+/// digest recorded when it was written. `0` — the default — never checks.
+///
+/// Off by default because verification is not free: it reads every byte of a
+/// copy, and on a target holding a fleet's worth of them that is real I/O
+/// somebody has to have decided to spend. What is *not* a decision is whether
+/// the platform can tell you: without this, "the backup exists" is the only
+/// thing anybody can say, and a copy nobody has read is a belief rather than a
+/// backup.
+///
+/// One copy per pass, the most overdue first — see [`next_to_verify`]. That
+/// bounds the cost to one read per pass however many copies a target holds, and
+/// means a target with more copies checks each of them less often rather than
+/// the agent falling behind on everything else.
+fn never() -> u32 {
+    0
 }
 
 fn yes() -> bool {
@@ -157,6 +178,34 @@ pub struct BackupStatus {
     /// moment the bytes were read rather than the moment somebody asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub taken_at: Option<Timestamp>,
+    /// What the copy hashed to when it was written, `sha256:…`.
+    ///
+    /// Recorded at write time and never recomputed in place: the whole value of
+    /// this field is that it was taken when the bytes were known good. A digest
+    /// refreshed during verification would bless whatever is on the target now,
+    /// which is precisely the thing being questioned.
+    ///
+    /// `None` on copies made before this existed. Those are honestly
+    /// unverifiable rather than quietly assumed sound — see [`verify_error`].
+    ///
+    /// [`verify_error`]: BackupStatus::verify_error
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// When the copy was last read back and matched its digest.
+    ///
+    /// This, not `taken`, is what makes a copy a backup. `taken` says an agent
+    /// once wrote bytes; this says somebody has since read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<Timestamp>,
+    /// Why the last read-back did not match, when it did not.
+    ///
+    /// Set alongside a false `Ready` and **never** by deleting the copy. A
+    /// backup that failed verification is the one moment somebody has to look
+    /// at it themselves: it may be the copy that rotted, or the target's
+    /// filesystem, or a restore already under way from this very file. The
+    /// platform's job is to say so loudly, not to destroy the only artefact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_error: Option<String>,
 }
 
 /// "Keep a copy of this volume on that target, no older than this."
@@ -376,6 +425,60 @@ pub fn next_due(every_hours: u32, name: &str, mine: &[BackupView]) -> Option<Tim
         .map(|b| b.moment().0)
         .max()?;
     Some(Timestamp(newest + u64::from(every_hours) * 3_600_000))
+}
+
+/// One finished copy, as verification sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyView {
+    pub name: String,
+    /// When the copy was finished — the earliest anything could have read it.
+    pub taken_at: Timestamp,
+    /// When it was last read back and matched.
+    pub verified_at: Option<Timestamp>,
+    pub deleting: bool,
+}
+
+/// Which copy on this target to read back now, if any.
+///
+/// **One per pass, the most overdue first.** Verification reads every byte of a
+/// copy, so a pass that checked everything due would turn a target holding a
+/// hundred copies into a pass that never ends — and the agent has volumes to
+/// provision in the same loop. Bounding it to one means a busier target checks
+/// each copy less often, which is the right thing to give up: the alternative
+/// is an agent that falls behind on the work that is not optional.
+///
+/// A copy is due when it has never been read back and is older than the
+/// interval, or when its last read-back is. Never reading back a copy that was
+/// finished seconds ago is deliberate — the interval is how stale a *proof* may
+/// get, and a fresh copy's proof is the write that just succeeded.
+///
+/// `every_hours == 0` verifies nothing and is the default; see
+/// [`BackupTargetSpec::verify_every_hours`].
+pub fn next_to_verify(
+    every_hours: u32,
+    copies: &[CopyView],
+    now: Timestamp,
+) -> Option<String> {
+    if every_hours == 0 {
+        return None;
+    }
+    let interval = i128::from(every_hours) * 3_600_000;
+    copies
+        .iter()
+        .filter(|c| !c.deleting)
+        .filter_map(|c| {
+            // How long this copy's proof has been stale. Measured from the last
+            // read-back, or from when it was written for one nobody has read.
+            let since = c.verified_at.unwrap_or(c.taken_at);
+            let stale = i128::from(now.0) - i128::from(since.0);
+            // A copy from the future is a clock that disagrees with itself, not
+            // a copy that is overdue — the same reading `due` takes.
+            (stale >= interval).then_some((stale, &c.name))
+        })
+        // Most overdue first; by name where two are equally so, so that a pass
+        // is reproducible rather than dependent on map order.
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+        .map(|(_, name)| name.clone())
 }
 
 #[cfg(test)]
@@ -600,5 +703,81 @@ mod tests {
         let now = Timestamp(100 * HOUR);
         let future = [made("b1", Some("s"), true, 200 * HOUR)];
         assert!(!due(daily().every_hours, "s", &future, now));
+    }
+
+    fn copy(name: &str, taken: u64, verified: Option<u64>) -> CopyView {
+        CopyView {
+            name: name.into(),
+            taken_at: Timestamp(taken * HOUR),
+            verified_at: verified.map(|h| Timestamp(h * HOUR)),
+            deleting: false,
+        }
+    }
+
+    /// Off by default, and off means off: a target nobody asked to verify
+    /// reads nothing back, however old its copies are.
+    #[test]
+    fn a_target_that_was_not_asked_to_verify_reads_nothing_back() {
+        let now = Timestamp(1000 * HOUR);
+        let ancient = [copy("b1", 1, None)];
+        assert_eq!(next_to_verify(0, &ancient, now), None);
+    }
+
+    /// One per pass, and the one whose proof is stalest — so a target whose
+    /// copies outnumber its passes still gets round to all of them.
+    #[test]
+    fn the_copy_whose_proof_is_stalest_goes_first() {
+        let now = Timestamp(100 * HOUR);
+        let copies = [
+            // Read back 10h ago.
+            copy("recent", 1, Some(90)),
+            // Never read back, written 50h ago — staler than `recent`.
+            copy("never-read", 50, None),
+            // Read back 40h ago.
+            copy("middling", 1, Some(60)),
+        ];
+        assert_eq!(next_to_verify(24, &copies, now).as_deref(), Some("never-read"));
+    }
+
+    /// A copy that was just written is not read straight back. The interval is
+    /// how stale a *proof* may get, and a fresh copy's proof is the write.
+    #[test]
+    fn a_copy_written_moments_ago_is_not_read_straight_back() {
+        let now = Timestamp(100 * HOUR);
+        let fresh = [copy("b1", 99, None)];
+        assert_eq!(next_to_verify(24, &fresh, now), None);
+    }
+
+    /// Verifying resets the clock: the copy just read is not the one picked
+    /// again on the next pass while another is older.
+    #[test]
+    fn a_copy_just_read_back_goes_to_the_end_of_the_queue() {
+        let now = Timestamp(100 * HOUR);
+        let before = [copy("a", 1, Some(20)), copy("b", 1, Some(30))];
+        assert_eq!(next_to_verify(24, &before, now).as_deref(), Some("a"));
+
+        let after = [copy("a", 1, Some(100)), copy("b", 1, Some(30))];
+        assert_eq!(next_to_verify(24, &after, now).as_deref(), Some("b"));
+    }
+
+    /// A copy on its way out is not read back. Spending a pass proving the
+    /// integrity of something about to be deleted is the one read nobody wants.
+    #[test]
+    fn a_copy_being_deleted_is_not_read_back() {
+        let now = Timestamp(100 * HOUR);
+        let mut going = copy("b1", 1, None);
+        going.deleting = true;
+        assert_eq!(next_to_verify(24, &[going], now), None);
+    }
+
+    /// Equally overdue copies resolve by name rather than by order, so a pass
+    /// is reproducible and two agents reading the same list agree.
+    #[test]
+    fn equally_overdue_copies_are_picked_in_a_fixed_order() {
+        let now = Timestamp(100 * HOUR);
+        let copies = [copy("b", 1, None), copy("a", 1, None)];
+        assert_eq!(next_to_verify(24, &copies, now).as_deref(), Some("a"));
+        let reversed = [copy("a", 1, None), copy("b", 1, None)];
+        assert_eq!(next_to_verify(24, &reversed, now).as_deref(), Some("a"));
     }
 }
