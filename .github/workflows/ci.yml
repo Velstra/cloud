@@ -126,6 +126,35 @@ jobs:
       # is a change nobody made on purpose, and it is better found here than in
       # a release build.
       #
+      # The fabric controller, built beside this checkout.
+      #
+      # `tests/fabric_datapath.rs` deliberately goes red when it is missing:
+      # the SRv6 end-to-end case is the one thing here with no unit fallback —
+      # the config served back, with its derived service SIDs, is fabric's own
+      # logic and only reachable over gRPC — so a run without it would skip that
+      # case and go green, which looks exactly like a run that proved SRv6
+      # works. The test offers VELSTRA_FABRIC_OPTIONAL=1 to accept that gap on
+      # purpose. This builds it instead, because accepting the gap in the one
+      # place that could close it is not accepting a gap, it is hiding one.
+      #
+      # Cloned rather than checked out with the action: the test looks for
+      # `<repo>/../fabric`, and actions/checkout cannot write outside the
+      # workspace. Shallow, and only the one binary — the eBPF crate needs a
+      # nightly toolchain and bpf-linker, and none of that is wanted here.
+      #
+      # The cost is honest and worth naming: cloud's CI now goes red if fabric's
+      # main does not build. That is information rather than noise — the two are
+      # a client and a server of one contract, and a fabric that does not build
+      # is a fabric this cannot talk to either.
+      - name: Build the fabric controller, so SRv6 is really exercised
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Velstra/fabric.git \
+            "$GITHUB_WORKSPACE/../fabric"
+          cargo build -p velstra-controller \
+            --manifest-path "$GITHUB_WORKSPACE/../fabric/Cargo.toml"
+          test -x "$GITHUB_WORKSPACE/../fabric/target/debug/velstra-controller"
+
       # This runs the two guest-boot tests too, and they will skip — the runner
       # has no QEMU here. That is what the `guests` job below is for; it installs
       # the fixtures and fails if they skip there.

@@ -1,0 +1,28 @@
+# GitHub Pages serves this directory (Settings → Pages → main /docs).
+#
+# There was no index and no config, so the site built cleanly and the root URL
+# answered 404 while every individual page answered 200 — which looks exactly
+# like "Pages is broken" and is really "nothing was ever put at /".
+#
+# `jekyll-relative-links` is the load-bearing line. It is what makes the links
+# in these files work in both places at once: `[quick start](quickstart.md)`
+# stays a working link on GitHub, where the reader is looking at the Markdown,
+# and is rewritten to `quickstart.html` for the built site. Without it every
+# cross-reference on the published site is a 404 — and these documents are
+# almost entirely cross-references.
+#
+# Nothing else is set. `images/` needs no `include`: only paths beginning with
+# `_` or `.` are dropped by default, so an entry for it would be a line that
+# does nothing while looking like it does something.
+title: Velstra Cloud
+description: >-
+  A virtualisation platform that says what it is doing: what was asked for and
+  what is running are two columns, never one.
+
+theme: jekyll-theme-primer
+
+plugins:
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+  collections: false
