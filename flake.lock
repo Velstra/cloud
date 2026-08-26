@@ -106,15 +106,15 @@
       "locked": {
         "lastModified": 1787734468,
         "narHash": "sha256-iY4huVdv2Bwq0JqGi6OUJQDVG7gWKhdrYKyi9em01tM=",
-        "ref": "refs/heads/main",
+        "owner": "Velstra",
+        "repo": "sentinel",
         "rev": "3cf3905170adcb7cd18b633d6eeacc9c6056577c",
-        "revCount": 213,
-        "type": "git",
-        "url": "file:///home/mbrandt/01_repositories/velstra/sentinel"
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:///home/mbrandt/01_repositories/velstra/sentinel"
+        "owner": "Velstra",
+        "repo": "sentinel",
+        "type": "github"
       }
     },
     "wren": {

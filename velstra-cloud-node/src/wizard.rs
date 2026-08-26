@@ -533,6 +533,56 @@ pub(crate) fn validate_ipv4(s: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("{s:?} is not an IPv4 address"))
 }
 
+/// A VTEP address: either family, because the underlay is the operator's and
+/// plenty of them are v6-only.
+///
+/// An address rather than a name on purpose. This value is what *other* hosts
+/// send encapsulated frames to, and a name resolved here would be resolved
+/// against this machine's resolver — which is not the one that has to agree.
+pub(crate) fn validate_ip(s: &str) -> Result<()> {
+    validate_safe_value(s)?;
+    s.parse::<std::net::IpAddr>()
+        .map(|_| ())
+        .map_err(|_| anyhow::anyhow!("{s:?} is not an IP address"))
+}
+
+/// A network interface name, as the kernel will accept it.
+pub(crate) fn validate_interface(s: &str) -> Result<()> {
+    if s.is_empty() {
+        bail!("the interface name cannot be empty");
+    }
+    // IFNAMSIZ is 16 including the terminator, so 15 is the real ceiling.
+    if s.len() > 15 {
+        bail!("{s:?} is longer than the 15 characters an interface name can have");
+    }
+    if let Some(c) = s.chars().find(|c| c.is_whitespace() || *c == '/' || *c == ':') {
+        bail!("{c:?} cannot appear in an interface name");
+    }
+    validate_safe_value(s)
+}
+
+/// An SRv6 locator: an IPv6 prefix with a length, e.g. `fc00:0:1::/64`.
+///
+/// v6 specifically, and not [`validate_cidr`], which is v4: a locator is a
+/// slice of an IPv6 address plan and there is no v4 spelling of one.
+pub(crate) fn validate_srv6_locator(s: &str) -> Result<()> {
+    validate_safe_value(s)?;
+    let Some((addr, len)) = s.split_once('/') else {
+        bail!("{s:?} has no /prefix-length");
+    };
+    addr.parse::<std::net::Ipv6Addr>()
+        .map_err(|_| anyhow::anyhow!("{addr:?} is not an IPv6 address"))?;
+    let len: u8 = len
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{len:?} is not a prefix length"))?;
+    // Shorter than /32 is not a locator anybody routes; /128 leaves no room for
+    // the function bits every service SID needs.
+    if !(32..=112).contains(&len) {
+        bail!("/{len} is not a usable locator length — 32 to 112");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,6 +640,42 @@ mod tests {
             "IPv6 is not the uplink family here"
         );
         assert!(validate_ipv4("gateway").is_err());
+    }
+
+    /// A VTEP takes either family — plenty of underlays are v6-only — but it is
+    /// an address, never a name: this value is resolved by nobody, it is what
+    /// other hosts send frames to.
+    #[test]
+    fn vtep_addresses_take_either_family_but_not_a_name() {
+        assert!(validate_ip("10.0.0.7").is_ok());
+        assert!(validate_ip("2001:db8::1").is_ok());
+        assert!(validate_ip("underlay.example").is_err());
+        assert!(validate_ip("10.0.0.7/32").is_err());
+    }
+
+    #[test]
+    fn interface_names_fit_what_the_kernel_accepts() {
+        assert!(validate_interface("eth1").is_ok());
+        assert!(validate_interface("bond0.100").is_ok());
+        assert!(validate_interface("").is_err());
+        // IFNAMSIZ is 16 including the terminator.
+        assert!(validate_interface(&"e".repeat(15)).is_ok());
+        assert!(validate_interface(&"e".repeat(16)).is_err());
+        assert!(validate_interface("eth 1").is_err());
+        assert!(validate_interface("eth/1").is_err());
+    }
+
+    /// A locator is IPv6 and nothing else: it is a slice of an IPv6 address
+    /// plan, and there is no v4 spelling of one.
+    #[test]
+    fn srv6_locators_are_ipv6_prefixes_with_a_usable_length() {
+        assert!(validate_srv6_locator("fc00:0:1::/64").is_ok());
+        assert!(validate_srv6_locator("2001:db8:1::/48").is_ok());
+        assert!(validate_srv6_locator("10.0.0.0/24").is_err());
+        assert!(validate_srv6_locator("fc00:0:1::").is_err());
+        // /128 leaves no room for the function bits every service SID needs.
+        assert!(validate_srv6_locator("fc00:0:1::/128").is_err());
+        assert!(validate_srv6_locator("fc00:0:1::/8").is_err());
     }
 
     #[test]

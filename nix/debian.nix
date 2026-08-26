@@ -99,7 +99,49 @@ let
       description = "Velstra Cloud storage pool agent";
       exec = bin "velstra-cloud-poolagent";
     };
+    "velstra-fabric-agent.service" = fabricUnit;
   };
+
+  # The fabric data plane, which is not one of the four.
+  #
+  # Two things separate it from the units above and each is a reason it is
+  # written out by hand rather than folded into `unit`:
+  #
+  # It is gated on **two** conditions, not one — the hypervisor role AND a
+  # fabric named in the seed. A cell without a fabric is a real way to run, and
+  # on such a machine this must read as "not for this box", not as a failure.
+  #
+  # And its binary is not ours. `velstra` is the fabric agent; this package
+  # does not ship it, because vendoring somebody else's eBPF data plane into a
+  # Debian package would make its kernel compatibility our problem. It is a
+  # `Recommends:`, and the condition below means an operator who has not
+  # installed it gets a skipped unit rather than a red one.
+  fabricUnit = ''
+    [Unit]
+    Description=Velstra Fabric data plane (eBPF/XDP)
+    Wants=network-online.target
+    After=network-online.target
+    Before=velstra-cloud-nodeagent.service
+
+    [Service]
+    Type=simple
+    Restart=on-failure
+    RestartSec=2
+    RuntimeDirectory=velstra
+    RuntimeDirectoryMode=0700
+    EnvironmentFile=-/var/lib/velstra/node.env
+    ${roleGuard "hypervisor"}ExecCondition=/bin/sh -c 'command -v velstra >/dev/null || { echo "the fabric agent (velstra) is not installed; tenant networks here separate no traffic"; exit 1; }; grep -qE "^VELSTRA_FABRIC_CONTROL=." /var/lib/velstra/node.env || { echo "no VELSTRA_FABRIC_CONTROL in the seed: this cell has no data plane"; exit 1; }'
+    ExecStart=/bin/sh -c 'exec velstra run --controller "$VELSTRA_FABRIC_CONTROL" --node-id "$VELSTRA_NODE"'
+    AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+    CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+    NoNewPrivileges=true
+    ProtectHome=true
+    RestrictSUIDSGID=true
+    LockPersonality=true
+
+    [Install]
+    WantedBy=multi-user.target
+  '';
 
   # Debian's own name for this machine's architecture. Only amd64 is built here;
   # anything else is a cross-compile question and not a packaging one.
@@ -140,7 +182,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     Architecture: ${debArch}
     Maintainer: Velstra <noreply@velstra.invalid>
     Depends: systemd
-    Recommends: qemu-system-x86, qemu-utils, etcd-server, ceph-common
+    Recommends: qemu-system-x86, qemu-utils, etcd-server, ceph-common, velstra
     Description: Velstra Cloud — control plane, node agent and storage pool
      One package, four roles. Which of them this machine runs is decided by
      \`velstra-cloud-node setup\`, which writes /var/lib/velstra/node.env; every
@@ -183,7 +225,8 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     # reinstalling mean re-registering.
     if [ "$1" = "remove" ]; then
       for u in velstra-cloud-api velstra-cloud-controller \
-               velstra-cloud-nodeagent velstra-cloud-poolagent; do
+               velstra-cloud-nodeagent velstra-cloud-poolagent \
+               velstra-fabric-agent; do
         systemctl stop "$u" >/dev/null 2>&1 || true
       done
     fi

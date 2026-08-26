@@ -55,11 +55,18 @@ in
       type = lib.types.nullOr lib.types.package;
       default = null;
       description = ''
-        The Velstra Fabric eBPF/XDP agent (`velstra`), put on PATH when set.
-        A seam, on purpose: the binary is available for the fabric datapath,
-        but no unit starts it — its configuration comes from the fabric
-        controller, and a service wired to a controller nobody has named would
-        be a promise nothing keeps. See docs/install.md.
+        The Velstra Fabric eBPF/XDP agent (`velstra`).
+
+        Set it and this machine gets a `velstra-fabric-agent` unit — the thing
+        that actually enforces a tenant network on the wire. Leave it null and
+        the node still runs: it places guests, gives them addresses and reports
+        healthy, and every tenant network stays a record that separates no
+        traffic.
+
+        Which controller it watches is not set here. It comes from the seed
+        (`VELSTRA_FABRIC_CONTROL`), like everything else this machine was told
+        about itself, so one file answers "what is this box doing" on NixOS and
+        on Debian alike. The unit stays off until that key is there.
       '';
     };
 
@@ -230,6 +237,23 @@ in
             exit 1
             ;;
         esac
+        # The overlay, if the seed names one. Without it the agent keeps its
+        # default datapath: real taps, no tenant programming — which is why a
+        # port carrying security groups is then refused rather than quietly
+        # given a wire that enforces none of them.
+        fabric_args=
+        if [ -n "''${VELSTRA_FABRIC:-}" ]; then
+          fabric_args="--datapath fabric --fabric $VELSTRA_FABRIC"
+          fabric_args="$fabric_args --fabric-vtep $VELSTRA_FABRIC_VTEP"
+          fabric_args="$fabric_args --fabric-underlay $VELSTRA_FABRIC_UNDERLAY"
+          if [ -n "''${VELSTRA_FABRIC_SRV6_LOCATOR:-}" ]; then
+            fabric_args="$fabric_args --fabric-srv6-locator $VELSTRA_FABRIC_SRV6_LOCATOR"
+          fi
+        fi
+        # Unquoted on purpose: systemd is not involved here, this is the shell
+        # splitting a flag list, and the empty case has to disappear entirely.
+        # Every value in it went through the wizard's seed-safety check, which
+        # refuses anything that would need quoting.
         exec ${cfg.package}/bin/velstra-cloud-nodeagent \
           --node "$VELSTRA_NODE" \
           --cell "$VELSTRA_CELL" \
@@ -238,7 +262,94 @@ in
           --api-token-file ${cfg.stateDir}/node-token \
           --vmm "$VELSTRA_VMM" \
           ''${vmm_binary:+--vmm-binary "$vmm_binary"} \
-          --state-dir ${cfg.stateDir}
+          --state-dir ${cfg.stateDir} \
+          $fabric_args
+      '';
+    };
+
+    # The data plane itself.
+    #
+    # Everything above decides what *should* be true — which guest is on which
+    # network, which rules apply to its port. This is what makes it true on the
+    # wire, and until this session it existed nowhere: the agent shipped on the
+    # node image, sat on PATH, and nothing started it. A cell installed from
+    # this module got tenant networks that were records and nothing else.
+    #
+    # It watches fabric's agent-facing service (`--controller`), which is NOT
+    # the orchestrator the node agent above talks to — different port, different
+    # audience, different amount of trust. Fabric binds the orchestrator to
+    # localhost by default and offers mTLS on this one.
+    systemd.services.velstra-fabric-agent = lib.mkIf (cfg.fabricAgent != null) {
+      description = "Velstra Fabric data plane (eBPF/XDP)";
+      wantedBy = [ "multi-user.target" ];
+      # Before the node agent, not after: the agent creates taps and asks the
+      # orchestrator to make them tenant ports, and a port programmed against a
+      # data plane that is not loaded yet is a guest with a wire and no rules
+      # for however long the gap lasts.
+      before = [ "velstra-cloud-nodeagent.service" ];
+      after = [
+        "network-pre.target"
+        "velstra-node-boot.service"
+      ];
+      unitConfig = {
+        # Same rule as the node agent: no seed, no unit — and the condition
+        # names the key, so `systemctl status` is the error message. A machine
+        # whose cell has no fabric never starts this and never fails it.
+        ConditionPathExists = "${cfg.stateDir}/node.env";
+        RequiresMountsFor = [ cfg.stateDir ];
+      };
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        EnvironmentFile = "${cfg.stateDir}/node.env";
+        Restart = "on-failure";
+        RestartSec = 2;
+        RuntimeDirectory = "velstra";
+        RuntimeDirectoryMode = "0700";
+        # Whether this cell has a fabric is a runtime answer in the seed, but
+        # whether the agent is on the machine is a build-time one — so on the
+        # standard node image every node carries this unit and most of them may
+        # have nothing to join.
+        #
+        # ExecCondition rather than a script that exits 0: systemd records a
+        # failed condition as "skipped", not as "ran and finished", which is the
+        # difference between `systemctl status` saying this box is not part of a
+        # fabric and it saying the data plane started and stopped. The condition
+        # still writes to the journal, so the reason is there to read.
+        ExecCondition = pkgs.writeShellScript "velstra-fabric-wanted" ''
+          if grep -qE '^VELSTRA_FABRIC_CONTROL=.' ${cfg.stateDir}/node.env; then
+            exit 0
+          fi
+          echo "no VELSTRA_FABRIC_CONTROL in ${cfg.stateDir}/node.env: this cell has no data"
+          echo "plane, so tenant networks here are records that separate no traffic."
+          echo "'velstra-cloud-node setup' asks for a fabric; answering it changes this."
+          exit 1
+        '';
+        # Loading and attaching XDP/eBPF. CAP_SYS_ADMIN is broad; narrowing it
+        # to CAP_BPF+CAP_PERFMON depends on the target kernel, so it stays until
+        # a check proves the narrower set loads here.
+        AmbientCapabilities = [
+          "CAP_BPF"
+          "CAP_NET_ADMIN"
+          "CAP_SYS_ADMIN"
+        ];
+        CapabilityBoundingSet = [
+          "CAP_BPF"
+          "CAP_NET_ADMIN"
+          "CAP_SYS_ADMIN"
+        ];
+        NoNewPrivileges = true;
+        ProtectHome = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+      };
+      # --node-id must be the cell's node id rather than the hostname the agent
+      # would default to: the node agent registers this host with the
+      # orchestrator under that id, and a config fetched under a second name
+      # would be a config for a host nobody registered.
+      script = ''
+        exec ${cfg.fabricAgent}/bin/velstra run \
+          --controller "$VELSTRA_FABRIC_CONTROL" \
+          --node-id "$VELSTRA_NODE"
       '';
     };
 

@@ -19,13 +19,23 @@
     # The Sentinel appliance factory: A/B slots, dm-verity store, Secure Boot,
     # installer ISO — the node image is a different package set in the SAME
     # machinery (docs/deployment-and-devices.md §2A), so the machinery is an
-    # input, not a copy. While both repos move together this points at the
-    # sibling checkout (git+file uses the working tree, so unreleased factory
-    # changes are visible; `nix flake update sentinel` after editing it); a
-    # release replaces it with the pinned public URL, e.g.
-    # github:Velstra/sentinel.
+    # input, not a copy.
+    #
+    # The public URL rather than the sibling checkout, and the difference is not
+    # cosmetic: a `git+file:` pointing into one person's home directory is a
+    # flake nobody else can evaluate — not another developer, and not CI, which
+    # is why none of the checks below had ever run on a runner.
+    #
+    # Working on both repos at once still works, and does not need this line
+    # edited: pass the checkout for the length of one command.
+    #
+    #     nix build .#checks.x86_64-linux.guest \
+    #       --override-input sentinel path:../sentinel
+    #
+    # That is better than editing it, because an edit is a thing to remember to
+    # undo and an override is not.
     sentinel = {
-      url = "git+file:///home/mbrandt/01_repositories/velstra/sentinel";
+      url = "github:Velstra/sentinel";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -521,6 +531,315 @@
                     f"curl -fsS {auth} {api}/nodes/node-1 | grep -q vcpus",
                     timeout=120,
                 )
+          '';
+        };
+
+        # One box that is the whole cell.
+        #
+        # The smallest real installation: control plane, hypervisor and storage
+        # pool on one machine, with the bundled etcd, which is what somebody
+        # running this at home has. It is also the shape most likely to rot
+        # unnoticed — every other check runs two of the three roles together
+        # (`guest` takes control plane + hypervisor, `storage` control plane +
+        # pool) and nothing ran all three, so anything that only breaks when
+        # they share a machine had nowhere to be caught.
+        #
+        # What it proves is the whole chain on one host: the pool provisions a
+        # volume, the scheduler places a guest on the only node there is, and
+        # the agent runs it. Then the two things a single node makes awkward on
+        # purpose — a spread policy with nothing to spread across, and drain,
+        # which on one machine means "nothing may run here".
+        #   nix build .#checks.x86_64-linux.single-node -L
+        single-node = pkgs.testers.runNixOSTest {
+          name = "velstra-single-node";
+          nodes.home = {
+            imports = [
+              controlPlaneNode
+              self.nixosModules.node
+              self.nixosModules.pool
+            ];
+            velstra.cloud.node = {
+              enable = true;
+              package = velstra-cloud;
+            };
+            velstra.cloud.pool = {
+              enable = true;
+              package = velstra-cloud;
+              id = "local";
+              # The cell's own etcd — the one the control plane on this very
+              # machine brought up. `memory` would give the pool agent a store
+              # of its own, and it would report a pool nobody can see.
+              store = "127.0.0.1:2379";
+              resyncSeconds = 2;
+            };
+            velstra.cloud.controlPlane.resyncSeconds = 5;
+            # Deliberately modest. A machine somebody has at home is not a
+            # rack, and a cell that needs a rack to hold its own control plane
+            # would not be the thing this claims to be.
+            virtualisation = {
+              memorySize = 2048;
+              diskSize = 4096;
+            };
+          };
+          testScript = ''
+            import json
+
+            auth = "-H 'Authorization: Bearer opstoken'"
+            ct = "-H 'Content-Type: application/json'"
+            api = "http://127.0.0.1:8443/api/v1"
+
+            with subtest("all three roles come up on one machine"):
+                for unit in [
+                    "etcd.service",
+                    "velstra-cloud-api.service",
+                    "velstra-cloud-controller.service",
+                    "velstra-cloud-poolagent.service",
+                ]:
+                    home.wait_for_unit(unit)
+                home.wait_until_succeeds(f"curl -fsS {auth} {api}/pools")
+
+            with subtest("the box registers as its own node"):
+                created = json.loads(home.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"home-1\", \"spec\": {{\"schedulable\": true}}}}'"
+                    f" {api}/nodes"
+                ))
+                token = created["nodeToken"]
+                home.succeed("mkdir -p /var/lib/velstra")
+                home.succeed(f"echo {token} > /var/lib/velstra/node-token")
+                home.succeed("chmod 600 /var/lib/velstra/node-token")
+                # The seed a home installation actually writes: every role on
+                # one line, which is what `velstra-cloud-node setup` produces
+                # when somebody answers "1 2 3".
+                home.succeed(
+                    "printf 'VELSTRA_ROLES=control-plane,hypervisor,pool\n"
+                    "VELSTRA_NODE=home-1\nVELSTRA_CELL=cell-1\n"
+                    "VELSTRA_REGION=eu-central\nVELSTRA_API_URL=http://127.0.0.1:8443\n"
+                    "VELSTRA_VMM=fake\nVELSTRA_POOL=local\n"
+                    "VELSTRA_POOL_BACKEND=directory\nVELSTRA_HOSTNAME=home\n'"
+                    " > /var/lib/velstra/node.env"
+                )
+                home.succeed("systemctl start velstra-cloud-nodeagent")
+                home.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/nodes/home-1 | grep -q vcpus",
+                    timeout=120,
+                )
+
+            with subtest("the local pool provisions a volume"):
+                home.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"local\", \"spec\": {{\"accepting\": true}}}}'"
+                    f" {api}/pools"
+                )
+                home.succeed(
+                    f"curl -fsS -X POST {auth} {ct} -d '{{\"id\": \"home\","
+                    f" \"spec\": {{\"quota\": {{}}}}}}' {api}/projects"
+                )
+                home.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"disk\", \"spec\": {{\"sizeGib\": 1,"
+                    f" \"pool\": \"local\"}}}}'"
+                    f" {api}/projects/home/volumes"
+                )
+                home.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/home/volumes/disk"
+                    " | grep -q '\"provisioned\":true'",
+                    timeout=180,
+                )
+                # The bytes, not the object.
+                home.succeed("ls /var/lib/velstra/pool | grep -q qcow2")
+
+            with subtest("a guest is placed on the only node there is"):
+                slug = "sha256-" + "ab" * 32
+                home.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"{slug}\", \"spec\": {{"
+                    f"\"digest\": \"sha256:{'ab' * 32}\", \"format\": \"Raw\","
+                    f" \"sizeBytes\": 8388608,"
+                    f" \"sourceUrl\": \"file:///dev/null\"}}}}'"
+                    f" {api}/projects/home/images"
+                )
+                home.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"g1\", \"spec\": {{\"vcpus\": 1,"
+                    f" \"memoryMib\": 256, \"rootDiskGib\": 1,"
+                    f" \"image\": \"projects/home/images/{slug}\"}}}}'"
+                    f" {api}/projects/home/instances"
+                )
+                home.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/home/instances/g1"
+                    " | grep -q '\"node\":\"home-1\"'",
+                    timeout=180,
+                )
+
+            def guest(name, policy=""):
+                extra = f" \"placementPolicy\": {{{policy}}}," if policy else ""
+                return (
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"{name}\", \"spec\": {{\"vcpus\": 1,"
+                    f" \"memoryMib\": 256, \"rootDiskGib\": 1,{extra}"
+                    f" \"image\": \"projects/home/images/{slug}\"}}}}'"
+                    f" {api}/projects/home/instances"
+                )
+
+            with subtest("keeping a pair apart is a wish a one-node cell can still grant"):
+                # This is the difference a home installation actually feels.
+                # `Preferred` means "put it elsewhere if anywhere else will take
+                # it, rather than not running at all" — and on one machine there
+                # is nowhere else, so it runs beside its sibling. A cell of one
+                # must not be a cell where half the placement vocabulary means
+                # "never starts".
+                home.succeed(guest("g2", "\"antiAffinityGroup\": \"web\","
+                                         " \"spread\": \"Preferred\""))
+                home.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/home/instances/g2"
+                    " | grep -q '\"node\":\"home-1\"'",
+                    timeout=180,
+                )
+
+            with subtest("and demanding it is refused in words, not left pending"):
+                # `Required` genuinely cannot be met here, and the important
+                # thing is that somebody is told which rule stopped it — not a
+                # guest that sits unplaced with nothing said.
+                home.succeed(guest("g3", "\"antiAffinityGroup\": \"web\","
+                                         " \"spread\": \"Required\""))
+                said = home.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/home/instances/g3:explainPlacement"
+                    " | grep -o '\"[^\"]*\"' | head -40",
+                    timeout=180,
+                )
+                # It names the node it could not use, so the answer is about
+                # this cell rather than a generic "no valid host".
+                assert "home-1" in said, said
+
+            with subtest("the one node can still be taken out of service"):
+                # Somebody has to be able to take their own machine down, and
+                # the platform has to say what that costs rather than refuse or
+                # pretend the guests moved somewhere.
+                said = home.succeed(
+                    f"curl -fsS {auth} {api}/nodes/home-1:explainMaintenance"
+                )
+                assert "home-1" in said, said
+          '';
+        };
+
+        # A node that comes up has a data plane — or says why it does not.
+        #
+        # This is the check for the gap that existed until now: the fabric agent
+        # shipped on the node image, sat on PATH, and no unit anywhere started
+        # it. Every node installed from this module got tenant networks that
+        # were records in a database and separated no traffic, and nothing
+        # anywhere said so. Everything reported healthy.
+        #
+        # A stub agent rather than the real one. What is under test is the
+        # wiring — does a unit exist, is it gated on the right two things, does
+        # it get the controller and the node id, does it load before the node
+        # agent starts asking for ports. Whether eBPF verifies on this kernel is
+        # fabric's own question and it has its own VM tests for it; pulling that
+        # in here would make this check slow, and make it fail for reasons that
+        # are not about the wiring.
+        #   nix build .#checks.x86_64-linux.fabric-agent -L
+        fabric-agent = pkgs.testers.runNixOSTest {
+          name = "velstra-fabric-agent";
+          nodes.node =
+            { pkgs, ... }:
+            {
+              imports = [ self.nixosModules.node ];
+              velstra.cloud.node = {
+                enable = true;
+                package = velstra-cloud;
+                # Records how it was called and then stays up, the way the real
+                # agent does — a stub that exited would make "the unit is
+                # active" untestable.
+                fabricAgent = pkgs.writeShellScriptBin "velstra" ''
+                  echo "$@" > /run/fabric-agent-argv
+                  exec sleep infinity
+                '';
+              };
+            };
+          testScript = ''
+            node.wait_for_unit("multi-user.target")
+            node.succeed("mkdir -p /var/lib/velstra")
+
+            seed = (
+                "VELSTRA_NODE=node-1\nVELSTRA_CELL=cell-1\nVELSTRA_REGION=eu-central\n"
+                "VELSTRA_API_URL=http://cell:8443\nVELSTRA_VMM=fake\n"
+            )
+
+            with subtest("a cell with no fabric skips it, and the journal says why"):
+                node.succeed(f"printf '{seed}' > /var/lib/velstra/node.env")
+                # `start` on a unit whose condition fails is success: systemd
+                # records it as skipped. What must NOT happen is a failed unit —
+                # a cell without an overlay is a real way to run.
+                node.succeed("systemctl start velstra-fabric-agent.service")
+                state = node.succeed(
+                    "systemctl show -p ActiveState --value velstra-fabric-agent.service"
+                ).strip()
+                assert state != "failed", f"a fabric-less cell must not fail the unit, got {state}"
+                node.fail("test -e /run/fabric-agent-argv")
+                # And it is discoverable rather than silent: the condition says
+                # what is missing and what to do about it.
+                #
+                # `journal`, not `log`: the test driver already has a global
+                # `log` (its logger), and the name is not rejected, it is
+                # shadowed — the type checker catches it here, a plain
+                # assignment would not have.
+                journal = node.succeed("journalctl -u velstra-fabric-agent --no-pager -o cat")
+                assert "VELSTRA_FABRIC_CONTROL" in journal, journal
+                assert "separate no traffic" in journal, journal
+
+            with subtest("naming a fabric brings the data plane up"):
+                node.succeed(
+                    f"printf '{seed}VELSTRA_FABRIC=http://fab:50052\n"
+                    "VELSTRA_FABRIC_CONTROL=http://fab:50051\n"
+                    "VELSTRA_FABRIC_VTEP=10.0.0.7\nVELSTRA_FABRIC_UNDERLAY=eth1\n'"
+                    " > /var/lib/velstra/node.env"
+                )
+                node.succeed("systemctl daemon-reload")
+                node.succeed("systemctl restart velstra-fabric-agent.service")
+                node.wait_for_unit("velstra-fabric-agent.service")
+
+            with subtest("it watches the agent-facing service, under the cell's node id"):
+                argv = node.succeed("cat /run/fabric-agent-argv").strip()
+                # The config service, NOT the orchestrator on :50052. They are
+                # different services on different ports with different amounts
+                # of trust, and pointing this at the other one gets
+                # `unimplemented` — a confusing way to learn that.
+                assert "--controller http://fab:50051" in argv, argv
+                assert "50052" not in argv, f"that is the orchestrator, not the config service: {argv}"
+                # The cell's node id, not the hostname the agent would default
+                # to: the orchestrator is told about this host under that id.
+                assert "--node-id node-1" in argv, argv
+
+            with subtest("the node agent is given the overlay too"):
+                # The other half of the same seed. Without these the agent keeps
+                # its default datapath — real taps, nothing programmed — and a
+                # port carrying security groups is refused rather than quietly
+                # given a wire that enforces none of them.
+                #
+                # The generated start script, not `systemctl cat`: NixOS turns a
+                # `script` into its own store path, so the unit file names a
+                # wrapper and says nothing about what it runs.
+                start = node.succeed(
+                    "systemctl show -p ExecStart --value velstra-cloud-nodeagent.service"
+                )
+                # systemd renders ExecStart as a record — `{ path=/nix/...;
+                # argv[]=...; }` — so the word carries a `path=` prefix.
+                word = [w for w in start.split() if "unit-script" in w][0]
+                path = word.split("=", 1)[1].rstrip(";")
+                body = node.succeed(f"cat {path}")
+                assert "--datapath fabric" in body, body
+                assert "fabric-vtep" in body, body
+                assert "fabric-underlay" in body, body
+
+            with subtest("the data plane is ordered before the ports are asked for"):
+                # A port programmed against a data plane that is not loaded yet
+                # is a guest with a wire and no rules for however long the gap
+                # lasts. Ordering is the whole fix, so it is asserted.
+                after = node.succeed(
+                    "systemctl show -p After --value velstra-cloud-nodeagent.service"
+                )
+                assert "velstra-fabric-agent.service" in after, after
           '';
         };
 
@@ -1101,7 +1420,8 @@
                 ./lib/systemd/system/velstra-cloud-api.service \
                 ./lib/systemd/system/velstra-cloud-controller.service \
                 ./lib/systemd/system/velstra-cloud-nodeagent.service \
-                ./lib/systemd/system/velstra-cloud-poolagent.service; do
+                ./lib/systemd/system/velstra-cloud-poolagent.service \
+                ./lib/systemd/system/velstra-fabric-agent.service; do
                 echo "$contents" | grep -q " $want\$" || {
                   echo "the package is missing $want" >&2
                   echo "$contents" >&2
@@ -1142,6 +1462,40 @@
               }
               grep -q "EnvironmentFile=-/var/lib/velstra/node.env" unit
 
+              # The fabric unit is gated twice, and both gates matter.
+              #
+              # A cell with no fabric is a legitimate way to run — it is what
+              # every cell did before the data plane had a unit at all — and the
+              # agent is a package this one only recommends. So on a hypervisor
+              # whose seed names no fabric, and on one where `velstra` was never
+              # installed, this must read as "not for this machine" rather than
+              # as a service that failed. Both are ExecCondition, which systemd
+              # records as skipped.
+              dpkg-deb --fsys-tarfile "$deb" | tar -xO ./lib/systemd/system/velstra-fabric-agent.service > fab
+              grep -q "ExecCondition=.*has-role hypervisor" fab || {
+                echo "the fabric unit is not conditional on the hypervisor role:" >&2
+                cat fab >&2
+                exit 1
+              }
+              grep -q "VELSTRA_FABRIC_CONTROL" fab || {
+                echo "the fabric unit would start on a node whose cell has no fabric:" >&2
+                cat fab >&2
+                exit 1
+              }
+              grep -q "command -v velstra" fab || {
+                echo "the fabric unit does not check that the agent is installed:" >&2
+                cat fab >&2
+                exit 1
+              }
+              # It must load before the node agent asks the orchestrator to turn
+              # a tap into a tenant port: a port programmed against a data plane
+              # that is not up yet is a guest with a wire and no rules.
+              grep -q "Before=velstra-cloud-nodeagent.service" fab || {
+                echo "the fabric unit does not order itself before the node agent:" >&2
+                cat fab >&2
+                exit 1
+              }
+
               # `postinst` runs as root on somebody else's machine. One that is
               # not executable is a package that half-installs.
               dpkg-deb --control "$deb" ctrl
@@ -1174,7 +1528,15 @@
             mkdir -p seed
             # region, cell, roles (control-plane + hypervisor + pool), API url,
             # node id, token, hypervisor, pool id, backend, store, other cells,
-            # confirm.
+            # fabric (no), confirm.
+            #
+            # Positional, so a question added anywhere above shifts every answer
+            # below it — which is exactly what happened when the fabric question
+            # arrived: `y` began answering "name a fabric?" instead of "write
+            # this?", and the run derailed with no clue attached. It is worth
+            # keeping positional rather than driving it with expect: this is the
+            # cheapest check in the tree and it is the one that catches a
+            # question nobody meant to add.
             ${velstra-cloud}/bin/velstra-cloud-node setup --dir "$PWD/seed" --nixos false <<'ANSWERS' > out 2>&1
             eu-north
             cell-7
@@ -1187,6 +1549,7 @@
             1
             10.0.0.1:2379
             cell-8=https://cell-8.example:8443
+            n
             y
             ANSWERS
 
@@ -1203,6 +1566,13 @@
             grep -qx "VELSTRA_POOL_BACKEND=directory" seed/node.env
             grep -qx "VELSTRA_STORE=10.0.0.1:2379" seed/node.env
             grep -qx "VELSTRA_CELLS=cell-8=https://cell-8.example:8443" seed/node.env
+            # No fabric was named, so no key for one. A cell that programs no
+            # overlay is a real way to run; what must not happen is a seed that
+            # half-describes one.
+            if grep -q "VELSTRA_FABRIC" seed/node.env; then
+              echo "a cell that declined a fabric was given one anyway" >&2
+              exit 1
+            fi
 
             # The token is the one secret here, and it is not in the file every
             # unit reads.
@@ -1213,6 +1583,42 @@
             grep -q "${lib.concatStrings (lib.replicate 32 "ab")}" seed/node-token
             test "$(stat -c %a seed/node-token)" = 600
             test "$(stat -c %a seed/node.env)" = 644
+
+            # And the same wizard, answering the fabric question this time.
+            #
+            # Its own run rather than more asserts on the one above, because the
+            # two answers produce genuinely different seeds and the interesting
+            # one is what a *declined* fabric leaves out.
+            mkdir -p fabric-seed
+            ${velstra-cloud}/bin/velstra-cloud-node setup --dir "$PWD/fabric-seed" --nixos false <<'ANSWERS' > fabout 2>&1
+            eu-north
+            cell-7
+            2
+            https://cell-7.example:8443
+            node-b
+            ${lib.concatStrings (lib.replicate 32 "cd")}
+            1
+            y
+            http://fab.example:50052
+            http://fab.example:50051
+            10.0.0.7
+            eth1
+            fc00:0:1::/64
+            y
+            ANSWERS
+            cat fabric-seed/node.env
+
+            grep -qx "VELSTRA_FABRIC=http://fab.example:50052" fabric-seed/node.env
+            # The orchestrator and the agent-facing service are different
+            # endpoints with different amounts of trust. A seed that carried one
+            # twice would be a node talking to the wrong one.
+            grep -qx "VELSTRA_FABRIC_CONTROL=http://fab.example:50051" fabric-seed/node.env
+            grep -qx "VELSTRA_FABRIC_VTEP=10.0.0.7" fabric-seed/node.env
+            grep -qx "VELSTRA_FABRIC_UNDERLAY=eth1" fabric-seed/node.env
+            grep -qx "VELSTRA_FABRIC_SRV6_LOCATOR=fc00:0:1::/64" fabric-seed/node.env
+            # A hypervisor is told to enable the data plane; it is not one of the
+            # roles, so this line only appears when a fabric was actually named.
+            grep -q "systemctl enable --now velstra-fabric-agent" fabout
 
             # Told what to enable, and told what it cannot do for them.
             grep -q "systemctl enable --now velstra-cloud-nodeagent" out
