@@ -373,11 +373,15 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
     // round sends replies from the public address out of a door they cannot
     // return through — the asymmetric-routing bug that looks like a firewall
     // problem for a day. See `velstra_cloud_model::public`.
-    let public_default = usable
-        .iter()
-        .flat_map(|nic| nic.public.iter())
-        .next()
-        .cloned();
+    //
+    // Asked of the model rather than worked out again here. The rule was
+    // written down in `public::defaults_through_public` — including *which*
+    // address wins when a guest holds two, and why it must be a stated
+    // arbitrary answer rather than whichever a map happened to yield first —
+    // and this file re-derived it by hand. Two spellings of one rule agree
+    // until the day somebody changes one of them.
+    let routed: Vec<_> = usable.iter().flat_map(|nic| nic.public.iter().cloned()).collect();
+    let public_default = velstra_cloud_model::public::defaults_through_public(&routed).cloned();
     for (n, nic) in usable.iter().enumerate() {
         let mac = format_mac(&nic.mac.expect("filtered"));
         let cidr = nic.cidr.expect("filtered");

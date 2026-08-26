@@ -414,6 +414,8 @@ pub async fn create_target(store: &Arc<dyn Store>, id: &str, path: &str) {
             // whether some pool agent is watching it is a different question.
             // `writable: None` means "unknown", which is not a refusal.
             agent: String::new(),
+
+            verify_every_hours: 0,
         },
         Default::default(),
     );
