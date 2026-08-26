@@ -120,7 +120,13 @@ impl PortController {
                 Ok(true)
             }
             FinalizerStep::Delete => {
-                self.ports.delete(name, port.meta.revision).await?;
+                self.ports
+                    .delete(
+                        name,
+                        port.meta.revision,
+                        &velstra_cloud_model::access::Writer::controller("port"),
+                    )
+                    .await?;
                 info!(port = name, "gone");
                 Ok(true)
             }
@@ -270,15 +276,18 @@ mod tests {
 
     async fn a_port(ports: &TypedStore<PortSpec, PortStatus>, name: &str) {
         ports
-            .create(&Resource::new(
-                meta(name),
-                PortSpec {
-                    network: "projects/p1/networks/n1".into(),
-                    subnet: "projects/p1/subnets/s1".into(),
-                    ..Default::default()
-                },
-                PortStatus::default(),
-            ))
+            .create(
+                &Resource::new(
+                    meta(name),
+                    PortSpec {
+                        network: "projects/p1/networks/n1".into(),
+                        subnet: "projects/p1/subnets/s1".into(),
+                        ..Default::default()
+                    },
+                    PortStatus::default(),
+                ),
+                &velstra_cloud_model::access::Writer::controller("port"),
+            )
             .await
             .unwrap();
     }
@@ -290,17 +299,20 @@ mod tests {
         on: Option<&str>,
     ) {
         instances
-            .create(&Resource::new(
-                meta(name),
-                InstanceSpec {
-                    ports: vec![port.to_string()],
-                    ..Default::default()
-                },
-                InstanceStatus {
-                    node: on.map(str::to_string),
-                    ..Default::default()
-                },
-            ))
+            .create(
+                &Resource::new(
+                    meta(name),
+                    InstanceSpec {
+                        ports: vec![port.to_string()],
+                        ..Default::default()
+                    },
+                    InstanceStatus {
+                        node: on.map(str::to_string),
+                        ..Default::default()
+                    },
+                ),
+                &velstra_cloud_model::access::Writer::controller("port"),
+            )
             .await
             .unwrap();
     }

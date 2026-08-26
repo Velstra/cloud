@@ -122,7 +122,13 @@ impl Reconciler for InstanceController {
                 // Conditional on the revision, so an instance that gained a
                 // finalizer between the read and now survives instead of being
                 // torn out from under whoever added it.
-                self.instances.delete(name, instance.meta.revision).await?;
+                self.instances
+                    .delete(
+                        name,
+                        instance.meta.revision,
+                        &velstra_cloud_model::access::Writer::controller("instance"),
+                    )
+                    .await?;
                 info!(instance = name, "gone");
                 Ok(())
             }
@@ -154,14 +160,17 @@ mod tests {
             TypedStore::new(raw.clone(), "cell-1", "instances");
         let controller = InstanceController::new(store.clone());
         store
-            .create(&Resource::new(
-                Meta::new(
-                    ResourceName::parse(NAME).unwrap(),
-                    Placement::new("eu", "cell-1"),
+            .create(
+                &Resource::new(
+                    Meta::new(
+                        ResourceName::parse(NAME).unwrap(),
+                        Placement::new("eu", "cell-1"),
+                    ),
+                    InstanceSpec::default(),
+                    InstanceStatus::default(),
                 ),
-                InstanceSpec::default(),
-                InstanceStatus::default(),
-            ))
+                &velstra_cloud_model::access::Writer::controller("instance"),
+            )
             .await
             .unwrap();
         (raw, store, controller)

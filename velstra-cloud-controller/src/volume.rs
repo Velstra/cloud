@@ -184,7 +184,13 @@ impl Reconciler for VolumeController {
                 // Conditional on the revision, so a volume that gained a
                 // finalizer between the read and now survives instead of being
                 // torn out from under whoever added it.
-                self.volumes.delete(name, volume.meta.revision).await?;
+                self.volumes
+                    .delete(
+                        name,
+                        volume.meta.revision,
+                        &velstra_cloud_model::access::Writer::controller("volume"),
+                    )
+                    .await?;
                 info!(volume = name, "gone");
                 Ok(())
             }
@@ -224,6 +230,7 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             VolumeSpec {
+                source_backup: None,
                 size_gib: 100,
                 pool: "pool-a".into(),
                 encryption_key: None,
@@ -232,7 +239,13 @@ mod tests {
             },
             VolumeStatus::default(),
         );
-        cell.volumes.create(&v).await.unwrap();
+        cell.volumes
+            .create(
+                &v,
+                &velstra_cloud_model::access::Writer::controller("volume"),
+            )
+            .await
+            .unwrap();
         let controller =
             VolumeController::new(cell.volumes.clone(), cell.snapshots.clone(), "cell-1");
         (cell, controller)
@@ -251,12 +264,25 @@ mod tests {
                 },
                 SnapshotStatus::default(),
             );
-            self.snapshots.create(&s).await.unwrap();
+            self.snapshots
+                .create(
+                    &s,
+                    &velstra_cloud_model::access::Writer::controller("volume"),
+                )
+                .await
+                .unwrap();
         }
 
         async fn drop_snapshot(&self) {
             let s = self.snapshots.get(COPY).await.unwrap().unwrap();
-            self.snapshots.delete(COPY, s.meta.revision).await.unwrap();
+            self.snapshots
+                .delete(
+                    COPY,
+                    s.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller("volume"),
+                )
+                .await
+                .unwrap();
         }
 
         /// Run the controller once over the volume as it now stands.
@@ -512,7 +538,13 @@ mod tests {
             },
             SnapshotStatus::default(),
         );
-        cell.snapshots.create(&other).await.unwrap();
+        cell.snapshots
+            .create(
+                &other,
+                &velstra_cloud_model::access::Writer::controller("volume"),
+            )
+            .await
+            .unwrap();
 
         cell.pass(&controller).await;
         assert!(

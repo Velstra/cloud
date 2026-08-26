@@ -57,10 +57,32 @@ impl Drop for Fabric {
     }
 }
 
+/// Whether nothing is already listening here.
+///
+/// Checked before spawning, because the failure it prevents is silent: a
+/// fixture whose port is taken does not fail to start — it connects to
+/// whatever *is* there and tests against somebody else's state.
+///
+/// **50950–50999 belongs to `velstra-cloud-controller`**; the node agent crate
+/// has 50900–50949. `cargo test` runs test binaries concurrently, and when the
+/// two ranges overlapped this produced three different intermittent failures
+/// in three different files, each looking like a bug in whatever it hit.
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
 impl Fabric {
     async fn start(binary: &PathBuf) -> Option<Self> {
         // Its own ports, so every fixture in this crate can exist at once.
         let (listen, admin, raft) = (50971, 50972, 50973);
+        for port in [listen, admin, raft] {
+            assert!(
+                port_is_free(port),
+                "127.0.0.1:{port} is already listening. This fixture would connect to it and \
+                 test against somebody else's fabric — which is how an intermittent failure \
+                 that looks like a bug in the code under test is really a port collision."
+            );
+        }
         let _ = std::process::Command::new("ip")
             .args(["link", "set", "lo", "up"])
             .status();
@@ -125,36 +147,48 @@ async fn a_router_makes_two_tenant_networks_route_on_the_real_fabric() {
 
     for (i, (name, vni)) in [BLUE, GREEN].into_iter().enumerate() {
         networks
-            .create(&Resource::new(
-                meta(name),
-                NetworkSpec { vni, mtu: 1500 },
-                NetworkStatus::default(),
-            ))
+            .create(
+                &Resource::new(
+                    meta(name),
+                    NetworkSpec { vni, mtu: 1500,
+                external: false,
+                announce: Default::default(),
+            },
+                    NetworkStatus::default(),
+                ),
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
             .await
             .unwrap();
         subnets
-            .create(&Resource::new(
-                meta(&format!("projects/p1/subnets/s{i}")),
-                SubnetSpec {
-                    network: name.into(),
-                    cidr: format!("10.3{i}.0.0/24"),
-                    gateway: format!("10.3{i}.0.1"),
-                    dns: vec![],
-                    reserved: vec![],
-                },
-                SubnetStatus::default(),
-            ))
+            .create(
+                &Resource::new(
+                    meta(&format!("projects/p1/subnets/s{i}")),
+                    SubnetSpec {
+                        network: name.into(),
+                        cidr: format!("10.3{i}.0.0/24"),
+                        gateway: format!("10.3{i}.0.1"),
+                        dns: vec![],
+                        reserved: vec![],
+                    },
+                    SubnetStatus::default(),
+                ),
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
             .await
             .unwrap();
     }
     routers
-        .create(&Resource::new(
-            meta(ROUTER),
-            RouterSpec {
-                networks: vec![BLUE.0.into(), GREEN.0.into()],
-            },
-            RouterStatus::default(),
-        ))
+        .create(
+            &Resource::new(
+                meta(ROUTER),
+                RouterSpec {
+                    networks: vec![BLUE.0.into(), GREEN.0.into()],
+                },
+                RouterStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 

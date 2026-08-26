@@ -214,19 +214,35 @@ mod tests {
                     Placement::new("eu", "cell-1"),
                 ),
                 InstanceSpec {
+                    start_order: 0,
+                    start_delay_s: 0,
+                    on_node_loss: Default::default(),
+                    console: false,
+                    devices: Vec::new(),
                     vcpus: 2,
                     memory_mib: 4096,
                     node: Some(on.to_string()),
                     ..Default::default()
                 },
                 InstanceStatus {
+                    running_size: None,
+                    console_tail: String::new(),
+                    console_bytes: 0,
+                    devices: Vec::new(),
+                    cpu: None,
                     observed_generation: 1,
                     state: InstanceState::Running,
                     node: Some(on.to_string()),
                     ..Default::default()
                 },
             );
-            self.instances.create(&i).await.unwrap();
+            self.instances
+                .create(
+                    &i,
+                    &velstra_cloud_model::access::Writer::controller("migration"),
+                )
+                .await
+                .unwrap();
         }
 
         async fn migration(&self, from: &str, to: &str) -> Migration {
@@ -244,7 +260,13 @@ mod tests {
                 },
                 MigrationStatus::default(),
             );
-            self.migrations.create(&m).await.unwrap();
+            self.migrations
+                .create(
+                    &m,
+                    &velstra_cloud_model::access::Writer::controller("migration"),
+                )
+                .await
+                .unwrap();
             self.reload_migration().await
         }
 

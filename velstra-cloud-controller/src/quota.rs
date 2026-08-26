@@ -13,10 +13,12 @@
 //! full and nothing in the system can prove otherwise.
 
 use velstra_cloud_model::{
+    loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
     meta::{ResourceName, set_condition},
     reconcile::{count_quota, quota_condition},
     resources::{
-        InstanceSpec, InstanceStatus, Project, ProjectSpec, ProjectStatus, VolumeSpec, VolumeStatus,
+        FloatingIpSpec, FloatingIpStatus, InstanceSpec, InstanceStatus, Project, ProjectSpec,
+        ProjectStatus, VolumeSpec, VolumeStatus,
     },
 };
 use velstra_cloud_store::{Cached, prefix_for};
@@ -31,6 +33,8 @@ pub struct QuotaController {
     /// port controller hit, found by the same test, fixed the same way.
     instances: Cached<InstanceSpec, InstanceStatus>,
     volumes: Cached<VolumeSpec, VolumeStatus>,
+    floating: Cached<FloatingIpSpec, FloatingIpStatus>,
+    balancers: Cached<LoadBalancerSpec, LoadBalancerStatus>,
     status: StatusWriter<ProjectSpec, ProjectStatus>,
     cell: String,
 }
@@ -39,12 +43,16 @@ impl QuotaController {
     pub fn new(
         instances: Cached<InstanceSpec, InstanceStatus>,
         volumes: Cached<VolumeSpec, VolumeStatus>,
+        floating: Cached<FloatingIpSpec, FloatingIpStatus>,
+        balancers: Cached<LoadBalancerSpec, LoadBalancerStatus>,
         status: StatusWriter<ProjectSpec, ProjectStatus>,
         cell: &str,
     ) -> Self {
         Self {
             instances,
             volumes,
+            floating,
+            balancers,
             status,
             cell: cell.to_string(),
         }
@@ -73,7 +81,7 @@ impl Reconciler for QuotaController {
         // Leaving this to the resync alone would mean the API admits work
         // against a number that is up to a resync interval out of date, which
         // is exactly how a project overshoots its limit.
-        ["instances", "volumes"]
+        ["instances", "volumes", "floatingips", "load-balancers"]
             .into_iter()
             .map(|kind| Related::named(prefix_for(&self.cell, kind), owning_project))
             .collect()
@@ -86,9 +94,19 @@ impl Reconciler for QuotaController {
 
         let (instances, _) = self.instances.all().await;
         let (volumes, _) = self.volumes.all().await;
+        let (floating, _) = self.floating.all().await;
+        let (balancers, _) = self.balancers.all().await;
         let instances: Vec<_> = instances.iter().map(|i| (**i).clone()).collect();
         let volumes: Vec<_> = volumes.iter().map(|v| (**v).clone()).collect();
-        let used = count_quota(&project.meta.name, &instances, &volumes);
+        let floating: Vec<_> = floating.iter().map(|f| (**f).clone()).collect();
+        let balancers: Vec<_> = balancers.iter().map(|l| (**l).clone()).collect();
+        let used = count_quota(
+            &project.meta.name,
+            &instances,
+            &volumes,
+            &floating,
+            &balancers,
+        );
 
         let mut next = project.clone();
         next.status.used = used;
@@ -124,6 +142,7 @@ mod tests {
         projects: TypedStore<ProjectSpec, ProjectStatus>,
         instances: TypedStore<InstanceSpec, InstanceStatus>,
         volumes: TypedStore<VolumeSpec, VolumeStatus>,
+        floating: TypedStore<FloatingIpSpec, FloatingIpStatus>,
     }
 
     async fn fixture(limit: Quota) -> (Fixture, QuotaController) {
@@ -132,23 +151,27 @@ mod tests {
             projects: TypedStore::new(raw.clone(), "cell-1", "projects"),
             instances: TypedStore::new(raw.clone(), "cell-1", "instances"),
             volumes: TypedStore::new(raw.clone(), "cell-1", "volumes"),
+            floating: TypedStore::new(raw.clone(), "cell-1", "floatingips"),
             raw: raw.clone(),
         };
         f.projects
-            .create(&Resource::new(
-                Meta::new(
-                    ResourceName::parse("projects/p1").unwrap(),
-                    Placement::new("eu", "cell-1"),
+            .create(
+                &Resource::new(
+                    Meta::new(
+                        ResourceName::parse("projects/p1").unwrap(),
+                        Placement::new("eu", "cell-1"),
+                    ),
+                    ProjectSpec {
+                        display_name: "one".into(),
+                        parent: "organizations/o1".into(),
+                        quota: limit,
+                        bindings: Vec::new(),
+                        cell: String::new(),
+                    },
+                    ProjectStatus::default(),
                 ),
-                ProjectSpec {
-                    display_name: "one".into(),
-                    parent: "organizations/o1".into(),
-                    quota: limit,
-                    bindings: Vec::new(),
-                    cell: String::new(),
-                },
-                ProjectStatus::default(),
-            ))
+                &velstra_cloud_model::access::Writer::controller("quota"),
+            )
             .await
             .unwrap();
         let controller = QuotaController::new(
@@ -161,6 +184,20 @@ mod tests {
                 f.volumes.clone(),
                 raw.clone(),
                 prefix_for("cell-1", "volumes"),
+            ),
+            Cached::start(
+                f.floating.clone(),
+                raw.clone(),
+                prefix_for("cell-1", "floatingips"),
+            ),
+            Cached::start(
+                TypedStore::<LoadBalancerSpec, LoadBalancerStatus>::new(
+                    raw.clone(),
+                    "cell-1",
+                    "load-balancers",
+                ),
+                raw.clone(),
+                prefix_for("cell-1", "load-balancers"),
             ),
             StatusWriter::new(raw, "cell-1", "projects", "quota"),
             "cell-1",
@@ -181,6 +218,11 @@ mod tests {
                     Placement::new("eu", "cell-1"),
                 ),
                 InstanceSpec {
+                    start_order: 0,
+                    start_delay_s: 0,
+                    on_node_loss: Default::default(),
+                    console: false,
+                    devices: Vec::new(),
                     vcpus,
                     memory_mib,
                     root_disk_gib: 10,
@@ -188,7 +230,13 @@ mod tests {
                 },
                 InstanceStatus::default(),
             );
-            self.instances.create(&i).await.unwrap();
+            self.instances
+                .create(
+                    &i,
+                    &velstra_cloud_model::access::Writer::controller("quota"),
+                )
+                .await
+                .unwrap();
             i
         }
 
@@ -240,6 +288,7 @@ mod tests {
                     .unwrap()
                     .meta
                     .revision,
+                &velstra_cloud_model::access::Writer::controller("quota"),
             )
             .await
             .unwrap();
@@ -288,10 +337,12 @@ mod tests {
     #[tokio::test]
     async fn a_project_over_its_limit_says_so_on_itself() {
         let (f, controller) = fixture(Quota {
+            devices: 0,
             instances: 1,
             vcpus: 2,
             memory_mib: 2048,
             volume_gib: 100,
+            ..Quota::default()
         })
         .await;
         f.instance("projects/p1/instances/i1", 2, 2048).await;

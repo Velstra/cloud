@@ -28,6 +28,7 @@ use velstra_cloud_fabric::pb;
 use velstra_cloud_model::{
     access::Writer,
     ipam::{assign_floating, unaddressable_condition},
+    loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
     meta::{Condition, ConditionStatus, condition, set_condition},
     reconcile::{FinalizerStep, finalizer_step},
     resources::{
@@ -40,6 +41,8 @@ use velstra_cloud_store::TypedStore;
 use crate::{Result, runner::Reconciler, status::StatusWriter};
 
 const WHO: &str = "floating-ip";
+
+
 
 /// The condition this controller owns: whether the address exists and reaches
 /// what it was told to.
@@ -54,6 +57,9 @@ pub struct FloatingIpController {
     say: StatusWriter<FloatingIpSpec, FloatingIpStatus>,
     subnets: TypedStore<SubnetSpec, SubnetStatus>,
     ports: TypedStore<PortSpec, PortStatus>,
+    /// Read, never written: a load balancer's VIP comes out of the same range,
+    /// and a floating IP must never be given one.
+    balancers: TypedStore<LoadBalancerSpec, LoadBalancerStatus>,
     fabric: Option<Arc<str>>,
 }
 
@@ -64,6 +70,7 @@ impl FloatingIpController {
         floating: TypedStore<FloatingIpSpec, FloatingIpStatus>,
         subnets: TypedStore<SubnetSpec, SubnetStatus>,
         ports: TypedStore<PortSpec, PortStatus>,
+        balancers: TypedStore<LoadBalancerSpec, LoadBalancerStatus>,
         fabric: Option<String>,
     ) -> Self {
         Self {
@@ -71,6 +78,7 @@ impl FloatingIpController {
             say: StatusWriter::new(store, cell, "floatingips", WHO),
             subnets,
             ports,
+            balancers,
             fabric: fabric.map(Arc::from),
         }
     }
@@ -88,7 +96,8 @@ impl FloatingIpController {
         let subnet = self.subnets.get(&fip.spec.subnet).await?;
         let ports = self.ports.list().await?;
         let others = self.floating.list().await?;
-        match assign_floating(fip, subnet.as_ref(), &ports, &others) {
+        let balancers = self.balancers.list().await?;
+        match assign_floating(fip, subnet.as_ref(), &ports, &others, &balancers) {
             Ok(None) => Ok(false),
             Ok(Some(address)) => {
                 let mut next = fip.clone();
@@ -114,6 +123,117 @@ impl FloatingIpController {
                     self.say.write(fip, &next).await?;
                 }
                 Ok(true)
+            }
+        }
+    }
+
+    /// A routed address, bound to the port as a second address.
+    ///
+    /// The datapath has to accept it as a source from that port and deliver it
+    /// as a destination to it — which is what a bound address *is*, and the
+    /// reason a routed address needs no allocation and no association: there is
+    /// nothing translating, so there is nothing to translate between.
+    ///
+    /// Held and pointing at nothing is a state, not a failure — it is the
+    /// reason the object exists — so an address with no port settles as
+    /// allocated-and-idle rather than being reported as broken.
+    async fn bind_to_port(
+        &self,
+        client: &mut velstra_cloud_fabric::Connected,
+        fip: &FloatingIp,
+        address: &str,
+    ) -> Result<()> {
+        if fip.spec.port.is_empty() {
+            return self
+                .settle(
+                    fip,
+                    ConditionStatus::True,
+                    "Held",
+                    "allocated and bound to nothing, which is an address kept for later",
+                    Some((String::new(), String::new())),
+                )
+                .await;
+        }
+        let Some(port) = self.ports.get(&fip.spec.port).await? else {
+            return self
+                .settle(
+                    fip,
+                    ConditionStatus::False,
+                    "NoPort",
+                    &format!("{} does not exist", fip.spec.port),
+                    None,
+                )
+                .await;
+        };
+        // The fabric's own id for the port, found the same way the translated
+        // path finds it: by the tap and host the port reports, because that is
+        // what the fabric keyed it on when the node created it.
+        let port_id = match self.target(client, &port).await {
+            Ok(Ok((id, _fixed))) => id,
+            Ok(Err(why)) => {
+                return self
+                    .settle(fip, ConditionStatus::False, "NoPort", &why, None)
+                    .await;
+            }
+            Err(status) => {
+                warn!(floating_ip = %fip.meta.name, error = %status, "the fabric would not say");
+                return Ok(());
+            }
+        };
+        // Already bound, as far as this side knows — and "as far as this side
+        // knows" is doing real work in that sentence.
+        //
+        // Everywhere else in this file the fabric is *asked* rather than
+        // remembered, because a fabric that lost an association would otherwise
+        // never be corrected. That is not possible here: the fabric reports one
+        // address per port (`PortInfo.ip`, the fixed one) and offers no call
+        // that lists a port's bound addresses, so there is nothing to compare
+        // against. Re-binding blindly is not an option either — the call is not
+        // idempotent, and the second one is refused as "already allocated",
+        // which would leave every routed address reporting a failure one pass
+        // after it worked.
+        //
+        // So this one fact is remembered. The cost is stated rather than
+        // hidden: a fabric restored from a snapshot older than the binding will
+        // not have it, and nothing here will notice. Clearing `spec.port` and
+        // setting it again re-binds. The fix is a fabric that can list a port's
+        // addresses, and then this becomes a comparison like the rest.
+        if fip.status.associated == address {
+            return Ok(());
+        }
+        match client
+            .bind_port_subnet(pb::BindPortSubnetRequest {
+                port_id,
+                subnet_id: fip.spec.subnet.clone(),
+                ip: address.to_string(),
+            })
+            .await
+        {
+            Ok(_) => {
+                self.settle(
+                    fip,
+                    ConditionStatus::True,
+                    // Not "Forwarding": nothing forwards. The guest holds it.
+                    "Held By The Guest",
+                    "",
+                    Some((String::new(), address.to_string())),
+                )
+                .await
+            }
+            Err(status) => {
+                warn!(
+                    floating_ip = %fip.meta.name,
+                    error = %status,
+                    "the fabric refused to bind the address to the port"
+                );
+                self.settle(
+                    fip,
+                    ConditionStatus::False,
+                    "Refused",
+                    status.message(),
+                    None,
+                )
+                .await
             }
         }
     }
@@ -313,7 +433,9 @@ impl Reconciler for FloatingIpController {
         let FloatingIpSpec {
             subnet: _,  // where the address comes from — used by `address`
             address: _, // the address itself — allocated on the fabric below
-            port: _,    // what it reaches — associated or detached below
+            port: _,      // what it reaches — associated or detached below
+            delivery: _,  // how it reaches the guest — see `crate::public`
+            announce: _,  // who says where it is, when it disagrees with its network
         } = &fip.spec;
 
         // The address first, and always: a cell with no fabric still decides it,
@@ -336,6 +458,16 @@ impl Reconciler for FloatingIpController {
                 return Ok(());
             }
         };
+
+        // A routed address is a different thing on the fabric, not a variant of
+        // the same one. It is **bound to the port as a second address** — the
+        // guest holds it, so the datapath has to accept it as a source and
+        // deliver it as a destination, which is exactly what a bound address
+        // is. Nothing is allocated as a floating IP and nothing is associated:
+        // there is no translation to set up.
+        if fip.spec.delivery == velstra_cloud_model::public::Delivery::Routed {
+            return self.bind_to_port(&mut client, fip, &address).await;
+        }
 
         let info = match self.on_fabric(&mut client, fip, &address).await {
             Ok(info) => info,
@@ -566,39 +698,46 @@ mod tests {
                 self.floating.clone(),
                 self.subnets.clone(),
                 self.ports.clone(),
+                TypedStore::new(self.raw.clone(), CELL, "load-balancers"),
                 None,
             )
         }
 
         async fn subnet(&self, cidr: &str) {
             self.subnets
-                .create(&Resource::new(
-                    meta(SUBNET),
-                    SubnetSpec {
-                        network: "projects/p1/networks/n1".into(),
-                        cidr: cidr.into(),
-                        gateway: "10.20.0.1".into(),
-                        dns: vec![],
-                        reserved: vec![],
-                    },
-                    SubnetStatus::default(),
-                ))
+                .create(
+                    &Resource::new(
+                        meta(SUBNET),
+                        SubnetSpec {
+                            network: "projects/p1/networks/n1".into(),
+                            cidr: cidr.into(),
+                            gateway: "10.20.0.1".into(),
+                            dns: vec![],
+                            reserved: vec![],
+                        },
+                        SubnetStatus::default(),
+                    ),
+                    &velstra_cloud_model::access::Writer::controller("floating_ip"),
+                )
                 .await
                 .unwrap();
         }
 
         async fn port(&self, id: &str, address: &str) {
             self.ports
-                .create(&Resource::new(
-                    meta(&format!("projects/p1/ports/{id}")),
-                    PortSpec {
-                        network: "projects/p1/networks/n1".into(),
-                        subnet: SUBNET.into(),
-                        address: Some(address.into()),
-                        ..Default::default()
-                    },
-                    PortStatus::default(),
-                ))
+                .create(
+                    &Resource::new(
+                        meta(&format!("projects/p1/ports/{id}")),
+                        PortSpec {
+                            network: "projects/p1/networks/n1".into(),
+                            subnet: SUBNET.into(),
+                            address: Some(address.into()),
+                            ..Default::default()
+                        },
+                        PortStatus::default(),
+                    ),
+                    &velstra_cloud_model::access::Writer::controller("floating_ip"),
+                )
                 .await
                 .unwrap();
         }
@@ -610,10 +749,18 @@ mod tests {
                     subnet: SUBNET.into(),
                     address: address.map(str::to_string),
                     port: String::new(),
-                },
+                delivery: Default::default(),
+                announce: None,
+            },
                 FloatingIpStatus::default(),
             );
-            self.floating.create(&f).await.unwrap();
+            self.floating
+                .create(
+                    &f,
+                    &velstra_cloud_model::access::Writer::controller("floating_ip"),
+                )
+                .await
+                .unwrap();
             self.floating.get(FIP).await.unwrap().unwrap()
         }
     }

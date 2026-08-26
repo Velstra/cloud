@@ -90,7 +90,13 @@ impl Reconciler for SnapshotController {
                 // Conditional on the revision, so a snapshot that gained a
                 // finalizer between the read and now survives instead of being
                 // torn out from under whoever added it.
-                self.snapshots.delete(name, snapshot.meta.revision).await?;
+                self.snapshots
+                    .delete(
+                        name,
+                        snapshot.meta.revision,
+                        &velstra_cloud_model::access::Writer::controller("snapshot"),
+                    )
+                    .await?;
                 info!(snapshot = name, "gone");
                 Ok(())
             }
@@ -126,7 +132,13 @@ mod tests {
             },
             SnapshotStatus::default(),
         );
-        snapshots.create(&s).await.unwrap();
+        snapshots
+            .create(
+                &s,
+                &velstra_cloud_model::access::Writer::controller("snapshot"),
+            )
+            .await
+            .unwrap();
         let controller = SnapshotController::new(snapshots.clone());
         (snapshots, controller)
     }

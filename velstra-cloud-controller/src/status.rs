@@ -153,6 +153,11 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             InstanceSpec {
+                start_order: 0,
+                start_delay_s: 0,
+                on_node_loss: Default::default(),
+                console: false,
+                devices: Vec::new(),
                 vcpus: 2,
                 ..Default::default()
             },
@@ -172,7 +177,13 @@ mod tests {
     #[tokio::test]
     async fn a_controller_may_speak_for_an_object_no_agent_owns() {
         let (typed, writer, _) = pair();
-        typed.create(&instance()).await.unwrap();
+        typed
+            .create(
+                &instance(),
+                &velstra_cloud_model::access::Writer::controller("status"),
+            )
+            .await
+            .unwrap();
         let before = typed
             .get("projects/p1/instances/i1")
             .await
@@ -207,7 +218,13 @@ mod tests {
         let (typed, writer, _) = pair();
         let mut i = instance();
         i.status.node = Some("node-a".into());
-        typed.create(&i).await.unwrap();
+        typed
+            .create(
+                &i,
+                &velstra_cloud_model::access::Writer::controller("status"),
+            )
+            .await
+            .unwrap();
         let before = typed
             .get("projects/p1/instances/i1")
             .await
@@ -223,7 +240,13 @@ mod tests {
     #[tokio::test]
     async fn the_status_path_cannot_smuggle_a_spec_change() {
         let (typed, writer, _) = pair();
-        typed.create(&instance()).await.unwrap();
+        typed
+            .create(
+                &instance(),
+                &velstra_cloud_model::access::Writer::controller("status"),
+            )
+            .await
+            .unwrap();
         let before = typed
             .get("projects/p1/instances/i1")
             .await
@@ -242,7 +265,13 @@ mod tests {
     #[tokio::test]
     async fn writing_what_is_already_there_writes_nothing() {
         let (typed, writer, store) = pair();
-        typed.create(&instance()).await.unwrap();
+        typed
+            .create(
+                &instance(),
+                &velstra_cloud_model::access::Writer::controller("status"),
+            )
+            .await
+            .unwrap();
         let before = typed
             .get("projects/p1/instances/i1")
             .await
@@ -267,7 +296,13 @@ mod tests {
     #[tokio::test]
     async fn a_stale_copy_loses_rather_than_clobbering() {
         let (typed, writer, _) = pair();
-        typed.create(&instance()).await.unwrap();
+        typed
+            .create(
+                &instance(),
+                &velstra_cloud_model::access::Writer::controller("status"),
+            )
+            .await
+            .unwrap();
         let stale = typed
             .get("projects/p1/instances/i1")
             .await

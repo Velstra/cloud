@@ -60,7 +60,11 @@ impl Reconciler for AttachmentController {
                 // the read and now survives instead of being torn out from
                 // under whoever added it.
                 self.attachments
-                    .delete(name, attachment.meta.revision)
+                    .delete(
+                        name,
+                        attachment.meta.revision,
+                        &velstra_cloud_model::access::Writer::controller("attachment"),
+                    )
                     .await?;
                 info!(attachment = name, "released");
                 Ok(())
@@ -139,7 +143,13 @@ mod tests {
             },
             AttachmentStatus::default(),
         );
-        store.create(&a).await.unwrap();
+        store
+            .create(
+                &a,
+                &velstra_cloud_model::access::Writer::controller("attachment"),
+            )
+            .await
+            .unwrap();
         (raw, store, controller)
     }
 
@@ -262,19 +272,22 @@ mod release_tests {
             TypedStore::new(raw, "cell-1", "attachments");
         let controller = AttachmentController::new(store.clone());
         store
-            .create(&Resource::new(
-                Meta::new(
-                    ResourceName::parse(NAME).unwrap(),
-                    Placement::new("eu", "cell-1"),
+            .create(
+                &Resource::new(
+                    Meta::new(
+                        ResourceName::parse(NAME).unwrap(),
+                        Placement::new("eu", "cell-1"),
+                    ),
+                    AttachmentSpec {
+                        volume: "projects/p1/volumes/v1".into(),
+                        instance: "projects/p1/instances/i1".into(),
+                        node: "node-a".into(),
+                        read_only: false,
+                    },
+                    AttachmentStatus::default(),
                 ),
-                AttachmentSpec {
-                    volume: "projects/p1/volumes/v1".into(),
-                    instance: "projects/p1/instances/i1".into(),
-                    node: "node-a".into(),
-                    read_only: false,
-                },
-                AttachmentStatus::default(),
-            ))
+                &velstra_cloud_model::access::Writer::controller("attachment"),
+            )
             .await
             .unwrap();
         (store, controller)
