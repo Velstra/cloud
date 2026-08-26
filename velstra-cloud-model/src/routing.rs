@@ -97,6 +97,7 @@ mod tests {
             "networks",
             "subnets",
             "ports",
+            "load-balancers",
             "security-groups",
             "images",
             "nodes",

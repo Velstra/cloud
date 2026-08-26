@@ -409,3 +409,123 @@ mod tests {
         assert!(m.finalizers.is_empty());
     }
 }
+
+/// One term of a label selector: a key, and optionally the value it must have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelTerm {
+    pub key: String,
+    /// `None` means "has this label at all, whatever it says". Both forms are
+    /// worth having: `env=prod` is the common one, and `deprecated` — present
+    /// with any value, or none — is how somebody marks a thing without
+    /// deciding on a vocabulary first.
+    pub value: Option<String>,
+}
+
+/// Read a selector as a person types it: `env=prod,tier=web`.
+///
+/// Commas separate terms and every term must match — an "or" would need
+/// precedence rules, and a filter box whose meaning depends on precedence is
+/// one people get wrong silently. Somebody who needs "or" runs two searches
+/// and can see both answers.
+///
+/// Whitespace around a term is somebody's typing, not part of the key. An
+/// empty term is skipped rather than refused, so a trailing comma does not
+/// turn a working filter into an error message.
+pub fn parse_selector(text: &str) -> Vec<LabelTerm> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(|term| match term.split_once('=') {
+            Some((key, value)) => LabelTerm {
+                key: key.trim().to_string(),
+                value: Some(value.trim().to_string()),
+            },
+            None => LabelTerm {
+                key: term.to_string(),
+                value: None,
+            },
+        })
+        .collect()
+}
+
+/// Whether these labels satisfy every term.
+///
+/// An empty selector matches everything, which is what "no filter" has to
+/// mean — the alternative is a filter box that empties the list when cleared.
+pub fn labels_match(labels: &BTreeMap<String, String>, terms: &[LabelTerm]) -> bool {
+    terms.iter().all(|term| match &term.value {
+        Some(want) => labels.get(&term.key).is_some_and(|have| have == want),
+        None => labels.contains_key(&term.key),
+    })
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn every_term_must_match_rather_than_any() {
+        let it = labels(&[("env", "prod"), ("tier", "web")]);
+        assert!(labels_match(&it, &parse_selector("env=prod")));
+        assert!(labels_match(&it, &parse_selector("env=prod,tier=web")));
+        // An "or" would need precedence rules, and a filter box whose meaning
+        // depends on precedence is one people get wrong silently.
+        assert!(!labels_match(&it, &parse_selector("env=prod,tier=db")));
+    }
+
+    /// A bare key asks whether the label is there at all.
+    #[test]
+    fn a_bare_key_matches_whatever_the_value_says() {
+        let marked = labels(&[("deprecated", "")]);
+        assert!(labels_match(&marked, &parse_selector("deprecated")));
+        assert!(!labels_match(&labels(&[("env", "prod")]), &parse_selector("deprecated")));
+    }
+
+    /// An empty selector matches everything.
+    ///
+    /// The alternative is a filter box that empties the list when it is
+    /// cleared, which reads as "nothing here" rather than "no filter".
+    #[test]
+    fn no_selector_matches_everything() {
+        assert!(labels_match(&labels(&[]), &parse_selector("")));
+        assert!(labels_match(&labels(&[("env", "prod")]), &parse_selector("  ")));
+        assert!(labels_match(&labels(&[("env", "prod")]), &parse_selector(",,")));
+    }
+
+    /// Typing is forgiven where forgiving it cannot change the meaning.
+    #[test]
+    fn spaces_and_a_trailing_comma_do_not_break_a_working_filter() {
+        let it = labels(&[("env", "prod"), ("tier", "web")]);
+        assert!(labels_match(&it, &parse_selector(" env = prod , tier=web ,")));
+    }
+
+    /// A value that itself contains `=` survives.
+    #[test]
+    fn only_the_first_equals_separates_a_term() {
+        let it = labels(&[("note", "a=b")]);
+        assert_eq!(
+            parse_selector("note=a=b"),
+            vec![LabelTerm {
+                key: "note".into(),
+                value: Some("a=b".into())
+            }]
+        );
+        assert!(labels_match(&it, &parse_selector("note=a=b")));
+    }
+
+    /// An empty value is a value, and is not the same as asking for presence.
+    #[test]
+    fn an_empty_value_is_different_from_no_value() {
+        assert!(labels_match(&labels(&[("env", "")]), &parse_selector("env=")));
+        assert!(!labels_match(&labels(&[("env", "prod")]), &parse_selector("env=")));
+        // Whereas the bare key matches either.
+        assert!(labels_match(&labels(&[("env", "prod")]), &parse_selector("env")));
+    }
+}

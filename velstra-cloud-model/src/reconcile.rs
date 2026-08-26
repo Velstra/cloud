@@ -95,6 +95,10 @@ pub fn reconcile_instance(
     image_cached: bool,
     ports_programmed: &[bool],
     disk_present: bool,
+    // Whether anything ahead of this guest in the node's start order is still
+    // coming up. `Go` for everything a caller has no ordering opinion about,
+    // which is most callers and every cell that has not asked for one.
+    gate: StartGate,
 ) -> Vec<Action> {
     let name = instance.meta.name.to_string();
     let mut actions = Vec::new();
@@ -153,6 +157,12 @@ pub fn reconcile_instance(
         (DesiredState::Running, InstanceState::Failed) => actions.push(Action::RestartCrashedVm {
             instance: name.clone(),
         }),
+        // Held by the start order, not by anything about this guest. No
+        // action, no state, nothing recorded: the next pass asks the same
+        // question of a world that has moved on, and by then the group ahead
+        // is up. Why it is waiting is answerable — see `StartGate` — rather
+        // than written onto the object, because the node owns that status.
+        (DesiredState::Running, _) if ready_to_run && gate != StartGate::Go => {}
         (DesiredState::Running, _) if ready_to_run => {
             actions.push(Action::StartVm {
                 instance: name.clone(),
@@ -201,6 +211,106 @@ pub fn reconcile_attachment(attachment: &Attachment) -> Vec<Action> {
     actions
 }
 
+/// One guest on this node, as the start gate sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartPeer {
+    pub name: String,
+    pub order: u32,
+    pub state: InstanceState,
+    /// What its operator wants it doing. A guest nobody wants running is not
+    /// something to wait for.
+    pub desired: DesiredState,
+    pub started_at: Option<Timestamp>,
+}
+
+/// Whether a guest may start yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartGate {
+    /// Nothing is in the way.
+    Go,
+    /// Something earlier in the order has not come up.
+    ///
+    /// Carries which one, because "waiting" without a name is a thing an
+    /// operator stares at. If a whole node stays down for one broken guest,
+    /// the name of that guest is the entire fix.
+    WaitingFor { instance: String },
+    /// Everything earlier is up, and its settling time has not elapsed.
+    WaitingOut { seconds: u64 },
+}
+
+/// Whether this guest may start yet, given what else is on its node.
+///
+/// The problem this solves is the one a platform is judged on: power comes
+/// back, a node starts forty guests at once, and the database that everything
+/// else needs loses the race for disk to a dozen web servers.
+///
+/// Level-triggered like everything else. There is no queue and no "starting"
+/// state — every pass asks the same question of the same world, and a guest
+/// that may not start yet is simply not started this pass.
+///
+/// **What counts as settled**, and this is where the deadlock lives:
+///
+/// * `Running` — up, obviously.
+/// * `Failed` — it had its chance. Waiting forever for a guest that cannot
+///   start would take a whole node down for one broken disk.
+/// * Anything whose operator wants it `Stopped` — it is not coming up, and
+///   waiting for a machine nobody asked to run is waiting for nothing.
+///
+/// Everything else blocks, which is the case somebody actually wants to wait
+/// for: a guest that is genuinely still coming up. A guest stuck trying — no
+/// image, no capacity — does hold the ones behind it, and that is deliberate:
+/// the alternative is starting the application servers without the database
+/// and calling it success. It is *visible*, which is the difference — the
+/// refusal names what is being waited on.
+pub fn start_gate(
+    order: u32,
+    delay_s: u32,
+    peers: &[StartPeer],
+    now: Timestamp,
+) -> StartGate {
+    let earlier: Vec<&StartPeer> = peers.iter().filter(|p| p.order < order).collect();
+
+    for peer in &earlier {
+        let settled = peer.state == InstanceState::Running
+            || peer.state == InstanceState::Failed
+            || peer.desired == DesiredState::Stopped;
+        if !settled {
+            return StartGate::WaitingFor {
+                instance: peer.name.clone(),
+            };
+        }
+    }
+
+    if delay_s == 0 {
+        return StartGate::Go;
+    }
+    // The newest start among everything earlier. A guest waits for the group
+    // in front of it to have been up a while, not for each member in turn —
+    // which would make a fleet's boot the sum of every delay rather than the
+    // longest one.
+    let newest = earlier
+        .iter()
+        .filter(|p| p.state == InstanceState::Running)
+        .filter_map(|p| p.started_at)
+        .map(|t| t.0)
+        .max();
+    let Some(newest) = newest else {
+        // Nothing earlier is running: either there is nothing earlier, or what
+        // is there is failed or deliberately stopped. Either way there is
+        // nothing to settle after.
+        return StartGate::Go;
+    };
+    let waited_ms = now.0.saturating_sub(newest);
+    let need_ms = u64::from(delay_s) * 1000;
+    if waited_ms >= need_ms {
+        StartGate::Go
+    } else {
+        StartGate::WaitingOut {
+            seconds: (need_ms - waited_ms).div_ceil(1000),
+        }
+    }
+}
+
 /// Why a node was not chosen. The chain of these *is* the explain API: an
 /// operator asking "why did this not schedule" gets the filter that removed
 /// each candidate, not a log to grep.
@@ -226,6 +336,46 @@ pub enum Rejected {
     AntiAffinity {
         group: String,
     },
+    /// The node's processor is below the level this instance asked for.
+    CpuLevelTooLow {
+        has: Option<crate::cpu::CpuLevel>,
+        want: crate::cpu::CpuLevel,
+    },
+    /// The node cannot give this guest the PCI devices it asked for.
+    ///
+    /// Carries the shortfall rather than a count, because the two questions an
+    /// operator asks next are different: "there are none here" sends them to
+    /// another node, and "the audio function beside it is bound to
+    /// snd_hda_intel" is fixed on this one in a minute.
+    NoDevice {
+        why: crate::pci::Shortfall,
+    },
+    /// This instance is already running somewhere, and this node cannot give
+    /// it the CPU it is running with. Carries the mismatch rather than a
+    /// flattened string so the console can tell "three flags short" from
+    /// "this VMM can never mask" — two facts with two different remedies.
+    CpuIncompatible {
+        why: crate::cpu::CpuMismatch,
+    },
+    /// The rest of this guest's group is somewhere else, and it asked to be
+    /// with them.
+    ///
+    /// Carries where they are, so the sentence an operator reads is "the rest
+    /// of it is on node-b" rather than "no valid host" — one of those names
+    /// the machine to go and look at.
+    NotWithGroup {
+        group: String,
+        elsewhere: Vec<String>,
+    },
+    /// The node is out of service in a window somebody declared.
+    ///
+    /// Carries when it comes back and what it is for, because "no capacity" and
+    /// "node-b is back at 03:00 for the memory swap" are the same fact told two
+    /// ways, and only one of them ends the conversation.
+    InMaintenance {
+        minutes_left: u64,
+        note: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,10 +394,26 @@ pub struct Explanation {
 pub fn place(
     instance: &Instance,
     nodes: &[Node],
+    // Which anti-affinity group already occupies which node.
     occupied_groups: &[(String, String)],
+    // Which affinity group is already on which node — the same shape, and a
+    // separate list because a name may mean both things to two different
+    // guests, and folding them together would let one guest's "keep apart"
+    // answer another's "keep together".
+    with_group: &[(String, String)],
+    // The cell's device classes, needed to answer what an instance asked for.
+    // Empty when nothing in the cell passes hardware through, which is most
+    // cells — an instance asking for a class then finds none, by name.
+    classes: &std::collections::BTreeMap<String, crate::pci::DeviceClassSpec>,
+    // The nodes that are out of service this instant, from
+    // [`crate::maintenance::closed_now`]. Passed in rather than read here
+    // because this function is pure and the clock is not: a scheduler that
+    // computed a different answer on a second call with the same arguments
+    // would be untestable and unexplainable.
+    closed: &[crate::maintenance::Closed],
 ) -> Result<String, Vec<Explanation>> {
     let mut rejected = Vec::new();
-    let mut best: Option<(&Node, u64)> = None;
+    let mut best: Option<(&Node, (u8, u8, u64))> = None;
 
     for node in nodes {
         let id = node.meta.name.id().to_string();
@@ -255,6 +421,16 @@ pub fn place(
             rejected.push(Explanation {
                 node: id,
                 why: Rejected::Unschedulable,
+            });
+            continue;
+        }
+        if let Some(shut) = closed.iter().find(|c| c.node == id) {
+            rejected.push(Explanation {
+                node: id,
+                why: Rejected::InMaintenance {
+                    minutes_left: shut.minutes_left,
+                    note: shut.note.clone(),
+                },
             });
             continue;
         }
@@ -283,12 +459,91 @@ pub fn place(
             });
             continue;
         }
-        if let Some(group) = &instance.spec.placement_policy.anti_affinity_group {
-            if occupied_groups.iter().any(|(g, n)| g == group && n == &id) {
+        // The CPU, before capacity: a node that cannot run this guest at all
+        // is not a near miss to be reported as "2 vcpus short".
+        let node_cpu = node.status.cpu.clone().unwrap_or_default();
+        if let Some(want) = instance.spec.placement_policy.min_cpu_level {
+            let has = node_cpu.level();
+            if has.is_none_or(|has| has < want) {
+                rejected.push(Explanation {
+                    node: id,
+                    why: Rejected::CpuLevelTooLow { has, want },
+                });
+                continue;
+            }
+        }
+        // An instance that has run before carries the CPU it was given. The
+        // question is never "what could this node present" but "can it present
+        // what this guest already sees" — see the invariant on `crate::cpu`.
+        if let Some(guest_cpu) = &instance.status.cpu {
+            if let Err(why) = crate::cpu::may_run_on(guest_cpu, &node_cpu) {
+                rejected.push(Explanation {
+                    node: id,
+                    why: Rejected::CpuIncompatible { why },
+                });
+                continue;
+            }
+        }
+        // The devices, before capacity: a node without the hardware is not a
+        // near miss to be reported as "2 vcpus short", and the reason it
+        // cannot take the guest is a hardware fact the operator can act on.
+        if !instance.spec.devices.is_empty() {
+            if let Err(why) = crate::pci::assign(
+                &instance.spec.devices,
+                classes,
+                &node.status.pci_devices,
+            ) {
+                rejected.push(Explanation {
+                    node: id,
+                    why: Rejected::NoDevice { why },
+                });
+                continue;
+            }
+        }
+        // Anti-affinity and affinity, both of which can be a rule or a wish.
+        //
+        // A wish does not reject here; it is carried to the score below, where
+        // "beside its sibling" loses to "anywhere else" and still beats "not
+        // running at all".
+        let policy = &instance.spec.placement_policy;
+        let mut crowded = false;
+        if let Some(group) = &policy.anti_affinity_group
+            && occupied_groups.iter().any(|(g, n)| g == group && n == &id)
+        {
+            if policy.spread == crate::resources::Strength::Required {
                 rejected.push(Explanation {
                     node: id,
                     why: Rejected::AntiAffinity {
                         group: group.clone(),
+                    },
+                });
+                continue;
+            }
+            crowded = true;
+        }
+        // Affinity only bites once a member is placed somewhere. Before that
+        // there is nothing to be near, and refusing every node would mean a
+        // group whose first member could never start.
+        let mut together = false;
+        if let Some(group) = &policy.affinity_group {
+            let anywhere = with_group.iter().any(|(g, _)| g == group);
+            together = with_group.iter().any(|(g, n)| g == group && n == &id);
+            if anywhere
+                && !together
+                && policy.affinity == crate::resources::Strength::Required
+            {
+                rejected.push(Explanation {
+                    node: id,
+                    why: Rejected::NotWithGroup {
+                        group: group.clone(),
+                        // Where the group actually is, so "no valid host"
+                        // becomes "node-b is where the rest of it is, and
+                        // node-b has 2 GiB free".
+                        elsewhere: with_group
+                            .iter()
+                            .filter(|(g, _)| g == group)
+                            .map(|(_, n)| n.clone())
+                            .collect(),
                     },
                 });
                 continue;
@@ -336,9 +591,18 @@ pub fn place(
             continue;
         }
 
-        // Least-loaded wins, so one node does not collect every small instance
-        // while its neighbours idle.
-        let score = free.memory_mib;
+        // Wishes first, then least-loaded — so one node does not collect every
+        // small instance while its neighbours idle.
+        //
+        // Lexicographic rather than weighted, deliberately. A weight is a
+        // number somebody has to tune, and the first time it is wrong it is
+        // wrong silently; an order is a sentence: be with your group, then be
+        // away from your siblings, then be on the emptiest machine.
+        let score = (
+            u8::from(together),
+            u8::from(!crowded),
+            free.memory_mib,
+        );
         if best.map(|(_, s)| score > s).unwrap_or(true) {
             best = Some((node, score));
         }
@@ -350,16 +614,120 @@ pub fn place(
     }
 }
 
+/// How many vCPUs this node is willing to hand out in total.
+///
+/// The ratio is a *spec* field, so it is an operator's decision, and it is
+/// applied here rather than to the reported capacity: a node reports what it
+/// has, and what a cell is prepared to promise on top of that is not something
+/// an agent gets to say about itself.
+pub fn offered_vcpus(node: &Node) -> u32 {
+    let real = node.status.capacity.vcpus;
+    match node.spec.vcpu_overcommit {
+        // Zero is "nobody set one", the same reading a quota gives it — so a
+        // node stored before the field existed behaves exactly as it did.
+        0 | 1 => real,
+        ratio => real.saturating_mul(ratio),
+    }
+}
+
 fn free_capacity(node: &Node) -> Capacity {
     let c = &node.status.capacity;
     let a = &node.status.allocated;
     Capacity {
-        vcpus: c.vcpus.saturating_sub(a.vcpus),
+        vcpus: offered_vcpus(node).saturating_sub(a.vcpus),
         memory_mib: c.memory_mib.saturating_sub(a.memory_mib),
         disk_gib: c.disk_gib.saturating_sub(a.disk_gib),
         numa_free_mib: c.numa_free_mib.clone(),
         hugepages_1gi: c.hugepages_1gi.saturating_sub(a.hugepages_1gi),
     }
+}
+
+/// What a cell has, what is spoken for, and what is actually left.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Headroom {
+    /// Every node that is ready and accepting work.
+    pub usable_nodes: usize,
+    /// Nodes that exist and cannot take anything: draining, not ready, or
+    /// being emptied. Counted separately because "we have twelve nodes" and
+    /// "eight of them will take a guest" are different sentences, and the
+    /// second one is the one somebody planning capacity needs.
+    pub unusable_nodes: usize,
+    pub total: Capacity,
+    pub allocated: Capacity,
+    /// What is free across the usable nodes — and *not* `total - allocated`,
+    /// which would count a draining node's empty half as room.
+    pub free: Capacity,
+    /// How many vCPUs the usable nodes are prepared to hand out.
+    ///
+    /// Distinct from `total.vcpus`, which is silicon. They differ exactly where
+    /// an operator has set a ratio, and keeping them apart is what stops a
+    /// capacity page from reading as though the cell had grown a processor:
+    /// "64 cores, offered as 256" is the true sentence and neither number tells
+    /// it alone.
+    pub offered_vcpus: u32,
+    /// The largest guest that would still fit somewhere.
+    ///
+    /// The number an operator actually wants and cannot get from a sum: a cell
+    /// with 64 GiB free spread over eight nodes fits no 16 GiB guest at all,
+    /// and every dashboard that shows the sum has told somebody it would.
+    pub largest_fit: Capacity,
+}
+
+/// Add up a cell, in the one way that does not lie.
+///
+/// Sums are the obvious approach and they mislead in two specific ways, both
+/// of which this avoids:
+///
+/// * A drained node's free memory is not free — nothing may be placed there.
+///   It is counted in `total` and excluded from `free`, so the two disagree on
+///   purpose and the gap is the drained capacity.
+/// * Free memory does not add up into a guest. Sixty-four gibibytes spread
+///   over eight nodes fits no sixteen-gibibyte guest, and `largest_fit` is the
+///   only honest answer to "will another one go in".
+pub fn headroom(nodes: &[Node], closed: &[crate::maintenance::Closed]) -> Headroom {
+    let mut out = Headroom::default();
+    for node in nodes {
+        if node.meta.is_deleting() {
+            continue;
+        }
+        let c = &node.status.capacity;
+        out.total.vcpus = out.total.vcpus.saturating_add(c.vcpus);
+        out.total.memory_mib = out.total.memory_mib.saturating_add(c.memory_mib);
+        out.total.disk_gib = out.total.disk_gib.saturating_add(c.disk_gib);
+
+        let a = &node.status.allocated;
+        out.allocated.vcpus = out.allocated.vcpus.saturating_add(a.vcpus);
+        out.allocated.memory_mib = out.allocated.memory_mib.saturating_add(a.memory_mib);
+        out.allocated.disk_gib = out.allocated.disk_gib.saturating_add(a.disk_gib);
+
+        let ready = crate::meta::condition(&node.status.conditions, "Ready")
+            .is_some_and(|c| c.status == ConditionStatus::True);
+        // A machine inside an open maintenance window is unusable in exactly
+        // the way a draining one is. Counting it would put its free memory into
+        // `largestFit`, and `largestFit` is the number a tenant is told they
+        // can start — a promise the scheduler would then refuse.
+        let out_of_service = closed.iter().any(|c| c.node == node.meta.name.id());
+        if !ready || !node.spec.schedulable || node.spec.evacuate || out_of_service {
+            out.unusable_nodes += 1;
+            continue;
+        }
+        out.usable_nodes += 1;
+        out.offered_vcpus = out.offered_vcpus.saturating_add(offered_vcpus(node));
+
+        let free = free_capacity(node);
+        out.free.vcpus = out.free.vcpus.saturating_add(free.vcpus);
+        out.free.memory_mib = out.free.memory_mib.saturating_add(free.memory_mib);
+        out.free.disk_gib = out.free.disk_gib.saturating_add(free.disk_gib);
+
+        // The largest single machine, per dimension. Deliberately not one
+        // node's whole shape: a guest needs vcpus *and* memory on one host, so
+        // the honest reading of this field is "no guest larger than this in
+        // any dimension can fit anywhere", which is what a person is checking.
+        out.largest_fit.vcpus = out.largest_fit.vcpus.max(free.vcpus);
+        out.largest_fit.memory_mib = out.largest_fit.memory_mib.max(free.memory_mib);
+        out.largest_fit.disk_gib = out.largest_fit.disk_gib.max(free.disk_gib);
+    }
+    out
 }
 
 /// The condition an instance should carry, given what the node reported.
@@ -478,6 +846,25 @@ fn describe(why: &Rejected) -> String {
         }
         Rejected::MissingLabel { label } => format!("missing label {label}"),
         Rejected::AntiAffinity { group } => format!("already runs a member of {group}"),
+        Rejected::CpuLevelTooLow { has, want } => match has {
+            Some(has) => format!("cpu is {has}, {want} wanted"),
+            // Distinct from a low level: an agent too old to report its CPU
+            // cannot be shown to satisfy anything, and saying "cpu is v1"
+            // would be a claim nobody made.
+            None => format!("cpu unknown, {want} wanted"),
+        },
+        Rejected::CpuIncompatible { why } => why.to_string(),
+        Rejected::NotWithGroup { group, elsewhere } => format!(
+            "{group} is on {}, and this guest asked to be with it",
+            elsewhere.join(", ")
+        ),
+        Rejected::NoDevice { why } => why.to_string(),
+        Rejected::InMaintenance { minutes_left, note } if note.is_empty() => {
+            format!("out of service for another {minutes_left} minutes")
+        }
+        Rejected::InMaintenance { minutes_left, note } => {
+            format!("out of service for another {minutes_left} minutes: {note}")
+        }
     }
 }
 
@@ -541,6 +928,8 @@ pub fn count_quota(
     project: &crate::meta::ResourceName,
     instances: &[Instance],
     volumes: &[Volume],
+    floating_ips: &[crate::resources::FloatingIp],
+    load_balancers: &[crate::loadbalancer::LoadBalancer],
 ) -> Quota {
     let mut used = Quota::default();
     for instance in instances.iter().filter(|i| i.meta.name.is_under(project)) {
@@ -548,10 +937,26 @@ pub fn count_quota(
         used.vcpus = used.vcpus.saturating_add(instance.spec.vcpus);
         used.memory_mib = used.memory_mib.saturating_add(instance.spec.memory_mib);
         used.volume_gib = used.volume_gib.saturating_add(instance.spec.root_disk_gib);
+        // What the instance *asked for*, not what it was given. A guest that
+        // is stopped still holds its claim on the fleet's accelerators as far
+        // as a limit is concerned — otherwise a project could sit on every
+        // GPU in the cell by keeping its guests stopped.
+        used.devices = used
+            .devices
+            .saturating_add(instance.spec.devices.len() as u32);
     }
     for volume in volumes.iter().filter(|v| v.meta.name.is_under(project)) {
+        used.volumes = used.volumes.saturating_add(1);
         used.volume_gib = used.volume_gib.saturating_add(volume.spec.size_gib);
     }
+    used.floating_ips = floating_ips
+        .iter()
+        .filter(|f| f.meta.name.is_under(project))
+        .count() as u32;
+    used.load_balancers = load_balancers
+        .iter()
+        .filter(|l| l.meta.name.is_under(project))
+        .count() as u32;
     used
 }
 
@@ -567,9 +972,15 @@ pub fn count_quota(
 pub fn quota_condition(limit: &Quota, used: &Quota, at_generation: u64) -> Condition {
     let over: Vec<&str> = [
         (used.instances > limit.instances && limit.instances > 0).then_some("instances"),
+        (used.devices > limit.devices && limit.devices > 0).then_some("devices"),
         (used.vcpus > limit.vcpus && limit.vcpus > 0).then_some("vcpus"),
         (used.memory_mib > limit.memory_mib && limit.memory_mib > 0).then_some("memory"),
+        (used.volumes > limit.volumes && limit.volumes > 0).then_some("volumes"),
         (used.volume_gib > limit.volume_gib && limit.volume_gib > 0).then_some("storage"),
+        (used.floating_ips > limit.floating_ips && limit.floating_ips > 0)
+            .then_some("floating IPs"),
+        (used.load_balancers > limit.load_balancers && limit.load_balancers > 0)
+            .then_some("load balancers"),
     ]
     .into_iter()
     .flatten()
@@ -743,6 +1154,11 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             InstanceSpec {
+                start_order: 0,
+                start_delay_s: 0,
+                on_node_loss: Default::default(),
+                console: false,
+                devices: Vec::new(),
                 vcpus: 2,
                 memory_mib: 2048,
                 image: "sha256:abc".into(),
@@ -761,8 +1177,13 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             NodeSpec {
+                evacuate: false,
+                vcpu_overcommit: 0,
+                fence_after_s: 0,
                 schedulable: true,
                 labels: vec![],
+                cpu_baseline: None,
+                gateway: false,
             },
             NodeStatus {
                 capacity: Capacity {
@@ -782,7 +1203,7 @@ mod tests {
     #[test]
     fn nothing_starts_before_what_it_needs_exists() {
         let i = inst("projects/p1/instances/i1");
-        let actions = reconcile_instance(&i, false, &[false], false);
+        let actions = reconcile_instance(&i, false, &[false], false, StartGate::Go);
         assert!(actions.contains(&Action::PullImage {
             digest: "sha256:abc".into()
         }));
@@ -798,7 +1219,7 @@ mod tests {
     #[test]
     fn once_everything_is_in_place_the_vm_starts() {
         let i = inst("projects/p1/instances/i1");
-        let actions = reconcile_instance(&i, true, &[true], true);
+        let actions = reconcile_instance(&i, true, &[true], true, StartGate::Go);
         assert_eq!(
             actions,
             vec![Action::StartVm {
@@ -813,14 +1234,14 @@ mod tests {
         // object must be empty, or every resync would churn the cluster.
         let mut i = inst("projects/p1/instances/i1");
         i.status.state = InstanceState::Running;
-        assert!(reconcile_instance(&i, true, &[true], true).is_empty());
+        assert!(reconcile_instance(&i, true, &[true], true, StartGate::Go).is_empty());
     }
 
     #[test]
     fn a_crashed_guest_is_restarted_and_says_so() {
         let mut i = inst("projects/p1/instances/i1");
         i.status.state = InstanceState::Failed;
-        let actions = reconcile_instance(&i, true, &[true], true);
+        let actions = reconcile_instance(&i, true, &[true], true, StartGate::Go);
         assert_eq!(
             actions,
             vec![Action::RestartCrashedVm {
@@ -835,7 +1256,7 @@ mod tests {
         i.status.state = InstanceState::Running;
         i.meta.deleted_at = Some(crate::meta::Timestamp::now());
         i.meta.add_finalizer(NODE_RELEASE_FINALIZER);
-        let actions = reconcile_instance(&i, true, &[true], true);
+        let actions = reconcile_instance(&i, true, &[true], true, StartGate::Go);
         let del = actions
             .iter()
             .position(|a| matches!(a, Action::DeleteVm { .. }));
@@ -892,11 +1313,434 @@ mod tests {
         assert!(may_delete(&a.meta));
     }
 
+
+    /// A node without the hardware is rejected by name, and the busy one
+    /// blames the *neighbour* rather than the device that was asked for.
+    ///
+    /// The whole point of the IOMMU-group rule, seen from the outside: an
+    /// operator asking why their guest will not start is told which device to
+    /// unbind, on which node, rather than that the class is unavailable.
+    #[test]
+    fn a_node_without_the_device_is_rejected_with_the_hardware_reason() {
+        use crate::pci::{DeviceClassSpec, DeviceKind, DeviceUse, PciDevice};
+
+        let gpu = |address: &str, group: u32| PciDevice {
+            address: address.into(),
+            vendor_device: "10de:2204".into(),
+            kind: DeviceKind::Gpu,
+            iommu_group: Some(group),
+            state: DeviceUse::Free,
+            ..PciDevice::default()
+        };
+        let classes = std::collections::BTreeMap::from([(
+            "gpu-a100".to_string(),
+            DeviceClassSpec {
+                matches: vec!["10de:2204".into()],
+                ..DeviceClassSpec::default()
+            },
+        )]);
+
+        let mut i = inst("projects/p1/instances/i1");
+        i.spec.devices = vec!["gpu-a100".into()];
+
+        let bare = node("bare", 8, 16384);
+        let mut has = node("has", 8, 16384);
+        has.status.pci_devices = vec![gpu("0000:41:00.0", 17)];
+        let mut busy = node("busy", 8, 16384);
+        busy.status.pci_devices = vec![
+            gpu("0000:41:00.0", 17),
+            PciDevice {
+                address: "0000:41:00.1".into(),
+                vendor_device: "10de:1aef".into(),
+                kind: DeviceKind::Audio,
+                iommu_group: Some(17),
+                state: DeviceUse::HostDriver {
+                    driver: "snd_hda_intel".into(),
+                },
+                ..PciDevice::default()
+            },
+        ];
+
+        // The one that can give it a GPU is chosen.
+        assert_eq!(
+            place(&i, &[bare.clone(), has, busy.clone()], &[], &[], &classes, &[]).unwrap(),
+            "has"
+        );
+
+        // With only the two that cannot, both rejections say why.
+        let why = place(&i, &[bare, busy], &[], &[], &classes, &[]).unwrap_err();
+        let all: String = why
+            .iter()
+            .map(|e| format!("{}: {}\n", e.node, describe(&e.why)))
+            .collect();
+        assert!(all.contains("bare: no gpu-a100 here"), "{all}");
+        assert!(
+            all.contains("snd_hda_intel") && all.contains("0000:41:00.1"),
+            "the busy node blamed the GPU instead of its group-mate:\n{all}"
+        );
+    }
+
+    /// An instance asking for a class nobody defined is refused by name.
+    #[test]
+    fn an_instance_asking_for_an_undefined_class_is_told_so() {
+        let mut i = inst("projects/p1/instances/i1");
+        i.spec.devices = vec!["gpu-h100".into()];
+        let why = place(&i, &[node("a", 8, 16384)], &[], &[], &Default::default(), &[]).unwrap_err();
+        assert!(
+            describe(&why[0].why).contains("no device class gpu-h100"),
+            "{:?}",
+            why[0].why
+        );
+    }
+
+
+    fn peer(name: &str, order: u32, state: InstanceState, started_at: Option<u64>) -> StartPeer {
+        StartPeer {
+            name: name.into(),
+            order,
+            state,
+            desired: DesiredState::Running,
+            started_at: started_at.map(Timestamp),
+        }
+    }
+
+    /// The case a platform is judged on: power comes back and forty guests
+    /// start at once.
+    #[test]
+    fn a_guest_waits_for_what_is_ahead_of_it_and_says_what() {
+        let db = peer("db-1", 1, InstanceState::Stopped, None);
+        let gate = start_gate(2, 0, &[db], Timestamp(0));
+        assert_eq!(
+            gate,
+            StartGate::WaitingFor {
+                instance: "db-1".into()
+            },
+            "the web tier started without its database"
+        );
+
+        // Once it is up, the next order goes.
+        let db = peer("db-1", 1, InstanceState::Running, Some(1000));
+        assert_eq!(start_gate(2, 0, &[db], Timestamp(2000)), StartGate::Go);
+    }
+
+    /// A guest that cannot start does not take the whole node down with it.
+    ///
+    /// The deadlock this avoids: wait forever for something that has failed,
+    /// and one broken disk keeps forty machines off.
+    #[test]
+    fn a_failed_guest_ahead_does_not_block_the_ones_behind_it() {
+        let broken = peer("db-1", 1, InstanceState::Failed, None);
+        assert_eq!(start_gate(2, 0, &[broken], Timestamp(0)), StartGate::Go);
+    }
+
+    /// A guest nobody wants running is not something to wait for.
+    #[test]
+    fn a_deliberately_stopped_guest_ahead_does_not_block() {
+        let mut off = peer("db-1", 1, InstanceState::Stopped, None);
+        off.desired = DesiredState::Stopped;
+        assert_eq!(start_gate(2, 0, &[off], Timestamp(0)), StartGate::Go);
+    }
+
+    /// The settling time is measured from the group, not from each member.
+    ///
+    /// Otherwise a fleet's boot is the sum of every delay rather than the
+    /// longest one, and a hundred guests at thirty seconds each is fifty
+    /// minutes of nothing happening.
+    #[test]
+    fn the_delay_is_measured_from_the_group_ahead_not_each_member_in_turn() {
+        let ahead = [
+            peer("db-1", 1, InstanceState::Running, Some(1_000)),
+            peer("db-2", 1, InstanceState::Running, Some(3_000)),
+        ];
+        // Ten seconds after the *newest* of them.
+        assert_eq!(
+            start_gate(2, 10, &ahead, Timestamp(13_000)),
+            StartGate::Go
+        );
+        assert_eq!(
+            start_gate(2, 10, &ahead, Timestamp(8_000)),
+            StartGate::WaitingOut { seconds: 5 }
+        );
+    }
+
+    /// Nothing ahead means nothing to wait for, delay or no delay.
+    #[test]
+    fn the_first_group_never_waits() {
+        assert_eq!(start_gate(0, 30, &[], Timestamp(0)), StartGate::Go);
+        let behind = [peer("web-1", 5, InstanceState::Stopped, None)];
+        assert_eq!(
+            start_gate(1, 30, &behind, Timestamp(0)),
+            StartGate::Go,
+            "a guest waited for one that comes after it"
+        );
+    }
+
+    /// A settling time with nothing running ahead has nothing to settle after.
+    #[test]
+    fn a_delay_with_nothing_running_ahead_does_not_wait_forever() {
+        let failed = [peer("db-1", 1, InstanceState::Failed, None)];
+        assert_eq!(start_gate(2, 30, &failed, Timestamp(0)), StartGate::Go);
+    }
+
+    /// The remaining wait is rounded up, so "0 seconds left" never means
+    /// "still waiting".
+    #[test]
+    fn the_wait_is_reported_in_whole_seconds_that_are_never_zero() {
+        let ahead = [peer("db-1", 1, InstanceState::Running, Some(0))];
+        assert_eq!(
+            start_gate(2, 10, &ahead, Timestamp(9_900)),
+            StartGate::WaitingOut { seconds: 1 }
+        );
+    }
+
+
+    fn sized(id: &str, vcpus: u32, mem: u64, used_mem: u64) -> Node {
+        let mut n = node(id, vcpus, mem);
+        n.status.allocated.memory_mib = used_mem;
+        n
+    }
+
+    /// The number a sum cannot give: free memory does not add up into a guest.
+    ///
+    /// Four nodes with 16 GiB free each is 64 GiB "free" and fits no 32 GiB
+    /// guest at all. Every dashboard that shows the sum has told somebody it
+    /// would.
+    #[test]
+    fn the_largest_guest_that_fits_is_not_the_sum_of_what_is_free() {
+        let cell: Vec<Node> = (1..=4)
+            .map(|i| sized(&format!("n{i}"), 8, 32_768, 16_384))
+            .collect();
+        let h = headroom(&cell, &[]);
+
+        assert_eq!(h.free.memory_mib, 4 * 16_384, "the sum is still worth having");
+        assert_eq!(
+            h.largest_fit.memory_mib, 16_384,
+            "a 32 GiB guest was reported as fitting a cell with no room for one"
+        );
+    }
+
+    /// A drained node's empty half is not free, and the two numbers disagree
+    /// on purpose.
+    #[test]
+    fn a_drained_node_counts_toward_the_total_and_not_toward_what_is_free() {
+        let mut draining = sized("n2", 8, 32_768, 0);
+        draining.spec.schedulable = false;
+        let cell = vec![sized("n1", 8, 32_768, 8_192), draining];
+
+        let h = headroom(&cell, &[]);
+        assert_eq!(h.usable_nodes, 1);
+        assert_eq!(h.unusable_nodes, 1);
+        assert_eq!(h.total.memory_mib, 2 * 32_768, "the machine still exists");
+        assert_eq!(
+            h.free.memory_mib,
+            32_768 - 8_192,
+            "a drained node's empty memory was counted as room"
+        );
+        assert_eq!(h.largest_fit.memory_mib, 32_768 - 8_192);
+    }
+
+    /// A node being emptied is not somewhere to put things either.
+    #[test]
+    fn a_node_being_emptied_offers_no_room() {
+        let mut leaving = sized("n1", 8, 32_768, 0);
+        leaving.spec.evacuate = true;
+        let h = headroom(&[leaving], &[]);
+        assert_eq!(h.usable_nodes, 0);
+        assert_eq!(h.free.memory_mib, 0);
+    }
+
+    /// A node nobody has heard from offers nothing, whatever it last said.
+    #[test]
+    fn a_node_that_is_not_ready_offers_no_room() {
+        let mut quiet = sized("n1", 8, 32_768, 0);
+        quiet.status.conditions.clear();
+        let h = headroom(&[quiet], &[]);
+        assert_eq!(h.usable_nodes, 0);
+        assert_eq!(h.free.memory_mib, 0);
+        assert_eq!(h.total.memory_mib, 32_768);
+    }
+
+    /// Sharing a processor is a trade an operator makes on purpose: two guests
+    /// that both want a core get one each in turn, and being wrong costs speed.
+    /// Sharing memory is not that trade, which is why there is no ratio for it.
+    #[test]
+    fn a_node_told_to_share_its_cores_has_room_for_more_guests_and_no_more_memory() {
+        let mut plain = sized("n1", 8, 32_768, 0);
+        assert_eq!(offered_vcpus(&plain), 8);
+        // Zero is "nobody set one", so a node stored before the field existed
+        // behaves exactly as it did.
+        plain.spec.vcpu_overcommit = 0;
+        assert_eq!(offered_vcpus(&plain), 8);
+
+        let mut shared = plain.clone();
+        shared.spec.vcpu_overcommit = 4;
+        assert_eq!(offered_vcpus(&shared), 32);
+
+        let h = headroom(&[shared.clone()], &[]);
+        assert_eq!(h.free.vcpus, 32, "the ratio did not reach what can be placed");
+        assert_eq!(h.largest_fit.vcpus, 32);
+        // Silicon is silicon. A capacity page that reported 32 cores would say
+        // the cell had grown a processor.
+        assert_eq!(h.total.vcpus, 8);
+        assert_eq!(h.offered_vcpus, 32);
+        // And not one mebibyte more memory: a guest promised 8 GiB and handed
+        // 4 does not run slowly, it is killed.
+        assert_eq!(h.free.memory_mib, 32_768);
+
+        // It really places: a guest wanting more vCPUs than the node has cores
+        // is refused on a plain node and taken by a shared one.
+        let mut big = inst("projects/p1/instances/i1");
+        big.spec.vcpus = 16;
+        big.spec.memory_mib = 1024;
+        assert!(place(&big, &[plain], &[], &[], &Default::default(), &[]).is_err());
+        assert_eq!(
+            place(&big, &[shared], &[], &[], &Default::default(), &[]).unwrap(),
+            "n1"
+        );
+    }
+
+    /// A machine inside an open maintenance window is unusable in exactly the
+    /// way a draining one is — and it must not appear in `largest_fit`, which
+    /// is the number a tenant is told they can start.
+    #[test]
+    fn a_node_out_of_service_lends_nothing_to_what_can_be_started() {
+        let cell = vec![sized("n1", 8, 32_768, 0), sized("n2", 64, 262_144, 0)];
+        let open = headroom(&cell, &[]);
+        assert_eq!(open.largest_fit.memory_mib, 262_144);
+
+        let closed = vec![crate::maintenance::Closed {
+            node: "n2".into(),
+            until: Timestamp(0),
+            minutes_left: 40,
+            note: String::new(),
+            window: "maintenance-windows/w".into(),
+        }];
+        let h = headroom(&cell, &closed);
+        assert_eq!(
+            h.largest_fit.memory_mib, 32_768,
+            "a machine out of service was still offered as room for a guest"
+        );
+        assert_eq!(h.usable_nodes, 1);
+        assert_eq!(h.unusable_nodes, 1);
+        // Still counted in the total: the hardware exists, it is merely out
+        // this evening, and a capacity page that made it vanish would read as
+        // a machine having been lost.
+        assert_eq!(h.total.memory_mib, 294_912);
+    }
+
+    /// A node on its way out is not part of the cell at all.
+    #[test]
+    fn a_node_being_removed_is_in_neither_count() {
+        let mut going = sized("n1", 8, 32_768, 0);
+        going.meta.deleted_at = Some(Timestamp(1));
+        let h = headroom(&[going], &[]);
+        assert_eq!(h.usable_nodes, 0);
+        assert_eq!(h.unusable_nodes, 0);
+        assert_eq!(h.total.memory_mib, 0, "a machine being removed was still counted");
+    }
+
     #[test]
     fn placement_picks_the_emptiest_node_that_fits() {
         let i = inst("projects/p1/instances/i1");
         let nodes = vec![node("a", 8, 4096), node("b", 8, 16384)];
-        assert_eq!(place(&i, &nodes, &[]).unwrap(), "b");
+        assert_eq!(place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap(), "b");
+    }
+
+    /// A machine somebody has declared out of service is not a candidate — and
+    /// the rejection says when it comes back and what it is for, because
+    /// otherwise "no valid host" sends an operator hunting for a fault they
+    /// themselves scheduled.
+    #[test]
+    fn a_node_inside_a_maintenance_window_is_not_offered_and_says_why() {
+        let i = inst("projects/p1/instances/i1");
+        let nodes = vec![node("a", 8, 16384), node("b", 8, 65536)];
+        let closed = vec![crate::maintenance::Closed {
+            node: "b".into(),
+            until: Timestamp(0),
+            minutes_left: 40,
+            note: "swapping the failed DIMM in slot 3".into(),
+            window: "maintenance-windows/dimm-swap".into(),
+        }];
+        // The emptiest node would have won on every other pass.
+        assert_eq!(place(&i, &nodes, &[], &[], &Default::default(), &closed).unwrap(), "a");
+
+        let mut alone = nodes;
+        alone.remove(0);
+        let why = place(&i, &alone, &[], &[], &Default::default(), &closed).unwrap_err();
+        assert!(matches!(why[0].why, Rejected::InMaintenance { minutes_left: 40, .. }));
+        let said = describe(&why[0].why);
+        assert!(said.contains("another 40 minutes"), "{said}");
+        assert!(said.contains("DIMM"), "the operator's own words are not in it: {said}");
+    }
+
+    /// Anti-affinity keeps a service alive when a machine dies; affinity keeps
+    /// it fast while they all live. A platform with only the first can express
+    /// only half of what people actually run.
+    #[test]
+    fn a_guest_that_asked_to_be_near_its_group_is_placed_beside_it() {
+        let mut i = inst("projects/p1/instances/cache-1");
+        i.spec.memory_mib = 1024;
+        i.spec.placement_policy.affinity_group = Some("web".into());
+        // The emptiest node is `a`, and it would win on every other pass.
+        let nodes = vec![node("a", 8, 65_536), node("b", 8, 16_384)];
+        let with = vec![("web".to_string(), "b".to_string())];
+        assert_eq!(place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap(), "b");
+
+        // With nobody placed yet there is nothing to be near, and refusing
+        // every node would mean a group whose first member could never start.
+        assert_eq!(place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap(), "a");
+    }
+
+    /// A required affinity that cannot be honoured says where the rest of the
+    /// group is — one of those names is a machine to go and look at, and "no
+    /// valid host" is not.
+    #[test]
+    fn a_group_that_will_not_fit_together_says_where_the_rest_of_it_is() {
+        let mut i = inst("projects/p1/instances/cache-1");
+        i.spec.memory_mib = 32_768;
+        i.spec.placement_policy.affinity_group = Some("web".into());
+        let nodes = vec![node("a", 8, 65_536), node("b", 8, 16_384)];
+        let with = vec![("web".to_string(), "b".to_string())];
+
+        let why = place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap_err();
+        let about_a = why.iter().find(|e| e.node == "a").unwrap();
+        assert!(matches!(about_a.why, Rejected::NotWithGroup { .. }));
+        assert!(describe(&about_a.why).contains("on b"), "{}", describe(&about_a.why));
+
+        // A wish rather than a rule: crowded beats not running at all — and
+        // here the roomy node wins outright because the group's own node is
+        // too small.
+        i.spec.placement_policy.affinity = crate::resources::Strength::Preferred;
+        assert_eq!(place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap(), "a");
+    }
+
+    /// Three replicas of a database must not share a machine even if that
+    /// means one stays down; twelve web servers would rather be crowded than
+    /// short. Both are right answers to different questions.
+    #[test]
+    fn a_preferred_spread_takes_a_crowded_node_over_not_running() {
+        let mut i = inst("projects/p1/instances/web-3");
+        i.spec.memory_mib = 1024;
+        i.spec.placement_policy.anti_affinity_group = Some("web".into());
+        let only = vec![node("a", 8, 65_536)];
+        let taken = vec![("web".to_string(), "a".to_string())];
+
+        // Required — the default, and what this platform did before the field
+        // existed.
+        let why = place(&i, &only, &taken, &[], &Default::default(), &[]).unwrap_err();
+        assert!(matches!(why[0].why, Rejected::AntiAffinity { .. }));
+
+        i.spec.placement_policy.spread = crate::resources::Strength::Preferred;
+        assert_eq!(place(&i, &only, &taken, &[], &Default::default(), &[]).unwrap(), "a");
+
+        // And it is still a preference: given a choice, the empty node wins
+        // even though it has less room than the crowded one.
+        let both = vec![node("a", 8, 65_536), node("b", 8, 16_384)];
+        assert_eq!(
+            place(&i, &both, &taken, &[], &Default::default(), &[]).unwrap(),
+            "b",
+            "a preference for spreading lost to free memory"
+        );
     }
 
     #[test]
@@ -904,7 +1748,7 @@ mod tests {
         let mut i = inst("projects/p1/instances/i1");
         i.spec.memory_mib = 99999;
         let nodes = vec![node("a", 8, 4096), node("b", 8, 16384)];
-        let why = place(&i, &nodes, &[]).unwrap_err();
+        let why = place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap_err();
         assert_eq!(why.len(), 2, "an operator must learn about every candidate");
         assert!(matches!(why[0].why, Rejected::InsufficientMemory { .. }));
     }
@@ -917,7 +1761,7 @@ mod tests {
         i.spec.memory_mib = 8192;
         let mut n = node("a", 8, 16384);
         n.status.capacity.numa_free_mib = vec![4096, 4096];
-        let why = place(&i, &[n], &[]).unwrap_err();
+        let why = place(&i, &[n], &[], &[], &Default::default(), &[]).unwrap_err();
         assert_eq!(why[0].why, Rejected::NoNumaNodeFits { want_mib: 8192 });
     }
 
@@ -927,7 +1771,7 @@ mod tests {
         i.spec.placement_policy.anti_affinity_group = Some("web".into());
         let nodes = vec![node("a", 8, 16384)];
         let occupied = vec![("web".to_string(), "a".to_string())];
-        assert!(place(&i, &nodes, &occupied).is_err());
+        assert!(place(&i, &nodes, &occupied, &[], &Default::default(), &[]).is_err());
     }
 
     #[test]
@@ -935,7 +1779,7 @@ mod tests {
         let i = inst("projects/p1/instances/i1");
         let mut n = node("a", 8, 16384);
         n.spec.schedulable = false;
-        let why = place(&i, &[n], &[]).unwrap_err();
+        let why = place(&i, &[n], &[], &[], &Default::default(), &[]).unwrap_err();
         assert_eq!(why[0].why, Rejected::Unschedulable);
     }
 
@@ -1052,7 +1896,7 @@ mod tests {
         dying.meta.deleted_at = Some(crate::meta::Timestamp::now());
         let theirs = inst("projects/p2/instances/i1");
 
-        let used = count_quota(&project, &[mine, dying, theirs], &[]);
+        let used = count_quota(&project, &[mine, dying, theirs], &[], &[], &[]);
         assert_eq!(
             used.instances, 2,
             "another project's instance was charged here"
@@ -1066,16 +1910,24 @@ mod tests {
     #[test]
     fn a_project_over_a_lowered_limit_says_so_rather_than_failing() {
         let limit = Quota {
+            devices: 0,
             instances: 2,
             vcpus: 8,
             memory_mib: 8192,
+            volumes: 5,
             volume_gib: 100,
+            floating_ips: 2,
+            load_balancers: 2,
         };
         let within = Quota {
+            devices: 0,
             instances: 1,
             vcpus: 2,
             memory_mib: 2048,
+            volumes: 2,
             volume_gib: 20,
+            floating_ips: 1,
+            load_balancers: 1,
         };
         assert_eq!(
             quota_condition(&limit, &within, 1).status,
@@ -1083,8 +1935,12 @@ mod tests {
         );
 
         let over = Quota {
+            devices: 0,
             instances: 3,
             vcpus: 32,
+            volumes: 9,
+            floating_ips: 4,
+            load_balancers: 3,
             ..within.clone()
         };
         let c = quota_condition(&limit, &over, 1);
@@ -1092,6 +1948,9 @@ mod tests {
         assert_eq!(c.reason, "OverQuota");
         assert!(c.message.contains("instances"), "{}", c.message);
         assert!(c.message.contains("vcpus"), "{}", c.message);
+        assert!(c.message.contains("volumes"), "{}", c.message);
+        assert!(c.message.contains("floating IPs"), "{}", c.message);
+        assert!(c.message.contains("load balancers"), "{}", c.message);
 
         // An unset limit is unset, not zero — otherwise every project is broken
         // until somebody remembers to set four numbers on it.
