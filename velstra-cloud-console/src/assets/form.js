@@ -1162,6 +1162,12 @@ function openEdit(coll, r) {
     title: "Edit " + idOf(r),
     values: flatten(spec(r), coll.fields),
     submitLabel: "Save",
+    // Answered once, when the object was made. Offering a control here would
+    // be offering an edit whose only outcome is a refusal — or, before the API
+    // refused it, something worse: changing a volume's pool was accepted and
+    // moved no bytes, and the volume quietly stopped converging because one
+    // agent had let go and the other would not take it.
+    locked: coll.fields.filter((f) => f.atCreation).map((f) => f.key),
     async onSubmit(f) {
       // The whole spec, merged over what was read, so a field this console does
       // not know about is not dropped by an edit that never touched it.

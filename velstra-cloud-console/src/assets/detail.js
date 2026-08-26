@@ -134,16 +134,44 @@ function valueNode(v, kindHint) {
 /// do nothing, and show the object as settled. A badge is not the point: the
 /// two numbers are, because "pending" on its own is a thing people dismiss.
 function pendingChanges(r) {
-  const running = at(status(r), "runningSize");
-  if (!running) return [];
-  const pairs = [
-    ["vCPU", "vcpus", pick(running, "vcpus")],
-    ["Memory", "memoryMib", pick(running, "memoryMib")],
-    ["Root disk", "rootDiskGib", pick(running, "rootDiskGib")],
-  ];
-  return pairs
-    .filter(([, key, have]) => Number(have) !== Number(at(spec(r), key)))
-    .map(([label, key, have]) => ({ label, from: Number(have), to: Number(at(spec(r), key)) }));
+  // Read, not recomputed. This used to do the comparison itself, which made
+  // three copies of one rule — the model's `pending_changes`, this, and
+  // nothing in between — and the API was the one that did not have it, so the
+  // board could not show what the sheet knew. The API answers it now, on every
+  // read, and this renders the answer.
+  const answered = at(status(r), "pendingChanges");
+  if (!Array.isArray(answered)) return [];
+  const labels = { vcpus: "vCPU", memoryMib: "Memory", rootDiskGib: "Root disk" };
+  return answered.map((c) => ({
+    label: labels[pick(c, "field")] || pick(c, "field"),
+    from: pick(c, "from"),
+    to: pick(c, "to"),
+  }));
+}
+
+/// A node's PCI devices, each with what it drags along.
+function passableBlock(r) {
+  const devices = at(status(r), "pciDevices");
+  if (!Array.isArray(devices) || !devices.length) return null;
+  return el("div.pending",
+    el("div.why.muted",
+      "Passing one of these to a guest takes everything on its line: a device " +
+      "shares an isolation group with its neighbours and the hardware cannot " +
+      "separate them."),
+    el("div", devices.map((d) => {
+      const address = pick(d, "address");
+      const withIt = at(d, "groupWith");
+      const others = Array.isArray(withIt) ? withIt.filter((a) => a !== address) : [];
+      const group = pick(d, "iommuGroup");
+      return el("div.cpuline",
+        el("span.cpukey", pick(d, "description") || address),
+        el("span.cpuval.mono",
+          group === undefined || group === null
+            ? address + " — no isolation group, cannot be passed through"
+            : others.length
+              ? address + " + " + others.join(", ")
+              : address + " — on its own"));
+    })));
 }
 
 function pendingBlock(r) {
@@ -698,6 +726,20 @@ function renderSheet(coll, r) {
     const host = el("div", { id: "maintenance" });
     panel.appendChild(spread("Maintenance", host, "what is scheduled, and what it will cost"));
     maintenanceInto(host, r);
+
+    // What hardware this machine has that can be passed to a guest — and what
+    // comes with each piece. Passing one device through takes its whole IOMMU
+    // group, because the hardware cannot isolate less than that, and somebody
+    // who learns that afterwards learns it from an outage.
+    //
+    // `groupWith` is the API's answer, not a grouping done here. A filter on
+    // equal group numbers would get the interesting case backwards: a device
+    // with no group is not grouped *with* the other ungrouped ones, it is in no
+    // group at all and can never be passed through.
+    const devices = passableBlock(r);
+    if (devices) {
+      panel.appendChild(spread("Hardware", devices, "what can be passed to a guest"));
+    }
   }
 
   if (coll.explainable) {
