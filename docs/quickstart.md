@@ -60,13 +60,24 @@ On NixOS the same thing is a declaration — see
 
 ## 2. Sign in
 
-Open `https://<this-machine>:8443/`.
+Open **`http://127.0.0.1:8443/`** on the laptop itself.
+
+`http`, not `https`: the API serves plain HTTP and is meant to sit behind
+something that terminates TLS. And loopback, because that is where it binds
+unless told otherwise (`VELSTRA_LISTEN`) — which is the right default for one
+machine and the thing to change before it has to be reachable from another.
 
 ![The sign-in page](images/signin.png)
 
-The first operator's credentials come from `tokenFile` (NixOS) or
-`/etc/velstra/tokens` (Debian): one `<token> <subject>` per line. There is no
-default password, on purpose — a platform that ships one ships a way in.
+Sign in as the administrator the wizard asked for. There is no default password,
+on purpose: a platform that ships one ships a way in.
+
+The password lives in `/var/lib/velstra/bootstrap-password`, mode 0600, and the
+API reads it from there at start rather than taking it on a command line — an
+argument is visible in `ps` to every user on the machine. It is only used to
+*create* that administrator: re-running against a cell that already has one
+never resets a live password, because that would be an unauthenticated way back
+in for anybody who can restart the process.
 
 ---
 

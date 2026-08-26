@@ -1551,7 +1551,7 @@
             mkdir -p seed
             # region, cell, roles (control-plane + hypervisor + pool), API url,
             # node id, token, hypervisor, pool id, backend, store, other cells,
-            # fabric (no), confirm.
+            # admin + password twice, fabric (no), confirm.
             #
             # Positional, so a question added anywhere above shifts every answer
             # below it — which is exactly what happened when the fabric question
@@ -1572,6 +1572,9 @@
             1
             10.0.0.1:2379
             cell-8=https://cell-8.example:8443
+            admin
+            correcthorsebattery
+            correcthorsebattery
             n
             y
             ANSWERS
@@ -1589,6 +1592,24 @@
             grep -qx "VELSTRA_POOL_BACKEND=directory" seed/node.env
             grep -qx "VELSTRA_STORE=10.0.0.1:2379" seed/node.env
             grep -qx "VELSTRA_CELLS=cell-8=https://cell-8.example:8443" seed/node.env
+            # The cell's first administrator. Without one the API comes up,
+            # serves the console and refuses every sign-in — it says so in a
+            # warning, which is not where somebody looking at a login form is
+            # looking. The Debian path had no way to supply it at all: the
+            # wizard never asked, the seed never carried it, and the unit passed
+            # nothing, so a fresh install produced a control plane nobody could
+            # get into.
+            grep -qx "VELSTRA_BOOTSTRAP_ADMIN=admin" seed/node.env
+
+            # The username is not a secret and the password is. Same split the
+            # node token already makes, same mode.
+            if grep -q "correcthorsebattery" seed/node.env; then
+              echo "the bootstrap password is in the world-readable seed" >&2
+              exit 1
+            fi
+            grep -q "correcthorsebattery" seed/bootstrap-password
+            test "$(stat -c %a seed/bootstrap-password)" = 600
+
             # No fabric was named, so no key for one. A cell that programs no
             # overlay is a real way to run; what must not happen is a seed that
             # half-describes one.

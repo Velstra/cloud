@@ -425,7 +425,7 @@ fn ask_safe(msg: &str, default: &str) -> Result<String> {
 /// discipline before `stty` has run. The window is small and entirely real:
 /// it is how the wizard check caught this, by answering the moment it saw the
 /// prompt, which is also what a paste does.
-fn prompt_secret(msg: &str) -> Result<String> {
+pub(crate) fn prompt_secret(msg: &str) -> Result<String> {
     use std::io::Write;
     let is_term = std::io::stdin().is_terminal();
     if is_term {
