@@ -104,13 +104,16 @@ impl Recorder {
 
     fn tools(&self) -> CephAdmin {
         let path = self.dir.join("record").to_str().unwrap().to_string();
-        CephAdmin {
-            cephadm: path.clone(),
-            ceph: path.clone(),
-            systemctl: path,
-            ceph_conf: self.dir.join("ceph.conf").display().to_string(),
-            authorized_keys: self.dir.join("authorized_keys").display().to_string(),
-        }
+        // Built from the default rather than as a literal: `CephAdmin` carries
+        // private state of its own, so a literal here could not name every
+        // field even though the paths below are all this test wants to change.
+        let mut tools = CephAdmin::default();
+        tools.cephadm = path.clone();
+        tools.ceph = path.clone();
+        tools.systemctl = path;
+        tools.ceph_conf = self.dir.join("ceph.conf").display().to_string();
+        tools.authorized_keys = self.dir.join("authorized_keys").display().to_string();
+        tools
     }
 
     /// Pretend this machine already holds a cluster.
@@ -276,7 +279,10 @@ async fn make_cluster(store: &Arc<dyn Store>, spec: CephClusterSpec, status: Cep
     let clusters: TypedStore<CephClusterSpec, CephClusterStatus> =
         TypedStore::new(store.clone(), CELL, "ceph-clusters");
     clusters
-        .create(&Resource::new(meta("ceph-clusters/ceph"), spec, status))
+        .create(
+            &Resource::new(meta("ceph-clusters/ceph"), spec, status),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 }

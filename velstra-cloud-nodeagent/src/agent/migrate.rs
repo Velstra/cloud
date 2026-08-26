@@ -631,7 +631,21 @@ impl Agent {
             taps.insert(port.clone(), tap);
         }
 
-        let request = self.vm_request(instance, &taps, ports)?;
+        // The receiver must describe the same machine as the sender, and the
+        // CPU is part of that machine. Read here rather than assumed, so a
+        // destination with a different baseline builds a different request —
+        // which `may_migrate` has already refused before anything got here.
+        // Whatever it already holds, which for a migrating guest is nothing:
+        // `may_migrate` refuses a live move of a guest holding hardware, and a
+        // reboot migration starts it fresh on the destination.
+        let devices = instance.status.devices.clone();
+        let request = self.vm_request(
+            instance,
+            &taps,
+            ports,
+            self.declared_baseline().await,
+            devices,
+        )?;
         self.vmm
             .prepare_receiver(&request, mode)
             .await

@@ -167,6 +167,7 @@ impl Agent {
         {
             me.status.ceph = host.ceph.clone();
             me.status.devices = host.devices.clone();
+            me.status.cpu = host.cpu.clone();
             // And this machine is manifestly reporting: it is doing it right
             // now. The stored heartbeat is one pass old at best and absent on a
             // freshly started agent, and a node that judged *itself* dead would

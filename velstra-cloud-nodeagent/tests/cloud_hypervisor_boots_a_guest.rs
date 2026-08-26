@@ -113,12 +113,14 @@ async fn a_directly_booted_kernel_runs_and_says_so() {
 
     let instance = "projects/p1/instances/ch-1";
     let request = VmRequest {
+        devices: Vec::new(),
         instance: instance.to_string(),
         vcpus: 1,
         memory_mib: 1024,
         image: "projects/p1/images/netboot".into(),
         root_disk_gib: 1,
         nics: vec![],
+        cpu_baseline: None,
     };
 
     // A disk is still made and attached: nothing boots from it here, but the

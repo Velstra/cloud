@@ -44,11 +44,11 @@
 
 use std::collections::BTreeMap;
 
-use velstra_cloud_model::{meta::ResourceName, storage::VolumeSource};
+use velstra_cloud_model::meta::ResourceName;
 
 use crate::{
     host::{HostError, Result},
-    pool::{PoolState, SnapshotInPool, Storage},
+    pool::{Origin, PoolState, SnapshotInPool, Storage},
 };
 
 /// The snapshot every image carries, and what a volume is cloned from.
@@ -348,8 +348,9 @@ impl CephPool {
         // Junk is an error, not "no snapshots": treating an unreadable answer as
         // an empty list would report the base snapshot absent and re-import an
         // image that is already there.
-        let rows: Vec<RbdSnap> = serde_json::from_slice(&out)
-            .map_err(|e| HostError::failed(format!("`rbd snap ls` did not answer with json: {e}")))?;
+        let rows: Vec<RbdSnap> = serde_json::from_slice(&out).map_err(|e| {
+            HostError::failed(format!("`rbd snap ls` did not answer with json: {e}"))
+        })?;
         Ok(rows.iter().any(|s| s.name == IMAGE_BASE_SNAPSHOT))
     }
 }
@@ -394,7 +395,7 @@ impl Storage for CephPool {
         &self,
         volume: &str,
         gib: u64,
-        source: &VolumeSource,
+        source: Origin<'_>,
         encryption_key: Option<&str>,
     ) -> Result<()> {
         if let Some(key) = encryption_key {
@@ -412,11 +413,11 @@ impl Storage for CephPool {
         let target = spec(&self.config.pool, &rbd_name(volume));
 
         match source {
-            VolumeSource::Blank => {
+            Origin::Blank => {
                 self.rbd(&["create", "--size", &format!("{gib}G"), &target])
                     .await?;
             }
-            VolumeSource::Image(image) => {
+            Origin::Image(image) => {
                 let parent = rbd_name(image);
                 if !self.image_is_clonable(&parent).await? {
                     return Err(HostError::failed(format!(
@@ -441,7 +442,7 @@ impl Storage for CephPool {
                 // for one pass is one a guest can be started from.
                 self.grow(volume, gib).await?;
             }
-            VolumeSource::Snapshot(snapshot) => {
+            Origin::Snapshot(snapshot) => {
                 let Some((from_volume, snap)) = snapshot_location(snapshot) else {
                     return Err(HostError::failed(format!(
                         "{snapshot} is not a snapshot of a volume, so there is nothing to clone \
@@ -466,6 +467,20 @@ impl Storage for CephPool {
                     &target,
                 ])
                 .await?;
+                self.grow(volume, gib).await?;
+            }
+            // A restore: bytes from outside the cluster entirely. `rbd import`
+            // creates the image from the file, which is why there is no
+            // `create` before it — and why a half-finished import leaves no
+            // image rather than an empty one under the right name.
+            Origin::File(from) => {
+                if !std::path::Path::new(from).exists() {
+                    return Err(HostError::failed(format!(
+                        "{from} is not on this machine, so nothing can be restored from it. Is \
+                         the target mounted here?"
+                    )));
+                }
+                self.rbd(&["import", from, &target]).await?;
                 self.grow(volume, gib).await?;
             }
         }
@@ -496,6 +511,39 @@ impl Storage for CephPool {
         self.rbd(&["rm", &spec(&self.config.pool, &rbd_name(volume))])
             .await
             .map(|_| ())
+    }
+
+    async fn copy_out(&self, volume: &str, path: &str) -> Result<u64> {
+        // `rbd export` writes the image out as a flat file. It returns when the
+        // file is written, which is what `Storage::copy_out` requires — and it
+        // is written to a `.partial` first, because the name a restore will
+        // read months from now must never have been on a half-written file.
+        let partial = format!("{path}.partial");
+        let _ = std::fs::remove_file(&partial);
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                HostError::failed(format!("{} is not usable: {e}", parent.display()))
+            })?;
+        }
+        if let Err(e) = self
+            .rbd(&[
+                "export",
+                &spec(&self.config.pool, &rbd_name(volume)),
+                &partial,
+            ])
+            .await
+        {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
+        std::fs::rename(&partial, path).map_err(|e| {
+            HostError::failed(format!("{path} was exported and could not be moved into place: {e}"))
+        })?;
+        std::fs::metadata(path)
+            .map(|m| m.len())
+            .map_err(|e| HostError::failed(format!("{path} was written and cannot be read: {e}")))
     }
 
     async fn take_snapshot(&self, snapshot: &str, volume: &str) -> Result<()> {

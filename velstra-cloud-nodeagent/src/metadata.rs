@@ -369,6 +369,15 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
         return None;
     }
     let mut out = String::from("version: 2\nethernets:\n");
+    // A guest holding a public address defaults out through it. The other way
+    // round sends replies from the public address out of a door they cannot
+    // return through — the asymmetric-routing bug that looks like a firewall
+    // problem for a day. See `velstra_cloud_model::public`.
+    let public_default = usable
+        .iter()
+        .flat_map(|nic| nic.public.iter())
+        .next()
+        .cloned();
     for (n, nic) in usable.iter().enumerate() {
         let mac = format_mac(&nic.mac.expect("filtered"));
         let cidr = nic.cidr.expect("filtered");
@@ -379,6 +388,15 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
             "    addresses:\n      - \"{}/{}\"\n",
             cidr.address, cidr.prefix_len
         ));
+        // The public addresses this NIC holds, as host routes. A `/32` belongs
+        // to no broadcast domain, which is exactly what makes the address
+        // correct on whichever machine the guest is running on today.
+        for route in &nic.public {
+            out.push_str(&format!(
+                "      - \"{}/{}\"\n",
+                route.address, route.prefix_len
+            ));
+        }
         if let Some(mtu) = nic.mtu {
             out.push_str(&format!("    mtu: {mtu}\n"));
         }
@@ -386,15 +404,36 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
         // metric between them is a guest whose egress depends on which one the
         // kernel happened to install second.
         if n == 0 {
-            if let Some(gateway) = nic.gateway {
-                let destination = if gateway.is_ipv4() {
-                    "0.0.0.0/0"
-                } else {
-                    "::/0"
-                };
-                out.push_str(&format!(
-                    "    routes:\n      - to: \"{destination}\"\n        via: \"{gateway}\"\n"
-                ));
+            match (&public_default, nic.gateway) {
+                // Out through the public address, and the next hop is on-link
+                // and in no subnet — answered by the host itself. That is what
+                // frees the address from any L2 segment: nothing has to move a
+                // VLAN when the guest migrates.
+                (Some(route), _) => {
+                    let destination = if route.address.is_ipv4() {
+                        "0.0.0.0/0"
+                    } else {
+                        "::/0"
+                    };
+                    out.push_str(&format!(
+                        "    routes:\n      - to: \"{destination}\"\n        via: \"{}\"\n",
+                        route.via
+                    ));
+                    if route.on_link {
+                        out.push_str("        on-link: true\n");
+                    }
+                }
+                (None, Some(gateway)) => {
+                    let destination = if gateway.is_ipv4() {
+                        "0.0.0.0/0"
+                    } else {
+                        "::/0"
+                    };
+                    out.push_str(&format!(
+                        "    routes:\n      - to: \"{destination}\"\n        via: \"{gateway}\"\n"
+                    ));
+                }
+                (None, None) => {}
             }
             if !nic.dns.is_empty() {
                 out.push_str("    nameservers:\n      addresses:\n");
@@ -427,6 +466,7 @@ mod tests {
                 dns: vec!["10.20.0.1".parse().unwrap()],
                 mtu: Some(1450),
                 tap: Some("vt-port-a".into()),
+                public: Vec::new(),
             }],
         }
     }
@@ -502,5 +542,78 @@ mod tests {
         let mut unknown = guest();
         unknown.interfaces[0].cidr = None;
         assert_eq!(render_network_config(&unknown), None);
+    }
+
+    /// The whole point of a routed address: the guest is told to configure it.
+    ///
+    /// Not "the platform knows about it" — the guest's own netplan carries the
+    /// address as a host route and defaults out through a next hop that is in
+    /// no subnet. Everything else about this feature is bookkeeping around this
+    /// document.
+    #[test]
+    fn a_guest_holding_a_public_address_is_told_to_configure_it() {
+        let mut view = guest();
+        view.interfaces[0].public = vec![velstra_cloud_model::public::guest_route(
+            "203.0.113.7".parse().unwrap(),
+        )];
+        let rendered = render_network_config(&view).expect("a guest with a NIC gets a document");
+
+        // Both addresses: the tenant one it already had, and the public one it
+        // now holds. A `/32` belongs to no broadcast domain, which is what
+        // makes it correct on whichever machine is running the guest today.
+        assert!(rendered.contains("- \"10.20.0.10/24\""), "{rendered}");
+        assert!(rendered.contains("- \"203.0.113.7/32\""), "{rendered}");
+
+        // And it defaults out through the public next hop rather than through
+        // the tenant gateway — the other way round is the asymmetric-routing
+        // bug that looks like a firewall problem for a day.
+        assert!(rendered.contains("via: \"169.254.1.1\""), "{rendered}");
+        assert!(rendered.contains("on-link: true"), "{rendered}");
+        assert!(
+            !rendered.contains("via: \"10.20.0.1\""),
+            "the guest still defaults through the tenant gateway: {rendered}"
+        );
+    }
+
+    /// A guest with no public address is unchanged — the tenant gateway is
+    /// still its way out.
+    #[test]
+    fn a_guest_without_one_still_defaults_through_its_tenant_gateway() {
+        let rendered = render_network_config(&guest()).expect("a document");
+        assert!(rendered.contains("via: \"10.20.0.1\""), "{rendered}");
+        assert!(!rendered.contains("169.254.1.1"), "{rendered}");
+    }
+
+    /// A translated address must **not** be configured by the guest: it would
+    /// answer ARP for something the edge is also answering for, and the two
+    /// would take turns.
+    #[test]
+    fn a_translated_address_is_never_put_in_the_guest() {
+        use velstra_cloud_model::{
+            meta::{Meta, Placement, ResourceName},
+            public::Delivery,
+            resources::{FloatingIp, FloatingIpSpec, FloatingIpStatus, Resource},
+        };
+        let fip = |id: &str, delivery: Delivery| -> FloatingIp {
+            Resource::new(
+                Meta::new(
+                    ResourceName::parse(&format!("projects/p1/floatingips/{id}")).unwrap(),
+                    Placement::new("eu", "cell-1"),
+                ),
+                FloatingIpSpec {
+                    subnet: "projects/p1/subnets/public".into(),
+                    address: Some("203.0.113.7".into()),
+                    port: "projects/p1/ports/port-a".into(),
+                    delivery,
+                    announce: None,
+                },
+                FloatingIpStatus::default(),
+            )
+        };
+        let held = crate::guests::public_addresses(&[fip("nat", Delivery::Nat)]);
+        assert!(held.is_empty(), "a translated address was handed to the guest");
+
+        let routed = crate::guests::public_addresses(&[fip("routed", Delivery::Routed)]);
+        assert_eq!(routed["projects/p1/ports/port-a"].len(), 1);
     }
 }

@@ -35,16 +35,14 @@ impl Agent {
     /// [`velstra_cloud_model::access::judge`] permits this agent's write to its
     /// own node object. Nothing assigns a hypervisor to a hypervisor.
     ///
-    /// The writer identity on that write is **self-declared**, and the agent
-    /// authenticates as a cell operator: in the current single-operator phase
-    /// there is no per-node credential, so this is a trust limit, not a
-    /// boundary — anything holding the operator token could write any node's
-    /// status. It is safe because that token is held only by the operator's own
-    /// agents. See `docs/rest-contract.md`, "Node agents write with the
-    /// operator's token".
+    /// How this write is judged depends on the mode. In the direct-store default
+    /// the writer identity is **self-declared** and the agent holds a cell
+    /// operator token — a trust limit, not a boundary. In `--api` mode the report
+    /// goes through [`crate::sink::StatusSink`] as this node's own token, and the
+    /// API authenticates it and refuses anything that is not this node's. See
+    /// `docs/rest-contract.md`, "Node agents, and the two ways they write".
     pub(super) async fn node_pass(&self, mine: &[&Instance], host: &HostState, pass: &mut Pass) {
-        let name = format!("nodes/{}", self.config.node);
-        let stored = match self.nodes.get(&name).await {
+        let stored = match self.own_node().await {
             Ok(Some(node)) => node,
             // A node that was never registered is not this agent's to invent.
             Ok(None) => return,
@@ -70,6 +68,12 @@ impl Agent {
             allocated.disk_gib += instance.spec.root_disk_gib;
         }
 
+        // Remembered while this agent can still read anything. The moment
+        // fencing matters is the moment it cannot, so a deadline it would have
+        // to fetch is a deadline it will never get.
+        self.fence_after_s
+            .store(stored.spec.fence_after_s, Ordering::Relaxed);
+
         let mut next = stored.clone();
         next.status.observed_generation = stored.meta.generation;
         next.status.capacity = capacity;
@@ -87,6 +91,13 @@ impl Agent {
         // says what is there and the rule says what is safe.
         next.status.devices = host.devices.clone();
         next.status.ceph = host.ceph.clone();
+        // What this machine's processor is, and what it presents. The
+        // baseline was already applied by `Agent::present_baseline`, in one
+        // place, so this and every guest's recorded CPU cannot disagree.
+        next.status.cpu = host.cpu.clone();
+        // The hardware this machine has, with this node's guests already
+        // marked on it by `Agent::mark_held_devices`.
+        next.status.pci_devices = host.pci_devices.clone();
         set_condition(
             &mut next.status.conditions,
             Condition::new(
@@ -98,18 +109,34 @@ impl Agent {
             ),
         );
 
+        // `--api`: the report goes through the API as this node's own token; the
+        // once-only warning below is the same one, moved onto the sink's refusal.
+        if let Some(sink) = &self.sink {
+            use crate::sink::SinkOutcome;
+            let value = serde_json::to_value(&next).expect("a node always serialises");
+            match sink.write_status("nodes", &value, &self.writer).await {
+                SinkOutcome::Wrote => {
+                    pass.reports += 1;
+                    self.heard();
+                }
+                SinkOutcome::Conflict => pass.conflicts += 1,
+                SinkOutcome::Refused(_) => {
+                    pass.refused += 1;
+                    self.warn_about_node_once();
+                }
+                SinkOutcome::Failed(why) => {
+                    tracing::warn!(error = %why, "could not report this node's status");
+                    pass.failures += 1;
+                }
+            }
+            return;
+        }
         if let Err(e) = self.nodes.update(&next, &self.writer).await {
             match e {
                 TypedError::Store(StoreError::Conflict { .. }) => pass.conflicts += 1,
                 TypedError::Refused(_) => {
                     pass.refused += 1;
-                    if !self.warned_about_node.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(
-                            node = %self.config.node,
-                            "this node may not write its own status; the scheduler is reading \
-                             stale capacity and no heartbeat is arriving"
-                        );
-                    }
+                    self.warn_about_node_once();
                 }
                 other => {
                     tracing::warn!(error = %other, "could not report this node's status");
@@ -118,7 +145,57 @@ impl Agent {
             }
         } else {
             pass.reports += 1;
+            // The watchdog's only input. Set where the write actually
+            // succeeded rather than where it was attempted: an agent that is
+            // shouting into a dead store has *not* reported, and treating the
+            // attempt as success is how a partitioned node keeps its guests
+            // running past the moment somebody else is told they stopped.
+            self.heard();
         }
+    }
+
+    /// Note that this agent managed to report.
+    pub(super) fn heard(&self) {
+        self.last_report.store(
+            velstra_cloud_model::meta::Timestamp::now().0,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Warn, once per process, that this node cannot write its own status — a
+    /// disagreement about who this node is that would otherwise repeat every
+    /// resync and bury everything else.
+    fn warn_about_node_once(&self) {
+        if !self.warned_about_node.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                node = %self.config.node,
+                "this node may not write its own status; the scheduler is reading \
+                 stale capacity and no heartbeat is arriving"
+            );
+        }
+    }
+
+    /// This node's own object, read from wherever this agent reads the cell.
+    ///
+    /// Through the store directly in the default mode, and through the API in
+    /// `--api` mode — where a keyed store read would hit an empty local store and
+    /// this node would look unregistered to itself. The API hands a node the
+    /// whole node list (it reads it for Ceph anyway), so its own object is in
+    /// there; a linear scan for one's own name is cheap and happens once a pass.
+    pub(super) async fn own_node(
+        &self,
+    ) -> crate::host::Result<Option<velstra_cloud_model::resources::Node>> {
+        if self.sink.is_some() {
+            let all = self.cell.nodes().await?;
+            return Ok(all
+                .into_iter()
+                .find(|n| n.meta.name.id() == self.config.node));
+        }
+        let name = format!("nodes/{}", self.config.node);
+        self.nodes
+            .get(&name)
+            .await
+            .map_err(|e| crate::host::HostError::failed(e.to_string()))
     }
 
     // ---- what this node tells its guests ----------------------------------
@@ -144,8 +221,20 @@ impl Agent {
     ) {
         let subnets = self.shared(self.cell.subnets().await, "subnets", pass);
         let networks = self.shared(self.cell.networks().await, "networks", pass);
+        // The public addresses this node's ports hold. A cell that hands out
+        // none reads an empty list and pays a list call; one that does needs
+        // them here, because a routed address is configured *by the guest* and
+        // this is where a guest is told what it has.
+        let public = match self.cell.floating_ips().await {
+            Ok(floating) => guests::public_addresses(&floating),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the cell's public addresses");
+                pass.failures += 1;
+                Default::default()
+            }
+        };
         self.guests
-            .replace(guests::derive(mine, ports, &subnets, &networks, taps));
+            .replace(guests::derive(mine, ports, &subnets, &networks, taps, &public));
     }
 
     /// A collection this node only reads, keyed by name. An unreadable one is a
@@ -173,6 +262,11 @@ impl Agent {
     // ---- writing ---------------------------------------------------------
 
     /// Report the observed status. See [`crate::reporting::report`].
+    ///
+    /// In `--api` mode the write goes through the sink — the API, as this node's
+    /// own token — instead of the store; the two are the same report with the
+    /// ownership rule enforced in a different place. An unchanged status writes
+    /// nothing either way, which is what keeps a converged agent quiet.
     pub(super) async fn report<S, T>(
         &self,
         store: &TypedStore<S, T>,
@@ -183,6 +277,13 @@ impl Agent {
         S: Serialize + DeserializeOwned + PartialEq + Assigned + Send + Sync,
         T: Serialize + DeserializeOwned + PartialEq + Observed + Send + Sync,
     {
+        if self.sink.is_some() {
+            if next.status == stored.status {
+                return;
+            }
+            self.write_through_sink(store.kind(), &next, pass).await;
+            return;
+        }
         crate::reporting::report(store, stored, next, &self.writer, pass).await;
     }
 
@@ -197,6 +298,46 @@ impl Agent {
         S: Serialize + DeserializeOwned + PartialEq + Clone + Assigned + Send + Sync,
         T: Serialize + DeserializeOwned + PartialEq + Observed + Clone + Send + Sync,
     {
+        if self.sink.is_some() {
+            let mut next = stored.clone();
+            take_ownership(&mut next.status);
+            self.write_through_sink(store.kind(), &next, pass).await;
+            return;
+        }
         crate::reporting::claim(store, stored, take_ownership, &self.writer, pass).await;
+    }
+
+    /// Send one report through the sink and count what the far end made of it.
+    ///
+    /// The mapping from [`crate::sink::SinkOutcome`] to the pass counters is the
+    /// same one [`crate::reporting::report`] applies to a direct-store write, so
+    /// a `--api` agent and a direct one report the same shape of pass — a refusal
+    /// is a refusal whichever wrote it.
+    pub(super) async fn write_through_sink<S, T>(
+        &self,
+        kind: &str,
+        next: &Resource<S, T>,
+        pass: &mut Pass,
+    ) where
+        S: Serialize,
+        T: Serialize,
+    {
+        use crate::sink::SinkOutcome;
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let value = serde_json::to_value(next).expect("a resource always serialises");
+        match sink.write_status(kind, &value, &self.writer).await {
+            SinkOutcome::Wrote => pass.reports += 1,
+            SinkOutcome::Conflict => pass.conflicts += 1,
+            SinkOutcome::Refused(why) => {
+                tracing::warn!(%kind, %why, "the API refused this agent's report");
+                pass.refused += 1;
+            }
+            SinkOutcome::Failed(why) => {
+                tracing::warn!(%kind, %why, "could not report status through the API");
+                pass.failures += 1;
+            }
+        }
     }
 }

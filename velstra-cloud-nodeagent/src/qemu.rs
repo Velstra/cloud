@@ -48,19 +48,42 @@ use velstra_cloud_model::{
 };
 
 use crate::{
+    cephadm::CephAdmin,
     host::{HostError, HostState, Receiver, Result, Transfer, VmObservation, VmRequest, Vmm},
     hostfs::{self, Boot, Layout, slug, unslug},
 };
 
 pub struct QemuVmm {
     layout: Layout,
+    /// Ceph's tools, held rather than built per observation.
+    ///
+    /// Held for two reasons. It keeps whatever binaries this node was
+    /// configured with instead of silently reverting to the defaults on the
+    /// observation path; and [`CephAdmin`] only says a standing failure once
+    /// per spell, which a value rebuilt every pass would defeat by making
+    /// every pass the first one.
+    cephadm: CephAdmin,
 }
 
 impl QemuVmm {
     /// `layout.binary` is the QEMU to run — `qemu-system-x86_64` on a normal
     /// node — and `layout.firmware` is what it boots.
     pub fn new(layout: Layout) -> Self {
-        Self { layout }
+        Self {
+            layout,
+            cephadm: CephAdmin::default(),
+        }
+    }
+
+    /// Point this VMM's Ceph observation at particular binaries.
+    ///
+    /// The counterpart to the agent's own `with_ceph_tools`: the deployment
+    /// path and the observation path are two different call sites, and a test
+    /// that redirected only one of them would be testing the redirection
+    /// rather than the node.
+    pub fn with_ceph_tools(mut self, cephadm: CephAdmin) -> Self {
+        self.cephadm = cephadm;
+        self
     }
 
     pub fn layout(&self) -> &Layout {
@@ -274,7 +297,26 @@ impl Vmm for QemuVmm {
             Ok(devices) => host.devices = devices,
             Err(e) => tracing::debug!("could not read this machine's disks: {e}"),
         }
-        let ceph = crate::cephadm::CephAdmin::default().installed().await;
+        // `can_mask: true` on x86: QEMU has a CPU model system, which is what
+        // lets a mixed fleet be baselined into one migration domain. Not on
+        // aarch64, where QEMU has no models either — the capability belongs to
+        // the pair, not to the VMM's name.
+        // Silicon only. What this node *presents* is the agent's to apply,
+        // because it is declared on the node object and this backend cannot
+        // see it — see `Agent::present_baseline`.
+        host.cpu = Some(crate::hostcpu::observe(
+            std::env::consts::ARCH == "x86_64",
+            None,
+        ));
+
+        // The machine's hardware as sysfs has it. Which guest holds which
+        // device is *not* known here and is deliberately left blank: a device
+        // passed to a guest is bound to `vfio-pci` exactly like a free one, so
+        // sysfs cannot tell them apart. The agent overlays that from the
+        // instances it holds — see `Agent::mark_held_devices`.
+        host.pci_devices = crate::pcidev::observe(&Default::default());
+
+        let ceph = self.cephadm.installed().await;
         if ceph.installed {
             host.ceph = Some(ceph);
         }
@@ -288,6 +330,13 @@ impl Vmm for QemuVmm {
             if !self.monitor(&instance).exists() && !self.incoming_monitor(&instance).exists() {
                 continue;
             }
+            // Read once per guest per pass, before either branch: a VMM that
+            // has just died still has its log on disk, and this is the moment
+            // to pick it up.
+            let (console_tail, console_bytes) = hostfs::console_tail(
+                &self.layout.console(&instance),
+                velstra_cloud_model::resources::CONSOLE_TAIL_BYTES,
+            );
             let Some(state) = self.run_state(&instance).await else {
                 // The socket is there and nobody is behind it: the VMM died and
                 // left it. A failure, not a stop — the two want different
@@ -295,9 +344,22 @@ impl Vmm for QemuVmm {
                 host.vms.insert(
                     instance,
                     VmObservation {
+                        // A dead VMM is running nothing, so there is no size
+                        // to report — and a stale one would make a stopped
+                        // guest look as though it disagreed with its spec.
+                        size: None,
+                        // Especially here. A VMM that died and left its socket
+                        // behind is the case this whole capture exists for.
+                        console_tail,
+                        console_bytes,
                         state: InstanceState::Failed,
                         pid: None,
                         started_at: hostfs::started_at(&dir),
+                        // A dead VMM holds nothing: whatever it had is back
+                        // with the host, and reporting otherwise would keep a
+                        // device out of everyone's reach until somebody
+                        // noticed.
+                        devices: Vec::new(),
                     },
                 );
                 continue;
@@ -317,9 +379,27 @@ impl Vmm for QemuVmm {
             host.vms.insert(
                 instance.clone(),
                 VmObservation {
+                    size: running_size(
+                        &hostfs::unit_command(self.layout.scope, &self.unit(&instance))
+                            .await
+                            .unwrap_or_default(),
+                        hostfs::disk_gib(&self.layout.disk(&instance)),
+                    ),
+                    console_tail,
+                    console_bytes,
                     state: state_of(&state),
                     pid: hostfs::main_pid(self.layout.scope, &self.unit(&instance)).await,
                     started_at: hostfs::started_at(&dir),
+                    // Read back off the running VMM's own command line, the
+                    // same way a receiver's URL is. The agent therefore
+                    // remembers nothing: a restarted agent recovers which
+                    // guest holds which device from the machine, which is the
+                    // rule this whole crate is built on.
+                    devices: passed_devices(
+                        &hostfs::unit_command(self.layout.scope, &self.unit(&instance))
+                            .await
+                            .unwrap_or_default(),
+                    ),
                 },
             );
         }
@@ -339,6 +419,11 @@ impl Vmm for QemuVmm {
     /// Covered by `tests/qemu_boots_a_guest.rs`, which starts a real guest and
     /// reads its console: "running" is what a VMM reports for a machine that
     /// loaded nothing, so the console is the only proof that it booted.
+    fn disk_path(&self, instance: &str) -> Option<std::path::PathBuf> {
+        let path = self.layout().disk(instance);
+        path.exists().then_some(path)
+    }
+
     async fn start(&self, request: &VmRequest) -> Result<()> {
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
@@ -576,6 +661,59 @@ async fn answer(
 /// receiving command line is the same one plus `-incoming`, which is what makes
 /// a migrated guest come back as the machine it was: a destination that boots a
 /// different shape of machine is a guest that resumes into missing devices.
+/// The value for `-cpu`.
+///
+/// No baseline declared: `host`, the machine the guest was actually placed on.
+/// A baseline: the model, with `enforce` appended so QEMU refuses to start
+/// rather than quietly presenting the guest something smaller than promised.
+///
+/// `enforce` is what makes a baseline a promise instead of a hope. Without it
+/// a node that cannot provide the model starts the guest anyway with whatever
+/// subset it has, the platform reports the baseline as met, and the first
+/// symptom is a guest faulting on the destination of a migration the platform
+/// had every reason to believe was safe.
+/// The size a QEMU command line describes.
+///
+/// Parsed back out for the same reason the devices are: the agent remembers
+/// nothing, so what a running guest *is* has to be recoverable from the
+/// machine. `-smp 4 -m 8192`, in the form `qemu_args` writes them.
+///
+/// The disk is not on the command line as a size — it is a file — so it is
+/// read from the file instead, by the caller.
+fn running_size(command: &str, disk_gib: u64) -> Option<velstra_cloud_model::resources::RunningSize> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let after = |flag: &str| -> Option<&str> {
+        words.iter().position(|w| *w == flag).and_then(|at| words.get(at + 1)).copied()
+    };
+    Some(velstra_cloud_model::resources::RunningSize {
+        vcpus: after("-smp")?.split(',').next()?.parse().ok()?,
+        memory_mib: after("-m")?.parse().ok()?,
+        root_disk_gib: disk_gib,
+    })
+}
+
+/// The PCI addresses on a QEMU command line.
+///
+/// Parsed back out rather than remembered, so a restarted agent recovers what
+/// each guest holds from the machine. The form is the one `qemu_args` writes:
+/// `-device vfio-pci,host=0000:41:00.0`.
+fn passed_devices(command: &str) -> Vec<String> {
+    command
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix("vfio-pci,host="))
+        .map(|rest| rest.split(',').next().unwrap_or(rest).to_string())
+        .collect()
+}
+
+fn cpu_arg(request: &VmRequest) -> String {
+    match request.cpu_baseline {
+        None => "host".to_string(),
+        // `CpuLevel` prints as `x86-64-v3`, which is also QEMU's name for that
+        // model. The baseline and the command line are the same string.
+        Some(level) => format!("{level},enforce"),
+    }
+}
+
 fn qemu_args(
     layout: &Layout,
     request: &VmRequest,
@@ -585,6 +723,13 @@ fn qemu_args(
     let mut args: Vec<OsString> = vec![
         "-machine".into(),
         "accel=kvm".into(),
+        // Never omitted. QEMU's x86_64 default is `qemu64`, an Opteron-G1-era
+        // model without SSSE3, SSE4.1, SSE4.2 or POPCNT — below x86-64-v2,
+        // which RHEL 9, CentOS Stream 9 and a growing list of distributions
+        // require in order to boot at all. Leaving `-cpu` off does not mean
+        // "whatever the host has"; it means a 2006 processor.
+        "-cpu".into(),
+        cpu_arg(request).into(),
         "-nodefaults".into(),
         "-display".into(),
         "none".into(),
@@ -607,6 +752,13 @@ fn qemu_args(
         "-serial".into(),
         format!("file:{}", layout.console(&request.instance).display()).into(),
     ];
+    // Passed-through hardware. `vfio-pci` is the only device model here:
+    // whole-device passthrough is all this platform offers, and a mediated
+    // device would need a `sysfsdev` this build has nothing to fill in with.
+    for address in &request.devices {
+        args.push("-device".into());
+        args.push(format!("vfio-pci,host={address}").into());
+    }
     match &layout.boot {
         // `-bios`, not `-kernel`. QEMU's `-kernel` takes a Linux kernel and
         // nothing else; a firmware blob given to it boots nothing and says
@@ -754,6 +906,7 @@ mod tests {
 
     fn request() -> VmRequest {
         VmRequest {
+            devices: Vec::new(),
             instance: "projects/p1/instances/i1".into(),
             vcpus: 4,
             memory_mib: 8192,
@@ -769,6 +922,7 @@ mod tests {
                     mac: None,
                 },
             ],
+            cpu_baseline: None,
         }
     }
 
@@ -815,6 +969,88 @@ mod tests {
         assert!(nets[0].contains("id=n0,ifname=vt-a"), "{nets:?}");
         assert!(nets[1].contains("id=n1,ifname=vt-b"), "{nets:?}");
         assert!(booting.contains(&"8192".to_string()));
+    }
+
+    /// A guest is never started on QEMU's default CPU.
+    ///
+    /// The regression this pins is a real one this code shipped with: no
+    /// `-cpu` at all, which is not "whatever the host has" but `qemu64` — an
+    /// Opteron-G1-era model below x86-64-v2. RHEL 9 and CentOS Stream 9 need
+    /// v2 to boot, so those images simply did not run here.
+    #[test]
+    fn a_guest_is_never_left_on_qemus_2006_default_cpu() {
+        let args = words(&qemu_args(
+            &layout(),
+            &request(),
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let at = args.iter().position(|a| a == "-cpu").expect("no -cpu given");
+        assert_eq!(args[at + 1], "host");
+    }
+
+    /// A declared baseline reaches the command line, with `enforce`.
+    ///
+    /// `enforce` is the whole difference between a baseline and a hope:
+    /// without it QEMU silently drops features the host cannot provide, the
+    /// guest runs with less than was promised, and the platform goes on
+    /// believing a migration to a matching node is safe.
+    #[test]
+    fn a_baseline_is_passed_to_qemu_and_enforced() {
+        let mut r = request();
+        r.cpu_baseline = Some(velstra_cloud_model::cpu::CpuLevel::V3);
+        let args = words(&qemu_args(&layout(), &r, Path::new("/run/qmp.sock"), None));
+        let at = args.iter().position(|a| a == "-cpu").expect("no -cpu given");
+        assert_eq!(args[at + 1], "x86-64-v3,enforce");
+    }
+
+
+    /// A passed-through device reaches the command line, and reads back off it.
+    ///
+    /// The round trip is the point: the agent remembers nothing, so which
+    /// guest holds which device has to be recoverable from the machine. If
+    /// these two ever disagree, a restarted agent offers a device a running
+    /// guest is already using — and two guests with the same GPU is a host
+    /// that does not survive it.
+    #[test]
+    fn a_passed_device_reaches_qemu_and_reads_back_off_its_command_line() {
+        let mut r = request();
+        r.devices = vec!["0000:41:00.0".into(), "0000:81:00.0".into()];
+        let args = words(&qemu_args(&layout(), &r, Path::new("/run/qmp.sock"), None));
+
+        let passed: Vec<&String> = args.iter().filter(|a| a.starts_with("vfio-pci,")).collect();
+        assert_eq!(passed.len(), 2, "{args:?}");
+        assert_eq!(passed[0], "vfio-pci,host=0000:41:00.0");
+        assert_eq!(passed[1], "vfio-pci,host=0000:81:00.0");
+
+        // And back out of a command line shaped like the one systemd reports.
+        assert_eq!(passed_devices(&args.join(" ")), r.devices);
+    }
+
+    /// A guest with no devices produces no `-device` at all.
+    ///
+    /// Not cosmetic: an empty `-device` argument is one QEMU refuses, and a
+    /// guest that will not start for a feature it never asked for is the worst
+    /// kind of regression.
+    #[test]
+    fn a_guest_without_devices_gets_no_vfio_arguments() {
+        let args = words(&qemu_args(
+            &layout(),
+            &request(),
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        assert!(!args.iter().any(|a| a.contains("vfio-pci")), "{args:?}");
+        assert!(passed_devices(&args.join(" ")).is_empty());
+    }
+
+    /// Reading devices off a command line ignores everything that is not one.
+    #[test]
+    fn reading_devices_back_ignores_the_rest_of_the_command_line() {
+        let command = "/usr/bin/qemu-system-x86_64 -cpu host -device vfio-pci,host=0000:41:00.0 \
+                       -device virtio-net-pci,netdev=n0 -m 8192";
+        assert_eq!(passed_devices(command), ["0000:41:00.0"]);
+        assert!(passed_devices("").is_empty());
     }
 
     #[test]

@@ -70,11 +70,14 @@ pub mod fabric;
 pub mod fake;
 pub mod guests;
 pub mod host;
+pub mod hostcpu;
+pub mod pcidev;
 pub mod hostfs;
 pub mod metadata;
 pub mod pool;
 pub mod qemu;
 pub(crate) mod reporting;
+pub mod sink;
 
 pub use agent::{Agent, AgentConfig, Pass};
 pub use cell::{CellReader, StoreCell};

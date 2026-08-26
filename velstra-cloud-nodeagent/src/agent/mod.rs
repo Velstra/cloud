@@ -34,7 +34,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}},
     time::Duration,
 };
 
@@ -171,6 +171,14 @@ pub(super) struct CellView<'a> {
     /// source, so without this the agent could refuse a bad image and never
     /// obtain a good one.
     pub images: &'a BTreeMap<String, ImageSpec>,
+    /// Every instance this cell holds.
+    ///
+    /// Here rather than as one more parameter, and that is what this struct is
+    /// for: it is what this pass read of the cell, handed down once. The start
+    /// order needs it — whether a guest may start is a question about the
+    /// machine, not about the guest, and it can only be answered with the
+    /// whole list in hand.
+    pub instances: &'a [Instance],
 }
 
 pub struct Agent {
@@ -179,6 +187,11 @@ pub struct Agent {
     instances: TypedStore<InstanceSpec, InstanceStatus>,
     attachments: TypedStore<AttachmentSpec, AttachmentStatus>,
     ports: TypedStore<PortSpec, PortStatus>,
+    /// Written, not read: what this node reports about a capture it is making.
+    captures: TypedStore<
+        velstra_cloud_model::capture::CaptureSpec,
+        velstra_cloud_model::capture::CaptureStatus,
+    >,
     nodes: TypedStore<NodeSpec, NodeStatus>,
     /// Written, not read: the destination of a migration owns its status and
     /// reports on it. What this node is *told* about migrations comes through
@@ -204,6 +217,31 @@ pub struct Agent {
     /// An agent that cannot write its own node object says so once. Repeating
     /// it every resync would bury everything else in the journal.
     warned_about_node: AtomicBool,
+    /// Where status reports go. `None` is the direct-store default — this agent
+    /// writes to the store as `Writer::agent`, and the store judges it. `Some` is
+    /// `--api` mode: reports go through the API as this node's own token, which
+    /// authenticates them rather than trusting a self-declared identity. See
+    /// [`crate::sink`].
+    sink: Option<Arc<dyn crate::sink::StatusSink>>,
+    /// When this agent last managed to report its own node object.
+    ///
+    /// The watchdog's only input, and the reason it needs nothing from anybody:
+    /// a node that cannot reach the control plane cannot be *told* to stop, so
+    /// it has to decide by itself, against its own clock. Milliseconds since
+    /// the epoch, in an atomic because the pass that updates it and the loop
+    /// that reads it are not the same task.
+    ///
+    /// Starts at the moment the agent was built. An agent that has never
+    /// managed to report is one that has not been trusted with anything yet,
+    /// and giving it a grace period from startup is what stops a control plane
+    /// that is merely slow to come up from taking every guest down with it.
+    last_report: AtomicU64,
+    /// This node's fencing deadline, as last read from its own object.
+    ///
+    /// Cached rather than read when it is needed, and that is the whole design:
+    /// the moment fencing matters is the moment this agent cannot read
+    /// anything. A deadline it has to fetch is a deadline it will never get.
+    fence_after_s: AtomicU32,
 }
 
 impl Agent {
@@ -237,6 +275,7 @@ impl Agent {
             instances: TypedStore::new(store.clone(), &cell, "instances"),
             attachments: TypedStore::new(store.clone(), &cell, "attachments"),
             ports: TypedStore::new(store.clone(), &cell, "ports"),
+            captures: TypedStore::new(store.clone(), &cell, "captures"),
             nodes: TypedStore::new(store.clone(), &cell, "nodes"),
             migrations: TypedStore::new(store, &cell, "migrations"),
             cell: reader,
@@ -248,7 +287,26 @@ impl Agent {
             warned_about_ceph_reads: AtomicBool::new(false),
             probed_ceph_reads: AtomicBool::new(false),
             warned_about_node: AtomicBool::new(false),
+            sink: None,
+            last_report: AtomicU64::new(velstra_cloud_model::meta::Timestamp::now().0),
+            fence_after_s: AtomicU32::new(0),
         }
+    }
+
+    /// Route this agent's status reports through `sink` — the API — instead of
+    /// straight to the store.
+    ///
+    /// This is what makes `--api` mode a trust boundary: with it, a report is
+    /// authenticated as this node's own token and the API refuses anything that
+    /// is not this node's, so the credential a node holds can write only its own
+    /// objects. Without it (the default), the agent writes to the store directly
+    /// and the store judges a self-declared identity — the single-operator phase.
+    ///
+    /// Reads follow the same seam through [`Agent::reading`]; a `--api` agent uses
+    /// the API for both.
+    pub fn with_status_sink(mut self, sink: Arc<dyn crate::sink::StatusSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Point the Ceph pass at different binaries.
@@ -297,8 +355,7 @@ impl Agent {
     /// agent's own pass, which has just written a fresher heartbeat than this
     /// one would have.
     async fn touch_heartbeat(&self) {
-        let name = format!("nodes/{}", self.config.node);
-        let stored = match self.nodes.get(&name).await {
+        let stored = match self.own_node().await {
             Ok(Some(stored)) => stored,
             // A node that is not there is not this agent's to invent, and is
             // silent by design. A read that *failed* is different — the store is
@@ -312,6 +369,15 @@ impl Agent {
         };
         let mut next = stored.clone();
         next.status.last_heartbeat = velstra_cloud_model::meta::Timestamp::now();
+        if let Some(sink) = &self.sink {
+            let value = serde_json::to_value(&next).expect("a node always serialises");
+            if let crate::sink::SinkOutcome::Failed(why) =
+                sink.write_status("nodes", &value, &self.writer).await
+            {
+                tracing::debug!(error = %why, "could not write this node's heartbeat through the API");
+            }
+            return;
+        }
         if let Err(e) = self.nodes.update(&next, &self.writer).await {
             tracing::debug!(error = %e, "could not write this node's heartbeat");
         }
@@ -399,15 +465,244 @@ impl Agent {
         }
     }
 
+
+
+    /// Which devices this guest is to be given.
+    ///
+    /// **Already-held devices win.** A guest that is running was assigned
+    /// these when it started, and re-choosing on every pass would hand it a
+    /// different GPU the moment another one freed up — a restart for a reason
+    /// nobody could see. This is the same rule the CPU follows and for the
+    /// same reason: what a running guest holds is a fact recorded once.
+    ///
+    /// For a guest that holds none, the choice is made from what this node has
+    /// free right now, and a shortfall is returned as a sentence rather than
+    /// as an empty list — a guest silently started without the accelerator it
+    /// asked for is worse than one that does not start.
+    async fn devices_for(
+        &self,
+        instance: &Instance,
+        host: &crate::host::HostState,
+    ) -> Result<Vec<String>, String> {
+        if instance.spec.devices.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !instance.status.devices.is_empty() {
+            return Ok(instance.status.devices.clone());
+        }
+        let classes = self.device_classes().await;
+        velstra_cloud_model::pci::assign(&instance.spec.devices, &classes, &host.pci_devices)
+            .map_err(|why| why.to_string())
+    }
+
+    /// The cell's PCI device classes, by id.
+    ///
+    /// Empty when the cell has none or they cannot be read. A node that
+    /// invented a class would start a guest without the hardware it asked
+    /// for; an empty map refuses it by name instead.
+    async fn device_classes(
+        &self,
+    ) -> std::collections::BTreeMap<String, velstra_cloud_model::pci::DeviceClassSpec> {
+        match self.cell.device_classes().await {
+            Ok(all) => all,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read this cell's device classes");
+                Default::default()
+            }
+        }
+    }
+
+
+    /// Stop every guest on this machine, because nobody has heard from it.
+    ///
+    /// The mechanism the whole of recovery rests on. A node that has gone quiet
+    /// is not a node that has stopped — it may be unreachable and still running
+    /// everything it holds — so before anything may be started elsewhere, *this*
+    /// has to have happened.
+    ///
+    /// It needs nothing from anybody, which is the point: an agent that cannot
+    /// reach the control plane cannot be told to stop. It reads its own clock,
+    /// its own last successful report, and its own node object's deadline.
+    ///
+    /// The deadline comes from the node's spec, which this agent last read while
+    /// it could still read anything. A node that has never been given one does
+    /// not fence — and is never recovered from, which is the honest pair.
+    async fn self_fence_pass(&self, host: &crate::host::HostState, pass: &mut Pass) {
+        let fence_after_s = self.fence_after_s.load(Ordering::Relaxed);
+        let last = velstra_cloud_model::meta::Timestamp(self.last_report.load(Ordering::Relaxed));
+        let now = velstra_cloud_model::meta::Timestamp::now();
+        if !velstra_cloud_model::ha::should_self_fence(fence_after_s, last, now) {
+            return;
+        }
+
+        let running: Vec<String> = host
+            .vms
+            .iter()
+            .filter(|(_, vm)| vm.state == velstra_cloud_model::resources::InstanceState::Running)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if running.is_empty() {
+            return;
+        }
+
+        // Said loudly and every time, unlike the once-per-spell warnings
+        // elsewhere. This is the agent taking somebody's guests down, and a
+        // line per occurrence is the record of why they went.
+        tracing::error!(
+            node = %self.config.node,
+            quiet_s = (now.0.saturating_sub(last.0)) / 1000,
+            fence_after_s,
+            guests = running.len(),
+            "this node has not been heard from for longer than its fencing deadline; \
+             stopping its guests so they cannot run twice"
+        );
+        for instance in running {
+            if let Err(e) = self.vmm.stop(&instance).await {
+                // Reported and carried on. A guest that will not stop is worse
+                // than one that will, and the remaining ones are still worth
+                // stopping — leaving them running because a neighbour was
+                // stubborn would be the wrong half of a bad situation.
+                tracing::error!(instance = %instance, error = %e, "could not stop a guest while fencing");
+                pass.failures += 1;
+            }
+        }
+    }
+
+
+    /// Whether this guest may start yet, given the rest of this node.
+    ///
+    /// Built here because the question is about the machine, not the guest: it
+    /// needs every instance on this node and how far along each one is, which
+    /// only the agent holding them has.
+    ///
+    /// The peers are taken from the *store's* view of each instance rather than
+    /// from this pass's observation, for one reason: a guest on this node that
+    /// this agent has not visited yet in this pass still counts, and leaving it
+    /// out would let the group behind it go early exactly once per restart.
+    fn start_gate_for(
+        instance: &Instance,
+        all: &[Instance],
+        host: &crate::host::HostState,
+    ) -> velstra_cloud_model::reconcile::StartGate {
+        use velstra_cloud_model::reconcile::{StartGate, StartPeer, start_gate};
+
+        // Nothing to work out for the first group with no wait — which is
+        // every guest in every cell that has not asked for an order, so it is
+        // the path that has to cost nothing.
+        if instance.spec.start_order == 0 && instance.spec.start_delay_s == 0 {
+            return StartGate::Go;
+        }
+
+        let here = instance.status.node.clone().or_else(|| instance.spec.node.clone());
+        let peers: Vec<StartPeer> = all
+            .iter()
+            .filter(|other| other.meta.name != instance.meta.name)
+            .filter(|other| {
+                let theirs = other.status.node.clone().or_else(|| other.spec.node.clone());
+                theirs.is_some() && theirs == here
+            })
+            .filter(|other| !other.meta.is_deleting())
+            .map(|other| {
+                let name = other.meta.name.to_string();
+                // What this machine sees, falling back to what was last
+                // reported: a guest this agent has looked at already is more
+                // current than the stored copy, and one it has not is not
+                // therefore absent.
+                let seen = host.vms.get(&name);
+                StartPeer {
+                    order: other.spec.start_order,
+                    state: seen.map(|vm| vm.state).unwrap_or(other.status.state),
+                    desired: other.spec.desired_state,
+                    started_at: seen
+                        .and_then(|vm| vm.started_at)
+                        .or(other.status.started_at),
+                    name,
+                }
+            })
+            .collect();
+
+        start_gate(
+            instance.spec.start_order,
+            instance.spec.start_delay_s,
+            &peers,
+            velstra_cloud_model::meta::Timestamp::now(),
+        )
+    }
+
+    /// Mark the devices this node's guests are holding.
+    ///
+    /// The VMM reports sysfs, which cannot tell a device passed to a guest
+    /// from a free one — both are bound to `vfio-pci`. Only the instance
+    /// objects know, and only this node's own instances matter, because a
+    /// device is a piece of this machine.
+    ///
+    /// Applied in one place for the same reason the CPU baseline is: two call
+    /// sites overlaying it separately is how a node comes to offer a device it
+    /// has already given away.
+    fn mark_held_devices(host: &mut crate::host::HostState, mine: &[&Instance]) {
+        let held: std::collections::BTreeMap<String, String> = mine
+            .iter()
+            .flat_map(|i| {
+                let name = i.meta.name.to_string();
+                i.status
+                    .devices
+                    .iter()
+                    .map(move |address| (address.clone(), name.clone()))
+            })
+            .collect();
+        for device in &mut host.pci_devices {
+            if let Some(instance) = held.get(&device.address) {
+                device.state = velstra_cloud_model::pci::DeviceUse::Guest {
+                    instance: instance.clone(),
+                };
+            }
+        }
+    }
+
+    /// The baseline this node has been told to present, from its own object.
+    ///
+    /// Read from the node's spec rather than from local configuration so an
+    /// operator can declare it through the API instead of editing files on
+    /// every machine, and so what a node presents is visible to the same
+    /// people who decide it. Unreadable node, or none declared: the host's own
+    /// processor, which is the default everywhere else too.
+    pub(super) async fn declared_baseline(&self) -> Option<velstra_cloud_model::cpu::CpuLevel> {
+        self.own_node().await.ok().flatten()?.spec.cpu_baseline
+    }
+
+    /// Apply the declared baseline to what the VMM reported.
+    ///
+    /// One place, deliberately. The node's status and every guest's recorded
+    /// CPU are both derived from this value, and two call sites applying it
+    /// separately is how a node comes to report one CPU and hand out another.
+    fn present_baseline(
+        host: &mut crate::host::HostState,
+        baseline: Option<velstra_cloud_model::cpu::CpuLevel>,
+    ) {
+        let Some(cpu) = host.cpu.as_mut() else {
+            return;
+        };
+        match baseline {
+            Some(level) => {
+                cpu.presents = level.to_string();
+                cpu.presented_flags = level.flags();
+            }
+            None => {
+                cpu.presents = "host".to_string();
+                cpu.presented_flags = cpu.flags.clone();
+            }
+        }
+    }
+
+    /// Safe to call as often as anyone likes, and on a converged node it
     /// One full pass over everything this node owns.
     ///
-    /// Safe to call as often as anyone likes, and on a converged node it
     /// performs no actions and writes nothing — which is the property that
     /// makes the resync interval a matter of taste rather than of load.
     pub async fn resync(&self) -> Pass {
         let mut pass = Pass::default();
 
-        let host = match self.vmm.observe().await {
+        let mut host = match self.vmm.observe().await {
             Ok(host) => host,
             Err(e) => {
                 // Without a picture of the machine there is nothing honest to
@@ -417,6 +712,9 @@ impl Agent {
                 return pass;
             }
         };
+        let baseline = self.declared_baseline().await;
+        Self::present_baseline(&mut host, baseline);
+        let host = host;
         let programmed = match self.datapath.observe().await {
             Ok(programmed) => programmed,
             Err(e) => {
@@ -485,11 +783,21 @@ impl Agent {
             }
         };
 
+        let instances = match self.cell.instances().await {
+            Ok(instances) => instances,
+            Err(e) => {
+                tracing::error!(error = %e, "could not list instances");
+                pass.failures += 1;
+                return pass;
+            }
+        };
+
         let cell = CellView {
             ports: &ports,
             groups: &groups,
             networks: &networks,
             images: &images,
+            instances: &instances,
         };
 
         let migrations = match self.cell.migrations().await {
@@ -522,14 +830,6 @@ impl Agent {
             }
         };
 
-        let instances = match self.cell.instances().await {
-            Ok(instances) => instances,
-            Err(e) => {
-                tracing::error!(error = %e, "could not list instances");
-                pass.failures += 1;
-                return pass;
-            }
-        };
         let mut mine = Vec::new();
         for instance in &instances {
             if moving.released.contains(&instance.meta.name.to_string()) {
@@ -641,12 +941,26 @@ impl Agent {
         self.destination_pass(&migrations, &taps, &cell, &host, &mut pass)
             .await;
 
+        // After the guests, because a capture is of a stopped guest and the
+        // pass above is what stops one: asked for and acted on in the same
+        // sweep rather than a resync later.
+        self.capture_pass(&mine, &mut pass).await;
+
         self.refresh_guests(&mine, &ports, &taps, &mut pass).await;
         // Before the node status is written, because the status is where this
         // node's Ceph report goes and the pass fills it in.
         let mut host = host;
+        // Which devices this node's guests are holding. Only the instance
+        // objects know — sysfs cannot tell a passed-through device from a free
+        // one — so the overlay happens here, once, on the way to the report.
+        Self::mark_held_devices(&mut host, &mine);
         self.ceph_pass(&mut host, &mut pass).await;
         self.node_pass(&mine, &host, &mut pass).await;
+        // Last, and after the report: if that report landed, the deadline has
+        // just been pushed out and nothing here fires. If it did not, this is
+        // the pass that notices — and the ordering means an agent never fences
+        // itself over a report it was about to make successfully.
+        self.self_fence_pass(&host, &mut pass).await;
         pass
     }
 
@@ -707,6 +1021,7 @@ impl Agent {
                 &host,
                 &name,
                 stored.meta.is_deleting(),
+                stored.spec.console,
             );
 
             let actions = reconcile_instance(
@@ -739,6 +1054,10 @@ impl Agent {
                     })
                     .collect::<Vec<_>>(),
                 host.disks.contains(&name),
+                // What else is on this machine, and how far along it is. The
+                // order is a property of the node rather than of any guest, so
+                // it can only be answered here — with the whole list in hand.
+                Self::start_gate_for(stored, cell.instances, &host),
             );
 
             // Letting go of the finalizer is a metadata write, which belongs to
@@ -764,7 +1083,7 @@ impl Agent {
 
             let mut failed = None;
             for action in &work {
-                match self.perform_instance(action, stored, &taps, cell).await {
+                match self.perform_instance(action, stored, &taps, cell, &host).await {
                     Ok(()) => pass.actions += 1,
                     Err(why) => {
                         // The order in `reconcile_instance` is load-bearing, so
@@ -808,7 +1127,13 @@ impl Agent {
         let mut next = stored.clone();
         next.status.node = Some(self.config.node.clone());
         next.status.observed_generation = acted_on;
-        observe_instance(&mut next.status, &host, &name, stored.meta.is_deleting());
+        observe_instance(
+            &mut next.status,
+            &host,
+            &name,
+            stored.meta.is_deleting(),
+            stored.spec.console,
+        );
         next.status.addresses = if stored.meta.is_deleting() {
             Vec::new()
         } else {
@@ -904,6 +1229,9 @@ impl Agent {
         instance: &Instance,
         taps: &BTreeMap<String, String>,
         cell: &CellView<'_>,
+        // This machine as it was observed at the top of the pass. Needed to
+        // choose PCI devices, which is a question about the hardware here.
+        host: &crate::host::HostState,
     ) -> Result<(), String> {
         let (ports, groups, networks) = (cell.ports, cell.groups, cell.networks);
         let result = match action {
@@ -954,7 +1282,20 @@ impl Agent {
             },
             Action::UnprogramPort { port } => self.datapath.unprogram(port).await,
             Action::StartVm { .. } | Action::RestartCrashedVm { .. } => {
-                match self.vm_request(instance, taps, ports) {
+                let devices = match self.devices_for(instance, host).await {
+                    Ok(devices) => devices,
+                    // Said on the instance rather than logged: an operator
+                    // asking why their guest will not start should not have to
+                    // find the agent's log on whichever machine ran it.
+                    Err(why) => return Err(why),
+                };
+                match self.vm_request(
+                    instance,
+                    taps,
+                    ports,
+                    self.declared_baseline().await,
+                    devices,
+                ) {
                     Ok(request) => self.vmm.start(&request).await,
                     Err(why) => Err(crate::host::HostError::failed(why)),
                 }
@@ -973,6 +1314,14 @@ impl Agent {
         instance: &Instance,
         taps: &BTreeMap<String, String>,
         ports: &BTreeMap<String, Port>,
+        // Passed in rather than read here: this is a pure builder, and the
+        // baseline is one read of the node's own object that the caller has
+        // already made for the pass it is in the middle of.
+        baseline: Option<velstra_cloud_model::cpu::CpuLevel>,
+        // The PCI addresses this guest is to be given, already chosen. Same
+        // reasoning: choosing is a decision with a store read behind it, and
+        // this builder stays pure.
+        devices: Vec<String>,
     ) -> Result<VmRequest, String> {
         let mut wanted = Vec::with_capacity(instance.spec.ports.len());
         for port in &instance.spec.ports {
@@ -995,10 +1344,223 @@ impl Agent {
             image: instance.spec.image.clone(),
             root_disk_gib: instance.spec.root_disk_gib,
             nics: wanted,
+            // What this guest is to be given, as declared on this node right
+            // now. A guest already running is unaffected: it keeps the CPU it
+            // booted with, and adopts this one the next time it starts.
+            cpu_baseline: baseline,
+            devices,
         })
     }
 
     // ---- attachments -----------------------------------------------------
+
+    /// Turning a guest that somebody built by hand into an image.
+    ///
+    /// The half nothing did: a `Capture` was created, assigned to the node
+    /// holding the disk, and no agent ever claimed it — so the controller that
+    /// makes an image out of a finished one never had a finished one to act on.
+    ///
+    /// What a capture is, concretely: copy the guest's disk somewhere it will
+    /// survive, hash the bytes, and report the hash. The hash is not decoration
+    /// — an image's *name* carries its digest and the agent that later fetches
+    /// one refuses a name without it, which is what makes a pull verifiable.
+    async fn capture_pass(&self, mine: &[&Instance], pass: &mut Pass) {
+        let captures = match self.cell.captures().await {
+            Ok(captures) => captures,
+            Err(e) => {
+                tracing::error!(error = %e, "could not list captures");
+                pass.failures += 1;
+                return;
+            }
+        };
+        let wanted: Vec<&velstra_cloud_model::resources::Capture> = captures
+            .iter()
+            .filter(|c| !c.meta.is_deleting())
+            // Already done. Every pass after the first takes this path, so it
+            // has to cost one comparison and no reads.
+            .filter(|c| c.status.digest.is_none())
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let targets = match self.cell.backup_targets().await {
+            Ok(targets) => targets,
+            Err(e) => {
+                tracing::error!(error = %e, "could not list backup targets");
+                pass.failures += 1;
+                return;
+            }
+        };
+        for capture in wanted {
+            match self.ownership(
+                capture.status.node.as_deref(),
+                Some(capture.spec.node.as_str()),
+            ) {
+                Ownership::Mine => self.one_capture(capture, mine, &targets, pass).await,
+                Ownership::Claim => {
+                    let me = self.config.node.clone();
+                    self.claim(
+                        &self.captures,
+                        capture,
+                        |status| status.node = Some(me),
+                        pass,
+                    )
+                    .await
+                }
+                Ownership::Skip => {}
+            }
+        }
+    }
+
+    /// One capture: refuse what the model refuses, copy, hash, report.
+    async fn one_capture(
+        &self,
+        capture: &velstra_cloud_model::resources::Capture,
+        mine: &[&Instance],
+        targets: &[velstra_cloud_model::resources::BackupTarget],
+        pass: &mut Pass,
+    ) {
+        let name = capture.meta.name.to_string();
+        let guest = mine
+            .iter()
+            .find(|i| i.meta.name.to_string() == capture.spec.instance);
+        let view = velstra_cloud_model::capture::GuestView {
+            name: capture.spec.instance.clone(),
+            running: guest
+                .map(|g| g.status.state == velstra_cloud_model::resources::InstanceState::Running)
+                .unwrap_or(false),
+            // This node holds the guest — that is what being assigned here
+            // means — so a guest it cannot find in its own list is one that has
+            // gone, not one that is unplaced.
+            node: guest.map(|_| self.config.node.clone()),
+            deleting: guest.map(|g| g.meta.is_deleting()).unwrap_or(false),
+        };
+        let target = targets
+            .iter()
+            .find(|t| t.meta.name.to_string() == capture.spec.target);
+        let usable = target
+            .map(|t| t.spec.accepting && t.status.writable != Some(false))
+            .unwrap_or(false);
+
+        // The model's own rule, asked here rather than re-derived. A running
+        // guest is the refusal this exists for: a disk copied from under one is
+        // crash-consistent, which a template stamped out a hundred times must
+        // not be.
+        if let Err(why) =
+            velstra_cloud_model::capture::may_capture(&view, usable, &capture.spec.target)
+        {
+            self.say_about_capture(capture, ConditionStatus::False, "Refused", &why.to_string(), pass)
+                .await;
+            return;
+        }
+        let Some(target) = target else { return };
+
+        let Some(from) = self.vmm.disk_path(&capture.spec.instance) else {
+            self.say_about_capture(
+                capture,
+                ConditionStatus::False,
+                "NoDisk",
+                &format!(
+                    "{} has no disk this node can read. A guest whose root disk is a pool volume \
+                     is captured from the pool, not from here.",
+                    capture.spec.instance
+                ),
+                pass,
+            )
+            .await;
+            return;
+        };
+
+        // Written under a temporary name and hashed *there*. The final name
+        // carries the digest, and a digest cannot be known before the bytes
+        // exist — so the copy is made, read back, and only then given the name
+        // an image will be fetched by.
+        let staging = format!(
+            "{}/{}.capturing",
+            target.spec.path.trim_end_matches('/'),
+            name.replace('/', "~")
+        );
+        if let Err(e) = tokio::fs::copy(&from, &staging).await {
+            tracing::warn!(capture = %name, error = %e, "the disk could not be copied out");
+            pass.failures += 1;
+            self.say_about_capture(capture, ConditionStatus::False, "CopyFailed", &e.to_string(), pass)
+                .await;
+            return;
+        }
+        let digest = match crate::hostfs::sha256_file(std::path::Path::new(&staging)).await {
+            // Prefixed here rather than in the hasher: `sha256_file` answers
+            // what the bytes hash to, and *which* algorithm that was is part of
+            // the name an image is fetched by — `capture::image_id` and
+            // `image_url` both split on the colon.
+            Ok(digest) => format!("sha256:{digest}"),
+            Err(e) => {
+                let _ = std::fs::remove_file(&staging);
+                tracing::warn!(capture = %name, error = %e, "the copy could not be read back");
+                pass.failures += 1;
+                self.say_about_capture(
+                    capture,
+                    ConditionStatus::False,
+                    "Unreadable",
+                    &e.to_string(),
+                    pass,
+                )
+                .await;
+                return;
+            }
+        };
+        let final_path = velstra_cloud_model::capture::image_url(&target.spec.path, &digest)
+            .trim_start_matches("file://")
+            .to_string();
+        if let Err(e) = std::fs::rename(&staging, &final_path) {
+            let _ = std::fs::remove_file(&staging);
+            self.say_about_capture(
+                capture,
+                ConditionStatus::False,
+                "CopyFailed",
+                &format!("{staging} could not be moved into place: {e}"),
+                pass,
+            )
+            .await;
+            return;
+        }
+        let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+        pass.actions += 1;
+
+        let mut next = capture.clone();
+        next.status.digest = Some(digest);
+        next.status.size_bytes = size;
+        next.status.finished_at = Some(velstra_cloud_model::meta::Timestamp::now());
+        next.status.observed_generation = capture.meta.generation;
+        set_condition(
+            &mut next.status.conditions,
+            Condition::new(
+                "Ready",
+                ConditionStatus::True,
+                "Captured",
+                &format!("copied to {final_path}"),
+                capture.meta.generation,
+            ),
+        );
+        self.report(&self.captures, capture, next, pass).await;
+    }
+
+    /// Say on the capture why it has not happened.
+    async fn say_about_capture(
+        &self,
+        capture: &velstra_cloud_model::resources::Capture,
+        status: ConditionStatus,
+        reason: &str,
+        message: &str,
+        pass: &mut Pass,
+    ) {
+        let mut next = capture.clone();
+        next.status.observed_generation = capture.meta.generation;
+        set_condition(
+            &mut next.status.conditions,
+            Condition::new("Ready", status, reason, message, capture.meta.generation),
+        );
+        self.report(&self.captures, capture, next, pass).await;
+    }
 
     async fn attachment_pass(&self, stored: &Attachment, host: &HostState, pass: &mut Pass) {
         let acted_on = stored.meta.generation;

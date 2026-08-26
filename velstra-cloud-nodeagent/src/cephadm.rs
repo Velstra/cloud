@@ -38,6 +38,8 @@
 //! cluster can say, and a mock that agreed with itself would be worse than the
 //! gap it hides.
 
+use std::sync::{Arc, Mutex};
+
 use velstra_cloud_model::ceph::{CephPoolSpec, NodeCeph};
 
 use crate::host::{HostError, Result};
@@ -66,6 +68,13 @@ pub struct CephAdmin {
     /// test that appended to the real `/root/.ssh/authorized_keys` would be a
     /// test that changes who can log into the machine running it.
     pub authorized_keys: String,
+    /// The last spawn failure already reported by [`Self::installed`], so that a
+    /// standing condition is stated once instead of once per observation pass.
+    ///
+    /// Shared across clones on purpose: the agent clones this struct per pass,
+    /// and per-clone state would make every pass the first one and reinstate
+    /// exactly the flood this exists to stop.
+    reported_spawn_failure: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for CephAdmin {
@@ -76,6 +85,7 @@ impl Default for CephAdmin {
             systemctl: "systemctl".to_string(),
             ceph_conf: "/etc/ceph/ceph.conf".to_string(),
             authorized_keys: "/root/.ssh/authorized_keys".to_string(),
+            reported_spawn_failure: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -302,29 +312,78 @@ impl CephAdmin {
             .output()
             .await;
         match version {
-            Ok(out) if out.status.success() => NodeCeph {
-                installed: true,
-                version: String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                ..NodeCeph::default()
-            },
+            Ok(out) if out.status.success() => {
+                self.forget_spawn_failure();
+                NodeCeph {
+                    installed: true,
+                    version: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                    ..NodeCeph::default()
+                }
+            }
             // It ran and said no. Ordinary, and the reason this is not an
             // error: most nodes in most cells will never run Ceph.
-            Ok(_) => NodeCeph::default(),
+            Ok(_) => {
+                self.forget_spawn_failure();
+                NodeCeph::default()
+            }
             // It could not be run at all, which is a different thing and is
             // worth saying. The answer stays `false`, because a machine that
             // cannot spawn a process is not one to hand a cluster to — but
             // "does not have Ceph installed yet", which is what the deployment
             // will report from here, is then the wrong sentence about the right
             // machine, and this line is the only place the truth appears.
+            //
+            // Said once per spell of it, not once per pass: observation runs on
+            // a loop, and a standing condition logged every pass buries the
+            // events worth reading — including the one that ends this spell.
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    binary = %self.cephadm,
-                    "could not run cephadm at all; reporting this node as not having it"
-                );
+                if self.spawn_failure_is_news(&e) {
+                    tracing::warn!(
+                        error = %e,
+                        binary = %self.cephadm,
+                        "could not run cephadm at all; reporting this node as not having it. \
+                         Repeats are not logged until this changes."
+                    );
+                }
                 NodeCeph::default()
             }
         }
+    }
+
+    /// Whether this spawn failure is worth a line, and remember it if so.
+    ///
+    /// News means the situation changed: the first failure of a spell, or a
+    /// different failure than the one standing (`permission denied` after a
+    /// spell of `not found` is a different fact about the machine and is not
+    /// swallowed as a repeat).
+    fn spawn_failure_is_news(&self, e: &std::io::Error) -> bool {
+        let now = e.to_string();
+        let mut last = self.reported_spawn_failure.lock().unwrap_or_else(|p| {
+            // A poisoned lock here means some other thread panicked while
+            // holding it. That is not a reason to take the agent down over a
+            // log-suppression detail, and the worst case of carrying on is one
+            // extra line.
+            self.reported_spawn_failure.clear_poison();
+            p.into_inner()
+        });
+        if last.as_deref() == Some(now.as_str()) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
+    /// Forget any standing spawn failure, so the next one is news again.
+    ///
+    /// Called on every pass where `cephadm` ran — including the passes where it
+    /// ran and said no — because both mean the machine can spawn it, which is
+    /// the condition the warning was about.
+    fn forget_spawn_failure(&self) {
+        let mut last = self.reported_spawn_failure.lock().unwrap_or_else(|p| {
+            self.reported_spawn_failure.clear_poison();
+            p.into_inner()
+        });
+        *last = None;
     }
 
     async fn ceph(&self, args: &[String]) -> Result<Vec<u8>> {
@@ -428,7 +487,6 @@ impl CephAdmin {
         let out = self.ceph(&host_ls_argv()).await?;
         parse_hosts(&String::from_utf8_lossy(&out))
     }
-
 }
 
 #[cfg(test)]
@@ -541,6 +599,51 @@ mod tests {
         // A host with nothing on it, and a host nobody has heard of, answer the
         // same — which is correct: neither is running anything.
         assert_eq!(parse_daemons("hv-9", json).unwrap(), (false, false));
+    }
+
+    /// A node without Ceph says so once, not once per observation pass.
+    ///
+    /// The regression this pins: the agent observes on a loop, and the missing
+    /// binary was warned about on every pass — several lines a second in a VM
+    /// test, and a log nobody can read anything else out of on a real node.
+    #[test]
+    fn a_standing_spawn_failure_is_reported_once_rather_than_every_pass() {
+        let admin = CephAdmin::default();
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+
+        assert!(admin.spawn_failure_is_news(&missing()), "the first one is");
+        for _ in 0..100 {
+            assert!(!admin.spawn_failure_is_news(&missing()), "repeats are not");
+        }
+
+        // A *different* failure is a different fact about the machine, and is
+        // not swallowed as a repeat of the standing one.
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(admin.spawn_failure_is_news(&denied));
+        assert!(!admin.spawn_failure_is_news(&denied));
+
+        // And once it can be run again, the next spell is news on its own.
+        admin.forget_spawn_failure();
+        assert!(admin.spawn_failure_is_news(&missing()));
+    }
+
+    /// Clones share the suppression, because the agent clones per pass.
+    ///
+    /// Without this the flood comes back wearing a different hat: every pass
+    /// would hold a fresh clone, every clone's first failure would be news, and
+    /// the test above would keep passing while the log filled up anyway.
+    #[test]
+    fn clones_do_not_each_get_a_first_time() {
+        let admin = CephAdmin::default();
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+
+        assert!(admin.spawn_failure_is_news(&missing()));
+        assert!(!admin.clone().spawn_failure_is_news(&missing()));
+
+        // ...and a clone that sees it recover clears it for everyone holding
+        // the same node's tools, rather than only for itself.
+        admin.clone().forget_spawn_failure();
+        assert!(admin.spawn_failure_is_news(&missing()));
     }
 
     #[test]

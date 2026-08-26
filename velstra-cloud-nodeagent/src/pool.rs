@@ -98,6 +98,112 @@ impl PoolState {
     }
 }
 
+/// Is this path there, can this process write to it, and how much room is left.
+///
+/// Answered by *trying*, not by reading permissions: a directory can be
+/// writable by its mode and read-only because the filesystem under it is, or
+/// because the mount is gone and what is left is the empty mountpoint on the
+/// root disk — which is the failure this exists to catch, and the one a stat
+/// cannot see.
+fn look_at_target(path: &str) -> (bool, u64, Option<String>) {
+    let dir = std::path::Path::new(path);
+    if !dir.is_dir() {
+        return (
+            false,
+            0,
+            Some(format!(
+                "{path} is not a directory on this machine. Is the target mounted here?"
+            )),
+        );
+    }
+    // Written and removed. The alternative is trusting the mode bits, which say
+    // nothing about a read-only filesystem underneath them.
+    let probe = dir.join(".velstra-writable");
+    if let Err(e) = std::fs::write(&probe, b"") {
+        return (false, 0, Some(format!("{path} cannot be written: {e}")));
+    }
+    let _ = std::fs::remove_file(&probe);
+    (true, free_gib(dir), None)
+}
+
+/// How much room is left where this path is. Zero when it cannot be asked,
+/// which reads as "unknown" everywhere it is shown rather than as "full".
+fn free_gib(dir: &std::path::Path) -> u64 {
+    let Ok(text) = std::process::Command::new("df")
+        .arg("-BG")
+        .arg("--output=avail")
+        .arg(dir)
+        .output()
+    else {
+        return 0;
+    };
+    String::from_utf8_lossy(&text.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|line| line.trim().trim_end_matches('G').parse().ok())
+        .unwrap_or(0)
+}
+
+/// The cell's backups and targets, as one pass has them.
+#[derive(Default)]
+struct Copies {
+    backups: Vec<velstra_cloud_model::resources::Backup>,
+    targets: Vec<velstra_cloud_model::resources::BackupTarget>,
+}
+
+impl Copies {
+    /// Where this backup's bytes are, if there are any.
+    ///
+    /// `None` when the backup is unknown, when its copy was never made, or when
+    /// its target is not one this machine knows about — three different reasons
+    /// and one answer, because the caller's next move is the same for all
+    /// three: refuse, and say so on the volume.
+    fn path_of(&self, backup: &str) -> Option<String> {
+        let backup = self
+            .backups
+            .iter()
+            .find(|b| b.meta.name.to_string() == backup)?;
+        if !backup.status.taken {
+            return None;
+        }
+        let target = self
+            .targets
+            .iter()
+            .find(|t| t.meta.name.to_string() == backup.spec.target)?;
+        Some(backup_path(&target.spec.path, &backup.meta.name.to_string()))
+    }
+}
+
+/// Where a pool reads the bytes a new volume starts as.
+///
+/// The *agent's* view of [`VolumeSource`], and the difference is the last
+/// variant: a backup has already been resolved to a path by the time a backend
+/// sees it. A path is a fact about one machine's filesystem, so the model must
+/// not carry one — and a backend cannot resolve a backup's name, because that
+/// needs the backup, the target it names, and the target's path. Whoever has
+/// all three does the resolving, once, here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin<'a> {
+    Blank,
+    Image(&'a str),
+    Snapshot(&'a str),
+    /// A file on this machine — a backup on a target that is mounted here.
+    File(&'a str),
+}
+
+/// Where one backup's bytes go inside a target.
+///
+/// The resource's name with its slashes flattened, exactly as an image is
+/// stored on a node — so a person looking at a target with `ls` can read which
+/// copy is which, and two cells sharing a target cannot collide.
+pub fn backup_path(target_path: &str, backup: &str) -> String {
+    format!(
+        "{}/{}",
+        target_path.trim_end_matches('/'),
+        backup.replace('/', "~")
+    )
+}
+
 /// A storage backend. One implementation per real technology; the fake is what
 /// every test uses.
 #[async_trait::async_trait]
@@ -116,7 +222,7 @@ pub trait Storage: Send + Sync {
         &self,
         volume: &str,
         gib: u64,
-        source: &VolumeSource,
+        source: Origin<'_>,
         encryption_key: Option<&str>,
     ) -> Result<()>;
     async fn grow(&self, volume: &str, to_gib: u64) -> Result<()>;
@@ -133,6 +239,21 @@ pub trait Storage: Send + Sync {
 
     /// Destroy the copy. The volume it was taken from is untouched.
     async fn destroy_snapshot(&self, snapshot: &str) -> Result<()>;
+
+    /// Write this volume's bytes out to `path`, and answer how many landed.
+    ///
+    /// The other half of a snapshot, and deliberately a different method: a
+    /// snapshot stays in the pool and is cheap because it shares blocks with
+    /// the volume; this leaves the pool entirely, which is the whole point and
+    /// also why it costs a full copy. A backend that cannot do it says so
+    /// rather than pretending — an empty file reported as a backup is worse
+    /// than no backup, because somebody will believe it.
+    ///
+    /// Like `take_snapshot`, this returns when the copy *is* one. A backend
+    /// that returned early would have the agent report `taken` over a
+    /// half-written file, and a backup is never taken twice: the second copy
+    /// would be of a different moment under a name somebody trusts.
+    async fn copy_out(&self, volume: &str, path: &str) -> Result<u64>;
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +282,14 @@ pub struct PoolAgent {
     /// it is *told* about comes through `cell`.
     volumes: TypedStore<VolumeSpec, VolumeStatus>,
     snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
+    backups: TypedStore<
+        velstra_cloud_model::backup::BackupSpec,
+        velstra_cloud_model::backup::BackupStatus,
+    >,
+    targets: TypedStore<
+        velstra_cloud_model::backup::BackupTargetSpec,
+        velstra_cloud_model::backup::BackupTargetStatus,
+    >,
     pools: TypedStore<PoolSpec, PoolStatus>,
     /// Everything this pool reads about the cell — the only thing that grew with
     /// the cell rather than with this pool's own work. See [`crate::cell`].
@@ -192,6 +321,8 @@ impl PoolAgent {
             writer: Writer::agent(&config.pool),
             volumes: TypedStore::new(store.clone(), &cell, "volumes"),
             snapshots: TypedStore::new(store.clone(), &cell, "snapshots"),
+            backups: TypedStore::new(store.clone(), &cell, "backups"),
+            targets: TypedStore::new(store.clone(), &cell, "backup-targets"),
             pools: TypedStore::new(store, &cell, "pools"),
             config,
             cell: reader,
@@ -254,8 +385,18 @@ impl PoolAgent {
                 return pass;
             }
         };
+        // Read once for the whole pass and handed to both halves: a volume
+        // being restored needs to find its copy, and a backup being taken needs
+        // its target. Two lists rather than one per object, for the same reason
+        // the targets are read once rather than per backup.
+        let mut copies = self.copies(&mut pass).await;
+        // The targets first, and their answers kept: a volume being restored
+        // and a backup being taken are both judged against what a target says
+        // about itself, and a list read before anybody looked says nothing.
+        copies.targets = self.target_sweep(copies.targets, &mut pass).await;
+
         for volume in volumes.iter().filter(|v| v.spec.pool == self.config.pool) {
-            self.volume_pass(volume, &seen, &mut pass).await;
+            self.volume_pass(volume, &seen, &copies, &mut pass).await;
         }
 
         // Volumes first, copies second: a snapshot is of a volume, and a copy
@@ -275,11 +416,22 @@ impl PoolAgent {
             }
         }
 
+        // Copies that leave the pool, last: a backup is of a volume, and one
+        // asked for in the same pass that provisions its source would be a copy
+        // of something not there yet.
+        self.backup_sweep(&copies, &mut pass).await;
+
         self.pool_pass(&volumes, &seen, &mut pass).await;
         pass
     }
 
-    async fn volume_pass(&self, stored: &Volume, seen: &PoolState, pass: &mut Pass) {
+    async fn volume_pass(
+        &self,
+        stored: &Volume,
+        seen: &PoolState,
+        copies: &Copies,
+        pass: &mut Pass,
+    ) {
         let name = stored.meta.name.to_string();
 
         // Claim first, act never before. A volume whose status another pool
@@ -307,7 +459,7 @@ impl PoolAgent {
         let mut next = stored.clone();
         let mut trouble = None;
         for action in reconcile_volume(stored, here) {
-            match self.perform(&action).await {
+            match self.perform(&action, copies).await {
                 Ok(()) => pass.actions += 1,
                 Err(e) => {
                     tracing::warn!(volume = %name, error = %e, "this volume could not be brought into line");
@@ -360,6 +512,271 @@ impl PoolAgent {
             ),
         );
         reporting::report(&self.volumes, stored, next, &self.writer, pass).await;
+    }
+
+    /// Every copy this pool owes a target.
+    ///
+    /// Read as two lists — the backups and the targets — because a target is
+    /// one row per place copies are kept, and forty backups pointing at three
+    /// targets should be three reads rather than forty.
+    /// The cell's copies and the places they are kept, read once per pass.
+    ///
+    /// Empty when they cannot be read, and that direction is deliberate: a
+    /// restore then refuses with "no copy this pool can read", which is
+    /// recoverable and true, rather than provisioning a blank volume under a
+    /// name somebody expects their data to be behind.
+    async fn copies(&self, pass: &mut Pass) -> Copies {
+        let backups = match self.cell.backups().await {
+            Ok(backups) => backups,
+            Err(e) => {
+                tracing::error!(error = %e, "could not list backups");
+                pass.failures += 1;
+                return Copies::default();
+            }
+        };
+        let targets = match self.cell.backup_targets().await {
+            Ok(targets) => targets,
+            Err(e) => {
+                tracing::error!(error = %e, "could not list backup targets");
+                pass.failures += 1;
+                return Copies::default();
+            }
+        };
+        Copies { backups, targets }
+    }
+
+    /// What each target looks like from this machine.
+    ///
+    /// The one thing worth reporting about a target, and it was consulted long
+    /// before anything wrote it: `may_back_up` refuses a target that is not
+    /// writable, so with nobody reporting, *every* backup was refused — the
+    /// platform holding a door shut and blaming the door.
+    ///
+    /// Claimed like anything else, and the claim matters more here than usual:
+    /// a target can be mounted on several machines, and two pools reporting on
+    /// one object would be two answers to "is the mount up" from two different
+    /// mounts.
+    /// Hands back what it wrote, rather than leaving the pass to re-read it.
+    ///
+    /// The targets were read at the top of the pass, and looking at them
+    /// changes them — so a backup judged against the list as it was read would
+    /// be judged against a target that had not reported yet, and refused for a
+    /// pass. Returning the updated rows costs nothing and removes the whole
+    /// question.
+    async fn target_sweep(
+        &self,
+        targets: Vec<velstra_cloud_model::resources::BackupTarget>,
+        pass: &mut Pass,
+    ) -> Vec<velstra_cloud_model::resources::BackupTarget> {
+        let mut out = Vec::with_capacity(targets.len());
+        for target in targets {
+            let target = &target;
+            // Only what an operator gave this pool. A target names its reporter
+            // in its spec; one that names another pool — or nobody — is not
+            // this agent's to answer for, and the access rule would refuse the
+            // write anyway.
+            if target.spec.agent != self.config.pool {
+                out.push(target.clone());
+                continue;
+            }
+            // Claimed in the same breath as the first report: the assignment
+            // is already an operator's decision, so there is nothing to race
+            // over and nothing to wait a pass for.
+            let mut next = target.clone();
+            if next.status.agent.as_deref() != Some(self.config.pool.as_str()) {
+                next.status.agent = Some(self.config.pool.clone());
+            }
+            out.push(self.look_and_report(target, next, pass).await);
+        }
+        out
+    }
+
+    /// Look at one target and say what is there.
+    async fn look_and_report(
+        &self,
+        target: &velstra_cloud_model::resources::BackupTarget,
+        mut next: velstra_cloud_model::resources::BackupTarget,
+        pass: &mut Pass,
+    ) -> velstra_cloud_model::resources::BackupTarget {
+        {
+            let (writable, free_gib, why) = look_at_target(&target.spec.path);
+            next.status.writable = Some(writable);
+            next.status.free_gib = free_gib;
+            next.status.observed_generation = target.meta.generation;
+            set_condition(
+                &mut next.status.conditions,
+                match &why {
+                    Some(why) => Condition::new(
+                        "Ready",
+                        ConditionStatus::False,
+                        "NotWritable",
+                        why,
+                        target.meta.generation,
+                    ),
+                    None => Condition::new(
+                        "Ready",
+                        ConditionStatus::True,
+                        "Writable",
+                        "",
+                        target.meta.generation,
+                    ),
+                },
+            );
+            reporting::report(&self.targets, target, next.clone(), &self.writer, pass).await;
+            next
+        }
+    }
+
+    async fn backup_sweep(&self, copies: &Copies, pass: &mut Pass) {
+        for backup in copies
+            .backups
+            .iter()
+            .filter(|b| b.spec.pool == self.config.pool)
+        {
+            self.backup_pass(backup, &copies.targets, pass).await;
+        }
+    }
+
+    /// One backup: claim it, copy the bytes out, report what is on the target.
+    ///
+    /// The same shape as a snapshot and the same reason for it — `status.taken`
+    /// is consulted, not just reported, so a copy is never made twice. What is
+    /// different is where the bytes go: out of the pool entirely, which is the
+    /// whole point of a backup and also why it costs a full copy rather than a
+    /// share of blocks.
+    async fn backup_pass(
+        &self,
+        stored: &velstra_cloud_model::resources::Backup,
+        targets: &[velstra_cloud_model::resources::BackupTarget],
+        pass: &mut Pass,
+    ) {
+        let name = stored.meta.name.to_string();
+
+        match stored.status.agent.as_deref() {
+            Some(owner) if owner == self.config.pool => {}
+            Some(_) => return,
+            None => {
+                let me = self.config.pool.clone();
+                reporting::claim(
+                    &self.backups,
+                    stored,
+                    |status| status.agent = Some(me),
+                    &self.writer,
+                    pass,
+                )
+                .await;
+                return;
+            }
+        }
+
+        // Already made. This is every pass after the first, and it has to cost
+        // one comparison: a copy that exists is never made again, because a
+        // copy made later is of a different moment under a name somebody
+        // trusts.
+        if stored.status.taken {
+            return;
+        }
+
+        let Some(target) = targets
+            .iter()
+            .find(|t| t.meta.name.to_string() == stored.spec.target)
+        else {
+            self.backup_trouble(
+                stored,
+                format!("{} does not exist", stored.spec.target),
+                "NoTarget",
+                pass,
+            )
+            .await;
+            return;
+        };
+
+        // The model's rule, asked here rather than re-derived: a target that is
+        // the volume's own pool is a copy that dies with what it was copied
+        // from, and it is refused by name.
+        let view = velstra_cloud_model::backup::TargetView {
+            name: target.meta.name.to_string(),
+            path: target.spec.path.clone(),
+            accepting: target.spec.accepting,
+            writable: target.status.writable,
+            same_pool_as: None,
+        };
+        if let Err(why) =
+            velstra_cloud_model::backup::may_back_up(&stored.spec.volume, &self.config.pool, &view)
+        {
+            self.backup_trouble(stored, why.to_string(), "TargetUnusable", pass)
+                .await;
+            return;
+        }
+
+        let path = backup_path(&target.spec.path, &name);
+        let written = match self.storage.copy_out(&stored.spec.volume, &path).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(backup = %name, error = %e, "this copy could not be made");
+                pass.failures += 1;
+                self.backup_trouble(stored, e.to_string(), "CopyFailed", pass)
+                    .await;
+                return;
+            }
+        };
+        pass.actions += 1;
+
+        // The source's size as this pool has it, which is the smallest volume
+        // that can be restored from the copy — a different number from what the
+        // copy occupies, and both are worth knowing.
+        let size_gib = self
+            .storage
+            .observe()
+            .await
+            .ok()
+            .and_then(|seen| seen.volumes.get(&stored.spec.volume).copied())
+            .unwrap_or(0);
+
+        let mut next = stored.clone();
+        next.status.taken = true;
+        next.status.size_gib = size_gib;
+        next.status.stored_bytes = written;
+        next.status.taken_at = Some(Timestamp::now());
+        next.status.observed_generation = stored.meta.generation;
+        set_condition(
+            &mut next.status.conditions,
+            Condition::new(
+                "Ready",
+                ConditionStatus::True,
+                "Taken",
+                &format!("copied to {path}"),
+                stored.meta.generation,
+            ),
+        );
+        reporting::report(&self.backups, stored, next, &self.writer, pass).await;
+    }
+
+    /// Say on the object why a copy has not been made.
+    ///
+    /// On the backup rather than in a log on whichever machine happens to run
+    /// this pool: "why is there no copy" is asked by somebody looking at the
+    /// backup, months later, and a log line is not where they will look.
+    async fn backup_trouble(
+        &self,
+        stored: &velstra_cloud_model::resources::Backup,
+        why: String,
+        reason: &str,
+        pass: &mut Pass,
+    ) {
+        let mut next = stored.clone();
+        next.status.observed_generation = stored.meta.generation;
+        set_condition(
+            &mut next.status.conditions,
+            Condition::new(
+                "Ready",
+                ConditionStatus::False,
+                reason,
+                &why,
+                stored.meta.generation,
+            ),
+        );
+        reporting::report(&self.backups, stored, next, &self.writer, pass).await;
     }
 
     /// One snapshot: claim it, do what the model says, report what is there.
@@ -461,7 +878,7 @@ impl PoolAgent {
         reporting::report(&self.snapshots, stored, next, &self.writer, pass).await;
     }
 
-    async fn perform(&self, action: &VolumeAction) -> Result<()> {
+    async fn perform(&self, action: &VolumeAction, copies: &Copies) -> Result<()> {
         match action {
             VolumeAction::Provision {
                 volume,
@@ -469,8 +886,35 @@ impl PoolAgent {
                 source,
                 encryption_key,
             } => {
+                // A backup is resolved here and nowhere else: it takes the
+                // backup, the target it names and that target's path, and a
+                // backend has none of the three. What a backend is handed is a
+                // file it can open.
+                let origin = match source {
+                    VolumeSource::Blank => Origin::Blank,
+                    VolumeSource::Image(image) => Origin::Image(image),
+                    VolumeSource::Snapshot(snapshot) => Origin::Snapshot(snapshot),
+                    VolumeSource::Backup(backup) => {
+                        let Some(path) = copies.path_of(backup) else {
+                            // Refused rather than made blank. A volume that was
+                            // asked to be a restore and quietly came up empty
+                            // is the worst outcome available: it boots, it is
+                            // the right size, and everything that was on it is
+                            // gone.
+                            return Err(HostError::failed(format!(
+                                "{backup} has no copy on a target this pool can read, so there is \
+                                 nothing to restore from. A backup that was never taken, or whose \
+                                 target is not mounted here, is not an empty volume."
+                            )));
+                        };
+                        return self
+                            .storage
+                            .provision(volume, *gib, Origin::File(&path), encryption_key.as_deref())
+                            .await;
+                    }
+                };
                 self.storage
-                    .provision(volume, *gib, source, encryption_key.as_deref())
+                    .provision(volume, *gib, origin, encryption_key.as_deref())
                     .await
             }
             VolumeAction::Grow { volume, to_gib } => self.storage.grow(volume, *to_gib).await,
@@ -580,9 +1024,15 @@ struct FakeInner {
     from_image: BTreeMap<String, String>,
     /// The same, for volumes made from a snapshot.
     from_snapshot: BTreeMap<String, String>,
+    /// And for volumes restored from a file on a target.
+    from_file: BTreeMap<String, String>,
     /// Every copy this fake holds.
     snapshots: BTreeMap<String, SnapshotInPool>,
     encrypted: BTreeMap<String, String>,
+    /// Every copy that has left this pool, by the path it was written to. A
+    /// test asks this the way an operator would ask a target: is it there, and
+    /// what is it a copy of.
+    copied_out: BTreeMap<String, (String, u64)>,
 }
 
 impl FakePool {
@@ -590,6 +1040,17 @@ impl FakePool {
         let me = Self::default();
         me.inner.lock().unwrap().capacity_gib = capacity_gib;
         me
+    }
+
+    /// What a volume was restored from, if it was.
+    pub fn restored_from(&self, volume: &str) -> Option<String> {
+        self.inner.lock().unwrap().from_file.get(volume).cloned()
+    }
+
+    /// What was written out to `path`, if anything: the volume it came from
+    /// and how large that volume was.
+    pub fn copied_out(&self, path: &str) -> Option<(String, u64)> {
+        self.inner.lock().unwrap().copied_out.get(path).cloned()
     }
 
     /// Make one operation fail. `what` is `provision`, `grow`, `destroy` or
@@ -676,7 +1137,7 @@ impl Storage for FakePool {
         &self,
         volume: &str,
         gib: u64,
-        source: &VolumeSource,
+        source: Origin<'_>,
         encryption_key: Option<&str>,
     ) -> Result<()> {
         self.fault("provision", volume)?;
@@ -684,26 +1145,40 @@ impl Storage for FakePool {
         // A volume made from a snapshot that this pool does not hold is not an
         // empty volume, it is a mistake — and a fake that quietly made one
         // anyway could not be used to prove the platform refuses it.
-        if let VolumeSource::Snapshot(snapshot) = source
+        if let Origin::Snapshot(snapshot) = source
             && !inner.snapshots.contains_key(snapshot)
         {
             return Err(HostError::failed(format!(
                 "{snapshot} is not in this pool, so nothing can be copied from it"
             )));
         }
+        // The same rule for a restore: a file that is not there is not an empty
+        // volume. This is the fake's stand-in for the copy existing on the
+        // target — nothing was written there, so what it knows is what it was
+        // asked to write.
+        if let Origin::File(path) = source
+            && !inner.copied_out.contains_key(path)
+        {
+            return Err(HostError::failed(format!(
+                "{path} is not on this machine, so nothing can be restored from it"
+            )));
+        }
         inner.volumes.insert(volume.to_string(), gib);
         match source {
-            VolumeSource::Image(image) => {
+            Origin::Image(image) => {
                 inner
                     .from_image
                     .insert(volume.to_string(), image.to_string());
             }
-            VolumeSource::Snapshot(snapshot) => {
+            Origin::Snapshot(snapshot) => {
                 inner
                     .from_snapshot
                     .insert(volume.to_string(), snapshot.to_string());
             }
-            VolumeSource::Blank => {}
+            Origin::File(path) => {
+                inner.from_file.insert(volume.to_string(), path.to_string());
+            }
+            Origin::Blank => {}
         }
         if let Some(key) = encryption_key {
             inner.encrypted.insert(volume.to_string(), key.to_string());
@@ -757,6 +1232,26 @@ impl Storage for FakePool {
         self.inner.lock().unwrap().snapshots.remove(snapshot);
         Ok(())
     }
+
+    async fn copy_out(&self, volume: &str, path: &str) -> Result<u64> {
+        self.fault("copy_out", volume)?;
+        let mut inner = self.inner.lock().unwrap();
+        // A copy of nothing is a mistake, not an empty copy — the same rule
+        // `take_snapshot` holds to, and for the same reason: a fake that made
+        // one anyway could not be used to prove the platform refuses it.
+        let Some(gib) = inner.volumes.get(volume).copied() else {
+            return Err(HostError::failed(format!(
+                "{volume} is not in this pool, so there is nothing to copy out"
+            )));
+        };
+        inner
+            .copied_out
+            .insert(path.to_string(), (volume.to_string(), gib));
+        // A gibibyte in bytes: the fake writes nothing, and a caller that
+        // reasons about how much a target now holds needs a number that at
+        // least has the right units.
+        Ok(gib * 1024 * 1024 * 1024)
+    }
 }
 
 #[cfg(test)]
@@ -775,6 +1270,14 @@ mod tests {
         volumes: TypedStore<VolumeSpec, VolumeStatus>,
         snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
         pools: TypedStore<PoolSpec, PoolStatus>,
+        backups: TypedStore<
+            velstra_cloud_model::backup::BackupSpec,
+            velstra_cloud_model::backup::BackupStatus,
+        >,
+        targets: TypedStore<
+            velstra_cloud_model::backup::BackupTargetSpec,
+            velstra_cloud_model::backup::BackupTargetStatus,
+        >,
         fake: FakePool,
     }
 
@@ -785,6 +1288,8 @@ mod tests {
             volumes: TypedStore::new(store.clone(), "cell-1", "volumes"),
             snapshots: TypedStore::new(store.clone(), "cell-1", "snapshots"),
             pools: TypedStore::new(store.clone(), "cell-1", "pools"),
+            backups: TypedStore::new(store.clone(), "cell-1", "backups"),
+            targets: TypedStore::new(store.clone(), "cell-1", "backup-targets"),
             fake: fake.clone(),
         };
         let agent = PoolAgent::new(store, PoolConfig::new(pool, "eu", "cell-1"), Arc::new(fake));
@@ -799,6 +1304,7 @@ mod tests {
                     Placement::new("eu", "cell-1"),
                 ),
                 VolumeSpec {
+                    source_backup: None,
                     size_gib: gib,
                     pool: pool.to_string(),
                     encryption_key: None,
@@ -808,8 +1314,93 @@ mod tests {
                 VolumeStatus::default(),
             );
             v.meta.finalizers = vec![POOL_RELEASE_FINALIZER.to_string()];
-            self.volumes.create(&v).await.unwrap();
+            self.volumes
+                .create(&v, &velstra_cloud_model::access::Writer::controller("pool"))
+                .await
+                .unwrap();
             self.reload().await
+        }
+
+        /// A place copies are kept, as an operator declares one.
+        ///
+        /// A real directory when it is meant to be usable, because the agent
+        /// now *looks*: it writes a probe file and removes it, which is the
+        /// only way to tell a writable directory from an empty mountpoint on
+        /// the root disk. A fixture that only set `writable: true` in the
+        /// status would be testing a field the agent overwrites.
+        async fn target(&self, id: &str, accepting: bool, writable: bool) {
+            let t: velstra_cloud_model::resources::BackupTarget = Resource::new(
+                Meta::new(
+                    ResourceName::parse(&format!("backup-targets/{id}")).unwrap(),
+                    Placement::new("eu", "cell-1"),
+                ),
+                velstra_cloud_model::backup::BackupTargetSpec {
+                    kind: velstra_cloud_model::backup::TargetKind::Directory,
+                    path: self.target_dir(id, writable),
+                    accepting,
+                    // Named by the operator, as the model requires: a target
+                    // assigned to nobody is one no agent may report on.
+                    agent: "nvme".into(),
+                },
+                velstra_cloud_model::backup::BackupTargetStatus::default(),
+            );
+            self.targets
+                .create(&t, &velstra_cloud_model::access::Writer::controller("pool"))
+                .await
+                .unwrap();
+        }
+
+        /// A copy somebody asked for, as the API stores it.
+        async fn backup(&self, id: &str, pool: &str, target: &str) -> velstra_cloud_model::resources::Backup {
+            let b: velstra_cloud_model::resources::Backup = Resource::new(
+                Meta::new(
+                    ResourceName::parse(&format!("projects/p1/backups/{id}")).unwrap(),
+                    Placement::new("eu", "cell-1"),
+                ),
+                velstra_cloud_model::backup::BackupSpec {
+                    volume: VOLUME.to_string(),
+                    target: format!("backup-targets/{target}"),
+                    pool: pool.to_string(),
+                    schedule: None,
+                },
+                Default::default(),
+            );
+            self.backups
+                .create(&b, &velstra_cloud_model::access::Writer::controller("pool"))
+                .await
+                .unwrap();
+            self.reload_backup(id).await
+        }
+
+        /// Where a target points. Real and made when it is meant to be
+        /// usable; a path that is not there when it is not.
+        fn target_dir(&self, id: &str, usable: bool) -> String {
+            let dir = std::env::temp_dir().join(format!(
+                "velstra-target-{}-{id}",
+                std::process::id()
+            ));
+            if usable {
+                std::fs::create_dir_all(&dir).unwrap();
+            } else {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            dir.to_string_lossy().to_string()
+        }
+
+        async fn reload_target(&self, id: &str) -> velstra_cloud_model::resources::BackupTarget {
+            self.targets
+                .get(&format!("backup-targets/{id}"))
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn reload_backup(&self, id: &str) -> velstra_cloud_model::resources::Backup {
+            self.backups
+                .get(&format!("projects/p1/backups/{id}"))
+                .await
+                .unwrap()
+                .unwrap()
         }
 
         async fn register_pool(&self, id: &str) {
@@ -824,11 +1415,47 @@ mod tests {
                 },
                 PoolStatus::default(),
             );
-            self.pools.create(&p).await.unwrap();
+            self.pools
+                .create(&p, &velstra_cloud_model::access::Writer::controller("pool"))
+                .await
+                .unwrap();
         }
 
         async fn reload(&self) -> Volume {
             self.volumes.get(VOLUME).await.unwrap().unwrap()
+        }
+
+        async fn reload_named(&self, id: &str) -> Volume {
+            self.volumes
+                .get(&format!("projects/p1/volumes/{id}"))
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        /// A volume asked to be a restore of a copy.
+        async fn restored(&self, id: &str, pool: &str, backup: &str) -> Volume {
+            let mut v: Volume = Resource::new(
+                Meta::new(
+                    ResourceName::parse(&format!("projects/p1/volumes/{id}")).unwrap(),
+                    Placement::new("eu", "cell-1"),
+                ),
+                VolumeSpec {
+                    source_backup: Some(backup.to_string()),
+                    size_gib: 40,
+                    pool: pool.to_string(),
+                    encryption_key: None,
+                    source_image: None,
+                    source_snapshot: None,
+                },
+                VolumeStatus::default(),
+            );
+            v.meta.finalizers = vec![POOL_RELEASE_FINALIZER.to_string()];
+            self.volumes
+                .create(&v, &velstra_cloud_model::access::Writer::controller("pool"))
+                .await
+                .unwrap();
+            self.reload_named(id).await
         }
 
         async fn snapshot(&self, id: &str, pool: &str) -> Snapshot {
@@ -845,7 +1472,10 @@ mod tests {
                 SnapshotStatus::default(),
             );
             s.meta.finalizers = vec![POOL_RELEASE_FINALIZER.to_string()];
-            self.snapshots.create(&s).await.unwrap();
+            self.snapshots
+                .create(&s, &velstra_cloud_model::access::Writer::controller("pool"))
+                .await
+                .unwrap();
             self.reload_snapshot(id).await
         }
 
@@ -1318,5 +1948,241 @@ mod tests {
 
         assert!(!cell.fake.has_snapshot(&format!("{VOLUME}/snapshots/s1")));
         assert_eq!(cell.reload_snapshot("s1").await.status.pool, None);
+    }
+
+    /// A backup is bytes leaving the pool, and until this the platform had the
+    /// object, the schedule, the retention and the console — and nothing that
+    /// ever wrote one.
+    #[tokio::test]
+    async fn a_backup_is_claimed_copied_out_and_reported() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        agent.resync().await;
+
+        cell.backup("b1", "nvme", "archive").await;
+
+        // First pass claims it. A pool that copied before claiming would have
+        // two pools copying one volume the first time somebody added a second.
+        agent.resync().await;
+        let claimed = cell.reload_backup("b1").await;
+        assert_eq!(claimed.status.agent.as_deref(), Some("nvme"));
+        assert!(!claimed.status.taken, "it was copied before it was claimed");
+
+        agent.resync().await;
+        let taken = cell.reload_backup("b1").await;
+        assert!(taken.status.taken, "the copy was never made");
+        assert_eq!(
+            taken.status.size_gib, 40,
+            "the smallest volume this can be restored into is not recorded"
+        );
+        assert!(taken.status.stored_bytes > 0, "the copy occupies nothing");
+        assert!(taken.status.taken_at.is_some());
+
+        // And the bytes really left the pool, under a name a person can read
+        // off the target with `ls`.
+        let path = backup_path(&cell.target_dir("archive", true), "projects/p1/backups/b1");
+        assert!(path.ends_with("/projects~p1~backups~b1"), "{path}");
+        let (from, gib) = cell
+            .fake
+            .copied_out(&path)
+            .expect("nothing was written to the target");
+        assert_eq!(from, VOLUME);
+        assert_eq!(gib, 40);
+    }
+
+    /// A copy that exists is never made again. The whole reason `taken` is
+    /// consulted and not merely reported: a second copy would be of a different
+    /// moment under a name somebody trusts.
+    #[tokio::test]
+    async fn a_backup_that_has_been_made_is_not_made_again() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        cell.backup("b1", "nvme", "archive").await;
+        for _ in 0..3 {
+            agent.resync().await;
+        }
+        assert!(cell.reload_backup("b1").await.status.taken);
+
+        let before = cell.reload_backup("b1").await.meta.revision;
+        let pass = agent.resync().await;
+        assert_eq!(
+            cell.reload_backup("b1").await.meta.revision,
+            before,
+            "a settled backup was written again"
+        );
+        assert_eq!(pass.actions, 0, "a copy that exists was made a second time");
+    }
+
+    /// A target whose mount has gone reports itself unwritable, and the copies
+    /// pointed at it stop rather than being written to the empty mountpoint on
+    /// the root disk.
+    ///
+    /// Answered by writing a probe file and removing it, because that is the
+    /// only way to tell the two apart: an empty mountpoint has the same mode
+    /// bits as the directory that was mounted over it.
+    #[tokio::test]
+    async fn a_target_that_is_not_there_says_so_and_takes_nothing() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        // Declared, and the path is not a directory on this machine.
+        cell.target("gone", true, false).await;
+        cell.backup("b1", "nvme", "gone").await;
+        for _ in 0..3 {
+            agent.resync().await;
+        }
+
+        let target = cell.reload_target("gone").await;
+        assert_eq!(target.status.agent.as_deref(), Some("nvme"));
+        assert_eq!(
+            target.status.writable,
+            Some(false),
+            "a missing directory did not report itself unwritable"
+        );
+        let ready = velstra_cloud_model::meta::condition(&target.status.conditions, "Ready")
+            .expect("a target that cannot be written says so");
+        assert!(
+            ready.message.contains("mounted"),
+            "the reason does not point at the likely cause: {}",
+            ready.message
+        );
+
+        let backup = cell.reload_backup("b1").await;
+        assert!(!backup.status.taken, "a copy was reported onto a target that is not there");
+    }
+
+    /// A target that is not accepting is refused, and the reason is on the
+    /// backup rather than in a log on whichever machine happens to run this
+    /// pool — "why is there no copy" is asked months later by somebody looking
+    /// at the backup.
+    #[tokio::test]
+    async fn a_target_that_will_not_take_it_says_so_on_the_object() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", false, true).await;
+        cell.backup("b1", "nvme", "archive").await;
+        for _ in 0..3 {
+            agent.resync().await;
+        }
+
+        let refused = cell.reload_backup("b1").await;
+        assert!(!refused.status.taken);
+        let ready = velstra_cloud_model::meta::condition(&refused.status.conditions, "Ready")
+            .expect("a backup that was not made says why");
+        assert_eq!(ready.status, ConditionStatus::False);
+        assert!(
+            ready.message.contains("not accepting"),
+            "the reason is not the model's own words: {}",
+            ready.message
+        );
+        assert!(
+            cell.fake
+                .copied_out(&backup_path(&cell.target_dir("archive", true), "projects/p1/backups/b1"))
+                .is_none(),
+            "bytes were written to a target that is not accepting"
+        );
+    }
+
+    /// A copy that could not be written is not reported as one. The failure
+    /// mode this guards is the worst one a backup has: a file that is believed.
+    #[tokio::test]
+    async fn a_copy_that_failed_is_never_reported_as_taken() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        cell.backup("b1", "nvme", "archive").await;
+        cell.fake.fail("copy_out", VOLUME, "the target filled up");
+
+        for _ in 0..3 {
+            agent.resync().await;
+        }
+        let after = cell.reload_backup("b1").await;
+        assert!(!after.status.taken, "a copy that failed was reported as made");
+        let ready = velstra_cloud_model::meta::condition(&after.status.conditions, "Ready")
+            .expect("a backup that failed says why");
+        assert!(ready.message.contains("filled up"), "{}", ready.message);
+    }
+
+    /// The other half, and the one that matters when somebody is having a bad
+    /// day: a volume made *from* a backup.
+    #[tokio::test]
+    async fn a_volume_is_restored_from_a_backup_that_was_taken() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        cell.backup("b1", "nvme", "archive").await;
+        for _ in 0..3 {
+            agent.resync().await;
+        }
+        assert!(cell.reload_backup("b1").await.status.taken);
+
+        cell.restored("restored", "nvme", "projects/p1/backups/b1").await;
+        for _ in 0..3 {
+            agent.resync().await;
+        }
+
+        let volume = cell.reload_named("restored").await;
+        assert!(volume.status.provisioned, "the restore never happened");
+        assert_eq!(
+            cell.fake.restored_from("projects/p1/volumes/restored"),
+            Some(backup_path(&cell.target_dir("archive", true), "projects/p1/backups/b1")),
+            "the volume was made from something other than the copy it named"
+        );
+    }
+
+    /// A restore that cannot find its copy is **refused**, never made blank.
+    ///
+    /// The worst outcome available: a volume that boots, is the right size, and
+    /// has nothing on it — under a name somebody expects their data behind.
+    #[tokio::test]
+    async fn a_restore_with_no_copy_to_read_is_refused_rather_than_made_empty() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        // Asked for, never taken — the schedule has not run, or the copy
+        // failed.
+        cell.backup("b1", "nvme", "archive").await;
+        cell.restored("restored", "nvme", "projects/p1/backups/b1").await;
+
+        for _ in 0..2 {
+            agent.resync().await;
+        }
+        let volume = cell.reload_named("restored").await;
+        assert!(
+            !volume.status.provisioned,
+            "a volume was made blank in place of a restore"
+        );
+        let ready = velstra_cloud_model::meta::condition(&volume.status.conditions, "Ready")
+            .expect("a volume that could not be restored says why");
+        assert_eq!(ready.status, ConditionStatus::False);
+        assert!(
+            ready.message.contains("not an empty volume"),
+            "the reason does not say what was avoided: {}",
+            ready.message
+        );
+    }
+
+    /// Another pool's copies are not this pool's business.
+    #[tokio::test]
+    async fn a_backup_of_another_pool_is_left_alone() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        cell.backup("b1", "spinning-rust", "archive").await;
+        for _ in 0..3 {
+            agent.resync().await;
+        }
+        let untouched = cell.reload_backup("b1").await;
+        assert_eq!(untouched.status.agent, None);
+        assert!(!untouched.status.taken);
     }
 }

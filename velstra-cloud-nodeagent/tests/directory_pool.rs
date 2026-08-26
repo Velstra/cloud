@@ -8,7 +8,7 @@
 //! Skips loudly without `qemu-img` rather than failing. A red test on a machine
 //! that simply lacks a tool is a test people learn to scroll past.
 
-use velstra_cloud_model::storage::VolumeSource;
+use velstra_cloud_nodeagent::pool::Origin;
 use velstra_cloud_nodeagent::{directory_pool::DirectoryPool, pool::Storage};
 
 const VOLUME: &str = "projects/p1/volumes/data-1";
@@ -63,7 +63,7 @@ async fn a_blank_volume_is_made_and_read_back_at_the_size_that_was_asked_for() {
     let dir = Dir::new("blank");
     let pool = dir.pool();
 
-    pool.provision(VOLUME, 2, &VolumeSource::Blank, None)
+    pool.provision(VOLUME, 2, Origin::Blank, None)
         .await
         .expect("provisioning a blank volume");
 
@@ -90,7 +90,7 @@ async fn a_volume_grows_and_never_shrinks() {
     needs_qemu_img!();
     let dir = Dir::new("grow");
     let pool = dir.pool();
-    pool.provision(VOLUME, 1, &VolumeSource::Blank, None)
+    pool.provision(VOLUME, 1, Origin::Blank, None)
         .await
         .unwrap();
 
@@ -122,7 +122,7 @@ async fn a_volume_from_an_image_has_the_image_in_it_before_it_exists() {
     bytes[..7].copy_from_slice(b"VELSTRA");
     std::fs::write(&raw, &bytes).unwrap();
 
-    pool.provision(VOLUME, 1, &VolumeSource::Image(image.into()), None)
+    pool.provision(VOLUME, 1, Origin::Image(image), None)
         .await
         .expect("provisioning from an image");
 
@@ -159,7 +159,7 @@ async fn an_image_that_is_not_here_is_refused_rather_than_left_blank() {
         .provision(
             VOLUME,
             1,
-            &VolumeSource::Image("projects/p1/images/sha256-nope".into()),
+            Origin::Image("projects/p1/images/sha256-nope"),
             None,
         )
         .await
@@ -176,7 +176,7 @@ async fn a_copy_is_a_copy_and_a_volume_can_be_made_from_it() {
     needs_qemu_img!();
     let dir = Dir::new("snap");
     let pool = dir.pool();
-    pool.provision(VOLUME, 2, &VolumeSource::Blank, None)
+    pool.provision(VOLUME, 2, Origin::Blank, None)
         .await
         .unwrap();
 
@@ -196,7 +196,7 @@ async fn a_copy_is_a_copy_and_a_volume_can_be_made_from_it() {
     assert_eq!(seen.of(VOLUME).snapshots, 1);
 
     let restored = "projects/p1/volumes/data-2";
-    pool.provision(restored, 2, &VolumeSource::Snapshot(SNAPSHOT.into()), None)
+    pool.provision(restored, 2, Origin::Snapshot(SNAPSHOT), None)
         .await
         .expect("provisioning from the copy");
     assert_eq!(
@@ -262,7 +262,7 @@ async fn a_volume_that_asks_to_be_encrypted_is_refused_rather_than_made_in_plain
     let dir = Dir::new("crypt");
     let pool = dir.pool();
     let err = pool
-        .provision(VOLUME, 1, &VolumeSource::Blank, Some("projects/p1/keys/k1"))
+        .provision(VOLUME, 1, Origin::Blank, Some("projects/p1/keys/k1"))
         .await
         .expect_err("an encrypted volume was made by a pool with no key");
     assert!(err.to_string().contains("no KMS"), "{err}");

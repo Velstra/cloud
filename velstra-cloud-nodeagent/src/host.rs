@@ -48,6 +48,26 @@ pub type Result<T> = std::result::Result<T, HostError>;
 /// a lie nobody owns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmObservation {
+    /// The size this guest is actually running with.
+    ///
+    /// Read back off the running VMM rather than remembered, the same way its
+    /// devices are: a restarted agent has to recover what a machine *is* from
+    /// the machine, not from a table.
+    pub size: Option<velstra_cloud_model::resources::RunningSize>,
+    /// The last of what this guest wrote to its console, and how much it wrote
+    /// in total.
+    ///
+    /// Read on every pass because a guest's last words arrive at whatever
+    /// moment it stops being able to speak, and a tail fetched only when
+    /// somebody asks is a tail fetched after the VMM has been torn down.
+    /// Whether it is *published* is the agent's decision, not this one — see
+    /// `Agent::publish_console`.
+    pub console_tail: String,
+    pub console_bytes: u64,
+    /// PCI addresses this guest currently holds, as the VMM was told to give
+    /// it. Observed rather than remembered, so a restarted agent recovers it
+    /// from the machine like everything else here.
+    pub devices: Vec<String>,
     pub state: InstanceState,
     /// The host process, for the console and for an operator with `ps`. Absent
     /// once the VMM is gone, which is exactly how a crash becomes visible.
@@ -91,6 +111,17 @@ pub struct HostState {
     /// filesystem on it, is a change the next pass has to see. A cached list is
     /// how a console offers a disk that is no longer free.
     pub devices: Vec<velstra_cloud_model::ceph::BlockDevice>,
+    /// PCI devices this machine has, and what each is being used for.
+    ///
+    /// Empty on a machine with no PCI bus or no readable sysfs, which is the
+    /// honest answer and not an error: most nodes never pass anything through.
+    pub pci_devices: Vec<velstra_cloud_model::pci::PciDevice>,
+    /// This machine's processor, and whether its VMM can present another.
+    ///
+    /// `None` only before the first pass. Read centrally — see
+    /// `velstra_cloud_model::cpu` — never by this node to decide anything
+    /// about itself.
+    pub cpu: Option<velstra_cloud_model::cpu::NodeCpu>,
     /// What this machine runs of Ceph, when it runs any. `None` on the nodes
     /// that do not, which in most cells is most of them.
     pub ceph: Option<velstra_cloud_model::ceph::NodeCeph>,
@@ -126,6 +157,22 @@ pub struct VmRequest {
     /// order is the guest's NIC order, and a guest that finds its addresses on
     /// the wrong NIC after a restart is an outage with no error message.
     pub nics: Vec<Nic>,
+    /// The CPU this guest is to be given. `None` is the host's own.
+    ///
+    /// Carried on the request rather than in the node's local layout, and that
+    /// placement is load-bearing twice over. It is a per-start decision, so a
+    /// baseline declared while a guest runs governs it only at its next start
+    /// — which is the whole adoption model. And a migration receiver rebuilds
+    /// this same request, so both ends of a transfer describe the same machine
+    /// without either side reading configuration the other cannot see.
+    pub cpu_baseline: Option<velstra_cloud_model::cpu::CpuLevel>,
+    /// PCI addresses to pass into the guest, chosen by the agent from what its
+    /// node has free.
+    ///
+    /// Addresses rather than classes, because by this point the choice has
+    /// been made: a class is what an instance asks for and what the scheduler
+    /// places on, and a VMM needs the one device it is to attach.
+    pub devices: Vec<String>,
 }
 
 /// One NIC, as the host has to build it.
@@ -185,6 +232,20 @@ pub trait Vmm: Send + Sync + 'static {
     /// pass is a disk a guest can be started from, and a guest booted off an
     /// empty disk fails in the least legible way there is.
     async fn create_disk(&self, instance: &str, gib: u64, image: &str) -> Result<()>;
+
+    /// Where this guest's root disk is on this machine, for something that has
+    /// to read the bytes rather than boot them.
+    ///
+    /// Exactly one caller: making an image out of a guest somebody built by
+    /// hand. It is on this trait rather than derived by the agent because the
+    /// agent has no business knowing a backend's filesystem layout — and a
+    /// backend that keeps the disk somewhere unreadable (a network block
+    /// device, a pool volume) answers `None` and says so rather than handing
+    /// out a path that opens to nothing.
+    fn disk_path(&self, instance: &str) -> Option<std::path::PathBuf> {
+        let _ = instance;
+        None
+    }
 
     async fn start(&self, request: &VmRequest) -> Result<()>;
 
