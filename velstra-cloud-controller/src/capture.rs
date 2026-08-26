@@ -179,6 +179,7 @@ mod tests {
                 path: "/srv/images".into(),
                 accepting: true,
                 agent: String::new(),
+                verify_every_hours: 0,
             },
             BackupTargetStatus {
                 writable: Some(true),

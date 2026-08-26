@@ -75,6 +75,14 @@ pub struct CephConfig {
     /// The `rbd` binary. Overridable so a test can point at something else and
     /// an operator can point at a build that is not on the path.
     pub rbd: String,
+    /// The `ceph` binary, for the same reason and by the same argument.
+    ///
+    /// It was a literal in the one call site that needs it, which made this
+    /// backend half-configurable: an operator could point `rbd` at their own
+    /// build and `ceph df` would still go to whatever was on `PATH`. It also
+    /// meant no test could substitute it, which is why the pool path had unit
+    /// tests about argv and nothing that ran the loop.
+    pub ceph: String,
 }
 
 impl CephConfig {
@@ -85,6 +93,7 @@ impl CephConfig {
             user: "client.admin".to_string(),
             conf: None,
             rbd: "rbd".to_string(),
+            ceph: "ceph".to_string(),
         }
     }
 
@@ -316,7 +325,7 @@ impl CephPool {
     async fn ceph_df(&self) -> Result<Vec<u8>> {
         let mut argv = self.config.common();
         argv.extend(["df".into(), "--format".into(), "json".into()]);
-        let output = tokio::process::Command::new("ceph")
+        let output = tokio::process::Command::new(&self.config.ceph)
             .args(&argv)
             .output()
             .await

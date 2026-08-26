@@ -370,9 +370,25 @@ impl PoolAgent {
             Err(e) => {
                 // Without a reading of the backend there is nothing to compare
                 // against, and acting on the last known picture is how a volume
-                // gets created twice. Report nothing and try again next pass.
+                // gets created twice. So nothing is *done* this pass — but it
+                // is said.
+                //
+                // It used to only be logged, and that made an unreachable
+                // backend the quietest failure in the platform: every volume on
+                // it sat unprovisioned with no condition, no reason and no
+                // event, and the only record was a line on whichever machine
+                // runs this pool. Which is exactly the argument `backup_trouble`
+                // makes a few hundred lines down — somebody asking "why is
+                // there no volume" is looking at the object, months later, and a
+                // log line is not where they will look.
+                //
+                // On the pool and not on the volumes: one backend being down is
+                // one fact, and writing it onto a hundred objects would be a
+                // hundred writes saying the same thing, all of which then have
+                // to be cleaned up.
                 tracing::error!(error = %e, "could not read this pool; doing nothing this pass");
                 pass.failures += 1;
+                self.unreachable(&e.to_string(), &mut pass).await;
                 return pass;
             }
         };
@@ -635,6 +651,189 @@ impl PoolAgent {
         {
             self.backup_pass(backup, &copies.targets, pass).await;
         }
+        self.verify_sweep(copies, pass).await;
+    }
+
+    /// Read one copy back per target and check it against its digest.
+    ///
+    /// Until this existed the platform could say a backup had been *written*
+    /// and nothing more. That is a weaker claim than it looks: bit rot, a
+    /// filesystem that lied about a flush, a target quietly remounted read-only
+    /// over an old copy of itself — none of them change the fact that bytes
+    /// were once written, and all of them are found at restore time, which is
+    /// the worst moment to find anything.
+    ///
+    /// One copy per target per pass. The pass also provisions volumes and takes
+    /// snapshots, and those are not optional; reading every overdue copy would
+    /// let a target with a hundred of them starve the work somebody is waiting
+    /// on. See [`velstra_cloud_model::backup::next_to_verify`].
+    async fn verify_sweep(&self, copies: &Copies, pass: &mut Pass) {
+        for target in &copies.targets {
+            let target_name = target.meta.name.to_string();
+            // Only the agent that owns the target reads from it. A shared mount
+            // visible to three machines would otherwise be read by all three,
+            // which triples the I/O to answer one question.
+            if target.spec.agent != self.config.pool {
+                continue;
+            }
+            if target.spec.verify_every_hours == 0 {
+                continue;
+            }
+
+            // Only copies this pool made: a backup's bytes came out of one pool
+            // and its object is claimed by that pool's agent.
+            let mine: Vec<velstra_cloud_model::backup::CopyView> = copies
+                .backups
+                .iter()
+                .filter(|b| b.spec.pool == self.config.pool)
+                .filter(|b| b.spec.target == target_name)
+                .filter(|b| b.status.taken)
+                .filter_map(|b| {
+                    Some(velstra_cloud_model::backup::CopyView {
+                        name: b.meta.name.to_string(),
+                        taken_at: b.status.taken_at?,
+                        verified_at: b.status.verified_at,
+                        deleting: b.meta.is_deleting(),
+                    })
+                })
+                .collect();
+
+            let Some(chosen) = velstra_cloud_model::backup::next_to_verify(
+                target.spec.verify_every_hours,
+                &mine,
+                Timestamp::now(),
+            ) else {
+                continue;
+            };
+            let Some(stored) = copies
+                .backups
+                .iter()
+                .find(|b| b.meta.name.to_string() == chosen)
+            else {
+                continue;
+            };
+            self.verify_one(stored, &target.spec.path, pass).await;
+        }
+    }
+
+    /// Read one copy back, compare, and say what was found on the backup.
+    async fn verify_one(
+        &self,
+        stored: &velstra_cloud_model::resources::Backup,
+        target_path: &str,
+        pass: &mut Pass,
+    ) {
+        let name = stored.meta.name.to_string();
+        let path = backup_path(target_path, &name);
+
+        // A copy written before digests existed. It is not sound and not
+        // broken: nobody can tell, and saying so is the only honest answer.
+        // Recording a digest now would bless whatever is on the target today,
+        // which is exactly the question being asked.
+        let Some(want) = stored.status.digest.clone() else {
+            let mut next = stored.clone();
+            next.status.verify_error = Some(
+                "no digest was recorded when this copy was made, so reading it back \
+                 proves nothing; the next copy of this volume will carry one"
+                    .into(),
+            );
+            next.status.observed_generation = stored.meta.generation;
+            set_condition(
+                &mut next.status.conditions,
+                Condition::new(
+                    "Ready",
+                    ConditionStatus::True,
+                    "Unverifiable",
+                    "the copy is here; whether it is intact cannot be established",
+                    stored.meta.generation,
+                ),
+            );
+            reporting::report(&self.backups, stored, next, &self.writer, pass).await;
+            return;
+        };
+
+        pass.actions += 1;
+        let found = match crate::hostfs::sha256_file(std::path::Path::new(&path)).await {
+            Ok(hex) => format!("sha256:{hex}"),
+            Err(e) => {
+                // The copy could not be read at all — gone, or a mount that is
+                // no longer there. Louder than a mismatch, not different in
+                // kind: either way this is not a backup any more.
+                pass.failures += 1;
+                self.verify_failed(
+                    stored,
+                    format!("this copy could not be read back from {path}: {e}"),
+                    "Unreadable",
+                    pass,
+                )
+                .await;
+                return;
+            }
+        };
+
+        if found != want {
+            pass.failures += 1;
+            self.verify_failed(
+                stored,
+                format!(
+                    "this copy no longer matches what was written: expected {want}, \
+                     found {found}. The bytes are still on the target and nothing here \
+                     will remove them — a restore from this copy would not be the volume \
+                     it was made from"
+                ),
+                "DigestMismatch",
+                pass,
+            )
+            .await;
+            return;
+        }
+
+        let mut next = stored.clone();
+        next.status.verified_at = Some(Timestamp::now());
+        next.status.verify_error = None;
+        next.status.observed_generation = stored.meta.generation;
+        set_condition(
+            &mut next.status.conditions,
+            Condition::new(
+                "Ready",
+                ConditionStatus::True,
+                "Verified",
+                &format!("read back from {path} and it matches"),
+                stored.meta.generation,
+            ),
+        );
+        reporting::report(&self.backups, stored, next, &self.writer, pass).await;
+    }
+
+    /// Say on the backup that reading it back did not work out.
+    ///
+    /// The copy is never deleted. A failed verification is the one moment
+    /// somebody has to look themselves: it may be the copy that rotted, or the
+    /// filesystem under it, or a restore already running from this very file.
+    /// Destroying the only artefact would take that decision away, and it is
+    /// not the platform's to take.
+    async fn verify_failed(
+        &self,
+        stored: &velstra_cloud_model::resources::Backup,
+        why: String,
+        reason: &str,
+        pass: &mut Pass,
+    ) {
+        tracing::error!(backup = %stored.meta.name, reason, "{why}");
+        let mut next = stored.clone();
+        next.status.verify_error = Some(why.clone());
+        next.status.observed_generation = stored.meta.generation;
+        set_condition(
+            &mut next.status.conditions,
+            Condition::new(
+                "Ready",
+                ConditionStatus::False,
+                reason,
+                &why,
+                stored.meta.generation,
+            ),
+        );
+        reporting::report(&self.backups, stored, next, &self.writer, pass).await;
     }
 
     /// One backup: claim it, copy the bytes out, report what is on the target.
@@ -733,10 +932,33 @@ impl PoolAgent {
             .and_then(|seen| seen.volumes.get(&stored.spec.volume).copied())
             .unwrap_or(0);
 
+        // Hash what was just written, while it is still the thing that was
+        // written. This is the only moment a digest is worth anything: taken
+        // now, it is a record of bytes known good, and every later read-back is
+        // measured against it. Computed on a second pass it would only ever
+        // certify whatever the target holds by then.
+        //
+        // A hash that cannot be computed is not a failed backup. The copy is
+        // there and restorable; what is missing is the ability to prove it
+        // later, so the copy stands and the field stays `None` — which reads
+        // exactly as it should when verification comes round.
+        let digest = match crate::hostfs::sha256_file(std::path::Path::new(&path)).await {
+            Ok(hex) => Some(format!("sha256:{hex}")),
+            Err(e) => {
+                tracing::warn!(
+                    backup = %name,
+                    error = %e,
+                    "the copy was made but could not be hashed; it cannot be verified later"
+                );
+                None
+            }
+        };
+
         let mut next = stored.clone();
         next.status.taken = true;
         next.status.size_gib = size_gib;
         next.status.stored_bytes = written;
+        next.status.digest = digest;
         next.status.taken_at = Some(Timestamp::now());
         next.status.observed_generation = stored.meta.generation;
         set_condition(
@@ -961,6 +1183,44 @@ impl PoolAgent {
                 ConditionStatus::True,
                 "Ready",
                 "the pool agent is running and answering",
+                stored.meta.generation,
+            ),
+        );
+        reporting::report(&self.pools, &stored, next, &self.writer, pass).await;
+    }
+
+    /// Say on the pool that its backend could not be read.
+    ///
+    /// Deliberately does **not** touch capacity or what is allocated: those are
+    /// the last numbers anybody read off a working cluster, and replacing them
+    /// with zeroes would tell the scheduler this pool is full — turning "we
+    /// cannot see it" into "it has no room", which is a different and much
+    /// worse claim. They stay, stale, next to a condition saying they are.
+    async fn unreachable(&self, why: &str, pass: &mut Pass) {
+        let name = format!("pools/{}", self.config.pool);
+        let Ok(Some(stored)) = self.pools.get(&name).await else {
+            // A pool nobody registered is not this agent's to invent — the same
+            // rule `pool_pass` holds to. There is nowhere to say this, and
+            // saying it in a place of our own choosing would be worse.
+            return;
+        };
+        let mut next: Pool = stored.clone();
+        next.status.observed_generation = stored.meta.generation;
+        next.status.agent_version = self.config.agent_version.clone();
+        // The heartbeat still moves: the *agent* is alive and answering, and it
+        // is the agent that would otherwise look dead. What is unreachable is
+        // the storage behind it, and the condition is where that is said.
+        next.status.last_heartbeat = Timestamp::now();
+        set_condition(
+            &mut next.status.conditions,
+            Condition::new(
+                "Ready",
+                ConditionStatus::False,
+                "BackendUnreachable",
+                &format!(
+                    "the pool agent is running but could not read its backend, so nothing \
+                     here is being provisioned: {why}"
+                ),
                 stored.meta.generation,
             ),
         );
@@ -1247,9 +1507,27 @@ impl Storage for FakePool {
         inner
             .copied_out
             .insert(path.to_string(), (volume.to_string(), gib));
-        // A gibibyte in bytes: the fake writes nothing, and a caller that
-        // reasons about how much a target now holds needs a number that at
-        // least has the right units.
+        // Real bytes, small and deterministic.
+        //
+        // This used to write nothing and return a plausible number, which made
+        // every reader of a copy untestable — including the one that reads a
+        // copy back to check it, which is the entire point of having made one.
+        // A fake that only records that a copy "happened" can prove the copy
+        // was requested and nothing about the copy.
+        //
+        // Deterministic in the volume and its size so that a test can corrupt a
+        // copy and know the difference is the corruption.
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                HostError::failed(format!("{} could not be made: {e}", parent.display()))
+            })?;
+        }
+        let body = format!("velstra fake copy of {volume} at {gib} GiB\n");
+        std::fs::write(path, &body)
+            .map_err(|e| HostError::failed(format!("{path} could not be written: {e}")))?;
+        // What the caller is told is what a real backend reports: the size of
+        // the source, not of whatever this fake happened to put on disk. A
+        // target's free space is computed from the former.
         Ok(gib * 1024 * 1024 * 1024)
     }
 }
@@ -1279,12 +1557,25 @@ mod tests {
             velstra_cloud_model::backup::BackupTargetStatus,
         >,
         fake: FakePool,
+        /// Unique per cell, so two tests running side by side do not share a
+        /// backup target directory.
+        ///
+        /// It used to be keyed on the process id alone, which was fine only
+        /// because the fake pool wrote no bytes: every test used the target id
+        /// "archive" and the backup id "b1", so they all pointed at one path
+        /// that never had anything in it. The moment `copy_out` became honest,
+        /// tests that passed alone started failing together — and would have
+        /// gone on doing it intermittently, which is the worst way to find out.
+        tag: u64,
     }
 
     fn cell(pool: &str) -> (Cell, PoolAgent) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
         let fake = FakePool::new(1000);
         let cell = Cell {
+            tag: NEXT.fetch_add(1, Ordering::Relaxed),
             volumes: TypedStore::new(store.clone(), "cell-1", "volumes"),
             snapshots: TypedStore::new(store.clone(), "cell-1", "snapshots"),
             pools: TypedStore::new(store.clone(), "cell-1", "pools"),
@@ -1341,6 +1632,7 @@ mod tests {
                     // Named by the operator, as the model requires: a target
                     // assigned to nobody is one no agent may report on.
                     agent: "nvme".into(),
+                    verify_every_hours: 0,
                 },
                 velstra_cloud_model::backup::BackupTargetStatus::default(),
             );
@@ -1376,8 +1668,9 @@ mod tests {
         /// usable; a path that is not there when it is not.
         fn target_dir(&self, id: &str, usable: bool) -> String {
             let dir = std::env::temp_dir().join(format!(
-                "velstra-target-{}-{id}",
-                std::process::id()
+                "velstra-target-{}-{}-{id}",
+                std::process::id(),
+                self.tag
             ));
             if usable {
                 std::fs::create_dir_all(&dir).unwrap();
@@ -1403,6 +1696,60 @@ mod tests {
                 .unwrap()
         }
 
+        /// A writable, accepting target that reads its copies back.
+        async fn target_verifying(&self, id: &str, hours: u32) {
+            self.target(id, true, true).await;
+            self.set_verify(id, hours).await;
+        }
+
+        /// Change how often this target verifies, as an operator would.
+        async fn set_verify(&self, id: &str, hours: u32) {
+            let name = format!("backup-targets/{id}");
+            let mut t = self.targets.get(&name).await.unwrap().unwrap();
+            // Setting it to what it already is is not an edit, and the store
+            // says so (`GenerationWithoutChange`). Worth keeping rather than
+            // working around: a generation that moved without a spec changing
+            // is how a controller convinces itself it has work to do.
+            if t.spec.verify_every_hours == hours {
+                return;
+            }
+            t.spec.verify_every_hours = hours;
+            t.meta.generation += 1;
+            self.targets
+                .update(&t, &velstra_cloud_model::access::Writer::controller("pool"))
+                .await
+                .unwrap();
+        }
+
+        /// Age a finished copy, so its proof is stale enough to be due.
+        ///
+        /// The clock is moved rather than the test waiting: verification is
+        /// deliberately not something that happens the moment a copy lands, so
+        /// there is no way to observe it without time having passed.
+        async fn backdate_backup(&self, id: &str, by_ms: u64) {
+            let mut b = self.reload_backup(id).await;
+            if let Some(at) = b.status.taken_at {
+                b.status.taken_at = Some(Timestamp(at.0.saturating_sub(by_ms)));
+            }
+            if let Some(at) = b.status.verified_at {
+                b.status.verified_at = Some(Timestamp(at.0.saturating_sub(by_ms)));
+            }
+            self.backups
+                .update(&b, &velstra_cloud_model::access::Writer::agent("nvme"))
+                .await
+                .unwrap();
+        }
+
+        /// A copy as it would look if it had been made before digests existed.
+        async fn forget_digest(&self, id: &str) {
+            let mut b = self.reload_backup(id).await;
+            b.status.digest = None;
+            self.backups
+                .update(&b, &velstra_cloud_model::access::Writer::agent("nvme"))
+                .await
+                .unwrap();
+        }
+
         async fn register_pool(&self, id: &str) {
             let p: Pool = Resource::new(
                 Meta::new(
@@ -1419,6 +1766,10 @@ mod tests {
                 .create(&p, &velstra_cloud_model::access::Writer::controller("pool"))
                 .await
                 .unwrap();
+        }
+
+        async fn reload_pool(&self, id: &str) -> Pool {
+            self.pools.get(&format!("pools/{id}")).await.unwrap().unwrap()
         }
 
         async fn reload(&self) -> Volume {
@@ -1736,11 +2087,32 @@ mod tests {
         let pass = agent.resync().await;
         assert_eq!(pass.failures, 1);
         assert_eq!(pass.actions, 0, "it acted on a picture it could not read");
-        // Zero writes is the right assertion *here*, unlike on a settled pass: a
-        // pool that cannot be read returns before it reaches its own object, so
-        // not even the heartbeat goes out. That silence is the point — a node
-        // reporting a heartbeat it could not verify would look alive.
-        assert_eq!(pass.reports, 0);
+
+        // Zero *actions* is the invariant; zero writes was the old one, and it
+        // was wrong.
+        //
+        // The argument for silence was that "a pool reporting a heartbeat it
+        // could not verify would look alive". True of a bare heartbeat — and it
+        // assumed those were the only two options. They are not: the agent
+        // reports the heartbeat *and* a false `Ready` naming the backend, which
+        // says the one thing neither alternative could. Silence is
+        // indistinguishable from a dead agent, and those are different problems
+        // with different fixes; a bare heartbeat is a lie. This is neither.
+        //
+        // Safe to move the heartbeat because nothing consults a *pool's*:
+        // fencing and recovery read a node's (`ha.rs`), and the only reader here
+        // is a person, for whom "heard two seconds ago, and it says its backend
+        // is unreachable" beats "not heard from in ten minutes".
+        assert_eq!(pass.reports, 1, "an unreadable backend said nothing anywhere");
+        let pool = cell.reload_pool("pool-a").await;
+        let ready = ready_condition(&pool.status.conditions);
+        assert_eq!(ready.status, ConditionStatus::False, "{ready:?}");
+        assert_eq!(ready.reason, "BackendUnreachable", "{ready:?}");
+        assert!(ready.message.contains("the array is not answering"), "{ready:?}");
+        // And the volume was not touched: one backend being down is one fact,
+        // written once, not onto every object that depends on it.
+        let v = cell.reload().await;
+        assert!(!v.status.provisioned);
     }
     // ---- copies ----------------------------------------------------------
     //
@@ -2184,5 +2556,151 @@ mod tests {
         let untouched = cell.reload_backup("b1").await;
         assert_eq!(untouched.status.agent, None);
         assert!(!untouched.status.taken);
+    }
+
+    /// The `Ready` condition an object is carrying.
+    fn ready_condition(
+        conditions: &[Condition],
+    ) -> &Condition {
+        conditions
+            .iter()
+            .find(|c| c.kind == "Ready")
+            .expect("it says nothing about itself")
+    }
+
+    /// Turn a target's verification on and hand back the path of a finished
+    /// copy, so a test can go and do something to it.
+    async fn a_verified_copy(hours: u32) -> (Cell, PoolAgent, String) {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target_verifying("archive", hours).await;
+        cell.backup("b1", "nvme", "archive").await;
+        // Claim, then copy.
+        agent.resync().await;
+        agent.resync().await;
+        let path = backup_path(&cell.target_dir("archive", true), "projects/p1/backups/b1");
+        (cell, agent, path)
+    }
+
+    /// The digest is taken when the bytes are written, because that is the only
+    /// moment it means anything.
+    #[tokio::test]
+    async fn a_copy_records_what_it_hashed_to_when_it_was_written() {
+        let (cell, _agent, path) = a_verified_copy(1).await;
+        let taken = cell.reload_backup("b1").await;
+        let digest = taken.status.digest.expect("the copy carries no digest");
+        assert!(digest.starts_with("sha256:"), "{digest}");
+        // Which algorithm it was is part of the answer, not folklore.
+        let want = crate::hostfs::sha256_file(std::path::Path::new(&path))
+            .await
+            .unwrap();
+        assert_eq!(digest, format!("sha256:{want}"));
+    }
+
+    /// The pass that makes "a backup exists" into "somebody has read it".
+    #[tokio::test]
+    async fn a_copy_is_read_back_and_says_when_it_last_matched() {
+        let (cell, agent, _path) = a_verified_copy(0).await;
+        // Not asked to verify: nothing is read back, however long it sits.
+        agent.resync().await;
+        assert!(
+            cell.reload_backup("b1").await.status.verified_at.is_none(),
+            "a target nobody asked to verify read a copy back anyway"
+        );
+
+        // Asked to verify, and the copy is older than the interval.
+        cell.set_verify("archive", 1).await;
+        cell.backdate_backup("b1", 4 * 3_600_000).await;
+        agent.resync().await;
+
+        let checked = cell.reload_backup("b1").await;
+        assert!(
+            checked.status.verified_at.is_some(),
+            "the copy was never read back"
+        );
+        assert_eq!(checked.status.verify_error, None);
+        let ready = ready_condition(&checked.status.conditions);
+        assert_eq!(ready.reason, "Verified", "{ready:?}");
+    }
+
+    /// The failure this whole feature exists to find: bytes that are no longer
+    /// the bytes that were written. Nothing else in the platform would notice
+    /// until somebody tried to restore from it.
+    #[tokio::test]
+    async fn a_copy_that_has_rotted_is_reported_and_never_deleted() {
+        let (cell, agent, path) = a_verified_copy(1).await;
+        cell.backdate_backup("b1", 4 * 3_600_000).await;
+
+        // One flipped byte is enough, and is what rot looks like.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        agent.resync().await;
+
+        let bad = cell.reload_backup("b1").await;
+        let why = bad.status.verify_error.expect("the corruption went unnoticed");
+        assert!(why.contains("no longer matches"), "{why}");
+        // It says what a restore from it would actually mean, because that is
+        // the decision the reader has to make.
+        assert!(why.contains("would not be the volume it was made from"), "{why}");
+        let ready = ready_condition(&bad.status.conditions);
+        assert_eq!(ready.status, ConditionStatus::False, "{ready:?}");
+        assert_eq!(ready.reason, "DigestMismatch", "{ready:?}");
+
+        // And the bytes are still there. A failed verification is the one
+        // moment somebody has to look themselves — it may be the copy that
+        // rotted, or the filesystem under it, or a restore already running
+        // from this very file. Deleting the only artefact takes that away.
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the platform destroyed the copy it was asked to check"
+        );
+        assert!(bad.status.taken, "a failed check un-made the copy");
+    }
+
+    /// A copy that has gone missing entirely is louder, not different in kind.
+    #[tokio::test]
+    async fn a_copy_that_cannot_be_read_at_all_says_so() {
+        let (cell, agent, path) = a_verified_copy(1).await;
+        cell.backdate_backup("b1", 4 * 3_600_000).await;
+        std::fs::remove_file(&path).unwrap();
+
+        agent.resync().await;
+
+        let gone = cell.reload_backup("b1").await;
+        let why = gone.status.verify_error.expect("a missing copy went unnoticed");
+        assert!(why.contains("could not be read back"), "{why}");
+        assert_eq!(
+            ready_condition(&gone.status.conditions).reason,
+            "Unreadable"
+        );
+    }
+
+    /// A copy from before digests existed. Not sound and not broken — nobody
+    /// can tell, and a digest recorded now would only bless whatever is on the
+    /// target today, which is the very thing being asked about.
+    #[tokio::test]
+    async fn a_copy_with_no_digest_is_called_unverifiable_rather_than_assumed_good() {
+        let (cell, agent, _path) = a_verified_copy(1).await;
+        cell.forget_digest("b1").await;
+        cell.backdate_backup("b1", 4 * 3_600_000).await;
+
+        agent.resync().await;
+
+        let old = cell.reload_backup("b1").await;
+        let why = old.status.verify_error.expect("it claimed to have checked something");
+        assert!(why.contains("proves nothing"), "{why}");
+        assert!(old.status.verified_at.is_none(), "it recorded a check it did not do");
+        let ready = ready_condition(&old.status.conditions);
+        // The copy is here and restorable; what is unknown is whether it is
+        // intact. That is not a broken backup, so `Ready` stays true.
+        assert_eq!(ready.status, ConditionStatus::True, "{ready:?}");
+        assert_eq!(ready.reason, "Unverifiable", "{ready:?}");
+        assert_eq!(
+            old.status.digest, None,
+            "verification invented a digest, which would certify the wrong moment"
+        );
     }
 }
