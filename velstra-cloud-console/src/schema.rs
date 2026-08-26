@@ -343,6 +343,19 @@ pub struct Field {
     pub help: &'static str,
     /// Set by the platform, not by an operator: shown, never editable.
     pub derived: bool,
+    /// Answered when the object is created and fixed from then on.
+    ///
+    /// Not [`derived`] — an operator does decide it, once — and not an ordinary
+    /// field either, because the API refuses to change it afterwards. Without
+    /// this the edit form offers a control whose only possible outcome is a
+    /// refusal, or worse: `spec.pool` on a volume was offered for editing, the
+    /// API accepted the change, and nothing moved a byte. The old pool's agent
+    /// stopped matching its filter and let go; the new one saw a volume another
+    /// pool still had claimed and would not touch it. The volume simply stopped
+    /// converging, with nothing anywhere saying why.
+    ///
+    /// [`derived`]: Field::derived
+    pub at_creation: bool,
 }
 
 /// A column in a list.
@@ -459,6 +472,7 @@ const USER_FIELDS: &[Field] = &[
         help: "Shown on screen. Never used to decide anything — the account's id \
                is its identity.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "email",
@@ -471,6 +485,7 @@ const USER_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "disabled",
@@ -484,6 +499,7 @@ const USER_FIELDS: &[Field] = &[
                new sign-ins. Its roles are kept, so turning it back on restores \
                exactly what it had.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "cellAdmin",
@@ -497,6 +513,7 @@ const USER_FIELDS: &[Field] = &[
         help: "May do anything anywhere in this cell, including inside every \
                project. Grant it to operate the platform, not to use it.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -516,6 +533,7 @@ const CEPH_FIELDS: &[Field] = &[
                several interfaces has several answers, and the wrong one puts \
                replication traffic on the tenant network.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "clusterNetwork",
@@ -529,6 +547,7 @@ const CEPH_FIELDS: &[Field] = &[
         help: "A separate network for replication. Empty means the one above \
                carries both, which is the ordinary answer for a small cluster.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "monitors",
@@ -548,6 +567,7 @@ const CEPH_FIELDS: &[Field] = &[
         help: "Three nodes, or one for a lab. Never two: a quorum of two \
                survives no failures and looks like it would.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "osds",
@@ -578,6 +598,7 @@ const CEPH_FIELDS: &[Field] = &[
                is empty is offered, so a disk you really do want to give up has \
                to be wiped outside the platform first.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "pools",
@@ -600,6 +621,7 @@ const CEPH_FIELDS: &[Field] = &[
                holding data it cannot protect — so a floor equal to the copies \
                means one node rebooting stops writing.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "paused",
@@ -610,6 +632,7 @@ const CEPH_FIELDS: &[Field] = &[
         help: "Stops the deployment where it stands. Nothing is torn down, and \
                turning it off carries on from there.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -625,6 +648,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "parent",
@@ -637,6 +661,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: true,
         help: "Policies and quota are inherited from here.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "cell",
@@ -657,6 +682,7 @@ const PROJECT_FIELDS: &[Field] = &[
                for them are routed. Leave empty to use whichever cell answers — \
                which is what an installation with one cell wants.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "quota.instances",
@@ -675,6 +701,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: true,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "quota.vcpus",
@@ -690,6 +717,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: true,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "quota.memoryMib",
@@ -705,6 +733,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: true,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "quota.volumeGib",
@@ -720,6 +749,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: true,
         help: "",
         derived: false,
+        at_creation: false,
     },
     // The four the API has always enforced and this screen could not set. A
     // dimension a cell operator cannot cap is a dimension that is capped at
@@ -739,6 +769,7 @@ const PROJECT_FIELDS: &[Field] = &[
         help: "A count, separate from the space: per-volume overhead is a \
                different worry from capacity, and the two are capped apart.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "quota.floatingIps",
@@ -755,6 +786,7 @@ const PROJECT_FIELDS: &[Field] = &[
         help: "An address that outlives the machine answering on it is scarce \
                and externally routable.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "quota.loadBalancers",
@@ -771,6 +803,7 @@ const PROJECT_FIELDS: &[Field] = &[
         help: "Each one takes an address out of a subnet and datapath entries \
                on every ingress host.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "quota.devices",
@@ -788,6 +821,7 @@ const PROJECT_FIELDS: &[Field] = &[
                oversubscribed, so without a cap one project can take every \
                accelerator in the cell.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -804,6 +838,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "vcpus",
@@ -819,6 +854,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "memoryMib",
@@ -834,6 +870,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "rootDiskGib",
@@ -849,6 +886,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "desiredState",
@@ -862,6 +900,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "What it should be doing. Asking twice is the same as asking once.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "ports",
@@ -876,6 +915,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "Attached in this order.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "sshKeys",
@@ -889,6 +929,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "userData",
@@ -900,6 +941,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "Handed to the guest on first boot.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "node",
@@ -914,6 +956,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         help: "Left empty the scheduler chooses. Moving it afterwards is a \
                migration, not an edit.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "placementPolicy.antiAffinityGroup",
@@ -927,6 +970,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         help: "Instances in one group are kept off the same node — what keeps \
                a service alive when a machine dies.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "placementPolicy.spread",
@@ -944,6 +988,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                means one stays down. A wish takes a crowded node over not \
                running at all, which is what twelve web servers want.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "placementPolicy.affinityGroup",
@@ -959,6 +1004,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                it reads on every request — where a hop between machines is the \
                whole latency budget.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "placementPolicy.affinity",
@@ -975,6 +1021,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                and says which that is. A wish places elsewhere rather than not \
                at all.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "placementPolicy.requiredLabels",
@@ -987,6 +1034,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "Only nodes carrying all of these.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "startOrder",
@@ -1005,6 +1053,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                everything it holds at once and the database loses the race for \
                disk to a dozen web servers.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "startDelayS",
@@ -1022,6 +1071,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                in turn — a hundred guests at thirty seconds each would be \
                fifty minutes of nothing happening.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "onNodeLoss",
@@ -1041,6 +1091,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                its guests — a node with no fencing deadline is never recovered \
                from.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "console",
@@ -1056,6 +1107,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                every time the guest logs a line. A guest that is not running \
                shows its last output whether this is on or not.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "devices",
@@ -1070,6 +1122,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                two devices. A guest holding one cannot be live-migrated — a \
                device's state is in hardware and cannot be transferred.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "placementPolicy.minCpuLevel",
@@ -1087,6 +1140,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         help: "What the image needs to run. RHEL 9 and CentOS Stream 9 need \
                x86-64-v2 or they will not boot.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1105,6 +1159,7 @@ const VOLUME_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "pool",
@@ -1117,6 +1172,7 @@ const VOLUME_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: true,
     },
     Field {
         key: "sourceImage",
@@ -1130,6 +1186,7 @@ const VOLUME_FIELDS: &[Field] = &[
         advanced: false,
         help: "Left empty the volume comes up blank.",
         derived: false,
+        at_creation: true,
     },
     Field {
         key: "sourceSnapshot",
@@ -1155,6 +1212,7 @@ const VOLUME_FIELDS: &[Field] = &[
         help: "Restores that snapshot into a new volume. A volume is never \
                restored in place, so this is what restoring means.",
         derived: false,
+        at_creation: true,
     },
     Field {
         key: "encryptionKey",
@@ -1168,6 +1226,7 @@ const VOLUME_FIELDS: &[Field] = &[
         help: "Empty means the bytes are stored in the clear, which is a \
                decision rather than a default.",
         derived: false,
+        at_creation: true,
     },
 ];
 
@@ -1184,6 +1243,7 @@ const ATTACHMENT_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "instance",
@@ -1197,6 +1257,7 @@ const ATTACHMENT_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "node",
@@ -1216,6 +1277,7 @@ const ATTACHMENT_FIELDS: &[Field] = &[
         // asking for it.
         help: "Where the volume will be opened. Taken from the instance.",
         derived: true,
+        at_creation: false,
     },
     Field {
         key: "readOnly",
@@ -1225,6 +1287,7 @@ const ATTACHMENT_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1240,6 +1303,7 @@ const NETWORK_FIELDS: &[Field] = &[
                the world can reach. Only a cell operator may say so — a tenant \
                who could would mint themselves a public range by typing a CIDR.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "announce",
@@ -1256,6 +1320,7 @@ const NETWORK_FIELDS: &[Field] = &[
                An individual address may say otherwise. Meaningless on a \
                network that carries no real addresses.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "mtu",
@@ -1271,6 +1336,7 @@ const NETWORK_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "vni",
@@ -1286,6 +1352,7 @@ const NETWORK_FIELDS: &[Field] = &[
         advanced: true,
         help: "Assigned by the controller from the cell's range.",
         derived: true,
+        at_creation: false,
     },
 ];
 
@@ -1302,6 +1369,7 @@ const SUBNET_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "cidr",
@@ -1314,6 +1382,7 @@ const SUBNET_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "gateway",
@@ -1326,6 +1395,7 @@ const SUBNET_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "dns",
@@ -1338,6 +1408,7 @@ const SUBNET_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "reserved",
@@ -1350,6 +1421,7 @@ const SUBNET_FIELDS: &[Field] = &[
         advanced: true,
         help: "Addresses the platform will not hand out.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1365,6 +1437,7 @@ const SECURITY_GROUP_FIELDS: &[Field] = &[Field {
                is a group that allows nothing extra, which is the platform's \
                default anyway: nothing in, everything out, replies always.",
     derived: false,
+    at_creation: false,
 }];
 
 const PORT_FIELDS: &[Field] = &[
@@ -1380,6 +1453,7 @@ const PORT_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "subnet",
@@ -1393,6 +1467,7 @@ const PORT_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "securityGroups",
@@ -1408,6 +1483,7 @@ const PORT_FIELDS: &[Field] = &[
                keeps the platform's default: nothing in, everything out, \
                replies always.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "address",
@@ -1421,6 +1497,7 @@ const PORT_FIELDS: &[Field] = &[
         help: "Left empty IPAM allocates one. It never changes afterwards — an \
                address that moves under a running guest is an outage.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "mac",
@@ -1433,6 +1510,7 @@ const PORT_FIELDS: &[Field] = &[
         advanced: true,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "securityGroups",
@@ -1445,6 +1523,7 @@ const PORT_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "rateLimitMbit",
@@ -1461,6 +1540,7 @@ const PORT_FIELDS: &[Field] = &[
         help: "Zero is unlimited. Multi-tenancy without a ceiling is one noisy \
                neighbour away from an incident.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1477,6 +1557,7 @@ const IMAGE_FIELDS: &[Field] = &[
         help: "The bytes are addressed by this, so an image cannot be replaced \
                under an instance that was built from it.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "format",
@@ -1488,6 +1569,7 @@ const IMAGE_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "sourceUrl",
@@ -1500,6 +1582,7 @@ const IMAGE_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "sizeBytes",
@@ -1515,6 +1598,7 @@ const IMAGE_FIELDS: &[Field] = &[
         advanced: true,
         help: "",
         derived: false,
+        at_creation: false,
     },
     // There is deliberately no `signature` field. It used to be here, with the
     // help text "Verified before a node will boot it" — and nothing in the
@@ -1534,6 +1618,7 @@ const NODE_FIELDS: &[Field] = &[
         help: "Turning this off drains the node: nothing new is placed, what \
                runs keeps running.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "labels",
@@ -1546,6 +1631,7 @@ const NODE_FIELDS: &[Field] = &[
         advanced: false,
         help: "What placement policies match on.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "evacuate",
@@ -1558,6 +1644,7 @@ const NODE_FIELDS: &[Field] = &[
                per guest that can move — a guest holding a passed-through \
                device cannot, and stays with the reason on it.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "fenceAfterS",
@@ -1577,6 +1664,7 @@ const NODE_FIELDS: &[Field] = &[
                \"unreachable\" from \"stopped\". Set it and guests marked for \
                restart can be brought up elsewhere.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "gateway",
@@ -1589,6 +1677,7 @@ const NODE_FIELDS: &[Field] = &[
                machines may carry it — the network above sees them as equal \
                next hops — and a cell with none simply cannot use that mode.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "vcpuOvercommit",
@@ -1609,6 +1698,7 @@ const NODE_FIELDS: &[Field] = &[
                world is run. There is deliberately no setting for memory: a \
                guest promised 8 GiB and handed 4 is not slow, it is killed.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "cpuBaseline",
@@ -1629,6 +1719,7 @@ const NODE_FIELDS: &[Field] = &[
                between them. Guests already running keep the CPU they started \
                with and adopt this one when they next restart.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1648,6 +1739,7 @@ const ROUTER_FIELDS: &[Field] = &[Field {
     help: "The networks whose subnets reach each other. A network belongs to \
                at most one router.",
     derived: false,
+    at_creation: false,
 }];
 
 /// A floating IP: the address, where it comes from, and what it points at.
@@ -1665,6 +1757,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         help: "Where the address comes from. The same counting as a port's \
                address, so the two are never the same address.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "address",
@@ -1679,6 +1772,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         advanced: true,
         help: "Leave empty to be given the lowest address nothing else holds.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "port",
@@ -1696,6 +1790,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         help: "The port this address reaches. Clearing it holds the address \
                while the machine behind it is replaced.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "delivery",
@@ -1715,6 +1810,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
                it and the guest never knows. A held address has to come from \
                an external network.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "announce",
@@ -1735,6 +1831,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
                needs only that one machine to peer, and costs a detour in both \
                directions.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1753,6 +1850,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
         advanced: false,
         help: "The machine going out of service.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "startsAt",
@@ -1765,6 +1863,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
         help: "In your own timezone. A start already past means now — work \
                that has already begun is a true thing to declare.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "minutes",
@@ -1782,6 +1881,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
                with this one: two fields that can disagree about the same \
                fact are one field too many.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "drain",
@@ -1795,6 +1895,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
                what pulling the machine wants. A guest that cannot move is \
                left where it is, and :explainMaintenance says which.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "note",
@@ -1813,6 +1914,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
                refused, so \"no capacity\" reads as \"node-b is out until \
                03:00 for the memory swap\" instead.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1830,6 +1932,7 @@ const SNAPSHOT_SCHEDULE_FIELDS: &[Field] = &[
         advanced: false,
         help: "What is snapshotted.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "everyHours",
@@ -1847,6 +1950,7 @@ const SNAPSHOT_SCHEDULE_FIELDS: &[Field] = &[
                own pool: it is the right tool for going back an hour, and it \
                is lost with the pool — which is what backups are for.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "keep",
@@ -1864,6 +1968,7 @@ const SNAPSHOT_SCHEDULE_FIELDS: &[Field] = &[
                the last one that worked. Snapshots taken by hand are never \
                expired.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1885,6 +1990,7 @@ const CAPTURE_FIELDS: &[Field] = &[
                times must not be — if you want a copy of a live guest, take a \
                backup instead.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "label",
@@ -1898,6 +2004,7 @@ const CAPTURE_FIELDS: &[Field] = &[
         help: "What the resulting image is called. Its digest is added to \
                this — a list of hashes is not something anybody chooses from.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "target",
@@ -1912,6 +2019,7 @@ const CAPTURE_FIELDS: &[Field] = &[
         help: "Where the bytes go. Any node that can reach the same path can \
                then boot guests from the image.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1932,6 +2040,7 @@ const BACKUP_TARGET_FIELDS: &[Field] = &[
                that managed its own mounts would be a second, worse copy of \
                what init already does.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "accepting",
@@ -1942,6 +2051,7 @@ const BACKUP_TARGET_FIELDS: &[Field] = &[
         help: "Turning this off stops new copies going here. What is already \
                here stays, and can still be restored from.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "agent",
@@ -1960,6 +2070,30 @@ const BACKUP_TARGET_FIELDS: &[Field] = &[
                nobody looks: copies are still written by the pool holding the \
                volume, and a path it cannot reach fails on the backup instead.",
         derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "verifyEveryHours",
+        label: "Read a copy back every",
+        kind: Kind::Number {
+            unit: "hours",
+            min: 0,
+            max: 8760,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: false,
+        help: "How often a copy here is read back and checked against what it \
+               hashed to when it was written. 0 never checks, which is the \
+               default: verification reads every byte of a copy, and that is \
+               real I/O somebody has to decide to spend. Without it, 'the \
+               backup exists' is the only thing anybody can say about it. One \
+               copy per pass, the one whose last check is stalest — so a target \
+               holding more copies checks each of them less often rather than \
+               falling behind on the work that is not optional.",
+        derived: false,
+        at_creation: false,
     },
 ];
 
@@ -1977,6 +2111,7 @@ const BACKUP_FIELDS: &[Field] = &[
         advanced: false,
         help: "What is copied.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "target",
@@ -1992,6 +2127,7 @@ const BACKUP_FIELDS: &[Field] = &[
                refused: a copy beside the original is a snapshot, and is lost \
                with the pool it is in.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -2009,6 +2145,7 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
         advanced: false,
         help: "What is copied.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "target",
@@ -2022,6 +2159,7 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
         advanced: false,
         help: "Where the copies go.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "everyHours",
@@ -2039,6 +2177,7 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
                interval rather than a cron line, because the only question \
                anybody asks a schedule is when it will next run.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "keep",
@@ -2056,6 +2195,7 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
                copies count, so a run of failures never expires the last one \
                that worked. Copies taken by hand are never expired.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -2073,6 +2213,7 @@ const DEVICE_CLASS_FIELDS: &[Field] = &[
         help: "vendor:device, as `lspci -n` prints it. Several, because a \
                fleet buys the same accelerator across board revisions.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "description",
@@ -2085,6 +2226,7 @@ const DEVICE_CLASS_FIELDS: &[Field] = &[
         advanced: false,
         help: "What to call it in this console.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -2105,6 +2247,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         help: "The network the address lives on. It scopes the service, so two \
                projects may front the same address on different networks.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "subnet",
@@ -2120,6 +2263,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
                address and a floating IP's, so no two of them are ever the \
                same address.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "listeners",
@@ -2134,6 +2278,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
                pool by connection, so one client's connection stays on one \
                member.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "members",
@@ -2151,6 +2296,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
                migrated guest stays in the pool. Empty holds the address and \
                forwards to nothing.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "vip",
@@ -2164,6 +2310,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         advanced: true,
         help: "Leave empty to be given the lowest address nothing else holds.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -2179,6 +2326,7 @@ const POOL_FIELDS: &[Field] = &[
         help: "Turning this off drains the pool: nothing new is provisioned \
                into it, what it holds stays.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "labels",
@@ -2191,6 +2339,7 @@ const POOL_FIELDS: &[Field] = &[
         advanced: false,
         help: "What a volume's placement matches on.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -2214,6 +2363,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "fromNode",
@@ -2227,6 +2377,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         advanced: false,
         help: "Where the guest is now. Taken from the instance.",
         derived: true,
+        at_creation: false,
     },
     Field {
         key: "toNode",
@@ -2241,6 +2392,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         help: "Only the nodes that can receive this guest can be chosen. The \
                rest are shown with the reason they cannot.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "mode",
@@ -2257,6 +2409,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         help: "What a failure costs. Under Live the guest stays where it is; \
                under Post-copy a failure mid-flight loses it.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "downtimeMs",
@@ -2273,6 +2426,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         help: "The pause the guest may take at the end. A busy guest needs a \
                larger budget or the transfer never converges.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "timeoutS",
@@ -2289,6 +2443,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         help: "A migration that cannot converge is one that runs until somebody \
                notices.",
         derived: false,
+        at_creation: false,
     },
     Field {
         key: "connections",
@@ -2305,6 +2460,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         help: "Parallel streams for the transfer. One is the only value a local \
                socket accepts.",
         derived: false,
+        at_creation: false,
     },
 ];
 
@@ -2320,6 +2476,7 @@ const OPERATION_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: true,
+        at_creation: false,
     },
     Field {
         key: "verb",
@@ -2332,6 +2489,7 @@ const OPERATION_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: true,
+        at_creation: false,
     },
     Field {
         key: "targetGeneration",
@@ -2347,6 +2505,7 @@ const OPERATION_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: true,
+        at_creation: false,
     },
     Field {
         key: "requestedBy",
@@ -2359,6 +2518,7 @@ const OPERATION_FIELDS: &[Field] = &[
         advanced: false,
         help: "",
         derived: true,
+        at_creation: false,
     },
 ];
 
@@ -2410,6 +2570,16 @@ pub const COLLECTIONS: &[Collection] = &[
                 label: "Address",
                 cell: Cell::Mono,
                 width: 136,
+            },
+            // Beside the vCPU and memory columns, deliberately: those two are
+            // read off `spec`, and this is the column that says whether the
+            // guest is actually running on them. Without it the board showed
+            // eight vCPUs for a machine running on two, converged and green.
+            Column {
+                path: "status.pendingChanges.0.field",
+                label: "Awaiting restart",
+                cell: Cell::Text,
+                width: 128,
             },
         ],
         agreements: &[
@@ -3140,6 +3310,26 @@ pub const COLLECTIONS: &[Collection] = &[
                 cell: Cell::Ago,
                 width: 112,
             },
+            // "Copied" says an agent once wrote bytes. This says somebody has
+            // since read them back, which is a different and much stronger
+            // claim — and the one an operator actually wants before a restore.
+            // Empty means nobody has looked: either the target was never asked
+            // to (`verifyEveryHours` is 0) or its turn has not come.
+            Column {
+                path: "status.verifiedAt",
+                label: "Read back",
+                cell: Cell::Ago,
+                width: 112,
+            },
+            // Last, and text: a copy that failed verification is the one row
+            // on this board somebody has to act on, and it says what was found
+            // rather than a flag they have to go and interpret.
+            Column {
+                path: "status.verifyError",
+                label: "Trouble",
+                cell: Cell::Text,
+                width: 240,
+            },
         ],
         agreements: &[],
         creatable: true,
@@ -3478,10 +3668,23 @@ pub const COLLECTIONS: &[Collection] = &[
             },
         ],
         agreements: &[],
-        // A pool comes into existence when its agent registers one, the same
-        // way a node does. Creating one here would be describing a backend
-        // nobody has attached.
-        creatable: false,
+        // A pool is declared here first, then claimed by an agent — the same
+        // two halves as a node, and for the same reason.
+        //
+        // This used to be false, on the argument that creating one would be
+        // "describing a backend nobody has attached". That stopped being true
+        // when nodes became creatable: the cell is told a machine is coming,
+        // and the machine is then told what it is. A pool has exactly that
+        // shape, and the id in a machine's seed has to match a pool object —
+        // a mismatch is a pool that claims nothing and volumes that are never
+        // provisioned, with nothing anywhere saying so. Creating the object
+        // here, before the seed is written, is what makes the two agree.
+        //
+        // Unlike a node it mints no credential: a pool agent authenticates
+        // with a token an operator supplies. Worth knowing, and not a reason
+        // to keep the object un-creatable — it is a reason the form does not
+        // pretend to hand one out.
+        creatable: true,
         editable: true,
         deletable: false,
         explainable: false,
