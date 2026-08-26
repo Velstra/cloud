@@ -96,7 +96,7 @@ async fn a_request_for_another_cells_project_is_delivered_there() {
         .create(
             "projects/p1",
             "instances",
-            &json!({"id": "i1", "spec": {"vcpus": 1, "memoryMib": 512}}),
+            &json!({"id": "i1", "spec": {"vcpus": 1, "memory_mib": 512}}),
             &who(),
         )
         .await
@@ -140,7 +140,7 @@ async fn a_request_for_this_cells_project_is_answered_here() {
     api.create(
         "projects/p1",
         "instances",
-        &json!({"id": "i1", "spec": {"vcpus": 1, "memoryMib": 512}}),
+        &json!({"id": "i1", "spec": {"vcpus": 1, "memory_mib": 512}}),
         &who(),
     )
     .await
@@ -177,7 +177,7 @@ async fn a_project_with_no_home_is_answered_without_a_hop() {
     api.create(
         "projects/p1",
         "instances",
-        &json!({"id": "i1", "spec": {"vcpus": 1, "memoryMib": 512}}),
+        &json!({"id": "i1", "spec": {"vcpus": 1, "memory_mib": 512}}),
         &who(),
     )
     .await

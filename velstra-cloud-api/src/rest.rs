@@ -186,9 +186,7 @@ async fn set_password(
     if own {
         let current = body.current_password.as_deref().unwrap_or_default();
         if !api.identity().verify_current(&id, current).await? {
-            return Err(ApiError::forbidden(
-                "the current password was not correct",
-            ));
+            return Err(ApiError::forbidden("the current password was not correct"));
         }
     }
     // Changing your own password ends your other sessions and not the one you
@@ -241,6 +239,17 @@ enum Target {
     Collection { parent: String, kind: String },
     Object(ResourceName),
     Verb { name: ResourceName, verb: String },
+    /// A custom method on a whole collection: `nodes:explainCpu`.
+    ///
+    /// Some answers are about a set rather than a member. Which nodes can
+    /// exchange guests is a property of the fleet, and hanging it off an
+    /// arbitrary node would make the answer look like that node's while being
+    /// the same for every one of them.
+    CollectionVerb {
+        parent: String,
+        kind: String,
+        verb: String,
+    },
 }
 
 fn target(path: &str) -> ApiResult<Target> {
@@ -253,9 +262,21 @@ fn target(path: &str) -> ApiResult<Target> {
     // `…/instances/i1:explainPlacement` — the custom-method form AIP-136 uses,
     // and the only thing in this API that is not a plain name.
     if let Some((name, verb)) = path.rsplit_once(':') {
-        let name = ResourceName::parse(name)?;
-        return Ok(Target::Verb {
-            name,
+        // An object name if it parses as one, a collection otherwise. Tried in
+        // that order because an object name is the common case and the more
+        // specific shape; a collection path has an odd number of segments and
+        // would never parse as a name.
+        if let Ok(name) = ResourceName::parse(name) {
+            return Ok(Target::Verb {
+                name,
+                verb: verb.to_string(),
+            });
+        }
+        let segments: Vec<&str> = name.split('/').collect();
+        let (kind, parent) = segments.split_last().expect("split never yields nothing");
+        return Ok(Target::CollectionVerb {
+            parent: parent.join("/"),
+            kind: kind.to_string(),
             verb: verb.to_string(),
         });
     }
@@ -308,6 +329,38 @@ async fn read(
         Target::Verb { name, verb } if verb == "explainMigration" => {
             Ok(Json(api.explain_migration(&name, &who).await?).into_response())
         }
+        Target::Verb { name, verb } if verb == "explainReach" => {
+            Ok(Json(api.explain_reach(&name, &who).await?).into_response())
+        }
+        Target::Verb { name, verb } if verb == "explainQuota" => {
+            Ok(Json(api.explain_quota(&name, &who).await?).into_response())
+        }
+        Target::Verb { name, verb } if verb == "explainMaintenance" => {
+            Ok(Json(api.explain_maintenance(&name, &who).await?).into_response())
+        }
+        Target::Verb { name, verb } if verb == "explainRecovery" => {
+            Ok(Json(api.explain_recovery(&name, &who).await?).into_response())
+        }
+        // `parent` must be empty: nodes are a cell's, not a project's, and
+        // `projects/p1/nodes:explainCpu` reading as the whole cell's report
+        // would be an answer about somebody else's machines.
+        Target::CollectionVerb { parent, kind, verb }
+            if parent.is_empty() && kind == "nodes" && verb == "explainCpu" =>
+        {
+            Ok(Json(api.explain_cpu(&who).await?).into_response())
+        }
+        Target::CollectionVerb { parent, kind, verb }
+            if parent.is_empty() && kind == "nodes" && verb == "explainCapacity" =>
+        {
+            Ok(Json(api.explain_capacity(&who).await?).into_response())
+        }
+        Target::CollectionVerb { parent, kind, verb } => Err(ApiError::invalid(if parent
+            .is_empty()
+        {
+            format!("{kind} has no method {verb:?}")
+        } else {
+            format!("{parent}/{kind} has no method {verb:?}")
+        })),
         Target::Verb { verb, .. } => Err(ApiError::invalid(format!(
             "there is no method called {verb}"
         ))),
@@ -326,6 +379,36 @@ async fn read(
                 (Some(node), None) => Filter::for_node(node),
                 (None, Some(pool)) => Filter::for_pool(pool),
                 (None, None) => Filter::none(),
+            };
+            // `?labels=env=prod,tier=web`. Every term must match; an "or"
+            // would need precedence rules, and a filter whose meaning depends
+            // on precedence is one people get wrong silently.
+            //
+            // A selector that matches nothing is an empty list, not an error:
+            // "no guests are tagged that" is an answer, and refusing it would
+            // make a typo look like a broken endpoint.
+            // `?target=projects/p1/instances/i1` — the records *about* one
+            // object. Only `operations` and `audit` carry a target, and asking
+            // any other collection for one is a caller who has misunderstood
+            // rather than one who should get the whole cell back.
+            let filter = match query.get("target") {
+                Some(_) if kind != "operations" && kind != "audit" => {
+                    return Err(ApiError::invalid(format!(
+                        "{kind} are not records about another object; only operations and audit                          carry a target"
+                    )));
+                }
+                Some(target) => Filter {
+                    target: Some(target.clone()),
+                    ..filter
+                },
+                None => filter,
+            };
+            let filter = match query.get("labels") {
+                Some(text) => Filter {
+                    labels: velstra_cloud_model::meta::parse_selector(text),
+                    ..filter
+                },
+                None => filter,
             };
             if query.get("watch").map(|w| w == "true").unwrap_or(false) {
                 return watch(api, &parent, &kind, query.get("fromRevision"), filter, &who).await;
@@ -362,12 +445,36 @@ async fn create(
     State(api): State<Api>,
     Extension(identity): Extension<Identity>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Response> {
-    let Target::Collection { parent, kind } = target(&path)? else {
-        return Err(ApiError::invalid(
-            "a create posts to a collection; the id goes in the body, not in the path",
-        ));
+    let (parent, kind) = match target(&path)? {
+        Target::Collection { parent, kind } => (parent, kind),
+        // A node agent's status write, AIP-136's custom-method shape: a POST to
+        // `…/instances/i1:reportStatus`. It is here rather than on PATCH because
+        // PATCH is the client's spec-only surface by contract, and a status write
+        // is a different caller (a node) doing a different thing.
+        Target::Verb { name, verb } if verb == "reportStatus" => {
+            let reported = api
+                .report_status(&name, &document(&body)?, if_match(&headers)?, &identity)
+                .await?;
+            return Ok(object(StatusCode::OK, reported));
+        }
+        Target::CollectionVerb { verb, .. } => {
+            return Err(ApiError::invalid(format!(
+                "{verb:?} is not something that can be posted to a collection"
+            )));
+        }
+        Target::Verb { verb, .. } => {
+            return Err(ApiError::invalid(format!(
+                "there is no method called {verb} on a create"
+            )));
+        }
+        Target::Object(_) => {
+            return Err(ApiError::invalid(
+                "a create posts to a collection; the id goes in the body, not in the path",
+            ));
+        }
     };
     let created = api
         .create(&parent, &kind, &document(&body)?, &identity)

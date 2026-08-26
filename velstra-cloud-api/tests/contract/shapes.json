@@ -1,0 +1,504 @@
+{
+  "audit?target=projects/p1/instances/web-1": {
+    "items": [
+      {
+        "meta": {
+          "createdAt": "number",
+          "deletedAt": "null",
+          "finalizers": [],
+          "generation": "number",
+          "labels": {},
+          "name": "string",
+          "placement": {
+            "cell": "string",
+            "region": "string"
+          },
+          "revision": "string",
+          "uid": "string"
+        },
+        "spec": {
+          "at": "number",
+          "detail": "string",
+          "kind": "string",
+          "subject": "string",
+          "target": "string",
+          "verb": "string"
+        },
+        "status": {
+          "conditions": [],
+          "observedGeneration": "number"
+        }
+      }
+    ],
+    "revision": "string"
+  },
+  "maintenance-windows": {
+    "items": [
+      {
+        "meta": {
+          "createdAt": "number",
+          "deletedAt": "null",
+          "finalizers": [],
+          "generation": "number",
+          "labels": {},
+          "name": "string",
+          "placement": {
+            "cell": "string",
+            "region": "string"
+          },
+          "revision": "string",
+          "uid": "string"
+        },
+        "spec": {
+          "drain": "bool",
+          "minutes": "number",
+          "node": "string",
+          "note": "string",
+          "startsAt": "number"
+        },
+        "status": {
+          "conditions": [],
+          "observedGeneration": "number"
+        }
+      }
+    ],
+    "revision": "string"
+  },
+  "nodes": {
+    "items": [
+      {
+        "meta": {
+          "createdAt": "number",
+          "deletedAt": "null",
+          "finalizers": [],
+          "generation": "number",
+          "labels": {},
+          "name": "string",
+          "placement": {
+            "cell": "string",
+            "region": "string"
+          },
+          "revision": "string",
+          "uid": "string"
+        },
+        "spec": {
+          "evacuate": "bool",
+          "fenceAfterS": "number",
+          "gateway": "bool",
+          "labels": [],
+          "schedulable": "bool",
+          "vcpuOvercommit": "number"
+        },
+        "status": {
+          "agentVersion": "string",
+          "allocated": {
+            "diskGib": "number",
+            "hugepages1gi": "number",
+            "memoryMib": "number",
+            "numaFreeMib": [],
+            "vcpus": "number"
+          },
+          "capacity": {
+            "diskGib": "number",
+            "hugepages1gi": "number",
+            "memoryMib": "number",
+            "numaFreeMib": [
+              "number"
+            ],
+            "vcpus": "number"
+          },
+          "conditions": [
+            {
+              "kind": "string",
+              "lastTransition": "number",
+              "message": "string",
+              "observedGeneration": "number",
+              "reason": "string",
+              "status": "string"
+            }
+          ],
+          "cpu": {
+            "arch": "string",
+            "canMask": "bool",
+            "family": "number",
+            "flags": [
+              "string"
+            ],
+            "model": "number",
+            "modelName": "string",
+            "presentedFlags": [
+              "string"
+            ],
+            "presents": "string",
+            "stepping": "number",
+            "vendor": "string"
+          },
+          "devices": [
+            {
+              "kernelName": "string",
+              "model": "string",
+              "path": "string",
+              "rotational": "bool",
+              "serial": "string",
+              "sizeGib": "number",
+              "state": {
+                "kind": "string"
+              }
+            }
+          ],
+          "images": [
+            "string"
+          ],
+          "lastHeartbeat": "number",
+          "observedGeneration": "number"
+        }
+      }
+    ],
+    "revision": "string"
+  },
+  "nodes/node-a": {
+    "meta": {
+      "createdAt": "number",
+      "deletedAt": "null",
+      "finalizers": [],
+      "generation": "number",
+      "labels": {},
+      "name": "string",
+      "placement": {
+        "cell": "string",
+        "region": "string"
+      },
+      "revision": "string",
+      "uid": "string"
+    },
+    "spec": {
+      "evacuate": "bool",
+      "fenceAfterS": "number",
+      "gateway": "bool",
+      "labels": [],
+      "schedulable": "bool",
+      "vcpuOvercommit": "number"
+    },
+    "status": {
+      "agentVersion": "string",
+      "allocated": {
+        "diskGib": "number",
+        "hugepages1gi": "number",
+        "memoryMib": "number",
+        "numaFreeMib": [],
+        "vcpus": "number"
+      },
+      "capacity": {
+        "diskGib": "number",
+        "hugepages1gi": "number",
+        "memoryMib": "number",
+        "numaFreeMib": [
+          "number"
+        ],
+        "vcpus": "number"
+      },
+      "conditions": [
+        {
+          "kind": "string",
+          "lastTransition": "number",
+          "message": "string",
+          "observedGeneration": "number",
+          "reason": "string",
+          "status": "string"
+        }
+      ],
+      "cpu": {
+        "arch": "string",
+        "canMask": "bool",
+        "family": "number",
+        "flags": [
+          "string"
+        ],
+        "model": "number",
+        "modelName": "string",
+        "presentedFlags": [
+          "string"
+        ],
+        "presents": "string",
+        "stepping": "number",
+        "vendor": "string"
+      },
+      "devices": [
+        {
+          "kernelName": "string",
+          "model": "string",
+          "path": "string",
+          "rotational": "bool",
+          "serial": "string",
+          "sizeGib": "number",
+          "state": {
+            "kind": "string"
+          }
+        }
+      ],
+      "images": [
+        "string"
+      ],
+      "lastHeartbeat": "number",
+      "observedGeneration": "number"
+    }
+  },
+  "nodes/node-a:explainMaintenance": {
+    "cannotMove": [],
+    "draining": "bool",
+    "next": "null",
+    "node": "string",
+    "open": "null",
+    "willMove": []
+  },
+  "nodes/node-b:explainMaintenance": {
+    "cannotMove": [],
+    "draining": "bool",
+    "next": "null",
+    "node": "string",
+    "open": {
+      "drain": "bool",
+      "endsAt": "number",
+      "minutes": "number",
+      "note": "string",
+      "opensInMinutes": "null",
+      "startsAt": "number",
+      "window": "string"
+    },
+    "willMove": []
+  },
+  "nodes:explainCapacity": {
+    "allocated": {
+      "diskGib": "number",
+      "memoryMib": "number",
+      "vcpus": "number"
+    },
+    "free": {
+      "diskGib": "number",
+      "memoryMib": "number",
+      "vcpus": "number"
+    },
+    "largestFit": {
+      "diskGib": "number",
+      "memoryMib": "number",
+      "vcpus": "number"
+    },
+    "offeredVcpus": "number",
+    "total": {
+      "diskGib": "number",
+      "memoryMib": "number",
+      "vcpus": "number"
+    },
+    "unusableNodes": "number",
+    "usableNodes": "number"
+  },
+  "nodes:explainCpu": {
+    "advice": [
+      {
+        "featuresLost": [
+          {
+            "flags": [
+              "string"
+            ],
+            "node": "string"
+          }
+        ],
+        "kind": "string",
+        "level": "string",
+        "nodes": [
+          "string"
+        ]
+      }
+    ],
+    "domains": [
+      {
+        "arch": "string",
+        "canBaseline": "bool",
+        "level": "string",
+        "nodes": [
+          "string"
+        ]
+      }
+    ],
+    "pendingAdoption": [],
+    "unreported": []
+  },
+  "projects/p1/instances": {
+    "items": [
+      {
+        "meta": {
+          "createdAt": "number",
+          "deletedAt": "null",
+          "finalizers": [],
+          "generation": "number",
+          "labels": {},
+          "name": "string",
+          "placement": {
+            "cell": "string",
+            "region": "string"
+          },
+          "revision": "string",
+          "uid": "string"
+        },
+        "spec": {
+          "console": "bool",
+          "desiredState": "string",
+          "image": "string",
+          "memoryMib": "number",
+          "node": "string",
+          "onNodeLoss": "string",
+          "placementPolicy": {
+            "affinity": "string",
+            "antiAffinityGroup": "null",
+            "requiredLabels": [],
+            "spread": "string"
+          },
+          "ports": [],
+          "rootDiskGib": "number",
+          "sshKeys": [],
+          "startDelayS": "number",
+          "startOrder": "number",
+          "userData": "null",
+          "vcpus": "number"
+        },
+        "status": {
+          "addresses": [
+            "string"
+          ],
+          "conditions": [],
+          "consoleBytes": "number",
+          "node": "string",
+          "observedGeneration": "number",
+          "startedAt": "null",
+          "state": "string",
+          "vmmPid": "null"
+        }
+      }
+    ],
+    "revision": "string"
+  },
+  "projects/p1/instances/web-1": {
+    "meta": {
+      "createdAt": "number",
+      "deletedAt": "null",
+      "finalizers": [],
+      "generation": "number",
+      "labels": {},
+      "name": "string",
+      "placement": {
+        "cell": "string",
+        "region": "string"
+      },
+      "revision": "string",
+      "uid": "string"
+    },
+    "spec": {
+      "console": "bool",
+      "desiredState": "string",
+      "image": "string",
+      "memoryMib": "number",
+      "node": "string",
+      "onNodeLoss": "string",
+      "placementPolicy": {
+        "affinity": "string",
+        "antiAffinityGroup": "null",
+        "requiredLabels": [],
+        "spread": "string"
+      },
+      "ports": [],
+      "rootDiskGib": "number",
+      "sshKeys": [],
+      "startDelayS": "number",
+      "startOrder": "number",
+      "userData": "null",
+      "vcpus": "number"
+    },
+    "status": {
+      "addresses": [
+        "string"
+      ],
+      "conditions": [],
+      "consoleBytes": "number",
+      "node": "string",
+      "observedGeneration": "number",
+      "startedAt": "null",
+      "state": "string",
+      "vmmPid": "null"
+    }
+  },
+  "projects/p1/instances/web-1:explainMigration": {
+    "destinations": [
+      {
+        "allowed": "bool",
+        "detail": "string",
+        "node": "string",
+        "why": "string"
+      }
+    ],
+    "from": "string"
+  },
+  "projects/p1/instances/web-1:explainPlacement": {
+    "placed": "string",
+    "rejected": []
+  },
+  "projects/p1/instances/web-1:explainRecovery": {
+    "detail": "string",
+    "node": "string",
+    "recoverable": "bool",
+    "why": "string"
+  },
+  "projects/p1/operations?target=projects/p1/instances/web-1": {
+    "items": [
+      {
+        "meta": {
+          "createdAt": "number",
+          "deletedAt": "null",
+          "finalizers": [],
+          "generation": "number",
+          "labels": {},
+          "name": "string",
+          "placement": {
+            "cell": "string",
+            "region": "string"
+          },
+          "revision": "string",
+          "uid": "string"
+        },
+        "spec": {
+          "requestedBy": "string",
+          "target": "string",
+          "targetGeneration": "number",
+          "verb": "string"
+        },
+        "status": {
+          "conditions": [],
+          "done": "bool",
+          "error": "null",
+          "finishedAt": "null",
+          "observedGeneration": "number"
+        }
+      }
+    ],
+    "revision": "string"
+  },
+  "projects/p1:explainQuota": {
+    "dimensions": [
+      {
+        "exhausted": "bool",
+        "left": "number",
+        "limit": "number",
+        "name": "string",
+        "unlimited": "bool",
+        "used": "number"
+      }
+    ],
+    "largestStartable": {
+      "memoryLimitedBy": "string",
+      "memoryMib": "number",
+      "none": "bool",
+      "vcpus": "number",
+      "vcpusLimitedBy": "string"
+    },
+    "project": "string"
+  }
+}

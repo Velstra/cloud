@@ -45,7 +45,7 @@ async fn make_instance(api: &Api, project: &str, id: &str) -> Result<(), String>
     api.create(
         &format!("projects/{project}"),
         "instances",
-        &json!({"id": id, "spec": {"vcpus": 1, "memoryMib": 512}}),
+        &json!({"id": id, "spec": {"vcpus": 1, "memory_mib": 512}}),
         &who(),
     )
     .await

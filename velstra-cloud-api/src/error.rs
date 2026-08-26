@@ -85,6 +85,12 @@ pub struct ApiError {
     /// Set on a conflict: what the object is actually at now, so the client can
     /// re-read from the answer rather than guess.
     pub revision: Option<Revision>,
+    /// Milliseconds until this exact request would be accepted.
+    ///
+    /// Only a rate limit sets it. Carried rather than left to the client: one
+    /// that retries immediately turns a refusal into a loop, and one that backs
+    /// off arbitrarily waits far longer than it needed to.
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ApiError {
@@ -94,11 +100,17 @@ impl ApiError {
             message: message.into(),
             field: None,
             revision: None,
+            retry_after_ms: None,
         }
     }
 
     pub fn at(mut self, field: impl Into<String>) -> Self {
         self.field = Some(field.into());
+        self
+    }
+
+    pub fn retry_after(mut self, millis: u64) -> Self {
+        self.retry_after_ms = Some(millis);
         self
     }
 
@@ -131,6 +143,7 @@ impl ApiError {
             ),
             field: Some("meta.revision".into()),
             revision: Some(current),
+            retry_after_ms: None,
         }
     }
 }
@@ -163,6 +176,14 @@ struct Envelope {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.code.http();
+        // `Retry-After` in seconds, because that is what the header is defined
+        // as and what every client library reads — rounded **up**, so a client
+        // that obeys it to the letter is never turned away a second time. The
+        // millisecond figure is in the sentence for anybody who wants to wait
+        // exactly as long as they have to.
+        let retry_after = self
+            .retry_after_ms
+            .map(|ms| [(axum::http::header::RETRY_AFTER, ms.div_ceil(1000).max(1).to_string())]);
         let body = Body {
             error: Envelope {
                 code: self.code.as_str(),
@@ -171,7 +192,10 @@ impl IntoResponse for ApiError {
                 revision: self.revision.map(|r| r.to_string()),
             },
         };
-        (status, Json(body)).into_response()
+        match retry_after {
+            Some(headers) => (status, headers, Json(body)).into_response(),
+            None => (status, Json(body)).into_response(),
+        }
     }
 }
 
@@ -236,15 +260,32 @@ impl From<TypedError> for ApiError {
             // gets here. If one arrives anyway, it is still the client's
             // mistake and it is still named after the field it touched.
             TypedError::Refused(r) => {
-                let field = match &r {
-                    WriteRefused::SpecIsNotYours { .. } => Some("spec"),
-                    WriteRefused::StatusIsNotYours { .. } => Some("status"),
-                    WriteRefused::MetaIsNotYours { .. } => Some("meta"),
-                    _ => None,
-                };
-                let mut err = ApiError::new(Code::InvalidArgument, r.to_string());
-                err.field = field.map(str::to_string);
-                err
+                // Two shapes of refusal, and they are different kinds of no. One
+                // is "you wrote the wrong half of an object you may touch" — a
+                // client sending `status` on a spec write — which is a 400 named
+                // after the field. The other is "that object, or that verb, is
+                // not yours": a node writing another node's status, creating an
+                // object, or deleting one. That is a permission failure, and
+                // answering it as an invalid argument would tell an agent to fix
+                // its request when the request was refused on principle.
+                match &r {
+                    WriteRefused::NotYourObject { .. }
+                    | WriteRefused::CreateIsNotYours { .. }
+                    | WriteRefused::DeleteIsNotYours { .. } => {
+                        ApiError::new(Code::PermissionDenied, r.to_string())
+                    }
+                    _ => {
+                        let field = match &r {
+                            WriteRefused::SpecIsNotYours { .. } => Some("spec"),
+                            WriteRefused::StatusIsNotYours { .. } => Some("status"),
+                            WriteRefused::MetaIsNotYours { .. } => Some("meta"),
+                            _ => None,
+                        };
+                        let mut err = ApiError::new(Code::InvalidArgument, r.to_string());
+                        err.field = field.map(str::to_string);
+                        err
+                    }
+                }
             }
             TypedError::Corrupt { kind, source } => {
                 ApiError::internal(format!("a stored {kind} could not be read: {source}"))

@@ -80,6 +80,17 @@ fn fields(kind: &str) -> &'static [(&'static str, Form)] {
         // whose port is deleted is precisely the state a floating IP exists to
         // be in — the address is held while the machine behind it is replaced.
         "floatingips" => &[("subnet", Form::Name), ("port", Form::Name)],
+        // `members` is deliberately **not** shape-only on delete: it is in this
+        // table, so a port a pool still names cannot be deleted out from under
+        // it (see `REFERRING_KINDS`). At write time it is checked for shape
+        // like every list of names — a member may be created after the load
+        // balancer that names it, and the controller waits for the whole pool
+        // rather than balancing across part of one.
+        "load-balancers" => &[
+            ("network", Form::Name),
+            ("subnet", Form::Name),
+            ("members", Form::Name),
+        ],
         "projects" => &[("parent", Form::Name)],
         _ => &[],
     }
@@ -103,6 +114,7 @@ pub const REFERRING_KINDS: &[&str] = &[
     "projects",
     "routers",
     "floatingips",
+    "load-balancers",
 ];
 
 /// Every resource this spec names, in full-name form.

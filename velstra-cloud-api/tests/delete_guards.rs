@@ -67,7 +67,7 @@ async fn cell() -> Api {
         &json!({"id": "pt1", "spec": {
             "network": "projects/p1/networks/n1",
             "subnet": "projects/p1/subnets/s1",
-            "securityGroups": []
+            "security_groups": []
         }}),
         &who(),
     )
@@ -77,8 +77,13 @@ async fn cell() -> Api {
         "projects/p1",
         "instances",
         &json!({"id": "i1", "spec": {
-            "vcpus": 1, "memoryMib": 512, "rootDiskGib": 1,
-            "desiredState": "Running",
+            // Spelled as the model spells it: this calls the API core
+            // directly, and the camelCase→snake_case conversion is the REST
+            // layer's. Written the other way these three fields were silently
+            // ignored, and the fixture quietly described a guest it was not
+            // creating.
+            "vcpus": 1, "memory_mib": 512, "root_disk_gib": 1,
+            "desired_state": "Running",
             "ports": ["projects/p1/ports/pt1"]
         }}),
         &who(),

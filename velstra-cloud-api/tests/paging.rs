@@ -117,7 +117,7 @@ async fn cell_of(n: usize) -> (Arc<Counting>, Api) {
             // Zero-padded so name order and creation order agree, which is what
             // makes "exactly once, in order" a statement about paging rather
             // than about how the ids happen to sort.
-            &json!({"id": format!("i{i:04}"), "spec": {"vcpus": 1, "memoryMib": 512}}),
+            &json!({"id": format!("i{i:04}"), "spec": {"vcpus": 1, "memory_mib": 512}}),
             &who(),
         )
         .await
@@ -304,7 +304,7 @@ async fn a_token_from_another_collection_is_refused_rather_than_answered() {
 async fn a_token_that_this_api_did_not_issue_is_refused() {
     assert!(PageToken::decode("not-base64-!!").is_err());
     assert!(
-        PageToken::decode("aGVsbG8").is_err(),
+        PageToken::decode("a_g_vsb_g8").is_err(),
         "a decodable but meaningless token was accepted"
     );
 }
@@ -355,7 +355,7 @@ async fn every_page_of_a_walk_reports_where_the_walk_started() {
     api.create(
         "projects/p1",
         "instances",
-        &json!({"id": "i9999", "spec": {"vcpus": 1, "memoryMib": 512}}),
+        &json!({"id": "i9999", "spec": {"vcpus": 1, "memory_mib": 512}}),
         &who(),
     )
     .await

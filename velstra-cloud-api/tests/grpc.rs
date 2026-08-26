@@ -85,6 +85,11 @@ fn instance(name: &str, vcpus: u32) -> v1::Instance {
             ..Default::default()
         }),
         spec: Some(v1::InstanceSpec {
+            start_order: 0,
+            start_delay_s: 0,
+            on_node_loss: Default::default(),
+            console: false,
+            devices: Vec::new(),
             vcpus,
             memory_mib: 2048,
             ..Default::default()

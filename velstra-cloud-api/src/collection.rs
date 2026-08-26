@@ -97,10 +97,41 @@ pub trait Collection: Send + Sync {
     /// the failure, in its own words and without the field.
     fn check_spec(&self, spec: &Value) -> ApiResult<()>;
 
+    /// Refuse a field this platform has never heard of.
+    ///
+    /// Serde ignores what it does not recognise, which is the right default for
+    /// **reading stored objects** — a field removed from the code must not make
+    /// yesterday's data unreadable — and precisely the wrong answer at the
+    /// door. An operator who sets `memoryOvercommit: 2`, is answered `200`, and
+    /// goes home believing memory is overcommitted has been told something
+    /// untrue by a success.
+    ///
+    /// So the strictness lives here, at the boundary, and not on the types.
+    fn check_known(&self, sent: &Value) -> ApiResult<()>;
+
     /// Create from a complete `meta` and a complete `spec`.
     async fn create(&self, meta: Value, spec: Value) -> ApiResult<Value>;
     async fn patch(&self, name: &str, patch: &Patch, expect: Option<Revision>) -> ApiResult<Value>;
     async fn delete(&self, name: &str, expect: Option<Revision>) -> ApiResult<Deleted>;
+
+    /// Write only the `status` of an object, as `writer` — the one write a node
+    /// agent makes, and the seam that makes `--api` mode a real trust boundary.
+    ///
+    /// The stored `spec` and `meta` are kept verbatim: an agent that sent a
+    /// different spec through this path changes nothing, because this reads the
+    /// stored object and overlays only the incoming status onto it. The write
+    /// then goes through the same `store.update` every writer uses, so
+    /// [`velstra_cloud_model::access::judge`] does the enforcing — a node may
+    /// write status only of an object it owns or was assigned, and touching spec
+    /// or another node's object is refused there, in one place, rather than
+    /// re-checked here.
+    async fn report_status(
+        &self,
+        name: &str,
+        status: &Value,
+        expect: Option<Revision>,
+        writer: &Writer,
+    ) -> ApiResult<Value>;
 
     fn watch(&self, from: Option<Revision>) -> tokio::sync::mpsc::Receiver<Event>;
 
@@ -234,7 +265,13 @@ where
         // never completes in a cell whose controllers are down.
         let gone = may_delete(&resource.meta);
         if gone {
-            self.store.delete(name, resource.meta.revision).await?;
+            self.store
+                .delete(
+                    name,
+                    resource.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller("collection"),
+                )
+                .await?;
         }
         Ok(Deleted {
             resource: Self::document(&resource)?,
@@ -289,11 +326,57 @@ where
         }
     }
 
+    fn check_known(&self, sent: &Value) -> ApiResult<()> {
+        let Some(fields) = sent.as_object() else {
+            return Ok(());
+        };
+        // What the type knows, in both directions: the fields a default value
+        // renders, plus the fields that survive a round trip of what was sent.
+        // The second half matters because a field marked "skip when empty" is
+        // absent from the first — and a patch that sets exactly such a field
+        // would otherwise be refused for naming a field it does have.
+        let mut merged = self.empty_spec();
+        overlay(&mut merged, sent);
+        let echoed = serde_json::from_value::<S>(merged)
+            .ok()
+            .and_then(|s| serde_json::to_value(s).ok())
+            .unwrap_or_else(|| json!({}));
+        let known = |key: &str| {
+            echoed.get(key).is_some() || self.empty_spec().get(key).is_some()
+        };
+
+        for (key, value) in fields {
+            if known(key) {
+                continue;
+            }
+            // An unknown field carrying nothing is somebody echoing back an
+            // object, or clearing something: no intention was lost, so there is
+            // nothing to tell them about. What is refused is a field somebody
+            // *set*, because that is the one where saying `200` would be
+            // agreeing to something that will not happen.
+            if is_nothing(value) {
+                continue;
+            }
+            return Err(ApiError::invalid(format!(
+                "there is no field called {key} on a {}; nothing would have been done with it",
+                self.kind()
+            ))
+            .at(format!("spec.{key}")));
+        }
+        Ok(())
+    }
+
     async fn create(&self, meta: Value, spec: Value) -> ApiResult<Value> {
         let document = json!({ "meta": meta, "spec": spec, "status": T::default() });
         let mut resource: Resource<S, T> = serde_json::from_value(document)
             .map_err(|e| blame::<S>(&spec, &self.empty_spec(), e))?;
-        let revision = self.store.create(&resource).await?;
+        let revision = self
+            .store
+            .create(
+                &resource,
+                &velstra_cloud_model::access::Writer::controller("collection"),
+            )
+            .await?;
         resource.meta.revision = revision;
         Self::document(&resource)
     }
@@ -318,6 +401,43 @@ where
             }
         }
         Err(last.expect("a loop that fell through has an error"))
+    }
+
+    async fn report_status(
+        &self,
+        name: &str,
+        status: &Value,
+        expect: Option<Revision>,
+        writer: &Writer,
+    ) -> ApiResult<Value> {
+        let stored = self.read(name).await?;
+        if let Some(expected) = expect {
+            // The agent's own compare-and-swap: it read the object, acted, and is
+            // writing the status it observed against the revision it read. A
+            // mismatch means the object moved under it, and the next pass redoes
+            // the work against the new one — exactly as a direct-store report does.
+            if expected != stored.meta.revision {
+                return Err(ApiError::conflict(stored.meta.revision));
+            }
+        }
+        // Overlay only the status onto the stored object. The spec and metadata
+        // are kept as stored, so an agent cannot change them here whatever it
+        // sends — and `judge` refuses the write outright if the overlaid status
+        // is not this agent's to write.
+        let mut document = Self::document(&stored)?;
+        document["status"] = status.clone();
+        let mut next: Resource<S, T> = serde_json::from_value(document).map_err(|e| {
+            ApiError::invalid(format!("that is not a valid status: {e}")).at("status")
+        })?;
+        next.meta.revision = stored.meta.revision;
+        if next.status == stored.status {
+            // An unchanged report writes nothing, the same quiet a converged
+            // agent has against the store directly.
+            return Self::document(&stored);
+        }
+        let revision = self.store.update(&next, writer).await?;
+        next.meta.revision = revision;
+        Self::document(&next)
     }
 
     fn watch(&self, from: Option<Revision>) -> tokio::sync::mpsc::Receiver<Event> {
@@ -348,6 +468,36 @@ where
 /// Only on the error path, and only until it finds the culprit. If two fields
 /// are wrong at once no single swap fixes it, and the caller gets the plain
 /// message — which is exactly what it would have got anyway.
+/// Copy `patch` onto `into`, one level at a time, keeping keys neither knows.
+///
+/// Unknown keys are kept deliberately: they are the whole point of the caller.
+fn overlay(into: &mut Value, patch: &Value) {
+    let (Some(into), Some(patch)) = (into.as_object_mut(), patch.as_object()) else {
+        *into = patch.clone();
+        return;
+    };
+    for (key, value) in patch {
+        match into.get_mut(key) {
+            Some(existing) if existing.is_object() && value.is_object() => overlay(existing, value),
+            _ => {
+                into.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Whether a value carries no intention: absent, empty, or zero.
+fn is_nothing(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        Value::Bool(b) => !b,
+        Value::Number(n) => n.as_f64() == Some(0.0),
+    }
+}
+
 fn blame<S: DeserializeOwned>(
     spec: &Value,
     known_good: &Value,

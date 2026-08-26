@@ -66,6 +66,43 @@ struct Args {
     #[arg(long)]
     cell_admin: Vec<String>,
 
+    /// Another cell this installation can reach: `cell-2=https://cell-2:8443`.
+    /// Repeatable, and `VELSTRA_CELLS` takes the same pairs comma-separated.
+    ///
+    /// A cell is the failure and scaling domain, so growing means adding cells —
+    /// and that only works if a client can reach **one** address and have the
+    /// request land in the cell holding the resource. With no pairs this
+    /// process answers everything itself, which is what every single-cell
+    /// installation wants and costs nothing.
+    ///
+    /// Which cell owns what is read from the projects collection, not from
+    /// this list: the list says only where each cell *is*. A project this
+    /// installation has not heard of yet is answered here rather than refused —
+    /// a router a few seconds behind must not turn propagation delay into an
+    /// error a tenant sees.
+    #[arg(long = "cell-endpoint", env = "VELSTRA_CELLS", value_delimiter = ',')]
+    cell_endpoint: Vec<String>,
+
+    /// How many **writes** a second one caller may sustain. `0` — the default —
+    /// is no limit.
+    ///
+    /// What it stops is the ordinary accident: a script in a loop, a controller
+    /// somebody wrote with no backoff, taking the cell's write path from
+    /// everybody else. It is not a security boundary and does not pretend to be
+    /// one. Reads are never counted, and node agents are never limited — an
+    /// agent reports when something changed, and something changing is not
+    /// something it can defer.
+    #[arg(long, default_value_t = 0, env = "VELSTRA_WRITES_PER_SECOND")]
+    writes_per_second: u32,
+
+    /// How many writes one caller may spend at once after being quiet.
+    ///
+    /// Defaults to ten seconds' worth. Creating twenty guests in a moment is a
+    /// normal Tuesday, and a limiter that refuses it is one people route
+    /// around.
+    #[arg(long, env = "VELSTRA_WRITE_BURST")]
+    write_burst: Option<u32>,
+
     /// The cell this API serves. Every object it writes is stamped with it, and
     /// a cell is the failure domain — one going down must not take a region
     /// with it.
@@ -113,6 +150,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(endpoints = %args.store, "state store connected");
         Arc::new(store)
     };
+    // Kept for the cross-cell router below, which watches the projects to learn
+    // which cell owns what. Cloned rather than re-connected: two connections to
+    // one etcd for one process is one too many.
+    let routing_store = store.clone();
     if args.cell_admin.is_empty() && args.bootstrap_admin.is_none() {
         // Said out loud rather than discovered: a cell with no operator can
         // still serve every tenant whose project grants them, but nobody can
@@ -157,12 +198,30 @@ async fn main() -> anyhow::Result<()> {
         (None, None) => {}
     }
 
-    let api = velstra_cloud_api::Api::new(store, &args.region, &args.cell, verifier)
+    let mut api = velstra_cloud_api::Api::new(store, &args.region, &args.cell, verifier)
         .with_cell_admins(args.cell_admin.clone());
+    if args.writes_per_second > 0 {
+        let rate = velstra_cloud_model::limit::Rate {
+            per_second: args.writes_per_second,
+            burst: args.write_burst.unwrap_or(args.writes_per_second * 10),
+        };
+        tracing::info!(
+            per_second = rate.per_second,
+            burst = rate.burst,
+            "capping how fast one caller may write"
+        );
+        api = api.with_write_rate(rate);
+    }
+    let api = api;
     // One watch on the store per assigned collection, from here on, however many
     // node agents ask. Started by the server and not by `Api::new`, so a test or
     // a one-shot tool that builds an Api pays for none of it.
     api.serve_agents();
+    // Delete expired sessions on a timer. The request path only reaches a token
+    // that is presented again; this reaps the ones that were issued and never
+    // used once more, which otherwise sit in the store until it is compacted by
+    // hand.
+    api.spawn_session_sweeper();
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(
         listen = %args.listen,
@@ -170,6 +229,22 @@ async fn main() -> anyhow::Result<()> {
         cell = %args.cell,
         "serving REST under /api/v1/ and gRPC on the same port"
     );
-    axum::serve(listener, velstra_cloud_api::server(api)).await?;
+    // One address for several cells, when this installation has been told
+    // where the others are. `server_routed` existed, was tested, and was
+    // reachable from nothing — so a multi-cell installation had no hop and
+    // every client had to know which cell held what.
+    let served = if args.cell_endpoint.is_empty() {
+        velstra_cloud_api::server(api)
+    } else {
+        let cells = velstra_cloud_api::proxy::Cells::parse(&args.cell_endpoint)
+            .map_err(|e| anyhow::anyhow!("--cell-endpoint: {e}"))?;
+        tracing::info!(
+            cells = args.cell_endpoint.join(","),
+            "this address answers for several cells"
+        );
+        let router = velstra_cloud_api::proxy::Router::new(routing_store, &args.cell, cells);
+        velstra_cloud_api::server_routed(api, router)
+    };
+    axum::serve(listener, served).await?;
     Ok(())
 }
