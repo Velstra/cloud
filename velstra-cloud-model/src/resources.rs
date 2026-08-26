@@ -572,7 +572,11 @@ pub struct RunningSize {
 }
 
 /// One thing an operator asked for that the running guest does not have.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serialisable because it is answered on a read: the API computes these on the
+/// way out rather than storing them, so the shape has to cross the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingChange {
     /// The spec field, as the API spells it — so a console can point at the
     /// control that caused it rather than at a paragraph.
