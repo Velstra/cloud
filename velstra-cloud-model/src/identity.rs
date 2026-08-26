@@ -138,9 +138,55 @@ pub struct SessionStatus {
 
 pub type Session = Resource<SessionSpec, SessionStatus>;
 
+/// A per-node agent credential, keyed by the **digest** of its bearer token.
+///
+/// The node-identity analogue of a [`Session`], and separated from the node for
+/// the same reasons a password is separated from the user: it lives in a
+/// collection the API does not serve, so a node token cannot leak through a
+/// route that does not exist, and only its SHA-256 digest is stored, so a store
+/// dump hands an attacker digests they cannot present. The record names the node
+/// the token speaks for; verification is a single keyed read on the digest.
+///
+/// **A node cannot rotate its own credential.** This is a `spec`, which only a
+/// controller writes ([`crate::access`]), in a collection with no route — so
+/// nothing a node can reach touches it. That is the whole point of putting the
+/// digest here rather than on the node object: a node writes its own status, and
+/// a credential that lived in that status would be a credential the node could
+/// rewrite. Rotation is a cell operator minting a new token, which mints a new
+/// record; the old digest stops being accepted when its record is deleted.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeCredentialSpec {
+    /// The node this token authenticates as. Reading the credential yields the
+    /// identity `Writer::agent(node)` is built from.
+    pub node: String,
+    /// When it was issued, so an operator can see a credential's age.
+    #[serde(default)]
+    pub issued_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeCredentialStatus {
+    pub observed_generation: u64,
+}
+
+pub type NodeCredential = Resource<NodeCredentialSpec, NodeCredentialStatus>;
+
 impl crate::resources::Assigned for UserSpec {}
 impl crate::resources::Assigned for CredentialSpec {}
 impl crate::resources::Assigned for SessionSpec {}
+impl crate::resources::Assigned for NodeCredentialSpec {}
+
+impl crate::resources::Observed for NodeCredentialStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &[]
+    }
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+}
 
 impl crate::resources::Observed for UserStatus {
     fn observed_generation(&self) -> u64 {
@@ -248,17 +294,33 @@ pub fn check_password_strength(password: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A fresh session token: 256 bits from the OS, rendered URL-safe.
+/// A fresh 256-bit bearer token from the OS, rendered as sixty-four hex
+/// characters.
 ///
 /// Returned once and never stored — [`token_digest`] is what goes to the store.
-pub fn new_session_token() -> String {
+/// Hex rather than base64: it survives every URL, header, shell and log without
+/// an encoding question, and sixty-four characters is not a burden for something
+/// no person types.
+///
+/// The same generator serves a session token and a per-node agent token, because
+/// a token is a token — 256 bits of uniform randomness, stored only as its
+/// digest. The two differ in what record the digest keys, not in the secret.
+pub fn new_bearer_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    // Hex rather than base64: it survives every URL, header, shell and log
-    // without an encoding question, and sixty-four characters is not a burden
-    // for something no person types.
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A fresh session token. See [`new_bearer_token`].
+pub fn new_session_token() -> String {
+    new_bearer_token()
+}
+
+/// A fresh per-node agent token, shown once at registration and stored only as
+/// its digest in a [`NodeCredential`]. See [`new_bearer_token`].
+pub fn new_node_token() -> String {
+    new_bearer_token()
 }
 
 /// The store key for a bearer token: its SHA-256 digest, hex.

@@ -21,6 +21,7 @@
 use std::collections::BTreeSet;
 
 use crate::{
+    loadbalancer::LoadBalancer,
     meta::{Condition, ConditionStatus},
     network::{Cidr, allocate, mac_for},
     resources::{FloatingIp, Port, Subnet},
@@ -75,6 +76,7 @@ pub fn assign(
     subnet: Option<&Subnet>,
     others: &[Port],
     floating: &[FloatingIp],
+    balancers: &[LoadBalancer],
 ) -> Result<Assignment, Unaddressable> {
     let mac = port
         .spec
@@ -101,11 +103,12 @@ pub fn assign(
             why: why.to_string(),
         })?;
 
-    let address =
-        allocate(&cidr, &taken(subnet, others, floating)).ok_or(Unaddressable::SubnetFull {
+    let address = allocate(&cidr, &taken(subnet, others, floating, balancers)).ok_or(
+        Unaddressable::SubnetFull {
             subnet: name,
             cidr: subnet.spec.cidr.clone(),
-        })?;
+        },
+    )?;
     Ok(Assignment {
         address: Some(address.to_string()),
         mac,
@@ -120,14 +123,20 @@ pub fn assign(
 /// address handed out from under it would be two machines with one address for
 /// as long as the teardown takes.
 ///
-/// **Floating IPs are in here because they are the second allocator this range
-/// would otherwise have.** A floating address and a port address come out of
-/// the same subnet, and a count that saw only one kind would hand the same
-/// address to both — silently, and only visible as a guest whose traffic
-/// sometimes goes somewhere else. The parameter is not optional for the same
-/// reason `others` is not: a caller that passed an empty slice would be
-/// allocating against a range it had only half looked at.
-fn taken(subnet: &Subnet, ports: &[Port], floating: &[FloatingIp]) -> BTreeSet<std::net::IpAddr> {
+/// **Floating IPs and load balancer VIPs are in here because they are the
+/// second and third allocator this range would otherwise have.** A floating
+/// address, a VIP and a port address all come out of the same subnet, and a
+/// count that saw only one kind would hand the same address to two of them —
+/// silently, and only visible as a guest whose traffic sometimes goes
+/// somewhere else. None of the parameters is optional for the same reason
+/// `others` is not: a caller that passed an empty slice would be allocating
+/// against a range it had only half looked at.
+fn taken(
+    subnet: &Subnet,
+    ports: &[Port],
+    floating: &[FloatingIp],
+    balancers: &[LoadBalancer],
+) -> BTreeSet<std::net::IpAddr> {
     let name = subnet.meta.name.to_string();
     subnet
         .spec
@@ -151,6 +160,14 @@ fn taken(subnet: &Subnet, ports: &[Port], floating: &[FloatingIp]) -> BTreeSet<s
                 .filter_map(|a| a.split('/').next())
                 .filter_map(|a| a.parse().ok()),
         )
+        .chain(
+            balancers
+                .iter()
+                .filter(|l| l.spec.subnet == name)
+                .filter_map(|l| l.spec.vip.as_deref())
+                .filter_map(|a| a.split('/').next())
+                .filter_map(|a| a.parse().ok()),
+        )
         .collect()
 }
 
@@ -165,6 +182,7 @@ pub fn assign_floating(
     subnet: Option<&Subnet>,
     ports: &[Port],
     others: &[FloatingIp],
+    balancers: &[LoadBalancer],
 ) -> Result<Option<String>, Unaddressable> {
     if fip.spec.address.is_some() {
         return Ok(None);
@@ -189,11 +207,58 @@ pub fn assign_floating(
         .filter(|f| f.meta.name != fip.meta.name)
         .cloned()
         .collect();
-    let address =
-        allocate(&cidr, &taken(subnet, ports, &others)).ok_or(Unaddressable::SubnetFull {
+    let address = allocate(&cidr, &taken(subnet, ports, &others, balancers)).ok_or(
+        Unaddressable::SubnetFull {
             subnet: name,
             cidr: subnet.spec.cidr.clone(),
+        },
+    )?;
+    Ok(Some(address.to_string()))
+}
+
+/// Decide what address a load balancer's VIP should be, or why it cannot have
+/// one.
+///
+/// The same counting as [`assign`] and [`assign_floating`], over the same
+/// range: one allocator decides for all three kinds of holder. A load balancer
+/// that already names a VIP keeps it — pinning one is how an operator moves a
+/// known address in front of a rebuilt pool.
+pub fn assign_vip(
+    balancer: &LoadBalancer,
+    subnet: Option<&Subnet>,
+    ports: &[Port],
+    floating: &[FloatingIp],
+    others: &[LoadBalancer],
+) -> Result<Option<String>, Unaddressable> {
+    if balancer.spec.vip.is_some() {
+        return Ok(None);
+    }
+    let Some(subnet) = subnet else {
+        return Err(Unaddressable::NoSuchSubnet {
+            subnet: balancer.spec.subnet.clone(),
+        });
+    };
+    let name = subnet.meta.name.to_string();
+    let cidr =
+        Cidr::parse(&subnet.spec.cidr).map_err(|why| Unaddressable::SubnetNotAddressable {
+            subnet: name.clone(),
+            cidr: subnet.spec.cidr.clone(),
+            why: why.to_string(),
         })?;
+    // Excluded from the count it is being allocated against, exactly as a
+    // floating IP is: it holds nothing yet, and a self-collision would make
+    // the subnet look one address fuller than it is.
+    let others: Vec<LoadBalancer> = others
+        .iter()
+        .filter(|l| l.meta.name != balancer.meta.name)
+        .cloned()
+        .collect();
+    let address = allocate(&cidr, &taken(subnet, ports, floating, &others)).ok_or(
+        Unaddressable::SubnetFull {
+            subnet: name,
+            cidr: subnet.spec.cidr.clone(),
+        },
+    )?;
     Ok(Some(address.to_string()))
 }
 
@@ -202,7 +267,12 @@ pub fn assign_floating(
 /// Counted rather than tracked, for the same reason as everything else here: a
 /// running total that is incremented and decremented drifts, and a count of
 /// what exists cannot.
-pub fn counts(subnet: &Subnet, ports: &[Port], floating: &[FloatingIp]) -> (u32, u32) {
+pub fn counts(
+    subnet: &Subnet,
+    ports: &[Port],
+    floating: &[FloatingIp],
+    balancers: &[LoadBalancer],
+) -> (u32, u32) {
     let Ok(cidr) = Cidr::parse(&subnet.spec.cidr) else {
         return (0, 0);
     };
@@ -214,10 +284,14 @@ pub fn counts(subnet: &Subnet, ports: &[Port], floating: &[FloatingIp]) -> (u32,
         + floating
             .iter()
             .filter(|f| f.spec.subnet == name && f.spec.address.is_some())
+            .count() as u64
+        + balancers
+            .iter()
+            .filter(|l| l.spec.subnet == name && l.spec.vip.is_some())
             .count() as u64;
     let usable = cidr.usable();
     // Reserved addresses are not available even though nothing holds them.
-    let reserved = taken(subnet, &[], &[]).len() as u64;
+    let reserved = taken(subnet, &[], &[], &[]).len() as u64;
     (
         allocated.min(u32::MAX as u64) as u32,
         usable
@@ -299,6 +373,8 @@ mod tests {
                 subnet: SUBNET.into(),
                 address: address.map(str::to_string),
                 port: String::new(),
+                delivery: Default::default(),
+                announce: None,
             },
             crate::resources::FloatingIpStatus::default(),
         )
@@ -317,6 +393,7 @@ mod tests {
             Some(&subnet("10.20.0.0/24")),
             &[],
             &held,
+            &[],
         )
         .unwrap();
         assert_eq!(assignment.address.as_deref(), Some("10.20.0.4"));
@@ -326,8 +403,14 @@ mod tests {
     #[test]
     fn a_floating_ip_is_not_given_an_address_a_port_holds() {
         let ports = vec![port("port-a", Some("10.20.0.3"), None)];
-        let address =
-            assign_floating(&fip("f1", None), Some(&subnet("10.20.0.0/24")), &ports, &[]).unwrap();
+        let address = assign_floating(
+            &fip("f1", None),
+            Some(&subnet("10.20.0.0/24")),
+            &ports,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(address.as_deref(), Some("10.20.0.4"));
     }
 
@@ -340,7 +423,7 @@ mod tests {
     fn a_floating_ip_does_not_count_itself() {
         let me = fip("f1", None);
         let all = vec![me.clone(), fip("f2", Some("10.20.0.3"))];
-        let address = assign_floating(&me, Some(&subnet("10.20.0.0/24")), &[], &all).unwrap();
+        let address = assign_floating(&me, Some(&subnet("10.20.0.0/24")), &[], &all, &[]).unwrap();
         assert_eq!(address.as_deref(), Some("10.20.0.4"));
     }
 
@@ -349,8 +432,67 @@ mod tests {
     #[test]
     fn a_floating_ip_that_names_an_address_keeps_it() {
         let pinned = fip("f1", Some("10.20.0.200"));
-        let address = assign_floating(&pinned, Some(&subnet("10.20.0.0/24")), &[], &[]).unwrap();
+        let address =
+            assign_floating(&pinned, Some(&subnet("10.20.0.0/24")), &[], &[], &[]).unwrap();
         assert_eq!(address, None, "a pinned floating address was reassigned");
+    }
+
+    fn lb(id: &str, vip: Option<&str>) -> LoadBalancer {
+        Resource::new(
+            meta(&format!("projects/p1/load-balancers/{id}")),
+            crate::loadbalancer::LoadBalancerSpec {
+                network: "projects/p1/networks/net-a".into(),
+                subnet: SUBNET.into(),
+                vip: vip.map(str::to_string),
+                listeners: vec![],
+                members: vec![],
+            },
+            crate::loadbalancer::LoadBalancerStatus::default(),
+        )
+    }
+
+    /// The third kind of holder: a port must never be given a VIP, and a VIP
+    /// must never be a port's or a floating IP's address. One allocator over
+    /// one range, or two machines answer to one address.
+    #[test]
+    fn a_vip_and_a_port_address_are_never_the_same_address() {
+        let balancers = vec![lb("web", Some("10.20.0.3"))];
+        let assignment = assign(
+            &port("port-a", None, None),
+            Some(&subnet("10.20.0.0/24")),
+            &[],
+            &[],
+            &balancers,
+        )
+        .unwrap();
+        assert_eq!(assignment.address.as_deref(), Some("10.20.0.4"));
+
+        let ports = vec![port("port-a", Some("10.20.0.3"), None)];
+        let held = vec![fip("f1", Some("10.20.0.4"))];
+        let vip = assign_vip(
+            &lb("web", None),
+            Some(&subnet("10.20.0.0/24")),
+            &ports,
+            &held,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(vip.as_deref(), Some("10.20.0.5"));
+    }
+
+    /// A load balancer does not collide with itself, and a pinned VIP is kept —
+    /// the same two properties a floating IP's allocation has, for the same
+    /// reasons.
+    #[test]
+    fn a_vip_is_stable_against_itself_and_a_pinned_one_is_kept() {
+        let me = lb("web", None);
+        let all = vec![me.clone(), lb("db", Some("10.20.0.3"))];
+        let vip = assign_vip(&me, Some(&subnet("10.20.0.0/24")), &[], &[], &all).unwrap();
+        assert_eq!(vip.as_deref(), Some("10.20.0.4"));
+
+        let pinned = lb("web", Some("10.20.0.200"));
+        let vip = assign_vip(&pinned, Some(&subnet("10.20.0.0/24")), &[], &[], &[]).unwrap();
+        assert_eq!(vip, None, "a pinned VIP was reassigned");
     }
 
     /// The usage an operator reads counts both kinds of holder. A subnet that
@@ -360,8 +502,8 @@ mod tests {
         let subnet = subnet("10.20.0.0/24");
         let ports = vec![port("port-a", Some("10.20.0.3"), None)];
         let held = vec![fip("f1", Some("10.20.0.4"))];
-        let (with, _) = counts(&subnet, &ports, &held);
-        let (without, _) = counts(&subnet, &ports, &[]);
+        let (with, _) = counts(&subnet, &ports, &held, &[]);
+        let (without, _) = counts(&subnet, &ports, &[], &[]);
         assert_eq!(with, 2);
         assert_eq!(without, 1, "the fixture does not isolate the difference");
     }
@@ -375,6 +517,7 @@ mod tests {
             Some(&subnet("10.20.0.0/24")),
             &existing,
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(assignment.address.as_deref(), Some("10.20.0.4"));
@@ -387,7 +530,7 @@ mod tests {
         // changes underneath it simply stops being reachable.
         let has = port("port-a", Some("10.20.0.50"), Some("52:54:00:12:34:56"));
         assert!(!needs_assignment(&has));
-        let assignment = assign(&has, Some(&subnet("10.20.0.0/24")), &[], &[]).unwrap();
+        let assignment = assign(&has, Some(&subnet("10.20.0.0/24")), &[], &[], &[]).unwrap();
         assert_eq!(assignment, Assignment::default());
     }
 
@@ -395,7 +538,7 @@ mod tests {
     fn a_port_with_an_address_but_no_mac_gets_only_the_mac() {
         let half = port("port-a", Some("10.20.0.50"), None);
         assert!(needs_assignment(&half));
-        let assignment = assign(&half, Some(&subnet("10.20.0.0/24")), &[], &[]).unwrap();
+        let assignment = assign(&half, Some(&subnet("10.20.0.0/24")), &[], &[], &[]).unwrap();
         assert_eq!(assignment.address, None);
         assert!(assignment.mac.is_some());
     }
@@ -404,8 +547,8 @@ mod tests {
     fn the_mac_is_the_same_one_however_often_it_is_asked_for() {
         // A write that is lost and retried must not give the guest a new NIC.
         let p = port("port-a", None, None);
-        let first = assign(&p, Some(&subnet("10.20.0.0/24")), &[], &[]).unwrap();
-        let second = assign(&p, Some(&subnet("10.20.0.0/24")), &[], &[]).unwrap();
+        let first = assign(&p, Some(&subnet("10.20.0.0/24")), &[], &[], &[]).unwrap();
+        let second = assign(&p, Some(&subnet("10.20.0.0/24")), &[], &[], &[]).unwrap();
         assert_eq!(first.mac, second.mac);
     }
 
@@ -426,6 +569,7 @@ mod tests {
             Some(&subnet("10.20.0.0/24")),
             &[going],
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(assignment.address.as_deref(), Some("10.20.0.4"));
@@ -440,6 +584,7 @@ mod tests {
             Some(&subnet("10.20.0.0/24")),
             &[elsewhere],
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(assignment.address.as_deref(), Some("10.20.0.3"));
@@ -447,7 +592,7 @@ mod tests {
 
     #[test]
     fn every_refusal_names_the_thing_an_operator_would_change() {
-        let missing = assign(&port("port-a", None, None), None, &[], &[]).unwrap_err();
+        let missing = assign(&port("port-a", None, None), None, &[], &[], &[]).unwrap_err();
         assert_eq!(
             missing,
             Unaddressable::NoSuchSubnet {
@@ -461,6 +606,7 @@ mod tests {
             Some(&subnet("not-a-range")),
             &[],
             &[],
+            &[],
         )
         .unwrap_err();
         assert!(matches!(
@@ -472,6 +618,7 @@ mod tests {
         let full = assign(
             &port("port-a", None, None),
             Some(&subnet("10.20.0.0/30")),
+            &[],
             &[],
             &[],
         )
@@ -488,7 +635,7 @@ mod tests {
             port("port-b", Some("10.20.0.4"), None),
             port("port-c", None, None),
         ];
-        let (allocated, available) = counts(&subnet, &ports, &[]);
+        let (allocated, available) = counts(&subnet, &ports, &[], &[]);
         assert_eq!(allocated, 2);
         // 254 usable, less the gateway and the one reserved address, less the
         // two that are out.

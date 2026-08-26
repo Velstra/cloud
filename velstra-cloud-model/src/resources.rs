@@ -76,6 +76,215 @@ impl<S, T: Observed> Resource<S, T> {
     }
 }
 
+/// "Keep a recent snapshot of this volume." See
+/// [`crate::storage::SnapshotScheduleSpec`].
+pub type SnapshotSchedule =
+    Resource<crate::storage::SnapshotScheduleSpec, crate::storage::SnapshotScheduleStatus>;
+
+impl Observed for crate::storage::SnapshotScheduleStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        // Nothing owns an intention. What it caused is a set of snapshots,
+        // each owned by the pool that holds it.
+        None
+    }
+}
+
+impl Assigned for crate::storage::SnapshotScheduleSpec {}
+
+// ---- captures ------------------------------------------------------------
+
+/// "Make an image out of this guest." See [`crate::capture`].
+pub type Capture = Resource<crate::capture::CaptureSpec, crate::capture::CaptureStatus>;
+
+impl Observed for crate::capture::CaptureStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+}
+
+impl Assigned for crate::capture::CaptureSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        // Only the machine with the disk can copy it.
+        (!self.node.is_empty()).then_some(self.node.as_str())
+    }
+}
+
+impl Assigned for crate::maintenance::MaintenanceWindowSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        // Nobody, and deliberately not the node it is about. Assigning it to
+        // the node would let that node's agent write the window that governs
+        // it — a machine deciding when it is allowed to be out of service.
+        // Whether it is open is arithmetic, and there is nothing here to claim.
+        None
+    }
+}
+
+// ---- audit ---------------------------------------------------------------
+
+/// One thing that was refused, or one session that began or ended.
+///
+/// Cell-scoped, and read by cell operators only — a tenant who could read this
+/// would learn the names of projects and people that are not theirs, which is
+/// the opposite of what an audit trail is for.
+pub type AuditRecord = Resource<crate::audit::AuditSpec, crate::audit::AuditStatus>;
+
+impl Observed for crate::audit::AuditStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        // Nothing owns a record of something that already happened. It is
+        // written once and never reported on.
+        None
+    }
+}
+
+impl Assigned for crate::audit::AuditSpec {}
+
+// ---- backups -------------------------------------------------------------
+
+/// A place backups are kept, and the agent that reports on it.
+pub type BackupTarget = Resource<crate::backup::BackupTargetSpec, crate::backup::BackupTargetStatus>;
+
+/// One copy of one volume, at one moment, on one target.
+pub type Backup = Resource<crate::backup::BackupSpec, crate::backup::BackupStatus>;
+
+/// "Keep a copy of this volume on that target, no older than this."
+pub type BackupSchedule =
+    Resource<crate::backup::BackupScheduleSpec, crate::backup::BackupScheduleStatus>;
+
+impl Observed for crate::backup::BackupTargetStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        self.agent.as_deref()
+    }
+}
+
+impl Observed for crate::backup::BackupStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        self.agent.as_deref()
+    }
+}
+
+impl Observed for crate::backup::BackupScheduleStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        // Nothing owns a schedule: it is an intention, not a thing an agent
+        // holds. What it *caused* is a set of backups, each owned by whoever
+        // made it.
+        None
+    }
+}
+
+impl Assigned for crate::backup::BackupTargetSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        // Named by an operator, never claimed. A target assigned to nobody is
+        // one any agent could grab, and "an agent may only report on what it
+        // was given" is the rule that makes a node token a boundary rather
+        // than a formality.
+        (!self.agent.is_empty()).then_some(self.agent.as_str())
+    }
+}
+
+impl Assigned for crate::backup::BackupSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        // The pool holding the source reads the bytes, so it is the party with
+        // something to report — exactly as a snapshot is assigned to its pool.
+        (!self.pool.is_empty()).then_some(self.pool.as_str())
+    }
+}
+
+impl Assigned for crate::backup::BackupScheduleSpec {}
+
+// ---- device class --------------------------------------------------------
+
+/// A named set of interchangeable PCI devices, across the whole cell.
+///
+/// A cell-scoped resource rather than a project one: the hardware belongs to
+/// the cell, and a class defined per project would be a different name for the
+/// same silicon in every tenancy. What a project controls is how many it may
+/// hold ([`Quota::devices`]), not what they are called.
+pub type DeviceClass = Resource<crate::pci::DeviceClassSpec, DeviceClassStatus>;
+
+/// A stretch of time in which one node is out of service.
+///
+/// Cell-scoped, like the node it is about. Nothing writes its status: whether
+/// it is upcoming, open or over is arithmetic on the clock, and a stored copy
+/// of that would be right only while somebody was awake to write it.
+pub type MaintenanceWindow = Resource<
+    crate::maintenance::MaintenanceWindowSpec,
+    crate::maintenance::MaintenanceWindowStatus,
+>;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeviceClassStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+}
+
+impl Observed for crate::maintenance::MaintenanceWindowStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        // Nobody. A window is a declaration about a stretch of time; whether it
+        // is open is arithmetic on the clock, so there is nothing here for an
+        // agent to report and nothing for it to claim.
+        None
+    }
+}
+
+impl Observed for DeviceClassStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        // Nothing owns a class: it is a definition, not a thing a node holds.
+        // How many of its members exist and where is computed from the node
+        // reports, never stored here — an aggregate is not a fact anybody owns.
+        None
+    }
+}
+
+impl Assigned for crate::pci::DeviceClassSpec {}
+
 // ---- project -------------------------------------------------------------
 
 /// The IAM and quota anchor. Everything chargeable hangs under one.
@@ -123,15 +332,48 @@ pub struct ProjectSpec {
     pub cell: String,
 }
 
+/// How much of a guest's console output travels on its status.
+///
+/// Eight kibibytes: enough for a kernel panic with its trace, a bootloader
+/// giving up, or cloud-init's last complaint — the three things anybody reads
+/// this for — and small enough that a cell full of watched guests does not
+/// turn its store into a log shipper.
+pub const CONSOLE_TAIL_BYTES: usize = 8 * 1024;
+
 /// Limits, counted rather than reserved. A reservation that is not released on
 /// a crash is a quota that shrinks over time; a count is recomputed from what
 /// exists and cannot drift.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Quota {
     pub instances: u32,
     pub vcpus: u32,
     pub memory_mib: u64,
+    /// A count of volume objects, distinct from `volume_gib`: a project can be
+    /// held to a number of volumes as well as a number of gibibytes, and the two
+    /// answer different worries — one is per-volume overhead, the other is
+    /// capacity. Both are counted from what exists, never tracked as a running
+    /// total.
+    pub volumes: u32,
     pub volume_gib: u64,
+    /// A count of floating IP objects a project may hold. An address that
+    /// outlives the machine answering on it is a scarce, externally-routable
+    /// resource, so it is one a cell operator wants to be able to cap.
+    pub floating_ips: u32,
+    /// A count of load balancer objects a project may hold. Each one takes an
+    /// address out of a subnet and a set of datapath map entries on every
+    /// ingress host, so it is capped the way a floating IP is. `default` so a
+    /// quota stored before the field existed still reads back.
+    #[serde(default)]
+    pub load_balancers: u32,
+    /// A count of passed-through PCI devices a project may hold.
+    ///
+    /// Capped for the plainest reason of all: each one is a piece of hardware
+    /// that exists once and cannot be oversubscribed, so without a cap one
+    /// project can take every accelerator in the cell. Counted from what
+    /// exists, like every other dimension here.
+    #[serde(default)]
+    pub devices: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -167,7 +409,96 @@ pub struct NodeSpec {
     /// Draining is a spec change, not a command, so a controller restart cannot
     /// lose it half way.
     pub schedulable: bool,
+    /// Move what is already running here, somewhere else.
+    ///
+    /// Separate from `schedulable`, and the pair is deliberate: draining says
+    /// "nothing new", evacuating says "and none of the old either". They are
+    /// different intentions and an operator taking a machine out for an hour
+    /// wants the first without the second.
+    ///
+    /// A desired state, not a command — "there should be no guests here". A
+    /// controller creates one migration per guest that can move, and a guest
+    /// that cannot stays where it is with the reason answerable at
+    /// `:explainMigration`. Turning it off stops further moves; it does not
+    /// bring anything back.
+    #[serde(default)]
+    pub evacuate: bool,
+    #[serde(default)]
     pub labels: Vec<String>,
+    /// How long this node may fail to report before it stops its own guests.
+    ///
+    /// Zero — the default — means it does not, and a node that does not stop
+    /// its own guests is **never recovered from**: "unreachable" and "stopped"
+    /// are different statements, and acting on the first as though it were the
+    /// second is how two guests come to write to one volume.
+    ///
+    /// Set it, and the node runs its own deadline against its own clock,
+    /// needing nothing from anybody — which is the situation this is for. The
+    /// control plane then waits longer still. See [`crate::ha`].
+    #[serde(default)]
+    pub fence_after_s: u32,
+    /// How many vCPUs this node may hand out per real core.
+    ///
+    /// `0` — the default — means one for one: every vCPU a guest was promised
+    /// has a core of its own. That is the safe reading of a zero and it is the
+    /// same convention a quota uses, so a node stored before this field existed
+    /// behaves exactly as it did.
+    ///
+    /// ## Why only the processor
+    ///
+    /// A processor can be *shared*: two guests that both want a core get one
+    /// each in turn, and the cost of being wrong is that they run slowly. That
+    /// is a trade an operator makes on purpose, and it is how nearly every
+    /// hypervisor fleet in the world is run — a machine idles most of the day.
+    ///
+    /// Memory cannot be shared that way. A guest promised 8 GiB and handed 4
+    /// does not run slowly; it is killed, or it kills its neighbour, and the
+    /// operator finds out from a guest that has vanished. So there is
+    /// deliberately **no memory ratio here**, and there should not be one until
+    /// this platform can hand a guest back the page it lent out — which means
+    /// ballooning, and which is a feature, not a number.
+    ///
+    /// ## Where it applies
+    ///
+    /// Placement only, and nowhere else. Nothing about the guest changes: it is
+    /// still given the vCPUs it asked for, and the hypervisor still schedules
+    /// them. What changes is how many the cell believes a node has room for.
+    #[serde(default)]
+    pub vcpu_overcommit: u32,
+    /// This machine carries traffic between the cell and the world.
+    ///
+    /// What it means concretely: a public address whose network says
+    /// `FromGateway` is announced from here, and packets for it reach the guest
+    /// over the overlay. Several machines may carry it — the upstream sees them
+    /// as equal next hops — and a cell with none simply cannot use that mode,
+    /// which is refused by name rather than silently doing nothing.
+    ///
+    /// Not the same as being a hypervisor. A gateway may hold guests and
+    /// usually does; a cell may also keep two machines that do nothing else.
+    #[serde(default)]
+    pub gateway: bool,
+    /// The CPU this node presents to guests, if it has been told to present
+    /// something other than its own.
+    ///
+    /// Declared here, on the node, rather than as a resource with a label
+    /// selector. The selector version reads better on paper and behaves worse:
+    /// a machine added later would silently join an aggregate because of a
+    /// label somebody set for another reason, and quietly deciding what
+    /// processor a new machine offers is not a decision to make on an
+    /// operator's behalf. Declaring it per node keeps one writer per object —
+    /// the operator — and needs no controller.
+    ///
+    /// The cost is that a new node does not join an aggregate by itself. That
+    /// is paid back by [`crate::cpu::advise`], which says so out loud rather
+    /// than leaving it to be noticed.
+    ///
+    /// **A change here governs guests started after it.** Guests already
+    /// running keep the CPU they booted with until they are restarted — see
+    /// the invariant on [`crate::cpu`] — so lowering a baseline over a running
+    /// fleet does not move anybody; it means the fleet adopts it as guests
+    /// come and go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_baseline: Option<crate::cpu::CpuLevel>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -198,6 +529,29 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ceph: Option<crate::ceph::NodeCeph>,
 
+    /// What processor this node has, and whether its VMM can present another.
+    ///
+    /// One node's observation of its own hardware, like `devices` above, and
+    /// read the same way: never on its own, always through
+    /// [`cpu::may_run_on`](crate::cpu::may_run_on) or the domain functions
+    /// beside it. Empty on a node whose agent is too old to report, which
+    /// every caller treats as "cannot be shown compatible" rather than as
+    /// "compatible".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<crate::cpu::NodeCpu>,
+
+    /// PCI devices this machine has, and what each is being used for.
+    ///
+    /// One node's observation of its own hardware, like `devices` and `cpu`
+    /// above. Which of these may be *offered* is
+    /// [`pci::offerable`](crate::pci::offerable) — never this list on its own,
+    /// because the list says what is there and the rule says what is safe: a
+    /// device whose IOMMU group holds something busy is present and not
+    /// available, and the difference is a guest that steals the host's audio
+    /// controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pci_devices: Vec<crate::pci::PciDevice>,
+
     /// Images this node holds a verified copy of, by resource name.
     ///
     /// It lives here, and not as `cached_on` on the image, for the reason that
@@ -207,6 +561,68 @@ pub struct NodeStatus {
     /// exists to forbid. Here it is what it really is: one node's report about
     /// itself. Whoever needs the aggregate computes it from these.
     pub images: Vec<String>,
+}
+
+/// What a running guest was actually given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningSize {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub root_disk_gib: u64,
+}
+
+/// One thing an operator asked for that the running guest does not have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingChange {
+    /// The spec field, as the API spells it — so a console can point at the
+    /// control that caused it rather than at a paragraph.
+    pub field: &'static str,
+    pub from: String,
+    pub to: String,
+}
+
+impl std::fmt::Display for PendingChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {} → {}", self.field, self.from, self.to)
+    }
+}
+
+/// What has been asked for that this guest will only get when it next starts.
+///
+/// Empty for a guest that is not running: there is nothing to differ from, and
+/// the next start gives it whatever the spec says by construction.
+///
+/// This is not a failure and it is not drift. It is the ordinary result of
+/// resizing a machine that is up, and the whole point is that it is **said**:
+/// the alternative — which this platform shipped — is a spec that reads as
+/// applied while the guest runs on the old numbers.
+pub fn pending_changes(instance: &Instance) -> Vec<PendingChange> {
+    let Some(running) = instance.status.running_size else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if running.vcpus != instance.spec.vcpus {
+        out.push(PendingChange {
+            field: "vcpus",
+            from: running.vcpus.to_string(),
+            to: instance.spec.vcpus.to_string(),
+        });
+    }
+    if running.memory_mib != instance.spec.memory_mib {
+        out.push(PendingChange {
+            field: "memoryMib",
+            from: running.memory_mib.to_string(),
+            to: instance.spec.memory_mib.to_string(),
+        });
+    }
+    if running.root_disk_gib != instance.spec.root_disk_gib {
+        out.push(PendingChange {
+            field: "rootDiskGib",
+            from: running.root_disk_gib.to_string(),
+            to: instance.spec.root_disk_gib.to_string(),
+        });
+    }
+    out
 }
 
 /// Which nodes hold an image, computed from what each node reports about
@@ -226,7 +642,23 @@ pub struct Capacity {
     pub disk_gib: u64,
     /// Per-NUMA-node free memory, so placement can refuse a host that has the
     /// total but not on one node.
+    ///
+    /// `default` because an agent old enough not to report it exists, and an
+    /// empty list already means "this machine said nothing about NUMA" —
+    /// which placement reads as "do not make the per-node check". Without the
+    /// attribute, a capacity written before this field could not be read at
+    /// all, and a cell upgrading would stop being able to read its own nodes.
+    #[serde(default)]
     pub numa_free_mib: Vec<u64>,
+    /// On the wire this is `hugepages1gi`, all lowercase, and it has to stay
+    /// that way.
+    ///
+    /// `hugepages_1_gi` would read better — `hugepages1Gi` — and cannot
+    /// round-trip: coming back, a digit followed by an uppercase letter is how
+    /// `l3Vni` is told from `hugepages1gi`, so one convention cannot serve
+    /// both. A field that does not survive its own wire is a field a client
+    /// cannot write, which is worse than an ugly name.
+    #[serde(default)]
     pub hugepages_1gi: u32,
 }
 
@@ -256,8 +688,19 @@ pub type Node = Resource<NodeSpec, NodeStatus>;
 /// not a state this system can reach.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImageSpec {
-    /// `sha256:…` — also the resource id.
+    /// `sha256:…` — carried in the resource id too, which is what makes
+    /// fetching one verifiable.
     pub digest: String,
+    /// The guest this was captured from, when it came from one rather than
+    /// from a URL somebody typed.
+    ///
+    /// Beside `source_url` rather than replacing it, and for the same reason a
+    /// volume carries three of these: it describes how the object came into
+    /// existence. An image made from a guest that has since been deleted still
+    /// says where it came from, which is what somebody looking at a list of
+    /// near-identical templates actually needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instance: Option<String>,
     pub format: ImageFormat,
     pub size_bytes: u64,
     pub source_url: String,
@@ -341,6 +784,66 @@ pub struct InstanceSpec {
     /// deliberate act with its own resource — never a silent re-place.
     pub node: Option<String>,
     pub placement_policy: PlacementPolicy,
+    /// When this guest starts, relative to others on the same node.
+    ///
+    /// Lower goes first; the same number is a group that starts together.
+    /// Zero — the default — is the first group, which is where everything sits
+    /// until somebody has a reason to say otherwise.
+    ///
+    /// The case this exists for is the one a platform is judged on: power comes
+    /// back, a node starts forty guests at once, and the database everything
+    /// else needs loses the race for disk to a dozen web servers.
+    #[serde(default)]
+    pub start_order: u32,
+    /// How long to let the group ahead settle before this one starts.
+    ///
+    /// Measured from the newest start in that group, not from each member in
+    /// turn — otherwise a fleet's boot is the sum of every delay rather than
+    /// the longest one, and a hundred guests at thirty seconds each is fifty
+    /// minutes of nothing happening.
+    ///
+    /// Zero means "as soon as they are up", which is what most things want:
+    /// the wait is for a database to finish recovering, not a ritual.
+    #[serde(default)]
+    pub start_delay_s: u32,
+    /// What to do if this guest's node stops answering.
+    ///
+    /// `Leave` by default, and not out of caution alone: a guest whose disk is
+    /// local to that machine has nothing to come back *to* elsewhere, and an
+    /// empty machine wearing a familiar name is worse than one that is down and
+    /// says so. See [`crate::ha`] for what makes the other answer safe.
+    #[serde(default)]
+    pub on_node_loss: crate::ha::OnNodeLoss,
+    /// Publish this guest's console output on its status.
+    ///
+    /// A desired state, not a command: "I am watching this guest's console".
+    /// Turning it on is idempotent, turning it off stops the publishing, and a
+    /// controller restart loses nothing — which is why it is a spec field and
+    /// not a request.
+    ///
+    /// Off by default, and that default is load-bearing. An agent writes a
+    /// status only when it has changed, which is what keeps a converged cell
+    /// quiet; a console tail that moved every time a guest logged a line would
+    /// turn every chatty guest into a write per pass. So the cost is paid only
+    /// for the guests somebody is actually looking at.
+    ///
+    /// A guest that is **not** ready publishes its tail regardless — see
+    /// [`InstanceStatus::console_tail`]. Requiring an operator to switch this
+    /// on and then wait for the failure to happen again would be the wrong
+    /// answer to the only question a dead guest is ever asked.
+    #[serde(default)]
+    pub console: bool,
+    /// PCI device classes this guest wants passed through, by resource id.
+    ///
+    /// A class and never an address: `0000:41:00.0` is node-specific, so an
+    /// instance naming one could only ever be scheduled on the one machine
+    /// that has it. Two entries of the same class mean two different devices.
+    ///
+    /// A guest holding one of these cannot be live-migrated — the device's
+    /// state lives in hardware nobody can copy — and the platform refuses the
+    /// migration by name rather than discovering it mid-transfer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,6 +859,55 @@ pub struct PlacementPolicy {
     pub anti_affinity_group: Option<String>,
     /// Only nodes carrying all of these labels.
     pub required_labels: Vec<String>,
+    /// Only nodes whose processor is at least this psABI level.
+    ///
+    /// A level, deliberately, and never a model name. A level is what a
+    /// distribution states as its requirement, and it stays meaningful across
+    /// vendors and generations; naming a model would make one instance
+    /// placeable on one kind of machine and turn a fleet-wide property into
+    /// thousands of per-guest ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_cpu_level: Option<crate::cpu::CpuLevel>,
+    /// Instances that should share a node — the opposite ask.
+    ///
+    /// The case it exists for is a pair that talks constantly: an application
+    /// and the cache it reads on every request, where a hop between machines is
+    /// the whole latency budget. Anti-affinity keeps a service alive when a
+    /// machine dies; affinity keeps it fast while they all live, and a platform
+    /// with only the first can express only half of what people actually run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_group: Option<String>,
+    /// Whether keeping the anti-affinity group apart is a rule or a wish.
+    ///
+    /// `Required` — the default, and what this platform did before the field
+    /// existed — refuses a node that already runs a member. `Preferred` places
+    /// elsewhere if anywhere else will take it, and puts it beside its sibling
+    /// rather than not running at all.
+    ///
+    /// Both are right answers to different questions. Three replicas of a
+    /// database must not share a machine even if that means one stays down;
+    /// twelve web servers would rather be crowded than short.
+    #[serde(default)]
+    pub spread: Strength,
+    /// Whether keeping the affinity group together is a rule or a wish.
+    #[serde(default)]
+    pub affinity: Strength,
+}
+
+/// A rule, or a wish.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Strength {
+    /// Refuse a node that does not satisfy it.
+    ///
+    /// The default, because it is what this platform did before the choice
+    /// existed — and because the safe direction for a rule nobody has thought
+    /// about is the one that says no rather than the one that quietly does
+    /// something else.
+    #[default]
+    Required,
+    /// Prefer a node that satisfies it, and take one that does not over not
+    /// running at all.
+    Preferred,
 }
 
 /// What the node sees. Every value here is observable on the host right now;
@@ -379,11 +931,67 @@ pub struct InstanceStatus {
     pub state: InstanceState,
     /// The node reporting this status. The only agent allowed to write it.
     pub node: Option<String>,
+    /// `default` for the same reason as everything else here: an agent old
+    /// enough not to have sent this exists, and an empty list already means
+    /// "it has no address yet", which every reader handles.
+    #[serde(default)]
     pub addresses: Vec<String>,
     /// Host-side identity of the running machine, for the console and for
     /// re-derivation after an agent restart.
     pub vmm_pid: Option<u32>,
     pub started_at: Option<Timestamp>,
+    /// The size the running guest actually has.
+    ///
+    /// Recorded when it starts, by the agent that asked the VMM for it, and
+    /// cleared when it stops — the same life as [`Self::cpu`] and
+    /// [`Self::devices`], for the same reason: what a running machine *is* is
+    /// a fact somebody observed, not something to re-derive from the ask.
+    ///
+    /// Without this, changing `spec.vcpus` on a running guest was accepted,
+    /// did nothing, and the object read as converged — the platform reporting
+    /// that a guest matched a spec it did not match. That is the one failure
+    /// every invariant here exists to prevent, and it was reachable from a
+    /// text box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_size: Option<RunningSize>,
+
+    /// The last of what this guest wrote to its serial console.
+    ///
+    /// Published when [`InstanceSpec::console`] is on, and always while the
+    /// guest is not ready — a guest that cannot boot is the one that most
+    /// needs to be heard and the one that says the least, which is why the
+    /// node captures this at all.
+    ///
+    /// A **tail**, capped at [`CONSOLE_TAIL_BYTES`]. Never the whole log: a
+    /// guest that has been up for a month has megabytes of it, and a status is
+    /// read by everything in the cell.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub console_tail: String,
+    /// How much the guest has written in total, so a reader can tell a tail
+    /// from the whole thing. Without it, eight kibibytes of output looks like
+    /// everything the guest ever said.
+    #[serde(default)]
+    pub console_bytes: u64,
+
+    /// PCI addresses this guest holds on its node, recorded when it started.
+    ///
+    /// Written by the agent that assigned them, for the same reason the CPU is:
+    /// nobody else can know, and re-deriving it every pass would hand a guest a
+    /// different device the moment another one freed up — restarting it for no
+    /// reason a person could see.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
+
+    /// The CPU this guest was actually given, recorded when it started.
+    ///
+    /// **Not derived from the node it sits on**, now or ever. A baseline
+    /// declared over a fleet does not change what a guest that is already
+    /// running can see, and computing compatibility from the node would say
+    /// otherwise — then move the guest somewhere missing instructions it has
+    /// been executing for hours. Written once by the agent that launched the
+    /// VMM, which is the only party that knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<crate::cpu::GuestCpu>,
 }
 
 impl Observed for InstanceStatus {
@@ -420,6 +1028,15 @@ pub struct VolumeSpec {
     /// in between. Restoring is making a new volume from a snapshot, which is
     /// this field.
     pub source_snapshot: Option<String>,
+    /// The backup this volume was restored from, if it came from one.
+    ///
+    /// The third of the same statement — `source_image`, `source_snapshot`,
+    /// and this — and it is a *field* for the reason written on the one above:
+    /// restoring in place would be a command sitting in a spec, performed
+    /// again on every resync, undoing whatever the guest wrote in between.
+    /// Restoring is making a new volume from a copy, which is this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_backup: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -567,6 +1184,18 @@ pub struct FloatingIpSpec {
     /// operator is holding on to — the reason to have one at all.
     #[serde(default)]
     pub port: String,
+    /// Whether the guest holds this address itself, or something translates it
+    /// at the edge.
+    ///
+    /// `Routed` is the one that puts the address *in* the machine: it is bound
+    /// to the port as a second address, the guest configures it, and nothing
+    /// anywhere rewrites a packet. See [`crate::public`].
+    #[serde(default)]
+    pub delivery: crate::public::Delivery,
+    /// Who announces it, when the network's own answer is not the one this
+    /// address wants. `None` — the default — is "whatever the network says".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announce: Option<crate::public::Announce>,
 }
 
 // Same as `RouterStatus`: `alias`es keep objects stored under the old
@@ -810,6 +1439,23 @@ pub struct NetworkSpec {
     /// cell's range, never chosen by a tenant.
     pub vni: u32,
     pub mtu: u32,
+    /// This network carries addresses the world can reach.
+    ///
+    /// An operator's declaration and never a tenant's: a tenant that could mark
+    /// a network external could mint itself a public range by writing a CIDR
+    /// into a subnet. What it means is that the prefixes on this network's
+    /// subnets are **real** — routed to this cell by whoever is above it — so
+    /// an address taken from one is an address somebody can reach.
+    #[serde(default)]
+    pub external: bool,
+    /// How this cell tells the network above it where an address is.
+    ///
+    /// The cell's answer, which an individual address may override. See
+    /// [`crate::public`] for what the two modes cost. Meaningless on a network
+    /// that is not external, and ignored there rather than refused: a tenant
+    /// network carrying the default value is not a mistake worth a sentence.
+    #[serde(default)]
+    pub announce: crate::public::Announce,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1007,11 +1653,20 @@ mod tests {
         Resource::new(
             meta,
             InstanceSpec {
+                start_order: 0,
+                start_delay_s: 0,
+                on_node_loss: Default::default(),
+                console: false,
+                devices: Vec::new(),
                 vcpus: 2,
                 memory_mib: 4096,
                 ..Default::default()
             },
             InstanceStatus {
+                running_size: None,
+                console_tail: String::new(),
+                console_bytes: 0,
+                devices: Vec::new(),
                 observed_generation: observed,
                 ..Default::default()
             },
@@ -1083,5 +1738,89 @@ mod tests {
             c.message.contains("NUMA"),
             "the sentence an operator reads is on the object"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    use crate::meta::{Meta, Placement, ResourceName};
+
+    fn guest(spec_vcpus: u32, running: Option<RunningSize>) -> Instance {
+        Resource::new(
+            Meta::new(
+                ResourceName::parse("projects/p1/instances/i1").unwrap(),
+                Placement::new("eu", "cell-1"),
+            ),
+            InstanceSpec {
+                vcpus: spec_vcpus,
+                memory_mib: 4096,
+                root_disk_gib: 20,
+                ..Default::default()
+            },
+            InstanceStatus {
+                state: InstanceState::Running,
+                running_size: running,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The bug this exists for: a resize of a running guest used to be
+    /// accepted, do nothing, and read as applied.
+    #[test]
+    fn resizing_a_running_guest_is_reported_rather_than_silently_ignored() {
+        let g = guest(
+            8,
+            Some(RunningSize {
+                vcpus: 4,
+                memory_mib: 4096,
+                root_disk_gib: 20,
+            }),
+        );
+        let pending = pending_changes(&g);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].field, "vcpus");
+        // The sentence carries both numbers, because "pending" without them is
+        // a badge somebody dismisses.
+        assert_eq!(pending[0].to_string(), "vcpus: 4 → 8");
+    }
+
+    #[test]
+    fn a_guest_running_what_was_asked_for_has_nothing_pending() {
+        let g = guest(
+            4,
+            Some(RunningSize {
+                vcpus: 4,
+                memory_mib: 4096,
+                root_disk_gib: 20,
+            }),
+        );
+        assert!(pending_changes(&g).is_empty());
+    }
+
+    /// A guest that is not running has nothing to differ from.
+    ///
+    /// Its next start gives it whatever the spec says, by construction — so
+    /// reporting a pending change would be reporting one that does not exist.
+    #[test]
+    fn a_stopped_guest_has_nothing_pending_whatever_the_spec_says() {
+        assert!(pending_changes(&guest(64, None)).is_empty());
+    }
+
+    #[test]
+    fn every_size_field_is_compared_not_just_the_first() {
+        let mut g = guest(
+            8,
+            Some(RunningSize {
+                vcpus: 4,
+                memory_mib: 2048,
+                root_disk_gib: 10,
+            }),
+        );
+        g.spec.memory_mib = 4096;
+        g.spec.root_disk_gib = 20;
+        let fields: Vec<&str> = pending_changes(&g).iter().map(|c| c.field).collect();
+        assert_eq!(fields, ["vcpus", "memoryMib", "rootDiskGib"]);
     }
 }

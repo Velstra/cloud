@@ -50,6 +50,8 @@
 //! what anybody remembers, and running them twice over a settled volume asks for
 //! nothing.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     meta::{Condition, ConditionStatus, ResourceName},
     resources::{Snapshot, Volume, VolumeSpec},
@@ -66,6 +68,13 @@ pub enum VolumeSource {
     Blank,
     Image(String),
     Snapshot(String),
+    /// A copy on a target, by the backup's own name.
+    ///
+    /// The name and not a path, because a path is a fact about one agent's
+    /// filesystem and a spec that carried one could not be read by the next
+    /// machine. Whoever provisions resolves it — the backup says which target,
+    /// the target says where.
+    Backup(String),
 }
 
 impl VolumeSource {
@@ -78,9 +87,14 @@ impl VolumeSource {
     /// can only ever mean *more* recent bytes, never a silent regression to an
     /// installer image.
     pub fn of(spec: &VolumeSpec) -> Self {
-        match (&spec.source_snapshot, &spec.source_image) {
-            (Some(snapshot), _) if !snapshot.is_empty() => Self::Snapshot(snapshot.clone()),
-            (_, Some(image)) if !image.is_empty() => Self::Image(image.clone()),
+        match (&spec.source_snapshot, &spec.source_backup, &spec.source_image) {
+            (Some(snapshot), _, _) if !snapshot.is_empty() => Self::Snapshot(snapshot.clone()),
+            // Before the image and after the snapshot, on the same reasoning:
+            // both are more recent bytes than an installer image, and a
+            // snapshot is nearer still — it is in the pool the volume is being
+            // made in, with a lineage the backup does not have.
+            (_, Some(backup), _) if !backup.is_empty() => Self::Backup(backup.clone()),
+            (_, _, Some(image)) if !image.is_empty() => Self::Image(image.clone()),
             _ => Self::Blank,
         }
     }
@@ -505,6 +519,7 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             VolumeSpec {
+                source_backup: None,
                 size_gib,
                 pool: "pool-a".into(),
                 encryption_key: None,
@@ -837,6 +852,7 @@ mod tests {
     fn a_volume_made_from_a_snapshot_is_refused_before_it_exists() {
         let mut s = snapshot("nightly");
         let mut spec = VolumeSpec {
+            source_backup: None,
             size_gib: 100,
             pool: "pool-a".into(),
             source_snapshot: Some(s.meta.name.to_string()),
@@ -898,6 +914,7 @@ mod tests {
         s.status.taken = true;
         s.status.size_gib = 100;
         let mut spec = VolumeSpec {
+            source_backup: None,
             size_gib: 100,
             pool: "pool-a".into(),
             source_snapshot: Some(s.meta.name.to_string()),
@@ -952,4 +969,49 @@ mod tests {
         };
         assert_eq!(VolumeSource::of(&blank), VolumeSource::Blank);
     }
+}
+
+/// "Keep a recent snapshot of this volume, and the last few."
+///
+/// The cheap half of the pair. A snapshot lives in the volume's own pool: it
+/// costs almost nothing, it is taken in a moment, and it is the right tool for
+/// "let me be able to go back an hour". It is not a backup — lose the pool and
+/// it goes with it — which is why [`crate::backup`] exists beside it and why
+/// the two are separate schedules rather than one with a flag.
+///
+/// Cheap enough that the interval is in **hours like the other one but usually
+/// set to one**: every hour, keep twenty-four, and an operator who breaks
+/// something at 14:05 is back at 14:00 rather than at last night.
+///
+/// The arithmetic is [`crate::backup::due`] and [`crate::backup::prune`],
+/// which take an interval and a count rather than a backup — so this shares
+/// the rules that were hard to get right (an unfinished copy holds the
+/// schedule; only finished ones count toward `keep`; at least one always
+/// survives) instead of growing a second copy of them that drifts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotScheduleSpec {
+    pub volume: String,
+    /// How stale the newest snapshot may get before another is taken.
+    pub every_hours: u32,
+    /// How many of this schedule's snapshots to keep. Only ones it took are
+    /// counted or expired: a snapshot somebody made by hand is theirs.
+    pub keep: u32,
+}
+
+impl Default for SnapshotScheduleSpec {
+    fn default() -> Self {
+        Self {
+            volume: String::new(),
+            every_hours: 1,
+            // A day of hourly points. Enough to undo this morning, and small
+            // enough that a pool is not quietly full of yesterday.
+            keep: 24,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotScheduleStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<crate::meta::Condition>,
 }

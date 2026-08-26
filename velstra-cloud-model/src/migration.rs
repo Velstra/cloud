@@ -179,6 +179,44 @@ pub enum Refusal {
     /// without the image cannot start the receiver.
     #[error("{node} does not have {image}")]
     DestinationLacksImage { node: String, image: String },
+    /// The destination cannot present the CPU this guest is already running
+    /// with. Refused here rather than discovered later: an instruction the
+    /// guest can no longer execute does not fail at the move, it faults inside
+    /// the guest at some unrelated moment afterwards, which is the hardest
+    /// possible way to learn about it.
+    ///
+    /// Carries the mismatch rather than a sentence so the console can act on
+    /// which kind it is: a shortfall of flags invites a baseline, and a VMM
+    /// that cannot mask means no configuration will ever help.
+    #[error("{node} cannot give this guest the cpu it is running with: {why}")]
+    DestinationCpuIncompatible {
+        node: String,
+        why: crate::cpu::CpuMismatch,
+    },
+    /// The guest holds a passed-through PCI device.
+    ///
+    /// Not a limitation to work around: a device's state lives in hardware
+    /// that nobody can serialise, so there is nothing to send. Refused at the
+    /// door with the devices named, rather than discovered when the receiver
+    /// cannot be built — by which point the operator has watched a transfer
+    /// start.
+    ///
+    /// `Reboot` mode is the honest alternative and the message says so: stop,
+    /// move, start, and the guest gets the destination's devices.
+    #[error(
+        "it holds {devices} — a device's state is in hardware and cannot be transferred; \
+         move it with mode Reboot, which stops the guest and gives it the destination's devices"
+    )]
+    HoldsDevices { devices: String },
+    /// The guest has never reported what CPU it was given, so nothing can show
+    /// the destination is able to reproduce it.
+    ///
+    /// A separate refusal from the one above, and not an oversight: "we know
+    /// this will break" and "we cannot know" call for different actions, and
+    /// the second one is fixed by restarting the guest under an agent new
+    /// enough to report, not by finding another node.
+    #[error("this guest has not reported its cpu, so {node} cannot be shown to match it")]
+    GuestCpuUnknown { node: String },
 }
 
 /// Whether this guest may be moved there, and if not, the sentence that says
@@ -193,6 +231,9 @@ pub fn may_migrate(
     from: &Node,
     to: &Node,
     image_cached_on: &[String],
+    // How the guest is to be moved. Only `Reboot` can carry a guest that holds
+    // hardware, because only `Reboot` does not have to transfer device state.
+    mode: MigrationMode,
 ) -> Result<(), Refusal> {
     let from_id = from.meta.name.id();
     let to_id = to.meta.name.id();
@@ -240,6 +281,47 @@ pub fn may_migrate(
             image: instance.spec.image.clone(),
         });
     }
+    // Passed-through hardware, before the CPU: a guest holding a device
+    // cannot move at all, so the finer question of whether the destination's
+    // processor matches is not the one to answer first.
+    if !instance.status.devices.is_empty() && mode != MigrationMode::Reboot {
+        return Err(Refusal::HoldsDevices {
+            devices: instance.status.devices.join(", "),
+        });
+    }
+    // The CPU, last of the cheap checks and before anything is started: this
+    // is the mismatch that survives a successful transfer and shows up as a
+    // fault inside the guest later, so it is the one worth being strictest
+    // about.
+    match &instance.status.cpu {
+        Some(guest_cpu) => {
+            if let Err(why) = crate::cpu::may_run_on(guest_cpu, &to.status.cpu.clone().unwrap_or_default())
+            {
+                return Err(Refusal::DestinationCpuIncompatible {
+                    node: to_id.to_string(),
+                    why,
+                });
+            }
+        }
+        // Nothing recorded — a guest started before its agent could report.
+        //
+        // Refusing outright would strand every such guest until it is
+        // restarted, and restarting is the very thing migration exists to
+        // avoid. There is one case where the move is provably safe without
+        // knowing what the guest sees: when the two hosts are
+        // indistinguishable. Whatever the source presented out of that
+        // machine, the destination can present the same. Anything else is
+        // a guess, and this is not a place to guess.
+        None => {
+            let from_cpu = from.status.cpu.clone().unwrap_or_default();
+            let to_cpu = to.status.cpu.clone().unwrap_or_default();
+            if from_cpu.arch.is_empty() || !from_cpu.indistinguishable(&to_cpu) {
+                return Err(Refusal::GuestCpuUnknown {
+                    node: to_id.to_string(),
+                });
+            }
+        }
+    }
     if !versions_compatible(&from.status.agent_version, &to.status.agent_version) {
         return Err(Refusal::VersionsTooFarApart {
             from_node: from_id.to_string(),
@@ -249,6 +331,87 @@ pub fn may_migrate(
         });
     }
     Ok(())
+}
+
+/// One guest a node is trying to hand over, and where it may go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handover {
+    pub instance: String,
+    /// The destination, chosen from the ones that said yes.
+    pub to_node: String,
+}
+
+/// Why a guest could not be handed over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stranded {
+    pub instance: String,
+    /// Every node's verdict, so the reason is a hardware or capacity fact
+    /// rather than "no host found".
+    pub refusals: Vec<(String, Refusal)>,
+}
+
+/// Which guests on this node can be moved off it, and where each should go.
+///
+/// Pure, and deliberately does not create anything: the caller turns each
+/// [`Handover`] into a `Migration` object, and a guest that already has one in
+/// flight is not offered again.
+///
+/// **The emptiest destination wins**, by free memory. Not round-robin and not
+/// first-fit: an evacuation moves several guests at once, and first-fit puts
+/// them all on the same machine — which is how emptying one node fills
+/// another.
+///
+/// A guest that cannot move is *not* an error. Some never can — one holding a
+/// passed-through device is bound to that machine — and a node that refused to
+/// drain the rest because of it would be worse than one that moves what it can
+/// and says what is left.
+pub fn evacuate(
+    from: &Node,
+    guests: &[&Instance],
+    others: &[&Node],
+    image_cached_on: &dyn Fn(&str) -> Vec<String>,
+    already_moving: &[String],
+) -> (Vec<Handover>, Vec<Stranded>) {
+    let mut going = Vec::new();
+    let mut stuck = Vec::new();
+
+    for guest in guests {
+        let name = guest.meta.name.to_string();
+        // One migration per guest. A second would be two transfers of one
+        // machine, and the loser of that race is a guest nobody can account
+        // for.
+        if already_moving.iter().any(|m| m == &name) {
+            continue;
+        }
+        let cached = image_cached_on(&guest.spec.image);
+
+        let mut refusals = Vec::new();
+        let mut best: Option<(&Node, u64)> = None;
+        for to in others {
+            match may_migrate(guest, from, to, &cached, MigrationMode::Live) {
+                Err(why) => refusals.push((to.meta.name.id().to_string(), why)),
+                Ok(()) => {
+                    let free = free_memory_mib(to);
+                    if best.is_none_or(|(_, most)| free > most) {
+                        best = Some((to, free));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((to, _)) => going.push(Handover {
+                instance: name,
+                to_node: to.meta.name.id().to_string(),
+            }),
+            None => stuck.push(Stranded {
+                instance: name,
+                refusals,
+            }),
+        }
+    }
+    going.sort_by(|a, b| a.instance.cmp(&b.instance));
+    stuck.sort_by(|a, b| a.instance.cmp(&b.instance));
+    (going, stuck)
 }
 
 fn free_memory_mib(node: &Node) -> u64 {
@@ -521,6 +684,11 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             InstanceSpec {
+                start_order: 0,
+                start_delay_s: 0,
+                on_node_loss: Default::default(),
+                console: false,
+                devices: Vec::new(),
                 vcpus: 2,
                 memory_mib: 4096,
                 image: "projects/p1/images/sha256-abc".into(),
@@ -545,8 +713,13 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             NodeSpec {
+                evacuate: false,
+                vcpu_overcommit: 0,
+                fence_after_s: 0,
                 schedulable: true,
                 labels: vec![],
+                cpu_baseline: None,
+                gateway: false,
             },
             NodeStatus {
                 capacity: Cap {
@@ -557,6 +730,24 @@ mod tests {
                     hugepages_1gi: 0,
                 },
                 agent_version: version.to_string(),
+                // The fixture's nodes are the same machine unless a test says
+                // otherwise, which is what an ordinary cell looks like and
+                // what keeps the CPU check out of the way of tests about
+                // something else.
+                cpu: Some(crate::cpu::NodeCpu {
+                    arch: "x86_64".into(),
+                    flags: ["sse3", "ssse3", "sse4_1", "sse4_2", "popcnt", "cx16", "lahf_lm"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    presents: "host".into(),
+                    presented_flags: ["sse3", "ssse3", "sse4_1", "sse4_2", "popcnt", "cx16", "lahf_lm"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    can_mask: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         );
@@ -588,18 +779,18 @@ mod tests {
         let a = node("node-a", 16384, "0.1.0");
         let cached = vec!["node-a".to_string(), "node-b".to_string()];
 
-        assert!(may_migrate(&i, &a, &node("node-b", 16384, "0.1.0"), &cached).is_ok());
+        assert!(may_migrate(&i, &a, &node("node-b", 16384, "0.1.0"), &cached, MigrationMode::Live).is_ok());
 
         // Every one of these is knowable without touching a hypervisor, and
         // every one of them would otherwise fail after the memory was copied.
         assert_eq!(
-            may_migrate(&i, &a, &a, &cached),
+            may_migrate(&i, &a, &a, &cached, MigrationMode::Live),
             Err(Refusal::AlreadyThere {
                 node: "node-a".into()
             })
         );
         assert!(matches!(
-            may_migrate(&i, &a, &node("node-b", 1024, "0.1.0"), &cached),
+            may_migrate(&i, &a, &node("node-b", 1024, "0.1.0"), &cached, MigrationMode::Live),
             Err(Refusal::DestinationTooSmall { .. })
         ));
         assert!(matches!(
@@ -607,16 +798,166 @@ mod tests {
                 &i,
                 &a,
                 &node("node-b", 16384, "0.1.0"),
-                &["node-a".to_string()]
+                &["node-a".to_string()],
+                MigrationMode::Live
             ),
             Err(Refusal::DestinationLacksImage { .. })
         ));
         let mut draining = node("node-b", 16384, "0.1.0");
         draining.spec.schedulable = false;
         assert!(matches!(
-            may_migrate(&i, &a, &draining, &cached),
+            may_migrate(&i, &a, &draining, &cached, MigrationMode::Live),
             Err(Refusal::DestinationDraining { .. })
         ));
+    }
+
+    /// A guest may not land somewhere that cannot give it what it is running
+    /// with — and the refusal names the flags.
+    ///
+    /// This is the mismatch that *survives* a successful transfer: the guest
+    /// arrives, runs, and faults at whatever unrelated moment it next reaches
+    /// for the missing instruction.
+    #[test]
+    fn a_guest_is_not_moved_onto_a_cpu_that_cannot_run_it() {
+        let mut i = instance(InstanceState::Running, Some("node-a"));
+        i.status.cpu = Some(crate::cpu::GuestCpu {
+            model: "host".into(),
+            arch: "x86_64".into(),
+            flags: ["sse4_2", "avx", "avx2"].iter().map(|s| s.to_string()).collect(),
+        });
+        let cached = vec!["node-a".to_string(), "node-b".to_string()];
+
+        let mut smaller = node("node-b", 16384, "1.0.0");
+        smaller.status.cpu = Some(crate::cpu::NodeCpu {
+            arch: "x86_64".into(),
+            flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
+            presents: "host".into(),
+            presented_flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
+            can_mask: true,
+            ..Default::default()
+        });
+
+        let Err(Refusal::DestinationCpuIncompatible { why, .. }) =
+            may_migrate(&i, &node("node-a", 16384, "1.0.0"), &smaller, &cached, MigrationMode::Live)
+        else {
+            panic!("a guest using avx2 was allowed onto a node without it");
+        };
+        assert_eq!(
+            why,
+            crate::cpu::CpuMismatch::NotIdentical {
+                missing: vec!["avx".to_string(), "avx2".to_string()],
+                extra: vec![],
+            }
+        );
+    }
+
+    /// A destination with *more* than the guest is refused as well, and the
+    /// message points at the baseline that would actually fix it.
+    ///
+    /// A running guest cannot be handed features mid-flight: it has read
+    /// CPUID already. "The destination is better" is not a reason to move a
+    /// guest onto it.
+    #[test]
+    fn a_bigger_destination_is_a_different_machine_and_says_what_would_help() {
+        let mut i = instance(InstanceState::Running, Some("node-a"));
+        i.status.cpu = Some(crate::cpu::GuestCpu {
+            model: "host".into(),
+            arch: "x86_64".into(),
+            flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
+        });
+        let cached = vec!["node-a".to_string(), "node-b".to_string()];
+
+        let mut bigger = node("node-b", 16384, "1.0.0");
+        bigger.status.cpu = Some(crate::cpu::NodeCpu {
+            arch: "x86_64".into(),
+            flags: ["sse4_2", "avx", "avx2"].iter().map(|s| s.to_string()).collect(),
+            presents: "host".into(),
+            presented_flags: ["sse4_2", "avx", "avx2"].iter().map(|s| s.to_string()).collect(),
+            can_mask: true,
+            ..Default::default()
+        });
+        let Err(Refusal::DestinationCpuIncompatible { why, .. }) =
+            may_migrate(&i, &node("node-a", 16384, "1.0.0"), &bigger, &cached, MigrationMode::Live)
+        else {
+            panic!("a running guest was moved onto a cpu it had not been given");
+        };
+        assert!(
+            why.to_string().contains("declare a baseline"),
+            "the refusal does not say what would help: {why}"
+        );
+    }
+
+    /// A guest that never reported its CPU may still move between two machines
+    /// that are indistinguishable, and may not move anywhere else.
+    ///
+    /// Refusing both cases would strand every guest started before the agent
+    /// could report until it is restarted — and avoiding a restart is what
+    /// migration is for. Allowing both would guess.
+    #[test]
+    fn an_unreported_guest_cpu_moves_only_between_identical_machines() {
+        let i = instance(InstanceState::Running, Some("node-a"));
+        assert!(i.status.cpu.is_none());
+        let cached = vec!["node-a".to_string(), "node-b".to_string()];
+
+        // The fixture's nodes are the same machine: provably safe.
+        assert!(
+            may_migrate(
+                &i,
+                &node("node-a", 16384, "1.0.0"),
+                &node("node-b", 16384, "1.0.0"),
+                &cached,
+                MigrationMode::Live
+            )
+            .is_ok()
+        );
+
+        // A different machine: nothing can vouch for the guest.
+        let mut other = node("node-b", 16384, "1.0.0");
+        other.status.cpu = Some(crate::cpu::NodeCpu {
+            arch: "x86_64".into(),
+            flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
+            presents: "host".into(),
+            presented_flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
+            can_mask: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            may_migrate(&i, &node("node-a", 16384, "1.0.0"), &other, &cached, MigrationMode::Live),
+            Err(Refusal::GuestCpuUnknown { .. })
+        ));
+    }
+
+    /// A destination whose VMM cannot mask is refused with *that* reason.
+    ///
+    /// Not a flag list: "three flags short" invites a baseline, and this case
+    /// cannot be fixed by one. Handing the operator the wrong sentence sends
+    /// them to configure something that will never help.
+    #[test]
+    fn a_destination_that_cannot_mask_says_so_rather_than_listing_flags() {
+        let mut i = instance(InstanceState::Running, Some("node-a"));
+        i.status.cpu = Some(crate::cpu::GuestCpu {
+            model: "host".into(),
+            arch: "x86_64".into(),
+            flags: ["sse4_2", "avx2"].iter().map(|s| s.to_string()).collect(),
+        });
+        let cached = vec!["node-a".to_string(), "node-b".to_string()];
+
+        let mut ch = node("node-b", 16384, "1.0.0");
+        ch.status.cpu = Some(crate::cpu::NodeCpu {
+            arch: "x86_64".into(),
+            model_name: "AMD EPYC 9654".into(),
+            flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
+            presents: "host".into(),
+            presented_flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
+            can_mask: false,
+            ..Default::default()
+        });
+        let Err(Refusal::DestinationCpuIncompatible { why, .. }) =
+            may_migrate(&i, &node("node-a", 16384, "1.0.0"), &ch, &cached, MigrationMode::Live)
+        else {
+            panic!("a cloud-hypervisor node took a guest it cannot reproduce");
+        };
+        assert!(matches!(why, crate::cpu::CpuMismatch::CannotMask { .. }));
     }
 
     #[test]
@@ -631,7 +972,8 @@ mod tests {
                 &i,
                 &node("node-a", 16384, "0.1.0"),
                 &node("node-b", 16384, "2.0.0"),
-                &cached
+                &cached,
+                MigrationMode::Live
             ),
             Err(Refusal::VersionsTooFarApart { .. })
         ));
@@ -641,7 +983,8 @@ mod tests {
                 &i,
                 &node("node-a", 16384, "1.0.0"),
                 &node("node-b", 16384, "2.0.0"),
-                &cached
+                &cached,
+                MigrationMode::Live
             )
             .is_ok()
         );
@@ -652,7 +995,8 @@ mod tests {
                 &i,
                 &node("node-a", 16384, "dev"),
                 &node("node-b", 16384, "?"),
-                &cached
+                &cached,
+                MigrationMode::Live
             )
             .is_ok()
         );
@@ -666,10 +1010,166 @@ mod tests {
                 &stopped,
                 &node("node-a", 16384, "0.1.0"),
                 &node("node-b", 16384, "0.1.0"),
-                &["node-b".to_string()]
+                &["node-b".to_string()],
+                MigrationMode::Live
             ),
             Err(Refusal::NotRunning { .. })
         ));
+    }
+
+
+    /// A guest holding passed-through hardware is not live-migrated, and the
+    /// refusal says what would work instead.
+    ///
+    /// There is nothing to transfer: a device's state lives in hardware that
+    /// cannot be serialised. Refused at the door rather than when the receiver
+    /// cannot be built, by which point an operator has watched a transfer
+    /// start and is owed an explanation for why it stopped.
+    #[test]
+    fn a_guest_holding_a_device_is_not_live_migrated_and_is_told_what_would_work() {
+        let mut i = instance(InstanceState::Running, Some("node-a"));
+        i.status.devices = vec!["0000:41:00.0".into()];
+        let cached = vec!["node-a".to_string(), "node-b".to_string()];
+        let a = node("node-a", 16384, "1.0.0");
+        let b = node("node-b", 16384, "1.0.0");
+
+        let Err(Refusal::HoldsDevices { devices }) =
+            may_migrate(&i, &a, &b, &cached, MigrationMode::Live)
+        else {
+            panic!("a guest holding a PCI device was cleared for live migration");
+        };
+        assert_eq!(devices, "0000:41:00.0");
+
+        // The message names the remedy, because "it holds a device" leaves an
+        // operator with a guest they cannot move and no next step.
+        let said = Refusal::HoldsDevices { devices }.to_string();
+        assert!(said.contains("Reboot"), "{said}");
+
+        // Post-copy is no better: it still has to carry device state.
+        assert!(matches!(
+            may_migrate(&i, &a, &b, &cached, MigrationMode::PostCopy),
+            Err(Refusal::HoldsDevices { .. })
+        ));
+
+        // Reboot stops the guest, so there is no device state to carry and the
+        // guest picks up the destination's hardware when it starts again.
+        assert!(
+            may_migrate(&i, &a, &b, &cached, MigrationMode::Reboot).is_ok(),
+            "a reboot migration was refused for a guest holding a device"
+        );
+    }
+
+
+    /// Emptying a node fills the emptiest neighbour, not the first one.
+    ///
+    /// The trap this pins: first-fit moves every guest to the same machine, so
+    /// draining one node fills another and the operator is back where they
+    /// started with an extra outage.
+    #[test]
+    fn an_evacuation_spreads_guests_rather_than_stacking_them_on_the_first_fit() {
+        let from = node("node-a", 16384, "1.0.0");
+        let mut roomy = node("node-c", 65536, "1.0.0");
+        roomy.status.allocated.memory_mib = 0;
+        let mut tight = node("node-b", 16384, "1.0.0");
+        tight.status.allocated.memory_mib = 8192;
+
+        let mut one = instance(InstanceState::Running, Some("node-a"));
+        one.meta.name = ResourceName::parse("projects/p1/instances/i1").unwrap();
+        let mut two = instance(InstanceState::Running, Some("node-a"));
+        two.meta.name = ResourceName::parse("projects/p1/instances/i2").unwrap();
+
+        let cached = |_: &str| vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()];
+        let (going, stuck) = evacuate(&from, &[&one, &two], &[&tight, &roomy], &cached, &[]);
+
+        assert!(stuck.is_empty(), "{stuck:?}");
+        assert_eq!(going.len(), 2);
+        assert!(
+            going.iter().all(|h| h.to_node == "node-c"),
+            "guests went to the tighter node: {going:?}"
+        );
+    }
+
+    /// A guest already moving is not offered again.
+    #[test]
+    fn a_guest_already_in_flight_is_not_moved_twice() {
+        let from = node("node-a", 16384, "1.0.0");
+        let to = node("node-b", 65536, "1.0.0");
+        let i = instance(InstanceState::Running, Some("node-a"));
+        let name = i.meta.name.to_string();
+        let cached = |_: &str| vec!["node-a".to_string(), "node-b".to_string()];
+
+        let (going, _) = evacuate(&from, &[&i], &[&to], &cached, std::slice::from_ref(&name));
+        assert!(
+            going.is_empty(),
+            "a guest with a migration in flight was sent again: {going:?}"
+        );
+
+        // Without that, it is offered.
+        let (going, _) = evacuate(&from, &[&i], &[&to], &cached, &[]);
+        assert_eq!(going.len(), 1);
+    }
+
+    /// A guest that cannot move does not stop the rest, and carries the reason.
+    ///
+    /// Some guests never can — one holding a passed-through device is bound to
+    /// its machine — and a node that refused to drain the others because of it
+    /// would be worse than one that moves what it can and says what is left.
+    #[test]
+    fn a_guest_that_cannot_move_does_not_hold_up_the_ones_that_can() {
+        let from = node("node-a", 16384, "1.0.0");
+        let to = node("node-b", 65536, "1.0.0");
+
+        let mut movable = instance(InstanceState::Running, Some("node-a"));
+        movable.meta.name = ResourceName::parse("projects/p1/instances/i1").unwrap();
+        let mut bound = instance(InstanceState::Running, Some("node-a"));
+        bound.meta.name = ResourceName::parse("projects/p1/instances/i2").unwrap();
+        bound.status.devices = vec!["0000:41:00.0".into()];
+
+        let cached = |_: &str| vec!["node-a".to_string(), "node-b".to_string()];
+        let (going, stuck) = evacuate(&from, &[&movable, &bound], &[&to], &cached, &[]);
+
+        assert_eq!(going.len(), 1, "{going:?}");
+        assert_eq!(going[0].instance, "projects/p1/instances/i1");
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].instance, "projects/p1/instances/i2");
+        assert!(
+            matches!(stuck[0].refusals[0].1, Refusal::HoldsDevices { .. }),
+            "the reason a guest is stranded was lost: {:?}",
+            stuck[0].refusals
+        );
+    }
+
+    /// With nowhere to go, every node's verdict is kept.
+    ///
+    /// "No host found" sends an operator hunting. "node-b is draining, node-c
+    /// does not have the image" is two things they can fix.
+    #[test]
+    fn a_guest_with_nowhere_to_go_keeps_every_nodes_reason() {
+        let from = node("node-a", 16384, "1.0.0");
+        let mut draining = node("node-b", 65536, "1.0.0");
+        draining.spec.schedulable = false;
+        let without_image = node("node-c", 65536, "1.0.0");
+
+        let i = instance(InstanceState::Running, Some("node-a"));
+        // Only the source has it.
+        let cached = |_: &str| vec!["node-a".to_string()];
+        let (going, stuck) = evacuate(&from, &[&i], &[&draining, &without_image], &cached, &[]);
+
+        assert!(going.is_empty());
+        assert_eq!(stuck.len(), 1);
+        let reasons: Vec<&Refusal> = stuck[0].refusals.iter().map(|(_, r)| r).collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| matches!(r, Refusal::DestinationDraining { .. })),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| matches!(r, Refusal::DestinationLacksImage { .. })),
+            "{reasons:?}"
+        );
     }
 
     #[test]

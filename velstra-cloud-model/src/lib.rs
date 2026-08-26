@@ -8,14 +8,25 @@
 //! Start with [`meta`] for the three invariants everything else follows from.
 
 pub mod access;
+pub mod allowance;
 pub mod assignment;
+pub mod audit;
 pub mod authz;
+pub mod backup;
+pub mod capture;
 pub mod ceph;
+pub mod cpu;
+pub mod ha;
 pub mod identity;
 pub mod ipam;
+pub mod limit;
+pub mod loadbalancer;
+pub mod maintenance;
 pub mod meta;
 pub mod migration;
 pub mod network;
+pub mod pci;
+pub mod public;
 pub mod reconcile;
 pub mod resources;
 pub mod routing;

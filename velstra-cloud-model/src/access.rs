@@ -62,6 +62,14 @@ pub enum WriteRefused {
     GenerationWithoutChange,
     #[error("spec changed without the generation moving")]
     ChangeWithoutGeneration,
+    #[error(
+        "{writer} created an object; only a controller may create one — an agent reports on \
+         objects a controller brought into being, and never invents one, so it can never assert \
+         ownership by creating it either"
+    )]
+    CreateIsNotYours { writer: String },
+    #[error("{writer} deleted an object; only a controller may")]
+    DeleteIsNotYours { writer: String },
 }
 
 /// What changed between the stored copy and the one being written.
@@ -175,6 +183,48 @@ pub fn judge(writer: &Writer, changed: Changed, held: Ownership<'_>) -> Result<(
     }
 }
 
+/// Judge bringing an object into existence.
+///
+/// A create is a controller's act — it writes spec and metadata, which an agent
+/// never does.
+///
+/// So an agent that creates one is refused, and that single rule is what closes
+/// the ownership-smuggle: the way a compromised node would hand itself an object
+/// is by *creating* one whose status already names it as owner, bypassing the
+/// claim that ownership normally has to be earned through. An agent that cannot
+/// create anything cannot create a pre-owned object either — the smuggle has no
+/// door, rather than a door with a guard on it. A controller is trusted with
+/// spec and metadata and may create; in this platform it always does so with an
+/// empty status (the API forces it, and every controller writes
+/// `Status::default()`), so nothing is lost by not policing a controller's
+/// create for a claim it never makes.
+pub fn judge_create(writer: &Writer) -> Result<(), WriteRefused> {
+    match writer {
+        Writer::Controller(_) => Ok(()),
+        Writer::Agent { .. } => Err(WriteRefused::CreateIsNotYours {
+            writer: writer.describe(),
+        }),
+    }
+}
+
+/// Judge removing an object.
+///
+/// Deletion is a metadata decision — it sets `deleted_at` and then, once the
+/// finalizers are gone, takes the object away — and metadata is the controller's
+/// half. An agent reports on objects; it never asks for one to be gone, so an
+/// agent delete is refused for the same reason an agent's metadata write is. The
+/// stored ownership is not consulted: even the node that runs an instance may
+/// not delete it, because a delete is a decision about the object rather than a
+/// report about the machine.
+pub fn judge_delete(writer: &Writer) -> Result<(), WriteRefused> {
+    match writer {
+        Writer::Controller(_) => Ok(()),
+        Writer::Agent { node } => Err(WriteRefused::DeleteIsNotYours {
+            writer: format!("agent on {node}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +318,37 @@ mod tests {
             })
         );
         assert!(judge(&Writer::agent("node-a"), STATUS, held(None)).is_err());
+    }
+
+    #[test]
+    fn only_a_controller_may_create_and_never_with_a_status() {
+        // A controller brings objects into being — the ordinary case.
+        assert!(judge_create(&Writer::controller("api")).is_ok());
+
+        // An agent may not create at all: it reports on objects a controller
+        // brought into being, and inventing one is exactly the escalation the
+        // per-node boundary exists to stop. This is also what makes an ownership
+        // smuggle impossible — a node cannot create a pre-owned object because it
+        // cannot create an object.
+        assert_eq!(
+            judge_create(&Writer::agent("node-a")),
+            Err(WriteRefused::CreateIsNotYours {
+                writer: "agent on node-a".into()
+            })
+        );
+    }
+
+    #[test]
+    fn only_a_controller_may_delete() {
+        assert!(judge_delete(&Writer::controller("api")).is_ok());
+        // Even the node that runs the object may not delete it: a delete is a
+        // decision about the object, not a report about the machine.
+        assert_eq!(
+            judge_delete(&Writer::agent("node-a")),
+            Err(WriteRefused::DeleteIsNotYours {
+                writer: "agent on node-a".into()
+            })
+        );
     }
 
     #[test]

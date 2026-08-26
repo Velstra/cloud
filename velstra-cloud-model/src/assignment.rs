@@ -302,6 +302,9 @@ mod tests {
             "subnets",
             "networks",
             "security-groups",
+            // A load balancer is a cell-wide fact like the network it fronts:
+            // balancing happens wherever traffic arrives, so no node owns one.
+            "load-balancers",
             "nodes",
             "images",
             "projects",
