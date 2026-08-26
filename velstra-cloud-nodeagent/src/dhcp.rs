@@ -623,6 +623,7 @@ mod tests {
                 dns: vec!["10.20.0.1".parse().unwrap(), "fd00::1".parse().unwrap()],
                 mtu: Some(1450),
                 tap: Some(tap.to_string()),
+                public: Vec::new(),
             }],
             ..Default::default()
         }

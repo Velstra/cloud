@@ -524,8 +524,13 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             NodeSpec {
+                evacuate: false,
+                vcpu_overcommit: 0,
+                fence_after_s: 0,
                 schedulable: true,
                 labels: vec![],
+                cpu_baseline: None,
+                gateway: false,
             },
             NodeStatus {
                 ceph,

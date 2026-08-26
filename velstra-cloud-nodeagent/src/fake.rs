@@ -55,6 +55,27 @@ pub enum Fault {
     CancelSend,
 }
 
+/// The processor every fake machine reports unless a test says otherwise.
+fn ordinary_cpu() -> velstra_cloud_model::cpu::NodeCpu {
+    let flags: BTreeSet<String> = [
+        "cx16", "lahf_lm", "popcnt", "sse3", "sse4_1", "sse4_2", "ssse3", "avx", "avx2", "bmi1",
+        "bmi2", "f16c", "fma", "lzcnt", "movbe",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    velstra_cloud_model::cpu::NodeCpu {
+        arch: "x86_64".into(),
+        vendor: "GenuineIntel".into(),
+        model_name: "Intel(R) Xeon(R) Gold 6248R".into(),
+        presents: "host".into(),
+        presented_flags: flags.clone(),
+        flags,
+        can_mask: true,
+        ..Default::default()
+    }
+}
+
 #[derive(Default)]
 struct Machine {
     /// What other machines can reach this one at. Part of every URL it hands
@@ -67,6 +88,17 @@ struct Machine {
     /// disk picker without a machine that has spare disks.
     devices: Vec<velstra_cloud_model::ceph::BlockDevice>,
     ceph: Option<velstra_cloud_model::ceph::NodeCeph>,
+    /// What this fake machine claims its processor is.
+    ///
+    /// An ordinary one by default, and the *same* one on every fake machine,
+    /// because a homogeneous cell is what a test about something else needs
+    /// underneath it. A test that wants the "agent too old to report" case
+    /// sets this to `None` with [`FakeVmm::with_cpu`] and gets the refusal
+    /// that follows from it.
+    cpu: Option<velstra_cloud_model::cpu::NodeCpu>,
+    /// PCI devices this fake machine claims to have, so a test can drive the
+    /// passthrough paths without hardware.
+    pci_devices: Vec<velstra_cloud_model::pci::PciDevice>,
     /// Where each pulled image was told to come from, so a test can assert the
     /// node was handed the *right* source and not merely that it pulled.
     pulled_from: BTreeMap<String, String>,
@@ -139,6 +171,11 @@ impl FakeNetwork {
 #[derive(Clone)]
 pub struct FakeVmm {
     machine: Arc<Mutex<Machine>>,
+    /// Where this fake pretends a guest's disk is, when a test has given it
+    /// one. A real file, because the one caller reads the bytes and hashes
+    /// them — a fake that handed out a path to nothing could not be used to
+    /// prove that a capture copies anything.
+    disks_on_disk: Arc<Mutex<BTreeMap<String, std::path::PathBuf>>>,
 }
 
 impl Default for FakeVmm {
@@ -152,6 +189,10 @@ impl FakeVmm {
         Self {
             machine: Arc::new(Mutex::new(Machine {
                 id: "fake".to_string(),
+                // The same processor on every fake machine, so a cell built
+                // out of them is homogeneous — which is what a test about
+                // something other than CPUs needs underneath it.
+                cpu: Some(ordinary_cpu()),
                 next_pid: 1000,
                 next_port: 4900,
                 capacity: Capacity {
@@ -163,7 +204,20 @@ impl FakeVmm {
                 },
                 ..Default::default()
             })),
+            disks_on_disk: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Give a guest a real file to be its disk.
+    ///
+    /// A real one, because the one caller that asks — making an image out of a
+    /// guest — reads the bytes and hashes them. A fake that handed out a path
+    /// to nothing could not be used to prove that a capture copies anything.
+    pub fn with_disk_file(&self, instance: &str, path: std::path::PathBuf) {
+        self.disks_on_disk
+            .lock()
+            .unwrap()
+            .insert(instance.to_string(), path);
     }
 
     pub fn with_capacity(capacity: Capacity) -> Self {
@@ -342,6 +396,10 @@ impl FakeVmm {
             d.vms.insert(
                 instance.to_string(),
                 VmObservation {
+                    size: None,
+                    console_tail: String::new(),
+                    console_bytes: 0,
+                    devices: Vec::new(),
                     state: InstanceState::Running,
                     pid: Some(pid),
                     started_at: guest.started_at,
@@ -379,6 +437,10 @@ fn count(machine: &mut Machine, what: Fault, target: &str) {
 
 #[async_trait]
 impl Vmm for FakeVmm {
+    fn disk_path(&self, instance: &str) -> Option<std::path::PathBuf> {
+        self.disks_on_disk.lock().unwrap().get(instance).cloned()
+    }
+
     async fn observe(&self) -> Result<HostState> {
         let m = self.machine.lock().unwrap();
         Ok(HostState {
@@ -390,6 +452,8 @@ impl Vmm for FakeVmm {
             sending: m.sending.keys().cloned().collect(),
             devices: m.devices.clone(),
             ceph: m.ceph.clone(),
+            cpu: m.cpu.clone(),
+            pci_devices: m.pci_devices.clone(),
         })
     }
 
@@ -439,6 +503,10 @@ impl Vmm for FakeVmm {
         m.vms.insert(
             request.instance.clone(),
             VmObservation {
+                size: None,
+                console_tail: String::new(),
+                console_bytes: 0,
+                devices: Vec::new(),
                 state: InstanceState::Running,
                 pid: Some(pid),
                 started_at: Some(Timestamp::now()),
@@ -786,12 +854,14 @@ mod tests {
 
     fn request() -> VmRequest {
         VmRequest {
+            devices: Vec::new(),
             instance: "projects/p1/instances/i1".into(),
             vcpus: 2,
             memory_mib: 2048,
             image: "sha256:abc".into(),
             root_disk_gib: 10,
             nics: vec![],
+            cpu_baseline: None,
         }
     }
 

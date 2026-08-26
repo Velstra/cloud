@@ -18,14 +18,15 @@
 //! however many nodes there are, and a node is handed its own objects rather
 //! than the cell's.
 //!
-//! ## Why this is a read-only seam
+//! ## Reads here, writes in [`crate::sink`]
 //!
-//! Writes still go straight to the store, and that is not an oversight. A node's
-//! writes are already proportional to its own objects — it reports on what it
-//! holds and nothing else — so there is nothing to fix there, and routing them
-//! through the API would put a second process in the path of a status report
-//! that has to land for a guest to be usable. What was unbounded was the
-//! *reading*, and this is the seam that bounds it.
+//! This module is the *read* seam. The matching *write* seam is
+//! [`crate::sink::StatusSink`]: a direct-store agent writes to the store and the
+//! store judges a self-declared identity, while a `--api` agent reports through
+//! [`ApiCell`] as its own token and the API authenticates it. The two were split
+//! for a reason beyond scaling — reading through the API bounds a cell's watch
+//! load, and writing through it is what makes `--api` a trust boundary rather
+//! than a reader in front of a writer that still holds the operator's own store.
 //!
 //! ## Security groups
 //!
@@ -61,6 +62,13 @@ use crate::host::{HostError, Result};
 pub trait PoolReader: Send + Sync + 'static {
     async fn volumes(&self) -> Result<Vec<velstra_cloud_model::resources::Volume>>;
     async fn snapshots(&self) -> Result<Vec<velstra_cloud_model::resources::Snapshot>>;
+    /// The copies asked for, and the targets they go to.
+    ///
+    /// Two lists rather than one call per backup: a target is read once per
+    /// pass however many copies point at it, and a pool with forty backups
+    /// should not make forty reads to learn the same three paths.
+    async fn backups(&self) -> Result<Vec<velstra_cloud_model::resources::Backup>>;
+    async fn backup_targets(&self) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>>;
 
     /// What this reads, for a log line at startup.
     fn describe(&self) -> String;
@@ -76,13 +84,23 @@ pub struct StorePool {
         velstra_cloud_model::resources::SnapshotSpec,
         velstra_cloud_model::resources::SnapshotStatus,
     >,
+    backups: TypedStore<
+        velstra_cloud_model::backup::BackupSpec,
+        velstra_cloud_model::backup::BackupStatus,
+    >,
+    targets: TypedStore<
+        velstra_cloud_model::backup::BackupTargetSpec,
+        velstra_cloud_model::backup::BackupTargetStatus,
+    >,
 }
 
 impl StorePool {
     pub fn new(store: std::sync::Arc<dyn Store>, cell: &str) -> Self {
         Self {
             volumes: TypedStore::new(store.clone(), cell, "volumes"),
-            snapshots: TypedStore::new(store, cell, "snapshots"),
+            snapshots: TypedStore::new(store.clone(), cell, "snapshots"),
+            backups: TypedStore::new(store.clone(), cell, "backups"),
+            targets: TypedStore::new(store, cell, "backup-targets"),
         }
     }
 }
@@ -98,9 +116,18 @@ impl PoolReader for StorePool {
             .await
             .map_err(|e| failed("snapshots", e))
     }
+    async fn backups(&self) -> Result<Vec<velstra_cloud_model::resources::Backup>> {
+        self.backups.list().await.map_err(|e| failed("backups", e))
+    }
+    async fn backup_targets(&self) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
+        self.targets
+            .list()
+            .await
+            .map_err(|e| failed("backup targets", e))
+    }
     fn describe(&self) -> String {
-        "the store, unfiltered: this pool reads every volume and snapshot in the cell on every \
-         pass"
+        "the store, unfiltered: this pool reads every volume, snapshot and backup in the cell on \
+         every pass"
             .to_string()
     }
 }
@@ -120,6 +147,48 @@ pub trait CellReader: Send + Sync + 'static {
     async fn security_groups(&self) -> Result<Vec<SecurityGroup>>;
     async fn subnets(&self) -> Result<Vec<Subnet>>;
     async fn networks(&self) -> Result<Vec<Network>>;
+    /// The cell's PCI device classes, by resource id.
+    ///
+    /// Cell-wide, like the images: the hardware belongs to the cell, and a
+    /// class defined per project would be a different name for the same
+    /// silicon in every tenancy.
+    ///
+    /// A default rather than a required method, so a cell that passes no
+    /// hardware through — which is most of them — needs no extra collection
+    /// and no reader has to grow one to compile.
+    async fn device_classes(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<String, velstra_cloud_model::pci::DeviceClassSpec>,
+    > {
+        Ok(Default::default())
+    }
+
+    /// The captures asked for on this node.
+    ///
+    /// A default method: a cell where nobody has ever made a template out of a
+    /// guest needs no extra collection, and no reader has to grow one.
+    async fn captures(&self) -> Result<Vec<velstra_cloud_model::resources::Capture>> {
+        Ok(Vec::new())
+    }
+
+    /// The places copies are kept, so a capture knows where to write.
+    async fn backup_targets(
+        &self,
+    ) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
+        Ok(Vec::new())
+    }
+
+    /// The public addresses in this cell.
+    ///
+    /// Read because a routed one is an address the **guest** holds: the
+    /// metadata this node serves has to contain it, or the guest comes up
+    /// without the address the world is being told to send to. A default
+    /// method, like the device classes, so a cell that hands out no public
+    /// addresses needs no extra collection and no reader has to grow one.
+    async fn floating_ips(&self) -> Result<Vec<velstra_cloud_model::resources::FloatingIp>> {
+        Ok(Vec::new())
+    }
     /// The registered images, which is where an image's *source* lives.
     ///
     /// A node verifies an image against the sha256 in its own name, but the
@@ -169,6 +238,18 @@ pub struct StoreCell {
     subnets: TypedStore<SubnetSpec, SubnetStatus>,
     networks: TypedStore<NetworkSpec, NetworkStatus>,
     images: TypedStore<ImageSpec, ImageStatus>,
+    floating_ips: TypedStore<
+        velstra_cloud_model::resources::FloatingIpSpec,
+        velstra_cloud_model::resources::FloatingIpStatus,
+    >,
+    captures: TypedStore<
+        velstra_cloud_model::capture::CaptureSpec,
+        velstra_cloud_model::capture::CaptureStatus,
+    >,
+    backup_targets: TypedStore<
+        velstra_cloud_model::backup::BackupTargetSpec,
+        velstra_cloud_model::backup::BackupTargetStatus,
+    >,
     migrations: TypedStore<MigrationSpec, MigrationStatus>,
     all_nodes: TypedStore<
         velstra_cloud_model::resources::NodeSpec,
@@ -189,6 +270,9 @@ impl StoreCell {
             ports: TypedStore::new(store.clone(), cell, "ports"),
             groups: TypedStore::new(store.clone(), cell, "security-groups"),
             all_nodes: TypedStore::new(store.clone(), cell, "nodes"),
+            floating_ips: TypedStore::new(store.clone(), cell, "floatingips"),
+            captures: TypedStore::new(store.clone(), cell, "captures"),
+            backup_targets: TypedStore::new(store.clone(), cell, "backup-targets"),
             ceph_clusters: TypedStore::new(store.clone(), cell, "ceph-clusters"),
             subnets: TypedStore::new(store.clone(), cell, "subnets"),
             networks: TypedStore::new(store.clone(), cell, "networks"),
@@ -240,6 +324,26 @@ impl CellReader for StoreCell {
             .await
             .map_err(|e| failed("networks", e))
     }
+    async fn floating_ips(&self) -> Result<Vec<velstra_cloud_model::resources::FloatingIp>> {
+        self.floating_ips
+            .list()
+            .await
+            .map_err(|e| failed("floating ips", e))
+    }
+
+    async fn captures(&self) -> Result<Vec<velstra_cloud_model::resources::Capture>> {
+        self.captures.list().await.map_err(|e| failed("captures", e))
+    }
+
+    async fn backup_targets(
+        &self,
+    ) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
+        self.backup_targets
+            .list()
+            .await
+            .map_err(|e| failed("backup targets", e))
+    }
+
     async fn images(&self) -> Result<Vec<Image>> {
         self.images.list().await.map_err(|e| failed("images", e))
     }

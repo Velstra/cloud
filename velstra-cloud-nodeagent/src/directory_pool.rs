@@ -41,12 +41,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use velstra_cloud_model::{meta::ResourceName, storage::VolumeSource};
+use velstra_cloud_model::meta::ResourceName;
 
 use crate::{
     host::{HostError, Result},
     hostfs::{slug, unslug},
-    pool::{PoolState, SnapshotInPool, Storage},
+    pool::{Origin, PoolState, SnapshotInPool, Storage},
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -246,7 +246,7 @@ impl Storage for DirectoryPool {
         &self,
         volume: &str,
         gib: u64,
-        source: &VolumeSource,
+        source: Origin<'_>,
         encryption_key: Option<&str>,
     ) -> Result<()> {
         if let Some(key) = encryption_key {
@@ -261,7 +261,7 @@ impl Storage for DirectoryPool {
         let size = format!("{gib}G");
 
         match source {
-            VolumeSource::Blank => {
+            Origin::Blank => {
                 self.atomically(
                     &path,
                     vec!["create".into(), "-f".into(), "qcow2".into(), partial, size],
@@ -273,7 +273,7 @@ impl Storage for DirectoryPool {
             // that guest finds nothing. The convert writes the partial and the
             // rename publishes it, so there is no moment at which the name exists
             // and the bytes do not.
-            VolumeSource::Image(image) => {
+            Origin::Image(image) => {
                 let from = self.images.join(slug(image));
                 if !from.exists() {
                     return Err(HostError::failed(format!(
@@ -295,7 +295,7 @@ impl Storage for DirectoryPool {
                 .await?;
                 self.grow(volume, gib).await
             }
-            VolumeSource::Snapshot(snapshot) => {
+            Origin::Snapshot(snapshot) => {
                 let from = self.snapshot_path(snapshot);
                 if !from.exists() {
                     return Err(HostError::failed(format!(
@@ -314,6 +314,30 @@ impl Storage for DirectoryPool {
                         "-O".into(),
                         "qcow2".into(),
                         from.to_string_lossy().to_string(),
+                        partial,
+                    ],
+                )
+                .await?;
+                self.grow(volume, gib).await
+            }
+            // A restore. The same convert as a snapshot, from a file that is
+            // not in this pool at all — which is the whole point of a backup,
+            // and the reason the path is resolved by the agent rather than
+            // guessed here.
+            Origin::File(from) => {
+                if !std::path::Path::new(from).exists() {
+                    return Err(HostError::failed(format!(
+                        "{from} is not on this machine, so nothing can be restored from it. Is \
+                         the target mounted here?"
+                    )));
+                }
+                self.atomically(
+                    &path,
+                    vec![
+                        "convert".into(),
+                        "-O".into(),
+                        "qcow2".into(),
+                        from.to_string(),
                         partial,
                     ],
                 )
@@ -350,6 +374,46 @@ impl Storage for DirectoryPool {
                 path.display()
             ))),
         }
+    }
+
+    async fn copy_out(&self, volume: &str, path: &str) -> Result<u64> {
+        let from = self.volume_path(volume);
+        if !from.exists() {
+            return Err(HostError::failed(format!(
+                "{volume} is not in this pool, so there is nothing to copy out"
+            )));
+        }
+        let to = std::path::Path::new(path);
+        if let Some(parent) = to.parent() {
+            // The target's own directory has to be there already — an agent
+            // that created one could create it on the wrong machine, on a root
+            // filesystem, exactly when a mount failed to come up. What is made
+            // here is only the layer *inside* it that groups one cell's copies.
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    HostError::failed(format!("{} is not usable: {e}", parent.display()))
+                })?;
+            }
+        }
+        // The same rename dance as a snapshot, for a stronger reason: this file
+        // is what a restore reads, months later, from a machine that has
+        // forgotten everything about today. A half-written one that carried the
+        // final name would be a backup somebody trusts and cannot use.
+        self.atomically(
+            to,
+            vec![
+                "convert".into(),
+                "-O".into(),
+                "qcow2".into(),
+                from.to_string_lossy().to_string(),
+                to.with_extension("partial").to_string_lossy().to_string(),
+            ],
+        )
+        .await?;
+        let written = std::fs::metadata(to)
+            .map(|m| m.len())
+            .map_err(|e| HostError::failed(format!("{} was written and cannot be read: {e}", to.display())))?;
+        Ok(written)
     }
 
     async fn take_snapshot(&self, snapshot: &str, volume: &str) -> Result<()> {

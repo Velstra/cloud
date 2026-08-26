@@ -34,3 +34,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 tokio = { workspace = true }
+# Only the write-through-API test needs a real API to talk to; the agent crate
+# itself does not depend on the API, and this keeps that true for everything but
+# the one integration test that proves `--api` mode reports through it.
+velstra-cloud-api = { path = "../velstra-cloud-api" }

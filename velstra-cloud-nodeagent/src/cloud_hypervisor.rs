@@ -334,7 +334,27 @@ impl Vmm for CloudHypervisorVmm {
     /// tests below, and `tests/cloud_hypervisor_boots_a_guest.rs` reads a running guest's state back
     /// through it; asking systemd about receivers and transfers is not.
     async fn observe(&self) -> Result<HostState> {
-        let mut host = HostState::default();
+        // `can_mask: false`, on every architecture, and not a stopgap.
+        //
+        // Cloud Hypervisor derives the guest CPUID from the host's
+        // `KVM_GET_SUPPORTED_CPUID` and has no CPU model to name — `--cpus`
+        // takes boot/max/topology/kvm_hyperv/max_phys_bits and a small feature
+        // allowlist, none of which can present a different processor. So two
+        // Cloud Hypervisor nodes exchange guests only if they are the same
+        // machine, and the platform reports that rather than implying a
+        // baseline could fix it. If upstream gains CPU models, this flag is
+        // the only line that changes.
+        let mut host = HostState {
+            cpu: Some(crate::hostcpu::observe(false, None)),
+            ..HostState::default()
+        };
+
+        // The machine's hardware as sysfs has it. Which guest holds which
+        // device is *not* known here and is deliberately left blank: a device
+        // passed to a guest is bound to `vfio-pci` exactly like a free one, so
+        // sysfs cannot tell them apart. The agent overlays that from the
+        // instances it holds — see `Agent::mark_held_devices`.
+        host.pci_devices = crate::pcidev::observe(&Default::default());
 
         for digest in hostfs::read_dir_names(&self.layout.image_dir)? {
             // A file is only ever moved in here after its bytes hashed to this
@@ -366,8 +386,24 @@ impl Vmm for CloudHypervisorVmm {
                 continue;
             }
             let (unit, _) = self.live(&instance).await;
+            // Cloud Hypervisor writes its serial output to the same file QEMU
+            // does, so the capture and everything above it is one feature for
+            // both backends rather than two.
+            let (console_tail, console_bytes) = hostfs::console_tail(
+                &self.layout.console(&instance),
+                velstra_cloud_model::resources::CONSOLE_TAIL_BYTES,
+            );
             let observation = match self.api(&instance, "GET", "/api/v1/vm.info", "").await {
                 Ok(body) => VmObservation {
+                    // Out of the VMM's own view of itself, which `vm.info`
+                    // carries beside the state — so this costs no extra call
+                    // and needs no memory of what was asked for.
+                    size: size_of(&body, hostfs::disk_gib(&self.layout.disk(&instance))),
+                    console_tail: console_tail.clone(),
+                    console_bytes,
+                    // Cloud Hypervisor passthrough is not in this phase: the
+                    // backend never passes a device, so a guest here holds none.
+                    devices: Vec::new(),
                     state: state_of(&body),
                     pid: hostfs::main_pid(self.layout.scope, &unit).await,
                     started_at: hostfs::started_at(&dir),
@@ -390,6 +426,16 @@ impl Vmm for CloudHypervisorVmm {
                 // it is reported as one rather than as "stopped", because the two
                 // want different things done about them.
                 Err(_) => VmObservation {
+                    // A VMM that will not answer cannot say what it is running,
+                    // and guessing would report a size that may not be true.
+                    // Unreported reads as "nothing pending", which is the safe
+                    // direction for a machine that is already failing.
+                    size: None,
+                    console_tail: console_tail.clone(),
+                    console_bytes,
+                    // Cloud Hypervisor passthrough is not in this phase: the
+                    // backend never passes a device, so a guest here holds none.
+                    devices: Vec::new(),
                     state: InstanceState::Failed,
                     pid: None,
                     started_at: hostfs::started_at(&dir),
@@ -417,6 +463,11 @@ impl Vmm for CloudHypervisorVmm {
     /// Covered by `tests/cloud_hypervisor_boots_a_guest.rs`, which starts a real guest and
     /// reads its console: "running" is what a VMM reports for a machine that
     /// loaded nothing, so the console is the only proof that it booted.
+    fn disk_path(&self, instance: &str) -> Option<std::path::PathBuf> {
+        let path = self.layout.disk(instance);
+        path.exists().then_some(path)
+    }
+
     async fn start(&self, request: &VmRequest) -> Result<()> {
         let dir = self.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
@@ -765,6 +816,31 @@ fn send_args(
         "send-migration".into(),
         settings.join(",").into(),
     ])
+}
+
+/// The size a Cloud Hypervisor guest is actually running with.
+///
+/// Read out of `vm.info`, which carries the whole configuration beside the
+/// state — so this needs no extra call and no memory of what was asked for.
+///
+/// `None` when the shape is not the one this build knows. Deliberately: a
+/// wrong number here reads as a pending change nobody asked for, and an
+/// operator chasing a resize that never happened is worse off than one who
+/// sees nothing.
+///
+/// The disk is not in `vm.info` as a size — it is a file — so it comes from
+/// the caller, exactly as it does for QEMU.
+fn size_of(vm_info: &str, disk_gib: u64) -> Option<velstra_cloud_model::resources::RunningSize> {
+    let value: serde_json::Value = serde_json::from_str(vm_info).ok()?;
+    let config = value.get("config")?;
+    let vcpus = config.get("cpus")?.get("boot_vcpus")?.as_u64()?;
+    // Bytes on the wire; mebibytes everywhere a person reads them.
+    let bytes = config.get("memory")?.get("size")?.as_u64()?;
+    Some(velstra_cloud_model::resources::RunningSize {
+        vcpus: u32::try_from(vcpus).ok()?,
+        memory_mib: bytes / (1024 * 1024),
+        root_disk_gib: disk_gib,
+    })
 }
 
 fn state_of(vm_info: &str) -> InstanceState {
@@ -1121,12 +1197,14 @@ mod tests {
         let scratch = Scratch::new("nodisk");
         let vmm = vmm(&scratch);
         let request = VmRequest {
+            devices: Vec::new(),
             instance: "projects/p1/instances/i1".into(),
             vcpus: 2,
             memory_mib: 2048,
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
             nics: vec![],
+            cpu_baseline: None,
         };
         let err = vmm
             .prepare_receiver(&request, MigrationMode::Live)
@@ -1238,6 +1316,7 @@ mod tests {
         // finds its addresses on the wrong NIC after a move is an outage with
         // no error message.
         let request = VmRequest {
+            devices: Vec::new(),
             instance: "projects/p1/instances/i1".into(),
             vcpus: 4,
             memory_mib: 8192,
@@ -1253,6 +1332,7 @@ mod tests {
                     mac: None,
                 },
             ],
+            cpu_baseline: None,
         };
         let args = words(&vmm_args(
             &Layout::default(),
@@ -1297,4 +1377,39 @@ mod tests {
         assert!(r.contains("Content-Length: 2"));
         assert!(r.ends_with("\r\n\r\n{}"));
     }
+    /// The size comes out of `vm.info`, which the VMM already answers.
+    ///
+    /// Without this, a resize of a Cloud Hypervisor guest showed nothing
+    /// pending — the spec said one thing, the machine ran another, and the
+    /// object read as settled. That is the silent divergence the pending-change
+    /// work exists to remove, and it was still there on this backend.
+    #[test]
+    fn the_running_size_is_read_out_of_what_the_vmm_already_reports() {
+        let info = r#"{
+            "state": "Running",
+            "config": {
+                "cpus": { "boot_vcpus": 4, "max_vcpus": 8 },
+                "memory": { "size": 8589934592, "shared": false }
+            }
+        }"#;
+        let size = size_of(info, 40).expect("vm.info carries a size");
+        assert_eq!(size.vcpus, 4);
+        // Bytes on the wire, mebibytes where a person reads them.
+        assert_eq!(size.memory_mib, 8192);
+        assert_eq!(size.root_disk_gib, 40);
+    }
+
+    /// A shape this build does not know reports nothing, not a guess.
+    ///
+    /// A wrong number here reads as a pending change nobody asked for, and an
+    /// operator chasing a resize that never happened is worse off than one who
+    /// sees nothing.
+    #[test]
+    fn an_unfamiliar_shape_reports_no_size_rather_than_a_wrong_one() {
+        assert!(size_of("{}", 40).is_none());
+        assert!(size_of(r#"{"config":{"cpus":{}}}"#, 40).is_none());
+        assert!(size_of(r#"{"config":{"cpus":{"boot_vcpus":4}}}"#, 40).is_none());
+        assert!(size_of("not json at all", 40).is_none());
+    }
+
 }

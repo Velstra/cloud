@@ -57,12 +57,23 @@ pub async fn create_node(store: &Arc<dyn Store>, id: &str) {
     let node = Resource::new(
         meta(&format!("nodes/{id}")),
         NodeSpec {
+            evacuate: false,
+            vcpu_overcommit: 0,
+                fence_after_s: 0,
             schedulable: true,
             labels: vec![],
-        },
+            cpu_baseline: None,
+                gateway: false,
+            },
         NodeStatus::default(),
     );
-    nodes(store).create(&node).await.unwrap();
+    nodes(store)
+        .create(
+            &node,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 }
 
 pub async fn read_node(store: &Arc<dyn Store>, id: &str) -> Node {
@@ -102,7 +113,13 @@ pub async fn create_migration(
         },
         status,
     );
-    migrations(store).create(&migration).await.unwrap();
+    migrations(store)
+        .create(
+            &migration,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
     migration
 }
 
@@ -177,6 +194,11 @@ pub async fn create_instance(
     let instance = Resource::new(
         meta(name),
         InstanceSpec {
+            start_order: 0,
+            start_delay_s: 0,
+            on_node_loss: Default::default(),
+            console: false,
+            devices: Vec::new(),
             vcpus: 2,
             memory_mib: 2048,
             image: IMAGE.to_string(),
@@ -198,7 +220,13 @@ pub async fn create_instance(
     // boot. Registered here, idempotently, because every instance in these
     // tests boots the same one.
     register_image(store, IMAGE).await;
-    instances(store).create(&instance).await.unwrap();
+    instances(store)
+        .create(
+            &instance,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
     instance
 }
 
@@ -216,6 +244,7 @@ pub async fn register_image(store: &Arc<dyn Store>, name: &str) {
     let image = Resource::new(
         meta(name),
         ImageSpec {
+            source_instance: None,
             digest: "sha256-abc".into(),
             format: ImageFormat::Raw,
             size_bytes: 1024,
@@ -224,7 +253,12 @@ pub async fn register_image(store: &Arc<dyn Store>, name: &str) {
         },
         ImageStatus::default(),
     );
-    let _ = images.create(&image).await;
+    let _ = images
+        .create(
+            &image,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await;
 }
 
 /// The network and subnet every port here names.
@@ -238,30 +272,38 @@ pub async fn create_network(store: &Arc<dyn Store>, cidr: &str, gateway: &str) {
     let networks: TypedStore<NetworkSpec, NetworkStatus> =
         TypedStore::new(store.clone(), CELL, "networks");
     networks
-        .create(&Resource::new(
-            meta("projects/p1/networks/n1"),
-            NetworkSpec {
-                vni: 4711,
-                mtu: 1450,
+        .create(
+            &Resource::new(
+                meta("projects/p1/networks/n1"),
+                NetworkSpec {
+                    vni: 4711,
+                    mtu: 1450,
+                external: false,
+                announce: Default::default(),
             },
-            NetworkStatus::default(),
-        ))
+                NetworkStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
     let subnets: TypedStore<SubnetSpec, SubnetStatus> =
         TypedStore::new(store.clone(), CELL, "subnets");
     subnets
-        .create(&Resource::new(
-            meta("projects/p1/subnets/s1"),
-            SubnetSpec {
-                network: "projects/p1/networks/n1".into(),
-                cidr: cidr.to_string(),
-                gateway: gateway.to_string(),
-                dns: vec![gateway.to_string()],
-                reserved: vec![gateway.to_string()],
-            },
-            SubnetStatus::default(),
-        ))
+        .create(
+            &Resource::new(
+                meta("projects/p1/subnets/s1"),
+                SubnetSpec {
+                    network: "projects/p1/networks/n1".into(),
+                    cidr: cidr.to_string(),
+                    gateway: gateway.to_string(),
+                    dns: vec![gateway.to_string()],
+                    reserved: vec![gateway.to_string()],
+                },
+                SubnetStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 }
@@ -279,14 +321,19 @@ async fn ensure_segment(store: &Arc<dyn Store>) {
     let typed: TypedStore<NetworkSpec, NetworkStatus> =
         TypedStore::new(store.clone(), CELL, "networks");
     let _ = typed
-        .create(&Resource::new(
-            meta("projects/p1/networks/n1"),
-            NetworkSpec {
-                vni: 4711,
-                mtu: 1450,
+        .create(
+            &Resource::new(
+                meta("projects/p1/networks/n1"),
+                NetworkSpec {
+                    vni: 4711,
+                    mtu: 1450,
+                external: false,
+                announce: Default::default(),
             },
-            NetworkStatus::default(),
-        ))
+                NetworkStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await;
 }
 
@@ -311,7 +358,13 @@ pub async fn create_port(
             ..Default::default()
         },
     );
-    ports(store).create(&port).await.unwrap();
+    ports(store)
+        .create(
+            &port,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
     port
 }
 
@@ -335,8 +388,88 @@ pub async fn create_attachment(
             ..Default::default()
         },
     );
-    attachments(store).create(&attachment).await.unwrap();
+    attachments(store)
+        .create(
+            &attachment,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
     attachment
+}
+
+/// A place captures and backups are written to.
+pub async fn create_target(store: &Arc<dyn Store>, id: &str, path: &str) {
+    let targets: TypedStore<
+        velstra_cloud_model::backup::BackupTargetSpec,
+        velstra_cloud_model::backup::BackupTargetStatus,
+    > = TypedStore::new(store.clone(), CELL, "backup-targets");
+    let target: velstra_cloud_model::resources::BackupTarget = Resource::new(
+        meta(&format!("backup-targets/{id}")),
+        velstra_cloud_model::backup::BackupTargetSpec {
+            kind: velstra_cloud_model::backup::TargetKind::Directory,
+            path: path.to_string(),
+            accepting: true,
+            // Nobody reports on it here: this is a node writing to a path, and
+            // whether some pool agent is watching it is a different question.
+            // `writable: None` means "unknown", which is not a refusal.
+            agent: String::new(),
+        },
+        Default::default(),
+    );
+    targets
+        .create(&target, &velstra_cloud_model::access::Writer::controller("test"))
+        .await
+        .unwrap();
+}
+
+/// "Make an image out of this guest."
+pub async fn create_capture(store: &Arc<dyn Store>, id: &str, instance: &str, node: &str) {
+    let captures: TypedStore<
+        velstra_cloud_model::capture::CaptureSpec,
+        velstra_cloud_model::capture::CaptureStatus,
+    > = TypedStore::new(store.clone(), CELL, "captures");
+    let capture: velstra_cloud_model::resources::Capture = Resource::new(
+        meta(&format!("projects/p1/captures/{id}")),
+        velstra_cloud_model::capture::CaptureSpec {
+            instance: instance.to_string(),
+            target: "backup-targets/archive".into(),
+            node: node.to_string(),
+            label: id.to_string(),
+        },
+        Default::default(),
+    );
+    captures
+        .create(&capture, &velstra_cloud_model::access::Writer::controller("test"))
+        .await
+        .unwrap();
+}
+
+pub async fn read_capture(
+    store: &Arc<dyn Store>,
+    id: &str,
+) -> velstra_cloud_model::resources::Capture {
+    let captures: TypedStore<
+        velstra_cloud_model::capture::CaptureSpec,
+        velstra_cloud_model::capture::CaptureStatus,
+    > = TypedStore::new(store.clone(), CELL, "captures");
+    captures
+        .get(&format!("projects/p1/captures/{id}"))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Ask a guest to stop, as an operator would.
+pub async fn stop_instance(store: &Arc<dyn Store>, name: &str) {
+    let store_i = instances(store);
+    let mut next = store_i.get(name).await.unwrap().unwrap();
+    next.spec.desired_state = velstra_cloud_model::resources::DesiredState::Stopped;
+    next.meta.generation += 1;
+    store_i
+        .update(&next, &velstra_cloud_model::access::Writer::controller("test"))
+        .await
+        .unwrap();
 }
 
 pub async fn read_instance(store: &Arc<dyn Store>, name: &str) -> Instance {
@@ -484,7 +617,13 @@ pub async fn create_security_group(store: &Arc<dyn Store>, name: &str, rules: Ve
         SecurityGroupSpec { rules },
         SecurityGroupStatus::default(),
     );
-    security_groups(store).create(&group).await.unwrap();
+    security_groups(store)
+        .create(
+            &group,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 }
 
 /// A port that names security groups. The plain [`create_port`] deliberately
@@ -513,7 +652,13 @@ pub async fn create_port_in_groups(
             ..Default::default()
         },
     );
-    ports(store).create(&port).await.unwrap();
+    ports(store)
+        .create(
+            &port,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
     port
 }
 

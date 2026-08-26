@@ -97,24 +97,73 @@ impl Drop for Fabric {
     }
 }
 
+/// Whether nothing is already listening here.
+///
+/// Checked before spawning, because the failure it prevents is silent: a
+/// fixture whose port is taken does not fail to start — it connects to
+/// whatever *is* there and tests against somebody else's state. That is either
+/// a leftover controller from a killed run or another test binary using the
+/// same number, and both should be loud.
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
 impl Fabric {
+    /// The ports this crate's fabric fixtures use.
+    ///
+    /// **50900–50949 belongs to `velstra-cloud-nodeagent`.** The controller
+    /// crate has 50950–50999, and the two must not overlap: `cargo test`
+    /// runs test *binaries* concurrently, so a fixture here and one there can
+    /// be starting at the same moment. When they picked the same port, the
+    /// second one did not fail — it connected to the first one's controller and
+    /// found somebody else's fabric already in it. That produced three
+    /// different intermittent failures in three different files, each looking
+    /// like a bug in whatever it happened to hit:
+    ///
+    /// * a network whose address was "already allocated",
+    /// * an SRv6 endpoint that was not served,
+    /// * a floating IP that had not appeared.
+    ///
+    /// `port_is_free` below is what makes a future collision loud instead.
     async fn start(binary: &PathBuf) -> Option<Self> {
-        Self::start_on(binary, 50951).await
+        Self::start_on(binary, 50901).await
     }
 
     /// Its own three ports, so two fixtures in one test binary do not race for
     /// a listener. A fixture that hard-codes one port is a fixture that passes
     /// alone and fails the moment a second test needs the same thing.
+    ///
+    /// The directory below is per-fixture for the same reason, and it is worth
+    /// being honest about what that did **not** fix. This suite fails
+    /// intermittently, and a shared directory looked like the culprit — it was
+    /// not: the controller is started without `--raft-dir`, so its state is in
+    /// memory and this directory is never passed to it at all. The real race is
+    /// the one `floating_ip_mirror` documents: the controller is asked what it
+    /// holds immediately after being told, and Raft append-commit-apply is
+    /// asynchronous even for one bootstrapped node. The checks below that read
+    /// back served config have the same shape and the same exposure.
     async fn start_on(binary: &PathBuf, base: u16) -> Option<Self> {
         // `lo` is down in a fresh network namespace, and the controller and this
         // test talk to each other over it.
         let _ = std::process::Command::new("ip")
             .args(["link", "set", "lo", "up"])
             .status();
-        let dir = std::env::temp_dir().join(format!("velstra-fab-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "velstra-fab-{}-{base}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
         let (listen, admin, raft) = (base, base + 1, base + 2);
+        for port in [listen, admin, raft] {
+            assert!(
+                port_is_free(port),
+                "127.0.0.1:{port} is already listening. This fixture would connect to it and \
+                 test against somebody else's fabric — which is how an intermittent failure \
+                 that looks like a bug in the code under test is really a port collision. \
+                 Kill the leftover controller, or give this fixture a port nothing else uses."
+            );
+        }
         let child = std::process::Command::new(binary)
             .args([
                 "serve",
@@ -205,7 +254,7 @@ async fn a_port_with_rules_reaches_the_fabric() {
             subnet: "10.20.0.0/24".into(),
             default_action: pb::Action::Drop as i32,
             drop_icmp: false,
-        })
+            })
         .await
         .expect("declaring the network");
 
@@ -275,6 +324,8 @@ async fn a_port_with_rules_reaches_the_fabric() {
     let network = NetworkSpec {
         vni: VNI,
         mtu: 1450,
+        external: false,
+        announce: Default::default(),
     };
     let rules = vec![
         rule(Protocol::Tcp, 443, 443),
@@ -466,6 +517,8 @@ async fn a_rule_the_fabric_cannot_key_leaves_no_port_behind() {
             &NetworkSpec {
                 vni: VNI,
                 mtu: 1450,
+                external: false,
+                announce: Default::default(),
             },
             &[unsayable],
         )
@@ -503,7 +556,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
         eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
         return;
     };
-    let Some(fabric) = Fabric::start_on(&binary, 50961).await else {
+    let Some(fabric) = Fabric::start_on(&binary, 50911).await else {
         eprintln!("skipped: the fabric controller would not start on its ports");
         return;
     };
@@ -517,7 +570,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
             subnet: "10.30.0.0/24".into(),
             default_action: pb::Action::Drop as i32,
             drop_icmp: false,
-        })
+            })
         .await
         .expect("declaring the network");
 
@@ -636,7 +689,7 @@ async fn a_node_that_states_a_locator_is_served_an_srv6_overlay() {
         eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
         return;
     };
-    let Some(fabric) = Fabric::start_on(&binary, 50971).await else {
+    let Some(fabric) = Fabric::start_on(&binary, 50921).await else {
         eprintln!("skipped: the fabric controller did not come up");
         return;
     };
@@ -650,7 +703,7 @@ async fn a_node_that_states_a_locator_is_served_an_srv6_overlay() {
             subnet: "10.40.0.0/24".into(),
             default_action: pb::Action::Drop as i32,
             drop_icmp: false,
-        })
+            })
         .await
         .expect("declaring the network");
 

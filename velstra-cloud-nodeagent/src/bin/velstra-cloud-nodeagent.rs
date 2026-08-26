@@ -85,24 +85,24 @@ struct Args {
     #[arg(long, default_value = "2")]
     dhcp_scan_secs: u64,
 
-    /// Read the cell through the API instead of the store, and be handed only
-    /// this node's share.
+    /// Read and write the cell through the API instead of the store, as this
+    /// node's own token.
     ///
-    /// Without it, this agent lists every instance, port, attachment and
-    /// migration in the cell on every pass and watches them unfiltered — so its
-    /// load grows with the cell, and a thousand nodes are a thousand watchers on
-    /// one store with every write delivered a thousand times. With it, the API
-    /// serves every node from one watch per collection and hands each one its
-    /// own objects.
-    ///
-    /// Writes still go straight to the store either way: a node's writes are
-    /// already proportional to its own work, and putting a second process in the
-    /// path of a status report buys nothing.
+    /// Two things at once, and both matter. **Reads** are bounded: without this,
+    /// the agent lists every instance, port, attachment and migration in the cell
+    /// on every pass and watches them unfiltered, so a thousand nodes are a
+    /// thousand watchers on one store; with it, the API serves every node from
+    /// one watch per collection and hands each one its own objects. **Writes**
+    /// are a trust boundary: a status report goes through the API authenticated
+    /// as this node, and the API refuses anything that is not this node's — so
+    /// the credential a node holds can write only its own objects' status, which
+    /// the direct-store default (a shared operator token) never was.
     #[arg(long)]
     api: Option<String>,
 
-    /// The bearer token for `--api`. A file rather than a flag, so it is not in
-    /// anybody's process list.
+    /// The per-node token for `--api`, from the `nodeToken` a registration
+    /// returned once. A file rather than a flag, so it is not in anybody's
+    /// process list.
     #[arg(long)]
     api_token_file: Option<PathBuf>,
 
@@ -401,8 +401,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .into());
                 }
             };
-            let reader = Arc::new(ApiCell::for_node(url, &token, &args.node)?);
-            Agent::reading(store, config, vmm, datapath, reader)
+            // One client, used for both halves: reads are handed this node's
+            // share, and writes are reported back through it as this node's own
+            // token — which is what makes `--api` a trust boundary rather than a
+            // reader in front of a writer that still holds the operator's store.
+            let client = Arc::new(ApiCell::for_node(url, &token, &args.node)?);
+            Agent::reading(store, config, vmm, datapath, client.clone()).with_status_sink(client)
         }
         None => Agent::new(store, config, vmm, datapath),
     };

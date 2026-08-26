@@ -173,6 +173,47 @@ impl Layout {
     }
 }
 
+/// How large a guest's disk file is, in whole gibibytes.
+///
+/// The apparent size, not what it occupies: a sparse or backing-file disk
+/// takes far less room than it presents, and what a guest sees is the number
+/// its spec is about.
+pub fn disk_gib(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|m| m.len() / (1024 * 1024 * 1024))
+        .unwrap_or(0)
+}
+
+/// The last `cap` bytes a guest wrote to its console, and how much it wrote.
+///
+/// Seeks rather than reads: a guest that has been up for a month has a console
+/// log measured in megabytes, and loading it to keep the last eight kibibytes
+/// would make every observation pass proportional to guest uptime.
+///
+/// The cut lands on a byte boundary, not a character one, so the first line can
+/// begin mid-UTF-8. `from_utf8_lossy` handles that — one replacement character
+/// at the start of a tail is a better outcome than refusing to show a panic
+/// because its first byte was inconvenient.
+pub fn console_tail(path: &Path, cap: usize) -> (String, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (String::new(), 0);
+    };
+    let Ok(total) = file.metadata().map(|m| m.len()) else {
+        return (String::new(), 0);
+    };
+    let want = total.min(cap as u64);
+    if file.seek(SeekFrom::End(-(want as i64))).is_err() {
+        return (String::new(), total);
+    }
+    let mut buf = vec![0u8; want as usize];
+    if file.read_exact(&mut buf).is_err() {
+        return (String::new(), total);
+    }
+    (String::from_utf8_lossy(&buf).into_owned(), total)
+}
+
 // ---- names ---------------------------------------------------------------
 
 /// A resource name as one path segment, reversibly.
@@ -711,6 +752,68 @@ pub fn capacity(layout: &Layout) -> velstra_cloud_model::resources::Capacity {
 
 #[cfg(test)]
 mod tests {
+
+    /// The tail is the *last* bytes, and the total is the whole file.
+    ///
+    /// Both halves matter: a reader that saw eight kibibytes with no total
+    /// would take it for everything the guest ever said, and go looking for a
+    /// panic that scrolled off an hour ago.
+    #[test]
+    fn a_console_tail_is_the_end_of_the_log_and_says_how_big_the_log_is() {
+        let dir = std::env::temp_dir().join(format!("velstra-console-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.log");
+
+        // Shorter than the cap: the whole thing, and the total agrees.
+        std::fs::write(&path, b"boot\nok\n").unwrap();
+        let (tail, total) = console_tail(&path, 8192);
+        assert_eq!(tail, "boot\nok\n");
+        assert_eq!(total, 8);
+
+        // Longer than the cap: the end, not the beginning.
+        let long: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, long.as_bytes()).unwrap();
+        let (tail, total) = console_tail(&path, 64);
+        assert_eq!(total, long.len() as u64);
+        assert_eq!(tail.len(), 64);
+        assert!(tail.ends_with("line 499\n"), "{tail:?}");
+        assert!(!tail.contains("line 0\n"), "the tail carried the start");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cut that lands mid-character shows the tail anyway.
+    ///
+    /// The alternative is refusing to show a panic because its first byte was
+    /// inconvenient, which is the wrong trade at exactly the moment somebody
+    /// needs to read it.
+    #[test]
+    fn a_tail_that_starts_mid_character_is_still_shown() {
+        let dir = std::env::temp_dir().join(format!("velstra-console-utf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.log");
+
+        // A three-byte character, then plain ASCII. A four-byte tail cuts it.
+        std::fs::write(&path, "€abcd".as_bytes()).unwrap();
+        let (tail, _) = console_tail(&path, 4);
+        assert!(tail.ends_with("abcd"), "{tail:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A guest with no log yet says nothing, rather than failing.
+    ///
+    /// Every guest is in this state for the first moments of its life, and an
+    /// observation pass that errored on it would take the whole node down for
+    /// a file that is about to exist.
+    #[test]
+    fn a_missing_console_log_reads_as_silence() {
+        let (tail, total) = console_tail(Path::new("/nonexistent/console.log"), 8192);
+        assert!(tail.is_empty());
+        assert_eq!(total, 0);
+    }
 
     /// A unit name systemd takes as written.
     ///

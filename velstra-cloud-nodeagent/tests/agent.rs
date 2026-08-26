@@ -993,3 +993,108 @@ async fn a_datapath_that_cannot_report_its_rules_still_converges() {
         "a converged node kept working: {settled:?}"
     );
 }
+
+// ---- captures --------------------------------------------------------------
+
+/// A capture is real bytes with a real digest, or it is nothing.
+///
+/// Until this pass existed the object was created, assigned to the node holding
+/// the disk, and no agent ever claimed it — so the controller that turns a
+/// finished capture into an image never had a finished one to act on. The whole
+/// feature was a chain with the middle link missing.
+#[tokio::test]
+async fn a_stopped_guest_is_captured_into_bytes_with_a_digest() {
+    let (store, vmm, _datapath, agent) = one_instance_on("node-a").await;
+    let dir = std::env::temp_dir().join(format!("velstra-capture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A guest with a disk, stopped — which is the state a template is made
+    // from, because a disk copied from under a running machine is
+    // crash-consistent and a template is stamped out by people who assume it
+    // is clean.
+    let disk = dir.join("root.raw");
+    std::fs::write(&disk, b"a golden image, more or less").unwrap();
+    vmm.with_disk_file(I1, disk);
+    stop_instance(&store, I1).await;
+    agent.resync().await;
+
+    create_target(&store, "archive", dir.to_string_lossy().as_ref()).await;
+    create_capture(&store, "golden", I1, "node-a").await;
+
+    // One pass claims it, the next makes it. Claiming first is not ceremony: a
+    // node that copied before claiming would have two nodes copying one disk
+    // the first time an assignment moved.
+    agent.resync().await;
+    let claimed = read_capture(&store, "golden").await;
+    assert_eq!(claimed.status.node.as_deref(), Some("node-a"));
+    assert!(claimed.status.digest.is_none(), "it was copied before it was claimed");
+
+    agent.resync().await;
+    let done = read_capture(&store, "golden").await;
+    let digest = done
+        .status
+        .digest
+        .clone()
+        .expect("a capture that finished says what the bytes hashed to");
+    assert!(digest.starts_with("sha256:"), "{digest}");
+    assert!(done.status.size_bytes > 0);
+    assert!(done.status.finished_at.is_some());
+
+    // The bytes are on the target, under the name a pull will ask for — the
+    // digest, which is what makes fetching one verifiable.
+    let landed = dir.join(digest.replace(':', "-"));
+    assert!(landed.exists(), "nothing was written to the target");
+    assert_eq!(
+        std::fs::read(&landed).unwrap(),
+        b"a golden image, more or less",
+        "the copy is not the disk"
+    );
+
+    // And a finished capture is never made twice.
+    let before = read_capture(&store, "golden").await.meta.revision;
+    agent.resync().await;
+    assert_eq!(
+        read_capture(&store, "golden").await.meta.revision,
+        before,
+        "a finished capture was written again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The refusal the whole thing exists for, said on the object rather than in a
+/// log on whichever machine happened to hold the guest.
+#[tokio::test]
+async fn a_running_guest_is_refused_and_told_what_to_use_instead() {
+    let (store, vmm, _datapath, agent) = one_instance_on("node-a").await;
+    let dir = std::env::temp_dir().join(format!("velstra-capture-running-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let disk = dir.join("root.raw");
+    std::fs::write(&disk, b"still being written to").unwrap();
+    vmm.with_disk_file(I1, disk);
+
+    // Running, which is the ordinary state and the one that must be refused.
+    agent.resync().await;
+    create_target(&store, "archive", dir.to_string_lossy().as_ref()).await;
+    create_capture(&store, "golden", I1, "node-a").await;
+    for _ in 0..3 {
+        agent.resync().await;
+    }
+
+    let refused = read_capture(&store, "golden").await;
+    assert!(refused.status.digest.is_none(), "a running guest was captured");
+    let ready = velstra_cloud_model::meta::condition(&refused.status.conditions, "Ready")
+        .expect("a capture that did not happen says why");
+    assert!(
+        ready.message.contains("crash-consistent"),
+        "the reason is not the model's own words: {}",
+        ready.message
+    );
+    assert!(
+        ready.message.contains("take a backup"),
+        "it does not say which tool does what they wanted: {}",
+        ready.message
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

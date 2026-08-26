@@ -108,12 +108,14 @@ async fn a_stock_cloud_image_boots_and_says_so() {
 
     let instance = "projects/p1/instances/boot-1";
     let request = VmRequest {
+        devices: Vec::new(),
         instance: instance.to_string(),
         vcpus: 1,
         memory_mib: 512,
         image: "projects/p1/images/alpine".into(),
         root_disk_gib: 1,
         nics: vec![],
+        cpu_baseline: None,
     };
 
     // The image, published the way a pulled one is: under its slug in the

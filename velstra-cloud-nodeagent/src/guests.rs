@@ -70,6 +70,14 @@ pub struct Interface {
     pub mtu: Option<u32>,
     /// The host device this NIC is on, when it is programmed on this node.
     pub tap: Option<String>,
+    /// Public addresses this port holds, in the order they were declared.
+    ///
+    /// Held by the **guest**, which is the whole difference between a routed
+    /// address and a translated one: there is nothing at the edge rewriting a
+    /// packet, so the guest has to configure the address or it answers to
+    /// nothing. A guest that holds one also defaults out through it — see
+    /// [`velstra_cloud_model::public`].
+    pub public: Vec<velstra_cloud_model::public::GuestRoute>,
 }
 
 impl Interface {
@@ -233,6 +241,9 @@ pub fn derive(
     subnets: &BTreeMap<String, Subnet>,
     networks: &BTreeMap<String, Network>,
     taps: &BTreeMap<String, String>,
+    // Routed public addresses, by the port that holds them. Empty in a cell
+    // that hands out none, which is most of them.
+    public: &BTreeMap<String, Vec<velstra_cloud_model::public::GuestRoute>>,
 ) -> Vec<GuestView> {
     mine.iter()
         .filter(|i| !i.meta.is_deleting())
@@ -246,7 +257,7 @@ pub fn derive(
                 .ports
                 .iter()
                 .filter_map(|name| ports.get(name))
-                .map(|port| interface(port, subnets, networks, taps))
+                .map(|port| interface(port, subnets, networks, taps, public))
                 .collect(),
         })
         .collect()
@@ -257,6 +268,7 @@ fn interface(
     subnets: &BTreeMap<String, Subnet>,
     networks: &BTreeMap<String, Network>,
     taps: &BTreeMap<String, String>,
+    public: &BTreeMap<String, Vec<velstra_cloud_model::public::GuestRoute>>,
 ) -> Interface {
     let name = port.meta.name.to_string();
     let subnet = subnets.get(&port.spec.subnet);
@@ -278,8 +290,36 @@ fn interface(
             .map(|n| n.spec.mtu)
             .filter(|mtu| *mtu > 0),
         tap: taps.get(&name).cloned(),
+        public: public.get(&name).cloned().unwrap_or_default(),
         port: name,
     }
+}
+
+/// Which routed public addresses each port holds.
+///
+/// Only the routed ones: a translated address is answered for at the edge and
+/// the guest must **not** configure it — a guest that put a NAT address on its
+/// own interface would answer ARP for something the edge is also answering for,
+/// and the two would take turns.
+pub fn public_addresses(
+    floating: &[velstra_cloud_model::resources::FloatingIp],
+) -> BTreeMap<String, Vec<velstra_cloud_model::public::GuestRoute>> {
+    let mut out: BTreeMap<String, Vec<velstra_cloud_model::public::GuestRoute>> = BTreeMap::new();
+    for fip in floating {
+        if fip.spec.delivery != velstra_cloud_model::public::Delivery::Routed {
+            continue;
+        }
+        if fip.spec.port.is_empty() {
+            continue;
+        }
+        let Some(address) = fip.spec.address.as_deref().and_then(|a| a.parse().ok()) else {
+            continue;
+        };
+        out.entry(fip.spec.port.clone())
+            .or_default()
+            .push(velstra_cloud_model::public::guest_route(address));
+    }
+    out
 }
 
 /// A port's address, with the prefix length of the subnet it is on.
@@ -336,7 +376,9 @@ mod tests {
                 NetworkSpec {
                     vni: 4711,
                     mtu: 1450,
-                },
+                external: false,
+                announce: Default::default(),
+            },
                 NetworkStatus::default(),
             ),
         )])
@@ -400,7 +442,7 @@ mod tests {
             "vt-port-a".to_string(),
         )]);
         let i = instance("projects/p1/instances/i1", &["projects/p1/ports/port-a"]);
-        derive(&[&i], &ports, &subnet(), &network(), &taps)
+        derive(&[&i], &ports, &subnet(), &network(), &taps, &Default::default())
     }
 
     #[test]
@@ -434,7 +476,7 @@ mod tests {
             ),
         )]);
         let i = instance("projects/p1/instances/i1", &["projects/p1/ports/port-a"]);
-        let views = derive(&[&i], &ports, &subnet(), &network(), &BTreeMap::new());
+        let views = derive(&[&i], &ports, &subnet(), &network(), &BTreeMap::new(), &Default::default());
         assert_eq!(views[0].interfaces[0].cidr, None);
     }
 
@@ -446,7 +488,7 @@ mod tests {
         )]);
         let mut i = instance("projects/p1/instances/i1", &["projects/p1/ports/port-a"]);
         i.meta.deleted_at = Some(velstra_cloud_model::Timestamp::now());
-        assert!(derive(&[&i], &ports, &subnet(), &network(), &BTreeMap::new()).is_empty());
+        assert!(derive(&[&i], &ports, &subnet(), &network(), &BTreeMap::new(), &Default::default()).is_empty());
     }
 
     #[test]

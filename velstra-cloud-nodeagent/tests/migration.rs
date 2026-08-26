@@ -352,12 +352,14 @@ async fn a_receiver_that_outlived_its_transfer_is_taken_down() {
         .await
         .unwrap();
     let request = VmRequest {
+        devices: Vec::new(),
         instance: I1.to_string(),
         vcpus: 2,
         memory_mib: 2048,
         image: IMAGE.to_string(),
         root_disk_gib: 20,
         nics: vec![],
+        cpu_baseline: None,
     };
     // A receive process that did not exit when its transfer did: the guest is
     // here and something is still listening for it.
