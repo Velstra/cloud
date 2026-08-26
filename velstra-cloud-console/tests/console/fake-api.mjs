@@ -248,6 +248,43 @@ function decorate(r) {
   if (/\/security-groups\//.test(r.meta.name)) {
     return { ...r, status: { ...r.status, members: groupMembers(r) } };
   }
+  // What else comes with each passable device — `velstra_cloud_model::pci::
+  // group_members`, which the API runs on the way out. Computed here rather
+  // than seeded for the same reason it is computed there: a device with **no**
+  // group is answered as being alone, and a grouping by equal group number
+  // would instead collect every ungrouped device into one imaginary group.
+  if (/^nodes\//.test(r.meta.name) && Array.isArray(r.status.pciDevices)) {
+    const all = r.status.pciDevices;
+    const withGroups = all.map((d) => ({
+      ...d,
+      groupWith: d.iommuGroup === undefined || d.iommuGroup === null
+        ? [d.address]
+        : all.filter((o) => o.iommuGroup === d.iommuGroup)
+             .map((o) => o.address).sort(),
+    }));
+    r = { ...r, status: { ...r.status, pciDevices: withGroups } };
+  }
+  // What a running guest was asked for and will only get at its next start —
+  // `velstra_cloud_model::resources::pending_changes`, which the API runs on the
+  // way out. Absent when nothing is pending rather than an empty list, so a
+  // blank cell reads as "running on what was asked for" and not as "unknown".
+  //
+  // Computed here rather than seeded, because it is computed there: a fixture
+  // carrying the answer would let the console be written against a world where
+  // this field survives an edit, which the real API never produces.
+  if (/\/instances\//.test(r.meta.name) && r.status.runningSize) {
+    const was = r.status.runningSize;
+    const pending = [
+      ["vcpus", was.vcpus, r.spec.vcpus],
+      ["memoryMib", was.memoryMib, r.spec.memoryMib],
+      ["rootDiskGib", was.rootDiskGib, r.spec.rootDiskGib],
+    ]
+      .filter(([, from, to]) => from !== to)
+      .map(([field, from, to]) => ({ field, from: String(from), to: String(to) }));
+    if (pending.length) {
+      return { ...r, status: { ...r.status, pendingChanges: pending } };
+    }
+  }
   // A disk a Ceph cluster was given stops reporting as free — it is an OSD now,
   // which is what the node would say and what `may_consume` refuses. Modelled
   // here because it is the trap the console's disk picker has to survive: a
@@ -327,6 +364,23 @@ function seed() {
         disk("/dev/disk/by-id/nvme-eui.0003", "nvme1n1", 16, false, "Kingston NV2", { kind: "Free" }),
         disk("/dev/disk/by-id/ata-INTEL-0004", "sdb", 240, false, "INTEL SSDSC2", { kind: "System" }),
         disk("/dev/disk/by-id/ata-SEAGATE-0005", "sdc", 1863, true, "ST2000DM008", { kind: "Mounted", at: "/var/lib/velstra" }),
+      ],
+      // Hardware that can be passed to a guest. Three cases on purpose: a card
+      // that drags its own audio function along, one that is alone in its
+      // group, and one the machine cannot isolate at all.
+      pciDevices: [
+        { address: "0000:41:00.0", vendorDevice: "10de:2204",
+          description: "NVIDIA GA102 [GeForce RTX 3090]", kind: "Gpu",
+          iommuGroup: 17, state: { kind: "Free" } },
+        { address: "0000:41:00.1", vendorDevice: "10de:1aef",
+          description: "NVIDIA GA102 High Definition Audio", kind: "Other",
+          iommuGroup: 17, state: { kind: "Free" } },
+        { address: "0000:42:00.0", vendorDevice: "8086:1572",
+          description: "Intel X710 10GbE", kind: "Nic",
+          iommuGroup: 18, state: { kind: "Free" } },
+        { address: "0000:43:00.0", vendorDevice: "1912:0014",
+          description: "Renesas uPD720201 USB 3.0", kind: "Other",
+          state: { kind: "Free" } },
       ] });
   put("nodes/node-b", { schedulable: false, labels: ["nvme"] },
     { observedGeneration: 1, conditions: ready(1),
@@ -407,7 +461,12 @@ function seed() {
     desiredState: "Running", ports: ["projects/p1/ports/web-1-eth0"], sshKeys: ["ssh-ed25519 AAAAC3…"],
     userData: null, node: "node-a", placementPolicy: { antiAffinityGroup: "web", requiredLabels: [] } },
     { observedGeneration: 2, conditions: ready(2), state: "Running", node: "node-a",
-      addresses: ["10.20.0.11"], vmmPid: 4711, startedAt: now() - 7_200_000 },
+      addresses: ["10.20.0.11"], vmmPid: 4711, startedAt: now() - 7_200_000,
+      // What the guest is *actually* running on. Somebody asked for 4 vCPUs
+      // while it was up; it took 2 with it from its last start and keeps them
+      // until the next one. That is ordinary — what was not ordinary is that
+      // nothing said so, and every screen read as converged.
+      runningSize: { vcpus: 2, memoryMib: 8192, rootDiskGib: 40 } },
     { generation: 2, labels: { env: "prod", tier: "web" } });
 
   // Drifting: the ask moved and nothing has reported on it yet. The Ready
@@ -1482,6 +1541,23 @@ function blankStatus(collectionName) {
   // there — and a fixture that left it out crashed every reader that adds a
   // machine up, which is what happened the first time a node was created from
   // the console.
+  // A pool declared but not yet claimed by an agent — the same shape and the
+  // same argument as a node. `PoolStatus` is a typed struct, so `capacityGib`
+  // and `allocatedGib` are always numbers; a fixture that left them out would
+  // hand every reader that does arithmetic on them an `undefined`, which is the
+  // node bug again with a different collection's name on it.
+  //
+  // `backend` is empty rather than guessed: it is what the agent *found*, and
+  // nothing has looked yet.
+  if (kind === "pools") {
+    return {
+      backend: "",
+      capacityGib: 0,
+      allocatedGib: 0,
+      agentVersion: "",
+      lastHeartbeat: 0,
+    };
+  }
   if (kind === "nodes") {
     const zero = { vcpus: 0, memoryMib: 0, diskGib: 0, numaFreeMib: [], hugepages1gi: 0 };
     return {

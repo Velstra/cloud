@@ -179,6 +179,8 @@ mod complete {
             path: "/srv/archive".into(),
             accepting: true,
             agent: "nvme".into(),
+
+            verify_every_hours: 0,
         }
     }
 
@@ -702,6 +704,12 @@ fn computed_on_read(collection: &str, path: &str) -> Option<&'static str> {
             "which nodes hold a verified copy is an aggregate over every node's \
              own report; an image cannot write it and no controller owns it",
         ),
+        ("instances", "status.pendingChanges.0.field") => Some(
+            "what a running guest will only get at its next start is a comparison \
+             between spec and status.runningSize; storing it would be a third copy \
+             that can disagree with both. Absent when nothing is pending, so a \
+             blank here reads correctly as 'running on what was asked for'",
+        ),
         _ => None,
     }
 }
@@ -894,3 +902,43 @@ nothing_points_nowhere!(
     complete::load_balancer(),
     settled::load_balancer()
 );
+
+/// A field the API will not let anybody change must say so in the schema.
+///
+/// The two live apart on purpose — the refusal is a rule about the API, the
+/// flag is what a form does about it — and apart is exactly how they drift. A
+/// field refused by the API and not marked here is an edit control whose only
+/// possible outcome is a refusal; a field marked here and not refused is a
+/// control withheld for no reason.
+///
+/// Held as a list rather than derived, because the refusals are hand-written
+/// prose in `core.rs` and there is nothing to read them off. What the list buys
+/// is that adding a refusal without marking the field fails here rather than in
+/// somebody's face.
+#[test]
+fn a_field_the_api_refuses_to_change_is_not_offered_for_editing() {
+    // (collection, field) pairs `core.rs` refuses to change after creation.
+    const FIXED: &[(&str, &str)] = &[
+        ("volumes", "pool"),
+        ("volumes", "sourceImage"),
+        ("volumes", "sourceSnapshot"),
+    ];
+
+    for (collection, key) in FIXED {
+        let coll = velstra_cloud_console::COLLECTIONS
+            .iter()
+            .find(|c| c.id == *collection)
+            .unwrap_or_else(|| panic!("there is no {collection} collection"));
+        let field = coll
+            .fields
+            .iter()
+            .find(|f| f.key == *key)
+            .unwrap_or_else(|| panic!("{collection} has no {key} field"));
+        assert!(
+            field.at_creation || field.derived,
+            "the API refuses to change {collection}.{key} after creation, and the console \
+             still offers it in the edit form. Set at_creation: true, or the only thing an \
+             operator can do with that control is be refused by it."
+        );
+    }
+}

@@ -1953,6 +1953,48 @@ async fn a_volume_is_not_restored_in_place() {
     );
 }
 
+/// Re-pointing a volume at another pool moves no bytes, and what it used to
+/// produce was worse than a refusal: the pool holding it stopped matching its
+/// own watch filter and let go, the named pool saw a volume another pool still
+/// had claimed and declined it, and the volume sat converging on nothing — with
+/// no condition, no event and no log line, because every component had done
+/// exactly the right thing.
+#[tokio::test]
+async fn a_volume_is_not_moved_between_pools_by_editing_its_pool() {
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+
+    let refused = h
+        .patch(&volume, json!({ "spec": { "pool": "spinning-rust" } }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(refused.field(), "spec.pool");
+    let sentence = refused.body["error"]["message"].as_str().unwrap();
+    assert!(sentence.contains("moves none of them"), "{sentence}");
+    assert!(
+        sentence.contains("sourceBackup"),
+        "the refusal did not say what to do instead: {sentence}"
+    );
+
+    // And nothing moved, including the record of where it is.
+    assert_ne!(h.get(&volume).await.body["spec"]["pool"], json!("spinning-rust"));
+}
+
+/// Writing back the pool it already has is not a change. A client that read an
+/// object and is sending part of it back must never be refused for a field it
+/// did not touch.
+#[tokio::test]
+async fn sending_back_the_pool_a_volume_already_has_is_not_a_move() {
+    let h = Harness::new();
+    let volume = h.volume("data-1", 100).await;
+    let same = h.get(&volume).await.body["spec"]["pool"].as_str().unwrap().to_string();
+
+    let accepted = h
+        .patch(&volume, json!({ "spec": { "pool": same, "sizeGib": 200 } }))
+        .await;
+    assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
+}
+
 #[tokio::test]
 async fn where_a_volume_came_from_is_history_rather_than_a_control() {
     let h = Harness::new();
@@ -3171,6 +3213,7 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
                 path: path.into(),
                 accepting: true,
                 agent: String::new(),
+                verify_every_hours: 0,
             },
             velstra_cloud_model::backup::BackupTargetStatus {
                 writable: Some(true),
@@ -3274,4 +3317,150 @@ async fn a_list_is_narrowed_by_label_and_an_empty_selector_narrows_nothing() {
     // And cleared shows everything again.
     let cleared = h.get("projects/p1/networks?labels=").await;
     assert_eq!(ids(&cleared), ["db-1", "web-1", "web-2"]);
+}
+
+/// Resizing a running guest is said out loud instead of reading as applied.
+///
+/// The failure this pins is one this platform shipped, and it is the shape that
+/// costs most: everything agreed. The spec said eight vCPUs, the agent had
+/// genuinely handled the change so `observedGeneration` caught up, `Ready` was
+/// true — and the guest went on running on two. There was no screen anywhere
+/// that disagreed, which is why nobody found it by looking.
+#[tokio::test]
+async fn a_running_guest_says_what_it_will_only_get_when_it_restarts() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let name = running_guest(&h).await;
+
+    // An agent reports what the guest is actually running on — the half that
+    // already existed.
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut running = instances.get(&name).await.unwrap().unwrap();
+    running.status.running_size = Some(velstra_cloud_model::resources::RunningSize {
+        vcpus: 2,
+        memory_mib: 4096,
+        root_disk_gib: running.spec.root_disk_gib,
+    });
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "instances", &name),
+            serde_json::to_vec(&running).unwrap(),
+            velstra_cloud_store::Expect::Revision(running.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    // Nothing pending yet: what it runs on is what was asked for, and a field
+    // that is always there is one a reader has to inspect to learn nothing.
+    let settled = h.get(&name).await;
+    assert!(
+        settled.body["status"]["pendingChanges"].is_null(),
+        "{}",
+        settled.body["status"]
+    );
+
+    // Now somebody resizes it while it runs.
+    let asked = h.patch(&name, json!({ "spec": { "vcpus": 8 } })).await;
+    assert_eq!(asked.status, StatusCode::OK, "{}", asked.body);
+
+    let after = h.get(&name).await;
+    let pending = &after.body["status"]["pendingChanges"];
+    assert!(!pending.is_null(), "the resize reads as applied: {}", after.body["status"]);
+    assert_eq!(pending[0]["field"], json!("vcpus"));
+    assert_eq!(pending[0]["from"], json!("2"), "{pending}");
+    assert_eq!(pending[0]["to"], json!("8"), "{pending}");
+
+    // Computed, never stored: a third copy of a comparison between a spec and a
+    // status could disagree with both, and asking must not be a write.
+    let before = h.store.revision().await.unwrap();
+    let _ = h.get(&name).await;
+    assert_eq!(h.store.revision().await.unwrap(), before, "reading wrote something");
+
+    // And a listing says the same thing a read does — a console that learns
+    // about an object from a list must not see a different object.
+    let listed = h.get("projects/p1/instances").await;
+    let one = &listed.body["items"][0]["status"]["pendingChanges"];
+    assert_eq!(one[0]["to"], json!("8"), "{}", listed.body);
+}
+
+/// A guest that is not running has nothing to differ from.
+#[tokio::test]
+async fn a_stopped_guest_has_nothing_pending() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let name = running_guest(&h).await;
+    h.patch(&name, json!({ "spec": { "vcpus": 8 } })).await;
+
+    // `runningSize` is cleared when a guest stops — the field describes a
+    // running machine — so there is nothing to compare and nothing to say.
+    let after = h.get(&name).await;
+    assert!(
+        after.body["status"]["pendingChanges"].is_null(),
+        "a stopped guest claimed something was pending: {}",
+        after.body["status"]
+    );
+}
+
+/// A node says what else comes with each device it can pass through.
+///
+/// Passing one takes its whole IOMMU group — the hardware cannot isolate less —
+/// and an operator who learns that afterwards learns it from an outage.
+/// `pci::offerable` already stops an unsafe *assignment*; this is the sentence
+/// before the decision, which did not exist.
+#[tokio::test]
+async fn a_nodes_devices_say_what_comes_with_them() {
+    use velstra_cloud_model::pci::{DeviceKind, DeviceUse, PciDevice};
+
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let nodes = h.nodes();
+    let mut node = nodes.get("nodes/node-a").await.unwrap().unwrap();
+    let device = |address: &str, group: Option<u32>| PciDevice {
+        address: address.into(),
+        vendor_device: "10de:2204".into(),
+        description: "NVIDIA GA102".into(),
+        kind: DeviceKind::Gpu,
+        iommu_group: group,
+        state: DeviceUse::Free,
+    };
+    node.status.pci_devices = vec![
+        // A GPU and its audio function: one group, and taking the card takes
+        // both whether anybody wanted the audio device or not.
+        device("0000:41:00.0", Some(17)),
+        device("0000:41:00.1", Some(17)),
+        // A different group entirely.
+        device("0000:42:00.0", Some(18)),
+        // No IOMMU at all. This is the case a client-side grouping gets
+        // backwards: it is not in a group *with* the others, it is in no group
+        // and can never be passed through.
+        device("0000:43:00.0", None),
+    ];
+    nodes
+        .update(&node, &velstra_cloud_model::access::Writer::agent("node-a"))
+        .await
+        .unwrap();
+
+    let answer = h.get("nodes/node-a").await;
+    let devices = answer.body["status"]["pciDevices"].as_array().unwrap();
+    assert_eq!(
+        devices[0]["groupWith"],
+        json!(["0000:41:00.0", "0000:41:00.1"]),
+        "{}",
+        answer.body["status"]["pciDevices"]
+    );
+    // Both members answer the same list, in the same order, so a console does
+    // not have to care which one an operator clicked.
+    assert_eq!(devices[1]["groupWith"], devices[0]["groupWith"]);
+    assert_eq!(devices[2]["groupWith"], json!(["0000:42:00.0"]));
+    // The one that matters: alone, not lumped in with every other device that
+    // also has no group.
+    assert_eq!(devices[3]["groupWith"], json!(["0000:43:00.0"]));
+
+    // Computed, never stored: asking must not be a write.
+    let before = h.store.revision().await.unwrap();
+    let _ = h.get("nodes/node-a").await;
+    assert_eq!(h.store.revision().await.unwrap(), before, "reading wrote something");
 }
