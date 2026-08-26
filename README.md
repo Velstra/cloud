@@ -177,4 +177,15 @@ Start with the first one if you have never run this.
 
 ## Licence
 
-AGPL-3.0-or-later, matching the data plane. See the workspace `Cargo.toml`.
+**AGPL-3.0-or-later** — the full text is in [`LICENSE`](LICENSE), and every crate
+declares it through the workspace `Cargo.toml`.
+
+The same model the rest of Velstra uses, and the same one Proxmox and VyOS use:
+the whole product is open, under a copyleft strong enough to cover offering it as
+a service. `LICENSING.md` in the fabric repository sets out the family structure,
+including why the shared wire contract is permissive rather than copyleft.
+
+One file here is not AGPL:
+`velstra-cloud-fabric/proto/vendor/velstra.proto` is vendored from fabric under
+**MIT OR Apache-2.0**, and vendoring a file does not relicense it. Its own
+README says so, and so does the Debian package's `copyright`.
