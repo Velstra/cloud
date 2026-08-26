@@ -150,7 +150,22 @@
             "string"
           ],
           "lastHeartbeat": "number",
-          "observedGeneration": "number"
+          "observedGeneration": "number",
+          "pciDevices": [
+            {
+              "address": "string",
+              "description": "string",
+              "groupWith": [
+                "string"
+              ],
+              "iommuGroup": "number",
+              "kind": "string",
+              "state": {
+                "kind": "string"
+              },
+              "vendorDevice": "string"
+            }
+          ]
         }
       }
     ],
@@ -240,7 +255,22 @@
         "string"
       ],
       "lastHeartbeat": "number",
-      "observedGeneration": "number"
+      "observedGeneration": "number",
+      "pciDevices": [
+        {
+          "address": "string",
+          "description": "string",
+          "groupWith": [
+            "string"
+          ],
+          "iommuGroup": "number",
+          "kind": "string",
+          "state": {
+            "kind": "string"
+          },
+          "vendorDevice": "string"
+        }
+      ]
     }
   },
   "nodes/node-a:explainMaintenance": {
@@ -345,7 +375,7 @@
           "desiredState": "string",
           "image": "string",
           "memoryMib": "number",
-          "node": "string",
+          "node": "null",
           "onNodeLoss": "string",
           "placementPolicy": {
             "affinity": "string",
@@ -362,12 +392,10 @@
           "vcpus": "number"
         },
         "status": {
-          "addresses": [
-            "string"
-          ],
+          "addresses": [],
           "conditions": [],
           "consoleBytes": "number",
-          "node": "string",
+          "node": "null",
           "observedGeneration": "number",
           "startedAt": "null",
           "state": "string",
@@ -421,6 +449,18 @@
       "consoleBytes": "number",
       "node": "string",
       "observedGeneration": "number",
+      "pendingChanges": [
+        {
+          "field": "string",
+          "from": "string",
+          "to": "string"
+        }
+      ],
+      "runningSize": {
+        "memoryMib": "number",
+        "rootDiskGib": "number",
+        "vcpus": "number"
+      },
       "startedAt": "null",
       "state": "string",
       "vmmPid": "null"

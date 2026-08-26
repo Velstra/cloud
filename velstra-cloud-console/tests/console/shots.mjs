@@ -8,13 +8,18 @@
 //
 //     CONSOLE_SHOTS=/path/to/dir tests/console/shots.mjs   (via run-shots.sh)
 
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { browser, signIn, open, openRow, sleep, waitFor } from "./harness.mjs";
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:18100/";
 const TOKEN = process.env.CONSOLE_TOKEN || "testtoken";
 const OUT = process.env.CONSOLE_SHOTS || "/tmp/console-shots";
+// Emptied first, and this is not tidiness. The names carry a sequence number,
+// so inserting one shot renumbers every shot after it — and a directory that
+// was only written into then holds both numberings at once, silently. Which
+// breaks the one thing this file exists for: putting two passes side by side.
+rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
 
 const page = await browser({ width: 1600, height: 1000 });
@@ -64,6 +69,24 @@ await signIn(page, { username: process.env.CONSOLE_USER || "operator", password:
 await both("board-instances", () => open(page, "instances"));
 await both("board-nodes", () => open(page, "nodes"));
 await both("board-subnets", () => open(page, "subnets"));
+
+/// A node's own sheet: what it is running on, what a maintenance window would
+/// cost, and which of its hardware can be passed to a guest — including what
+/// each piece drags along with it.
+await both("sheet-node", async () => {
+  await open(page, "nodes");
+  await openRow(page, "node-a");
+  await waitFor(page, `!!document.getElementById("maintenance")`);
+  // Scrolled to the hardware, which is below the fold on this viewport. A
+  // picture whose caption describes something outside the frame is worse than
+  // no picture: the reader assumes they misread the caption.
+  await page.evaluate(`(() => {
+    const box = [...document.querySelectorAll(".pending")]
+      .find((b) => /isolation group/.test(b.textContent));
+    if (box) box.scrollIntoView({ block: "center" });
+  })()`);
+  await sleep(250);
+});
 
 // ---- one object -------------------------------------------------------------
 

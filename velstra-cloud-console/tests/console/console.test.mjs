@@ -2331,6 +2331,127 @@ await test("adding a node shows its registration token once, with what to do wit
   check(gone, "the token panel would not close");
 });
 
+/// A node says what its hardware drags along, before anybody claims it.
+///
+/// Passing one device to a guest takes its whole isolation group, because the
+/// hardware cannot separate less than that. The platform already refuses an
+/// unsafe assignment; what did not exist was the sentence *before* the
+/// decision, and an operator who learns it afterwards learns it from an outage.
+await test("a node's hardware says what comes with each piece", async () => {
+  await open(page, "nodes");
+  await openRow(page, "node-a");
+  const said = await waitFor(page, `(() => {
+    const box = [...document.querySelectorAll(".pending")]
+      .find((b) => /isolation group/.test(b.textContent));
+    return box ? box.textContent : null;
+  })()`);
+
+  // The card and its audio function are one line: claiming either takes both.
+  check(/0000:41:00\.0 \+ 0000:41:00\.1/.test(said), `the group is not shown: ${said}`);
+  // A device alone in its group says so rather than saying nothing.
+  check(/0000:42:00\.0 — on its own/.test(said), `a lone device is unclear: ${said}`);
+  // And the case a client-side grouping gets backwards: no group at all is not
+  // "grouped with the other ungrouped ones", it is "cannot be passed through".
+  check(/0000:43:00\.0 — no isolation group/.test(said), `an un-isolatable device is mislabelled: ${said}`);
+  check(!/0000:43:00\.0 \+/.test(said), `it lumped ungrouped devices together: ${said}`);
+});
+
+/// A guest resized while it runs says so, instead of reading as converged.
+///
+/// This is the failure that hid best: the spec said four vCPUs, the agent had
+/// genuinely handled the change so the generation caught up, Ready was true —
+/// and the guest went on running on two. Every screen agreed. The board now
+/// carries the one column that disagrees, next to the numbers it contradicts.
+await test("a guest running on old numbers says so on the board", async () => {
+  await open(page, "instances");
+  const row = await waitFor(page, `(() => {
+    const cell = [...document.querySelectorAll("#boardbody td")]
+      .find((c) => c.textContent.trim() === "web-1");
+    return cell ? cell.closest("tr").textContent : null;
+  })()`);
+
+  // The row text is concatenated, so the vCPU column's "4" runs into the next
+  // cell's "8,192 MiB" — asserting on a number here would be asserting on
+  // where the columns happen to sit. What matters is that the row says the
+  // resize has not taken effect, right beside the number that claims it has.
+  check(/vcpus/i.test(row), `nothing says the resize is still pending: ${row}`);
+
+  // And a guest running on what was asked for says nothing — a column that
+  // always had something in it would be one nobody reads.
+  const other = await page.evaluate(`(() => {
+    const cell = [...document.querySelectorAll("#boardbody td")]
+      .find((c) => c.textContent.trim() === "web-2");
+    return cell ? cell.closest("tr").textContent : null;
+  })()`);
+  check(other !== null && !/vcpus/i.test(other), `it claims a settled guest is pending: ${other}`);
+});
+
+/// A volume's pool is where its bytes are, and re-pointing it moves none.
+///
+/// Before this, editing it was accepted by the API and moved nothing: the old
+/// pool's agent stopped matching its watch filter and let go, the new one saw a
+/// volume another pool still had claimed and declined it, and the volume simply
+/// stopped converging with nothing anywhere saying why. The form must not offer
+/// the control, and the size next to it must still work — a lock that seized
+/// the whole dialog would be a worse bug than the one it fixes.
+await test("a volume's pool cannot be edited, and the rest of the form still can", async () => {
+  await open(page, "volumes");
+  await openRow(page, "data-1");
+  await page.evaluate(`document.getElementById("editbtn").click()`);
+
+  const state = await waitFor(page, `(() => {
+    const pool = document.getElementById("f-pool");
+    if (!pool) return null;
+    const size = document.getElementById("f-sizeGib");
+    return {
+      poolLocked: pool.hasAttribute("disabled"),
+      sizeLocked: size ? size.hasAttribute("disabled") : "no size field",
+    };
+  })()`, { timeout: 15000 });
+
+  check(state.poolLocked, "the edit form still offers to move a volume between pools");
+  check(state.sizeLocked === false, `locking the pool disabled the size too: ${state.sizeLocked}`);
+});
+
+/// A pool is declared here, then claimed by an agent — the same two halves as
+/// a node, in the same order. The id is the whole point: every volume is
+/// written against it, and a seed naming a pool nobody created is a pool that
+/// claims nothing and volumes that are never provisioned, quietly.
+///
+/// The second half of this test is the part worth having. A pool mints no
+/// credential, and a console that grew a token panel here — by copying the node
+/// path — would be handing out a secret the API never issued.
+await test("a pool can be declared before its agent exists, and is handed no token", async () => {
+  await open(page, "pools");
+  const opened = await page.evaluate(`(() => {
+    const button = document.getElementById("newbtn");
+    if (!button) return "the pools board offers no way to add one";
+    button.click();
+    return "";
+  })()`);
+  check(!opened, opened);
+
+  await page.evaluate(`(async () => {
+    const id = document.getElementById("f-id");
+    id.value = "nvme-2";
+    id.dispatchEvent(new Event("input"));
+    document.getElementById("submitform").click();
+  })()`);
+
+  const row = await waitFor(page, `(() => {
+    const cell = [...document.querySelectorAll("#rows td")]
+      .find((c) => c.textContent.trim() === "nvme-2");
+    return cell ? cell.closest("tr").textContent : null;
+  })()`, { timeout: 15000 });
+
+  // It exists and nothing has reported on it — which is the honest state for a
+  // pool whose machine has not been installed yet, not an error.
+  check(!/error/i.test(row), `a freshly declared pool reads as broken: ${row}`);
+
+  const token = await page.evaluate(`!!document.getElementById("nodetoken")`);
+  check(!token, "the console showed a registration token for a pool, which mints none");
+});
+
 /// A tenant's two questions in one answer: what am I allowed, and what would
 /// actually start.
 await test("a project's sheet says what is left and which limit is in the way", async () => {

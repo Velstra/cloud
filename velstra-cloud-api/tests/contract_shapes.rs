@@ -205,6 +205,29 @@ async fn seed(h: &Harness) {
                     serial: "WD-0001".into(),
                     state: velstra_cloud_model::ceph::DeviceUse::Free,
                 }],
+                // Hardware that can be passed to a guest, so the recording
+                // carries `groupWith` — what else comes along when one of these
+                // is claimed. Two devices in one group, because a card that
+                // drags its audio function with it is the ordinary case and the
+                // one an operator has to see before deciding.
+                pci_devices: vec![
+                    velstra_cloud_model::pci::PciDevice {
+                        address: "0000:41:00.0".into(),
+                        vendor_device: "10de:2204".into(),
+                        description: "NVIDIA GA102 [GeForce RTX 3090]".into(),
+                        kind: velstra_cloud_model::pci::DeviceKind::Gpu,
+                        iommu_group: Some(17),
+                        state: velstra_cloud_model::pci::DeviceUse::Free,
+                    },
+                    velstra_cloud_model::pci::PciDevice {
+                        address: "0000:41:00.1".into(),
+                        vendor_device: "10de:1aef".into(),
+                        description: "NVIDIA GA102 High Definition Audio".into(),
+                        kind: velstra_cloud_model::pci::DeviceKind::Other,
+                        iommu_group: Some(17),
+                        state: velstra_cloud_model::pci::DeviceUse::Free,
+                    },
+                ],
                 cpu: Some(velstra_cloud_model::cpu::NodeCpu {
                     arch: "x86_64".into(),
                     vendor: "GenuineIntel".into(),
@@ -244,6 +267,25 @@ async fn seed(h: &Harness) {
         }})),
     )
     .await;
+    // A second guest, unplaced, and named to sort **before** the running one.
+    //
+    // It is here because of what the list recording compares: the first element
+    // stands for the list, and the fixture on the console side holds several
+    // guests in different states. With one running guest here and an unplaced
+    // one first over there, the two lists were representative of different
+    // kinds of object, and every optional status field — `runningSize` is
+    // simply the first — read as a contract difference. Both sides now lead
+    // with a guest that is nowhere, and the running guest's full shape is
+    // recorded on its own path.
+    h.send(
+        "POST",
+        "projects/p1/instances",
+        Some(json!({ "id": "db-1", "spec": {
+            "vcpus": 2, "memoryMib": 4096, "rootDiskGib": 20, "desiredState": "Stopped",
+        }})),
+    )
+    .await;
+
     // Placed and running, as the scheduler and the node agent would leave it.
     // Written here because neither runs in this test, and half of these verbs
     // have nothing to say about a guest that is nowhere.
@@ -273,6 +315,17 @@ async fn seed(h: &Harness) {
         guest.status.state = velstra_cloud_model::resources::InstanceState::Running;
         guest.status.observed_generation = guest.meta.generation;
         guest.status.addresses = vec!["10.20.0.11".into()];
+        // What it is actually running on, and deliberately *not* what the spec
+        // says: the recording has to carry `status.pendingChanges`, and that is
+        // computed from the difference. A fixture whose guest ran on exactly
+        // what was asked for would record the shape as absent, and a client
+        // written against that recording would have no idea the field exists
+        // until a real guest was resized under it.
+        guest.status.running_size = Some(velstra_cloud_model::resources::RunningSize {
+            vcpus: 1,
+            memory_mib: 2048,
+            root_disk_gib: 20,
+        });
         instances
             .update(&guest, &Writer::agent("node-a"))
             .await
