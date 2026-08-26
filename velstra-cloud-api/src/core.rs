@@ -655,10 +655,7 @@ impl Api {
             detail: detail.to_string(),
             at,
         };
-        let meta = velstra_cloud_model::meta::Meta::new(
-            record_name,
-            self.inner.placement.clone(),
-        );
+        let meta = velstra_cloud_model::meta::Meta::new(record_name, self.inner.placement.clone());
         let (Ok(meta), Ok(spec)) = (serde_json::to_value(&meta), serde_json::to_value(&spec))
         else {
             return;
@@ -1215,13 +1212,15 @@ impl Api {
             refuse_an_unusable_overcommit(&spec)?;
         }
         if kind == "floatingips" {
-            self.refuse_an_address_that_reaches_nothing(&name, &spec).await?;
+            self.refuse_an_address_that_reaches_nothing(&name, &spec)
+                .await?;
         }
         if kind == "networks" {
             refuse_an_external_network_from_a_tenant(&spec, who, self.is_operator(who))?;
         }
         if kind == "maintenance-windows" {
-            self.refuse_a_window_that_would_do_nothing(&name, &spec).await?;
+            self.refuse_a_window_that_would_do_nothing(&name, &spec)
+                .await?;
         }
         self.check_cell(&name, kind).await?;
         self.check_quota(&name, kind, &spec).await?;
@@ -1770,16 +1769,15 @@ impl Api {
         // The cell's device classes, so that an instance asking for hardware
         // gets the same answer here as the scheduler will give it. Two
         // explanations that disagree would be worse than one that is late.
-        let classes: std::collections::BTreeMap<String, velstra_cloud_model::pci::DeviceClassSpec> =
-            {
-                let all: Vec<velstra_cloud_model::resources::DeviceClass> = self
-                    .typed_list("", "device-classes")
-                    .await
-                    .unwrap_or_default();
-                all.into_iter()
-                    .map(|c| (c.meta.name.id().to_string(), c.spec))
-                    .collect()
-            };
+        let classes: std::collections::BTreeMap<String, velstra_cloud_model::pci::DeviceClassSpec> = {
+            let all: Vec<velstra_cloud_model::resources::DeviceClass> = self
+                .typed_list("", "device-classes")
+                .await
+                .unwrap_or_default();
+            all.into_iter()
+                .map(|c| (c.meta.name.id().to_string(), c.spec))
+                .collect()
+        };
         let closed = self.closed_nodes().await?;
         // The opposite ask, read the same way and from the same objects.
         let with_group: Vec<(String, String)> = instances
@@ -1794,9 +1792,9 @@ impl Api {
             .collect();
         let (candidate, rejected) =
             match place(&instance, &nodes, &occupied, &with_group, &classes, &closed) {
-            Ok(node) => (Some(node), Vec::new()),
-            Err(chain) => (None, chain),
-        };
+                Ok(node) => (Some(node), Vec::new()),
+                Err(chain) => (None, chain),
+            };
         let placed = instance.spec.node.clone().or(candidate);
         let rejected: Vec<Value> = rejected
             .iter()
@@ -2232,8 +2230,6 @@ impl Api {
 
     // ---- snapshots --------------------------------------------------------
 
-
-
     /// A root disk may grow. It may not shrink.
     ///
     /// Shrinking is not a resize, it is a truncation: the bytes past the new
@@ -2270,7 +2266,6 @@ impl Api {
         .at("spec.rootDiskGib"))
     }
 
-
     /// Fill in a capture's node from its guest, and refuse the one thing that
     /// makes a template untrustworthy.
     ///
@@ -2298,9 +2293,11 @@ impl Api {
             .unwrap_or_default()
             .to_string();
         let target: velstra_cloud_model::resources::BackupTarget = self
-            .typed(&ResourceName::parse(&target_name).map_err(|e| {
-                ApiError::invalid(format!("spec.target: {e}")).at("spec.target")
-            })?)
+            .typed(
+                &ResourceName::parse(&target_name).map_err(|e| {
+                    ApiError::invalid(format!("spec.target: {e}")).at("spec.target")
+                })?,
+            )
             .await?;
 
         let guest = velstra_cloud_model::capture::GuestView {
@@ -2325,9 +2322,7 @@ impl Api {
                 velstra_cloud_model::capture::Refusal::TargetUnusable { .. } => "spec.target",
                 _ => "spec.instance",
             };
-            return Err(
-                ApiError::new(Code::FailedPrecondition, refusal.to_string()).at(field)
-            );
+            return Err(ApiError::new(Code::FailedPrecondition, refusal.to_string()).at(field));
         }
 
         // The node holding the disk, derived rather than asked for. Without it
@@ -2352,9 +2347,11 @@ impl Api {
             .unwrap_or_default()
             .to_string();
         let volume: Volume = self
-            .typed(&ResourceName::parse(&volume_name).map_err(|e| {
-                ApiError::invalid(format!("spec.volume: {e}")).at("spec.volume")
-            })?)
+            .typed(
+                &ResourceName::parse(&volume_name).map_err(|e| {
+                    ApiError::invalid(format!("spec.volume: {e}")).at("spec.volume")
+                })?,
+            )
             .await?;
 
         let target_name = spec
@@ -2363,9 +2360,11 @@ impl Api {
             .unwrap_or_default()
             .to_string();
         let target: velstra_cloud_model::resources::BackupTarget = self
-            .typed(&ResourceName::parse(&target_name).map_err(|e| {
-                ApiError::invalid(format!("spec.target: {e}")).at("spec.target")
-            })?)
+            .typed(
+                &ResourceName::parse(&target_name).map_err(|e| {
+                    ApiError::invalid(format!("spec.target: {e}")).at("spec.target")
+                })?,
+            )
             .await?;
 
         // Whether this target's path is a pool's. Answered from the pools
@@ -2716,17 +2715,17 @@ impl Api {
             })?;
         let existing: Vec<velstra_cloud_model::resources::MaintenanceWindow> =
             self.typed_list("", "maintenance-windows").await?;
-        let view = |name: String,
-                    spec: &velstra_cloud_model::maintenance::MaintenanceWindowSpec| {
-            velstra_cloud_model::maintenance::WindowView {
-                name,
-                node: spec.node.clone(),
-                starts_at: spec.starts_at,
-                minutes: spec.minutes,
-                drain: spec.drain,
-                note: spec.note.clone(),
-            }
-        };
+        let view =
+            |name: String, spec: &velstra_cloud_model::maintenance::MaintenanceWindowSpec| {
+                velstra_cloud_model::maintenance::WindowView {
+                    name,
+                    node: spec.node.clone(),
+                    starts_at: spec.starts_at,
+                    minutes: spec.minutes,
+                    drain: spec.drain,
+                    note: spec.note.clone(),
+                }
+            };
         let others: Vec<_> = existing
             .iter()
             .map(|w| view(w.meta.name.to_string(), &w.spec))
@@ -2819,15 +2818,18 @@ impl Api {
         // What the guest must have. Rendered from the same function the
         // metadata service renders from, so what an operator is told here and
         // what the guest was told cannot disagree.
-        let guest = view.address.filter(|_| view.delivery == Delivery::Routed).map(|address| {
-            let route = velstra_cloud_model::public::guest_route(address);
-            json!({
-                "address": format!("{}/{}", route.address, route.prefix_len),
-                "via": route.via.to_string(),
-                "onLink": route.on_link,
-                "defaultRoute": true,
-            })
-        });
+        let guest = view
+            .address
+            .filter(|_| view.delivery == Delivery::Routed)
+            .map(|address| {
+                let route = velstra_cloud_model::public::guest_route(address);
+                json!({
+                    "address": format!("{}/{}", route.address, route.prefix_len),
+                    "via": route.via.to_string(),
+                    "onLink": route.on_link,
+                    "defaultRoute": true,
+                })
+            });
 
         Ok(json!({
             "address": fip.spec.address,
@@ -2852,7 +2854,11 @@ impl Api {
     /// them cannot. A guest holding a passed-through device is bound to this
     /// machine and will be stopped rather than moved, and finding that out
     /// while the machine is on a trolley is finding it out too late.
-    pub async fn explain_maintenance(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+    pub async fn explain_maintenance(
+        &self,
+        name: &ResourceName,
+        who: &Identity,
+    ) -> ApiResult<Value> {
         self.authorize(who, Verb::Read, name).await?;
         let node: Node = self.typed(name).await?;
         let here = node.meta.name.id().to_string();
@@ -2897,15 +2903,13 @@ impl Api {
                 .iter()
                 .filter(|n| n.meta.name.id() != here && !n.meta.is_deleting())
                 .collect();
-            let cached =
-                |image: &str| velstra_cloud_model::resources::nodes_holding(image, &nodes);
+            let cached = |image: &str| velstra_cloud_model::resources::nodes_holding(image, &nodes);
             let migrations: Vec<
                 velstra_cloud_model::resources::Resource<
                     velstra_cloud_model::migration::MigrationSpec,
                     velstra_cloud_model::migration::MigrationStatus,
                 >,
-            > =
-                self.typed_list("", "migrations").await?;
+            > = self.typed_list("", "migrations").await?;
             let moving: Vec<String> = migrations
                 .iter()
                 .filter(|m| !m.meta.is_deleting())
@@ -3173,7 +3177,6 @@ impl Api {
         Ok(())
     }
 
-
     /// What this cell has, what is spoken for, and what would actually fit.
     ///
     /// A verb on the node collection, like `:explainCpu`: it is a property of
@@ -3186,8 +3189,7 @@ impl Api {
     /// this is computed here rather than left to whoever draws the dashboard.
     pub async fn explain_capacity(&self, who: &Identity) -> ApiResult<Value> {
         let _ = who;
-        let nodes: Vec<velstra_cloud_model::resources::Node> =
-            self.typed_list("", "nodes").await?;
+        let nodes: Vec<velstra_cloud_model::resources::Node> = self.typed_list("", "nodes").await?;
         let h = velstra_cloud_model::reconcile::headroom(&nodes, &self.closed_nodes().await?);
 
         let cap = |c: &velstra_cloud_model::resources::Capacity| {
@@ -3240,11 +3242,9 @@ impl Api {
             // missed, and it fails closed.
             &project.status.used,
         );
-        let nodes: Vec<velstra_cloud_model::resources::Node> =
-            self.typed_list("", "nodes").await?;
+        let nodes: Vec<velstra_cloud_model::resources::Node> = self.typed_list("", "nodes").await?;
         let room = velstra_cloud_model::reconcile::headroom(&nodes, &self.closed_nodes().await?);
-        let startable =
-            velstra_cloud_model::allowance::largest_startable(&dimensions, &room);
+        let startable = velstra_cloud_model::allowance::largest_startable(&dimensions, &room);
 
         Ok(json!({
             "project": name.to_string(),
@@ -3333,8 +3333,6 @@ impl Api {
         }))
     }
 
-
-
     /// Why a guest has, or has not, been brought back from a node that stopped
     /// answering.
     ///
@@ -3367,9 +3365,13 @@ impl Api {
         // that was actually placed, which is every guest this method exists
         // for. Found by the recorded-shape test on its first run.
         let node: velstra_cloud_model::resources::Node = self
-            .typed(&ResourceName::parse(&format!("nodes/{node_name}")).map_err(|e| {
-                ApiError::internal(format!("a guest names {node_name}, which is not an id: {e}"))
-            })?)
+            .typed(
+                &ResourceName::parse(&format!("nodes/{node_name}")).map_err(|e| {
+                    ApiError::internal(format!(
+                        "a guest names {node_name}, which is not an id: {e}"
+                    ))
+                })?,
+            )
             .await?;
 
         let guest = velstra_cloud_model::ha::GuestView {
@@ -3902,9 +3904,9 @@ fn answer_instance(document: &mut Value) {
     {
         return;
     }
-    let Ok(instance) = serde_json::from_value::<velstra_cloud_model::resources::Instance>(
-        document.clone(),
-    ) else {
+    let Ok(instance) =
+        serde_json::from_value::<velstra_cloud_model::resources::Instance>(document.clone())
+    else {
         // A document that will not parse as an instance is not one. Reading it
         // as a guest with nothing pending would be an answer about an object
         // this function never understood.

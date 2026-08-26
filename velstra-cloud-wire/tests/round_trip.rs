@@ -108,7 +108,10 @@ fn every_resource_survives_its_own_wire() {
                 family: 6,
                 model: 85,
                 stepping: 7,
-                flags: ["sse4_2", "avx", "avx2"].iter().map(|s| s.to_string()).collect(),
+                flags: ["sse4_2", "avx", "avx2"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 presents: "x86-64-v3".into(),
                 presented_flags: ["sse4_2", "avx"].iter().map(|s| s.to_string()).collect(),
                 can_mask: true,

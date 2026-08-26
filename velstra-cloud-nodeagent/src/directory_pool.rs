@@ -410,9 +410,12 @@ impl Storage for DirectoryPool {
             ],
         )
         .await?;
-        let written = std::fs::metadata(to)
-            .map(|m| m.len())
-            .map_err(|e| HostError::failed(format!("{} was written and cannot be read: {e}", to.display())))?;
+        let written = std::fs::metadata(to).map(|m| m.len()).map_err(|e| {
+            HostError::failed(format!(
+                "{} was written and cannot be read: {e}",
+                to.display()
+            ))
+        })?;
         Ok(written)
     }
 

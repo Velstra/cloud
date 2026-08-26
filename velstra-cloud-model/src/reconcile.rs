@@ -262,12 +262,7 @@ pub enum StartGate {
 /// the alternative is starting the application servers without the database
 /// and calling it success. It is *visible*, which is the difference — the
 /// refusal names what is being waited on.
-pub fn start_gate(
-    order: u32,
-    delay_s: u32,
-    peers: &[StartPeer],
-    now: Timestamp,
-) -> StartGate {
+pub fn start_gate(order: u32, delay_s: u32, peers: &[StartPeer], now: Timestamp) -> StartGate {
     let earlier: Vec<&StartPeer> = peers.iter().filter(|p| p.order < order).collect();
 
     for peer in &earlier {
@@ -488,11 +483,9 @@ pub fn place(
         // near miss to be reported as "2 vcpus short", and the reason it
         // cannot take the guest is a hardware fact the operator can act on.
         if !instance.spec.devices.is_empty() {
-            if let Err(why) = crate::pci::assign(
-                &instance.spec.devices,
-                classes,
-                &node.status.pci_devices,
-            ) {
+            if let Err(why) =
+                crate::pci::assign(&instance.spec.devices, classes, &node.status.pci_devices)
+            {
                 rejected.push(Explanation {
                     node: id,
                     why: Rejected::NoDevice { why },
@@ -528,10 +521,7 @@ pub fn place(
         if let Some(group) = &policy.affinity_group {
             let anywhere = with_group.iter().any(|(g, _)| g == group);
             together = with_group.iter().any(|(g, n)| g == group && n == &id);
-            if anywhere
-                && !together
-                && policy.affinity == crate::resources::Strength::Required
-            {
+            if anywhere && !together && policy.affinity == crate::resources::Strength::Required {
                 rejected.push(Explanation {
                     node: id,
                     why: Rejected::NotWithGroup {
@@ -598,11 +588,7 @@ pub fn place(
         // number somebody has to tune, and the first time it is wrong it is
         // wrong silently; an order is a sentence: be with your group, then be
         // away from your siblings, then be on the emptiest machine.
-        let score = (
-            u8::from(together),
-            u8::from(!crowded),
-            free.memory_mib,
-        );
+        let score = (u8::from(together), u8::from(!crowded), free.memory_mib);
         if best.map(|(_, s)| score > s).unwrap_or(true) {
             best = Some((node, score));
         }
@@ -1313,7 +1299,6 @@ mod tests {
         assert!(may_delete(&a.meta));
     }
 
-
     /// A node without the hardware is rejected by name, and the busy one
     /// blames the *neighbour* rather than the device that was asked for.
     ///
@@ -1363,7 +1348,15 @@ mod tests {
 
         // The one that can give it a GPU is chosen.
         assert_eq!(
-            place(&i, &[bare.clone(), has, busy.clone()], &[], &[], &classes, &[]).unwrap(),
+            place(
+                &i,
+                &[bare.clone(), has, busy.clone()],
+                &[],
+                &[],
+                &classes,
+                &[]
+            )
+            .unwrap(),
             "has"
         );
 
@@ -1385,14 +1378,21 @@ mod tests {
     fn an_instance_asking_for_an_undefined_class_is_told_so() {
         let mut i = inst("projects/p1/instances/i1");
         i.spec.devices = vec!["gpu-h100".into()];
-        let why = place(&i, &[node("a", 8, 16384)], &[], &[], &Default::default(), &[]).unwrap_err();
+        let why = place(
+            &i,
+            &[node("a", 8, 16384)],
+            &[],
+            &[],
+            &Default::default(),
+            &[],
+        )
+        .unwrap_err();
         assert!(
             describe(&why[0].why).contains("no device class gpu-h100"),
             "{:?}",
             why[0].why
         );
     }
-
 
     fn peer(name: &str, order: u32, state: InstanceState, started_at: Option<u64>) -> StartPeer {
         StartPeer {
@@ -1453,10 +1453,7 @@ mod tests {
             peer("db-2", 1, InstanceState::Running, Some(3_000)),
         ];
         // Ten seconds after the *newest* of them.
-        assert_eq!(
-            start_gate(2, 10, &ahead, Timestamp(13_000)),
-            StartGate::Go
-        );
+        assert_eq!(start_gate(2, 10, &ahead, Timestamp(13_000)), StartGate::Go);
         assert_eq!(
             start_gate(2, 10, &ahead, Timestamp(8_000)),
             StartGate::WaitingOut { seconds: 5 }
@@ -1493,7 +1490,6 @@ mod tests {
         );
     }
 
-
     fn sized(id: &str, vcpus: u32, mem: u64, used_mem: u64) -> Node {
         let mut n = node(id, vcpus, mem);
         n.status.allocated.memory_mib = used_mem;
@@ -1512,7 +1508,11 @@ mod tests {
             .collect();
         let h = headroom(&cell, &[]);
 
-        assert_eq!(h.free.memory_mib, 4 * 16_384, "the sum is still worth having");
+        assert_eq!(
+            h.free.memory_mib,
+            4 * 16_384,
+            "the sum is still worth having"
+        );
         assert_eq!(
             h.largest_fit.memory_mib, 16_384,
             "a 32 GiB guest was reported as fitting a cell with no room for one"
@@ -1577,7 +1577,10 @@ mod tests {
         assert_eq!(offered_vcpus(&shared), 32);
 
         let h = headroom(&[shared.clone()], &[]);
-        assert_eq!(h.free.vcpus, 32, "the ratio did not reach what can be placed");
+        assert_eq!(
+            h.free.vcpus, 32,
+            "the ratio did not reach what can be placed"
+        );
         assert_eq!(h.largest_fit.vcpus, 32);
         // Silicon is silicon. A capacity page that reported 32 cores would say
         // the cell had grown a processor.
@@ -1636,14 +1639,20 @@ mod tests {
         let h = headroom(&[going], &[]);
         assert_eq!(h.usable_nodes, 0);
         assert_eq!(h.unusable_nodes, 0);
-        assert_eq!(h.total.memory_mib, 0, "a machine being removed was still counted");
+        assert_eq!(
+            h.total.memory_mib, 0,
+            "a machine being removed was still counted"
+        );
     }
 
     #[test]
     fn placement_picks_the_emptiest_node_that_fits() {
         let i = inst("projects/p1/instances/i1");
         let nodes = vec![node("a", 8, 4096), node("b", 8, 16384)];
-        assert_eq!(place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap(), "b");
+        assert_eq!(
+            place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap(),
+            "b"
+        );
     }
 
     /// A machine somebody has declared out of service is not a candidate — and
@@ -1662,15 +1671,27 @@ mod tests {
             window: "maintenance-windows/dimm-swap".into(),
         }];
         // The emptiest node would have won on every other pass.
-        assert_eq!(place(&i, &nodes, &[], &[], &Default::default(), &closed).unwrap(), "a");
+        assert_eq!(
+            place(&i, &nodes, &[], &[], &Default::default(), &closed).unwrap(),
+            "a"
+        );
 
         let mut alone = nodes;
         alone.remove(0);
         let why = place(&i, &alone, &[], &[], &Default::default(), &closed).unwrap_err();
-        assert!(matches!(why[0].why, Rejected::InMaintenance { minutes_left: 40, .. }));
+        assert!(matches!(
+            why[0].why,
+            Rejected::InMaintenance {
+                minutes_left: 40,
+                ..
+            }
+        ));
         let said = describe(&why[0].why);
         assert!(said.contains("another 40 minutes"), "{said}");
-        assert!(said.contains("DIMM"), "the operator's own words are not in it: {said}");
+        assert!(
+            said.contains("DIMM"),
+            "the operator's own words are not in it: {said}"
+        );
     }
 
     /// Anti-affinity keeps a service alive when a machine dies; affinity keeps
@@ -1684,11 +1705,17 @@ mod tests {
         // The emptiest node is `a`, and it would win on every other pass.
         let nodes = vec![node("a", 8, 65_536), node("b", 8, 16_384)];
         let with = vec![("web".to_string(), "b".to_string())];
-        assert_eq!(place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap(), "b");
+        assert_eq!(
+            place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap(),
+            "b"
+        );
 
         // With nobody placed yet there is nothing to be near, and refusing
         // every node would mean a group whose first member could never start.
-        assert_eq!(place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap(), "a");
+        assert_eq!(
+            place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap(),
+            "a"
+        );
     }
 
     /// A required affinity that cannot be honoured says where the rest of the
@@ -1705,13 +1732,20 @@ mod tests {
         let why = place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap_err();
         let about_a = why.iter().find(|e| e.node == "a").unwrap();
         assert!(matches!(about_a.why, Rejected::NotWithGroup { .. }));
-        assert!(describe(&about_a.why).contains("on b"), "{}", describe(&about_a.why));
+        assert!(
+            describe(&about_a.why).contains("on b"),
+            "{}",
+            describe(&about_a.why)
+        );
 
         // A wish rather than a rule: crowded beats not running at all — and
         // here the roomy node wins outright because the group's own node is
         // too small.
         i.spec.placement_policy.affinity = crate::resources::Strength::Preferred;
-        assert_eq!(place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap(), "a");
+        assert_eq!(
+            place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap(),
+            "a"
+        );
     }
 
     /// Three replicas of a database must not share a machine even if that
@@ -1731,7 +1765,10 @@ mod tests {
         assert!(matches!(why[0].why, Rejected::AntiAffinity { .. }));
 
         i.spec.placement_policy.spread = crate::resources::Strength::Preferred;
-        assert_eq!(place(&i, &only, &taken, &[], &Default::default(), &[]).unwrap(), "a");
+        assert_eq!(
+            place(&i, &only, &taken, &[], &Default::default(), &[]).unwrap(),
+            "a"
+        );
 
         // And it is still a preference: given a choice, the empty node wins
         // even though it has less room than the crowded one.

@@ -1028,7 +1028,10 @@ async fn a_stopped_guest_is_captured_into_bytes_with_a_digest() {
     agent.resync().await;
     let claimed = read_capture(&store, "golden").await;
     assert_eq!(claimed.status.node.as_deref(), Some("node-a"));
-    assert!(claimed.status.digest.is_none(), "it was copied before it was claimed");
+    assert!(
+        claimed.status.digest.is_none(),
+        "it was copied before it was claimed"
+    );
 
     agent.resync().await;
     let done = read_capture(&store, "golden").await;
@@ -1083,7 +1086,10 @@ async fn a_running_guest_is_refused_and_told_what_to_use_instead() {
     }
 
     let refused = read_capture(&store, "golden").await;
-    assert!(refused.status.digest.is_none(), "a running guest was captured");
+    assert!(
+        refused.status.digest.is_none(),
+        "a running guest was captured"
+    );
     let ready = velstra_cloud_model::meta::condition(&refused.status.conditions, "Ready")
         .expect("a capture that did not happen says why");
     assert!(

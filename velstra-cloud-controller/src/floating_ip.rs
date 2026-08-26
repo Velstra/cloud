@@ -42,8 +42,6 @@ use crate::{Result, runner::Reconciler, status::StatusWriter};
 
 const WHO: &str = "floating-ip";
 
-
-
 /// The condition this controller owns: whether the address exists and reaches
 /// what it was told to.
 const ALLOCATED: &str = "Allocated";
@@ -431,11 +429,11 @@ impl Reconciler for FloatingIpController {
         // No `..`: every field of a floating IP is acted on below, and a new one
         // is a compile error here until somebody says how.
         let FloatingIpSpec {
-            subnet: _,  // where the address comes from — used by `address`
-            address: _, // the address itself — allocated on the fabric below
-            port: _,      // what it reaches — associated or detached below
-            delivery: _,  // how it reaches the guest — see `crate::public`
-            announce: _,  // who says where it is, when it disagrees with its network
+            subnet: _,   // where the address comes from — used by `address`
+            address: _,  // the address itself — allocated on the fabric below
+            port: _,     // what it reaches — associated or detached below
+            delivery: _, // how it reaches the guest — see `crate::public`
+            announce: _, // who says where it is, when it disagrees with its network
         } = &fip.spec;
 
         // The address first, and always: a cell with no fabric still decides it,
@@ -749,9 +747,9 @@ mod tests {
                     subnet: SUBNET.into(),
                     address: address.map(str::to_string),
                     port: String::new(),
-                delivery: Default::default(),
-                announce: None,
-            },
+                    delivery: Default::default(),
+                    announce: None,
+                },
                 FloatingIpStatus::default(),
             );
             self.floating

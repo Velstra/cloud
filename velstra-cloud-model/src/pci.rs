@@ -134,7 +134,9 @@ impl std::fmt::Display for NotOfferable {
             NotOfferable::InUse {
                 by: DeviceUse::Guest { instance },
             } => write!(f, "{instance} is using it"),
-            NotOfferable::InUse { by: DeviceUse::Free } => {
+            NotOfferable::InUse {
+                by: DeviceUse::Free,
+            } => {
                 // Not reachable from `offerable`, which never builds this.
                 f.write_str("it is not available")
             }
@@ -284,7 +286,9 @@ pub fn assign(
     let mut out = Vec::new();
     for name in wanted {
         let Some(class) = classes.get(name) else {
-            return Err(Shortfall::UnknownClass { class: name.clone() });
+            return Err(Shortfall::UnknownClass {
+                class: name.clone(),
+            });
         };
         let here = availability(class, devices);
         let Some(pick) = here.free.iter().find(|a| !taken.contains(*a)) else {
@@ -442,7 +446,9 @@ mod tests {
         let all = vec![d.clone()];
         assert_eq!(offerable(&d, &all), Err(NotOfferable::NoIommu));
         assert!(
-            NotOfferable::NoIommu.to_string().contains("kernel command line"),
+            NotOfferable::NoIommu
+                .to_string()
+                .contains("kernel command line"),
             "the refusal does not say what to change"
         );
         // Its "group" is itself: a console must still be able to say what

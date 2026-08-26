@@ -135,7 +135,11 @@ pub struct WindowView {
 
 impl WindowView {
     pub fn ends_at(&self) -> Timestamp {
-        Timestamp(self.starts_at.0.saturating_add(minutes_in_millis(self.minutes)))
+        Timestamp(
+            self.starts_at
+                .0
+                .saturating_add(minutes_in_millis(self.minutes)),
+        )
     }
 
     pub fn phase(&self, now: Timestamp) -> Phase {
@@ -203,7 +207,11 @@ pub fn may_declare(
 /// The earliest-opened one wins where two somehow overlap — [`may_declare`]
 /// refuses that pair, but a store can hold a pair declared before this rule
 /// existed, and answering deterministically beats answering by list order.
-pub fn open_on<'a>(node: &str, windows: &'a [WindowView], now: Timestamp) -> Option<&'a WindowView> {
+pub fn open_on<'a>(
+    node: &str,
+    windows: &'a [WindowView],
+    now: Timestamp,
+) -> Option<&'a WindowView> {
     windows
         .iter()
         .filter(|w| w.node == node && w.is_open(now))
@@ -211,7 +219,11 @@ pub fn open_on<'a>(node: &str, windows: &'a [WindowView], now: Timestamp) -> Opt
 }
 
 /// The next window declared for this node, if any is still to come.
-pub fn next_on<'a>(node: &str, windows: &'a [WindowView], now: Timestamp) -> Option<&'a WindowView> {
+pub fn next_on<'a>(
+    node: &str,
+    windows: &'a [WindowView],
+    now: Timestamp,
+) -> Option<&'a WindowView> {
     windows
         .iter()
         .filter(|w| w.node == node && w.phase(now) == Phase::Upcoming)
@@ -362,12 +374,21 @@ mod tests {
         else {
             panic!("two windows were allowed to cover the same hour of the same node");
         };
-        assert!(other.ends_with("swap"), "the refusal did not name which one: {other}");
+        assert!(
+            other.ends_with("swap"),
+            "the refusal did not name which one: {other}"
+        );
 
         // Touching, not overlapping: one ends exactly as the other begins.
-        assert_eq!(may_declare(&window("after", "node-a", 120, 30), &existing, at(0)), Ok(()));
+        assert_eq!(
+            may_declare(&window("after", "node-a", 120, 30), &existing, at(0)),
+            Ok(())
+        );
         // Another node at the same hour is the ordinary case, not a conflict.
-        assert_eq!(may_declare(&window("swap-b", "node-b", 60, 60), &existing, at(0)), Ok(()));
+        assert_eq!(
+            may_declare(&window("swap-b", "node-b", 60, 60), &existing, at(0)),
+            Ok(())
+        );
         // Editing the window itself must not collide with itself.
         let mut same = window("swap", "node-a", 60, 90);
         same.note = "longer than we thought".into();
@@ -378,7 +399,10 @@ mod tests {
     #[test]
     fn a_window_that_is_over_does_not_stand_in_the_way_of_a_new_one() {
         let done = vec![window("last-week", "node-a", 0, 60)];
-        assert_eq!(may_declare(&window("today", "node-a", 630, 60), &done, at(600)), Ok(()));
+        assert_eq!(
+            may_declare(&window("today", "node-a", 630, 60), &done, at(600)),
+            Ok(())
+        );
     }
 
     #[test]
@@ -391,12 +415,19 @@ mod tests {
         ];
         let open = open_on("node-a", &windows, at(70)).unwrap();
         assert!(open.name.ends_with("now"));
-        assert!(open_on("node-a", &windows, at(45)).is_none(), "a gap read as maintenance");
+        assert!(
+            open_on("node-a", &windows, at(45)).is_none(),
+            "a gap read as maintenance"
+        );
 
         let next = next_on("node-a", &windows, at(70)).unwrap();
         assert!(next.name.ends_with("later"));
         assert_eq!(opens_in_minutes(next, at(70)), Some(530));
-        assert_eq!(opens_in_minutes(open, at(70)), None, "an open window still counts down");
+        assert_eq!(
+            opens_in_minutes(open, at(70)),
+            None,
+            "an open window still counts down"
+        );
     }
 
     /// What placement is handed: one row per node, carrying when it comes back.
@@ -436,7 +467,10 @@ mod tests {
         moving.drain = true;
 
         let windows = vec![quiet.clone(), moving];
-        assert!(!draining("node-a", &windows, at(65)), "a firmware window moved a fleet");
+        assert!(
+            !draining("node-a", &windows, at(65)),
+            "a firmware window moved a fleet"
+        );
         assert!(draining("node-b", &windows, at(65)));
         // And only while it is open. A window that closes puts everything back
         // by ceasing to be open, with nothing to unwind.

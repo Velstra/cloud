@@ -548,7 +548,9 @@ impl Storage for CephPool {
             return Err(e);
         }
         std::fs::rename(&partial, path).map_err(|e| {
-            HostError::failed(format!("{path} was exported and could not be moved into place: {e}"))
+            HostError::failed(format!(
+                "{path} was exported and could not be moved into place: {e}"
+            ))
         })?;
         std::fs::metadata(path)
             .map(|m| m.len())

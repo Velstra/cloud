@@ -158,9 +158,7 @@ pub trait CellReader: Send + Sync + 'static {
     /// and no reader has to grow one to compile.
     async fn device_classes(
         &self,
-    ) -> Result<
-        std::collections::BTreeMap<String, velstra_cloud_model::pci::DeviceClassSpec>,
-    > {
+    ) -> Result<std::collections::BTreeMap<String, velstra_cloud_model::pci::DeviceClassSpec>> {
         Ok(Default::default())
     }
 
@@ -173,9 +171,7 @@ pub trait CellReader: Send + Sync + 'static {
     }
 
     /// The places copies are kept, so a capture knows where to write.
-    async fn backup_targets(
-        &self,
-    ) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
+    async fn backup_targets(&self) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
         Ok(Vec::new())
     }
 
@@ -332,12 +328,13 @@ impl CellReader for StoreCell {
     }
 
     async fn captures(&self) -> Result<Vec<velstra_cloud_model::resources::Capture>> {
-        self.captures.list().await.map_err(|e| failed("captures", e))
+        self.captures
+            .list()
+            .await
+            .map_err(|e| failed("captures", e))
     }
 
-    async fn backup_targets(
-        &self,
-    ) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
+    async fn backup_targets(&self) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
         self.backup_targets
             .list()
             .await

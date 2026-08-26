@@ -811,12 +811,12 @@ whole_object_survives!(
     resources::NodeSpec {
         evacuate: false,
         vcpu_overcommit: 0,
-                fence_after_s: 0,
+        fence_after_s: 0,
         schedulable: false,
         labels: vec!["ssd".into()],
         cpu_baseline: None,
-                gateway: false,
-            },
+        gateway: false,
+    },
     resources::NodeStatus {
         pci_devices: Vec::new(),
         cpu: None,
@@ -928,9 +928,9 @@ whole_object_survives!(
     resources::NetworkSpec {
         vni: 5001,
         mtu: 1450,
-                external: false,
-                announce: Default::default(),
-            },
+        external: false,
+        announce: Default::default(),
+    },
     resources::NetworkStatus {
         observed_generation: 1,
         conditions: vec![a_condition()],
@@ -967,9 +967,9 @@ whole_object_survives!(
         // round-trip of the default proves only that nothing was written.
         address: Some("203.0.113.7".into()),
         port: "projects/p1/ports/web".into(),
-                delivery: Default::default(),
-                announce: None,
-            },
+        delivery: Default::default(),
+        announce: None,
+    },
     resources::FloatingIpStatus {
         observed_generation: 2,
         conditions: vec![a_condition()],

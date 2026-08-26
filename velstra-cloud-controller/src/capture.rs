@@ -186,7 +186,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        targets.create(&t, &Writer::controller("test")).await.unwrap();
+        targets
+            .create(&t, &Writer::controller("test"))
+            .await
+            .unwrap();
 
         let c: Capture = Resource::new(
             Meta::new(
@@ -207,7 +210,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        captures.create(&c, &Writer::controller("test")).await.unwrap();
+        captures
+            .create(&c, &Writer::controller("test"))
+            .await
+            .unwrap();
 
         let controller = CaptureController::new(images.clone(), targets);
         Fixture {
@@ -281,13 +287,30 @@ mod tests {
     #[tokio::test]
     async fn a_capture_still_being_made_produces_nothing() {
         let f = fixture(None).await;
-        let before = f.captures.get(CAPTURE).await.unwrap().unwrap().meta.revision;
+        let before = f
+            .captures
+            .get(CAPTURE)
+            .await
+            .unwrap()
+            .unwrap()
+            .meta
+            .revision;
 
         f.pass().await;
 
         assert!(f.image_names().await.is_empty());
-        let after = f.captures.get(CAPTURE).await.unwrap().unwrap().meta.revision;
-        assert_eq!(before, after, "a pass over an unfinished capture wrote something");
+        let after = f
+            .captures
+            .get(CAPTURE)
+            .await
+            .unwrap()
+            .unwrap()
+            .meta
+            .revision;
+        assert_eq!(
+            before, after,
+            "a pass over an unfinished capture wrote something"
+        );
     }
 
     /// Which image a capture became is *computed*, and the capture itself is
@@ -299,14 +322,24 @@ mod tests {
     #[tokio::test]
     async fn the_link_to_the_image_is_derived_and_the_capture_is_never_written() {
         let f = fixture(Some("sha256:abc123")).await;
-        let before = f.captures.get(CAPTURE).await.unwrap().unwrap().meta.revision;
+        let before = f
+            .captures
+            .get(CAPTURE)
+            .await
+            .unwrap()
+            .unwrap()
+            .meta
+            .revision;
 
         f.pass().await;
 
         let c = f.captures.get(CAPTURE).await.unwrap().unwrap();
         assert_eq!(c.meta.revision, before, "the controller wrote the capture");
         assert_eq!(
-            velstra_cloud_model::capture::image_id(&c.spec.label, c.status.digest.as_deref().unwrap()),
+            velstra_cloud_model::capture::image_id(
+                &c.spec.label,
+                c.status.digest.as_deref().unwrap()
+            ),
             "debian-13-golden-sha256-abc123",
         );
         assert!(

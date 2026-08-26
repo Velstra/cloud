@@ -836,7 +836,10 @@ async fn an_open_window_empties_a_machine_without_anybody_flipping_a_switch() {
     for _ in 0..6 {
         cell.turn_with(&[&node_b]).await;
     }
-    assert_eq!(cell.instance("i1").await.status.node.as_deref(), Some("node-a"));
+    assert_eq!(
+        cell.instance("i1").await.status.node.as_deref(),
+        Some("node-a")
+    );
     assert!(cell.vmm.is_running("projects/p1/instances/i1"));
 
     // Declared through the API, as an operator would — open now, and asking
@@ -867,7 +870,11 @@ async fn an_open_window_empties_a_machine_without_anybody_flipping_a_switch() {
         if i.status.node.as_deref() == Some("node-b") && i.status.state == InstanceState::Running {
             break;
         }
-        assert!(turn < 16, "the window opened and nothing moved: {:?}", i.status);
+        assert!(
+            turn < 16,
+            "the window opened and nothing moved: {:?}",
+            i.status
+        );
     }
 
     let moved = cell.instance("i1").await;
@@ -885,8 +892,14 @@ async fn an_open_window_empties_a_machine_without_anybody_flipping_a_switch() {
     // written. A window that closes therefore takes nothing of theirs with it,
     // and a controller that died half way through left nothing flipped.
     let node = cell.nodes.get("nodes/node-a").await.unwrap().unwrap();
-    assert!(!node.spec.evacuate, "a controller wrote the operator's own field");
-    assert!(node.spec.schedulable, "a controller drained the node behind their back");
+    assert!(
+        !node.spec.evacuate,
+        "a controller wrote the operator's own field"
+    );
+    assert!(
+        node.spec.schedulable,
+        "a controller drained the node behind their back"
+    );
 
     // And nothing comes back onto it while the window is open: an emptied
     // machine that the scheduler then fills again is a machine that never got

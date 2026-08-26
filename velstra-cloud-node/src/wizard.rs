@@ -555,7 +555,10 @@ pub(crate) fn validate_interface(s: &str) -> Result<()> {
     if s.len() > 15 {
         bail!("{s:?} is longer than the 15 characters an interface name can have");
     }
-    if let Some(c) = s.chars().find(|c| c.is_whitespace() || *c == '/' || *c == ':') {
+    if let Some(c) = s
+        .chars()
+        .find(|c| c.is_whitespace() || *c == '/' || *c == ':')
+    {
         bail!("{c:?} cannot appear in an interface name");
     }
     validate_safe_value(s)

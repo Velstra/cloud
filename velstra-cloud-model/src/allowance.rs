@@ -24,10 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    reconcile::Headroom,
-    resources::Quota,
-};
+use crate::{reconcile::Headroom, resources::Quota};
 
 /// One dimension of a quota, with both sides of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,7 +128,12 @@ pub struct Startable {
 
 /// Combine what the tenant may have with what the cell can give.
 pub fn largest_startable(dimensions: &[Dimension], room: &Headroom) -> Startable {
-    let left = |name: &str| dimensions.iter().find(|d| d.name == name).and_then(Dimension::left);
+    let left = |name: &str| {
+        dimensions
+            .iter()
+            .find(|d| d.name == name)
+            .and_then(Dimension::left)
+    };
     let pick = |quota: Option<u64>, cell: u64| -> (u64, LimitedBy) {
         // No limit set: the machines are the only thing in the way, and saying
         // "your quota" here would send a tenant asking for allowance they
@@ -204,7 +206,10 @@ mod tests {
         let devices = d.iter().find(|d| d.name == "devices").unwrap();
         assert!(devices.unlimited());
         assert_eq!(devices.left(), None);
-        assert!(!devices.exhausted(), "an unset limit read as an exhausted one");
+        assert!(
+            !devices.exhausted(),
+            "an unset limit read as an exhausted one"
+        );
 
         // Every dimension is present whether or not it is in use: a screen that
         // showed only the interesting ones would rearrange itself between two
@@ -263,7 +268,10 @@ mod tests {
     fn a_project_at_its_instance_count_can_start_nothing_at_all() {
         let d = dimensions(&quota(3, 40, 65_536), &quota(3, 4, 4096));
         let out = largest_startable(&d, &room(64, 262_144));
-        assert!(out.none, "a project that may not create another guest looked ready to");
+        assert!(
+            out.none,
+            "a project that may not create another guest looked ready to"
+        );
         // The numbers are still reported: an operator raising the count wants
         // to know what it will be able to start afterwards.
         assert_eq!(out.vcpus, 36);
@@ -277,7 +285,10 @@ mod tests {
         assert_eq!(out.vcpus, 64);
         assert_eq!(out.vcpus_limited_by, LimitedBy::Cell);
         assert_eq!(out.memory_limited_by, LimitedBy::Cell);
-        assert!(!out.none, "a project with no quota looked like one that may start nothing");
+        assert!(
+            !out.none,
+            "a project with no quota looked like one that may start nothing"
+        );
     }
 
     /// An empty cell is "nothing can start", not "36 vCPUs available".

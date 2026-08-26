@@ -50,10 +50,7 @@ pub fn observe(held: &std::collections::BTreeMap<String, String>) -> Vec<PciDevi
     read_from(Path::new(SYSFS_PCI), held)
 }
 
-fn read_from(
-    root: &Path,
-    held: &std::collections::BTreeMap<String, String>,
-) -> Vec<PciDevice> {
+fn read_from(root: &Path, held: &std::collections::BTreeMap<String, String>) -> Vec<PciDevice> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -176,11 +173,11 @@ pub fn iommu_enabled() -> bool {
         .unwrap_or(false)
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{collections::BTreeMap, path::PathBuf};
+
+    use super::*;
 
     /// Build a fake `/sys/bus/pci/devices`.
     ///
@@ -376,10 +373,7 @@ mod tests {
             .into_iter()
             .map(|d| d.address)
             .collect();
-        assert_eq!(
-            addresses,
-            ["0000:41:00.0", "0000:41:00.1", "0000:81:00.0"]
-        );
+        assert_eq!(addresses, ["0000:41:00.0", "0000:41:00.1", "0000:81:00.0"]);
         assert_eq!(fs.read(&BTreeMap::new()), fs.read(&BTreeMap::new()));
     }
 }

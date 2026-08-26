@@ -99,7 +99,11 @@ impl Reconciler for SnapshotScheduleController {
         "snapshot-schedule"
     }
 
-    async fn reconcile(&self, name: &str, object: Option<&Resource<Self::Spec, Self::Status>>) -> Result<()> {
+    async fn reconcile(
+        &self,
+        name: &str,
+        object: Option<&Resource<Self::Spec, Self::Status>>,
+    ) -> Result<()> {
         let Some(schedule) = object else {
             return Ok(());
         };
@@ -146,7 +150,11 @@ impl Reconciler for SnapshotScheduleController {
                 },
                 SnapshotStatus::default(),
             );
-            match self.snapshots.create(&asked, &Writer::controller(WHO)).await {
+            match self
+                .snapshots
+                .create(&asked, &Writer::controller(WHO))
+                .await
+            {
                 Ok(_) => info!(schedule = %name, snapshot = %full, "asked for a snapshot"),
                 Err(e) if is_taken(&e) => {}
                 Err(e) => return Err(e.into()),
@@ -241,7 +249,10 @@ mod tests {
             },
             VolumeStatus::default(),
         );
-        volumes.create(&v, &Writer::controller("test")).await.unwrap();
+        volumes
+            .create(&v, &Writer::controller("test"))
+            .await
+            .unwrap();
 
         let s: Resource<SnapshotScheduleSpec, SnapshotScheduleStatus> = Resource::new(
             Meta::new(
@@ -255,7 +266,10 @@ mod tests {
             },
             SnapshotScheduleStatus::default(),
         );
-        schedules.create(&s, &Writer::controller("test")).await.unwrap();
+        schedules
+            .create(&s, &Writer::controller("test"))
+            .await
+            .unwrap();
 
         // Anchored to real time: `due` compares against `meta.created_at`,
         // which the store stamps with its own clock, and the two have to be

@@ -34,7 +34,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -465,8 +468,6 @@ impl Agent {
         }
     }
 
-
-
     /// Which devices this guest is to be given.
     ///
     /// **Already-held devices win.** A guest that is running was assigned
@@ -511,7 +512,6 @@ impl Agent {
             }
         }
     }
-
 
     /// Stop every guest on this machine, because nobody has heard from it.
     ///
@@ -568,7 +568,6 @@ impl Agent {
         }
     }
 
-
     /// Whether this guest may start yet, given the rest of this node.
     ///
     /// Built here because the question is about the machine, not the guest: it
@@ -593,12 +592,20 @@ impl Agent {
             return StartGate::Go;
         }
 
-        let here = instance.status.node.clone().or_else(|| instance.spec.node.clone());
+        let here = instance
+            .status
+            .node
+            .clone()
+            .or_else(|| instance.spec.node.clone());
         let peers: Vec<StartPeer> = all
             .iter()
             .filter(|other| other.meta.name != instance.meta.name)
             .filter(|other| {
-                let theirs = other.status.node.clone().or_else(|| other.spec.node.clone());
+                let theirs = other
+                    .status
+                    .node
+                    .clone()
+                    .or_else(|| other.spec.node.clone());
                 theirs.is_some() && theirs == here
             })
             .filter(|other| !other.meta.is_deleting())
@@ -1083,7 +1090,10 @@ impl Agent {
 
             let mut failed = None;
             for action in &work {
-                match self.perform_instance(action, stored, &taps, cell, &host).await {
+                match self
+                    .perform_instance(action, stored, &taps, cell, &host)
+                    .await
+                {
                     Ok(()) => pass.actions += 1,
                     Err(why) => {
                         // The order in `reconcile_instance` is load-bearing, so
@@ -1449,8 +1459,14 @@ impl Agent {
         if let Err(why) =
             velstra_cloud_model::capture::may_capture(&view, usable, &capture.spec.target)
         {
-            self.say_about_capture(capture, ConditionStatus::False, "Refused", &why.to_string(), pass)
-                .await;
+            self.say_about_capture(
+                capture,
+                ConditionStatus::False,
+                "Refused",
+                &why.to_string(),
+                pass,
+            )
+            .await;
             return;
         }
         let Some(target) = target else { return };
@@ -1483,8 +1499,14 @@ impl Agent {
         if let Err(e) = tokio::fs::copy(&from, &staging).await {
             tracing::warn!(capture = %name, error = %e, "the disk could not be copied out");
             pass.failures += 1;
-            self.say_about_capture(capture, ConditionStatus::False, "CopyFailed", &e.to_string(), pass)
-                .await;
+            self.say_about_capture(
+                capture,
+                ConditionStatus::False,
+                "CopyFailed",
+                &e.to_string(),
+                pass,
+            )
+            .await;
             return;
         }
         let digest = match crate::hostfs::sha256_file(std::path::Path::new(&staging)).await {

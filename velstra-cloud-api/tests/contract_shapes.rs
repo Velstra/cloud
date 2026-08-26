@@ -241,10 +241,7 @@ async fn seed(h: &Harness) {
                 ..Default::default()
             },
         );
-        velstra_cloud_model::meta::set_condition(
-            &mut node.status.conditions,
-            Condition::ready(1),
-        );
+        velstra_cloud_model::meta::set_condition(&mut node.status.conditions, Condition::ready(1));
         nodes
             // A controller, because only an agent's *status* is its own — a
             // node object is registered by the cell.

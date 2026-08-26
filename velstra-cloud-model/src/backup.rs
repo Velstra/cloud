@@ -298,11 +298,7 @@ pub struct TargetView {
 /// Answered before anything is created, because every one of these is knowable
 /// in advance — and a backup that fails after reading a terabyte has cost real
 /// time to tell somebody something that was true before it started.
-pub fn may_back_up(
-    volume: &str,
-    volume_pool: &str,
-    target: &TargetView,
-) -> Result<(), Refusal> {
+pub fn may_back_up(volume: &str, volume_pool: &str, target: &TargetView) -> Result<(), Refusal> {
     if target.same_pool_as.as_deref() == Some(volume_pool) {
         return Err(Refusal::SameAsSource {
             volume: volume.to_string(),
@@ -454,11 +450,7 @@ pub struct CopyView {
 ///
 /// `every_hours == 0` verifies nothing and is the default; see
 /// [`BackupTargetSpec::verify_every_hours`].
-pub fn next_to_verify(
-    every_hours: u32,
-    copies: &[CopyView],
-    now: Timestamp,
-) -> Option<String> {
+pub fn next_to_verify(every_hours: u32, copies: &[CopyView], now: Timestamp) -> Option<String> {
     if every_hours == 0 {
         return None;
     }
@@ -691,7 +683,10 @@ mod tests {
             made("b1", Some("s"), true, 10 * HOUR),
             made("b2", Some("s"), true, 30 * HOUR),
         ];
-        assert_eq!(next_due(daily().every_hours, "s", &mine), Some(Timestamp(54 * HOUR)));
+        assert_eq!(
+            next_due(daily().every_hours, "s", &mine),
+            Some(Timestamp(54 * HOUR))
+        );
         // Nothing yet: no answer rather than one invented from the schedule's
         // own creation time.
         assert_eq!(next_due(daily().every_hours, "s", &[]), None);
@@ -736,7 +731,10 @@ mod tests {
             // Read back 40h ago.
             copy("middling", 1, Some(60)),
         ];
-        assert_eq!(next_to_verify(24, &copies, now).as_deref(), Some("never-read"));
+        assert_eq!(
+            next_to_verify(24, &copies, now).as_deref(),
+            Some("never-read")
+        );
     }
 
     /// A copy that was just written is not read straight back. The interval is

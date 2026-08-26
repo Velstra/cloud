@@ -354,8 +354,6 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
     }
 }
 
-
-
 impl From<&resources::RunningSize> for v1::RunningSize {
     fn from(s: &resources::RunningSize) -> Self {
         Self {

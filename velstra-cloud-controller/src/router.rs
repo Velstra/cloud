@@ -326,10 +326,12 @@ mod tests {
         nets.create(
             &Resource::new(
                 meta(&format!("projects/p1/networks/{id}")),
-                NetworkSpec { vni, mtu: 1500,
-                external: false,
-                announce: Default::default(),
-            },
+                NetworkSpec {
+                    vni,
+                    mtu: 1500,
+                    external: false,
+                    announce: Default::default(),
+                },
                 NetworkStatus::default(),
             ),
             &velstra_cloud_model::access::Writer::controller("router"),

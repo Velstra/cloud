@@ -233,8 +233,9 @@ impl Agent {
                 Default::default()
             }
         };
-        self.guests
-            .replace(guests::derive(mine, ports, &subnets, &networks, taps, &public));
+        self.guests.replace(guests::derive(
+            mine, ports, &subnets, &networks, taps, &public,
+        ));
     }
 
     /// A collection this node only reads, keyed by name. An unreadable one is a

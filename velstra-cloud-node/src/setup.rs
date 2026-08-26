@@ -35,7 +35,11 @@
 //! cell's external traffic. The wizard says where they are set instead of
 //! pretending.
 
-use std::{fs, os::unix::fs::PermissionsExt, path::{Path, PathBuf}};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -127,10 +131,7 @@ pub fn render(m: &Machine) -> String {
         out.push_str(&format!("VELSTRA_API_URL={}\n", m.api_url));
     }
     if m.roles.contains(&Role::Hypervisor) {
-        out.push_str(&format!(
-            "VELSTRA_NODE={}\nVELSTRA_VMM={}\n",
-            m.node, m.vmm
-        ));
+        out.push_str(&format!("VELSTRA_NODE={}\nVELSTRA_VMM={}\n", m.node, m.vmm));
     }
     if m.roles.contains(&Role::Pool) {
         out.push_str(&format!(
@@ -200,7 +201,9 @@ pub fn parse(text: &str) -> Result<Machine> {
 
     let roles = crate::roles::parse_list(&need("VELSTRA_ROLES")?);
     if roles.is_empty() {
-        bail!("VELSTRA_ROLES names no role this version knows — one of control-plane, hypervisor, pool");
+        bail!(
+            "VELSTRA_ROLES names no role this version knows — one of control-plane, hypervisor, pool"
+        );
     }
     let mut m = Machine {
         region: or("VELSTRA_REGION", "eu-central"),
@@ -215,7 +218,12 @@ pub fn parse(text: &str) -> Result<Machine> {
         store: or("VELSTRA_STORE", "127.0.0.1:2379"),
         cells: values
             .get("VELSTRA_CELLS")
-            .map(|v| v.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect())
+            .map(|v| {
+                v.split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default(),
         fabric: None,
     };
@@ -285,8 +293,8 @@ pub fn run_with(
     let dir = dir.unwrap_or_else(|| PathBuf::from(SEED_DIR));
     let machine = match &config {
         Some(path) => {
-            let text = fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
+            let text =
+                fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
             // The token is the one answer a file should not have to carry: it
             // is a secret, and a file with a secret in it is a file somebody
             // copies. It may be there — automation that already holds one has
@@ -330,9 +338,7 @@ pub fn run_with(
         }
     }
     if machine.roles.contains(&Role::Hypervisor) {
-        println!(
-            "\nThis machine cannot mark itself a gateway, give itself labels, or make itself"
-        );
+        println!("\nThis machine cannot mark itself a gateway, give itself labels, or make itself");
         println!("schedulable — those are the cell's answer about it, not its own. Set them on");
         println!("the node object: PATCH /api/v1/nodes/{}", machine.node);
     }
@@ -438,7 +444,11 @@ fn collect() -> Result<Option<Machine>> {
 
     let roles = loop {
         let raw = prompt("Roles, space-separated [2]: ")?;
-        let raw = if raw.trim().is_empty() { "2".to_string() } else { raw };
+        let raw = if raw.trim().is_empty() {
+            "2".to_string()
+        } else {
+            raw
+        };
         match resolve_roles(raw.trim()) {
             Ok(roles) => break roles,
             Err(e) => println!("  {e}"),
@@ -495,7 +505,11 @@ fn collect() -> Result<Option<Machine>> {
 
     if roles.contains(&Role::Pool) {
         println!("\nThe pool id has to match the pool object; every volume is written against it.");
-        m.pool = ask_valid("Pool id: ", validate_node_name, "lowercase letters, digits and '-'")?;
+        m.pool = ask_valid(
+            "Pool id: ",
+            validate_node_name,
+            "lowercase letters, digits and '-'",
+        )?;
         m.pool_backend = loop {
             match prompt("Backend [1] directory  [2] ceph: ")?.trim() {
                 "" | "1" => break "directory".to_string(),
@@ -506,15 +520,17 @@ fn collect() -> Result<Option<Machine>> {
     }
 
     if roles.contains(&Role::ControlPlane) {
-        m.store = prompt("\nStore endpoints [127.0.0.1:2379]: ")
-            .map(|s| if s.trim().is_empty() { "127.0.0.1:2379".into() } else { s.trim().to_string() })?;
+        m.store = prompt("\nStore endpoints [127.0.0.1:2379]: ").map(|s| {
+            if s.trim().is_empty() {
+                "127.0.0.1:2379".into()
+            } else {
+                s.trim().to_string()
+            }
+        })?;
         println!("\nOther cells this address should answer for, as `cell=url` pairs,");
         println!("space-separated. Leave empty for a single-cell installation.");
         let raw = prompt("Other cells: ")?;
-        m.cells = raw
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        m.cells = raw.split_whitespace().map(str::to_string).collect();
         for pair in &m.cells {
             if !pair.contains('=') {
                 bail!("{pair:?} is not cell=url");
@@ -647,13 +663,19 @@ mod tests {
     #[test]
     fn a_seed_carries_the_roles_answers_and_no_others() {
         let rendered = render(&hypervisor());
-        assert!(rendered.contains("VELSTRA_ROLES=hypervisor\n"), "{rendered}");
+        assert!(
+            rendered.contains("VELSTRA_ROLES=hypervisor\n"),
+            "{rendered}"
+        );
         assert!(rendered.contains("VELSTRA_NODE=node-a\n"), "{rendered}");
         assert!(!rendered.contains("VELSTRA_POOL"), "{rendered}");
         assert!(!rendered.contains("VELSTRA_STORE"), "{rendered}");
         // The token is never in the seed: it is the one secret here and it gets
         // its own file with its own mode.
-        assert!(!rendered.contains(&"a".repeat(64)), "the token is in a world-readable file");
+        assert!(
+            !rendered.contains(&"a".repeat(64)),
+            "the token is in a world-readable file"
+        );
     }
 
     #[test]
@@ -694,7 +716,10 @@ mod tests {
         m.cells = vec!["cell-2=https://cell-2:8443".into()];
         let snippet = nix_snippet(&m);
         assert!(snippet.contains("controlPlane = {"), "{snippet}");
-        assert!(snippet.contains("\"cell-2\" = \"https://cell-2:8443\";"), "{snippet}");
+        assert!(
+            snippet.contains("\"cell-2\" = \"https://cell-2:8443\";"),
+            "{snippet}"
+        );
         assert!(snippet.contains("pool = {"), "{snippet}");
         assert!(snippet.contains("id = \"nvme\";"), "{snippet}");
         // Not a hypervisor, so no node module — a snippet that enabled every
@@ -733,7 +758,12 @@ mod tests {
 
         // And a pool needs its own id for the same reason.
         let pool = "VELSTRA_ROLES=pool\nVELSTRA_API_URL=https://c:8443\n";
-        assert!(parse(pool).unwrap_err().to_string().contains("VELSTRA_POOL"));
+        assert!(
+            parse(pool)
+                .unwrap_err()
+                .to_string()
+                .contains("VELSTRA_POOL")
+        );
     }
 
     /// A file for a control plane needs no URL to the API: it is the API.
@@ -759,7 +789,9 @@ mod tests {
 
     #[test]
     fn a_line_that_is_not_a_setting_says_which_line() {
-        let why = parse("VELSTRA_ROLES=pool\nnonsense\n").unwrap_err().to_string();
+        let why = parse("VELSTRA_ROLES=pool\nnonsense\n")
+            .unwrap_err()
+            .to_string();
         assert!(why.contains("line 2"), "{why}");
     }
 
@@ -782,10 +814,22 @@ mod tests {
         let mut m = hypervisor();
         m.fabric = Some(fabric());
         let rendered = render(&m);
-        assert!(rendered.contains("VELSTRA_FABRIC=http://fab:50052\n"), "{rendered}");
-        assert!(rendered.contains("VELSTRA_FABRIC_CONTROL=http://fab:50051\n"), "{rendered}");
-        assert!(rendered.contains("VELSTRA_FABRIC_VTEP=10.0.0.7\n"), "{rendered}");
-        assert!(rendered.contains("VELSTRA_FABRIC_UNDERLAY=eth1\n"), "{rendered}");
+        assert!(
+            rendered.contains("VELSTRA_FABRIC=http://fab:50052\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("VELSTRA_FABRIC_CONTROL=http://fab:50051\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("VELSTRA_FABRIC_VTEP=10.0.0.7\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("VELSTRA_FABRIC_UNDERLAY=eth1\n"),
+            "{rendered}"
+        );
         // Not asked, so not written — an empty locator would read as a decision.
         assert!(!rendered.contains("SRV6_LOCATOR"), "{rendered}");
 
@@ -793,7 +837,10 @@ mod tests {
         cp.roles = vec![Role::ControlPlane];
         cp.fabric = Some(fabric());
         let rendered = render(&cp);
-        assert!(rendered.contains("VELSTRA_FABRIC=http://fab:50052\n"), "{rendered}");
+        assert!(
+            rendered.contains("VELSTRA_FABRIC=http://fab:50052\n"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("VELSTRA_FABRIC_VTEP"), "{rendered}");
     }
 
@@ -837,7 +884,8 @@ mod tests {
     /// before the overlay existed, and it must not become an error.
     #[test]
     fn a_cell_with_no_fabric_is_still_a_cell() {
-        let text = "VELSTRA_ROLES=hypervisor\nVELSTRA_API_URL=https://c:8443\nVELSTRA_NODE=node-a\n";
+        let text =
+            "VELSTRA_ROLES=hypervisor\nVELSTRA_API_URL=https://c:8443\nVELSTRA_NODE=node-a\n";
         assert_eq!(parse(text).unwrap().fabric, None);
     }
 }

@@ -26,7 +26,9 @@
 use tracing::info;
 use velstra_cloud_model::{
     access::Writer,
-    backup::{self, BackupScheduleSpec, BackupScheduleStatus, BackupSpec, BackupStatus, BackupView},
+    backup::{
+        self, BackupScheduleSpec, BackupScheduleStatus, BackupSpec, BackupStatus, BackupView,
+    },
     meta::{Meta, ResourceName, Timestamp},
     resources::{Backup, BackupSchedule, Resource},
 };
@@ -79,10 +81,7 @@ impl BackupScheduleController {
     }
 
     /// Drive this controller from a clock the caller owns.
-    pub fn with_clock(
-        mut self,
-        now: impl Fn() -> Timestamp + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_clock(mut self, now: impl Fn() -> Timestamp + Send + Sync + 'static) -> Self {
         self.now = std::sync::Arc::new(now);
         self
     }
@@ -239,7 +238,10 @@ fn is_gone(e: &velstra_cloud_store::typed::TypedError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use velstra_cloud_model::{
         meta::{Meta, Placement, ResourceName},
@@ -295,7 +297,10 @@ mod tests {
             },
             velstra_cloud_model::resources::VolumeStatus::default(),
         );
-        volumes.create(&v, &Writer::controller("test")).await.unwrap();
+        volumes
+            .create(&v, &Writer::controller("test"))
+            .await
+            .unwrap();
 
         let s: BackupSchedule = Resource::new(
             Meta::new(
@@ -319,7 +324,7 @@ mod tests {
         let now = Arc::new(AtomicU64::new(base));
         let reading = now.clone();
         let controller = BackupScheduleController::new(backups.clone(), volumes)
-                .with_clock(move || Timestamp(reading.load(Ordering::Relaxed)));
+            .with_clock(move || Timestamp(reading.load(Ordering::Relaxed)));
         Fixture {
             schedules,
             backups,
@@ -422,7 +427,11 @@ mod tests {
         // stopping backups forever.
         f.after(25);
         f.pass().await;
-        assert_eq!(f.names().await.len(), 2, "a stuck copy blocked the schedule");
+        assert_eq!(
+            f.names().await.len(),
+            2,
+            "a stuck copy blocked the schedule"
+        );
     }
 
     /// Retention expires the oldest finished copies and never the newest.
@@ -451,7 +460,10 @@ mod tests {
         // The two newest, by the moment they were taken.
         assert!(left.iter().all(|n| n.starts_with("nightly-")), "{left:?}");
         let newest = format!("nightly-{}", f.stamp(3 * 24));
-        assert!(left.contains(&newest), "the newest copy was expired: {left:?}");
+        assert!(
+            left.contains(&newest),
+            "the newest copy was expired: {left:?}"
+        );
     }
 
     /// A run of failures does not expire the last copy that worked.

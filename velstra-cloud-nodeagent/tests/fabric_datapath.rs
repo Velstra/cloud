@@ -148,10 +148,7 @@ impl Fabric {
         let _ = std::process::Command::new("ip")
             .args(["link", "set", "lo", "up"])
             .status();
-        let dir = std::env::temp_dir().join(format!(
-            "velstra-fab-{}-{base}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("velstra-fab-{}-{base}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
         let (listen, admin, raft) = (base, base + 1, base + 2);
@@ -254,7 +251,7 @@ async fn a_port_with_rules_reaches_the_fabric() {
             subnet: "10.20.0.0/24".into(),
             default_action: pb::Action::Drop as i32,
             drop_icmp: false,
-            })
+        })
         .await
         .expect("declaring the network");
 
@@ -570,7 +567,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
             subnet: "10.30.0.0/24".into(),
             default_action: pb::Action::Drop as i32,
             drop_icmp: false,
-            })
+        })
         .await
         .expect("declaring the network");
 
@@ -703,7 +700,7 @@ async fn a_node_that_states_a_locator_is_served_an_srv6_overlay() {
             subnet: "10.40.0.0/24".into(),
             default_action: pb::Action::Drop as i32,
             drop_icmp: false,
-            })
+        })
         .await
         .expect("declaring the network");
 

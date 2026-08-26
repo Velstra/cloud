@@ -101,10 +101,7 @@ impl fmt::Display for Role {
 /// re-reads: a set that came back in a different order every time would make
 /// every seed look changed to anything comparing them.
 pub fn parse_list(text: &str) -> Vec<Role> {
-    let mut out: Vec<Role> = text
-        .split(',')
-        .filter_map(Role::parse)
-        .collect();
+    let mut out: Vec<Role> = text.split(',').filter_map(Role::parse).collect();
     out.sort();
     out.dedup();
     out
@@ -145,8 +142,8 @@ pub fn roles_of_seed(seed: &str) -> Vec<Role> {
 /// "no", not an error: a machine with no seed has no roles, which is exactly
 /// what a freshly unpacked package looks like.
 pub fn has_role_or_exit(role: &str) -> anyhow::Result<()> {
-    let seed = std::fs::read_to_string(format!("{}/node.env", crate::setup::SEED_DIR))
-        .unwrap_or_default();
+    let seed =
+        std::fs::read_to_string(format!("{}/node.env", crate::setup::SEED_DIR)).unwrap_or_default();
     if has_role(&seed, role)? {
         std::process::exit(0);
     }
@@ -193,7 +190,10 @@ mod tests {
         assert_eq!(render_list(&parsed), "hypervisor,pool");
         // Whatever order they were written in, the file reads the same — a set
         // that reordered itself would make every seed look changed.
-        assert_eq!(render_list(&parse_list("pool,hypervisor")), "hypervisor,pool");
+        assert_eq!(
+            render_list(&parse_list("pool,hypervisor")),
+            "hypervisor,pool"
+        );
     }
 
     #[test]

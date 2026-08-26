@@ -680,10 +680,17 @@ async fn answer(
 ///
 /// The disk is not on the command line as a size — it is a file — so it is
 /// read from the file instead, by the caller.
-fn running_size(command: &str, disk_gib: u64) -> Option<velstra_cloud_model::resources::RunningSize> {
+fn running_size(
+    command: &str,
+    disk_gib: u64,
+) -> Option<velstra_cloud_model::resources::RunningSize> {
     let words: Vec<&str> = command.split_whitespace().collect();
     let after = |flag: &str| -> Option<&str> {
-        words.iter().position(|w| *w == flag).and_then(|at| words.get(at + 1)).copied()
+        words
+            .iter()
+            .position(|w| *w == flag)
+            .and_then(|at| words.get(at + 1))
+            .copied()
     };
     Some(velstra_cloud_model::resources::RunningSize {
         vcpus: after("-smp")?.split(',').next()?.parse().ok()?,
@@ -985,7 +992,10 @@ mod tests {
             Path::new("/run/qmp.sock"),
             None,
         ));
-        let at = args.iter().position(|a| a == "-cpu").expect("no -cpu given");
+        let at = args
+            .iter()
+            .position(|a| a == "-cpu")
+            .expect("no -cpu given");
         assert_eq!(args[at + 1], "host");
     }
 
@@ -1000,10 +1010,12 @@ mod tests {
         let mut r = request();
         r.cpu_baseline = Some(velstra_cloud_model::cpu::CpuLevel::V3);
         let args = words(&qemu_args(&layout(), &r, Path::new("/run/qmp.sock"), None));
-        let at = args.iter().position(|a| a == "-cpu").expect("no -cpu given");
+        let at = args
+            .iter()
+            .position(|a| a == "-cpu")
+            .expect("no -cpu given");
         assert_eq!(args[at + 1], "x86-64-v3,enforce");
     }
-
 
     /// A passed-through device reaches the command line, and reads back off it.
     ///

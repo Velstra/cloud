@@ -170,7 +170,10 @@ impl Copies {
             .targets
             .iter()
             .find(|t| t.meta.name.to_string() == backup.spec.target)?;
-        Some(backup_path(&target.spec.path, &backup.meta.name.to_string()))
+        Some(backup_path(
+            &target.spec.path,
+            &backup.meta.name.to_string(),
+        ))
     }
 }
 
@@ -1643,7 +1646,12 @@ mod tests {
         }
 
         /// A copy somebody asked for, as the API stores it.
-        async fn backup(&self, id: &str, pool: &str, target: &str) -> velstra_cloud_model::resources::Backup {
+        async fn backup(
+            &self,
+            id: &str,
+            pool: &str,
+            target: &str,
+        ) -> velstra_cloud_model::resources::Backup {
             let b: velstra_cloud_model::resources::Backup = Resource::new(
                 Meta::new(
                     ResourceName::parse(&format!("projects/p1/backups/{id}")).unwrap(),
@@ -1769,7 +1777,11 @@ mod tests {
         }
 
         async fn reload_pool(&self, id: &str) -> Pool {
-            self.pools.get(&format!("pools/{id}")).await.unwrap().unwrap()
+            self.pools
+                .get(&format!("pools/{id}"))
+                .await
+                .unwrap()
+                .unwrap()
         }
 
         async fn reload(&self) -> Volume {
@@ -2103,12 +2115,18 @@ mod tests {
         // fencing and recovery read a node's (`ha.rs`), and the only reader here
         // is a person, for whom "heard two seconds ago, and it says its backend
         // is unreachable" beats "not heard from in ten minutes".
-        assert_eq!(pass.reports, 1, "an unreadable backend said nothing anywhere");
+        assert_eq!(
+            pass.reports, 1,
+            "an unreadable backend said nothing anywhere"
+        );
         let pool = cell.reload_pool("pool-a").await;
         let ready = ready_condition(&pool.status.conditions);
         assert_eq!(ready.status, ConditionStatus::False, "{ready:?}");
         assert_eq!(ready.reason, "BackendUnreachable", "{ready:?}");
-        assert!(ready.message.contains("the array is not answering"), "{ready:?}");
+        assert!(
+            ready.message.contains("the array is not answering"),
+            "{ready:?}"
+        );
         // And the volume was not touched: one backend being down is one fact,
         // written once, not onto every object that depends on it.
         let v = cell.reload().await;
@@ -2424,7 +2442,10 @@ mod tests {
         );
 
         let backup = cell.reload_backup("b1").await;
-        assert!(!backup.status.taken, "a copy was reported onto a target that is not there");
+        assert!(
+            !backup.status.taken,
+            "a copy was reported onto a target that is not there"
+        );
     }
 
     /// A target that is not accepting is refused, and the reason is on the
@@ -2454,7 +2475,10 @@ mod tests {
         );
         assert!(
             cell.fake
-                .copied_out(&backup_path(&cell.target_dir("archive", true), "projects/p1/backups/b1"))
+                .copied_out(&backup_path(
+                    &cell.target_dir("archive", true),
+                    "projects/p1/backups/b1"
+                ))
                 .is_none(),
             "bytes were written to a target that is not accepting"
         );
@@ -2475,7 +2499,10 @@ mod tests {
             agent.resync().await;
         }
         let after = cell.reload_backup("b1").await;
-        assert!(!after.status.taken, "a copy that failed was reported as made");
+        assert!(
+            !after.status.taken,
+            "a copy that failed was reported as made"
+        );
         let ready = velstra_cloud_model::meta::condition(&after.status.conditions, "Ready")
             .expect("a backup that failed says why");
         assert!(ready.message.contains("filled up"), "{}", ready.message);
@@ -2495,7 +2522,8 @@ mod tests {
         }
         assert!(cell.reload_backup("b1").await.status.taken);
 
-        cell.restored("restored", "nvme", "projects/p1/backups/b1").await;
+        cell.restored("restored", "nvme", "projects/p1/backups/b1")
+            .await;
         for _ in 0..3 {
             agent.resync().await;
         }
@@ -2504,7 +2532,10 @@ mod tests {
         assert!(volume.status.provisioned, "the restore never happened");
         assert_eq!(
             cell.fake.restored_from("projects/p1/volumes/restored"),
-            Some(backup_path(&cell.target_dir("archive", true), "projects/p1/backups/b1")),
+            Some(backup_path(
+                &cell.target_dir("archive", true),
+                "projects/p1/backups/b1"
+            )),
             "the volume was made from something other than the copy it named"
         );
     }
@@ -2522,7 +2553,8 @@ mod tests {
         // Asked for, never taken — the schedule has not run, or the copy
         // failed.
         cell.backup("b1", "nvme", "archive").await;
-        cell.restored("restored", "nvme", "projects/p1/backups/b1").await;
+        cell.restored("restored", "nvme", "projects/p1/backups/b1")
+            .await;
 
         for _ in 0..2 {
             agent.resync().await;
@@ -2559,9 +2591,7 @@ mod tests {
     }
 
     /// The `Ready` condition an object is carrying.
-    fn ready_condition(
-        conditions: &[Condition],
-    ) -> &Condition {
+    fn ready_condition(conditions: &[Condition]) -> &Condition {
         conditions
             .iter()
             .find(|c| c.kind == "Ready")
@@ -2640,11 +2670,17 @@ mod tests {
         agent.resync().await;
 
         let bad = cell.reload_backup("b1").await;
-        let why = bad.status.verify_error.expect("the corruption went unnoticed");
+        let why = bad
+            .status
+            .verify_error
+            .expect("the corruption went unnoticed");
         assert!(why.contains("no longer matches"), "{why}");
         // It says what a restore from it would actually mean, because that is
         // the decision the reader has to make.
-        assert!(why.contains("would not be the volume it was made from"), "{why}");
+        assert!(
+            why.contains("would not be the volume it was made from"),
+            "{why}"
+        );
         let ready = ready_condition(&bad.status.conditions);
         assert_eq!(ready.status, ConditionStatus::False, "{ready:?}");
         assert_eq!(ready.reason, "DigestMismatch", "{ready:?}");
@@ -2670,7 +2706,10 @@ mod tests {
         agent.resync().await;
 
         let gone = cell.reload_backup("b1").await;
-        let why = gone.status.verify_error.expect("a missing copy went unnoticed");
+        let why = gone
+            .status
+            .verify_error
+            .expect("a missing copy went unnoticed");
         assert!(why.contains("could not be read back"), "{why}");
         assert_eq!(
             ready_condition(&gone.status.conditions).reason,
@@ -2690,9 +2729,15 @@ mod tests {
         agent.resync().await;
 
         let old = cell.reload_backup("b1").await;
-        let why = old.status.verify_error.expect("it claimed to have checked something");
+        let why = old
+            .status
+            .verify_error
+            .expect("it claimed to have checked something");
         assert!(why.contains("proves nothing"), "{why}");
-        assert!(old.status.verified_at.is_none(), "it recorded a check it did not do");
+        assert!(
+            old.status.verified_at.is_none(),
+            "it recorded a check it did not do"
+        );
         let ready = ready_condition(&old.status.conditions);
         // The copy is here and restorable; what is unknown is whether it is
         // intact. That is not a broken backup, so `Ready` stays true.

@@ -1411,5 +1411,4 @@ mod tests {
         assert!(size_of(r#"{"config":{"cpus":{"boot_vcpus":4}}}"#, 40).is_none());
         assert!(size_of("not json at all", 40).is_none());
     }
-
 }

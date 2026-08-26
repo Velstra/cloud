@@ -205,7 +205,9 @@ pub enum Silent {
     NoGateway,
     /// The address is translated at the edge, so there is no /32 to announce —
     /// the edge answers for it as part of whatever range it already holds.
-    #[error("a translated address is answered for at the edge, not announced as a route of its own")]
+    #[error(
+        "a translated address is answered for at the edge, not announced as a route of its own"
+    )]
     Translated,
 }
 
@@ -317,8 +319,7 @@ mod tests {
     fn a_routed_address_from_a_tenant_range_is_refused_in_words() {
         let mut inside = routed();
         inside.subnet_is_external = false;
-        let Err(why @ Refusal::NotExternal { .. }) =
-            may_publish(&inside, Announce::FromHost, 0)
+        let Err(why @ Refusal::NotExternal { .. }) = may_publish(&inside, Announce::FromHost, 0)
         else {
             panic!("a routed address was taken from a tenant range");
         };
@@ -341,7 +342,10 @@ mod tests {
             panic!("an address was published from a gateway that does not exist");
         };
         assert!(why.to_string().contains("Mark one"), "{why}");
-        assert!(why.to_string().contains("peer with the network above"), "{why}");
+        assert!(
+            why.to_string().contains("peer with the network above"),
+            "{why}"
+        );
 
         assert_eq!(may_publish(&address, Announce::FromHost, 1), Ok(()));
     }
@@ -414,12 +418,18 @@ mod tests {
         let v4 = guest_route("203.0.113.7".parse().unwrap());
         assert_eq!(v4.prefix_len, 32);
         assert_eq!(v4.via, IpAddr::V4(NEXT_HOP_V4));
-        assert!(v4.on_link, "a v4 next hop outside every subnet needs saying so");
+        assert!(
+            v4.on_link,
+            "a v4 next hop outside every subnet needs saying so"
+        );
 
         let v6 = guest_route("2001:db8::7".parse().unwrap());
         assert_eq!(v6.prefix_len, 128);
         assert_eq!(v6.via, IpAddr::V6(NEXT_HOP_V6));
-        assert!(!v6.on_link, "a link-local next hop is on-link by construction");
+        assert!(
+            !v6.on_link,
+            "a link-local next hop is on-link by construction"
+        );
     }
 
     /// A guest holding a public address defaults out through it. The other way

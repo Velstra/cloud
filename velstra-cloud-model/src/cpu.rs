@@ -114,11 +114,7 @@ impl CpuLevel {
     pub fn of(flags: &BTreeSet<String>) -> CpuLevel {
         let mut level = CpuLevel::V1;
         for candidate in [CpuLevel::V2, CpuLevel::V3, CpuLevel::V4] {
-            if candidate
-                .added_flags()
-                .iter()
-                .all(|f| flags.contains(*f))
-            {
+            if candidate.added_flags().iter().all(|f| flags.contains(*f)) {
                 level = candidate;
             } else {
                 break;
@@ -401,11 +397,7 @@ pub fn may_run_on(guest: &GuestCpu, node: &NodeCpu) -> Result<(), CpuMismatch> {
 /// A node that has reported no flags is short of everything, which is the
 /// honest answer and keeps this from waving through an agent too old to say.
 pub fn can_present(node: &NodeCpu, level: CpuLevel) -> Result<(), Vec<String>> {
-    let missing: Vec<String> = level
-        .flags()
-        .difference(&node.flags)
-        .cloned()
-        .collect();
+    let missing: Vec<String> = level.flags().difference(&node.flags).cloned().collect();
     if missing.is_empty() {
         Ok(())
     } else {
@@ -550,7 +542,10 @@ pub enum Advice {
     /// two things — which is how a screen comes to print "3" where it meant to
     /// list three machines. Found by the recorded-shape test, which read the
     /// number where the fixture had a list.
-    AlreadyUniform { nodes: Vec<String>, level: Option<CpuLevel> },
+    AlreadyUniform {
+        nodes: Vec<String>,
+        level: Option<CpuLevel>,
+    },
     /// These domains could be merged by declaring a baseline.
     BaselineWouldMerge {
         /// The nodes that would end up together.
@@ -609,10 +604,7 @@ pub enum Advice {
 /// Pure, and computed on read. The recommendation is never stored, because a
 /// stored recommendation outlives the fleet that justified it.
 pub fn advise(nodes: &[NodeEntry], guests: &[(String, String, GuestCpu)]) -> Vec<Advice> {
-    let known: Vec<&NodeEntry> = nodes
-        .iter()
-        .filter(|e| !e.cpu.arch.is_empty())
-        .collect();
+    let known: Vec<&NodeEntry> = nodes.iter().filter(|e| !e.cpu.arch.is_empty()).collect();
     if known.is_empty() {
         return Vec::new();
     }
@@ -641,7 +633,11 @@ pub fn advise(nodes: &[NodeEntry], guests: &[(String, String, GuestCpu)]) -> Vec
     }
 
     for arch in &arches {
-        let here: Vec<&NodeEntry> = known.iter().copied().filter(|e| &e.cpu.arch == arch).collect();
+        let here: Vec<&NodeEntry> = known
+            .iter()
+            .copied()
+            .filter(|e| &e.cpu.arch == arch)
+            .collect();
         let entries: Vec<NodeEntry> = here.iter().map(|e| (*e).clone()).collect();
         let domains = migration_domains(&entries);
 
@@ -726,7 +722,9 @@ pub fn advise(nodes: &[NodeEntry], guests: &[(String, String, GuestCpu)]) -> Vec
                             // the remedy is "declare the baseline here" or
                             // "this machine needs an aggregate of its own".
                             missing: match level {
-                                Some(level) => can_present(&stray.cpu, level).err().unwrap_or_default(),
+                                Some(level) => {
+                                    can_present(&stray.cpu, level).err().unwrap_or_default()
+                                }
                                 None => Vec::new(),
                             },
                         });
@@ -977,10 +975,7 @@ mod tests {
 
     #[test]
     fn a_mixed_maskable_fleet_is_advised_to_baseline_and_told_the_price() {
-        let fleet = vec![
-            node("a", CpuLevel::V4, true),
-            node("b", CpuLevel::V2, true),
-        ];
+        let fleet = vec![node("a", CpuLevel::V4, true), node("b", CpuLevel::V2, true)];
         let advice = advise(&fleet, &[]);
         let Some(Advice::BaselineWouldMerge {
             nodes,
@@ -1020,10 +1015,7 @@ mod tests {
 
     #[test]
     fn a_uniform_fleet_is_told_so_rather_than_left_silent() {
-        let fleet = vec![
-            node("a", CpuLevel::V3, true),
-            node("b", CpuLevel::V3, true),
-        ];
+        let fleet = vec![node("a", CpuLevel::V3, true), node("b", CpuLevel::V3, true)];
         assert_eq!(
             advise(&fleet, &[]),
             vec![Advice::AlreadyUniform {
@@ -1212,5 +1204,4 @@ mod tests {
         let guests = vec![("i1".to_string(), "a".to_string(), guest)];
         assert!(pending_adoption(&guests, &fleet).is_empty());
     }
-
 }

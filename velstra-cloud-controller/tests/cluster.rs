@@ -142,12 +142,12 @@ fn node(id: &str) -> Node {
         NodeSpec {
             evacuate: false,
             vcpu_overcommit: 0,
-                fence_after_s: 0,
+            fence_after_s: 0,
             schedulable: true,
             labels: vec![],
             cpu_baseline: None,
-                gateway: false,
-            },
+            gateway: false,
+        },
         NodeStatus {
             pci_devices: Vec::new(),
             cpu: None,

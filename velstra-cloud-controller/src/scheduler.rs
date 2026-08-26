@@ -52,7 +52,12 @@ pub struct Scheduler {
     /// for. `None` in a cell that has none — which is most cells, and where
     /// an instance naming a class is refused by name rather than placed onto
     /// a machine that cannot give it anything.
-    classes: Option<TypedStore<velstra_cloud_model::pci::DeviceClassSpec, velstra_cloud_model::resources::DeviceClassStatus>>,
+    classes: Option<
+        TypedStore<
+            velstra_cloud_model::pci::DeviceClassSpec,
+            velstra_cloud_model::resources::DeviceClassStatus,
+        >,
+    >,
     /// The cell's maintenance windows, so that a node somebody has declared out
     /// of service is not handed new work at two in the morning. `None` in a
     /// cell where nothing has ever been scheduled for maintenance.
@@ -169,7 +174,9 @@ impl Scheduler {
     /// Which affinity group is already on which node — the opposite ask, read
     /// the same way and for the same reason.
     fn grouped_with(instances: &[Instance]) -> Vec<(String, String)> {
-        Self::groups_by(instances, |i| i.spec.placement_policy.affinity_group.clone())
+        Self::groups_by(instances, |i| {
+            i.spec.placement_policy.affinity_group.clone()
+        })
     }
 
     fn groups_by(
@@ -354,12 +361,12 @@ mod tests {
                 NodeSpec {
                     evacuate: false,
                     vcpu_overcommit: 0,
-                fence_after_s: 0,
+                    fence_after_s: 0,
                     schedulable: true,
                     labels: vec![],
                     cpu_baseline: None,
-                gateway: false,
-            },
+                    gateway: false,
+                },
                 NodeStatus {
                     capacity: Capacity {
                         vcpus: 16,

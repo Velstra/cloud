@@ -316,9 +316,7 @@ impl CellReader for ApiCell {
         self.list("captures").await
     }
 
-    async fn backup_targets(
-        &self,
-    ) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
+    async fn backup_targets(&self) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>> {
         self.list("backup-targets").await
     }
 

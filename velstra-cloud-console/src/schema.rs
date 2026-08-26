@@ -977,8 +977,14 @@ const INSTANCE_FIELDS: &[Field] = &[
         label: "Keeping them apart is",
         kind: Kind::Choice {
             options: &[
-                Choice { value: "Required", label: "a rule" },
-                Choice { value: "Preferred", label: "a wish" },
+                Choice {
+                    value: "Required",
+                    label: "a rule",
+                },
+                Choice {
+                    value: "Preferred",
+                    label: "a wish",
+                },
             ],
         },
         required: false,
@@ -1011,8 +1017,14 @@ const INSTANCE_FIELDS: &[Field] = &[
         label: "Keeping them together is",
         kind: Kind::Choice {
             options: &[
-                Choice { value: "Required", label: "a rule" },
-                Choice { value: "Preferred", label: "a wish" },
+                Choice {
+                    value: "Required",
+                    label: "a rule",
+                },
+                Choice {
+                    value: "Preferred",
+                    label: "a wish",
+                },
             ],
         },
         required: false,
@@ -1310,8 +1322,14 @@ const NETWORK_FIELDS: &[Field] = &[
         label: "Addresses announced by",
         kind: Kind::Choice {
             options: &[
-                Choice { value: "FromGateway", label: "a gateway node" },
-                Choice { value: "FromHost", label: "the machine holding the guest" },
+                Choice {
+                    value: "FromGateway",
+                    label: "a gateway node",
+                },
+                Choice {
+                    value: "FromHost",
+                    label: "the machine holding the guest",
+                },
             ],
         },
         required: false,
@@ -1797,8 +1815,14 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         label: "The guest",
         kind: Kind::Choice {
             options: &[
-                Choice { value: "Nat", label: "never sees it" },
-                Choice { value: "Routed", label: "holds it itself" },
+                Choice {
+                    value: "Nat",
+                    label: "never sees it",
+                },
+                Choice {
+                    value: "Routed",
+                    label: "holds it itself",
+                },
             ],
         },
         required: false,
@@ -1817,9 +1841,18 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         label: "Announced by",
         kind: Kind::Choice {
             options: &[
-                Choice { value: "", label: "as the network says" },
-                Choice { value: "FromHost", label: "the machine holding the guest" },
-                Choice { value: "FromGateway", label: "a gateway node" },
+                Choice {
+                    value: "",
+                    label: "as the network says",
+                },
+                Choice {
+                    value: "FromHost",
+                    label: "the machine holding the guest",
+                },
+                Choice {
+                    value: "FromGateway",
+                    label: "a gateway node",
+                },
             ],
         },
         required: false,
@@ -1834,7 +1867,6 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         at_creation: false,
     },
 ];
-
 
 /// "This node is out of service from then, for that long."
 const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[

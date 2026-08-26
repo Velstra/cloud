@@ -226,10 +226,7 @@ mod tests {
             },
         );
         set_condition(&mut n.status.conditions, Condition::ready(1));
-        nodes
-            .create(&n, &Writer::controller("test"))
-            .await
-            .unwrap();
+        nodes.create(&n, &Writer::controller("test")).await.unwrap();
 
         let mut i: Instance = Resource::new(
             Meta::new(
@@ -263,7 +260,7 @@ mod tests {
         let reading = now.clone();
         let controller = RecoveryController::new(instances.clone(), nodes)
             .with_margin(60)
-        .with_clock(move || Timestamp(reading.load(Ordering::Relaxed)));
+            .with_clock(move || Timestamp(reading.load(Ordering::Relaxed)));
 
         Fixture {
             instances,
@@ -284,13 +281,7 @@ mod tests {
         }
 
         async fn placed_on(&self) -> Option<String> {
-            self.instances
-                .get(GUEST)
-                .await
-                .unwrap()
-                .unwrap()
-                .spec
-                .node
+            self.instances.get(GUEST).await.unwrap().unwrap().spec.node
         }
 
         /// What the API's `:explainRecovery` would say about this guest right
