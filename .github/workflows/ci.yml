@@ -189,9 +189,22 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # Absent and unwritable are different problems and want different
+          # answers, and saying "not writable" for a device that is not there
+          # sends somebody to read about permissions for an hour.
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm does not exist on this runner. Nested virtualisation is \
+          documented by GitHub as unsupported-but-present, so it comes and goes with the image: \
+          it worked on this repository earlier the same day it first failed. Re-running may land \
+          on a runner that has it. If it stops coming back, the answer is a self-hosted runner, \
+          not software emulation — a test that silently passes under TCG is worse than one that \
+          does not run."
+            exit 1
+          fi
           if [ ! -w /dev/kvm ]; then
-            echo "::error::/dev/kvm is not writable — these tests cannot boot anything."
-            ls -l /dev/kvm || true
+            echo "::error::/dev/kvm exists but this user cannot open it — the udev rule above \
+          did not take. That is a fixable problem, unlike the one above."
+            ls -l /dev/kvm
             exit 1
           fi
           ls -l /dev/kvm
@@ -318,11 +331,20 @@ jobs:
       # same work the `check` job above already did with a warm cargo cache.
       - uses: DeterminateSystems/magic-nix-cache-action@v13
 
-      # Evaluation first, and on its own: a typo in a module fails here in
-      # seconds with a line number, rather than after twenty minutes of building
-      # something else.
-      - name: Does it evaluate
-        run: nix flake check --no-build
+      # There is deliberately no `nix flake check --no-build` step here, and the
+      # reason is worth writing down because it looked like an obvious win.
+      #
+      # The Rust toolchain input uses import-from-derivation: it reads a channel
+      # manifest with `builtins.readFile`, which means the manifest has to be
+      # *built* before evaluation can finish. `--no-build` refuses to build it,
+      # so the whole evaluation dies with "path … .drv is not valid" — and it
+      # dies on a developer machine only if their store happens not to have the
+      # manifest already, which mine did. It passed locally and failed on the
+      # first runner that ever tried it.
+      #
+      # The step below covers what that one was supposed to: it evaluates the
+      # checks attrset (names only, which needs no IFD) before anything is
+      # built, so a module that does not evaluate fails in seconds.
 
       # Every check the flake exposes is named by one of the two lanes.
       #
@@ -402,9 +424,15 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm does not exist on this runner, so these checks would \
+          emulate rather than boot. See the guests job for what that means and what to do."
+            exit 1
+          fi
           if [ ! -w /dev/kvm ]; then
-            echo "::error::/dev/kvm is not writable — these checks would emulate, not boot."
-            ls -l /dev/kvm || true
+            echo "::error::/dev/kvm exists but this user cannot open it — the udev rule did \
+          not take."
+            ls -l /dev/kvm
             exit 1
           fi
 
