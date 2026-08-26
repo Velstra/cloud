@@ -262,8 +262,13 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             spec: NodeSpec {
+                evacuate: false,
+                vcpu_overcommit: 0,
+                fence_after_s: 0,
                 schedulable: true,
                 labels: vec![],
+                cpu_baseline: None,
+                gateway: false,
             },
             status: NodeStatus {
                 ceph,
@@ -274,7 +279,13 @@ mod tests {
                 ..NodeStatus::default()
             },
         };
-        nodes.create(&node).await.unwrap();
+        nodes
+            .create(
+                &node,
+                &velstra_cloud_model::access::Writer::controller("ceph"),
+            )
+            .await
+            .unwrap();
     }
 
     fn spec() -> CephClusterSpec {
@@ -305,7 +316,13 @@ mod tests {
             spec,
             CephClusterStatus::default(),
         );
-        clusters.create(&object).await.unwrap();
+        clusters
+            .create(
+                &object,
+                &velstra_cloud_model::access::Writer::controller("ceph"),
+            )
+            .await
+            .unwrap();
         // Read back rather than returned as constructed: the store assigns the
         // revision, and that revision is the compare-and-swap the controller
         // writes against. Handing back the copy from before the create is how a

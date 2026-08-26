@@ -20,10 +20,10 @@ use velstra_cloud_model::{
     Condition,
     meta::{Meta, Placement, ResourceName, Revision, Timestamp, set_condition},
     resources::{
-        Attachment, AttachmentSpec, AttachmentStatus, Capacity, Instance, InstanceSpec,
-        InstanceState, InstanceStatus, NODE_RELEASE_FINALIZER, Node, NodeSpec, NodeStatus,
-        Operation, OperationSpec, OperationStatus, Project, ProjectSpec, ProjectStatus, Quota,
-        Resource, Volume, VolumeSpec, VolumeStatus,
+        Attachment, AttachmentSpec, AttachmentStatus, Capacity, FloatingIpSpec, FloatingIpStatus,
+        Instance, InstanceSpec, InstanceState, InstanceStatus, NODE_RELEASE_FINALIZER, Node,
+        NodeSpec, NodeStatus, Operation, OperationSpec, OperationStatus, Project, ProjectSpec,
+        ProjectStatus, Quota, Resource, Volume, VolumeSpec, VolumeStatus,
     },
 };
 use velstra_cloud_store::{Entry, Event, Expect, MemoryStore, Store, TypedStore};
@@ -78,6 +78,23 @@ impl Cell {
                 self.raw.clone(),
                 velstra_cloud_store::prefix_for("cell-1", "volumes"),
             ),
+            velstra_cloud_store::Cached::start(
+                TypedStore::<FloatingIpSpec, FloatingIpStatus>::new(
+                    self.raw.clone(),
+                    "cell-1",
+                    "floatingips",
+                ),
+                self.raw.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "floatingips"),
+            ),
+            velstra_cloud_store::Cached::start(
+                TypedStore::<
+                    velstra_cloud_model::loadbalancer::LoadBalancerSpec,
+                    velstra_cloud_model::loadbalancer::LoadBalancerStatus,
+                >::new(self.raw.clone(), "cell-1", "load-balancers"),
+                self.raw.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "load-balancers"),
+            ),
             StatusWriter::new(self.raw.clone(), "cell-1", "projects", "quota"),
             "cell-1",
         )
@@ -123,10 +140,17 @@ fn node(id: &str) -> Node {
     let mut n = Resource::new(
         meta(&format!("nodes/{id}")),
         NodeSpec {
+            evacuate: false,
+            vcpu_overcommit: 0,
+                fence_after_s: 0,
             schedulable: true,
             labels: vec![],
-        },
+            cpu_baseline: None,
+                gateway: false,
+            },
         NodeStatus {
+            pci_devices: Vec::new(),
+            cpu: None,
             observed_generation: 1,
             capacity: Capacity {
                 vcpus: 32,
@@ -146,6 +170,11 @@ fn unplaced(id: &str) -> Instance {
     Resource::new(
         meta(&format!("projects/p1/instances/{id}")),
         InstanceSpec {
+            start_order: 0,
+            start_delay_s: 0,
+            on_node_loss: Default::default(),
+            console: false,
+            devices: Vec::new(),
             vcpus: 2,
             memory_mib: 2048,
             image: "sha256:abc".into(),
@@ -162,7 +191,13 @@ fn unplaced(id: &str) -> Instance {
 /// would make it say.
 async fn settled_cell() -> Cell {
     let cell = Cell::new();
-    cell.nodes.create(&node("node-a")).await.unwrap();
+    cell.nodes
+        .create(
+            &node("node-a"),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     let mut instance = unplaced("i1");
     instance.spec.node = Some("node-a".into());
@@ -171,11 +206,18 @@ async fn settled_cell() -> Cell {
     instance.status.node = Some("node-a".into());
     instance.status.state = InstanceState::Running;
     set_condition(&mut instance.status.conditions, Condition::ready(2));
-    cell.instances.create(&instance).await.unwrap();
+    cell.instances
+        .create(
+            &instance,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     let volume: Volume = Resource::new(
         meta("projects/p1/volumes/v1"),
         VolumeSpec {
+            source_backup: None,
             size_gib: 100,
             pool: "rbd".into(),
             ..Default::default()
@@ -187,7 +229,13 @@ async fn settled_cell() -> Cell {
             ..Default::default()
         },
     );
-    cell.volumes.create(&volume).await.unwrap();
+    cell.volumes
+        .create(
+            &volume,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     let mut attachment: Attachment = Resource::new(
         meta("projects/p1/attachments/a1"),
@@ -206,7 +254,13 @@ async fn settled_cell() -> Cell {
         },
     );
     attachment.meta.add_finalizer(NODE_RELEASE_FINALIZER);
-    cell.attachments.create(&attachment).await.unwrap();
+    cell.attachments
+        .create(
+            &attachment,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     let mut project: Project = Resource::new(
         meta("projects/p1"),
@@ -214,10 +268,12 @@ async fn settled_cell() -> Cell {
             display_name: "one".into(),
             parent: "organizations/o1".into(),
             quota: Quota {
+                devices: 0,
                 instances: 10,
                 vcpus: 64,
                 memory_mib: 131072,
                 volume_gib: 1000,
+                ..Quota::default()
             },
             bindings: Vec::new(),
             cell: String::new(),
@@ -225,16 +281,25 @@ async fn settled_cell() -> Cell {
         ProjectStatus {
             observed_generation: 1,
             used: Quota {
+                devices: 0,
                 instances: 1,
                 vcpus: 2,
                 memory_mib: 2048,
+                volumes: 1,
                 volume_gib: 120,
+                ..Quota::default()
             },
             ..Default::default()
         },
     );
     set_condition(&mut project.status.conditions, Condition::ready(1));
-    cell.projects.create(&project).await.unwrap();
+    cell.projects
+        .create(
+            &project,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     let mut operation: Operation = Resource::new(
         meta("projects/p1/operations/op-1"),
@@ -257,7 +322,13 @@ async fn settled_cell() -> Cell {
         },
     );
     set_condition(&mut operation.status.conditions, Condition::ready(1));
-    cell.operations.create(&operation).await.unwrap();
+    cell.operations
+        .create(
+            &operation,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     cell
 }
@@ -281,7 +352,13 @@ async fn a_record_past_its_retention_is_removed_by_an_ordinary_pass() {
     old.meta.name = ResourceName::parse("projects/p1/operations/op-old").unwrap();
     old.meta.revision = Revision(0);
     old.status.finished_at = Some(Timestamp(1_700_000_000_000));
-    cell.operations.create(&old).await.unwrap();
+    cell.operations
+        .create(
+            &old,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     cell.reconcile_everything().await;
     assert!(
@@ -396,8 +473,20 @@ impl Store for DiesAfter {
 async fn a_controller_that_dies_before_its_write_leaves_the_object_untouched() {
     let backing = Arc::new(MemoryStore::new());
     let seed = Cell::on(backing.clone());
-    seed.nodes.create(&node("node-a")).await.unwrap();
-    seed.instances.create(&unplaced("i1")).await.unwrap();
+    seed.nodes
+        .create(
+            &node("node-a"),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+    seed.instances
+        .create(
+            &unplaced("i1"),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
     let before = seed.instance("i1").await;
 
     // Dies on its first write — after `place()` has already chosen a node.
@@ -432,11 +521,23 @@ async fn a_controller_that_dies_between_two_writes_needs_no_repair() {
     // never be made again.
     let backing = Arc::new(MemoryStore::new());
     let seed = Cell::on(backing.clone());
-    seed.instances.create(&unplaced("i1")).await.unwrap();
+    seed.instances
+        .create(
+            &unplaced("i1"),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     // No nodes yet: the instance collects a rejection.
     sweep(&seed.scheduler(), &seed.instances).await.unwrap();
-    seed.nodes.create(&node("node-a")).await.unwrap();
+    seed.nodes
+        .create(
+            &node("node-a"),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 
     // Now exactly one write survives — the condition — and the process dies
     // before the assignment.
@@ -490,11 +591,20 @@ async fn two_schedulers_place_each_instance_exactly_once() {
     let raw: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let cell = Cell::on(raw.clone());
     for id in ["node-a", "node-b", "node-c"] {
-        cell.nodes.create(&node(id)).await.unwrap();
+        cell.nodes
+            .create(
+                &node(id),
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
     }
     for i in 0..25 {
         cell.instances
-            .create(&unplaced(&format!("i{i}")))
+            .create(
+                &unplaced(&format!("i{i}")),
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
             .await
             .unwrap();
     }
@@ -570,7 +680,13 @@ async fn a_controller_that_stands_down_and_returns_still_reconciles() {
     let cell = Cell::new();
     let raw = cell.raw.clone();
     for id in ["node-a", "node-b"] {
-        cell.nodes.create(&node(id)).await.unwrap();
+        cell.nodes
+            .create(
+                &node(id),
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
     }
 
     let config = LoopConfig {
@@ -593,7 +709,13 @@ async fn a_controller_that_stands_down_and_returns_still_reconciles() {
     ));
 
     // Leading: it places what it is given.
-    cell.instances.create(&unplaced("before")).await.unwrap();
+    cell.instances
+        .create(
+            &unplaced("before"),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
     assert!(
         placed(&cell, "before").await,
         "the controller did not place an instance while it was leading"
@@ -602,7 +724,13 @@ async fn a_controller_that_stands_down_and_returns_still_reconciles() {
     // Stood down: it must not act at all.
     lead.send(false).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    cell.instances.create(&unplaced("during")).await.unwrap();
+    cell.instances
+        .create(
+            &unplaced("during"),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     let during = cell
         .instances

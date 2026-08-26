@@ -23,6 +23,7 @@ use tracing::info;
 use velstra_cloud_model::{
     access::Writer,
     ipam::{assign, needs_assignment, unaddressable_condition},
+    loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
     meta::{condition, set_condition},
     resources::{
         FloatingIpSpec, FloatingIpStatus, Port, PortSpec, PortStatus, SubnetSpec, SubnetStatus,
@@ -38,6 +39,9 @@ pub struct AddressController {
     /// Read, never written: a floating address is one this controller must not
     /// hand to a port.
     floating: TypedStore<FloatingIpSpec, FloatingIpStatus>,
+    /// Read, never written, for the same reason: a load balancer's VIP comes
+    /// out of the same range as a port's address.
+    balancers: TypedStore<LoadBalancerSpec, LoadBalancerStatus>,
     status: StatusWriter<PortSpec, PortStatus>,
     cell: String,
     /// Ports that could not be given an address, so that a subnet appearing or
@@ -51,6 +55,7 @@ impl AddressController {
         ports: TypedStore<PortSpec, PortStatus>,
         subnets: TypedStore<SubnetSpec, SubnetStatus>,
         floating: TypedStore<FloatingIpSpec, FloatingIpStatus>,
+        balancers: TypedStore<LoadBalancerSpec, LoadBalancerStatus>,
         status: StatusWriter<PortSpec, PortStatus>,
         cell: &str,
     ) -> Self {
@@ -58,6 +63,7 @@ impl AddressController {
             ports,
             subnets,
             floating,
+            balancers,
             status,
             cell: cell.to_string(),
             pending: Arc::new(Mutex::new(BTreeSet::new())),
@@ -121,12 +127,13 @@ impl Reconciler for AddressController {
 
         let subnet = self.subnets.get(&port.spec.subnet).await?;
         let others = self.ports.list().await?;
-        // Floating IPs come out of the same range. Reading them here is what
-        // keeps one allocator over that range rather than two — see
-        // [`velstra_cloud_model::ipam`].
+        // Floating IPs and load balancer VIPs come out of the same range.
+        // Reading them here is what keeps one allocator over that range rather
+        // than three — see [`velstra_cloud_model::ipam`].
         let floating = self.floating.list().await?;
+        let balancers = self.balancers.list().await?;
 
-        let assignment = match assign(port, subnet.as_ref(), &others, &floating) {
+        let assignment = match assign(port, subnet.as_ref(), &others, &floating, &balancers) {
             Ok(assignment) => assignment,
             Err(why) => {
                 self.explain(port, &why).await?;
@@ -223,6 +230,7 @@ mod tests {
                 self.ports.clone(),
                 self.subnets.clone(),
                 TypedStore::new(self.raw.clone(), "cell-1", "floatingips"),
+                TypedStore::new(self.raw.clone(), "cell-1", "load-balancers"),
                 StatusWriter::new(self.raw.clone(), "cell-1", "ports", "address"),
                 "cell-1",
             )
@@ -240,7 +248,13 @@ mod tests {
                 },
                 SubnetStatus::default(),
             );
-            self.subnets.create(&s).await.unwrap();
+            self.subnets
+                .create(
+                    &s,
+                    &velstra_cloud_model::access::Writer::controller("address"),
+                )
+                .await
+                .unwrap();
             s
         }
 
@@ -263,7 +277,13 @@ mod tests {
                     ..Default::default()
                 },
             );
-            self.ports.create(&p).await.unwrap();
+            self.ports
+                .create(
+                    &p,
+                    &velstra_cloud_model::access::Writer::controller("address"),
+                )
+                .await
+                .unwrap();
             p
         }
 

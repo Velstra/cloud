@@ -655,7 +655,12 @@ mod tests {
         let raw = Arc::new(MemoryStore::new());
         let seed: TypedStore<InstanceSpec, InstanceStatus> =
             TypedStore::new(raw.clone(), "cell-1", "instances");
-        seed.create(&instance("i1")).await.unwrap();
+        seed.create(
+            &instance("i1"),
+            &velstra_cloud_model::access::Writer::controller("runner"),
+        )
+        .await
+        .unwrap();
 
         let recorder = Recorder::new();
         let (running, _) = start(recorder.clone(), raw, config());
@@ -682,7 +687,12 @@ mod tests {
         let (running, _) = start(recorder.clone(), raw.clone(), config());
 
         for i in 0..20 {
-            seed.create(&instance(&format!("i{i}"))).await.unwrap();
+            seed.create(
+                &instance(&format!("i{i}")),
+                &velstra_cloud_model::access::Writer::controller("runner"),
+            )
+            .await
+            .unwrap();
         }
         settle().await;
         running.stop().await;
@@ -711,7 +721,12 @@ mod tests {
         // 1024 is the store's watch buffer; comfortably more than that, written
         // while the loop is busy, ends the stream.
         for i in 0..1500 {
-            seed.create(&instance(&format!("i{i}"))).await.unwrap();
+            seed.create(
+                &instance(&format!("i{i}")),
+                &velstra_cloud_model::access::Writer::controller("runner"),
+            )
+            .await
+            .unwrap();
         }
         for _ in 0..40 {
             settle().await;
@@ -732,7 +747,12 @@ mod tests {
         let raw = Arc::new(MemoryStore::new());
         let seed: TypedStore<InstanceSpec, InstanceStatus> =
             TypedStore::new(raw.clone(), "cell-1", "instances");
-        seed.create(&instance("i1")).await.unwrap();
+        seed.create(
+            &instance("i1"),
+            &velstra_cloud_model::access::Writer::controller("runner"),
+        )
+        .await
+        .unwrap();
 
         let recorder = Recorder::new();
         let mut config = config();
@@ -754,9 +774,19 @@ mod tests {
         let raw = Arc::new(MemoryStore::new());
         let seed: TypedStore<InstanceSpec, InstanceStatus> =
             TypedStore::new(raw.clone(), "cell-1", "instances");
-        seed.create(&instance("poison")).await.unwrap();
+        seed.create(
+            &instance("poison"),
+            &velstra_cloud_model::access::Writer::controller("runner"),
+        )
+        .await
+        .unwrap();
         for i in 0..10 {
-            seed.create(&instance(&format!("i{i}"))).await.unwrap();
+            seed.create(
+                &instance(&format!("i{i}")),
+                &velstra_cloud_model::access::Writer::controller("runner"),
+            )
+            .await
+            .unwrap();
         }
 
         let recorder = Recorder::poisoning("projects/p1/instances/poison");
@@ -847,7 +877,13 @@ mod tests {
         ));
         settle().await;
 
-        instances.create(&instance("i1")).await.unwrap();
+        instances
+            .create(
+                &instance("i1"),
+                &velstra_cloud_model::access::Writer::controller("runner"),
+            )
+            .await
+            .unwrap();
         settle().await;
         let _ = stop.send(true);
         let _ = handle.await;
@@ -913,8 +949,20 @@ mod tests {
             velstra_cloud_model::resources::ProjectSpec,
             velstra_cloud_model::resources::ProjectStatus,
         > = TypedStore::new(raw.clone(), "cell-1", "projects");
-        projects.create(&project("p1")).await.unwrap();
-        projects.create(&project("p2")).await.unwrap();
+        projects
+            .create(
+                &project("p1"),
+                &velstra_cloud_model::access::Writer::controller("runner"),
+            )
+            .await
+            .unwrap();
+        projects
+            .create(
+                &project("p2"),
+                &velstra_cloud_model::access::Writer::controller("runner"),
+            )
+            .await
+            .unwrap();
 
         let sweeper = Arc::new(Sweeper {
             seen: Mutex::new(Vec::new()),
@@ -936,7 +984,13 @@ mod tests {
         sweeper.seen.lock().unwrap().clear();
 
         // One instance, named after neither project.
-        instances.create(&instance("i1")).await.unwrap();
+        instances
+            .create(
+                &instance("i1"),
+                &velstra_cloud_model::access::Writer::controller("runner"),
+            )
+            .await
+            .unwrap();
         settle().await;
         let _ = stop.send(true);
         let _ = handle.await;

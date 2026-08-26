@@ -123,7 +123,13 @@ mod tests {
         );
         i.meta.created_at = Timestamp(0);
         build(&mut i);
-        store.create(&i).await.unwrap();
+        store
+            .create(
+                &i,
+                &velstra_cloud_model::access::Writer::controller("drift"),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -243,7 +249,11 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .delete("projects/p1/instances/i1", stored.meta.revision)
+            .delete(
+                "projects/p1/instances/i1",
+                stored.meta.revision,
+                &velstra_cloud_model::access::Writer::controller("drift"),
+            )
             .await
             .unwrap();
 

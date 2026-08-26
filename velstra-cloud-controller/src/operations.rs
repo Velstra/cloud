@@ -275,7 +275,13 @@ mod tests {
                 },
                 OperationStatus::default(),
             );
-            self.operations.create(&op).await.unwrap();
+            self.operations
+                .create(
+                    &op,
+                    &velstra_cloud_model::access::Writer::controller("operations"),
+                )
+                .await
+                .unwrap();
             self.reload().await
         }
 
@@ -287,6 +293,11 @@ mod tests {
                 ),
                 InstanceSpec::default(),
                 InstanceStatus {
+                    running_size: None,
+                    console_tail: String::new(),
+                    console_bytes: 0,
+                    devices: Vec::new(),
+                    cpu: None,
                     observed_generation: observed,
                     state: InstanceState::Running,
                     // Owned from the start, because a status is only ever
@@ -298,7 +309,13 @@ mod tests {
             if let Some(c) = ready {
                 set_condition(&mut i.status.conditions, c);
             }
-            self.instances.create(&i).await.unwrap();
+            self.instances
+                .create(
+                    &i,
+                    &velstra_cloud_model::access::Writer::controller("operations"),
+                )
+                .await
+                .unwrap();
         }
 
         async fn reload(&self) -> Operation {

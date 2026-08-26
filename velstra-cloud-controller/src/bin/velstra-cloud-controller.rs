@@ -20,6 +20,7 @@ use velstra_cloud_controller::{
     election::{ElectionConfig, elect},
     floating_ip::FloatingIpController,
     instance::InstanceController,
+    load_balancer::LoadBalancerController,
     migration::MigrationController,
     network::NetworkController,
     operations::OperationsController,
@@ -34,6 +35,7 @@ use velstra_cloud_controller::{
 };
 use velstra_cloud_model::{
     ceph::{CephClusterSpec, CephClusterStatus},
+    loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
     meta::Timestamp,
     migration::{MigrationSpec, MigrationStatus},
     resources::{
@@ -162,8 +164,24 @@ async fn main() {
         TypedStore::new(store.clone(), cell, "operations");
     let migrations: TypedStore<MigrationSpec, MigrationStatus> =
         TypedStore::new(store.clone(), cell, "migrations");
+    let device_classes: TypedStore<
+        velstra_cloud_model::pci::DeviceClassSpec,
+        velstra_cloud_model::resources::DeviceClassStatus,
+    > = TypedStore::new(store.clone(), cell, "device-classes");
+    let maintenance_windows: TypedStore<
+        velstra_cloud_model::maintenance::MaintenanceWindowSpec,
+        velstra_cloud_model::maintenance::MaintenanceWindowStatus,
+    > = TypedStore::new(store.clone(), cell, "maintenance-windows");
     let snapshots: TypedStore<SnapshotSpec, SnapshotStatus> =
         TypedStore::new(store.clone(), cell, "snapshots");
+    let backups: TypedStore<
+        velstra_cloud_model::backup::BackupSpec,
+        velstra_cloud_model::backup::BackupStatus,
+    > = TypedStore::new(store.clone(), cell, "backups");
+    let backup_schedules: TypedStore<
+        velstra_cloud_model::backup::BackupScheduleSpec,
+        velstra_cloud_model::backup::BackupScheduleStatus,
+    > = TypedStore::new(store.clone(), cell, "backup-schedules");
     let ports: TypedStore<PortSpec, PortStatus> = TypedStore::new(store.clone(), cell, "ports");
     let subnets: TypedStore<SubnetSpec, SubnetStatus> =
         TypedStore::new(store.clone(), cell, "subnets");
@@ -173,6 +191,8 @@ async fn main() {
         TypedStore::new(store.clone(), cell, "routers");
     let floating_ips: TypedStore<FloatingIpSpec, FloatingIpStatus> =
         TypedStore::new(store.clone(), cell, "floatingips");
+    let load_balancers: TypedStore<LoadBalancerSpec, LoadBalancerStatus> =
+        TypedStore::new(store.clone(), cell, "load-balancers");
 
     let (stop, shutdown) = watch::channel(false);
 
@@ -210,12 +230,20 @@ async fn main() {
     let mut tasks = tokio::task::JoinSet::new();
 
     tasks.spawn(run_when_leading(
-        Arc::new(Scheduler::new(
-            instances.clone(),
-            nodes.clone(),
-            StatusWriter::new(store.clone(), cell, "instances", "scheduler"),
-            cell,
-        )),
+        Arc::new(
+            Scheduler::new(
+                instances.clone(),
+                nodes.clone(),
+                StatusWriter::new(store.clone(), cell, "instances", "scheduler"),
+                cell,
+            )
+            // Without these the scheduler answers "no such device class" to
+            // every guest that asks for one, in a cell where the class is
+            // sitting right there — and refuses to notice a node somebody
+            // declared out of service for tonight.
+            .with_device_classes(device_classes.clone())
+            .with_maintenance(maintenance_windows.clone()),
+        ),
         instances.clone(),
         store.clone(),
         config,
@@ -230,6 +258,7 @@ async fn main() {
             ports.clone(),
             subnets.clone(),
             floating_ips.clone(),
+            load_balancers.clone(),
             StatusWriter::new(store.clone(), cell, "ports", "address"),
             cell,
         )),
@@ -295,6 +324,16 @@ async fn main() {
                 volumes.clone(),
                 store.clone(),
                 velstra_cloud_store::prefix_for(cell, "volumes"),
+            ),
+            velstra_cloud_store::Cached::start(
+                floating_ips.clone(),
+                store.clone(),
+                velstra_cloud_store::prefix_for(cell, "floatingips"),
+            ),
+            velstra_cloud_store::Cached::start(
+                load_balancers.clone(),
+                store.clone(),
+                velstra_cloud_store::prefix_for(cell, "load-balancers"),
             ),
             StatusWriter::new(store.clone(), cell, "projects", "quota"),
             cell,
@@ -411,6 +450,7 @@ async fn main() {
             floating_ips.clone(),
             subnets.clone(),
             ports.clone(),
+            load_balancers.clone(),
             args.fabric.clone(),
         )),
         floating_ips.clone(),
@@ -420,9 +460,115 @@ async fn main() {
         shutdown.clone(),
         leader.clone(),
     ));
+    // And a load balancer: one address the fabric answers on for a pool of
+    // ports. The VIP is decided even in a cell with no fabric; the services
+    // are mirrored only where one exists.
+    tasks.spawn(run_when_leading(
+        Arc::new(LoadBalancerController::new(
+            store.clone(),
+            cell,
+            load_balancers.clone(),
+            networks.clone(),
+            subnets.clone(),
+            ports.clone(),
+            floating_ips.clone(),
+            args.fabric.clone(),
+        )),
+        load_balancers.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
     tasks.spawn(run_when_leading(
         Arc::new(SnapshotController::new(snapshots.clone())),
         snapshots.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // Hourly snapshots. Beside the backup schedule rather than folded into
+    // it: a snapshot lives in the volume's own pool and is lost with it, and
+    // one field distinguishing "cheap and local" from "survives the pool"
+    // would be a flag people set wrong.
+    tasks.spawn(run_when_leading(
+        Arc::new(
+            velstra_cloud_controller::snapshot_schedule::SnapshotScheduleController::new(
+                snapshots.clone(),
+                volumes.clone(),
+            ),
+        ),
+        TypedStore::new(store.clone(), cell, "snapshot-schedules"),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // Turning finished captures into images. Leader-only: two of these would
+    // race to create the same image, and the loser's error is noise about a
+    // thing that worked.
+    tasks.spawn(run_when_leading(
+        Arc::new(velstra_cloud_controller::capture::CaptureController::new(
+            TypedStore::new(store.clone(), cell, "images"),
+            TypedStore::new(store.clone(), cell, "backup-targets"),
+        )),
+        TypedStore::new(store.clone(), cell, "captures"),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // Emptying a node that has been asked to give up its guests. Keyed on
+    // nodes, unlike its neighbours: the ask is on the node and the guests are
+    // what follows from it.
+    tasks.spawn(run_when_leading(
+        Arc::new(
+            velstra_cloud_controller::evacuation::EvacuationController::new(
+                instances.clone(),
+                nodes.clone(),
+                migrations.clone(),
+            )
+            .with_maintenance(maintenance_windows.clone()),
+        ),
+        nodes.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // Bringing guests back from a node that stopped answering. Leader-only,
+    // and emphatically so: two controllers unplacing the same guest would be
+    // two of them handing it to the scheduler, and the second one would do it
+    // after the first had already been placed.
+    tasks.spawn(run_when_leading(
+        Arc::new(velstra_cloud_controller::recovery::RecoveryController::new(
+            instances.clone(),
+            nodes.clone(),
+        )),
+        instances.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    // Backups. Leader-only like the rest: two controllers asking for the same
+    // copy on the same second would be refused by the derived name, but two of
+    // them *expiring* would race on a delete for no reason.
+    tasks.spawn(run_when_leading(
+        Arc::new(
+            velstra_cloud_controller::backup_schedule::BackupScheduleController::new(
+                backups.clone(),
+                volumes.clone(),
+            ),
+        ),
+        backup_schedules.clone(),
         store.clone(),
         config,
         metrics.clone(),

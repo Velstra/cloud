@@ -323,11 +323,17 @@ mod tests {
     }
 
     async fn add_network(nets: &TypedStore<NetworkSpec, NetworkStatus>, id: &str, vni: u32) {
-        nets.create(&Resource::new(
-            meta(&format!("projects/p1/networks/{id}")),
-            NetworkSpec { vni, mtu: 1500 },
-            NetworkStatus::default(),
-        ))
+        nets.create(
+            &Resource::new(
+                meta(&format!("projects/p1/networks/{id}")),
+                NetworkSpec { vni, mtu: 1500,
+                external: false,
+                announce: Default::default(),
+            },
+                NetworkStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("router"),
+        )
         .await
         .unwrap();
     }
@@ -475,7 +481,13 @@ mod tests {
         let (raw, routers, nets) = stores();
         add_network(&nets, "n1", 5001).await;
         let r = router(&["projects/p1/networks/n1"]);
-        routers.create(&r).await.unwrap();
+        routers
+            .create(
+                &r,
+                &velstra_cloud_model::access::Writer::controller("router"),
+            )
+            .await
+            .unwrap();
         let c = RouterController::new(raw, CELL, nets, None);
 
         c.reconcile("projects/p1/routers/r1", Some(&r))

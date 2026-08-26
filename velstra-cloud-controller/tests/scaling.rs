@@ -174,7 +174,13 @@ async fn cell_of(n: usize) -> (Arc<Counting>, Vec<Port>, Vec<Subnet>) {
     let mut made_subnets = Vec::new();
     for s in 0..subnet_count {
         let object = subnet(&format!("s{s}"));
-        subnets.create(&object).await.unwrap();
+        subnets
+            .create(
+                &object,
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
         made_subnets.push(
             subnets
                 .get(&object.meta.name.to_string())
@@ -187,7 +193,13 @@ async fn cell_of(n: usize) -> (Arc<Counting>, Vec<Port>, Vec<Subnet>) {
     for i in 0..n {
         let s = format!("projects/p1/subnets/s{}", i % subnet_count);
         let object = port(&format!("pt{i}"), &s);
-        ports.create(&object).await.unwrap();
+        ports
+            .create(
+                &object,
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
         made_ports.push(
             ports
                 .get(&object.meta.name.to_string())
@@ -196,11 +208,14 @@ async fn cell_of(n: usize) -> (Arc<Counting>, Vec<Port>, Vec<Subnet>) {
                 .unwrap(),
         );
         instances
-            .create(&instance(
-                &format!("i{i}"),
-                vec![format!("projects/p1/ports/pt{i}")],
-                Some("node-a"),
-            ))
+            .create(
+                &instance(
+                    &format!("i{i}"),
+                    vec![format!("projects/p1/ports/pt{i}")],
+                    Some("node-a"),
+                ),
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
             .await
             .unwrap();
     }
@@ -283,23 +298,29 @@ async fn a_resync_of_every_controller_grows_with_the_cell_not_its_square() {
         // One project per ten instances, one node per ten.
         for p in 0..(n / 10).max(1) {
             projects
-                .create(&Resource::new(
-                    ResourceName::parse(&format!("projects/p{p}"))
-                        .map(|nm| Meta::new(nm, Placement::new("eu", "cell-1")))
-                        .unwrap(),
-                    ProjectSpec::default(),
-                    ProjectStatus::default(),
-                ))
+                .create(
+                    &Resource::new(
+                        ResourceName::parse(&format!("projects/p{p}"))
+                            .map(|nm| Meta::new(nm, Placement::new("eu", "cell-1")))
+                            .unwrap(),
+                        ProjectSpec::default(),
+                        ProjectStatus::default(),
+                    ),
+                    &velstra_cloud_model::access::Writer::controller("test"),
+                )
                 .await
                 .unwrap();
             nodes
-                .create(&Resource::new(
-                    ResourceName::parse(&format!("nodes/node-{p}"))
-                        .map(|nm| Meta::new(nm, Placement::new("eu", "cell-1")))
-                        .unwrap(),
-                    NodeSpec::default(),
-                    NodeStatus::default(),
-                ))
+                .create(
+                    &Resource::new(
+                        ResourceName::parse(&format!("nodes/node-{p}"))
+                            .map(|nm| Meta::new(nm, Placement::new("eu", "cell-1")))
+                            .unwrap(),
+                        NodeSpec::default(),
+                        NodeStatus::default(),
+                    ),
+                    &velstra_cloud_model::access::Writer::controller("test"),
+                )
                 .await
                 .unwrap();
         }
@@ -310,7 +331,13 @@ async fn a_resync_of_every_controller_grows_with_the_cell_not_its_square() {
             // of a quiet cell is made of.
             let mut object = instance(&format!("i{i}"), vec![], Some("node-0"));
             object.spec.node = Some("node-0".into());
-            instances.create(&object).await.unwrap();
+            instances
+                .create(
+                    &object,
+                    &velstra_cloud_model::access::Writer::controller("test"),
+                )
+                .await
+                .unwrap();
         }
 
         // A quota resync: every project, through the controller's own reconcile.
@@ -324,6 +351,22 @@ async fn a_resync_of_every_controller_grows_with_the_cell_not_its_square() {
                 TypedStore::<VolumeSpec, VolumeStatus>::new(store.clone(), "cell-1", "volumes"),
                 store.clone(),
                 velstra_cloud_store::prefix_for("cell-1", "volumes"),
+            ),
+            velstra_cloud_store::Cached::start(
+                TypedStore::<
+                    velstra_cloud_model::resources::FloatingIpSpec,
+                    velstra_cloud_model::resources::FloatingIpStatus,
+                >::new(store.clone(), "cell-1", "floatingips"),
+                store.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "floatingips"),
+            ),
+            velstra_cloud_store::Cached::start(
+                TypedStore::<
+                    velstra_cloud_model::loadbalancer::LoadBalancerSpec,
+                    velstra_cloud_model::loadbalancer::LoadBalancerStatus,
+                >::new(store.clone(), "cell-1", "load-balancers"),
+                store.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "load-balancers"),
             ),
             velstra_cloud_controller::status::StatusWriter::new(
                 store.clone(),

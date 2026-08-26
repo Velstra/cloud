@@ -148,6 +148,15 @@ impl Reconciler for NetworkController {
             // to arrive to have any effect — the fabric's own overlay sizing
             // comes from the *underlay* MTU each node reads off its interface.
             mtu: _,
+            // The fabric has no notion of an external network and does not need
+            // one: what "external" means is that the prefix on this network's
+            // subnets is real, which is a fact about the world above the
+            // fabric. What the fabric is told is the same VNI, subnet and
+            // default action as for any other network.
+            external: _,
+            // The same: who announces an address is decided here and acted on
+            // by whichever agent holds the port.
+            announce: _,
         } = &network.spec;
         let spec = pb::NetworkSpec {
             vni: *vni,
@@ -304,17 +313,20 @@ mod tests {
         cidr: &str,
     ) {
         subnets
-            .create(&Resource::new(
-                meta(&format!("projects/p1/subnets/{id}")),
-                SubnetSpec {
-                    network: network.to_string(),
-                    cidr: cidr.to_string(),
-                    gateway: "10.0.0.1".into(),
-                    dns: vec![],
-                    reserved: vec![],
-                },
-                SubnetStatus::default(),
-            ))
+            .create(
+                &Resource::new(
+                    meta(&format!("projects/p1/subnets/{id}")),
+                    SubnetSpec {
+                        network: network.to_string(),
+                        cidr: cidr.to_string(),
+                        gateway: "10.0.0.1".into(),
+                        dns: vec![],
+                        reserved: vec![],
+                    },
+                    SubnetStatus::default(),
+                ),
+                &velstra_cloud_model::access::Writer::controller("network"),
+            )
             .await
             .unwrap();
     }
@@ -409,10 +421,18 @@ mod tests {
             NetworkSpec {
                 vni: 5001,
                 mtu: 1500,
+                external: false,
+                announce: Default::default(),
             },
             NetworkStatus::default(),
         );
-        networks.create(&network).await.unwrap();
+        networks
+            .create(
+                &network,
+                &velstra_cloud_model::access::Writer::controller("network"),
+            )
+            .await
+            .unwrap();
         let c = NetworkController::new(raw, CELL, subnets, None);
 
         c.reconcile("projects/p1/networks/n1", Some(&network))

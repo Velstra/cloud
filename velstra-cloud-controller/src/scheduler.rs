@@ -25,6 +25,20 @@ use velstra_cloud_store::{TypedStore, prefix_for};
 
 use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
 
+/// One stored window as the model's decisions see it.
+pub(crate) fn window_view(
+    w: &velstra_cloud_model::resources::MaintenanceWindow,
+) -> velstra_cloud_model::maintenance::WindowView {
+    velstra_cloud_model::maintenance::WindowView {
+        name: w.meta.name.to_string(),
+        node: w.spec.node.clone(),
+        starts_at: w.spec.starts_at,
+        minutes: w.spec.minutes,
+        drain: w.spec.drain,
+        note: w.spec.note.clone(),
+    }
+}
+
 pub struct Scheduler {
     instances: TypedStore<InstanceSpec, InstanceStatus>,
     nodes: TypedStore<NodeSpec, NodeStatus>,
@@ -34,6 +48,20 @@ pub struct Scheduler {
     /// exactly them. A hint for the queue and never a fact about the world:
     /// losing it in a restart costs one resync of latency and nothing else.
     pending: Arc<Mutex<BTreeSet<String>>>,
+    /// The cell's PCI device classes, read to answer what an instance asked
+    /// for. `None` in a cell that has none — which is most cells, and where
+    /// an instance naming a class is refused by name rather than placed onto
+    /// a machine that cannot give it anything.
+    classes: Option<TypedStore<velstra_cloud_model::pci::DeviceClassSpec, velstra_cloud_model::resources::DeviceClassStatus>>,
+    /// The cell's maintenance windows, so that a node somebody has declared out
+    /// of service is not handed new work at two in the morning. `None` in a
+    /// cell where nothing has ever been scheduled for maintenance.
+    windows: Option<
+        TypedStore<
+            velstra_cloud_model::maintenance::MaintenanceWindowSpec,
+            velstra_cloud_model::maintenance::MaintenanceWindowStatus,
+        >,
+    >,
 }
 
 impl Scheduler {
@@ -44,11 +72,86 @@ impl Scheduler {
         cell: &str,
     ) -> Self {
         Self {
+            classes: None,
+            windows: None,
             instances,
             nodes,
             status,
             cell: cell.to_string(),
             pending: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    /// Give this scheduler the cell's device classes.
+    ///
+    /// Opt-in rather than required, so a cell that passes no hardware through
+    /// needs no extra store — and so adding this could not change the shape of
+    /// every existing caller.
+    pub fn with_device_classes(
+        mut self,
+        classes: TypedStore<
+            velstra_cloud_model::pci::DeviceClassSpec,
+            velstra_cloud_model::resources::DeviceClassStatus,
+        >,
+    ) -> Self {
+        self.classes = Some(classes);
+        self
+    }
+
+    /// The classes, by id. Empty when this cell has none, and empty when they
+    /// cannot be read — a scheduler that placed a device-hungry guest onto an
+    /// arbitrary node because a list did not load would be worse than one that
+    /// refuses and says the class was not found.
+    async fn device_classes(
+        &self,
+    ) -> std::collections::BTreeMap<String, velstra_cloud_model::pci::DeviceClassSpec> {
+        let Some(store) = &self.classes else {
+            return Default::default();
+        };
+        match store.list().await {
+            Ok(all) => all
+                .into_iter()
+                .map(|c| (c.meta.name.id().to_string(), c.spec))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read this cell's device classes");
+                Default::default()
+            }
+        }
+    }
+
+    /// Give this scheduler the cell's maintenance windows.
+    pub fn with_maintenance(
+        mut self,
+        windows: TypedStore<
+            velstra_cloud_model::maintenance::MaintenanceWindowSpec,
+            velstra_cloud_model::maintenance::MaintenanceWindowStatus,
+        >,
+    ) -> Self {
+        self.windows = Some(windows);
+        self
+    }
+
+    /// The nodes that are out of service this instant.
+    ///
+    /// Empty when they cannot be read — and that direction is deliberate. A
+    /// list that fails to load makes this scheduler place onto a node somebody
+    /// is about to unplug, which costs one migration; treating every node as
+    /// closed would stop the cell placing anything at all because one read
+    /// failed, which is the worse of the two by a distance.
+    async fn closed_nodes(&self) -> Vec<velstra_cloud_model::maintenance::Closed> {
+        let Some(store) = &self.windows else {
+            return Vec::new();
+        };
+        match store.list().await {
+            Ok(all) => velstra_cloud_model::maintenance::closed_now(
+                &all.iter().map(window_view).collect::<Vec<_>>(),
+                velstra_cloud_model::meta::Timestamp::now(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read this cell's maintenance windows");
+                Vec::new()
+            }
         }
     }
 
@@ -58,13 +161,24 @@ impl Scheduler {
     /// a group membership that outlives its instance is an anti-affinity rule
     /// that refuses a node forever, for a guest that stopped existing.
     fn occupied_groups(instances: &[Instance]) -> Vec<(String, String)> {
+        Self::groups_by(instances, |i| {
+            i.spec.placement_policy.anti_affinity_group.clone()
+        })
+    }
+
+    /// Which affinity group is already on which node — the opposite ask, read
+    /// the same way and for the same reason.
+    fn grouped_with(instances: &[Instance]) -> Vec<(String, String)> {
+        Self::groups_by(instances, |i| i.spec.placement_policy.affinity_group.clone())
+    }
+
+    fn groups_by(
+        instances: &[Instance],
+        group_of: impl Fn(&Instance) -> Option<String>,
+    ) -> Vec<(String, String)> {
         instances
             .iter()
-            .filter_map(|i| {
-                let group = i.spec.placement_policy.anti_affinity_group.clone()?;
-                let node = i.spec.node.clone()?;
-                Some((group, node))
-            })
+            .filter_map(|i| Some((group_of(i)?, i.spec.node.clone()?)))
             .collect()
     }
 }
@@ -103,7 +217,16 @@ impl Reconciler for Scheduler {
         let all = self.instances.list().await?;
         let generation = instance.meta.generation;
 
-        match place(instance, &nodes, &Self::occupied_groups(&all)) {
+        let classes = self.device_classes().await;
+        let closed = self.closed_nodes().await;
+        match place(
+            instance,
+            &nodes,
+            &Self::occupied_groups(&all),
+            &Self::grouped_with(&all),
+            &classes,
+            &closed,
+        ) {
             Err(why) => {
                 // The rejection chain goes on the object, because an operator
                 // asking "why is this not running" should not have to find the
@@ -197,13 +320,24 @@ mod tests {
                     Placement::new("eu", "cell-1"),
                 ),
                 InstanceSpec {
+                    start_order: 0,
+                    start_delay_s: 0,
+                    on_node_loss: Default::default(),
+                    console: false,
+                    devices: Vec::new(),
                     vcpus: 2,
                     memory_mib,
                     ..Default::default()
                 },
                 InstanceStatus::default(),
             );
-            self.instances.create(&i).await.unwrap();
+            self.instances
+                .create(
+                    &i,
+                    &velstra_cloud_model::access::Writer::controller("scheduler"),
+                )
+                .await
+                .unwrap();
             self.instances
                 .get(&i.meta.name.to_string())
                 .await
@@ -218,9 +352,14 @@ mod tests {
                     Placement::new("eu", "cell-1"),
                 ),
                 NodeSpec {
+                    evacuate: false,
+                    vcpu_overcommit: 0,
+                fence_after_s: 0,
                     schedulable: true,
                     labels: vec![],
-                },
+                    cpu_baseline: None,
+                gateway: false,
+            },
                 NodeStatus {
                     capacity: Capacity {
                         vcpus: 16,
@@ -235,7 +374,13 @@ mod tests {
             if ready {
                 set_condition(&mut n.status.conditions, Condition::ready(1));
             }
-            self.nodes.create(&n).await.unwrap();
+            self.nodes
+                .create(
+                    &n,
+                    &velstra_cloud_model::access::Writer::controller("scheduler"),
+                )
+                .await
+                .unwrap();
         }
 
         async fn reload(&self, id: &str) -> Instance {

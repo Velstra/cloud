@@ -58,9 +58,35 @@ impl Drop for Fabric {
     }
 }
 
+/// Whether nothing is already listening here.
+///
+/// Checked before spawning, because the failure it prevents is silent: a
+/// fixture whose port is taken does not fail to start — it connects to
+/// whatever *is* there and tests against somebody else's state.
+///
+/// **50950–50999 belongs to `velstra-cloud-controller`**; the node agent crate
+/// has 50900–50949. `cargo test` runs test binaries concurrently, and when the
+/// two ranges overlapped this produced three different intermittent failures
+/// in three different files, each looking like a bug in whatever it hit.
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
 impl Fabric {
-    async fn start(binary: &PathBuf) -> Option<Self> {
-        let (listen, admin, raft) = (50981, 50982, 50983);
+    /// `base` is this test's own three ports. Two tests in one binary run
+    /// concurrently, so a fixed triple would have them starting two fabrics on
+    /// one port — and the loser would silently test against the winner's,
+    /// which is the failure the assertion below is about.
+    async fn start(binary: &PathBuf, base: u16) -> Option<Self> {
+        let (listen, admin, raft) = (base, base + 1, base + 2);
+        for port in [listen, admin, raft] {
+            assert!(
+                port_is_free(port),
+                "127.0.0.1:{port} is already listening. This fixture would connect to it and \
+                 test against somebody else's fabric — which is how an intermittent failure \
+                 that looks like a bug in the code under test is really a port collision."
+            );
+        }
         let _ = std::process::Command::new("ip")
             .args(["link", "set", "lo", "up"])
             .status();
@@ -110,7 +136,7 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
         eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
         return;
     };
-    let Some(fabric) = Fabric::start(&binary).await else {
+    let Some(fabric) = Fabric::start(&binary, 50981).await else {
         eprintln!("skipped: the fabric controller would not start here");
         return;
     };
@@ -125,28 +151,36 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
         TypedStore::new(raw.clone(), CELL, "floatingips");
 
     networks
-        .create(&Resource::new(
-            meta(NETWORK),
-            NetworkSpec {
-                vni: VNI,
-                mtu: 1500,
-            },
-            NetworkStatus::default(),
-        ))
+        .create(
+            &Resource::new(
+                meta(NETWORK),
+                NetworkSpec {
+                    vni: VNI,
+                    mtu: 1500,
+                    external: false,
+                    announce: Default::default(),
+                },
+                NetworkStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
     subnets
-        .create(&Resource::new(
-            meta(SUBNET),
-            SubnetSpec {
-                network: NETWORK.into(),
-                cidr: "10.40.0.0/24".into(),
-                gateway: "10.40.0.1".into(),
-                dns: vec![],
-                reserved: vec![],
-            },
-            SubnetStatus::default(),
-        ))
+        .create(
+            &Resource::new(
+                meta(SUBNET),
+                SubnetSpec {
+                    network: NETWORK.into(),
+                    cidr: "10.40.0.0/24".into(),
+                    gateway: "10.40.0.1".into(),
+                    dns: vec![],
+                    reserved: vec![],
+                },
+                SubnetStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 
@@ -168,7 +202,13 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
         );
         port.status.node = Some(HOST.into());
         port.status.tap_device = Some(tap.into());
-        ports.create(&port).await.unwrap();
+        ports
+            .create(
+                &port,
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
     }
 
     let mut client = velstra_cloud_fabric::connect(&fabric.admin).await.unwrap();
@@ -223,15 +263,20 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
     }
 
     floating
-        .create(&Resource::new(
-            meta(FIP),
-            FloatingIpSpec {
-                subnet: SUBNET.into(),
-                address: None,
-                port: "projects/p1/ports/web".into(),
-            },
-            FloatingIpStatus::default(),
-        ))
+        .create(
+            &Resource::new(
+                meta(FIP),
+                FloatingIpSpec {
+                    subnet: SUBNET.into(),
+                    address: None,
+                    port: "projects/p1/ports/web".into(),
+                    delivery: Default::default(),
+                    announce: None,
+                },
+                FloatingIpStatus::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 
@@ -241,6 +286,7 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
         floating.clone(),
         subnets.clone(),
         ports.clone(),
+        TypedStore::new(raw.clone(), CELL, "load-balancers"),
         Some(fabric.admin.clone()),
     );
     // Three passes, one write each: the guard that makes a delete releasable,
@@ -251,12 +297,29 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
         sweep(&c, &floating).await.unwrap();
     }
 
-    let fips = client
-        .list_floating_ips(pb::ListFloatingIpsRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .floating_ips;
+    // Asked again until it is there, rather than once and immediately.
+    //
+    // The controller has told the fabric; the fabric applies through Raft, and
+    // append-commit-apply is asynchronous even for a single bootstrapped node.
+    // Reading straight after the push therefore sometimes reads the moment
+    // before it landed — which failed perhaps one full-workspace run in twenty,
+    // always here, always looking like the controller had done nothing.
+    //
+    // The assertion is unchanged: still exactly one, still that address. This
+    // only allows the system the moment it needs to get there.
+    let mut fips = Vec::new();
+    for _ in 0..50 {
+        fips = client
+            .list_floating_ips(pb::ListFloatingIpsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .floating_ips;
+        if fips.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(fips.len(), 1, "{fips:?}");
     // Not an address a port holds — .1 is the gateway, .10 and .11 are the two
     // ports, so the lowest free one is .2.
@@ -374,5 +437,179 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
     assert!(
         !gone.meta.has_finalizer(FABRIC_RELEASE_FINALIZER),
         "the guard stayed on after the fabric let go, pinning the record forever"
+    );
+}
+
+/// A **routed** address is a different thing on the fabric, and this is what
+/// makes that a property rather than a claim: nothing is allocated as a
+/// floating IP and nothing is associated — the address is bound to the port, so
+/// the datapath accepts it as a source from that port and delivers it as a
+/// destination to it. That is what "the guest holds the address" means down
+/// here.
+#[tokio::test]
+async fn a_routed_address_is_bound_to_the_port_rather_than_translated() {
+    let Some(binary) = controller_binary() else {
+        eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
+        return;
+    };
+    let Some(fabric) = Fabric::start(&binary, 50985).await else {
+        eprintln!("skipped: the fabric controller would not start here");
+        return;
+    };
+
+    let raw: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let networks: TypedStore<NetworkSpec, NetworkStatus> =
+        TypedStore::new(raw.clone(), CELL, "networks");
+    let subnets: TypedStore<SubnetSpec, SubnetStatus> =
+        TypedStore::new(raw.clone(), CELL, "subnets");
+    let ports: TypedStore<PortSpec, PortStatus> = TypedStore::new(raw.clone(), CELL, "ports");
+    let floating: TypedStore<FloatingIpSpec, FloatingIpStatus> =
+        TypedStore::new(raw.clone(), CELL, "floatingips");
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+
+    networks
+        .create(
+            &Resource::new(
+                meta(NETWORK),
+                NetworkSpec {
+                    vni: VNI,
+                    mtu: 1500,
+                    // The prefix on this network's subnets is real. The fabric
+                    // is told nothing about that — what "external" means is a
+                    // fact about the world above it.
+                    external: true,
+                    announce: velstra_cloud_model::public::Announce::FromHost,
+                },
+                NetworkStatus::default(),
+            ),
+            &writer,
+        )
+        .await
+        .unwrap();
+    subnets
+        .create(
+            &Resource::new(
+                meta(SUBNET),
+                SubnetSpec {
+                    network: NETWORK.into(),
+                    cidr: "10.40.0.0/24".into(),
+                    gateway: "10.40.0.1".into(),
+                    dns: vec![],
+                    reserved: vec![],
+                },
+                SubnetStatus::default(),
+            ),
+            &writer,
+        )
+        .await
+        .unwrap();
+
+    let mut port = Resource::new(
+        meta("projects/p1/ports/web"),
+        PortSpec {
+            network: NETWORK.into(),
+            subnet: SUBNET.into(),
+            address: Some("10.40.0.10".into()),
+            ..Default::default()
+        },
+        PortStatus::default(),
+    );
+    port.status.node = Some(HOST.into());
+    port.status.tap_device = Some("vt-web".into());
+    ports.create(&port, &writer).await.unwrap();
+
+    let net_controller = NetworkController::new(
+        raw.clone(),
+        CELL,
+        subnets.clone(),
+        Some(fabric.admin.clone()),
+    );
+    sweep(&net_controller, &networks).await.unwrap();
+
+    let mut client = velstra_cloud_fabric::connect(&fabric.admin).await.unwrap();
+    client
+        .add_host(pb::HostSpec {
+            id: HOST.into(),
+            vtep: "10.0.0.1".into(),
+            underlay_iface: "eth0".into(),
+            underlay_mac: "02:00:00:00:00:01".into(),
+            encap: pb::Encap::Vxlan as i32,
+            udp_port: 0,
+            underlay_mtu: 0,
+            srv6_locator: String::new(),
+        })
+        .await
+        .expect("declaring the host");
+    client
+        .create_port(pb::CreatePortRequest {
+            network: VNI,
+            host: HOST.into(),
+            tap: "vt-web".into(),
+            ip: "10.40.0.10".into(),
+            policy: None,
+            mac: None,
+        })
+        .await
+        .expect("creating the fabric port");
+
+    floating
+        .create(
+            &Resource::new(
+                meta(FIP),
+                FloatingIpSpec {
+                    subnet: SUBNET.into(),
+                    address: None,
+                    port: "projects/p1/ports/web".into(),
+                    delivery: velstra_cloud_model::public::Delivery::Routed,
+                    announce: None,
+                },
+                FloatingIpStatus::default(),
+            ),
+            &writer,
+        )
+        .await
+        .unwrap();
+
+    let c = FloatingIpController::new(
+        raw.clone(),
+        CELL,
+        floating.clone(),
+        subnets.clone(),
+        ports.clone(),
+        TypedStore::new(raw.clone(), CELL, "load-balancers"),
+        Some(fabric.admin.clone()),
+    );
+    for _ in 0..3 {
+        sweep(&c, &floating).await.unwrap();
+    }
+
+    let after = floating.get(FIP).await.unwrap().unwrap();
+    assert_eq!(after.spec.address.as_deref(), Some("10.40.0.2"));
+    // Nothing was allocated as a floating IP: there is nothing to translate,
+    // so there is no translation to hold an id for.
+    assert!(after.status.fabric_id.is_empty(), "{:?}", after.status);
+    assert!(
+        format!("{:?}", after.status.conditions).contains("Held By The Guest"),
+        "{:?}",
+        after.status.conditions
+    );
+    let fips = client
+        .list_floating_ips(pb::ListFloatingIpsRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .floating_ips;
+    assert!(
+        fips.is_empty(),
+        "a routed address was allocated as a translated one: {fips:?}"
+    );
+
+    // And a settled one costs nothing, like everything else here.
+    let before = after.meta.revision;
+    sweep(&c, &floating).await.unwrap();
+    assert_eq!(
+        floating.get(FIP).await.unwrap().unwrap().meta.revision,
+        before,
+        "a settled routed address was written again"
     );
 }
