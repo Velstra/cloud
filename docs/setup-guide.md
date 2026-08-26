@@ -5,6 +5,10 @@ console, once from a file with nobody watching. Both end at the same place —
 the same seed, the same units, the same objects — because they are the same two
 halves in a different order.
 
+**Running this at home, on one machine?** Start at §0, which is the whole thing
+for a single box. A cell of one is a supported shape, not a cut-down one: the
+same roles, the same objects, all on the same host.
+
 ## The two halves
 
 Every machine in a cell is described in two places, and keeping them apart is
@@ -22,6 +26,72 @@ traffic.
 
 So the order is always: **the cell is told a machine is coming** (and hands out
 a token), then **the machine is told what it is** (and uses the token).
+
+---
+
+## 0. One machine, all of it
+
+The smallest real installation is **one box that is every role**, and it is a
+supported shape rather than a degraded one. If that is what you want, this
+section is the whole guide; the rest is for when you add a second machine.
+
+On Debian:
+
+```
+sudo dpkg -i velstra-cloud_*.deb
+sudo velstra-cloud-node setup
+```
+
+Answer `1 2 3` at the roles question — control plane, hypervisor and storage
+pool together. Then enable the four units it names. A single-member etcd comes
+with the control plane, so there is nothing else to install.
+
+On NixOS, the same thing declared:
+
+```nix
+{
+  imports = with velstra.nixosModules; [ controlPlane node pool ];
+  velstra.cloud = {
+    controlPlane = {
+      enable = true;
+      package = velstra-cloud;
+      listen = "0.0.0.0:8443";
+      cell = "cell-1";
+      region = "eu-central";
+      cellAdmins = [ "ops" ];
+      tokenFile = "/etc/velstra/tokens";
+    };
+    node.enable = true;
+    pool = { enable = true; id = "local"; backend = "directory"; store = "127.0.0.1:2379"; };
+  };
+}
+```
+
+Then create the node and pool objects through the console (§2 and §4) with the
+ids this machine's seed uses, and it is a cell.
+
+**What one machine changes, honestly:**
+
+* **Nothing to spread across.** `spread` and `affinity` set to `Preferred` still
+  place — the guest runs beside its sibling rather than not at all. Set to
+  `Required` they are refused, and `:explainPlacement` names this node and the
+  rule. That refusal is the correct answer, not a bug.
+* **A backup on the same machine survives a lost pool, not a lost machine.** A
+  target on a second disk is worth having; a target on a NAS is worth more. The
+  platform refuses a target that is the volume's own pool and will not pretend
+  otherwise.
+* **Maintenance has nowhere to evacuate to.** You can still drain the node —
+  it is your machine — and `:explainMaintenance` says what it costs.
+* **No overlay needed.** Skip §5 entirely. Without a fabric, guests get real tap
+  devices and reach the network; what you do not get is tenant separation, which
+  is not what a household is asking for. A network carrying security groups is
+  then refused rather than silently unenforced.
+* **etcd is a single member.** Fine for one machine — it is the same disk either
+  way. It is not an HA story, and the platform does not claim one.
+
+`nix build .#checks.x86_64-linux.single-node` runs exactly this: all three roles
+on one 2 GiB machine, a volume provisioned locally, a guest placed, and both
+halves of the placement behaviour above.
 
 ---
 
@@ -165,20 +235,85 @@ enables. `setup` prints the module snippet for the answers it was given:
 ## 4. Storage
 
 A pool is not a machine — several nodes reach one Ceph pool, one node may export
-three volume groups — so it is its own role and its own module. Register the
-pool object, then give the machine the `pool` role:
+three volume groups — so it is its own role and its own module.
 
-```
-curl -fsS -X POST … -d '{"id": "nvme", "spec": {"accepting": true}}' …/api/v1/pools
-```
+Same two halves as a node, same order: **Pools → New pool** in the console (or a
+`POST` to `/api/v1/pools`), then give the machine the `pool` role with that id
+in its seed.
 
-The id in the seed has to match: every volume is written against it, and a
-mismatch is a pool that claims nothing and volumes that are never provisioned —
-quietly.
+The id has to match. Every volume is written against it, and a mismatch is a
+pool that claims nothing and volumes that are never provisioned — quietly.
+Creating the object before writing the seed is what stops that, which is why it
+is worth the extra step rather than letting an agent invent one.
+
+Unlike a node, a pool is handed no token: its agent authenticates with one you
+supply (`velstra.cloud.pool.tokenFile`, or `--api-token-file`).
 
 ---
 
-## 5. More than one cell
+## 5. The data plane
+
+Everything so far decides what *should* be true — which guest is on which
+network, which rules apply to its port. The fabric is what makes it true on the
+wire, and it is the one part of a cell that can be missing without anything
+looking wrong: guests boot, addresses are handed out, every dashboard is green,
+and tenant networks separate no traffic.
+
+So it is asked for explicitly and never guessed.
+
+**Two addresses, and they are different services.** The fabric controller
+serves them on different ports for different audiences:
+
+| | Seed key | Who talks to it | Asked to |
+|---|---|---|---|
+| Orchestrator | `VELSTRA_FABRIC` | control plane, node agent | create a port, a network, a route |
+| Config service | `VELSTRA_FABRIC_CONTROL` | the eBPF agent on each node | say what this host should be running |
+
+Pointing either at the other's port gets `unimplemented`, which is a confusing
+way to learn this. Worth knowing before you widen anything: fabric binds the
+orchestrator to **localhost** by default and offers mTLS on the config service
+only — so giving every hypervisor a route to the orchestrator is a real
+decision, because that channel can reconfigure any node in the cell.
+
+On the control plane:
+
+```nix
+velstra.cloud.controlPlane.fabric = "http://fabric.cell-1:50052";
+```
+
+On a hypervisor, the seed carries both, plus this host's own place on the wire:
+
+```sh
+VELSTRA_FABRIC=http://fabric.cell-1:50052
+VELSTRA_FABRIC_CONTROL=http://fabric.cell-1:50051
+VELSTRA_FABRIC_VTEP=10.0.0.7          # what other hosts send frames to
+VELSTRA_FABRIC_UNDERLAY=eth1          # the interface that address is on
+VELSTRA_FABRIC_SRV6_LOCATOR=fc00:0:1::/64   # optional; empty stays VXLAN
+```
+
+The VTEP address is stated rather than derived: nothing on a machine can tell
+which of its addresses its peers route to, and picking one would pick wrong on
+every host with more than one interface. The locator is the same argument one
+step further — it is a slice of your own IPv6 plan, has to be routable in the
+underlay and unique per host, and nothing local knows any of that.
+
+Naming a fabric and leaving out this host's place on it is **an error**, not a
+default. That combination is the failure that looks most like success.
+
+On NixOS the unit comes with the node module once you give it the agent:
+
+```nix
+velstra.cloud.node.fabricAgent = pkgs.velstra;   # the fabric agent
+```
+
+On Debian the agent is a `Recommends:` — install the `velstra` package, then
+`systemctl enable --now velstra-fabric-agent`. Either way the unit skips itself
+on a machine whose seed names no fabric, and says so in the journal rather than
+turning red.
+
+---
+
+## 6. More than one cell
 
 A cell is the failure and scaling domain: **a machine belongs to exactly one**,
 and growing means adding cells rather than making one bigger. Objects carry
@@ -201,7 +336,7 @@ behind must not turn propagation delay into an error a tenant sees.
 
 ---
 
-## 6. What to check when it does not work
+## 7. What to check when it does not work
 
 | Symptom | Ask |
 |---|---|

@@ -232,14 +232,17 @@ rather than pretending TCG proved the same thing.
 
 ## Deliberate seams
 
-- **Fabric datapath**: the fabric agent binary ships on the image, but no unit
-  starts it — its configuration comes from the fabric controller, and a
-  service pointed at a controller nobody has named would be a promise nothing
-  keeps. Wiring it is the fabric-integration task, not an image default.
+- **Fabric endpoint**: the agent has a unit now (`velstra-fabric-agent`), and
+  it starts when the seed names a fabric. What is still nobody's default is the
+  *address*: `VELSTRA_FABRIC_CONTROL` has to be answered, because a service
+  pointed at a controller nobody named would be a promise nothing keeps. A node
+  whose seed has no fabric skips the unit rather than failing it — running a
+  cell with no overlay is a real choice, and the skip says so in the journal.
 - **Update channel**: slot writer shipped, signed channel not yet (above).
-- **Sentinel input**: while both repos move together, the flake input points
-  at the sibling checkout (`git+file:`); a release pins the public Sentinel
-  revision instead. `nix flake update sentinel` after changing the factory.
+- **Sentinel input**: pinned to the public repository, so the flake evaluates
+  for anybody — it used to point at a sibling checkout by absolute path, which
+  is why none of these checks had ever run in CI. Working on both at once:
+  `--override-input sentinel path:../sentinel` for the length of one command.
 - **Local accounts**: the node image has none — fleet access is through the
   control plane, break-glass is the console on the ISO. If operations needs an
   on-box account, that is an installer question plus a module option, added
