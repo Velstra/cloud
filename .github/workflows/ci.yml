@@ -1,6 +1,6 @@
 name: CI
 
-# Three lanes, split by what each one needs from the machine:
+# Five lanes, split by what each one needs from the machine:
 #
 #   check    — the workspace: format, lints, and every test that only needs a
 #              CPU and an etcd. Runs on every push and every pull request.
@@ -14,7 +14,15 @@ name: CI
 #              change to the node agent, and the run itself is seconds once the
 #              fixtures are cached.
 #
-# The nightly schedule re-runs all three unchanged. Nothing here is nightly-only:
+#   nix-sandbox — the flake's checks that need nothing but a CPU: the Debian
+#              package and its unit assertions, the setup wizard driven answer
+#              by answer, the console page, the dev smoke test. Minutes, so it
+#              runs on every push and pull request.
+#   nix-vm   — the flake's checks that boot a NixOS machine, one job each.
+#              Nightly and on demand: each builds a system closure and boots it,
+#              which on a two-vCPU hosted runner is tens of minutes even warm.
+#
+# The nightly schedule re-runs the first three unchanged. Nothing here is nightly-only:
 # it exists to catch what moves underneath us — a new nightly rustfmt, a mirror
 # that stopped serving an image, a hosted runner that lost KVM — on a day when
 # nobody is waiting on a merge.
@@ -279,3 +287,151 @@ jobs:
             exit 1
           fi
           echo "$booted guests booted."
+
+  # The Nix checks, split by what they cost.
+  #
+  # None of these had ever run on a runner, and the reason was one line: the
+  # `sentinel` input pointed at `git+file:///home/…`, so the flake could not be
+  # evaluated by anybody but its author. That is fixed at the source — it points
+  # at the public repository now, and a developer working on both at once passes
+  # `--override-input sentinel path:../sentinel` for the length of one command.
+  #
+  # Two jobs, because the two halves are not comparable. `nix-sandbox` builds
+  # what needs nothing but a CPU: the Debian package and its unit assertions, the
+  # setup wizard driven answer by answer, the console page, the dev smoke test.
+  # A few minutes, so it runs on every pull request. `nix-vm` boots real virtual
+  # machines — a NixOS system per check — and is the expensive half.
+  nix-sandbox:
+    name: nix — sandbox checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+
+      # Keeps the Rust build and the nixpkgs closure between runs. Without it
+      # every job rebuilds the workspace from source under Nix, which is the
+      # same work the `check` job above already did with a warm cargo cache.
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      # Evaluation first, and on its own: a typo in a module fails here in
+      # seconds with a line number, rather than after twenty minutes of building
+      # something else.
+      - name: Does it evaluate
+        run: nix flake check --no-build
+
+      # Every check the flake exposes is named by one of the two lanes.
+      #
+      # Without this, adding a thirteenth check runs it nowhere — and nothing
+      # says so, because a lane that lists eight names and runs eight names is
+      # green. That is the same silence this repository keeps finding in its own
+      # features, and the workflow is not exempt from it.
+      - name: No check runs nowhere
+        run: |
+          set -euo pipefail
+          exposed=$(nix eval --raw --impure --expr \
+            'builtins.concatStringsSep "\n" (builtins.attrNames (builtins.getFlake (toString ./.)).checks.x86_64-linux)')
+          missing=
+          for check in $exposed; do
+            # Matched as a whole word: `guest` must not be satisfied by
+            # `guests`, which is a different lane entirely.
+            grep -qE "(^|[^a-z-])$check([^a-z-]|$)" .github/workflows/ci.yml || missing="$missing $check"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::these flake checks are run by no lane:$missing"
+            exit 1
+          fi
+          echo "$(echo "$exposed" | wc -l) checks, all named by a lane."
+
+      - name: Sandbox checks
+        run: |
+          set -euo pipefail
+          for check in deb setup console dev-smoke; do
+            echo "::group::$check"
+            nix build ".#checks.x86_64-linux.$check" --no-link -L
+            echo "::endgroup::"
+          done
+
+  # The virtual-machine checks: a NixOS system per check, booted for real.
+  #
+  # Nightly and on demand rather than per pull request, and the reason is
+  # honest rather than principled — each of these builds a system closure and
+  # boots it, and on a two-vCPU hosted runner that is tens of minutes even with
+  # the cache warm. The cheap half above runs on every change; this half runs
+  # every night, which is where a mirror that stopped serving an image or a
+  # runner that lost KVM shows up.
+  #
+  # `workflow_dispatch` is deliberate: the moment to run this by hand is a
+  # change to a NixOS module, and that is a judgement the author can make.
+  #
+  # If this ever needs to be per-pull-request, the answer is a self-hosted
+  # runner with a persistent store, not trimming the list.
+  nix-vm:
+    name: nix — virtual machines
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      # One failing check must not hide the others: these are independent
+      # machines and knowing that three of seven broke is worth more than
+      # knowing that one did.
+      fail-fast: false
+      matrix:
+        check:
+          - single-node
+          - register
+          - guest
+          - storage
+          - maintenance
+          - fabric-agent
+          - wizard
+          - node-image-boots
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same rule as the `guests` job: /dev/kvm is present on hosted x86 Linux
+      # runners but not writable by this user, and a nixosTest without it falls
+      # back to software emulation slowly enough to look like a hang.
+      - name: Let this user open /dev/kvm
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is not writable — these checks would emulate, not boot."
+            ls -l /dev/kvm || true
+            exit 1
+          fi
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            system-features = nixos-test benchmark big-parallel kvm
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      # `--keep-failed` is the point of this step, not a flourish. A nixosTest
+      # writes its machines' journals and its screenshots into the build
+      # directory, and Nix deletes that directory on failure unless told not to
+      # — so without this the artifact upload below would faithfully collect
+      # nothing, every time, and look like it was working.
+      - name: ${{ matrix.check }}
+        run: nix build ".#checks.x86_64-linux.${{ matrix.check }}" --no-link --keep-failed -L
+
+      # What the machines said, which on a failure is the whole diagnosis: the
+      # test script's log, each VM's journal, and the screenshot taken when an
+      # assertion tripped.
+      - name: Keep what the machines said
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nixos-test-${{ matrix.check }}
+          path: /tmp/nix-build-*
+          retention-days: 7
+          if-no-files-found: warn

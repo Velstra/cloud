@@ -41,7 +41,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     roles::{Role, render_list},
-    wizard::{ask_valid, ask_yes, prompt, validate_node_name, validate_token, validate_url},
+    wizard::{
+        ask_valid, ask_yes, prompt, validate_interface, validate_ip, validate_node_name,
+        validate_srv6_locator, validate_token, validate_url,
+    },
 };
 
 /// Where the seed lives, on every kind of machine.
@@ -71,6 +74,41 @@ pub struct Machine {
     pub store: String,
     /// The other cells this installation can reach, as `cell=url` pairs.
     pub cells: Vec<String>,
+    /// The fabric, if this cell has one. See [`Fabric`].
+    pub fabric: Option<Fabric>,
+}
+
+/// Where the data plane is, from this machine's point of view.
+///
+/// **Two endpoints, and they are not interchangeable.** The fabric controller
+/// serves its orchestrator on one address and its agent-facing config service
+/// on another, because they have different audiences: the orchestrator is asked
+/// to *create a port*, the config service is asked *what should I be running*.
+/// Pointing either at the other's port gets `unimplemented`, which is a
+/// confusing way to learn this.
+///
+/// A note worth reading before widening anything: fabric binds the orchestrator
+/// to localhost by default and offers mTLS only on the agent-facing one. Giving
+/// every hypervisor in a cell a route to the orchestrator is therefore a real
+/// decision — that channel can reconfigure any node, not just the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fabric {
+    /// The orchestrator (fabric's `--admin-listen`, default `:50052`). Ports
+    /// and networks are created here, by the control plane and by the node
+    /// agent.
+    pub orchestrator: String,
+    /// The agent-facing config service (fabric's `--listen`, default `:50051`),
+    /// which the eBPF agent watches for its own configuration.
+    pub control: String,
+    /// The address other hosts send this one's encapsulated frames to. Stated
+    /// rather than guessed: nothing on a machine can tell which of its
+    /// addresses its peers route to.
+    pub vtep: String,
+    /// The interface that address is on; its MAC is read from the machine.
+    pub underlay: String,
+    /// This host's SRv6 locator as `prefix/len`. Set, it puts the host on the
+    /// SRv6 wire family instead of VXLAN; empty leaves it on VXLAN.
+    pub srv6_locator: String,
 }
 
 /// Render the seed. Exactly the keys that were answered, one per line.
@@ -104,6 +142,20 @@ pub fn render(m: &Machine) -> String {
         out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
         if !m.cells.is_empty() {
             out.push_str(&format!("VELSTRA_CELLS={}\n", m.cells.join(",")));
+        }
+    }
+    if let Some(f) = &m.fabric {
+        // The orchestrator is written for both roles that talk to it; the rest
+        // describes *this host's* place on the wire and is a hypervisor's.
+        out.push_str(&format!("VELSTRA_FABRIC={}\n", f.orchestrator));
+        if m.roles.contains(&Role::Hypervisor) {
+            out.push_str(&format!(
+                "VELSTRA_FABRIC_CONTROL={}\nVELSTRA_FABRIC_VTEP={}\nVELSTRA_FABRIC_UNDERLAY={}\n",
+                f.control, f.vtep, f.underlay
+            ));
+            if !f.srv6_locator.is_empty() {
+                out.push_str(&format!("VELSTRA_FABRIC_SRV6_LOCATOR={}\n", f.srv6_locator));
+            }
         }
     }
     out
@@ -165,6 +217,7 @@ pub fn parse(text: &str) -> Result<Machine> {
             .get("VELSTRA_CELLS")
             .map(|v| v.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect())
             .unwrap_or_default(),
+        fabric: None,
     };
     // Only what the named roles actually need. A file for a pool that had to
     // carry a node id would be a file with a value nobody reads, and the first
@@ -179,6 +232,45 @@ pub fn parse(text: &str) -> Result<Machine> {
         m.pool = need("VELSTRA_POOL")?;
         if m.api_url.is_empty() && !roles.contains(&Role::ControlPlane) {
             m.api_url = need("VELSTRA_API_URL")?;
+        }
+    }
+    // A fabric is optional: a cell that programs no overlay is a real way to
+    // run, and it is what every cell did before this existed. A *half* fabric
+    // is not. Naming the orchestrator and leaving out this host's place on the
+    // wire produces a node that starts, registers, reports healthy and carries
+    // no tenant traffic — the failure that looks most like success, so it is
+    // refused here where the answer is still a file somebody is editing.
+    let orchestrator = or("VELSTRA_FABRIC", "");
+    if !orchestrator.is_empty() {
+        let mut fabric = Fabric {
+            orchestrator,
+            control: String::new(),
+            vtep: String::new(),
+            underlay: String::new(),
+            srv6_locator: or("VELSTRA_FABRIC_SRV6_LOCATOR", ""),
+        };
+        if roles.contains(&Role::Hypervisor) {
+            fabric.control = need("VELSTRA_FABRIC_CONTROL")?;
+            fabric.vtep = need("VELSTRA_FABRIC_VTEP")?;
+            fabric.underlay = need("VELSTRA_FABRIC_UNDERLAY")?;
+        }
+        m.fabric = Some(fabric);
+    } else {
+        // The other way round is the same mistake mirrored: answers about a
+        // fabric with no fabric named. Silently ignoring them would leave
+        // somebody certain the overlay is on.
+        for key in [
+            "VELSTRA_FABRIC_CONTROL",
+            "VELSTRA_FABRIC_VTEP",
+            "VELSTRA_FABRIC_UNDERLAY",
+            "VELSTRA_FABRIC_SRV6_LOCATOR",
+        ] {
+            if values.get(key).is_some_and(|v| !v.is_empty()) {
+                bail!(
+                    "{key} is set but VELSTRA_FABRIC is not, so nothing would read it — \
+                     name the fabric orchestrator, or remove {key}"
+                );
+            }
         }
     }
     Ok(m)
@@ -228,6 +320,14 @@ pub fn run_with(
                 println!("  systemctl enable --now {unit}");
             }
         }
+        // Not one of the roles: the data plane is a separate package this one
+        // only recommends, and naming it for a machine whose cell has no fabric
+        // would be telling somebody to enable a service that will skip itself.
+        if machine.fabric.is_some() && machine.roles.contains(&Role::Hypervisor) {
+            println!("  systemctl enable --now velstra-fabric-agent");
+            println!("\nThat last one needs the fabric agent itself (the `velstra` package).");
+            println!("Without it the unit skips and tenant networks separate no traffic.");
+        }
     }
     if machine.roles.contains(&Role::Hypervisor) {
         println!(
@@ -256,10 +356,21 @@ pub fn nix_snippet(m: &Machine) -> String {
             }
             out.push_str("      };\n");
         }
+        if let Some(f) = &m.fabric {
+            out.push_str(&format!("      fabric = \"{}\";\n", f.orchestrator));
+        }
         out.push_str("    };\n");
     }
     if m.roles.contains(&Role::Hypervisor) {
+        // Only `enable`: everything else a node needs is in the seed this same
+        // run just wrote, and its units read it from there. Restating the
+        // answers here would put one fact in two files that can disagree —
+        // which is the difference between this module and the control plane's,
+        // where there is no seed and the declaration *is* the answer.
         out.push_str("    node.enable = true;\n");
+        if m.fabric.is_some() {
+            out.push_str("    # node.fabricAgent = <the fabric agent package>;\n");
+        }
     }
     if m.roles.contains(&Role::Pool) {
         out.push_str(&format!(
@@ -346,6 +457,7 @@ fn collect() -> Result<Option<Machine>> {
         pool_backend: "directory".into(),
         store: "127.0.0.1:2379".into(),
         cells: Vec::new(),
+        fabric: None,
     };
 
     // Everything that is not the control plane has to be told where the API is.
@@ -410,6 +522,68 @@ fn collect() -> Result<Option<Machine>> {
         }
     }
 
+    // The overlay. Asked last because it is the one answer a cell can honestly
+    // decline: without it guests still boot, still get addresses, and reach
+    // each other on no tenant network at all. Saying so here is the point —
+    // that outcome is indistinguishable from success on every dashboard.
+    println!("\nDoes this cell have a fabric? Without one the platform still places guests");
+    println!("and allocates addresses, but nothing programs a data plane: tenant networks");
+    println!("exist as records and separate no traffic.");
+    if ask_yes("Name a fabric?", false)? {
+        println!("\nTwo addresses, and they are different services. The orchestrator is where");
+        println!("ports and networks are created; the config service is what the eBPF agent");
+        println!("watches for its own configuration. Fabric binds the orchestrator to");
+        println!("localhost by default — reaching it from here may mean widening it, and that");
+        println!("channel can reconfigure any node in the cell.");
+        let orchestrator = ask_valid(
+            "Orchestrator URL (http://host:50052): ",
+            validate_url,
+            "a URL with a scheme and a host",
+        )?;
+        let mut fabric = Fabric {
+            orchestrator,
+            control: String::new(),
+            vtep: String::new(),
+            underlay: String::new(),
+            srv6_locator: String::new(),
+        };
+        if roles.contains(&Role::Hypervisor) {
+            fabric.control = ask_valid(
+                "Config service URL (http://host:50051): ",
+                validate_url,
+                "a URL with a scheme and a host",
+            )?;
+            println!("\nThis host's place on the wire. The VTEP address is stated rather than");
+            println!("guessed: nothing here can tell which of this machine's addresses its peers");
+            println!("route to, and picking one would pick wrong on every multi-homed host.");
+            fabric.vtep = ask_valid(
+                "VTEP address: ",
+                validate_ip,
+                "an IP address other hosts route to",
+            )?;
+            fabric.underlay = ask_valid(
+                "Underlay interface: ",
+                validate_interface,
+                "the interface that address is on",
+            )?;
+            println!("\nAn SRv6 locator puts this host on the SRv6 wire family instead of VXLAN.");
+            println!("It is a slice of your own IPv6 plan, routable in the underlay and unique");
+            println!("per host — nothing on this machine knows any of that. Empty stays VXLAN.");
+            fabric.srv6_locator = loop {
+                let raw = prompt("SRv6 locator (prefix/len, optional): ")?;
+                let raw = raw.trim().to_string();
+                if raw.is_empty() {
+                    break raw;
+                }
+                match validate_srv6_locator(&raw) {
+                    Ok(()) => break raw,
+                    Err(e) => println!("  {e:#} — expected an IPv6 prefix like fc00:0:1::/64."),
+                }
+            };
+        }
+        m.fabric = Some(fabric);
+    }
+
     println!("\n{}", render(&m));
     if !ask_yes("Write this?", true)? {
         return Ok(None);
@@ -453,6 +627,17 @@ mod tests {
             pool_backend: "directory".into(),
             store: "127.0.0.1:2379".into(),
             cells: Vec::new(),
+            fabric: None,
+        }
+    }
+
+    fn fabric() -> Fabric {
+        Fabric {
+            orchestrator: "http://fab:50052".into(),
+            control: "http://fab:50051".into(),
+            vtep: "10.0.0.7".into(),
+            underlay: "eth1".into(),
+            srv6_locator: String::new(),
         }
     }
 
@@ -587,5 +772,72 @@ mod tests {
             resolve_roles("3 1").unwrap(),
             vec![Role::ControlPlane, Role::Pool]
         );
+    }
+
+    /// A hypervisor's fabric answers describe *this host's* place on the wire,
+    /// so they belong in its seed. A control plane needs only the orchestrator:
+    /// it creates networks there and encapsulates nothing itself.
+    #[test]
+    fn a_fabric_seed_carries_the_wire_for_a_hypervisor_and_not_for_a_control_plane() {
+        let mut m = hypervisor();
+        m.fabric = Some(fabric());
+        let rendered = render(&m);
+        assert!(rendered.contains("VELSTRA_FABRIC=http://fab:50052\n"), "{rendered}");
+        assert!(rendered.contains("VELSTRA_FABRIC_CONTROL=http://fab:50051\n"), "{rendered}");
+        assert!(rendered.contains("VELSTRA_FABRIC_VTEP=10.0.0.7\n"), "{rendered}");
+        assert!(rendered.contains("VELSTRA_FABRIC_UNDERLAY=eth1\n"), "{rendered}");
+        // Not asked, so not written — an empty locator would read as a decision.
+        assert!(!rendered.contains("SRV6_LOCATOR"), "{rendered}");
+
+        let mut cp = hypervisor();
+        cp.roles = vec![Role::ControlPlane];
+        cp.fabric = Some(fabric());
+        let rendered = render(&cp);
+        assert!(rendered.contains("VELSTRA_FABRIC=http://fab:50052\n"), "{rendered}");
+        assert!(!rendered.contains("VELSTRA_FABRIC_VTEP"), "{rendered}");
+    }
+
+    #[test]
+    fn a_fabric_seed_round_trips() {
+        let mut m = hypervisor();
+        let mut f = fabric();
+        f.srv6_locator = "fc00:0:1::/64".into();
+        m.fabric = Some(f.clone());
+        let back = parse(&render(&m)).unwrap();
+        assert_eq!(back.fabric, Some(f));
+    }
+
+    /// The failure this refusal exists for: a node that starts, registers,
+    /// reports healthy and carries no tenant traffic, because the overlay was
+    /// named and this host's place on it was not.
+    #[test]
+    fn a_half_named_fabric_is_refused_naming_the_missing_key() {
+        let text = "VELSTRA_ROLES=hypervisor\nVELSTRA_API_URL=https://c:8443\n\
+                    VELSTRA_NODE=node-a\nVELSTRA_FABRIC=http://fab:50052\n";
+        let why = parse(text).unwrap_err().to_string();
+        assert!(why.contains("VELSTRA_FABRIC_CONTROL"), "{why}");
+
+        let text = format!("{text}VELSTRA_FABRIC_CONTROL=http://fab:50051\n");
+        let why = parse(&text).unwrap_err().to_string();
+        assert!(why.contains("VELSTRA_FABRIC_VTEP"), "{why}");
+    }
+
+    /// And the mirror image: answers about a fabric with no fabric named. They
+    /// would be read by nobody, and leave somebody certain the overlay is on.
+    #[test]
+    fn wire_answers_without_a_fabric_are_refused_rather_than_ignored() {
+        let text = "VELSTRA_ROLES=hypervisor\nVELSTRA_API_URL=https://c:8443\n\
+                    VELSTRA_NODE=node-a\nVELSTRA_FABRIC_VTEP=10.0.0.7\n";
+        let why = parse(text).unwrap_err().to_string();
+        assert!(why.contains("VELSTRA_FABRIC_VTEP"), "{why}");
+        assert!(why.contains("VELSTRA_FABRIC is not"), "{why}");
+    }
+
+    /// A cell with no fabric stays legitimate: this is what every cell did
+    /// before the overlay existed, and it must not become an error.
+    #[test]
+    fn a_cell_with_no_fabric_is_still_a_cell() {
+        let text = "VELSTRA_ROLES=hypervisor\nVELSTRA_API_URL=https://c:8443\nVELSTRA_NODE=node-a\n";
+        assert_eq!(parse(text).unwrap().fabric, None);
     }
 }

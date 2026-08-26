@@ -125,6 +125,29 @@ in
       '';
     };
 
+    fabric = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "http://fabric.cell-1.example:50051";
+      description = ''
+        Where this cell's fabric orchestrator answers.
+
+        Set it and every tenant network, router, port and load balancer is
+        mirrored there as it is decided here — which is the only way the data
+        plane learns what a VNI *is*. Leave it `null` and the control plane
+        still runs, still places guests and still hands out addresses; they
+        reach each other on no overlay, because nothing was ever programmed.
+
+        That is a legitimate way to run a cell, and it is also the failure that
+        looks most like success: everything reports healthy and no packet
+        crosses. Which is why this has no default — a guessed endpoint would be
+        a cell that mirrors into the void without saying so.
+
+        The nodes need the same address: see `velstra.cloud.node.fabric`, which
+        is what actually starts an agent on the machine.
+      '';
+    };
+
     writesPerSecond = lib.mkOption {
       type = lib.types.nullOr lib.types.ints.unsigned;
       default = null;
@@ -232,6 +255,7 @@ in
           ++ lib.optional (
             cfg.resyncSeconds != null
           ) "--resync-interval ${toString cfg.resyncSeconds}"
+          ++ lib.optional (cfg.fabric != null) "--fabric ${cfg.fabric}"
         );
       };
     };
