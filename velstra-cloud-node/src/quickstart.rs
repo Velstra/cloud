@@ -36,7 +36,7 @@ use anyhow::{Context, Result, bail};
 use crate::{
     roles::Role,
     setup::{Machine, SEED_DIR},
-    wizard::{ask_valid, prompt, prompt_secret, validate_node_name},
+    wizard::{prompt, prompt_secret, validate_node_name},
 };
 
 /// How long to wait for the API to answer after enabling it.
@@ -71,12 +71,23 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
 
     let node_id = match node {
         Some(id) => id,
-        None => ask_valid(
-            "A name for this machine [home-1]: ",
-            validate_node_name,
-            "lowercase letters, digits and '-'",
-        )
-        .map(|s| if s.is_empty() { "home-1".into() } else { s })?,
+        None => {
+            // Its hostname, not a name this installer made up. `home-1` was a
+            // laboratory name in a product that is meant to run somebody's
+            // estate, and a default nobody chose is one that ends up on real
+            // machines because it was there.
+            let suggestion = crate::wizard::suggested_node_name(&crate::wizard::hostname());
+            let question = match &suggestion {
+                Some(name) => format!("A name for this machine [{name}]: "),
+                None => "A name for this machine: ".to_string(),
+            };
+            crate::wizard::ask_valid_or(
+                suggestion.as_deref().unwrap_or(""),
+                &question,
+                validate_node_name,
+                "lowercase letters, digits and '-'",
+            )?
+        }
     };
 
     let listen = match listen {
