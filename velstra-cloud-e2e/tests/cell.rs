@@ -49,6 +49,8 @@ const REGION: &str = "eu-central";
 const CELL: &str = "cell-1";
 /// The image every instance in this file boots from.
 const IMAGE: &str = "projects/p1/images/sha256-abc";
+/// What the bytes behind it are filed under, which is a different question.
+const IMAGE_DIGEST: &str = "sha256:17bfebfb2d61335a30fb1119cc9894ed15605293c627cf8428f28864a832bf5a";
 const TOKEN: &str = "e2e-token";
 
 /// Everything a cell is made of, sharing one store — which is the point: there
@@ -152,6 +154,7 @@ impl Cell {
                 self.instances.clone(),
                 self.nodes.clone(),
                 self.migrations.clone(),
+                self.images.clone(),
             )
             .with_maintenance(self.windows.clone()),
             &self.nodes,
@@ -199,7 +202,10 @@ impl Cell {
                 family: "debian-13".into(),
                 version: "20260815".into(),
                 source_instance: None,
-                digest: "sha256-abc".into(),
+                // A real-length digest, because the length is load-bearing now: the
+                // bytes are filed on a node under `sha256-<64 hex>`, and a
+                // short one is not a digest a node can verify anything against.
+                digest: IMAGE_DIGEST.into(),
                 format: ImageFormat::Raw,
                 size_bytes: 1024,
                 source_url: "file:///var/lib/velstra/images/abc.raw".into(),
@@ -610,7 +616,7 @@ async fn a_running_guest_moves_to_another_node_and_nobody_is_ever_in_two_places(
     // cannot start a receiver — and the platform refuses the migration rather
     // than finding out after the memory has been copied.
     for vmm in [&cell.vmm, &vmm_b] {
-        vmm.cache_image(IMAGE);
+        vmm.cache_image(IMAGE_DIGEST);
     }
 
     create_instance(&cell, "i1").await;
@@ -720,7 +726,7 @@ async fn a_transfer_that_fails_leaves_the_guest_running_where_it_was() {
     // cannot start a receiver — and the platform refuses the migration rather
     // than finding out after the memory has been copied.
     for vmm in [&cell.vmm, &vmm_b] {
-        vmm.cache_image(IMAGE);
+        vmm.cache_image(IMAGE_DIGEST);
     }
 
     create_instance(&cell, "i1").await;
@@ -831,7 +837,7 @@ async fn an_open_window_empties_a_machine_without_anybody_flipping_a_switch() {
     cell.add_node("node-b", 8, 16384).await;
     let (node_b, vmm_b) = cell.join("node-b");
     for vmm in [&cell.vmm, &vmm_b] {
-        vmm.cache_image(IMAGE);
+        vmm.cache_image(IMAGE_DIGEST);
     }
 
     create_instance(&cell, "i1").await;

@@ -333,6 +333,10 @@ impl Vmm for CloudHypervisorVmm {
     /// **Partly untested:** the directory and image scan are exercised by the
     /// tests below, and `tests/cloud_hypervisor_boots_a_guest.rs` reads a running guest's state back
     /// through it; asking systemd about receivers and transfers is not.
+    fn vmm_name(&self) -> &'static str {
+        "cloud-hypervisor"
+    }
+
     async fn observe(&self) -> Result<HostState> {
         // `can_mask: false`, on every architecture, and not a stopgap.
         //
@@ -361,6 +365,16 @@ impl Vmm for CloudHypervisorVmm {
             // name, so presence is verification. There is no marker file to
             // trust, and none to go stale.
             host.images.insert(unslug(&digest));
+        }
+
+        // What is on its way in. The incoming directory holds a copy that has
+        // not been verified and moved across yet — which is what a fetch in
+        // progress *is*, so there is nothing to record and nothing to go stale.
+        for name in hostfs::read_dir_names(&self.layout.incoming_dir).unwrap_or_default() {
+            let name = name.strip_suffix(".partial").unwrap_or(&name).to_string();
+            if !host.images.contains(&name) {
+                host.fetching.insert(name);
+            }
         }
 
         for entry in hostfs::read_dir_names(&self.layout.run_dir)? {
@@ -450,8 +464,8 @@ impl Vmm for CloudHypervisorVmm {
     /// Verify bytes that arrived in `incoming` and publish them under their
     /// digest. Fetching them is somebody else's job — this node's job is to
     /// refuse to boot anything it has not hashed itself.
-    async fn pull_image(&self, image: &str, source: &str) -> Result<()> {
-        hostfs::fetch_image(&self.layout, image, source).await
+    async fn pull_image(&self, image: &str, digest: &str, source: &str) -> Result<()> {
+        hostfs::fetch_image(&self.layout, image, digest, source).await
     }
 
     /// A sparse file of the asked-for size. Real, and covered by a test.
@@ -1158,14 +1172,20 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        let image = format!("projects/p1/images/sha256-{digest}");
-        std::fs::write(vmm.layout.incoming_dir.join(slug(&image)), bytes).unwrap();
+        // The object may be called anything; the bytes are filed under their
+        // digest, which is what makes one node's copy serve every name.
+        let image = "projects/p1/images/debian-13";
+        let value = format!("sha256:{digest}");
+        let stored = format!("sha256-{digest}");
+        std::fs::write(vmm.layout.incoming_dir.join(&stored), bytes).unwrap();
 
         // The source names a file that does not exist: the copy already in
         // `incoming` must be what is verified and published, and if the fetch
         // were attempted anyway this would fail rather than pass quietly.
-        vmm.pull_image(&image, "file:///nonexistent").await.unwrap();
-        assert!(vmm.observe().await.unwrap().images.contains(&image));
+        vmm.pull_image(image, &value, "file:///nonexistent")
+            .await
+            .unwrap();
+        assert!(vmm.observe().await.unwrap().images.contains(&stored));
     }
 
     #[tokio::test]
@@ -1178,12 +1198,13 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        let image = format!("projects/p1/images/sha256-{digest}");
-        let arrived = vmm.layout.incoming_dir.join(slug(&image));
+        let image = "projects/p1/images/debian-13";
+        let value = format!("sha256:{digest}");
+        let arrived = vmm.layout.incoming_dir.join(format!("sha256-{digest}"));
         std::fs::write(&arrived, b"something else entirely").unwrap();
 
         let err = vmm
-            .pull_image(&image, "file:///nonexistent")
+            .pull_image(image, &value, "file:///nonexistent")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("hashed to"), "{err}");
@@ -1202,6 +1223,10 @@ mod tests {
         let err = vmm(&scratch)
             .pull_image(
                 "projects/p1/images/ubuntu-latest",
+                // No digest at all: a name is not one, and this is the case the
+                // refusal is for — a node that downloads bytes it cannot check
+                // is a node whose tenant isolation rests on the network alone.
+                "",
                 "http://images.invalid/x",
             )
             .await

@@ -17,6 +17,7 @@ use clap::{Parser, ValueEnum};
 use velstra_cloud_nodeagent::{
     api_cell::ApiCell,
     ceph_pool::{CephConfig, CephPool},
+    lvm_pool::{LvmConfig, LvmPool},
     directory_pool::DirectoryPool,
     pool::{FakePool, PoolAgent, PoolConfig, Storage},
 };
@@ -31,6 +32,10 @@ enum Backend {
     /// image that lives once in the cluster, so nothing is copied per node and
     /// every node reaches every image.
     Ceph,
+    /// Logical volumes in one LVM volume group. A guest is handed the device
+    /// itself — no image format between it and the disk — and the volume group
+    /// is what most single-machine estates already have.
+    Lvm,
     /// A pool in a process. Everything it holds dies with it — useful for
     /// exercising the loop and for nothing else.
     Fake,
@@ -72,8 +77,22 @@ struct Args {
     #[arg(long, default_value = "/var/lib/velstra/images")]
     images: PathBuf,
 
+    /// The LVM volume group volumes are made in, for the lvm backend.
+    #[arg(long, env = "VELSTRA_LVM_GROUP")]
+    lvm_group: Option<String>,
+
+    /// A thin pool inside that group, if there is one.
+    ///
+    /// It changes what a snapshot costs and how it fails: a thick snapshot
+    /// reserves its own space up front and is dropped by the kernel when it
+    /// fills, a thin one costs nothing until something is written. Said rather
+    /// than detected, because using a thin pool that exists for something else
+    /// is not this agent's decision to make.
+    #[arg(long, env = "VELSTRA_LVM_THIN_POOL")]
+    lvm_thin_pool: Option<String>,
+
     /// The RBD pool volumes and their snapshots live in, for the ceph backend.
-    #[arg(long, default_value = "velstra-volumes")]
+    #[arg(long, env = "VELSTRA_CEPH_POOL", default_value = "velstra-volumes")]
     ceph_pool: String,
 
     /// The RBD pool images live in.
@@ -81,17 +100,17 @@ struct Args {
     /// Separate from `--ceph-pool` on purpose: an image is written once and read
     /// for years, a volume is written constantly, and the two want different
     /// replication, placement and quota. Clones across pools cost nothing.
-    #[arg(long, default_value = "velstra-images")]
+    #[arg(long, env = "VELSTRA_CEPH_IMAGE_POOL", default_value = "velstra-images")]
     ceph_image_pool: String,
 
     /// The Ceph client to act as. Its keyring has to be where `rbd` looks —
     /// this agent does not manage credentials, because a process that could
     /// write its own keyring could grant itself a cluster.
-    #[arg(long, default_value = "client.admin")]
+    #[arg(long, env = "VELSTRA_CEPH_USER", default_value = "client.admin")]
     ceph_user: String,
 
     /// `ceph.conf`, when it is not in the default place.
-    #[arg(long)]
+    #[arg(long, env = "VELSTRA_CEPH_CONF")]
     ceph_conf: Option<String>,
 
     /// Publish an image into the cluster and exit, instead of running the agent.
@@ -142,6 +161,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Chosen before any TLS is spoken, because rustls will not choose: with
+    // two providers compiled in (reqwest brings one, tokio-rustls the other) it
+    // panics at first use — the same failure the API had, found the same way,
+    // on a machine serving real traffic. This time it took the whole agent
+    // down in a restart loop.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -185,6 +210,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "ceph pool"
             );
             Arc::new(CephPool::new(ceph_config(&args)))
+        }
+        Backend::Lvm => {
+            let Some(group) = args.lvm_group.clone() else {
+                // Refused here rather than on the first volume: a pool agent
+                // that does not know which volume group it is for cannot be
+                // pointed at one later without a restart, and a machine usually
+                // has more than one.
+                return Err("--lvm-group names the volume group this pool makes its volumes in, \
+                            and the lvm backend has no default for it: a machine may have several \
+                            and guessing would put a tenant's bytes in whichever came first"
+                    .into());
+            };
+            let mut config = LvmConfig::new(&group);
+            config.thin_pool = args.lvm_thin_pool.clone();
+            tracing::info!(
+                group = %group,
+                thin = ?config.thin_pool,
+                "lvm pool"
+            );
+            Arc::new(LvmPool::new(config))
         }
         Backend::Fake => {
             tracing::warn!(

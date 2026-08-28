@@ -184,6 +184,8 @@ async fn seed(h: &Harness) {
                 ..Default::default()
             },
             NodeStatus {
+                vmm: "qemu".into(),
+            fetching: Vec::new(),
                 capacity: Capacity {
                     vcpus: 16,
                     memory_mib: 16384,

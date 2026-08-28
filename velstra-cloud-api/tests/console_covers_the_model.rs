@@ -717,6 +717,12 @@ fn computed_on_read(collection: &str, path: &str) -> Option<&'static str> {
             "which nodes hold a verified copy is an aggregate over every node's \
              own report; an image cannot write it and no controller owns it",
         ),
+        ("images", "status.fetchingOn") => Some(
+            "which nodes are downloading it right now is the same aggregate, taken \
+             over what each node reports as arriving. It is on the nodes' disks — a \
+             partial copy in the incoming directory is what a fetch in progress *is* \
+             — so nothing has to be recorded and nothing can go stale",
+        ),
         ("instances", "status.pendingChanges.0.field") => Some(
             "what a running guest will only get at its next start is a comparison \
              between spec and status.runningSize; storing it would be a third copy \
@@ -1084,3 +1090,34 @@ fn the_console_and_the_model_agree_on_what_nobody_reports_on() {
         );
     }
 }
+
+/// The console hides what the API refuses.
+///
+/// Two answers to one question — "is this the cell's own?" — written in two
+/// languages. The API refuses a tenant's list of them; the console leaves them
+/// out of the rail. Drift either way is bad in a specific direction: an entry
+/// the console shows and the API refuses is a menu item that answers 403, and
+/// one the API serves and the console hides is a capability nobody can reach.
+#[test]
+fn the_console_hides_exactly_what_the_api_keeps_for_the_cell() {
+    let page = velstra_cloud_console::page_ref();
+    let start = page
+        .find("const CELL_ONLY = [")
+        .expect("the console names what it hides");
+    let end = page[start..].find("];").expect("a closing bracket") + start;
+    let listed: std::collections::BTreeSet<&str> = page[start..end]
+        .split('"')
+        .filter(|s| s.chars().all(|c| c.is_ascii_lowercase() || c == '-') && !s.is_empty())
+        .collect();
+
+    for kind in velstra_cloud_api::COLLECTIONS {
+        let api_keeps = velstra_cloud_model::authz::belongs_to_the_cell(kind);
+        if api_keeps {
+            assert!(
+                listed.contains(kind),
+                "the API refuses a tenant's list of {kind} and the console still offers it —                  a menu item that answers 403"
+            );
+        }
+    }
+}
+

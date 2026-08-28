@@ -83,7 +83,12 @@ terminates TLS — put them behind the ingress the cluster already trusts.
   velstra.cloud.controlPlane = {
     enable = true;
     package = velstra-cloud.packages.x86_64-linux.velstra-cloud;
-    listen = "0.0.0.0:8443";           # front with TLS before leaving loopback
+    listen = "0.0.0.0:8443";
+    # A PEM pair. `quickstart` makes a self-signed one; any real certificate
+    # goes in the same place. Without both, this port is plaintext and the API
+    # says so in its log at startup.
+    tlsCert = "/var/lib/velstra/tls/cert.pem";
+    tlsKey = "/var/lib/velstra/tls/key.pem";
     bootstrapAdmin = {
       username = "admin";
       passwordFile = "/run/keys/velstra-admin-password";
@@ -208,11 +213,28 @@ tying storage to whichever hypervisor happened to be asked is how a volume
 becomes unreachable the moment that node is drained. A box that is both a
 hypervisor and a pool imports both modules and says so.
 
+Three backends, and the choice is about what a volume *is*:
+
 `directory` keeps volumes as qcow2 files and needs nothing but a writable
 directory — with the property worth knowing: everything it holds is on one
 machine, so a guest on such a volume cannot migrate to a node that cannot see
-that directory. `ceph` keeps them as RBD images, and every node reaches every
-volume.
+that directory.
+
+`lvm` makes each volume a logical volume in one volume group, and hands the
+guest the device itself: no image format between it and the disk, and a resize
+is an `lvextend`. `--lvm-group` names the group and has no default — a machine
+may have several, and guessing would put a tenant's bytes in whichever came
+first. `--lvm-thin-pool` is worth answering: a thick snapshot reserves its space
+up front and is dropped by the kernel when it fills, a thin one costs nothing
+until something is written. Same-machine only, like `directory`.
+
+`ceph` keeps them as RBD images, and every node reaches every volume. It works
+against a cluster **this machine deployed** and against an **existing external
+one** — for the second, `VELSTRA_CEPH_CONF` and `VELSTRA_CEPH_USER` are what
+point it at yours, with `VELSTRA_CEPH_POOL` and `VELSTRA_CEPH_IMAGE_POOL` for
+the pools to use. Those are seed keys, so `velstra-cloud-node setup` asks for
+them and the unit picks them up; before this they were command-line only, which
+meant a package install could reach no cluster but its own.
 
 Until this module existed the pool agent was a binary that nothing started, so a
 cell built from this repository could hold a Pool object, a Volume object, and
@@ -254,3 +276,34 @@ rather than pretending TCG proved the same thing.
   control plane, break-glass is the console on the ISO. If operations needs an
   on-box account, that is an installer question plus a module option, added
   together.
+
+## TLS on the console's own port
+
+`quickstart` makes the machine a self-signed certificate and points the API at
+it, so the console is served over https from the first minute. The API takes any
+PEM pair (`VELSTRA_TLS_CERT` / `VELSTRA_TLS_KEY`, both or neither), and without
+them it serves plaintext and says so in the log.
+
+That used to be the only option, with "put a reverse proxy in front" as the
+documented answer. It is the right answer for a cluster and the wrong one for
+the box that *is* the whole cell: it has nothing in front of it, nobody installs
+nginx to look at a dashboard, and until they did an administrator's password
+crossed the wire in the clear on a port numbered 8443.
+
+**The fingerprint is the point.** A self-signed certificate stops somebody
+reading the password off the wire; it does not tell a browser which machine it
+is talking to, so the browser warns — correctly. The warning is only worth
+something to somebody who can check what they are agreeing to, so `quickstart`
+prints the sha256 of the certificate once, on the machine's own console, in the
+`AB:CD:…` form every browser shows:
+
+```
+  9F:2C:…:41
+
+To use a real certificate instead, put it at /var/lib/velstra/tls/cert.pem and
+its key at /var/lib/velstra/tls/key.pem, then restart velstra-cloud-api.
+```
+
+Nothing is ever overwritten: a second `quickstart` keeps the pair that is there,
+so a real certificate survives a rerun of an installer that is otherwise safe to
+repeat.

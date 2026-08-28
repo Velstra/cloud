@@ -55,6 +55,12 @@ pub fn router(api: Api) -> Router {
             "/api/v1/users/:id/password",
             axum::routing::put(set_password),
         )
+        .route(
+            // A token for a service account. POST because it **makes** one, and
+            // the answer carries it — once. Nothing can read it back.
+            "/api/v1/users/:id/tokens",
+            axum::routing::post(mint_service_token),
+        )
         // The layer goes on before the console's routes, so only the API is
         // behind a token. The page itself is markup with no data in it — it
         // carries the sign-in form, and demanding a token to fetch the form
@@ -170,6 +176,57 @@ struct PasswordBody {
 /// from whoever picked up their token. An operator resetting another account is
 /// the deliberate exception — the whole point of the reset is that nobody has
 /// the old password.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct TokenBody {
+    /// What this token is for, in the words of whoever minted it. Not
+    /// decoration: an operator looking at four tokens for one account has to
+    /// know which is which before revoking one.
+    #[serde(default)]
+    purpose: String,
+}
+
+/// Mint a token for a service account.
+///
+/// A cell operator's, like creating the account: a token is authority, and an
+/// account able to mint its own would be an account that cannot be contained by
+/// taking one away.
+async fn mint_service_token(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+    Path(id): Path<String>,
+    body: Option<Json<TokenBody>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !api.is_operator(&who) {
+        return Err(ApiError::forbidden(
+            "minting a token is a change to who can reach this cell; only a cell operator may",
+        ));
+    }
+    let Some(account) = api.identity().user(&id).await? else {
+        return Err(ApiError::new(
+            crate::error::Code::NotFound,
+            format!("there is no user called `{id}`"),
+        ));
+    };
+    if !account.spec.service {
+        return Err(ApiError::invalid(format!(
+            "`{id}` is a person, and a person signs in with a password rather than \
+             carrying a token. Set `spec.service` on an account that is a program."
+        ))
+        .at("id"));
+    }
+    let purpose = body.map(|Json(b)| b.purpose).unwrap_or_default();
+    let token = api.identity().mint_service_credential(&id, &purpose).await?;
+    // Once. The platform keeps a digest and cannot show it again — which is
+    // said here rather than left to be discovered.
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "user": id,
+        "purpose": purpose,
+        "shownOnce": true,
+    })))
+}
+
 async fn set_password(
     State(api): State<Api>,
     Extension(who): Extension<Identity>,
@@ -177,6 +234,21 @@ async fn set_password(
     Path(id): Path<String>,
     Json(body): Json<PasswordBody>,
 ) -> ApiResult<StatusCode> {
+    // A program has no password to set. Refused rather than stored, because a
+    // service account with a usable password is an account that can be signed
+    // into by whoever guesses it — and nobody would be looking for that.
+    if api
+        .identity()
+        .user(&id)
+        .await?
+        .is_some_and(|u| u.spec.service)
+    {
+        return Err(ApiError::invalid(format!(
+            "`{id}` is a service account: it authenticates with a token, not a password. \
+             POST /api/v1/users/{id}/tokens to mint one."
+        ))
+        .at("password"));
+    }
     let own = who.subject == id;
     if !api.is_operator(&who) && !own {
         return Err(ApiError::forbidden(

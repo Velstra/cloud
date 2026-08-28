@@ -58,6 +58,31 @@
       version =
         (builtins.fromTOML (builtins.readFile ./velstra-cloud-api/Cargo.toml)).package.version;
 
+      # What the Debian package calls itself, which is not the same question.
+      #
+      # `apt` decides whether to do anything by comparing versions, so a package
+      # whose version never moves is a package a cell cannot be upgraded with:
+      # every build was `0.1.0`, and `apt install ./new.deb` answered
+      # "velstra-cloud is already the newest version (0.1.0)" and did nothing.
+      # Reported from a real box, where the way out was `--reinstall` — which
+      # works and is not an upgrade path anybody should have to know.
+      #
+      # The timestamp leads and the revision follows, in that order, because
+      # only the first is **monotonic**. A git hash sorts lexically: the next
+      # commit is as likely to be `a1b2c3d` as `f9e8d7c`, and half the time apt
+      # would refuse the newer package as a downgrade. `lastModifiedDate` always
+      # moves forward; the revision is there to say exactly which build this is.
+      #
+      # A dirty tree gets `dirty` in place of a revision — it identifies nothing
+      # and says so, and its timestamp still moves, so a working session can keep
+      # upgrading a test cell.
+      debVersion =
+        let
+          rev = self.shortRev or self.dirtyShortRev or "dirty";
+          stamp = self.lastModifiedDate or "00000000000000";
+        in
+        "${version}+${stamp}.${rev}";
+
       # --- the workspace binaries -------------------------------------------
       # One build for all six: api, controller, nodeagent, poolagent, the
       # node installer, and the dev cell. protoc for the tonic build scripts.

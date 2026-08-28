@@ -131,7 +131,10 @@ async fn the_destination_publishes_a_url_before_the_source_does_anything_at_all(
         host.disks.contains(I1),
         "the guest would arrive with no disk"
     );
-    assert!(host.images.contains(IMAGE));
+    assert!(
+        host.images.contains(IMAGE_STORED),
+        "the destination has no verified copy of the bytes"
+    );
     assert!(
         cell.destination_datapath.is_programmed(PORT_A),
         "the guest would resume onto a tap that does not exist"

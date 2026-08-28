@@ -993,6 +993,16 @@ async function fillPicker(form, p) {
   // is a full resource name. The API refuses the wrong one at the door, so the
   // picker has to produce the right one rather than a plausible one.
   const wire = (o) => (f.spelling === "id" ? idOf(o) : nameOf(o));
+  // A family first, where images declare one: `families/debian-13` asks the
+  // platform for the newest and is what most people mean — the concrete builds
+  // below it are for pinning. Resolved once at create and written down, so a
+  // guest never changes its operating system on a restart.
+  if (f.collection === "images") {
+    const families = [...new Set(offered.map((o) => String(pick(spec(o), "family") || "").trim()).filter(Boolean))];
+    for (const fam of families.sort()) {
+      s.appendChild(el("option", { value: "families/" + fam }, fam + " — always the newest"));
+    }
+  }
   for (const o of offered) {
     // An image leads with what it *is*; everything else leads with its name,
     // which for everything else is already the readable thing.
@@ -1150,14 +1160,26 @@ function openCreate(coll, opts = {}) {
     coll,
     title: opts.title || "New " + coll.singular,
     blurb: opts.blurb,
-    values: { ...defaults(coll), ...(opts.values || {}) },
+    values: {
+      ...defaults(coll),
+      // Where it goes, for the collections that have two answers. The project
+      // leads, because that is what most creates are and what a tenant sees when
+      // there is no choice at all.
+      ...(offersBothScopes(coll) && session.project ? { __scope: "project" } : {}),
+      ...(opts.values || {}),
+    },
     submitLabel: opts.submitLabel || "Create",
     candidates: opts.candidates,
     locked: opts.locked,
     async onSubmit(f) {
       const id = f.values.__id;
-      const body = createBody(id, nest(settable(coll, f.values)));
-      const answer = await create(coll, body);
+      // `__scope` is the form's, not the object's: it decides the address the
+      // create goes to and must not travel in the body as if it were a field.
+      const scope = f.values.__scope;
+      const values = { ...f.values };
+      delete values.__scope;
+      const body = createBody(id, nest(settable(coll, values)));
+      const answer = await create(coll, body, scope);
       forgetOptions(coll.id);
       // A registration token comes back exactly once — the platform keeps a
       // hash and cannot show it again — so it gets a panel of its own rather
@@ -1208,7 +1230,26 @@ function openCreate(coll, opts = {}) {
     box.textContent = m || ""; box.classList.toggle("hidden", !m);
     input.classList.toggle("bad", !!m);
   };
-  dialog.insertBefore(el("div.fields", idField), dialog.querySelector(".fields"));
+  // Where it goes, before what it is: an image published to the cell and one
+  // published to a project are different offers, and the second question reads
+  // differently once the first is answered.
+  const first = [];
+  if (offersBothScopes(coll) && session.project) {
+    const pick = el("select", { id: "f-scope" },
+      el("option", { value: "project" }, "This project — " + session.project),
+      el("option", { value: "global" }, "The whole cell — everybody can boot it"));
+    pick.value = form.values.__scope || "project";
+    pick.addEventListener("change", () => { form.values.__scope = pick.value; });
+    first.push(el("div.field",
+      el("label", { for: "f-scope" }, "Where"),
+      pick,
+      el("div.hint",
+        "A cell image is the catalogue: every project may boot it, and only a cell "
+        + "operator may publish one. A project image belongs to " + session.project
+        + " and is invisible to everybody else.")));
+  }
+  first.push(idField);
+  dialog.insertBefore(el("div.fields", ...first), dialog.querySelector(".fields"));
   input.focus();
   return form;
 }

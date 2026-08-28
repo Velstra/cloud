@@ -288,6 +288,12 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     # cell, with no token, retrying for ever.
     if [ "$1" = "configure" ]; then
       systemctl daemon-reload >/dev/null 2>&1 || true
+      # An existing machine, brought up to what this package needs. The one that
+      # matters today: a cell that grew TLS leaves an agent still speaking plain
+      # HTTP to a TLS port, which stops the node following its cell entirely and
+      # says so only as "invalid HTTP version parsed" in a journal. Safe to run
+      # on a fresh install too — there is no seed yet, and it does nothing.
+      velstra-cloud-node migrate-seed 2>/dev/null || true
       if [ ! -f /var/lib/velstra/node.env ]; then
         echo ""
         echo "velstra-cloud is installed and nothing is running."

@@ -1066,6 +1066,11 @@ pub fn quota_condition(limit: &Quota, used: &Quota, at_generation: u64) -> Condi
 /// The target of an operation, as much of it as an operation needs to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TargetView {
+    /// The object is there and **nothing is ever going to report on it** — the
+    /// per-object twin of [`nobody_reports_on`], for a kind where the answer
+    /// depends on the object. A port assigned to no node is the case: no agent
+    /// has it, so waiting for one is waiting for nobody.
+    Unwatched,
     /// Nothing is stored under the target's name any more.
     Gone,
     Present {
@@ -1123,6 +1128,9 @@ pub fn nobody_reports_on(kind: &str) -> bool {
             | "subnets"
             | "images"
             | "snapshot-schedules"
+            // A view of the images, grouped by family and computed on the way
+            // out. There is no object here for anything to report on.
+            | "families"
     )
 }
 
@@ -1176,6 +1184,12 @@ pub fn operation_progress(spec: &OperationSpec, target: &TargetView) -> Operatio
         }
     }
     match target {
+        // Present, and nobody is coming. Existing is the whole of it — the same
+        // answer `nobody_reports_on` gives for a whole kind.
+        TargetView::Unwatched => OperationProgress {
+            done: true,
+            error: None,
+        },
         // For a delete, the object being gone *is* the success. For anything
         // else it means the thing the caller asked about no longer exists, and
         // an operation that waits for it would wait forever.
@@ -1335,6 +1349,8 @@ mod tests {
                 gateway: false,
             },
             NodeStatus {
+                vmm: "qemu".into(),
+            fetching: Vec::new(),
                 capacity: Capacity {
                     vcpus,
                     memory_mib: mem,

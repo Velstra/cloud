@@ -12,6 +12,16 @@ name = "velstra-cloud-api"
 path = "src/bin/velstra-cloud-api.rs"
 
 [dependencies]
+# TLS on the console's own port. Not a proxy's job on a single box: the machine
+# that is the whole cell has nothing in front of it, and "put a reverse proxy
+# here" is advice nobody follows on a laptop.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Named only to choose the crypto provider. Two are in this tree — `ring`
+# through one path and `aws-lc-rs` through another — and rustls refuses to guess
+# between them: it panics at the first handshake with "call
+# CryptoProvider::install_default() before this point". A failure that only
+# appears on a machine serving real traffic, which is where it appeared.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Already in the tree through axum; named here because this crate parses a
 # console stream's query itself, in the middleware, before any extractor runs.
 serde_urlencoded = "0.7"

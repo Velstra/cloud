@@ -36,8 +36,25 @@ const scopeFound = {};
 /// collection can be *read* from; letting it decide where a create goes was a
 /// bug with a very quiet failure — see `list`. A create belongs where the
 /// contract says it belongs.
-function writePath(coll) {
-  return basePath(coll, coll.scope);
+/// Where a write goes: the contract's scope, never the probed one.
+///
+/// `scope` overrides it for the collections that genuinely have two —
+/// `BOTH_SCOPES` — where a cell operator may put an object under a project or
+/// under the cell itself. An image is the case: a catalogue everybody may boot
+/// is a cell-wide object, and the console could only ever make project ones, so
+/// the one thing an administrator most wants to publish was the one thing this
+/// interface could not.
+function writePath(coll, scope) {
+  return basePath(coll, scope || coll.scope);
+}
+
+/// Whether this collection can be written at both levels, and this session may.
+///
+/// Both halves matter: an ordinary tenant sees no choice at all, because for
+/// them there is none — and offering one that is refused on submit is worse than
+/// not offering it.
+function offersBothScopes(coll) {
+  return BOTH_SCOPES.includes(coll.id) && !!(session.who && session.who.cellAdmin);
 }
 
 function basePath(coll, scope) {
@@ -349,7 +366,8 @@ const explainMaintenance = (id) =>
 
 const get = (coll, id) => request("GET", basePath(coll) + "/" + encodeURIComponent(id)).then((r) => r.body);
 
-const create = (coll, body) => request("POST", writePath(coll), { body }).then((r) => r.body);
+const create = (coll, body, scope) =>
+  request("POST", writePath(coll, scope), { body }).then((r) => r.body);
 
 const patch = (coll, id, body, ifMatch) =>
   request("PATCH", writePath(coll) + "/" + encodeURIComponent(id), { body, ifMatch }).then((r) => r.body);

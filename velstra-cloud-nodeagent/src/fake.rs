@@ -88,6 +88,7 @@ struct Machine {
     killed: Vec<String>,
     disks: BTreeSet<String>,
     images: BTreeSet<String>,
+    fetching: BTreeSet<String>,
     /// Disks this fake machine claims to have, so a test can drive the console's
     /// disk picker without a machine that has spare disks.
     devices: Vec<velstra_cloud_model::ceph::BlockDevice>,
@@ -296,12 +297,16 @@ impl FakeVmm {
 
     /// Put an image in the cache without pulling it, for a test that is about
     /// something else.
+    /// Say this machine already holds an image, by **digest**.
+    ///
+    /// The digest and not the name, because that is what a node files bytes
+    /// under: a fixture that seeded a name described a machine no real node
+    /// resembles, and the check it was meant to satisfy compared the other
+    /// spelling.
     pub fn cache_image(&self, digest: &str) {
-        self.machine
-            .lock()
-            .unwrap()
-            .images
-            .insert(digest.to_string());
+        self.machine.lock().unwrap().images.insert(
+            crate::hostfs::stored_as(digest).unwrap_or_else(|| digest.to_string()),
+        );
     }
 
     /// Where this machine was told to fetch `image` from, if it pulled it.
@@ -445,12 +450,17 @@ impl Vmm for FakeVmm {
         self.disks_on_disk.lock().unwrap().get(instance).cloned()
     }
 
+    fn vmm_name(&self) -> &'static str {
+        "fake"
+    }
+
     async fn observe(&self) -> Result<HostState> {
         let m = self.machine.lock().unwrap();
         Ok(HostState {
             vms: m.vms.clone(),
             disks: m.disks.clone(),
             images: m.images.clone(),
+            fetching: m.fetching.clone(),
             volumes: m.volumes.clone(),
             receivers: m.receivers.clone(),
             sending: m.sending.keys().cloned().collect(),
@@ -461,14 +471,18 @@ impl Vmm for FakeVmm {
         })
     }
 
-    async fn pull_image(&self, digest: &str, source: &str) -> Result<()> {
+    async fn pull_image(&self, image: &str, digest: &str, source: &str) -> Result<()> {
         // Recorded, so a test can assert the node was told *where* to fetch
         // from and not merely that it tried: passing the wrong source is the
         // failure this whole path exists to make impossible.
         let mut m = self.machine.lock().unwrap();
-        m.pulled_from.insert(digest.to_string(), source.to_string());
-        check(&mut m, Fault::Pull, digest)?;
-        m.images.insert(digest.to_string());
+        m.pulled_from.insert(image.to_string(), source.to_string());
+        check(&mut m, Fault::Pull, image)?;
+        // Filed the way a real backend files it — under the digest — so a test
+        // cell answers the same question the same way as a machine does.
+        m.images.insert(
+            crate::hostfs::stored_as(digest).unwrap_or_else(|| digest.to_string()),
+        );
         Ok(())
     }
 
@@ -492,7 +506,11 @@ impl Vmm for FakeVmm {
         // agent that got the order wrong must fail loudly here rather than
         // produce a guest with no disk and no network for somebody to find
         // later.
-        if !m.images.contains(&request.image) {
+        // By the name the bytes are filed under, which is what `request.image`
+        // now carries: an image object may be called anything.
+        let want = crate::hostfs::stored_as(&request.image)
+            .unwrap_or_else(|| request.image.clone());
+        if !m.images.contains(&want) {
             return Err(HostError::failed(format!(
                 "no verified copy of {} on this node",
                 request.image
@@ -592,7 +610,11 @@ impl Vmm for FakeVmm {
         // A real receiver refuses these too. The guest resumes into its own
         // disk and its own image, and a destination without them takes delivery
         // of a guest it cannot run.
-        if !m.images.contains(&request.image) {
+        // By the name the bytes are filed under, which is what `request.image`
+        // now carries: an image object may be called anything.
+        let want = crate::hostfs::stored_as(&request.image)
+            .unwrap_or_else(|| request.image.clone());
+        if !m.images.contains(&want) {
             return Err(HostError::failed(format!(
                 "no verified copy of {} on this node",
                 request.image
@@ -892,7 +914,7 @@ mod tests {
     async fn a_guest_will_not_start_without_its_image_and_disk() {
         let vmm = FakeVmm::new();
         assert!(vmm.start(&request()).await.is_err());
-        vmm.pull_image("sha256:abc", "http://images.invalid/x")
+        vmm.pull_image("sha256:abc", "sha256:abc", "http://images.invalid/x")
             .await
             .unwrap();
         assert!(
@@ -916,7 +938,7 @@ mod tests {
         // The property the restart tests rest on: another handle sees the same
         // guests, because a node has one machine and not one per process.
         let vmm = FakeVmm::new();
-        vmm.pull_image("sha256:abc", "http://images.invalid/x")
+        vmm.pull_image("sha256:abc", "sha256:abc", "http://images.invalid/x")
             .await
             .unwrap();
         vmm.create_disk(
@@ -937,7 +959,7 @@ mod tests {
     #[tokio::test]
     async fn a_crashed_guest_is_visible_as_failed_rather_than_absent() {
         let vmm = FakeVmm::new();
-        vmm.pull_image("sha256:abc", "http://images.invalid/x")
+        vmm.pull_image("sha256:abc", "sha256:abc", "http://images.invalid/x")
             .await
             .unwrap();
         vmm.create_disk(

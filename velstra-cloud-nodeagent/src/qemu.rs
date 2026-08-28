@@ -282,11 +282,25 @@ impl Vmm for QemuVmm {
     /// **Partly untested:** the directory and image scan need only a
     /// filesystem and are exercised below; the run state of a live guest is
     /// not.
+    fn vmm_name(&self) -> &'static str {
+        "qemu"
+    }
+
     async fn observe(&self) -> Result<HostState> {
         let mut host = HostState::default();
 
         for digest in hostfs::read_dir_names(&self.layout.image_dir)? {
             host.images.insert(unslug(&digest));
+        }
+
+        // What is on its way in. The incoming directory holds a copy that has
+        // not been verified and moved across yet — which is what a fetch in
+        // progress *is*, so there is nothing to record and nothing to go stale.
+        for name in hostfs::read_dir_names(&self.layout.incoming_dir).unwrap_or_default() {
+            let name = name.strip_suffix(".partial").unwrap_or(&name).to_string();
+            if !host.images.contains(&name) {
+                host.fetching.insert(name);
+            }
         }
 
         // The machine's disks, and what it runs of Ceph. Best-effort on both:
@@ -407,8 +421,8 @@ impl Vmm for QemuVmm {
         Ok(host)
     }
 
-    async fn pull_image(&self, image: &str, source: &str) -> Result<()> {
-        hostfs::fetch_image(&self.layout, image, source).await
+    async fn pull_image(&self, image: &str, digest: &str, source: &str) -> Result<()> {
+        hostfs::fetch_image(&self.layout, image, digest, source).await
     }
 
     async fn create_disk(

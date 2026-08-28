@@ -75,6 +75,8 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "NodeStatus",
         NodeStatus {
+            vmm: "qemu".into(),
+            fetching: Vec::new(),
             pci_devices: Vec::new(),
             observed_generation: 7,
             conditions: vec![],
@@ -198,6 +200,7 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "UserSpec",
         UserSpec {
+            service: false,
             display_name: "Ada".into(),
             email: "ada@example.org".into(),
             disabled: true,

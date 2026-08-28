@@ -1214,7 +1214,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
         "",
         "images",
         &json!({
-            "id": "debian-13",
+            "id": "sha256-3f9a2b",
             "spec": {
                 "digest": "sha256:3f9a2b",
                 "format": "Qcow2",
@@ -1228,10 +1228,10 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
     .expect("an operator publishes to the catalogue");
 
     // A tenant may read it — that is what makes it a catalogue.
-    api.get(&name("images/debian-13"), &who(ADA))
+    api.get(&name("images/sha256-3f9a2b"), &who(ADA))
         .await
         .expect("a tenant may read the catalogue");
-    api.get(&name("images/debian-13"), &who(BOB))
+    api.get(&name("images/sha256-3f9a2b"), &who(BOB))
         .await
         .expect("so may every other tenant");
 
@@ -1242,7 +1242,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
         "instances",
         &json!({
             "id": "i1",
-            "spec": { "image": "images/debian-13", "vcpus": 1, "memory_mib": 512 }
+            "spec": { "image": "images/sha256-3f9a2b", "vcpus": 1, "memory_mib": 512 }
         }),
         &who(ADA),
     )
@@ -1258,7 +1258,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
             "",
             "images",
             &json!({
-                "id": "mine",
+                "id": "sha256-beef",
                 "spec": {
                     "digest": "sha256:beef",
                     "format": "Qcow2",
@@ -1275,7 +1275,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
     // Nor may one be deleted or changed by a tenant: read is the whole grant.
     let refused = api
         .patch(
-            &name("images/debian-13"),
+            &name("images/sha256-3f9a2b"),
             &json!({ "spec": { "source_url": "https://example.invalid/other" } }),
             None,
             &who(ADA),
@@ -1290,7 +1290,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
         "projects/p2",
         "images",
         &json!({
-            "id": "private",
+            "id": "sha256-cafe",
             "spec": {
                 "digest": "sha256:cafe",
                 "format": "Qcow2",
@@ -1303,7 +1303,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
     .map_err(|e| e.to_string())
     .expect("a tenant may keep a private image");
     let refused = api
-        .get(&name("projects/p2/images/private"), &who(ADA))
+        .get(&name("projects/p2/images/sha256-cafe"), &who(ADA))
         .await
         .expect_err("one tenant read another's image");
     assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
@@ -1459,7 +1459,7 @@ async fn only_an_operator_may_put_a_network_on_the_machines_own_wire() {
     api.create(
         "projects/p1",
         "networks",
-        &json!({ "id": "private", "spec": { "mtu": 1500 } }),
+        &json!({ "id": "sha256-cafe", "spec": { "mtu": 1500 } }),
         &who(ADA),
     )
     .await
@@ -1683,4 +1683,243 @@ async fn an_operator_may_run_a_guest_and_not_create_or_destroy_one() {
         .await
         .expect_err("a viewer started a guest");
     assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+}
+
+#[tokio::test]
+async fn a_tenant_is_refused_the_machine_room_rather_than_shown_an_empty_one() {
+    // Found by signing in as a customer and asking the questions a customer's
+    // console asks. Every cell-wide collection answered **200 with an empty
+    // list** — so a tenant on a cell with one node, one pool and two users was
+    // told, in three separate answers, that it had none of each.
+    //
+    // Filtering is right where a tenant has objects of their own: `images` is a
+    // catalogue everybody may boot, `projects` shows them theirs, and an empty
+    // answer there means "none of yours". It is wrong where no object will ever
+    // pass, because then the empty list is not a filter result — it is a
+    // statement about the cell, and it is false.
+    let api = cell().await;
+    for kind in ["nodes", "pools", "device-classes", "users"] {
+        let refused = api.list_for("", kind, &Filter::none(), &who(ADA)).await;
+        let Err(e) = refused else {
+            panic!("{kind} was listed to a tenant instead of refused");
+        };
+        assert_eq!(e.code, Code::PermissionDenied, "{kind}: {e}");
+        assert!(
+            e.to_string().contains("not an empty list"),
+            "{kind}: {e} — the refusal has to say that, or it reads as 'there are none'"
+        );
+    }
+    // And the ones a tenant genuinely has a stake in still answer.
+    api.list_for("", "images", &Filter::none(), &who(ADA))
+        .await
+        .expect("a catalogue is everybody's to read");
+    api.list_for("", "projects", &Filter::none(), &who(ADA))
+        .await
+        .expect("a tenant lists their own projects");
+}
+
+#[tokio::test]
+async fn a_service_account_carries_a_token_and_signs_in_with_nothing() {
+    // A service account used to be a line in a static token file: no object, no
+    // bindings, nothing in the audit trail, and no way to take one away except
+    // by editing a file and restarting the API. So the thing every automated
+    // caller needs — an identity a project can grant something to — did not
+    // exist, and the answer was to hand out a person's password.
+    let api = cell().await;
+    api.create(
+        "",
+        "users",
+        &json!({ "id": "ci", "spec": { "service": true }}),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("a cell operator creates a service account");
+
+    // It has no password, and the refusal says what to do instead rather than
+    // just refusing.
+    // (The password refusal lives on the REST handler, where the account is
+    // read; `tests/rest.rs` covers it from the outside.)
+
+    // A token, minted by an operator and shown once.
+    let token = api
+        .identity()
+        .mint_service_credential("ci", "nightly backups")
+        .await
+        .expect("an operator mints a token");
+    let identity = api
+        .identity()
+        .identify_service(&token)
+        .await
+        .expect("the token names its account");
+    assert_eq!(identity.subject, "ci");
+
+    // And disabling the account stops it — read back on every request, not
+    // copied into the credential, so an operator shutting a door does not have
+    // to hunt for tokens down first.
+    api.patch(
+        &name("users/ci"),
+        &json!({ "spec": { "disabled": true }}),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator disables it");
+    assert!(
+        api.identity().identify_service(&token).await.is_err(),
+        "a disabled service account's token still worked"
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_boots_the_newest_of_a_family_like_anybody_else() {
+    // Found live, as the customer the feature exists for. `families/debian-13`
+    // was judged as a reference before it was resolved, parsed as a two-segment
+    // name of a collection no project governs, and the create answered "this is
+    // a cell-wide resource; only a cell operator may touch it" — a refusal
+    // about a name that names nothing. The family is resolved first now, and
+    // what gets authorised is the resolved image, which is the question that
+    // means something.
+    let api = cell().await;
+    api.create(
+        "",
+        "images",
+        &json!({ "spec": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "format": "Qcow2",
+            "family": "debian-13",
+            "source_url": "http://x.invalid/d.qcow2"
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("the operator stocks the catalogue");
+
+    let made = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "vom-katalog", "spec": {
+                "image": "families/debian-13",
+                "vcpus": 1, "memory_mib": 512, "root_disk_gib": 2, "ports": []
+            }}),
+            &who(ADA),
+        )
+        .await
+        .expect("a tenant boots the newest of a family");
+    let _ = made;
+    let stored: velstra_cloud_model::resources::Instance = api
+        .typed(&name("projects/p1/instances/vom-katalog"))
+        .await
+        .unwrap();
+    assert!(
+        stored.spec.image.starts_with("images/debian-13-"),
+        "the family was not resolved to the catalogue image: {}",
+        stored.spec.image
+    );
+}
+
+
+#[tokio::test]
+async fn the_catalogue_can_be_listed_and_not_only_guessed() {
+    // `families/debian-13` is the reference somebody is supposed to write, and
+    // for a long time the only way to learn one existed was to guess it and read
+    // the refusal — which helpfully lists them. A picker cannot offer what
+    // nothing can enumerate, so the console showed people
+    // `images/debian-13-d2af37c5` and let them pin themselves to one build.
+    let api = cell().await;
+    for (digest, family) in [("aa", "debian-13"), ("bb", "ubuntu-24-04")] {
+        api.create(
+            "",
+            "images",
+            &json!({ "spec": {
+                "digest": format!("sha256:{}", digest.repeat(32)),
+                "format": "Qcow2",
+                "family": family,
+                "source_url": "http://x.invalid/d.qcow2"
+            }}),
+            &who(OPERATOR),
+        )
+        .await
+        .expect("the operator stocks the catalogue");
+    }
+
+    // The customer's seat: the catalogue is what publishing one is *for*.
+    let listed = api
+        .list_for(
+            "",
+            "families",
+            &velstra_cloud_api::Filter::none(),
+            &who(ADA),
+        )
+        .await
+        .expect("a tenant reads the catalogue");
+    let names: Vec<String> = listed
+        .items
+        .iter()
+        .map(|i| i["meta"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["families/debian-13", "families/ubuntu-24-04"],
+        "the catalogue did not list what a create can resolve"
+    );
+    assert!(
+        listed.items.iter().all(|i| i["spec"]["public"] == json!(true)),
+        "a cell image is the catalogue's and everybody may boot it"
+    );
+    // Every entry names bytes that exist — a picker offering a family that
+    // resolves to nothing is worse than no picker.
+    for entry in &listed.items {
+        let image = entry["spec"]["image"].as_str().unwrap();
+        let found: Result<velstra_cloud_model::resources::Image, _> =
+            api.typed(&name(image)).await;
+        assert!(
+            found.is_ok(),
+            "the catalogue offered {image}, which is not there"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_projects_own_family_shadows_the_catalogues_in_the_listing_too() {
+    // Resolution already prefers the project's own, so a listing that showed the
+    // cell's would be a picker whose entries lie about what they boot.
+    let api = cell().await;
+    for (parent, digest, version) in [
+        ("", "aa", "20260101"),
+        ("projects/p1", "bb", "our-build"),
+    ] {
+        api.create(
+            parent,
+            "images",
+            &json!({ "spec": {
+                "digest": format!("sha256:{}", digest.repeat(32)),
+                "format": "Qcow2",
+                "family": "debian-13",
+                "version": version,
+                "source_url": "http://x.invalid/d.qcow2"
+            }}),
+            &who(if parent.is_empty() { OPERATOR } else { ADA }),
+        )
+        .await
+        .expect("both are published");
+    }
+
+    let listed = api
+        .list_for(
+            "projects/p1",
+            "families",
+            &velstra_cloud_api::Filter::none(),
+            &who(ADA),
+        )
+        .await
+        .expect("a tenant reads their own catalogue");
+    assert_eq!(listed.items.len(), 1, "one family, whichever wins");
+    let entry = &listed.items[0];
+    assert_eq!(entry["spec"]["version"], json!("our-build"));
+    assert_eq!(
+        entry["spec"]["public"],
+        json!(false),
+        "an image under a project is that project's alone"
+    );
 }

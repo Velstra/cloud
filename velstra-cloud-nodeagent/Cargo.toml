@@ -8,6 +8,18 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Images live on https. The digest is what makes the *bytes* trustworthy — a
+# wrong byte gives a wrong digest and the fetch fails — but refusing https meant
+# refusing every place a cloud image is actually published, and an operator was
+# told to go and find an http mirror of Debian.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# For the agent's own line to the API, which serves TLS now. Not reqwest,
+# because the watch is a long-lived chunked GET this client streams by hand —
+# the TCP stream is simply wrapped. The root of trust is the cell's certificate,
+# pinned from a file, never "accept anything".
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+futures-util = "0.3"
 velstra-cloud-fabric = { workspace = true }
 velstra-cloud-model = { workspace = true }
 velstra-cloud-store = { workspace = true }

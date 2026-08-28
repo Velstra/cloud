@@ -45,6 +45,12 @@ pub struct EvacuationController {
     instances: TypedStore<InstanceSpec, InstanceStatus>,
     nodes: TypedStore<NodeSpec, NodeStatus>,
     migrations: TypedStore<MigrationSpec, MigrationStatus>,
+    /// Read only to turn an image's name into the name its bytes are filed
+    /// under. The aggregate itself still comes from the nodes.
+    images: TypedStore<
+        velstra_cloud_model::resources::ImageSpec,
+        velstra_cloud_model::resources::ImageStatus,
+    >,
     /// The cell's maintenance windows. A window with `drain` set says the same
     /// thing `spec.evacuate` says, for a stretch of time somebody chose in
     /// advance — and it says it without writing that field, so the operator
@@ -63,11 +69,16 @@ impl EvacuationController {
         instances: TypedStore<InstanceSpec, InstanceStatus>,
         nodes: TypedStore<NodeSpec, NodeStatus>,
         migrations: TypedStore<MigrationSpec, MigrationStatus>,
+        images: TypedStore<
+            velstra_cloud_model::resources::ImageSpec,
+            velstra_cloud_model::resources::ImageStatus,
+        >,
     ) -> Self {
         Self {
             instances,
             nodes,
             migrations,
+            images,
             windows: None,
         }
     }
@@ -165,7 +176,19 @@ impl Reconciler for EvacuationController {
         // Which nodes hold which image, added up from what each node reports
         // about itself. Never the image collection: which nodes hold a copy is
         // an aggregate, and an aggregate is not a fact anybody owns.
-        let cached = |image: &str| velstra_cloud_model::resources::nodes_holding(image, &nodes);
+        // Through the image object, because a node files bytes under their
+        // digest and an object's name is a name. Comparing the two directly
+        // answered "nobody has it" for every image, and an evacuation then moved
+        // nothing at all — the machine stayed full with the window open.
+        let images = self.images.list().await?;
+        let cached = |image: &str| {
+            images
+                .iter()
+                .find(|i| i.meta.name.to_string() == image)
+                .and_then(|i| velstra_cloud_model::images::stored_name(&i.spec.digest))
+                .map(|stored| velstra_cloud_model::resources::nodes_holding(&stored, &nodes))
+                .unwrap_or_default()
+        };
 
         let migrations = self.migrations.list().await?;
         let moving: Vec<String> = migrations
@@ -292,6 +315,8 @@ mod tests {
                     gateway: false,
                 },
                 NodeStatus {
+                    vmm: "qemu".into(),
+            fetching: Vec::new(),
                     capacity: Capacity {
                         vcpus: 32,
                         memory_mib: 65536,
@@ -303,7 +328,7 @@ mod tests {
                     last_heartbeat: Timestamp::now(),
                     // Both hold the image, so the move is not refused for a
                     // reason this check is not about.
-                    images: vec!["projects/p1/images/sha256-abc".into()],
+                    images: vec!["sha256-392d11b010cde76dc82ebe107aa399feff105625fd332b1ba58624426fcba7ca".into()],
                     cpu: Some(velstra_cloud_model::cpu::NodeCpu {
                         arch: "x86_64".into(),
                         flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
@@ -359,11 +384,35 @@ mod tests {
             velstra_cloud_model::maintenance::MaintenanceWindowStatus,
         > = TypedStore::new(store.clone(), "cell-1", "maintenance-windows");
 
+        // The image object itself, because the aggregate is now taken through it:
+        // a node files bytes under their digest, and the name is a name.
+        let images: TypedStore<
+            velstra_cloud_model::resources::ImageSpec,
+            velstra_cloud_model::resources::ImageStatus,
+        > = TypedStore::new(store.clone(), "cell-1", "images");
+        images
+            .create(
+                &velstra_cloud_model::resources::Image::new(
+                    Meta::new(
+                        "projects/p1/images/sha256-abc".parse().unwrap(),
+                        Placement::new("eu", "cell-1"),
+                    ),
+                    velstra_cloud_model::resources::ImageSpec {
+                        digest: "sha256:392d11b010cde76dc82ebe107aa399feff105625fd332b1ba58624426fcba7ca".into(),
+                        ..Default::default()
+                    },
+                    Default::default(),
+                ),
+                &velstra_cloud_model::Writer::controller("test"),
+            )
+            .await
+            .unwrap();
+
         Fixture {
             nodes: nodes.clone(),
             migrations: migrations.clone(),
             windows: windows.clone(),
-            controller: EvacuationController::new(instances, nodes, migrations)
+            controller: EvacuationController::new(instances, nodes, migrations, images)
                 .with_maintenance(windows),
         }
     }

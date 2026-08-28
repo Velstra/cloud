@@ -221,6 +221,8 @@ mod tests {
                 gateway: false,
             },
             NodeStatus {
+                vmm: "qemu".into(),
+            fetching: Vec::new(),
                 last_heartbeat: Timestamp(heard),
                 ..Default::default()
             },

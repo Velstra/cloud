@@ -1159,7 +1159,13 @@ impl Agent {
 
             let actions = reconcile_instance(
                 &observed,
-                host.images.contains(&stored.spec.image),
+                // By digest, because that is what the bytes are stored under:
+                // an image may be called `debian-13` and a node's copy of it is
+                // the same file as every other object carrying those bytes.
+                cell.images
+                    .get(stored.spec.image.as_str())
+                    .and_then(|i| crate::hostfs::stored_as(&i.digest))
+                    .is_some_and(|name| host.images.contains(&name)),
                 // Not "is there a tap": a port whose group gained a member is
                 // carried and out of date, and a check that only asked whether
                 // it was present would never notice.
@@ -1390,9 +1396,14 @@ impl Agent {
             // the decision names what must be present, the agent looks up what
             // it needs to make that true.
             Action::PullImage { digest } => match cell.images.get(digest) {
+                // `digest` is the image's *name* — what the decision refers to.
+                // What verifies the download is `spec.digest`, which is why it
+                // is passed separately: the two used to be the same string, and
+                // that forced every image to be called `sha256-<64 hex>` in
+                // every list an operator reads.
                 Some(image) => self
                     .vmm
-                    .pull_image(digest, &image.source_url)
+                    .pull_image(digest, &image.digest, &image.source_url)
                     .await
                     .map(|_| ()),
                 None => Err(crate::host::HostError::failed(format!(
@@ -1412,12 +1423,14 @@ impl Agent {
                 // not have, which `pull_image` above refuses for the same
                 // reason — but the default is the safe one either way, since a
                 // raw copy of a raw image is what it always was.
-                let format = cell
-                    .images
-                    .get(image.as_str())
-                    .map(|i| i.format)
-                    .unwrap_or_default();
-                self.vmm.create_disk(instance, *gib, image, format).await
+                let known = cell.images.get(image.as_str());
+                let format = known.map(|i| i.format).unwrap_or_default();
+                // The bytes are on disk under their digest, so that is what
+                // finds them. An image the cell does not have leaves this empty,
+                // and `create_disk` makes an empty disk — the same answer as
+                // before, reached the same way.
+                let digest = known.map(|i| i.digest.as_str()).unwrap_or("");
+                self.vmm.create_disk(instance, *gib, digest, format).await
             }
             Action::ProgramPort { port } => match ports.get(port) {
                 Some(p) => {
@@ -1471,12 +1484,18 @@ impl Agent {
                     // find the agent's log on whichever machine ran it.
                     Err(why) => return Err(why),
                 };
+                let image_digest = cell
+                    .images
+                    .get(instance.spec.image.as_str())
+                    .map(|i| i.digest.clone())
+                    .unwrap_or_default();
                 match self.vm_request(
                     instance,
                     taps,
                     ports,
                     self.declared_baseline().await,
                     devices,
+                    &image_digest,
                 ) {
                     Ok(request) => self.vmm.start(&request).await,
                     Err(why) => Err(crate::host::HostError::failed(why)),
@@ -1509,6 +1528,11 @@ impl Agent {
         // reasoning: choosing is a decision with a store read behind it, and
         // this builder stays pure.
         devices: Vec<String>,
+        // What identifies the bytes, as against what identifies the object. A
+        // VMM needs the first: the disk it boots was made from a file filed
+        // under the digest, and an image called `debian-13` says nothing about
+        // which bytes that is.
+        image_digest: &str,
     ) -> Result<VmRequest, String> {
         let mut wanted = Vec::with_capacity(instance.spec.ports.len());
         for port in &instance.spec.ports {
@@ -1528,7 +1552,7 @@ impl Agent {
             instance: instance.meta.name.to_string(),
             vcpus: instance.spec.vcpus,
             memory_mib: instance.spec.memory_mib,
-            image: instance.spec.image.clone(),
+            image: image_digest.to_string(),
             root_disk_gib: instance.spec.root_disk_gib,
             nics: wanted,
             // What this guest is to be given, as declared on this node right

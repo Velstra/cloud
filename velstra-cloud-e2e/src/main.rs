@@ -439,7 +439,7 @@ async fn seed(store: Arc<dyn Store>) {
                 family: "debian-13".into(),
                 version: "seed".into(),
                 source_instance: None,
-                digest: "sha256:3f9a2b".into(),
+                digest: "sha256:bed9c5091e4cb31402af634b1c7a4494cb07c2119bb1a470cd12f9c3323a3b6f".into(),
                 format: ImageFormat::Raw,
                 size_bytes: 1_073_741_824,
                 source_url: "https://example.invalid/debian-13-amd64.raw".into(),

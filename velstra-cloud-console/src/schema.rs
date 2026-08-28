@@ -478,6 +478,20 @@ pub struct Collection {
 
 const USER_FIELDS: &[Field] = &[
     Field {
+        key: "service",
+        label: "Service account",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "A program rather than a person: it signs in with no password and \
+               carries a token instead, minted by an operator and shown once. It \
+               is named in a project's bindings like anybody else and gets the \
+               same four roles.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
         key: "displayName",
         label: "Display name",
         kind: Kind::Text {
@@ -919,18 +933,84 @@ const PROJECT_FIELDS: &[Field] = &[
     },
 ];
 
-const INSTANCE_FIELDS: &[Field] = &[
+const FAMILY_FIELDS: &[Field] = &[
+    Field {
+        key: "family",
+        label: "Family",
+        kind: Kind::Text {
+            placeholder: "",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: true,
+        at_creation: false,
+    },
+    Field {
+        key: "version",
+        label: "Newest version",
+        kind: Kind::Text {
+            placeholder: "",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: true,
+        at_creation: false,
+    },
     Field {
         key: "image",
-        label: "Image",
+        label: "Resolves to",
         kind: Kind::Ref {
             collection: "images",
             filter_by: None,
             spelling: Spelling::Name,
         },
+        required: false,
+        advanced: false,
+        help: "The bytes a machine made right now would get.",
+        when_empty: "",
+        derived: true,
+        at_creation: false,
+    },
+    Field {
+        key: "public",
+        label: "Everybody may boot it",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        // Placement is what has always decided this; it was simply never said
+        // out loud, so an operator publishing a template had no way to check
+        // which of the two they had made.
+        help: "Published to the cell rather than kept in one project.",
+        when_empty: "",
+        derived: true,
+        at_creation: false,
+    },
+];
+
+const INSTANCE_FIELDS: &[Field] = &[
+    Field {
+        key: "image",
+        // The catalogue, not the bytes. Picking `debian-13` gets the newest of
+        // that family at the moment the machine is made and pins the guest to it
+        // for life; picking one image pins it to whichever build somebody
+        // happened to be looking at. The field still takes either — it should
+        // just not be a digest that greets somebody choosing an OS.
+        label: "Image",
+        kind: Kind::Ref {
+            collection: "families",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
         required: true,
         advanced: false,
-        help: "",
+        help: "The newest of the family, resolved once when the machine is made. \
+               An existing machine keeps the bytes it was built from.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -1053,7 +1133,10 @@ const INSTANCE_FIELDS: &[Field] = &[
         required: false,
         // Almost always cloud-init's business rather than a field typed here.
         advanced: true,
-        help: "",
+        help: "Read by cloud-init on the guest's **first** boot and never again, \
+               so adding one to a machine that has already started does nothing \
+               to that machine. Without a key and without a password set in \
+               user-data, the console is the only way in.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -1318,12 +1401,18 @@ const VOLUME_FIELDS: &[Field] = &[
         key: "pool",
         label: "Pool",
         kind: Kind::Text {
-            placeholder: "nvme",
+            placeholder: "chosen for you",
             check: Check::Id,
         },
-        required: true,
-        advanced: false,
-        help: "",
+        // Which pool holds the bytes is the platform's business: left empty,
+        // the cell picks the accepting pool with the most room and writes it
+        // down. It was a required field, which meant a tenant had to name a
+        // pool they are not allowed to list — a form no customer could fill in.
+        required: false,
+        advanced: true,
+        help: "Left empty, the cell chooses: the accepting pool with the most \
+               room. Naming one is for operators pinning a volume to specific \
+               hardware — a tenant cannot list pools and does not need to.",
         when_empty: "",
         derived: false,
         at_creation: true,
@@ -1523,9 +1612,11 @@ const NETWORK_FIELDS: &[Field] = &[
             step: 1,
             scale: Scale::None,
         },
-        required: true,
-        advanced: false,
-        help: "",
+        required: false,
+        advanced: true,
+        help: "1450 when left empty: a VXLAN header is 50 bytes, and a tenant \\
+               network handed the wire's own 1500 black-holes every large packet \\
+               in a way that looks like an application bug for a week.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -1542,7 +1633,9 @@ const NETWORK_FIELDS: &[Field] = &[
         },
         required: false,
         advanced: true,
-        help: "Assigned by the controller from the cell's range.",
+        help: "The VXLAN network identifier. Left empty, the cell assigns the \\
+               smallest free one — which is the only correct answer, and not one \\
+               a tenant can work out.",
         when_empty: "",
         derived: true,
         at_creation: false,
@@ -3337,6 +3430,57 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "families",
+        title: "Catalogue",
+        singular: "family",
+        recheck: 0,
+        condition: "",
+        // Derived: the API groups the images by `spec.family` on the way out.
+        // Nothing stores one, which is why nothing here creates, edits or
+        // deletes one — publishing an image with a family in it is how a family
+        // comes to exist, and deleting the last of them is how it goes away.
+        group: "Compute",
+        scope: Scope::Project,
+        blurb: "What to boot, by the name that stays right when the bytes change. \
+                A machine resolves its family once, when it is made, and keeps \
+                the build it got.",
+        fields: FAMILY_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.family",
+                label: "Family",
+                cell: Cell::Text,
+                width: 200,
+            },
+            Column {
+                path: "spec.version",
+                label: "Newest",
+                cell: Cell::Text,
+                width: 160,
+            },
+            Column {
+                path: "spec.sizeBytes",
+                label: "Size",
+                cell: Cell::Bytes,
+                width: 120,
+            },
+            Column {
+                path: "spec.public",
+                label: "Who may boot it",
+                cell: Cell::Yes {
+                    yes: "Everybody",
+                    no: "This project",
+                },
+                width: 150,
+            },
+        ],
+        agreements: &[],
+        creatable: false,
+        editable: false,
+        deletable: false,
+        explainable: false,
+    },
+    Collection {
         id: "images",
         title: "Images",
         singular: "image",
@@ -3378,6 +3522,12 @@ pub const COLLECTIONS: &[Collection] = &[
                 label: "Digest",
                 cell: Cell::Mono,
                 width: 220,
+            },
+            Column {
+                path: "status.fetchingOn",
+                label: "Arriving",
+                cell: Cell::Count,
+                width: 100,
             },
             Column {
                 path: "status.cachedOn",
@@ -4478,12 +4628,13 @@ mod tests {
             "ceph-clusters",
             "maintenance-windows",
             "usage",
+            "families",
         ] {
             assert!(find(id).is_some(), "no screen for {id}");
         }
         assert_eq!(
             COLLECTIONS.len(),
-            28,
+            29,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:
@@ -4523,6 +4674,9 @@ mod tests {
             "subnets",
             "images",
             "snapshot-schedules",
+            // Derived on the way out of the API by grouping the images. There is
+            // no object to report on.
+            "families",
         ];
         for c in COLLECTIONS {
             let says_nobody = c.condition.is_empty();

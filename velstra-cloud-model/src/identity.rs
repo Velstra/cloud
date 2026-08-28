@@ -57,6 +57,26 @@ pub struct UserSpec {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub email: String,
 
+    /// Whether this identity is a **program** rather than a person.
+    ///
+    /// A cell serving customers needs both, and they differ in exactly one way
+    /// that matters: how they prove who they are. A person has a password and
+    /// signs in; a program has a token, minted by an operator, shown once and
+    /// stored only as a hash — the same shape a node's credential already has,
+    /// for the same reason.
+    ///
+    /// Everything else is deliberately identical. A service account is named in
+    /// a project's bindings like anybody else, gets the same four roles, and
+    /// appears in the audit trail under its own subject — so "what may this CI
+    /// system do here" is answered by reading the project, not by looking for a
+    /// token in a file somewhere and guessing.
+    ///
+    /// Before this, a service account *was* a line in a static token file: no
+    /// object, no bindings, no audit, and no way to take one away except by
+    /// editing a file and restarting the API.
+    #[serde(default)]
+    pub service: bool,
+
     /// A disabled account keeps its bindings and cannot sign in, and its live
     /// sessions stop being accepted on the next request.
     ///
@@ -171,10 +191,55 @@ pub struct NodeCredentialStatus {
 
 pub type NodeCredential = Resource<NodeCredentialSpec, NodeCredentialStatus>;
 
+/// A token a service account authenticates with.
+///
+/// The same shape as a node's, and stored the same way: keyed by the token's
+/// digest, in a collection with no route, written as a controller. The holder
+/// cannot read it back, cannot rotate it, and cannot enumerate the others —
+/// rotation is an operator minting a new one, and revocation is deleting a
+/// record.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServiceCredentialSpec {
+    /// The account this token speaks for.
+    pub user: String,
+    /// What it is for, in the words of whoever minted it — `deploy pipeline`,
+    /// `nightly backups`. An operator looking at four tokens for one account
+    /// needs to know which is which before revoking one.
+    #[serde(default)]
+    pub purpose: String,
+    #[serde(default)]
+    pub issued_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServiceCredentialStatus {
+    pub observed_generation: u64,
+}
+
+pub type ServiceCredential = Resource<ServiceCredentialSpec, ServiceCredentialStatus>;
+
 impl crate::resources::Assigned for UserSpec {}
 impl crate::resources::Assigned for CredentialSpec {}
 impl crate::resources::Assigned for SessionSpec {}
 impl crate::resources::Assigned for NodeCredentialSpec {}
+impl crate::resources::Assigned for ServiceCredentialSpec {}
+
+impl crate::resources::Observed for ServiceCredentialStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &[]
+    }
+    /// Nobody: a credential is a record of an issue, and no agent reports on
+    /// one.
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        true
+    }
+}
 
 impl crate::resources::Observed for NodeCredentialStatus {
     fn observed_generation(&self) -> u64 {
@@ -417,6 +482,7 @@ mod tests {
         // Not "at the next expiry" — now. Otherwise disabling an account is a
         // request rather than an act, and the window is the session lifetime.
         let disabled = UserSpec {
+            service: false,
             disabled: true,
             ..UserSpec::default()
         };

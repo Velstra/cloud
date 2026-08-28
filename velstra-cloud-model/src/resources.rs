@@ -754,6 +754,22 @@ pub struct NodeStatus {
     /// has no business on the machines a cell is made of.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub console_endpoint: String,
+    /// Which virtual machine monitor this node runs its guests under.
+    ///
+    /// `qemu` or `cloud-hypervisor`, reported rather than configured from here:
+    /// it is chosen with `--vmm` when the agent starts, because the two differ
+    /// in device passthrough and in what a live migration means, and that is a
+    /// property of the machine and not of one guest.
+    ///
+    /// It was not reported at all, so an operator could not see what a node ran
+    /// — not in the console, not over the API, nowhere. Choosing between them
+    /// was possible and knowing which you had was not.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vmm: String,
+    /// Images this node is fetching right now, by the name the bytes are filed
+    /// under. See [`nodes_fetching`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fetching: Vec<String>,
     /// Block devices this node can see, and what each is being used for.
     ///
     /// Here for the same reason `images` is: it is one node's observation of its
@@ -873,10 +889,30 @@ pub fn pending_changes(instance: &Instance) -> Vec<PendingChange> {
 
 /// Which nodes hold an image, computed from what each node reports about
 /// itself. Never stored — see [`NodeStatus::images`].
-pub fn nodes_holding(image: &str, nodes: &[Node]) -> Vec<String> {
+pub fn nodes_holding(stored_as: &str, nodes: &[Node]) -> Vec<String> {
     nodes
         .iter()
-        .filter(|n| n.status.images.iter().any(|i| i == image))
+        .filter(|n| n.status.images.iter().any(|i| i == stored_as))
+        .map(|n| n.meta.name.id().to_string())
+        .collect()
+}
+
+/// The nodes that are **fetching** it right now.
+///
+/// An image had exactly two states a person could see: on a node, or not. A
+/// gigabyte takes minutes to arrive, and for all of them the console said
+/// nothing at all — an operator publishing an image and starting a guest could
+/// not tell "downloading" from "stuck", which is the difference between waiting
+/// and going to look for a problem.
+///
+/// Read from what is on the node's disk rather than from bookkeeping: a partial
+/// copy in the incoming directory *is* a fetch in progress, so an agent that
+/// died mid-download reports the truth on its next pass without anybody having
+/// to clean a flag up.
+pub fn nodes_fetching(stored_as: &str, nodes: &[Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|n| n.status.fetching.iter().any(|i| i == stored_as))
         .map(|n| n.meta.name.id().to_string())
         .collect()
 }
@@ -939,6 +975,10 @@ pub type Node = Resource<NodeSpec, NodeStatus>;
 /// what this gives them, while every existing guest keeps the bytes it was built
 /// from.
 pub const FAMILY_PREFIX: &str = "families/";
+/// The same word without the separator: the collection a caller lists to learn
+/// which families exist, so the reference above is something to pick rather
+/// than something to guess.
+pub const FAMILIES: &str = "families";
 /// The newest image of a family, by when this cell learned of it.
 ///
 /// Ordering is by creation time and not by parsing `version`: every scheme for
@@ -1882,6 +1922,48 @@ pub struct PortSpec {
     /// Egress and ingress ceilings, in megabits. Multi-tenancy without these is
     /// one noisy neighbour away from an incident.
     pub rate_limit_mbit: Option<u32>,
+}
+
+/// Whether a port is waiting on anybody.
+///
+/// A port is declared before it is used: nothing programs one until a guest that
+/// names it is running on a node, so a port on no guest sits at
+/// `observedGeneration: 0` with no conditions — and every reader that treats
+/// that as "waiting" is wrong about it. On a fresh cell that put a port on the
+/// attention list the moment it was created and left it there, together with the
+/// operation that made it, which could never finish.
+///
+/// It is the same argument `security::group_condition` already makes about a
+/// group no node carries: reporting it as pending would be an alarm about
+/// nothing — the kind that teaches people to ignore the real one.
+///
+/// Computed on read, like a group's, because no writer owns it: the node that
+/// would report is precisely the node that does not exist yet.
+pub fn port_condition(generation: u64, node: Option<&str>, programmed: bool) -> Condition {
+    match (node, programmed) {
+        (Some(node), true) => Condition::new(
+            "Ready",
+            crate::ConditionStatus::True,
+            "Programmed",
+            &format!("carried by {node}"),
+            generation,
+        ),
+        (Some(node), false) => Condition::new(
+            "Ready",
+            crate::ConditionStatus::False,
+            "NotProgrammed",
+            &format!("{node} has the guest that uses it and has not programmed it yet"),
+            generation,
+        ),
+        (None, _) => Condition::new(
+            "Ready",
+            crate::ConditionStatus::True,
+            "Unused",
+            "declared, and no guest is on it yet — nothing programs a port until \
+             something uses it",
+            generation,
+        ),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

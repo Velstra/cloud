@@ -74,6 +74,7 @@ pub mod host;
 pub mod hostcpu;
 pub mod hostfs;
 pub mod localnet;
+pub mod lvm_pool;
 pub mod metadata;
 pub mod pcidev;
 pub mod pool;

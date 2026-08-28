@@ -59,7 +59,42 @@ pub struct ApiCell {
     /// Every object this node reads lives under one project today. Kept as a
     /// field because the day it does not, this is the one place that changes.
     parent: String,
+    /// The TLS client config, when the API is https. `None` is plain HTTP.
+    tls: Option<std::sync::Arc<tokio_rustls::rustls::ClientConfig>>,
 }
+
+/// A client config whose **only** root is the cell's own certificate.
+///
+/// Pinning, not PKI: a self-signed API certificate verifies against nothing a
+/// system store holds, and shipping `danger_accept_invalid_certs` instead would
+/// mean any machine on the path can be the API. The file the agent trusts is
+/// the file the operator was shown the fingerprint of.
+fn tls_config(ca_path: &str) -> Result<std::sync::Arc<tokio_rustls::rustls::ClientConfig>> {
+    let pem = std::fs::read(ca_path)
+        .map_err(|e| HostError::failed(format!("reading {ca_path}: {e}")))?;
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+        let cert = cert.map_err(|e| HostError::failed(format!("{ca_path}: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| HostError::failed(format!("{ca_path} is not usable as a root: {e}")))?;
+    }
+    if roots.is_empty() {
+        return Err(HostError::failed(format!(
+            "{ca_path} holds no certificate to trust"
+        )));
+    }
+    let config = tokio_rustls::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(std::sync::Arc::new(config))
+}
+
+/// Either side of the line, behind one type, so the HTTP client above does not
+/// care which it got.
+type IoStream = TokioIo<Box<dyn Stream>>;
+trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Stream for T {}
 
 impl ApiCell {
     /// `base` is the API's URL; `token` is what goes in `authorization`.
@@ -75,18 +110,37 @@ impl ApiCell {
 
     fn new(base: &str, token: &str, who: &str) -> Result<Self> {
         let base = base.trim_end_matches('/').to_string();
-        let authority = base
-            .strip_prefix("http://")
-            .ok_or_else(|| {
-                HostError::failed(format!(
-                    "{base} is not an http:// URL; this agent speaks plain HTTP to the API and \
-                     says so rather than quietly failing to verify a certificate"
-                ))
-            })?
-            .to_string();
+        // Two schemes, two trust stories, both explicit. `http://` is what a
+        // developer cell speaks. `https://` is what a cell speaks the moment
+        // `quickstart` makes it a certificate — and the agent broke the day
+        // that landed: this client refused anything but http, so the whole
+        // node was cut off from its cell, every guest on it stuck at
+        // `Unknown`, and the log filled with "invalid HTTP version parsed",
+        // which is what a TLS greeting looks like to an HTTP parser.
+        let (tls, authority) = if let Some(rest) = base.strip_prefix("http://") {
+            (None, rest.to_string())
+        } else if let Some(rest) = base.strip_prefix("https://") {
+            let ca = std::env::var("VELSTRA_API_CA")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| {
+                    HostError::failed(format!(
+                        "{base} is https and this agent has no root to verify it against. \
+                         Set VELSTRA_API_CA to the API's certificate (quickstart writes it \
+                         to /var/lib/velstra/tls/cert.pem) — the alternative would be to \
+                         accept any certificate at all, which is not an alternative."
+                    ))
+                })?;
+            (Some(tls_config(&ca)?), rest.to_string())
+        } else {
+            return Err(HostError::failed(format!(
+                "{base} names no scheme this agent speaks (http:// or https://)"
+            )));
+        };
         Ok(Self {
             base,
             authority,
+            tls,
             token: token.to_string(),
             who: who.to_string(),
             parent: String::new(),
@@ -168,12 +222,35 @@ impl ApiCell {
         &self,
     ) -> Result<(
         hyper::client::conn::http1::SendRequest<String>,
-        hyper::client::conn::http1::Connection<TokioIo<tokio::net::TcpStream>, String>,
+        hyper::client::conn::http1::Connection<IoStream, String>,
     )> {
         let stream = tokio::net::TcpStream::connect(&self.authority)
             .await
             .map_err(|e| HostError::failed(format!("connecting to {}: {e}", self.base)))?;
-        hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        let io: Box<dyn Stream> = match &self.tls {
+            None => Box::new(stream),
+            Some(config) => {
+                let host = self
+                    .authority
+                    .rsplit_once(':')
+                    .map(|(h, _)| h)
+                    .unwrap_or(&self.authority)
+                    .to_string();
+                let name = tokio_rustls::rustls::pki_types::ServerName::try_from(host)
+                    .map_err(|e| HostError::failed(format!("{}: {e}", self.base)))?;
+                let connected = tokio_rustls::TlsConnector::from(config.clone())
+                    .connect(name, stream)
+                    .await
+                    .map_err(|e| {
+                        HostError::failed(format!(
+                            "the API at {} did not verify against VELSTRA_API_CA: {e}",
+                            self.base
+                        ))
+                    })?;
+                Box::new(connected)
+            }
+        };
+        hyper::client::conn::http1::handshake(TokioIo::new(io))
             .await
             .map_err(|e| HostError::failed(format!("speaking HTTP to {}: {e}", self.base)))
     }
@@ -354,6 +431,7 @@ impl CellReader for ApiCell {
             token: self.token.clone(),
             who: self.who.clone(),
             parent: self.parent.clone(),
+            tls: self.tls.clone(),
         });
         // Only the four that are assigned. The shared collections change rarely
         // and the resync is what notices; subscribing to them would put every
