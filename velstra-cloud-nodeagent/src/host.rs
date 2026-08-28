@@ -231,7 +231,13 @@ pub trait Vmm: Send + Sync + 'static {
     /// The copy is not a step afterwards. A disk that exists empty for even one
     /// pass is a disk a guest can be started from, and a guest booted off an
     /// empty disk fails in the least legible way there is.
-    async fn create_disk(&self, instance: &str, gib: u64, image: &str) -> Result<()>;
+    async fn create_disk(
+        &self,
+        instance: &str,
+        gib: u64,
+        image: &str,
+        format: velstra_cloud_model::resources::ImageFormat,
+    ) -> Result<()>;
 
     /// Where this guest's root disk is on this machine, for something that has
     /// to read the bytes rather than boot them.
@@ -252,6 +258,17 @@ pub trait Vmm: Send + Sync + 'static {
     async fn stop(&self, instance: &str) -> Result<()>;
 
     /// Remove the guest and everything of it on this node.
+    /// Take the power away, for a guest that was asked to shut down and did
+    /// not. The disk and the object stay; only the machine stops.
+    ///
+    /// Separate from [`stop`] because they are different acts and a reader of
+    /// this trait should be able to tell which one is happening: one asks an
+    /// operating system to close its files, the other loses whatever was not
+    /// written.
+    ///
+    /// [`stop`]: Vmm::stop
+    async fn kill(&self, instance: &str) -> Result<()>;
+
     async fn delete(&self, instance: &str) -> Result<()>;
 
     /// Open a volume for a guest and return the device the guest sees.

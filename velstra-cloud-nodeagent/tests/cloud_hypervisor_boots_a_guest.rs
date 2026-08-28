@@ -126,9 +126,14 @@ async fn a_directly_booted_kernel_runs_and_says_so() {
     // A disk is still made and attached: nothing boots from it here, but the
     // backend's normal path includes one and a test that skipped it would be
     // testing a shape nobody runs.
-    vmm.create_disk(instance, request.root_disk_gib, &request.image)
-        .await
-        .expect("a root disk");
+    vmm.create_disk(
+        instance,
+        request.root_disk_gib,
+        &request.image,
+        velstra_cloud_model::resources::ImageFormat::Raw,
+    )
+    .await
+    .expect("a root disk");
     vmm.start(&request).await.expect("cloud-hypervisor starts");
 
     let mut running = false;

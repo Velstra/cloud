@@ -455,9 +455,15 @@ impl Vmm for CloudHypervisorVmm {
     }
 
     /// A sparse file of the asked-for size. Real, and covered by a test.
-    async fn create_disk(&self, instance: &str, gib: u64, image: &str) -> Result<()> {
+    async fn create_disk(
+        &self,
+        instance: &str,
+        gib: u64,
+        image: &str,
+        format: velstra_cloud_model::resources::ImageFormat,
+    ) -> Result<()> {
         let source = hostfs::image_path(&self.layout, image);
-        hostfs::create_disk(&self.layout, instance, gib, source.as_deref()).await
+        hostfs::create_disk(&self.layout, instance, gib, source.as_deref(), format).await
     }
 
     /// Covered by `tests/cloud_hypervisor_boots_a_guest.rs`, which starts a real guest and
@@ -504,6 +510,17 @@ impl Vmm for CloudHypervisorVmm {
 
     /// The teardown half of `tests/cloud_hypervisor_boots_a_guest.rs`: the guest is deleted and
     /// the machine is asked again, so "gone" is observed rather than assumed.
+    async fn kill(&self, instance: &str) -> Result<()> {
+        // `quit` ends the VMM process where `system_powerdown` only asks the
+        // guest to. The unit goes with it; the disk and the directory stay,
+        // because this is a stop and not a delete.
+        // `vm.shutdown` here is the hard one: Cloud Hypervisor's `vm.power-button`
+        // is the ACPI press that `stop` already made and this guest ignored.
+        let _ = self.api(instance, "PUT", "/api/v1/vm.shutdown", "").await;
+        hostfs::stop_unit(self.layout.scope, &self.unit(instance)).await;
+        Ok(())
+    }
+
     async fn delete(&self, instance: &str) -> Result<()> {
         // Either socket: a guest that arrived by migration answers on the
         // incoming one, and asking the absent one would skip the shutdown.
@@ -1087,6 +1104,7 @@ mod tests {
             "projects/p1/instances/i1",
             2,
             "projects/p1/images/sha256-abc",
+            velstra_cloud_model::resources::ImageFormat::Raw,
         )
         .await
         .unwrap();
@@ -1101,6 +1119,7 @@ mod tests {
             "projects/p1/instances/i1",
             2,
             "projects/p1/images/sha256-abc",
+            velstra_cloud_model::resources::ImageFormat::Raw,
         )
         .await
         .unwrap();
@@ -1115,6 +1134,7 @@ mod tests {
             "projects/p1/instances/i1",
             1,
             "projects/p1/images/sha256-abc",
+            velstra_cloud_model::resources::ImageFormat::Raw,
         )
         .await
         .unwrap();

@@ -59,6 +59,7 @@ let
       role,
       description,
       exec,
+      pre ? "",
       after ? "network-online.target",
     }:
     ''
@@ -72,7 +73,7 @@ let
       Restart=on-failure
       RestartSec=5
       EnvironmentFile=-/var/lib/velstra/node.env
-      ${roleGuard role}ExecStart=${exec}
+      ${pre}${roleGuard role}ExecStart=${exec}
 
       [Install]
       WantedBy=multi-user.target
@@ -97,15 +98,67 @@ let
       description = "Velstra Cloud controllers";
       exec = bin "velstra-cloud-controller";
     };
+    # Both agents are handed their answers on the command line, built from the
+    # seed — the same translation the NixOS modules do, for the same reason.
+    #
+    # They used to be started bare, on the assumption that `EnvironmentFile`
+    # was enough. It is not: `--node`, `--cell`, `--region` and `--pool` are
+    # required arguments with no environment fallback, so both units died
+    # immediately with "the following required arguments were not provided" and
+    # restarted for ever. The package installed, the units were enabled, and
+    # neither agent ever ran.
+    #
+    # Written as a shell line rather than a static ExecStart because the answers
+    # are only known at runtime, and because `--vmm-binary` has to be resolved
+    # from the seed: a transient guest unit does not inherit this unit's PATH,
+    # so the hypervisor must be named absolutely.
     "velstra-cloud-nodeagent.service" = unit {
       role = "hypervisor";
       description = "Velstra Cloud node agent";
-      exec = bin "velstra-cloud-nodeagent";
+      # The metadata address, which the agent binds and treats as fatal — a cell
+      # whose guests silently get no metadata is worse than a node that says so
+      # at startup. NixOS gives it a networkd dummy interface; a Debian machine
+      # may not run networkd at all, so the unit makes it itself.
+      #
+      # Without this the agent got as far as connecting to the store and then
+      # died on "Cannot assign requested address", which is the third thing the
+      # NixOS module did that this package did not.
+      #
+      # `-` on each line: re-running is normal (a restart, a second start after
+      # a crash) and an interface that already exists is success, not failure.
+      pre = ''
+        ExecStartPre=-/usr/sbin/ip link add vmeta0 type dummy
+        ExecStartPre=-/usr/sbin/ip addr add 169.254.169.254/32 dev vmeta0
+        ExecStartPre=-/usr/sbin/ip link set vmeta0 up
+      '';
+      exec = ''
+        /bin/sh -c 'case "''${VELSTRA_VMM:-}" in \
+          qemu) vmm=/usr/bin/qemu-system-x86_64 ;; \
+          cloud-hypervisor) vmm=/usr/bin/cloud-hypervisor ;; \
+          fake) vmm= ;; \
+          *) echo "node.env sets VELSTRA_VMM=''${VELSTRA_VMM:-} — expected qemu, cloud-hypervisor or fake" >&2; exit 1 ;; \
+        esac; \
+        fab=; \
+        if [ -n "''${VELSTRA_FABRIC:-}" ]; then \
+          fab="--datapath fabric --fabric $VELSTRA_FABRIC --fabric-vtep $VELSTRA_FABRIC_VTEP --fabric-underlay $VELSTRA_FABRIC_UNDERLAY"; \
+          [ -n "''${VELSTRA_FABRIC_SRV6_LOCATOR:-}" ] && fab="$fab --fabric-srv6-locator $VELSTRA_FABRIC_SRV6_LOCATOR"; \
+        fi; \
+        exec ${bin "velstra-cloud-nodeagent"} \
+          --node "$VELSTRA_NODE" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
+          --api "$VELSTRA_API_URL" --api-token-file /var/lib/velstra/node-token \
+          --vmm "$VELSTRA_VMM" ''${vmm:+--vmm-binary "$vmm"} \
+          --state-dir /var/lib/velstra \
+          ''${VELSTRA_CONSOLE_LISTEN:+--console-listen "$VELSTRA_CONSOLE_LISTEN"} \
+          ''${VELSTRA_CONSOLE_ADVERTISE:+--console-advertise "$VELSTRA_CONSOLE_ADVERTISE"} \
+          $fab' '';
     };
     "velstra-cloud-poolagent.service" = unit {
       role = "pool";
       description = "Velstra Cloud storage pool agent";
-      exec = bin "velstra-cloud-poolagent";
+      exec = ''
+        /bin/sh -c 'exec ${bin "velstra-cloud-poolagent"} \
+          --pool "$VELSTRA_POOL" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
+          --store "$VELSTRA_STORE" --backend "$VELSTRA_POOL_BACKEND"' '';
     };
     "velstra-fabric-agent.service" = fabricUnit;
   };
@@ -157,7 +210,10 @@ let
 in
 pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
   {
-    nativeBuildInputs = [ pkgs.dpkg ];
+    nativeBuildInputs = [
+      pkgs.dpkg
+      pkgs.patchelf
+    ];
     meta.description = "Velstra Cloud as a Debian package";
   }
   ''
@@ -165,13 +221,32 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/lib/systemd/system" \
              "$root/var/lib/velstra" "$root/usr/share/doc/velstra-cloud"
 
-    # The binaries, copied rather than symlinked into the store: a .deb that
-    # depended on /nix existing on the target would be a Nix installation
-    # wearing a Debian filename.
+    # The binaries, copied rather than symlinked into the store — and then
+    # pointed at Debian's own dynamic linker, which is the half that was
+    # missing.
+    #
+    # Copying the file was necessary and not sufficient. An ELF binary names its
+    # interpreter *inside itself*, and a Nix-built one names
+    # `/nix/store/…-glibc-2.42-67/lib/ld-linux-x86-64.so.2`. On a machine with no
+    # /nix that path does not exist, so the kernel refuses to start it and the
+    # shell reports "cannot execute: required file not found" — about the
+    # interpreter, not about the binary, which is sitting right there. The
+    # package installed cleanly and not one of its five binaries could run.
+    #
+    # The comment this replaces claimed copying was what stopped the package
+    # being "a Nix installation wearing a Debian filename". It was not, and
+    # nothing checked: the deb check grepped the *units* for /nix/store and
+    # never looked at the binaries. It does now.
+    #
+    # The rpath goes too — it points into the store as well, and an empty one
+    # sends the loader to the system paths, which is where Debian's libraries
+    # are.
     for b in velstra-cloud-api velstra-cloud-controller velstra-cloud-nodeagent \
              velstra-cloud-poolagent velstra-cloud-node; do
       cp ${velstra-cloud}/bin/$b "$root/usr/bin/$b"
       chmod 0755 "$root/usr/bin/$b"
+      patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 \
+               --set-rpath "" "$root/usr/bin/$b"
     done
 
     ${lib.concatStringsSep "\n" (
@@ -189,7 +264,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     Priority: optional
     Architecture: ${debArch}
     Maintainer: Velstra <noreply@velstra.invalid>
-    Depends: systemd
+    Depends: systemd, libc6 (>= 2.39), iproute2, nftables, curl
     Recommends: qemu-system-x86, qemu-utils, etcd-server, ceph-common, velstra
     Description: Velstra Cloud — control plane, node agent and storage pool
      One package, four roles. Which of them this machine runs is decided by
@@ -216,9 +291,15 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
       if [ ! -f /var/lib/velstra/node.env ]; then
         echo ""
         echo "velstra-cloud is installed and nothing is running."
-        echo "Say what this machine is for:"
         echo ""
-        echo "    sudo velstra-cloud-node setup"
+        echo "One machine, the whole cell — for a laptop or a home server:"
+        echo ""
+        echo "    sudo velstra-cloud-node quickstart"
+        echo ""
+        echo "One machine in a larger cell, or an unattended install:"
+        echo ""
+        echo "    sudo velstra-cloud-node setup            # asks"
+        echo "    sudo velstra-cloud-node setup --config …  # reads a seed"
         echo ""
       fi
     fi

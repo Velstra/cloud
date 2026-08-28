@@ -57,6 +57,9 @@ pub struct GuestView {
 pub struct Interface {
     /// The port resource name.
     pub port: String,
+    /// The subnet resource name. Not for the guest — for the node, which cannot
+    /// otherwise tell two of its guests being on one segment from being on two.
+    pub subnet: String,
     pub mac: Option<[u8; 6]>,
     /// The address and how much of the world is on this link. The prefix comes
     /// from the subnet, which is where the range is declared; a port carrying
@@ -70,6 +73,15 @@ pub struct Interface {
     pub mtu: Option<u32>,
     /// The host device this NIC is on, when it is programmed on this node.
     pub tap: Option<String>,
+    /// Whether this NIC is on the machine's own wire rather than one this
+    /// platform builds.
+    ///
+    /// What it changes is what this node **does not do**: it does not answer
+    /// DHCP for the guest, because whatever serves that wire already does, and
+    /// two servers on one segment is how a guest gets an address nobody agrees
+    /// on. The address on the Port is then the operator's note about where the
+    /// guest is expected to be, not an allocation this platform made.
+    pub on_host_bridge: bool,
     /// Public addresses this port holds, in the order they were declared.
     ///
     /// Held by the **guest**, which is the whole difference between a routed
@@ -162,6 +174,18 @@ impl GuestRegistry {
                             index.by_address.insert(address, (view.clone(), n));
                         }
                     }
+                }
+                // A guest on the machine's own wire is not this node's to lease
+                // to. Whatever serves that wire already answers, and a second
+                // server on one segment is how a guest ends up with an address
+                // nobody agrees on — including the one the Port says it has.
+                //
+                // Left out of the *wire* index only: the metadata service still
+                // answers it, because a guest on a host bridge reaches
+                // 169.254.169.254 on this machine like any other neighbour, and
+                // that is where its keys and its hostname come from.
+                if interface.on_host_bridge {
+                    continue;
                 }
                 let (Some(tap), Some(mac)) = (interface.tap.clone(), interface.mac) else {
                     continue;
@@ -279,6 +303,10 @@ fn interface(
         .as_deref()
         .and_then(|address| address_in(address, declared));
     Interface {
+        subnet: port.spec.subnet.clone(),
+        on_host_bridge: networks
+            .get(&port.spec.network)
+            .is_some_and(|n| !n.spec.host_bridge.is_empty()),
         mac: port.spec.mac.as_deref().and_then(parse_mac),
         cidr,
         gateway: subnet.and_then(|s| s.spec.gateway.parse().ok()),
@@ -374,6 +402,7 @@ mod tests {
             Resource::new(
                 meta("projects/p1/networks/net-a"),
                 NetworkSpec {
+                    host_bridge: String::new(),
                     vni: 4711,
                     mtu: 1450,
                     external: false,

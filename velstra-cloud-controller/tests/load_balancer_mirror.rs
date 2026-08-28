@@ -154,6 +154,7 @@ async fn a_load_balancer_is_programmed_follows_its_spec_and_is_torn_down() {
             &Resource::new(
                 meta(NETWORK),
                 NetworkSpec {
+                    host_bridge: String::new(),
                     vni: VNI,
                     mtu: 1500,
                     external: false,

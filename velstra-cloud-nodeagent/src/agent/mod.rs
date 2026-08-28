@@ -121,6 +121,59 @@ impl AgentConfig {
     }
 }
 
+impl Agent {
+    /// Make this node the first hop for the segments its guests are on.
+    ///
+    /// Off by default, and that is the safe default rather than the useful one:
+    /// a node that starts routing and translating a tenant's frames because
+    /// nobody said otherwise is a node that quietly overrode the cell's network
+    /// design. `quickstart` turns it on, because a home cell has no fabric and a
+    /// guest nobody can reach is not a guest.
+    pub fn as_first_hop(mut self, prefix: &str) -> Self {
+        self.localnet = Some(crate::localnet::LocalNet::new(prefix));
+        self
+    }
+
+    /// Make the far end of every wire this node carries.
+    ///
+    /// Idempotent and computed whole every time — see [`crate::localnet`] — so
+    /// calling it twice in a pass costs a handful of `ip` calls and leaves the
+    /// machine where it was. That matters, because it is called at two moments
+    /// on purpose: once before this node's guests are acted on, and again the
+    /// instant a port is programmed.
+    ///
+    /// The second call is the fix for a race that looked like a metadata bug for
+    /// a long time. A guest starts in the **same pass** as the tap it runs on,
+    /// so a picture of the segments built before that pass acted cannot contain
+    /// the tap — and the bridge, the gateway address and the route to
+    /// `169.254.169.254` all arrived a resync later. A stock cloud image does
+    /// its entire cloud-init inside fifteen seconds, finds nothing, and comes up
+    /// with no user and no SSH key.
+    /// Answers whether the machine now looks the way it should, so a caller with
+    /// a pass to count against can count it. A node that could not make the far
+    /// end has guests that will boot and reach nothing, which is a failure of
+    /// the pass and not a detail of it.
+    async fn ensure_first_hop(
+        &self,
+        ports: &BTreeMap<String, Port>,
+        subnets: &BTreeMap<String, velstra_cloud_model::resources::Subnet>,
+        networks: &BTreeMap<String, NetworkSpec>,
+        taps: &BTreeMap<String, String>,
+    ) -> bool {
+        let Some(localnet) = &self.localnet else {
+            return true;
+        };
+        let segments = crate::localnet::segments(ports, subnets, networks, taps);
+        match localnet.apply(&segments).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not make this node the first hop");
+                false
+            }
+        }
+    }
+}
+
 /// Whether this agent may touch an object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ownership {
@@ -167,6 +220,13 @@ pub(super) struct CellView<'a> {
     /// port would be the same answer fetched many times. It also replaces a
     /// second read this pass used to make when it described guests.
     pub networks: &'a BTreeMap<String, NetworkSpec>,
+    /// The segments those networks are cut into — where a port's address, mask
+    /// and gateway come from.
+    ///
+    /// Here rather than only in the guest description because the far end of a
+    /// wire has to exist before the guest on it starts, and the guest starts in
+    /// the same pass that makes the wire. See [`crate::localnet`].
+    pub subnets: &'a BTreeMap<String, velstra_cloud_model::resources::Subnet>,
     /// The registered images, by name — where an image's bytes come from.
     ///
     /// Read once per pass and handed down like the networks above. A node can
@@ -206,6 +266,11 @@ pub struct Agent {
     cell: Arc<dyn CellReader>,
     vmm: Arc<dyn Vmm>,
     datapath: Arc<dyn Datapath>,
+    /// The far end of the wire, when this node is it. `None` is the fabric case
+    /// and the deliberate dead end — see [`crate::localnet`], which is also
+    /// where the reason a guest on a first-hop-less node cannot be logged into
+    /// is written down.
+    localnet: Option<crate::localnet::LocalNet>,
     guests: GuestRegistry,
     /// How this node runs Ceph's own tools. A field so a test can point it at
     /// something that is not `cephadm`, and so the pass does not construct one
@@ -285,6 +350,7 @@ impl Agent {
             config,
             vmm,
             datapath,
+            localnet: None,
             guests: GuestRegistry::new(),
             cephadm: crate::cephadm::CephAdmin::default(),
             warned_about_ceph_reads: AtomicBool::new(false),
@@ -776,6 +842,20 @@ impl Agent {
             }
         };
 
+        // The same read `refresh_guests` used to make on its own, moved up so the
+        // pass that *creates* a wire can also make its far end. A segment that
+        // cannot be read leaves the far end alone rather than inventing one.
+        let subnets = match self.cell.subnets().await {
+            Ok(list) => list
+                .into_iter()
+                .map(|s| (s.meta.name.to_string(), s))
+                .collect::<BTreeMap<_, _>>(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not list subnets");
+                BTreeMap::new()
+            }
+        };
+
         let images = match self.cell.images().await {
             Ok(list) => list
                 .into_iter()
@@ -803,6 +883,7 @@ impl Agent {
             ports: &ports,
             groups: &groups,
             networks: &networks,
+            subnets: &subnets,
             images: &images,
             instances: &instances,
         };
@@ -836,6 +917,17 @@ impl Agent {
                 }
             }
         };
+
+        // Before a single guest is acted on. A port programmed on an earlier
+        // pass — after a restart, say — has a tap and no bridge until somebody
+        // makes one, and the guest on it is already running.
+        let taps_now = taps_of(&programmed);
+        if !self
+            .ensure_first_hop(&ports, &subnets, &networks, &taps_now)
+            .await
+        {
+            pass.failures += 1;
+        }
 
         let mut mine = Vec::new();
         for instance in &instances {
@@ -1008,6 +1100,10 @@ impl Agent {
         let mut host = host.clone();
         let mut outcome = Ok(());
         let mut previous: Option<Vec<Action>> = None;
+        // Outside the round loop: the note has to survive to the report below,
+        // which is where the status this pass publishes is assembled.
+        let mut asked_to_stop_at: Option<velstra_cloud_model::meta::Timestamp> =
+            stored.status.stop_requested_at;
         // A guest that is missing while a migration of it is open is the one
         // case where this node reports and does nothing else. Tearing down is
         // still allowed: a delete is a decision somebody made about the object,
@@ -1065,6 +1161,7 @@ impl Agent {
                 // order is a property of the node rather than of any guest, so
                 // it can only be answered here — with the whole list in hand.
                 Self::start_gate_for(stored, cell.instances, &host),
+                velstra_cloud_model::meta::Timestamp::now(),
             );
 
             // Letting go of the finalizer is a metadata write, which belongs to
@@ -1094,7 +1191,17 @@ impl Agent {
                     .perform_instance(action, stored, &taps, cell, &host)
                     .await
                 {
-                    Ok(()) => pass.actions += 1,
+                    Ok(()) => {
+                        pass.actions += 1;
+                        // The button was pressed; note when, so the next pass
+                        // can tell a guest that is shutting down from one that
+                        // is never going to. Written here rather than inside
+                        // `perform_instance`, which does not own a status.
+                        if matches!(action, Action::StopVm { .. }) {
+                            asked_to_stop_at
+                                .get_or_insert_with(velstra_cloud_model::meta::Timestamp::now);
+                        }
+                    }
                     Err(why) => {
                         // The order in `reconcile_instance` is load-bearing, so
                         // a failed step stops the rest: a guest started without
@@ -1137,6 +1244,10 @@ impl Agent {
         let mut next = stored.clone();
         next.status.node = Some(self.config.node.clone());
         next.status.observed_generation = acted_on;
+        // Set before the observation, which clears it again the moment the
+        // guest is actually gone — so the note lives exactly as long as
+        // somebody is waiting on a shutdown.
+        next.status.stop_requested_at = asked_to_stop_at;
         observe_instance(
             &mut next.status,
             &host,
@@ -1263,7 +1374,21 @@ impl Agent {
                 instance,
                 gib,
                 image,
-            } => self.vmm.create_disk(instance, *gib, image).await,
+            } => {
+                // The image's declared format, taken from the object rather
+                // than assumed: the disk is handed to the VMM as raw, so a
+                // qcow2 image has to be converted and not copied. Absent means
+                // this node was told to make a disk from an image the cell does
+                // not have, which `pull_image` above refuses for the same
+                // reason — but the default is the safe one either way, since a
+                // raw copy of a raw image is what it always was.
+                let format = cell
+                    .images
+                    .get(image.as_str())
+                    .map(|i| i.format)
+                    .unwrap_or_default();
+                self.vmm.create_disk(instance, *gib, image, format).await
+            }
             Action::ProgramPort { port } => match ports.get(port) {
                 Some(p) => {
                     // Said out loud rather than guessed at: a datapath that
@@ -1272,10 +1397,27 @@ impl Agent {
                     match networks.get(&p.spec.network) {
                         Some(network) => {
                             let rules = self.rules_for(&p.spec, groups, ports);
-                            self.datapath
-                                .program(port, &p.spec, network, &rules)
-                                .await
-                                .map(|_| ())
+                            let programmed =
+                                self.datapath.program(port, &p.spec, network, &rules).await;
+                            // The far end, before the guest that will use this
+                            // wire is started — which happens next, in this same
+                            // list of actions. Waiting for the next pass means
+                            // waiting past the whole of a stock image's
+                            // cloud-init.
+                            if programmed.is_ok() {
+                                if let Ok(now) = self.datapath.observe().await {
+                                    let taps = taps_of(&now);
+                                    // Counted by the pass that runs this before
+                                    // the guests; here the warning in the
+                                    // journal is the record, because an action
+                                    // arm reports on the *port*, and a bridge
+                                    // this node could not make is not something
+                                    // the port did wrong.
+                                    self.ensure_first_hop(ports, cell.subnets, networks, &taps)
+                                        .await;
+                                }
+                            }
+                            programmed.map(|_| ())
                         }
                         None => Err(crate::host::HostError::failed(format!(
                             "{} is on {}, which is not in the store yet",
@@ -1310,7 +1452,12 @@ impl Agent {
                     Err(why) => Err(crate::host::HostError::failed(why)),
                 }
             }
+            // The ACPI button, and a note that it was pressed — the model needs
+            // the second half to know when asking has stopped being useful.
             Action::StopVm { instance } => self.vmm.stop(instance).await,
+            // The note is written by the caller of `perform`, which owns the
+            // status it will report; see where the pass records it.
+            Action::KillVm { instance } => self.vmm.kill(instance).await,
             Action::DeleteVm { instance } => self.vmm.delete(instance).await,
             other => Err(crate::host::HostError::failed(format!(
                 "{other:?} is not an instance action"

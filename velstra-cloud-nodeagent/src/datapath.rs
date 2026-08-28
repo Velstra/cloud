@@ -252,7 +252,7 @@ impl Datapath for TapDatapath {
         &self,
         port: &str,
         spec: &PortSpec,
-        _network: &NetworkSpec,
+        network: &NetworkSpec,
         rules: &[ResolvedRule],
     ) -> Result<String> {
         // Refused rather than under-enforced. A port whose security groups came
@@ -320,6 +320,29 @@ impl Datapath for TapDatapath {
         self.ip(&["link", "set", "dev", &tap, "alias", port])
             .await?;
         self.ip(&["link", "set", "dev", &tap, "up"]).await?;
+
+        // A network the operator put on a host bridge is the machine's own wire.
+        // The guest goes on it and this platform does nothing else for it: no
+        // gateway of ours, no translation, no address — whatever serves that
+        // wire serves the guest, which is the point of asking for it.
+        if !network.host_bridge.is_empty() {
+            if !self.present(&network.host_bridge).await {
+                // Refused, not created. Making one would mean deciding what goes
+                // in it, and the only useful answer involves the machine's
+                // uplink — which is how a node takes itself off the network. An
+                // operator who wants this makes the bridge; the platform uses it.
+                return Err(HostError::failed(format!(
+                    "{port} is on a network that asks for host bridge `{}`, and this machine has \
+                     no such interface. Create the bridge on the node — with whatever uplink it \
+                     should carry — or take `hostBridge` off the network. This platform will not \
+                     make one, because deciding what goes in it means deciding whether this node \
+                     keeps its own network.",
+                    network.host_bridge
+                )));
+            }
+            self.ip(&["link", "set", "dev", &tap, "master", &network.host_bridge])
+                .await?;
+        }
         Ok(tap)
     }
 

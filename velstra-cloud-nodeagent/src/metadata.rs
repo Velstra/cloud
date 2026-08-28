@@ -36,6 +36,16 @@
 //! anywhere in this file whose answer depends on anything but which guest
 //! asked.
 
+/// Where a guest reaches this service.
+///
+/// The link-local address every cloud uses, and the one this node binds — named
+/// once because two places have to agree on it and neither can see the other:
+/// the DHCP responder hands it out as the server to renew from, and the VMM
+/// command line tells the guest's cloud-init to look there. A drift between them
+/// is a guest that is offered an address by one address and configured by
+/// nobody.
+pub const ADDRESS: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
+
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -98,7 +108,7 @@ fn router(registry: GuestRegistry) -> Router {
         .route("/latest/user-data", get(user_data))
         // NoCloud: the flat trio, for an image told `ds=nocloud-net`.
         .route("/meta-data", get(nocloud_meta_data))
-        .route("/user-data", get(user_data))
+        .route("/user-data", get(nocloud_user_data))
         .route("/network-config", get(network_config))
         .fallback(unknown_path)
         .with_state(registry)
@@ -281,6 +291,10 @@ enum Family {
     V6,
 }
 
+/// `/latest/user-data` — the EC2 spelling, where absent means 404.
+///
+/// That is what the EC2 datasource expects, and it reads a 404 as "this
+/// instance has none" and carries on.
 async fn user_data(
     State(registry): State<GuestRegistry>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -290,10 +304,37 @@ async fn user_data(
     };
     match &me.user_data {
         Some(data) => text(data.clone()),
-        // An instance with no user-data gets the same 404 cloud-init expects,
-        // not an empty 200 it would then try to run.
         None => not_found(),
     }
+}
+
+/// `/user-data` — the NoCloud spelling, where absent means an empty document.
+///
+/// The two layouts want **opposite** things from an instance with no user-data,
+/// and answering both the EC2 way is a defect that hides completely behind a
+/// working network.
+///
+/// NoCloud fetches the seed as a set: `meta-data`, then `user-data`. A failure
+/// to fetch either one fails the **whole datasource** — cloud-init throws away
+/// the meta-data it has already read, retries a few times, and falls back to
+/// `DataSourceNone`. The guest then boots with no user, no SSH key and nothing
+/// from the platform at all, and the only clue is one line saying "Used fallback
+/// datasource" among a thousand lines of boot.
+///
+/// Measured, not reasoned about: `/network-config` 200, `/meta-data` 200,
+/// `/user-data` 404 eight times, `Datasource DataSourceNone`. Every instance
+/// created without user-data — which is most of them, and every one this
+/// platform's own console makes — was that instance.
+async fn nocloud_user_data(
+    State(registry): State<GuestRegistry>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    let Some(me) = caller(&registry, peer) else {
+        return not_found();
+    };
+    // An empty document, because that is what "this instance has no user-data"
+    // is in this layout. cloud-init runs nothing for it.
+    text(me.user_data.clone().unwrap_or_default())
 }
 
 async fn nocloud_meta_data(
@@ -466,6 +507,8 @@ mod tests {
             ssh_keys: vec!["ssh-ed25519 AAAA user@host".into()],
             user_data: Some("#cloud-config\n".into()),
             interfaces: vec![Interface {
+                subnet: "projects/p1/subnets/s1".into(),
+                on_host_bridge: false,
                 port: "projects/p1/ports/port-a".into(),
                 mac: parse_mac("52:54:00:12:34:56"),
                 cidr: Some(Cidr::parse("10.20.0.10/24").unwrap()),

@@ -479,6 +479,7 @@ survives_the_wire!(
     resources::InstanceStatus,
     v1::InstanceStatus,
     resources::InstanceStatus {
+        stop_requested_at: Some(velstra_cloud_model::meta::Timestamp(1_700_000_000_123)),
         running_size: Some(velstra_cloud_model::resources::RunningSize {
             vcpus: 4,
             memory_mib: 8192,
@@ -502,7 +503,7 @@ survives_the_wire!(
     },
     {
         observed_generation, conditions, state, node, addresses, vmm_pid, started_at,
-        cpu, devices, console_tail, console_bytes, running_size,
+        cpu, devices, console_tail, console_bytes, running_size, stop_requested_at,
     }
 );
 
@@ -596,6 +597,7 @@ survives_the_wire!(
     resources::NetworkSpec,
     v1::NetworkSpec,
     resources::NetworkSpec {
+            host_bridge: "br0".into(),
         vni: 5001,
         mtu: 1450,
         external: true,
@@ -603,7 +605,7 @@ survives_the_wire!(
         // from one that was dropped.
         announce: velstra_cloud_model::public::Announce::FromHost,
     },
-    { vni, mtu, external, announce }
+    { vni, mtu, external, announce, host_bridge }
 );
 
 survives_the_wire!(
@@ -926,6 +928,7 @@ whole_object_survives!(
     resources::Network,
     v1::Network,
     resources::NetworkSpec {
+        host_bridge: "br0".into(),
         vni: 5001,
         mtu: 1450,
         external: false,
@@ -1067,6 +1070,7 @@ whole_object_survives!(
         },
     },
     resources::InstanceStatus {
+        stop_requested_at: None,
         running_size: None,
         console_tail: String::new(),
         console_bytes: 0,

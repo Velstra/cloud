@@ -155,6 +155,7 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
             &Resource::new(
                 meta(NETWORK),
                 NetworkSpec {
+                    host_bridge: String::new(),
                     vni: VNI,
                     mtu: 1500,
                     external: false,
@@ -472,6 +473,7 @@ async fn a_routed_address_is_bound_to_the_port_rather_than_translated() {
             &Resource::new(
                 meta(NETWORK),
                 NetworkSpec {
+                    host_bridge: String::new(),
                     vni: VNI,
                     mtu: 1500,
                     // The prefix on this network's subnets is real. The fabric

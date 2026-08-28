@@ -60,6 +60,8 @@ struct Args {
     #[arg(long, value_enum, default_value_t = VmmKind::Fake)]
     vmm: VmmKind,
 
+
+
     /// Where the metadata service listens. The guests' side of it is always
     /// `169.254.169.254:80`; this is configurable so a test, or a node whose
     /// link-local address is not up yet, can bind somewhere else.
@@ -218,6 +220,34 @@ struct Args {
     #[arg(long, default_value = "vt")]
     tap_prefix: String,
 
+    /// Be the far end of the wire: hold each segment's gateway, and let its
+    /// guests out through this node.
+    ///
+    /// Without this, `--datapath tap` creates a tap that leads **nowhere** —
+    /// which is correct on a node whose fabric carries the segment, and a silent
+    /// dead end on one without. The dead end costs more than reachability: a
+    /// guest whose cloud-init cannot reach `169.254.169.254` over its own link
+    /// gets no user, no SSH key and no network configuration, and boots to a
+    /// login prompt that nothing opens.
+    ///
+    /// So: on for one box that is the whole cell, off for a node joining a cell
+    /// that has a fabric. Needs `nft` and CAP_NET_ADMIN.
+    #[arg(
+        long,
+        env = "VELSTRA_LOCAL_NETWORK",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = truthy,
+    )]
+    local_network: bool,
+
+    /// The bridge-name prefix, for the same reason `--tap-prefix` exists: two
+    /// agents on one machine need two, and everything else derives from the
+    /// subnet.
+    #[arg(long, default_value = "vbr")]
+    bridge_prefix: String,
+
     /// The uid created taps are owned by, so a guest running as that user can
     /// open one. Unset means this process's own, which is what a root agent
     /// running root guests wants.
@@ -318,6 +348,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         ..Default::default()
     };
+    // Taken before the hypervisor is built, because building one moves fields
+    // out of the layout — and the console service needs only where a guest's
+    // directory is.
+    let console_layout = layout.clone();
     // A fake hypervisor gets a fake network and a real one gets real taps,
     // unless told otherwise. Pairing a real VMM with the fake network is what
     // used to happen unconditionally, and it does not merely program nothing: a
@@ -410,6 +444,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => Agent::new(store, config, vmm, datapath),
     };
+    // Both would own the far end of the same taps, and the fabric's answer is
+    // the one with the tenant separation in it. Said here rather than letting
+    // the last writer win.
+    if args.local_network && matches!(args.datapath, Some(DatapathKind::Fabric)) {
+        return Err("--local-network and --datapath fabric both claim the far end of every tap.                     The fabric carries the segment on a node that has one; --local-network is for                     a cell that does not."
+            .into());
+    }
+    let agent = if args.local_network {
+        tracing::info!(prefix = %args.bridge_prefix, "this node is the first hop for its guests");
+        agent.as_first_hop(&args.bridge_prefix)
+    } else {
+        agent
+    };
+
+    let agent = agent;
 
     // Named, because the bare OS error is not enough to act on. A node whose
     // link-local address is not up yet fails here with "Cannot assign requested
@@ -475,4 +524,86 @@ async fn open_store(spec: &str) -> Result<Arc<dyn Store>, velstra_cloud_store::S
     let store = EtcdStore::connect(&endpoints).await?;
     tracing::info!(endpoints = %spec, "state store connected");
     Ok(Arc::new(store))
+}
+
+/// A yes or a no, spelled the way a shell-sourced seed spells them.
+///
+/// A bare `#[arg(long, env)]` on a `bool` takes only `true` and `false` from the
+/// environment, and `VELSTRA_LOCAL_NETWORK=1` — which is what the wizard writes,
+/// and what anybody would write by hand — makes the agent exit at startup with
+/// `invalid value '1'`. It restarts, exits again, and the node never becomes
+/// ready; the only symptom anybody sees is instances stuck on `NoValidHost`.
+///
+/// Found by installing the package on a machine, which is the only place it
+/// could be found: every test in this repository passes the flag on a command
+/// line, where clap never consults this parser at all.
+fn truthy(raw: &str) -> std::result::Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Ok(true),
+        "0" | "false" | "no" | "n" | "off" | "" => Ok(false),
+        other => Err(format!(
+            "expected a yes or a no (1, true, yes, on — or 0, false, no, off), not {other:?}"
+        )),
+    }
+}
+
+/// The address to tell the cell this node's console is at.
+///
+/// A bound address is often `0.0.0.0:8447`, which is a promise nobody can keep:
+/// it is where this node listens, not where anybody reaches it. What the API can
+/// reach is, by definition, the local address this node uses to reach the API —
+/// so that is what gets asked for, with a connected UDP socket, which picks a
+/// route and a source address without sending a packet.
+///
+/// A node whose bind was already specific keeps it. A node with no API to
+/// measure against reports nothing rather than guessing: an endpoint that is
+/// wrong is worse than one that is absent, because the absent one makes the
+/// console button say why it is not there.
+fn advertise_from(bound: SocketAddr, api: Option<&str>) -> String {
+    if !bound.ip().is_unspecified() {
+        return bound.to_string();
+    }
+    let Some(api) = api else {
+        return String::new();
+    };
+    let Some(host) = api
+        .rsplit("://")
+        .next()
+        .and_then(|rest| rest.split('/').next())
+    else {
+        return String::new();
+    };
+    // The port is irrelevant to the answer — only the route matters — but a
+    // socket has to be connected to something, so the API's own is used.
+    let target = if host.contains(':') {
+        host.to_string()
+    } else {
+        format!("{host}:443")
+    };
+    let Ok(probe) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return String::new();
+    };
+    match probe.connect(&target).and_then(|()| probe.local_addr()) {
+        Ok(local) => format!("{}:{}", local.ip(), bound.port()),
+        Err(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod seed_spellings {
+    use super::truthy;
+
+    #[test]
+    fn the_seed_writes_one_and_the_agent_has_to_read_it() {
+        for yes in ["1", "true", "yes", "on", "Y", " 1 "] {
+            assert_eq!(truthy(yes), Ok(true), "{yes:?}");
+        }
+        for no in ["0", "false", "no", "off", ""] {
+            assert_eq!(truthy(no), Ok(false), "{no:?}");
+        }
+        // And a typo is an answer nobody gave, said out loud rather than read
+        // as a no — a node silently not being a first hop is the failure this
+        // whole module exists to stop.
+        assert!(truthy("maybe").is_err());
+    }
 }

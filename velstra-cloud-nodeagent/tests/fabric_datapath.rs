@@ -319,6 +319,7 @@ async fn a_port_with_rules_reaches_the_fabric() {
         assert!(rate_limit_mbit.is_some());
     }
     let network = NetworkSpec {
+        host_bridge: String::new(),
         vni: VNI,
         mtu: 1450,
         external: false,
@@ -512,6 +513,7 @@ async fn a_rule_the_fabric_cannot_key_leaves_no_port_behind() {
             "projects/p1/ports/wide",
             &PortSpec::default(),
             &NetworkSpec {
+                host_bridge: String::new(),
                 vni: VNI,
                 mtu: 1450,
                 external: false,

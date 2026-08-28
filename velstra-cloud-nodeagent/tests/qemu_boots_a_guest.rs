@@ -132,9 +132,14 @@ async fn a_stock_cloud_image_boots_and_says_so() {
     // file: the image was pulled, verified, and then never used, so every
     // instance this platform ever started booted a blank disk. On a direct
     // kernel boot that looks exactly like a guest that is merely slow.
-    vmm.create_disk(instance, request.root_disk_gib, &request.image)
-        .await
-        .expect("the root disk is made from the image");
+    vmm.create_disk(
+        instance,
+        request.root_disk_gib,
+        &request.image,
+        velstra_cloud_model::resources::ImageFormat::Raw,
+    )
+    .await
+    .expect("the root disk is made from the image");
     assert!(
         std::fs::metadata(layout.disk(instance))
             .expect("a disk")
@@ -193,4 +198,70 @@ async fn a_stock_cloud_image_boots_and_says_so() {
         "the guest is still here after being deleted"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+/// A qcow2 image becomes a raw disk, rather than a raw-shaped qcow2.
+///
+/// The disk is handed to the VMM as `format=raw`, and this used to be a byte
+/// copy whatever the image was — so a qcow2 image produced a root disk starting
+/// with `QFI\xfb` where a boot sector belongs. The guest started, found no
+/// bootloader, and sat with an empty console. Nothing failed anywhere: the disk
+/// was made, the VMM ran, and the platform reported a guest that could never
+/// boot. `ImageFormat` existed for this and was read by nobody, which is why
+/// every public cloud image — they are all qcow2 — was unbootable.
+#[tokio::test]
+async fn a_qcow2_image_is_converted_and_not_copied() {
+    use velstra_cloud_model::resources::ImageFormat;
+
+    let Some(qemu_img) = which("qemu-img") else {
+        println!("skipping: qemu-img is not on PATH");
+        return;
+    };
+    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("qcow2-convert");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let src = base.join("src.qcow2");
+    assert!(
+        std::process::Command::new(&qemu_img)
+            .args(["create", "-f", "qcow2"])
+            .arg(&src)
+            .arg("64M")
+            .status()
+            .unwrap()
+            .success()
+    );
+    // What the bug looked like from the outside: the source really is qcow2.
+    assert_eq!(&std::fs::read(&src).unwrap()[..4], b"QFI\xfb");
+
+    let layout = Layout {
+        run_dir: base.join("instances"),
+        image_dir: base.join("images"),
+        incoming_dir: base.join("images/incoming"),
+        ..Layout::default()
+    };
+    velstra_cloud_nodeagent::hostfs::create_disk(&layout, "g1", 1, Some(&src), ImageFormat::Qcow2)
+        .await
+        .expect("the disk was not made");
+
+    let disk = std::fs::read(layout.disk("g1")).unwrap();
+    assert_ne!(
+        &disk[..4],
+        b"QFI\xfb",
+        "the root disk is still a qcow2 wearing a .raw name"
+    );
+
+    // And a declaration that disagrees with the bytes is refused rather than
+    // guessed at: the digest proves which bytes these are, never what they are.
+    let wrong = velstra_cloud_nodeagent::hostfs::create_disk(
+        &layout,
+        "g2",
+        1,
+        Some(&src),
+        ImageFormat::Raw,
+    )
+    .await;
+    let why = wrong
+        .expect_err("a mis-declared image was accepted")
+        .to_string();
+    assert!(why.contains("first bytes say otherwise"), "{why}");
 }

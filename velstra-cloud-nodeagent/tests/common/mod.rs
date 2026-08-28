@@ -276,6 +276,7 @@ pub async fn create_network(store: &Arc<dyn Store>, cidr: &str, gateway: &str) {
             &Resource::new(
                 meta("projects/p1/networks/n1"),
                 NetworkSpec {
+                    host_bridge: String::new(),
                     vni: 4711,
                     mtu: 1450,
                     external: false,
@@ -325,6 +326,7 @@ async fn ensure_segment(store: &Arc<dyn Store>) {
             &Resource::new(
                 meta("projects/p1/networks/n1"),
                 NetworkSpec {
+                    host_bridge: String::new(),
                     vni: 4711,
                     mtu: 1450,
                     external: false,
@@ -814,4 +816,26 @@ pub fn api_shaped_agent(
         Arc::new(datapath.clone()),
         Arc::new(ApiShaped::new(store, node)),
     )
+}
+
+/// Take an instance's user-data away, which is how most instances are created.
+///
+/// The fixture above gives every instance some, and that turned out to hide a
+/// defect completely: the two metadata layouts want **opposite** answers for an
+/// instance that has none, and a fixture where none exists can never say so.
+pub async fn clear_user_data(store: &Arc<dyn Store>, name: &str) {
+    let store: TypedStore<InstanceSpec, InstanceStatus> =
+        TypedStore::new(store.clone(), CELL, "instances");
+    let mut instance = store.get(name).await.unwrap().expect("no such instance");
+    instance.spec.user_data = None;
+    // A spec change is a new generation, which the store insists on: a spec
+    // edited without one is a change nothing downstream would notice.
+    instance.meta.generation += 1;
+    store
+        .update(
+            &instance,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
 }

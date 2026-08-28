@@ -959,6 +959,23 @@ pub struct InstanceStatus {
     /// text box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running_size: Option<RunningSize>,
+    /// When this node asked the guest to shut down, while a stop is still
+    /// waiting on it.
+    ///
+    /// Reported by the agent because it is a fact about what the agent did —
+    /// the same shape as a backup's `taken_at` — and it is what makes
+    /// escalation possible without inventing a transient state: the model
+    /// compares it against the clock, and a pass that finds the guest already
+    /// gone clears it.
+    ///
+    /// It exists because a graceful stop is a *request*. `system_powerdown` is
+    /// an ACPI button press, and a guest wedged in its bootloader — or one with
+    /// no ACPI daemon — never answers it. Before this the platform pressed the
+    /// button again on every pass, for ever, while the object sat saying
+    /// "wanted Stopped, the node reports Running". Nothing was broken, and
+    /// nothing would ever happen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_requested_at: Option<Timestamp>,
 
     /// The last of what this guest wrote to its serial console.
     ///
@@ -1453,6 +1470,28 @@ pub struct NetworkSpec {
     /// an address taken from one is an address somebody can reach.
     #[serde(default)]
     pub external: bool,
+    /// A bridge on the node, when this network is the machine's own wire rather
+    /// than one the platform builds.
+    ///
+    /// Empty is the ordinary case: a **logical** network, whose guests get an
+    /// address from this platform's IPAM and whose segment the fabric — or the
+    /// node, as a first hop — carries. Set, and a guest's tap is put on a bridge
+    /// the operator already made, where it is on whatever the machine is on: the
+    /// house LAN, a VLAN, a lab network. Addresses then come from whatever
+    /// serves that wire, and this platform hands out none.
+    ///
+    /// **An operator's declaration and never a tenant's**, for the same reason
+    /// `external` is: a tenant that could name a bridge could put a guest onto
+    /// the machine's own network, past every rule the platform has about who may
+    /// talk to whom. It is the answer to "I just want this VM on my LAN" and it
+    /// is exactly the answer that must not be self-service.
+    ///
+    /// A bridge that is **not there** is refused by the node rather than
+    /// created: making one would mean deciding what goes in it, and the only
+    /// safe answer to that involves the machine's uplink — which is how a node
+    /// takes itself off the network.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host_bridge: String,
     /// How this cell tells the network above it where an address is.
     ///
     /// The cell's answer, which an individual address may override. See

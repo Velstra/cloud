@@ -327,6 +327,7 @@ mod tests {
             &Resource::new(
                 meta(&format!("projects/p1/networks/{id}")),
                 NetworkSpec {
+                    host_bridge: String::new(),
                     vni,
                     mtu: 1500,
                     external: false,

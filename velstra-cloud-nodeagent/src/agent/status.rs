@@ -35,6 +35,14 @@ pub(super) fn observe_instance(
             status.vmm_pid = vm.pid;
             status.started_at = vm.started_at;
 
+            // A guest that is no longer running is no longer being waited for.
+            // Clearing it here rather than where the stop is issued keeps the
+            // field a description of the world: it is set while somebody is
+            // waiting and absent when nobody is.
+            if vm.state != InstanceState::Running {
+                status.stop_requested_at = None;
+            }
+
             // The devices this guest holds. Reported by the VMM rather than
             // re-chosen, and cleared when the guest is not running, for the
             // same reason the CPU is: while it runs, what it holds is a fact;

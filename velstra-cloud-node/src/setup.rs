@@ -80,6 +80,21 @@ pub struct Machine {
     pub cells: Vec<String>,
     /// The fabric, if this cell has one. See [`Fabric`].
     pub fabric: Option<Fabric>,
+    /// Whether this node holds its guests' gateway and lets them out.
+    ///
+    /// A cell with a fabric answers no here and means it: the fabric owns the
+    /// far end of every tap. A cell without one that also answers no has guests
+    /// on a wire that leads nowhere — which is not only unreachable but
+    /// unconfigurable, because cloud-init reaches the metadata service over that
+    /// same wire.
+    pub local_network: bool,
+    /// Where the API listens, for a control plane.
+    ///
+    /// It has a place in the seed because the default is loopback, and a
+    /// control plane nobody can reach from another machine is the first thing
+    /// somebody hits and the last thing they think to look for: everything is
+    /// running, everything is green, and the browser says nothing answered.
+    pub listen: String,
     /// The cell's first administrator, for a control plane.
     ///
     /// Without one the API comes up, serves the console, and refuses every
@@ -150,6 +165,9 @@ pub fn render(m: &Machine) -> String {
     }
     if m.roles.contains(&Role::ControlPlane) {
         out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
+        if !m.listen.is_empty() {
+            out.push_str(&format!("VELSTRA_LISTEN={}\n", m.listen));
+        }
         // A username is not a secret; the password beside it is, and goes to a
         // 0600 file of its own — the same split the node token already makes.
         if !m.admin.is_empty() {
@@ -158,6 +176,9 @@ pub fn render(m: &Machine) -> String {
         if !m.cells.is_empty() {
             out.push_str(&format!("VELSTRA_CELLS={}\n", m.cells.join(",")));
         }
+    }
+    if m.local_network {
+        out.push_str("VELSTRA_LOCAL_NETWORK=1\n");
     }
     if let Some(f) = &m.fabric {
         // The orchestrator is written for both roles that talk to it; the rest
@@ -222,6 +243,10 @@ pub fn parse(text: &str) -> Result<Machine> {
     let mut m = Machine {
         region: or("VELSTRA_REGION", "eu-central"),
         cell: or("VELSTRA_CELL", "cell-1"),
+        local_network: matches!(
+            or("VELSTRA_LOCAL_NETWORK", "").as_str(),
+            "1" | "true" | "yes"
+        ),
         roles: roles.clone(),
         api_url: or("VELSTRA_API_URL", ""),
         node: String::new(),
@@ -230,6 +255,7 @@ pub fn parse(text: &str) -> Result<Machine> {
         pool: String::new(),
         pool_backend: or("VELSTRA_POOL_BACKEND", "directory"),
         store: or("VELSTRA_STORE", "127.0.0.1:2379"),
+        listen: or("VELSTRA_LISTEN", ""),
         cells: values
             .get("VELSTRA_CELLS")
             .map(|v| {
@@ -329,7 +355,7 @@ pub fn run_with(
         println!("Nothing was written.");
         return Ok(());
     };
-    write(&dir, &machine)?;
+    write_seed(&dir, &machine)?;
 
     let nixos = assume_nixos.unwrap_or_else(|| Path::new("/etc/NIXOS").exists());
     if nixos {
@@ -404,7 +430,7 @@ pub fn nix_snippet(m: &Machine) -> String {
     out
 }
 
-fn write(dir: &Path, m: &Machine) -> Result<()> {
+pub(crate) fn write_seed(dir: &Path, m: &Machine) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     write_with_mode(&dir.join("node.env"), &render(m), 0o644)?;
     if m.roles.contains(&Role::Hypervisor) && !m.token.is_empty() {
@@ -426,6 +452,11 @@ fn write(dir: &Path, m: &Machine) -> Result<()> {
     }
     println!("\nWrote {}/node.env", dir.display());
     Ok(())
+}
+
+/// A file only root may read, for the one secret its caller holds.
+pub(crate) fn write_secret(path: &Path, contents: &str) -> Result<()> {
+    write_with_mode(path, &format!("{}\n", contents.trim()), 0o600)
 }
 
 fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
@@ -486,6 +517,7 @@ fn collect() -> Result<Option<Machine>> {
         region,
         cell,
         roles: roles.clone(),
+        local_network: false,
         api_url: String::new(),
         node: String::new(),
         token: String::new(),
@@ -493,6 +525,7 @@ fn collect() -> Result<Option<Machine>> {
         pool: String::new(),
         pool_backend: "directory".into(),
         store: "127.0.0.1:2379".into(),
+        listen: String::new(),
         cells: Vec::new(),
         fabric: None,
         admin: String::new(),
@@ -574,6 +607,22 @@ fn collect() -> Result<Option<Machine>> {
         // looking at a login form is looking. A cell nobody can sign into is
         // not a cell, and finding that out after the install is finding it out
         // in the worst place.
+        // Where it listens. Asked before the administrator, because somebody who
+        // answers "only this machine" is describing a laptop and somebody who
+        // answers otherwise is describing a cell other people reach.
+        println!("\nWho should be able to reach the console and the API?");
+        println!("  [1] only this machine (127.0.0.1) — right for a laptop, and the default");
+        println!("  [2] anything that can reach this machine (0.0.0.0)");
+        println!("\nThere is no TLS here: put a reverse proxy in front before this leaves");
+        println!("a network you trust.");
+        m.listen = loop {
+            match prompt("Reachable from [1]: ")?.trim() {
+                "" | "1" => break "127.0.0.1:8443".to_string(),
+                "2" => break "0.0.0.0:8443".to_string(),
+                other => println!("  {other:?} is not a choice — 1 or 2."),
+            }
+        };
+
         println!("\nThe first administrator for this cell. Everything else is created by");
         println!("signing in as somebody: registering a node, making a project, all of it.");
         m.admin = ask_valid(
@@ -661,6 +710,18 @@ fn collect() -> Result<Option<Machine>> {
         m.fabric = Some(fabric);
     }
 
+    // Asked only of a cell with no fabric, because with one the answer is
+    // already no — and asking anyway would invite somebody to say yes and have
+    // two things owning the far end of every tap.
+    if m.fabric.is_none() && m.roles.contains(&Role::Hypervisor) {
+        println!("\nThis cell has no fabric, so nothing yet holds the far end of a guest's wire.");
+        println!("Without a first hop a guest is not only unreachable: its cloud-init cannot");
+        println!("reach the metadata service either, so it gets no user and no SSH key.");
+        println!("Saying yes makes this node the gateway for its guests and lets them out");
+        println!("through it — what a home hypervisor does. Needs nft.");
+        m.local_network = ask_yes("Should this node be the gateway for its guests?", true)?;
+    }
+
     println!("\n{}", render(&m));
     if !ask_yes("Write this?", true)? {
         return Ok(None);
@@ -693,6 +754,7 @@ mod tests {
 
     fn hypervisor() -> Machine {
         Machine {
+            local_network: false,
             region: "eu-central".into(),
             cell: "cell-1".into(),
             roles: vec![Role::Hypervisor],
@@ -703,6 +765,7 @@ mod tests {
             pool: String::new(),
             pool_backend: "directory".into(),
             store: "127.0.0.1:2379".into(),
+            listen: String::new(),
             cells: Vec::new(),
             fabric: None,
             admin: String::new(),
@@ -950,5 +1013,23 @@ mod tests {
         let text =
             "VELSTRA_ROLES=hypervisor\nVELSTRA_API_URL=https://c:8443\nVELSTRA_NODE=node-a\n";
         assert_eq!(parse(text).unwrap().fabric, None);
+    }
+
+    /// The seed is the only thing the agent reads, so a node that answered yes
+    /// and a node that answered no have to be told apart by it alone.
+    #[test]
+    fn whether_this_node_is_its_guests_gateway_survives_the_seed() {
+        let mut m = hypervisor();
+        m.local_network = true;
+        let text = render(&m);
+        assert!(text.contains("VELSTRA_LOCAL_NETWORK=1"), "{text}");
+        assert!(parse(&text).unwrap().local_network);
+
+        // And a node that said no says nothing, rather than saying zero: an
+        // absent line is what every other optional answer here looks like.
+        m.local_network = false;
+        let text = render(&m);
+        assert!(!text.contains("VELSTRA_LOCAL_NETWORK"), "{text}");
+        assert!(!parse(&text).unwrap().local_network);
     }
 }
