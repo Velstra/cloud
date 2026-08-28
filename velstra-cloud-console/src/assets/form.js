@@ -612,7 +612,7 @@ function renderDiskList(form, f, host, setErr) {
     const seen = new Set();
     let bad = "";
     for (const o of chosen) {
-      const key = pick(o, "node") + " " + pick(o, "device");
+      const key = pick(o, "node") + "\u0000" + pick(o, "device");
       if (seen.has(key)) bad = pick(o, "device") + " on " + pick(o, "node") + " is listed twice, and one disk makes one OSD";
       seen.add(key);
     }
@@ -1074,8 +1074,24 @@ function fillFromAnswer(form, p, answer) {
 ///
 /// So: the file it came from, or the guest it was captured from, and then the
 /// facts that tell two similar ones apart.
+/// What to call an image in front of a person.
+///
+/// Its *name* is its digest, because that is what makes fetching one verifiable
+/// — and `images/sha256-cbf3e1f588f02f8d738dbecb…` is not an answer to "which
+/// operating system is this". So: the family it belongs to, and which one in the
+/// family, both of which somebody chose and typed.
+///
+/// The two fallbacks are for images published before a family could be declared.
+/// A capture says which guest it came from; anything else is guessed out of the
+/// source URL's last path segment, which is a guess and is why declaring a
+/// family exists.
 function imageTitle(o) {
   const sp = spec(o);
+  const family = String(pick(sp, "family") || "").trim();
+  if (family) {
+    const version = String(pick(sp, "version") || "").trim();
+    return version ? family + " " + version : family;
+  }
   const from = pick(sp, "sourceInstance");
   if (from) return "from " + shortName(from);
   const url = String(pick(sp, "sourceUrl") || "");
