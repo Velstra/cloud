@@ -31,7 +31,18 @@ use crate::{Result, runner::Reconciler, status::StatusWriter};
 
 const WHO: &str = "network";
 
-/// The condition this controller owns: whether the fabric knows this network.
+/// The condition this controller owns: whether this network is as programmed as
+/// this cell can make it.
+///
+/// With a fabric that means the fabric has been told — the VNI, the range, the
+/// default. Without one it means there was nothing to tell, which is a real
+/// answer and not a pending one: a cell may deliberately run with no data plane
+/// and let each node carry its own segment.
+///
+/// Both are `True`, and the **reason** says which. The alternative — staying
+/// silent when there is no fabric — left every network at
+/// `observedGeneration: 0` for ever, and everything downstream renders that as
+/// "waiting".
 const MIRRORED: &str = "Mirrored";
 
 pub struct NetworkController {
@@ -124,7 +135,28 @@ impl Reconciler for NetworkController {
             return Ok(());
         };
         let Some(endpoint) = self.fabric.clone() else {
-            return Ok(());
+            // A cell with no fabric is a supported configuration, not an
+            // unfinished one — the node carries the segment itself, as a first
+            // hop. Saying nothing here left every network in such a cell at
+            // `observedGeneration: 0` for ever, which every reader downstream
+            // renders as "waiting": on a real cell that put each of them on the
+            // operator's attention list beside the things that were actually
+            // wrong.
+            //
+            // So it is said. `True`, because nothing is outstanding and nothing
+            // is broken — and the message carries the fact that a green tick
+            // would otherwise hide: without a data plane this network separates
+            // no traffic from any other.
+            return self
+                .say(
+                    network,
+                    ConditionStatus::True,
+                    "NoFabric",
+                    "this cell has no fabric, so there is nothing to mirror this network to — \
+                     and nothing separates its traffic from any other network's. The node \
+                     carries the segment itself; see --local-network.",
+                )
+                .await;
         };
 
         let subnet = match self.subnet_for(name).await? {
@@ -440,7 +472,14 @@ mod tests {
             .unwrap();
         let c = NetworkController::new(raw, CELL, subnets, None);
 
-        c.reconcile("projects/p1/networks/n1", Some(&network))
+        // As the runner hands it over: read back, so the write below is against
+        // what is actually stored.
+        let stored = networks
+            .get("projects/p1/networks/n1")
+            .await
+            .unwrap()
+            .unwrap();
+        c.reconcile("projects/p1/networks/n1", Some(&stored))
             .await
             .expect("a cell with no fabric must still reconcile");
 
@@ -449,9 +488,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // It says so, rather than saying nothing. Silence here left every
+        // network in a fabric-less cell reading as "waiting" for ever, on the
+        // one screen an operator uses to find what is wrong.
+        let said = condition(&after.status.conditions, MIRRORED)
+            .expect("a network with no fabric still says where it stands");
+        assert_eq!(said.status, ConditionStatus::True);
+        assert_eq!(said.reason, "NoFabric");
+        // And the sentence carries what a green tick would otherwise hide.
         assert!(
-            condition(&after.status.conditions, MIRRORED).is_none(),
-            "a network claimed a mirror state with no fabric to mirror to"
+            said.message.contains("separates"),
+            "the message has to say that nothing separates this traffic: {}",
+            said.message
         );
     }
 }

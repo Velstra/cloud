@@ -1049,6 +1049,50 @@ pub struct OperationProgress {
     pub error: Option<String>,
 }
 
+/// The collection a resource name belongs to.
+///
+/// The last path segment before the id — `projects/p1/subnets/lan0` is a
+/// `subnets`. Empty for anything that is not a resource name, which the caller
+/// treats as "something reports on it", the safe direction.
+pub fn kind_of(name: &str) -> &str {
+    let mut parts = name.rsplit('/');
+    let _id = parts.next();
+    parts.next().unwrap_or("")
+}
+
+/// Whether anything in this platform ever writes a status on objects of this
+/// kind.
+///
+/// **The one list, read by everybody who needs it.** An object nobody reports
+/// on stays at `observedGeneration: 0` with no conditions for its whole life,
+/// and every reader that treats that as "waiting" is wrong about it: the
+/// console's attention list filled with them, and an operation created for one
+/// never finished.
+///
+/// Two kinds of thing are on it. **Records** — an audit line, a usage reading —
+/// are facts about something that already happened. **Declarations** — an
+/// account, a hardware class, a place to put bytes, a statement about time, a
+/// range on a network — are asks that need no work: what acts on them are the
+/// objects that reference them, and those report for themselves.
+///
+/// Anything not named here is assumed to have a reporter, which is the safe
+/// direction: a new collection reads as "waiting" until somebody says
+/// otherwise, rather than silently reading as finished the moment it exists.
+pub fn nobody_reports_on(kind: &str) -> bool {
+    matches!(
+        kind,
+        "audit"
+            | "usage"
+            | "users"
+            | "device-classes"
+            | "backup-targets"
+            | "maintenance-windows"
+            | "subnets"
+            | "images"
+            | "snapshot-schedules"
+    )
+}
+
 /// Whether an operation has finished, computed from its target and nothing
 /// else.
 ///
@@ -1058,6 +1102,26 @@ pub struct OperationProgress {
 /// "mark the operation done" leaves an operation that computes to done on the
 /// next pass, not one that says `false` forever.
 pub fn operation_progress(spec: &OperationSpec, target: &TargetView) -> OperationProgress {
+    // Some things nobody reports on. A subnet, an image, a security group, a
+    // schedule: no agent owns one, so `observedGeneration` stays at zero for
+    // ever and there is never a condition to read. Waiting for one is waiting
+    // for something that will not happen — and an operation is exactly what a
+    // client is told to poll after a create.
+    //
+    // Measured on a real cell: seven operations from ordinary creates, every
+    // one of them `done: false` for ever. A client following the documented
+    // pattern hangs on a subnet that was made perfectly well.
+    //
+    // So for those, existing **is** finished. The list is the model's and the
+    // console reads the same one, so the two cannot drift.
+    if let TargetView::Present { .. } = target {
+        if nobody_reports_on(kind_of(&spec.target)) {
+            return OperationProgress {
+                done: true,
+                error: None,
+            };
+        }
+    }
     match target {
         // For a delete, the object being gone *is* the success. For anything
         // else it means the thing the caller asked about no longer exists, and
@@ -2110,6 +2174,93 @@ mod tests {
                 error: None
             }
         );
+    }
+
+    /// An operation for something nobody reports on has to finish.
+    ///
+    /// A subnet, an image, a security group: no agent owns one, so
+    /// `observedGeneration` stays at zero for its whole life. An operation that
+    /// waited for a report waited for ever — and an operation is precisely what
+    /// a client is told to poll after a create.
+    ///
+    /// Measured on a real cell: seven ordinary creates left seven operations
+    /// that would never finish.
+    #[test]
+    fn an_operation_for_something_nobody_reports_on_finishes_when_it_exists() {
+        for target in [
+            "projects/p1/subnets/lan0",
+            "projects/p1/images/sha256-abc",
+            "projects/p1/snapshot-schedules/nightly",
+            "users/ada",
+        ] {
+            let spec = OperationSpec {
+                target: target.to_string(),
+                target_generation: 1,
+                verb: "create".into(),
+                requested_by: "ada".into(),
+            };
+            // Exactly what such an object looks like for ever: nobody has
+            // looked at it, and there is no condition to read.
+            let never_reported = TargetView::Present {
+                observed_generation: 0,
+                ready: ConditionStatus::Unknown,
+                reason: String::new(),
+                message: String::new(),
+            };
+            let progress = operation_progress(&spec, &never_reported);
+            assert!(progress.done, "{target} would have waited for ever");
+            assert_eq!(progress.error, None);
+        }
+
+        // And something that *is* reported on still waits, or this would have
+        // turned every create into an immediate success. A security group is
+        // one of those: the API computes an `Applied` condition for it on the
+        // way out, so there is a report to wait for.
+        for target in [
+            "projects/p1/instances/i1",
+            "projects/p1/security-groups/web",
+        ] {
+            let spec = OperationSpec {
+                target: target.to_string(),
+                target_generation: 1,
+                verb: "create".into(),
+                requested_by: "ada".into(),
+            };
+            let not_yet = TargetView::Present {
+                observed_generation: 0,
+                ready: ConditionStatus::Unknown,
+                reason: String::new(),
+                message: String::new(),
+            };
+            assert!(!operation_progress(&spec, &not_yet).done, "{target}");
+        }
+        let spec = OperationSpec {
+            target: "projects/p1/instances/i1".into(),
+            target_generation: 1,
+            verb: "create".into(),
+            requested_by: "ada".into(),
+        };
+        let not_yet = TargetView::Present {
+            observed_generation: 0,
+            ready: ConditionStatus::Unknown,
+            reason: String::new(),
+            message: String::new(),
+        };
+        assert!(!operation_progress(&spec, &not_yet).done);
+    }
+
+    #[test]
+    fn a_kind_is_the_segment_before_the_id() {
+        assert_eq!(kind_of("projects/p1/subnets/lan0"), "subnets");
+        assert_eq!(kind_of("nodes/node-a"), "nodes");
+        assert_eq!(
+            kind_of("projects/p1/volumes/data/snapshots/nightly"),
+            "snapshots"
+        );
+        // Not a resource name: the caller then assumes something reports on it,
+        // which is the safe direction.
+        assert_eq!(kind_of("nonsense"), "");
+        assert!(!nobody_reports_on(""));
     }
 
     #[test]
