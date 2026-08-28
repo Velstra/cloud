@@ -129,13 +129,46 @@ pub fn reconcile_instance(
     // A deleted object is torn down in the reverse order it was built, and the
     // finalizer goes last so nothing can observe a half-removed instance.
     if instance.meta.is_deleting() {
-        if instance.status.state != InstanceState::Unknown {
+        // **Always**, including from `Unknown`. That state means "nobody has
+        // reported", which is what a guest looks like after its node agent
+        // restarts — the process is still running, the agent has not yet
+        // recognised it, and skipping the delete here left the tap held by a
+        // VMM nobody was going to stop. `ip tuntap del` then failed with
+        // `Device or resource busy`, that failure ended the pass before the
+        // finalizer, and the object could never be removed by any means.
+        //
+        // Reading `Unknown` as "there is nothing to delete" is the error: it
+        // means *we do not know*, which is exactly when you have to look.
+        // `DeleteVm` is idempotent — it asks the monitor socket, stops the unit
+        // and removes the directory, each of which is a no-op when there is
+        // nothing there.
+        // Until the node has said it let go. Two things turn on this, and both
+        // were wrong before:
+        //
+        // The teardown runs **from `Unknown` too**. That state means "nobody has
+        // reported", which is what every guest looks like after its node agent
+        // restarts — the VMM is still running and the agent has not recognised
+        // it. Skipping the delete there left the tap held by a process nobody
+        // was going to stop, `ip tuntap del` failed with `Device or resource
+        // busy`, and that failure ended the pass before the finalizer: the
+        // object could not be removed by any means the API offers. Reading
+        // `Unknown` as "there is nothing to delete" is the error — it means *we
+        // do not know*, which is exactly when you have to look.
+        //
+        // And it stops once the node says `Released`. Without that the port
+        // unprogram recurred on every resync of a torn-down object for as long
+        // as it sat there — the one place in this function where a settled
+        // object still asked for work, which `tests/agent.rs` had written down
+        // as worth fixing here.
+        let let_go = crate::meta::condition(&instance.status.conditions, "Released")
+            .is_some_and(|c| c.status == crate::ConditionStatus::True);
+        if !let_go {
             actions.push(Action::DeleteVm {
                 instance: name.clone(),
             });
-        }
-        for port in &instance.spec.ports {
-            actions.push(Action::UnprogramPort { port: port.clone() });
+            for port in &instance.spec.ports {
+                actions.push(Action::UnprogramPort { port: port.clone() });
+            }
         }
         if instance.meta.has_finalizer(NODE_RELEASE_FINALIZER) {
             actions.push(Action::ReleaseFinalizer {
@@ -1362,7 +1395,7 @@ mod tests {
     fn reconciling_a_settled_instance_asks_for_nothing() {
         // Idempotence, stated as a test: the second pass over a converged
         // object must be empty, or every resync would churn the cluster.
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.status.state = InstanceState::Running;
         assert!(
             reconcile_instance(
@@ -1379,7 +1412,7 @@ mod tests {
 
     #[test]
     fn a_crashed_guest_is_restarted_and_says_so() {
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.status.state = InstanceState::Failed;
         let actions = reconcile_instance(
             &i,
@@ -1399,7 +1432,7 @@ mod tests {
 
     #[test]
     fn deleting_tears_down_before_it_lets_go() {
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.status.state = InstanceState::Running;
         i.meta.deleted_at = Some(crate::meta::Timestamp::now());
         i.meta.add_finalizer(NODE_RELEASE_FINALIZER);
@@ -1493,7 +1526,7 @@ mod tests {
             },
         )]);
 
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.spec.devices = vec!["gpu-a100".into()];
 
         let bare = node("bare", 8, 16384);
@@ -1544,7 +1577,7 @@ mod tests {
     /// An instance asking for a class nobody defined is refused by name.
     #[test]
     fn an_instance_asking_for_an_undefined_class_is_told_so() {
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.spec.devices = vec!["gpu-h100".into()];
         let why = place(
             &i,
@@ -1950,7 +1983,7 @@ mod tests {
 
     #[test]
     fn placement_explains_every_rejection() {
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.spec.memory_mib = 99999;
         let nodes = vec![node("a", 8, 4096), node("b", 8, 16384)];
         let why = place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap_err();
@@ -1962,7 +1995,7 @@ mod tests {
     fn a_host_with_the_memory_but_not_on_one_numa_node_is_refused() {
         // Scheduling here would succeed and the guest would fail to start —
         // the worst outcome, because it looks like a hypervisor fault.
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.spec.memory_mib = 8192;
         let mut n = node("a", 8, 16384);
         n.status.capacity.numa_free_mib = vec![4096, 4096];
@@ -1972,7 +2005,7 @@ mod tests {
 
     #[test]
     fn anti_affinity_keeps_a_group_off_one_host() {
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.spec.placement_policy.anti_affinity_group = Some("web".into());
         let nodes = vec![node("a", 8, 16384)];
         let occupied = vec![("web".to_string(), "a".to_string())];
@@ -1990,7 +2023,7 @@ mod tests {
 
     #[test]
     fn an_unconverged_instance_is_unknown_rather_than_wrong() {
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.meta.generation = 2;
         i.status.observed_generation = 1;
         i.status.state = InstanceState::Stopped;
@@ -2010,7 +2043,7 @@ mod tests {
 
     #[test]
     fn only_an_unplaced_instance_is_the_schedulers_business() {
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         assert!(needs_placement(&i));
         i.spec.node = Some("node-a".into());
         assert!(
@@ -2329,7 +2362,7 @@ mod tests {
 
     #[test]
     fn divergence_is_one_definition_of_not_where_it_should_be() {
-        let mut i = inst("projects/p1/instances/i1");
+        let mut i = super::tests::inst("projects/p1/instances/i1");
         i.meta.generation = 2;
         i.status.observed_generation = 1;
         assert_eq!(
@@ -2379,7 +2412,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod stopping {
+mod teardown_and_stopping {
     use super::*;
     use crate::meta::Timestamp;
 
@@ -2467,4 +2500,43 @@ mod stopping {
         );
         assert!(actions.is_empty(), "{actions:?}");
     }
+
+    #[test]
+    fn a_guest_nobody_has_reported_on_is_still_taken_apart() {
+        // The shape a node agent restart leaves behind: the VMM is running, the
+        // object says `Unknown` because nothing has reported yet, and somebody
+        // asks for the guest to go away.
+        //
+        // Skipping the delete here does not save any work — it strands the guest.
+        // The tap is still held by the VMM, `ip tuntap del` fails with `Device
+        // or resource busy`, that failure ends the pass before the finalizer is
+        // released, and the object cannot be removed by any means the API
+        // offers. Found on a real cell, on three guests at once, after a deploy
+        // restarted the agent.
+        let mut i = super::tests::inst("projects/p1/instances/i1");
+        i.meta.deleted_at = Some(Timestamp(1));
+        i.meta.finalizers = vec![NODE_RELEASE_FINALIZER.to_string()];
+        i.status.state = InstanceState::Unknown;
+        i.spec.ports = vec!["projects/p1/ports/pt1".into()];
+
+        let actions = reconcile_instance(&i, false, &[false], false, StartGate::Go, Timestamp(2));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::DeleteVm { .. })),
+            "a guest nobody has reported on was left running: {actions:?}"
+        );
+        // And in the order that makes it work: the machine goes before the wire
+        // it is holding.
+        let vm = actions
+            .iter()
+            .position(|a| matches!(a, Action::DeleteVm { .. }))
+            .unwrap();
+        let port = actions
+            .iter()
+            .position(|a| matches!(a, Action::UnprogramPort { .. }))
+            .unwrap();
+        assert!(vm < port, "the tap was removed before the guest let go of it");
+    }
+
 }
