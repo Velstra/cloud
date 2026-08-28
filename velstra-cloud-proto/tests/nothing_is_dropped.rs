@@ -314,6 +314,7 @@ survives_the_wire!(
         }],
         observed_generation: 4,
         conditions: vec![a_condition()],
+        console_endpoint: "10.0.0.7:8447".into(),
         capacity: resources::Capacity {
             vcpus: 64,
             memory_mib: 262_144,
@@ -387,7 +388,7 @@ survives_the_wire!(
     },
     {
         observed_generation, conditions, capacity, allocated, agent_version,
-        last_heartbeat, images, devices, ceph, cpu, pci_devices,
+        console_endpoint, last_heartbeat, images, devices, ceph, cpu, pci_devices,
     }
 );
 
@@ -822,6 +823,7 @@ whole_object_survives!(
     resources::NodeStatus {
         pci_devices: Vec::new(),
         cpu: None,
+        console_endpoint: "10.0.0.7:8447".into(),
         observed_generation: 4,
         conditions: vec![a_condition()],
         capacity: resources::Capacity {

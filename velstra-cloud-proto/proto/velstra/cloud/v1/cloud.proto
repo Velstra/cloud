@@ -328,6 +328,11 @@ message NodeStatus {
   // over the whole list — a device whose IOMMU group holds something busy is
   // present and not available.
   repeated PciDevice pci_devices = 11;
+  // Where this node answers a console attach, as host:port. Reported rather
+  // than configured centrally, because only the machine knows what it actually
+  // bound. Empty means this node serves no console. An address the API reaches,
+  // never a browser.
+  string console_endpoint = 12;
 }
 
 // One PCI device, as the node holding it sees it.

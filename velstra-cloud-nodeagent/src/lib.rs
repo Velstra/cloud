@@ -62,6 +62,7 @@ pub mod ceph_deploy;
 pub mod ceph_pool;
 pub mod cephadm;
 pub mod cloud_hypervisor;
+pub mod console;
 pub mod datapath;
 pub mod devices;
 pub mod dhcp;

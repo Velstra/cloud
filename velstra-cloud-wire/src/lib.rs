@@ -236,6 +236,7 @@ mod tests {
                 },
                 allocated: Capacity::default(),
                 agent_version: "0.1.0".into(),
+                console_endpoint: "10.0.0.7:8447".into(),
                 last_heartbeat: Timestamp(1786732800000),
                 images: vec!["projects/p1/images/sha256-abc".into()],
                 // A busy disk, because the *reason* is what the console shows —

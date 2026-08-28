@@ -39,6 +39,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 etcd-client = "0.19"
 futures = "0.3"
+tokio-tungstenite = "0.24"
 hex = "0.4"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

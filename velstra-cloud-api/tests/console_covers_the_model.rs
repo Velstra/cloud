@@ -603,6 +603,13 @@ fn unscreened(kind: &str) -> Option<&'static str> {
              object, which is machinery rather than a schema entry — until then a volume is \
              restored by typing the snapshot's name",
         ),
+        "console-sessions" => Some(
+            "a console session is minted and spent within a minute of somebody clicking \
+             Console, and there is nothing on it a person would go looking for: the ticket is \
+             stored hashed, and the guest, the node and the time are all on the guest's own \
+             screen. It is a record, not a screen — an operator asking who opened a console \
+             lists them through the API or reads the audit trail",
+        ),
         _ => None,
     }
 }

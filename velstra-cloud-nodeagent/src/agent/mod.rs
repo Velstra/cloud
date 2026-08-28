@@ -108,6 +108,15 @@ pub struct AgentConfig {
     /// compaction, a change made while the process was not running.
     pub resync: Duration,
     pub agent_version: String,
+    /// Where this node answers a console attach, as `host:port`.
+    ///
+    /// The address actually bound and actually reachable, filled in by the
+    /// process once its listener is up — not what was asked for on a command
+    /// line, because a node that could not have the port it wanted must
+    /// advertise what it got. Empty means this node serves no console, which is
+    /// a real answer: the API then says so rather than offering a button that
+    /// leads nowhere.
+    pub console_endpoint: String,
 }
 
 impl AgentConfig {
@@ -117,6 +126,7 @@ impl AgentConfig {
             placement: Placement::new(region, cell),
             resync: Duration::from_secs(30),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            console_endpoint: String::new(),
         }
     }
 }
@@ -458,6 +468,26 @@ impl Agent {
     /// it has is a guest nobody can debug.
     pub fn guests(&self) -> GuestRegistry {
         self.guests.clone()
+    }
+
+    /// What this agent reads the cell through, for the console service, which
+    /// checks a ticket against the same sessions the pass would see.
+    pub fn cell(&self) -> Arc<dyn CellReader> {
+        self.cell.clone()
+    }
+
+    /// Where this agent reports status, for the console service, which has one
+    /// thing to say: that a ticket has been spent.
+    ///
+    /// `None` on an agent writing straight to a store, which is the developer
+    /// cell — there is no second writer there to go through.
+    pub fn status_sink(&self) -> Option<Arc<dyn crate::sink::StatusSink>> {
+        self.sink.clone()
+    }
+
+    /// Where this node answers a console attach, once its listener is up.
+    pub fn set_console_endpoint(&mut self, endpoint: &str) {
+        self.config.console_endpoint = endpoint.to_string();
     }
 
     /// The interval this agent reconciles at — exactly what it was asked for.

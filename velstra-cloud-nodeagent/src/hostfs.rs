@@ -171,6 +171,16 @@ impl Layout {
     pub fn console(&self, instance: &str) -> PathBuf {
         self.dir(instance).join("console.log")
     }
+
+    /// The guest's serial line, as something that can be attached to.
+    ///
+    /// Beside the log rather than instead of it. The log is what a dead guest
+    /// leaves behind and it must not depend on anybody having been attached;
+    /// this is what somebody who wants to *type* needs, and there is nothing to
+    /// type at in a file.
+    pub fn console_socket(&self, instance: &str) -> PathBuf {
+        self.dir(instance).join("console.sock")
+    }
 }
 
 /// How large a guest's disk file is, in whole gibibytes.
