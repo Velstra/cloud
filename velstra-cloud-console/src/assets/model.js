@@ -57,8 +57,63 @@ function condition(r, kind) {
 /// everything answers `Ready`; a migration answers `Moved`, because "ready" is
 /// not a thing a migration ever is. It is one function reading one condition
 /// either way — the vocabulary of the verdict does not grow with the platform.
+/// The sentence a person needs, which is not always on the condition being
+/// judged.
+///
+/// A guest whose node is still fetching its image reports `Ready=False` with
+/// "wanted Running, the node reports Stopped" — a restatement of the two
+/// fields, not a reason — while the *reason* sits on a second condition the
+/// agent writes: "copying images/sha256-… from /var/lib/velstra/src…".
+///
+/// Watching somebody create their first guest, that is the whole difference
+/// between a wall and a progress report. So the work in flight is appended
+/// where there is any.
+function because(r, sentence) {
+  const work = condition(r, "HostActions");
+  const doing = work && pick(work, "message");
+  return doing ? sentence + " — " + doing : sentence;
+}
+
 function verdict(r, kind) {
   const gen = generation(r), obs = observed(r);
+
+  // Nothing reports on some things, and saying "not reported" about them is
+  // how an attention list fills with objects nobody can act on. An audit
+  // record, a usage reading, a user account are *records*: no agent will ever
+  // write a condition on one, so `observedGeneration` stays at zero for ever.
+  //
+  // The schema says which, with an empty `condition`. Measured on a real cell
+  // before it did: a hundred and nine objects on the attention list, three of
+  // them actually wrong, and the three unfindable.
+  if (kind === "") {
+    return {
+      kind: "settled",
+      word: "Recorded",
+      why: "A record of something that happened. Nothing reports on it, and nothing will.",
+      since: null,
+    };
+  }
+  // An operation says whether it is finished, and that is the answer — not the
+  // condition beside it. `status.done` is computed from the target on every
+  // read, so an operation that is done is done however it ended: the change
+  // landed, or the thing it was about is gone. Either way there is nothing
+  // left to wait for and nothing anybody can do to the operation itself.
+  //
+  // Judging one by `Ready` instead put eighty-three finished operations on the
+  // attention list of a real cell, every one of them saying "the object I was
+  // about no longer exists" — which is true, and is a fact about a delete
+  // somebody did on purpose. If the target is genuinely broken, the target is
+  // on the list; the receipt for the request is not a second copy of it.
+  const finished = pick(status(r), "done");
+  if (finished === true) {
+    const failed = pick(status(r), "error");
+    return {
+      kind: "settled",
+      word: "Finished",
+      why: failed || "The change this was a receipt for has landed.",
+      since: null,
+    };
+  }
   const named = kind || "Ready";
   const ready = condition(r, named);
   const gone = deletedAt(r);
@@ -89,7 +144,7 @@ function verdict(r, kind) {
   if (decided) {
     return {
       kind: "failing", word: "Failing",
-      why: ready.message || "The " + named + " condition is false and says nothing more.",
+      why: because(r, ready.message || "The " + named + " condition is false and says nothing more."),
       since: pick(ready, "lastTransition"), ready,
     };
   }
@@ -129,7 +184,7 @@ function verdict(r, kind) {
   if (ready.status === "False") {
     return {
       kind: "failing", word: "Failing",
-      why: ready.message || "The " + named + " condition is false and says nothing more.",
+      why: because(r, ready.message || "The " + named + " condition is false and says nothing more."),
       since: pick(ready, "lastTransition"), ready,
     };
   }

@@ -30,6 +30,16 @@ const collection = (id) => SCHEMA.find((c) => c.id === id) || null;
 /// tries the other scope once and remembers the answer for the session.
 const scopeFound = {};
 
+/// Where a **write** goes: the scope the schema declares, always.
+///
+/// Never the probed one. The probe below exists to find where an unfamiliar
+/// collection can be *read* from; letting it decide where a create goes was a
+/// bug with a very quiet failure — see `list`. A create belongs where the
+/// contract says it belongs.
+function writePath(coll) {
+  return basePath(coll, coll.scope);
+}
+
 function basePath(coll, scope) {
   const s = scope || scopeFound[coll.id] || coll.scope;
   return s === "project"
@@ -186,10 +196,76 @@ async function firstPage(coll, scope, narrow) {
   };
 }
 
+/// Collections a person expects to see whole, wherever the objects live.
+///
+/// Images are the one so far, and the reason is the whole point of a catalogue:
+/// a project's own images are under the project, and the ones the cell
+/// published are under no project at all. A console that showed one of the two
+/// answered "which images are there" with half of it — and the half that is
+/// missing is the half a new tenant has, because their project is empty on the
+/// day they sign up.
+///
+/// Merged rather than switched, and each row keeps its own name, so where an
+/// image came from is readable from the row: `images/debian-13` is the cell's,
+/// `projects/p1/images/…` is this project's.
+const BOTH_SCOPES = ["images"];
+
+async function listBoth(coll, narrow) {
+  const seen = new Set();
+  const items = [];
+  let complete = true;
+  let revision = null;
+  for (const scope of ["global", "project"]) {
+    if (scope === "project" && !session.project) continue;
+    try {
+      const first = await firstPage(coll, scope, narrow);
+      const all = await walk(coll, scope, first, narrow);
+      if (all.complete === false) complete = false;
+      if (all.revision) revision = all.revision;
+      for (const r of all.items) {
+        const key = nameOf(r);
+        if (seen.has(key)) continue;
+        // The cell-wide half is asked without a parent, and the API answers it
+        // with everything the caller may read — which for a tenant is the
+        // catalogue plus their own, and for a **cell operator** is every
+        // project's. An operator picking an image in one project was being
+        // offered another tenant's, which is a choice nobody meant to make.
+        //
+        // So the global half keeps only what is genuinely the cell's: a name
+        // with no project in it.
+        if (scope === "global" && key.startsWith("projects/")) continue;
+        seen.add(key);
+        items.push(r);
+      }
+    } catch (e) {
+      // One half missing is not the whole answer failing: a tenant who may not
+      // read the cell's catalogue still has their own images, and an operator
+      // with no project selected still has the catalogue.
+      if (!(e instanceof ApiError) || (e.status !== 404 && e.status !== 403)) throw e;
+    }
+  }
+  return { items, revision, complete };
+}
+
 async function list(coll, narrow) {
-  const tries = scopeFound[coll.id]
-    ? [scopeFound[coll.id]]
-    : [coll.scope, coll.scope === "project" ? "global" : "project"];
+  if (BOTH_SCOPES.includes(coll.id)) return listBoth(coll, narrow);
+  // The fallback runs in one direction only: for a collection declared
+  // **global**, whose objects may turn out to be addressed under a project.
+  //
+  // The other direction is deliberately not probed. An empty answer for a
+  // project collection is the ordinary state of a project on its first day —
+  // not evidence of a wrong address — and probing past it asks the cell-wide
+  // path, which a cell operator may read in full. The rows that come back are
+  // other tenants', and believing them pointed the whole session at the wrong
+  // place: a new customer's first guest was created outside their project
+  // entirely. Writes never used the probed answer at all (see `writePath`);
+  // this stops the reads wandering too.
+  const settled = coll.scope === "project" && session.project;
+  const tries = settled
+    ? [coll.scope]
+    : scopeFound[coll.id]
+      ? [scopeFound[coll.id]]
+      : [coll.scope, coll.scope === "project" ? "global" : "project"];
   let last = null, empty = null;
   for (const scope of tries) {
     if (scope === "project" && !session.project) continue;
@@ -198,13 +274,17 @@ async function list(coll, narrow) {
       // answered by the first page, and walking the wrong one to the end before
       // finding out would be the whole cell fetched under a parent nobody meant.
       const first = await firstPage(coll, scope, narrow);
+      // Safe to remember: the probe only runs for a collection declared
+      // global, so the only thing it can discover is that the objects live
+      // under a project — which is narrower than where it was looking, never
+      // wider.
       if (first.items.length) { scopeFound[coll.id] = scope; return walk(coll, scope, first, narrow); }
-      // An empty answer is not proof of the right address: a collection asked
-      // for under the wrong parent answers 200 with nothing in it, which reads
-      // as "you have no nodes" rather than as a mistake. So the other scope is
-      // tried before an empty listing is believed — and if both are empty the
-      // declared one is kept, because it is the one that will start answering
-      // once something exists.
+      // An empty answer is not proof of the right address for a collection
+      // whose address is genuinely in doubt — a node might be addressed under a
+      // project or not. It **is** the ordinary answer for a project collection
+      // in a project that has nothing in it yet, which is every project on its
+      // first day. Probing past that and believing what comes back is how a new
+      // customer's first guest was created outside their project entirely.
       if (!empty) empty = { scope, first };
     } catch (e) {
       last = e;
@@ -269,13 +349,28 @@ const explainMaintenance = (id) =>
 
 const get = (coll, id) => request("GET", basePath(coll) + "/" + encodeURIComponent(id)).then((r) => r.body);
 
-const create = (coll, body) => request("POST", basePath(coll), { body }).then((r) => r.body);
+const create = (coll, body) => request("POST", writePath(coll), { body }).then((r) => r.body);
 
 const patch = (coll, id, body, ifMatch) =>
-  request("PATCH", basePath(coll) + "/" + encodeURIComponent(id), { body, ifMatch }).then((r) => r.body);
+  request("PATCH", writePath(coll) + "/" + encodeURIComponent(id), { body, ifMatch }).then((r) => r.body);
 
 const remove = (coll, id, ifMatch) =>
-  request("DELETE", basePath(coll) + "/" + encodeURIComponent(id), { ifMatch }).then((r) => r.body);
+  request("DELETE", writePath(coll) + "/" + encodeURIComponent(id), { ifMatch }).then((r) => r.body);
+
+/// Ask for a way into a guest.
+///
+/// A POST, because it **makes** something: a session, spent once, that expires
+/// in a minute. The ticket comes back in this answer and exists nowhere else —
+/// what is stored is its hash — so it is held in memory and put in the stream's
+/// query, never in a link and never in the address bar.
+const openConsole = (coll, id) =>
+  request("POST", writePath(coll) + "/" + encodeURIComponent(id) + ":console", { body: {} })
+    .then((r) => r.body);
+
+/// The full resource name of an object in the current scope, which is what a
+/// console stream's URL is built from.
+const consolePath = (coll, id) =>
+  basePath(coll) + "/" + encodeURIComponent(id);
 
 const explainPlacement = (coll, id) =>
   request("GET", basePath(coll) + "/" + encodeURIComponent(id) + ":explainPlacement").then((r) => r.body);

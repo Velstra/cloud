@@ -932,3 +932,56 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
   margin-top: var(--space-2);
   font-size: 13px;
 }
+
+/* The guest's serial line. Monospace and scrollable, with the screen focusable
+   so keystrokes have somewhere to land — a console you cannot click into is one
+   you can only watch. */
+pre.terminal {
+  margin: 0.5rem 0 0;
+  padding: 0.6rem 0.75rem;
+  max-height: 26rem;
+  overflow: auto;
+  background: var(--bg-app);
+  color: var(--text-strong);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+pre.terminal:focus {
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+}
+
+/* Grants, one per row: who, what, and a way to take it away. A set edited as a
+   set is a set one person silently replaces. */
+.grantrow {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 0.4rem;
+  margin-bottom: 0.35rem;
+  align-items: center;
+}
+.grantactions {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+/* Consequences of what is filled in — true, not wrong. Distinct from an error:
+   the form will submit, and somebody would rather know first. */
+.consequences {
+  margin: 0.6rem 0 0;
+}
+.consequences .note {
+  margin: 0 0 0.35rem;
+  padding: 0.4rem 0.55rem;
+  border-left: 3px solid var(--drifting);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-size: 0.9em;
+}

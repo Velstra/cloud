@@ -58,6 +58,8 @@ const SCRIPT: &[(&str, &str)] = &[
     ("detail", include_str!("assets/detail.js")),
     ("form", include_str!("assets/form.js")),
     ("migrate", include_str!("assets/migrate.js")),
+    ("terminal", include_str!("assets/terminal.js")),
+    ("iam", include_str!("assets/iam.js")),
     ("app", include_str!("assets/app.js")),
 ];
 
