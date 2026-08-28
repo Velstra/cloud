@@ -1119,7 +1119,34 @@ pub struct InstanceSpec {
     /// the same as asking once.
     pub desired_state: DesiredState,
     /// Ports on Velstra networks, in order.
+    ///
+    /// The truth about this guest's interfaces, and the only one: a port is
+    /// where a MAC and an address live, and they live there because they have
+    /// to outlast the guest that uses them. Inlining an interface in the
+    /// instance would mean either losing the address when the machine is
+    /// rebuilt, or reinventing the port under another name.
+    ///
+    /// It is not, however, what somebody asking for a machine should have to
+    /// write. See [`InstanceSpec::networks`].
     pub ports: Vec<String>,
+    /// Networks to put this guest on — a request, not a record.
+    ///
+    /// A port is a join: this guest, that network, this address. It is right in
+    /// the model and wrong in a form. Asked for one machine on their own
+    /// network, a customer had to create the port themselves, which means
+    /// knowing that a port exists, that it belongs to a subnet rather than to a
+    /// network, and that it must be made before the guest and not after.
+    ///
+    /// So this field takes networks and the platform mints the ports, the same
+    /// way `image: families/debian-13` takes a family and resolves the bytes.
+    /// It is **consumed on the way in**: what gets stored is `ports`, because
+    /// two fields describing one set of interfaces is two fields that drift.
+    ///
+    /// Naming both this and `ports` is refused rather than merged. They are two
+    /// answers to one question, and picking one silently is how somebody ends up
+    /// with a machine on a network they did not ask for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<String>,
     pub ssh_keys: Vec<String>,
     pub user_data: Option<String>,
     /// Set by the scheduler, once. Moving it is a migration, which is a

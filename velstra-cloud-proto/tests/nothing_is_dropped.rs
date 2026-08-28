@@ -478,6 +478,7 @@ survives_the_wire!(
         // `Running` is the default, so `Stopped` is the distinct one.
         desired_state: resources::DesiredState::Stopped,
         ports: vec!["projects/p1/ports/port-a".into()],
+        networks: vec!["projects/p1/networks/prod".to_string()],
         ssh_keys: vec!["ssh-ed25519 AAAA".into()],
         user_data: Some("#cloud-config".into()),
         node: Some("node-a".into()),
@@ -491,7 +492,7 @@ survives_the_wire!(
         },
     },
     {
-        vcpus, memory_mib, image, root_disk_gib, desired_state, ports, ssh_keys,
+        vcpus, memory_mib, image, root_disk_gib, desired_state, ports, networks, ssh_keys,
         user_data, node, placement_policy, devices, console, on_node_loss,
         start_order, start_delay_s,
     }
@@ -1086,6 +1087,7 @@ whole_object_survives!(
         root_disk_gib: 40,
         desired_state: resources::DesiredState::Stopped,
         ports: vec!["projects/p1/ports/port-a".into()],
+        networks: vec!["projects/p1/networks/prod".to_string()],
         ssh_keys: vec!["ssh-ed25519 AAAA".into()],
         user_data: Some("#cloud-config".into()),
         node: Some("node-a".into()),

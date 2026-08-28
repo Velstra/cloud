@@ -51,11 +51,18 @@ const check = (kind, value) => (value === "" ? "" : (CHECKS[kind] || CHECKS.none
 function consequences(coll, values) {
   const out = [];
   if (coll.id === "instances") {
+    // What this said until the platform grew a default network: "this guest will
+    // have no network". That was true then and is false now — an empty list is
+    // sent as nothing at all (see `nest`), and nothing at all means the project's
+    // default. A warning that has stopped being true is worse than no warning:
+    // it teaches people that the sentences beside this button can be ignored.
     const ports = values.ports;
-    if (!Array.isArray(ports) || !ports.length) {
-      out.push("This guest will have no network. It cannot be reached, and its "
-        + "cloud-init cannot fetch the SSH keys and hostname this platform would "
-        + "give it. Attach a port under More settings, or add one later.");
+    const nets = values.networks;
+    const named = (Array.isArray(ports) && ports.length) || (Array.isArray(nets) && nets.length);
+    if (!named) {
+      out.push("This guest joins your project's default network, which is made "
+        + "the first time somebody needs it. Machines in a project can reach each "
+        + "other on it. Name a network under More settings to use another one.");
     }
     if (!values.sshKeys && !values.userData) {
       out.push("No SSH key and no cloud-init. A stock cloud image has no password, "
