@@ -244,6 +244,8 @@ pub async fn register_image(store: &Arc<dyn Store>, name: &str) {
     let image = Resource::new(
         meta(name),
         ImageSpec {
+            family: "debian-13".into(),
+            version: "20260815".into(),
             source_instance: None,
             digest: "sha256-abc".into(),
             format: ImageFormat::Raw,

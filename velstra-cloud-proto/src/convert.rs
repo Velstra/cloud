@@ -778,6 +778,8 @@ impl From<v1::ImageFormat> for resources::ImageFormat {
 impl From<&resources::ImageSpec> for v1::ImageSpec {
     fn from(s: &resources::ImageSpec) -> Self {
         Self {
+            family: s.family.clone(),
+            version: s.version.clone(),
             digest: s.digest.clone(),
             format: v1::ImageFormat::from(s.format) as i32,
             size_bytes: s.size_bytes,
@@ -791,6 +793,8 @@ impl From<&resources::ImageSpec> for v1::ImageSpec {
 impl From<&v1::ImageSpec> for resources::ImageSpec {
     fn from(s: &v1::ImageSpec) -> Self {
         Self {
+            family: s.family.clone(),
+            version: s.version.clone(),
             digest: s.digest.clone(),
             format: s.format().into(),
             size_bytes: s.size_bytes,
