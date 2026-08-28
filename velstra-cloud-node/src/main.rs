@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 mod disks;
 mod install;
 mod product;
+mod quickstart;
 mod roles;
 mod seed;
 mod setup;
@@ -70,6 +71,25 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// One box, one command: seed, units, and the two objects a cell needs.
+    ///
+    /// `setup` answers "what is this machine". This answers that and then does
+    /// the rest — create the node, move its one-time token, create the pool,
+    /// bring the agents up — because none of that is hard and all of it is
+    /// where somebody trying this for the first time gives up.
+    ///
+    /// Safe to run again: nothing here is created twice.
+    Quickstart {
+        /// Where the seed goes.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// What the API binds, e.g. `0.0.0.0:8443`. Asked when left out.
+        #[arg(long)]
+        listen: Option<String>,
+        /// A name for this machine. Asked when left out.
+        #[arg(long)]
+        node: Option<String>,
+    },
     /// Exit 0 when this machine's seed names `role`, non-zero otherwise.
     ///
     /// What every unit's `ExecCondition` runs. A non-zero answer means "not
@@ -98,6 +118,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Install { source } => install::run_install(source),
         Cmd::Setup { dir, nixos, config } => setup::run_with(dir, nixos, config),
+        Cmd::Quickstart { dir, listen, node } => quickstart::run(dir, listen, node),
         Cmd::HasRole { role } => roles::has_role_or_exit(&role),
         Cmd::Unlock => unlock::run(),
         Cmd::Update { image } => update::run_update(&image),

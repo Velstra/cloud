@@ -599,8 +599,21 @@ impl Agent {
                 .map_err(|e| e.to_string())?;
         }
         if !host.disks.contains(name) {
+            let image_format = cell
+                .images
+                .get(&instance.spec.image)
+                .map(|i| i.format)
+                .unwrap_or_default();
             self.vmm
-                .create_disk(name, instance.spec.root_disk_gib, &instance.spec.image)
+                // A destination makes the same disk from the same image, so it
+                // needs the same format — a raw copy of a qcow2 here would land
+                // a guest that boots on the source and not on the destination.
+                .create_disk(
+                    name,
+                    instance.spec.root_disk_gib,
+                    &instance.spec.image,
+                    image_format,
+                )
                 .await
                 .map_err(|e| e.to_string())?;
         }

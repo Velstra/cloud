@@ -200,7 +200,7 @@ pub struct Server {
 impl Default for Server {
     fn default() -> Self {
         Self {
-            fallback_id: Ipv4Addr::new(169, 254, 169, 254),
+            fallback_id: crate::metadata::ADDRESS,
             lease: DEFAULT_LEASE,
         }
     }
@@ -272,6 +272,37 @@ fn options(mut rest: &[u8]) -> BTreeMap<u8, Vec<u8>> {
         }
     }
     found
+}
+
+/// Answer one packet that arrived on a device carrying `taps`.
+///
+/// One tap on a plain tap device; several on a shared bridge, where the frame
+/// does not say which of them it came from and the MAC is what picks the guest
+/// out. Tried in order, and the first tap that has this MAC behind it wins —
+/// which is exact, because a MAC belongs to one Port and a Port is on one tap.
+pub fn answer_behind(
+    taps: &[String],
+    packet: &[u8],
+    guests: &GuestRegistry,
+    server: &Server,
+) -> std::result::Result<Reply, Ignored> {
+    let mut last = None;
+    for tap in taps {
+        match answer(tap, packet, guests, server) {
+            Ok(reply) => return Ok(reply),
+            // Keep looking: on a shared bridge, "nothing on this tap has that
+            // MAC" is the expected answer for every tap but one.
+            Err(e @ Ignored::Unknown { .. }) => last = Some(e),
+            // Anything else is about the packet, not about which tap it came
+            // from, and asking a second tap the same question would get the
+            // same answer.
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or(Ignored::Unknown {
+        tap: taps.join(", "),
+        mac: String::new(),
+    }))
 }
 
 /// Answer one packet that arrived on `tap`.
@@ -505,66 +536,137 @@ fn encode(
 
 // ---- the socket layer ----------------------------------------------------
 
-/// Listen on every tap that carries a guest, and keep doing so as guests come
-/// and go.
+/// Listen wherever this node's guests can be heard, and keep doing so as guests
+/// come and go.
 ///
-/// The set of taps is re-read on a timer from the registry rather than pushed
-/// by the agent, for the same reason everything else here is level-triggered: a
-/// missed change costs one interval of latency, never a socket that is listening
-/// for a guest that has gone.
+/// The set is re-read on a timer from the registry rather than pushed by the
+/// agent, for the same reason everything else here is level-triggered: a missed
+/// change costs one interval of latency, never a socket that is listening for a
+/// guest that has gone.
+///
+/// ## Not always the tap
+///
+/// `SO_BINDTODEVICE` names an **L3** interface, and a tap that has been enslaved
+/// to a bridge is not one any more: the address is on the bridge, the frame is
+/// delivered on the bridge, and a socket bound to the tap is handed nothing.
+///
+/// That is not hypothetical — it is what [`crate::localnet`] does to every tap
+/// on a node that is its guests' first hop, and it broke this responder
+/// completely: the guest broadcast a DISCOVER, the kernel delivered it to the
+/// bridge, nothing was bound there, and the guest went on to time out, find no
+/// datasource, and boot unconfigured. Working DHCP became silent DHCP the moment
+/// the segment gained the gateway that made it useful.
+///
+/// So the device is resolved from the kernel on every pass — the master if the
+/// tap has one, the tap otherwise — and the listener is keyed by it. A tap that
+/// gains or loses a master changes the key, which replaces the listener, which
+/// is the whole recovery story.
 pub async fn serve(guests: GuestRegistry, server: Server, every: Duration) {
-    let mut listening: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
+    let mut listening: BTreeMap<String, (Vec<String>, tokio::task::JoinHandle<()>)> =
+        BTreeMap::new();
     let mut ticker = tokio::time::interval(every);
     loop {
         ticker.tick().await;
-        let wanted = guests.taps();
-        listening.retain(|tap, task| {
-            let keep = wanted.contains(tap) && !task.is_finished();
+        let mut wanted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for tap in guests.taps() {
+            wanted.entry(l3_device(&tap).await).or_default().push(tap);
+        }
+        listening.retain(|device, (taps, task)| {
+            // The tap set is part of the key in everything but name: a guest
+            // arriving on a bridge that is already listened to has to be
+            // answerable, and a listener holding a stale set would not know it.
+            let keep = wanted.get(device) == Some(taps) && !task.is_finished();
             if !keep {
                 task.abort();
-                tracing::info!(%tap, "stopped answering DHCP");
+                tracing::info!(%device, "stopped answering DHCP");
             }
             keep
         });
-        for tap in wanted {
-            if listening.contains_key(&tap) {
+        for (device, taps) in wanted {
+            if listening.contains_key(&device) {
                 continue;
             }
-            match bind(&tap) {
+            match bind(&device) {
                 Ok(socket) => {
-                    tracing::info!(%tap, "answering DHCP");
-                    let task = tokio::spawn(listen(tap.clone(), socket, guests.clone(), server));
-                    listening.insert(tap, task);
+                    tracing::info!(%device, taps = taps.len(), "answering DHCP");
+                    let task = tokio::spawn(listen(
+                        device.clone(),
+                        taps.clone(),
+                        socket,
+                        guests.clone(),
+                        server,
+                    ));
+                    listening.insert(device, (taps, task));
                 }
-                Err(e) => tracing::error!(%tap, error = %e, "could not answer DHCP on this tap"),
+                Err(e) => {
+                    tracing::error!(%device, error = %e, "could not answer DHCP on this device")
+                }
             }
         }
     }
 }
 
-/// One socket per tap, each seeing only its own guest's frames.
+/// Where frames from `tap` are actually delivered: its bridge, or itself.
+///
+/// Asked of `ip` rather than `/sys/class/net/<tap>/master`, for the reason
+/// [`crate::datapath`] gives at length: sysfs shows the network namespace it was
+/// *mounted* in, not the one this process is in.
+///
+/// An unanswerable question is answered with the tap. Binding to a tap that has
+/// a master hears nothing, which is the failure this exists to prevent — but
+/// binding to a device that does not exist fails outright, and a responder that
+/// stopped answering everybody because one `ip` call failed would be worse.
+async fn l3_device(tap: &str) -> String {
+    let output = tokio::process::Command::new("ip")
+        .args(["-o", "link", "show", "dev", tap])
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            master_of(&String::from_utf8_lossy(&o.stdout)).unwrap_or_else(|| tap.to_string())
+        }
+        _ => tap.to_string(),
+    }
+}
+
+/// The master in one line of `ip -o link show`, if the interface has one.
+fn master_of(line: &str) -> Option<String> {
+    let mut words = line.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "master" {
+            return words.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// One socket per L3 device, seeing the frames of every guest behind it.
 ///
 /// `SO_REUSEADDR` rather than `SO_REUSEPORT`: several sockets do have to share
 /// port 67, but `SO_REUSEPORT` load-balances a broadcast to exactly one member
 /// of the group, which would mean one tap's socket quietly swallowing another
 /// tap's DISCOVER.
-fn bind(tap: &str) -> std::io::Result<Arc<tokio::net::UdpSocket>> {
+fn bind(device: &str) -> std::io::Result<Arc<tokio::net::UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_broadcast(true)?;
-    // The one line that makes identity work: this socket receives only frames
-    // that arrived on this tap, so the tap half of `(tap, mac)` is a fact the
-    // kernel established rather than something the packet claimed.
-    socket.bind_device(Some(tap.as_bytes()))?;
+    // The one line that narrows identity: this socket receives only frames that
+    // arrived on this device, so which segment a request came from is a fact the
+    // kernel established rather than something the packet claimed. On a tap that
+    // is the guest; on a bridge it is the segment, and the MAC picks the guest
+    // out of it — which is all that is knowable there, because guests sharing a
+    // bridge share a wire.
+    socket.bind_device(Some(device.as_bytes()))?;
     socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, SERVER_PORT)).into())?;
     socket.set_nonblocking(true)?;
     Ok(Arc::new(tokio::net::UdpSocket::from_std(socket.into())?))
 }
 
 async fn listen(
-    tap: String,
+    device: String,
+    taps: Vec<String>,
     socket: Arc<tokio::net::UdpSocket>,
     guests: GuestRegistry,
     server: Server,
@@ -576,24 +678,24 @@ async fn listen(
         let received = match socket.recv_from(&mut buffer).await {
             Ok((n, _)) => n,
             Err(e) => {
-                tracing::error!(%tap, error = %e, "the DHCP socket failed");
+                tracing::error!(%device, error = %e, "the DHCP socket failed");
                 return;
             }
         };
-        match answer(&tap, &buffer[..received], &guests, &server) {
+        match answer_behind(&taps, &buffer[..received], &guests, &server) {
             Ok(reply) => {
                 let to = match reply.to {
                     Destination::Broadcast => SocketAddrV4::new(Ipv4Addr::BROADCAST, CLIENT_PORT),
                     Destination::Unicast(to) => to,
                 };
                 if let Err(e) = socket.send_to(&reply.bytes, to).await {
-                    tracing::error!(%tap, error = %e, "could not answer a guest's DHCP request");
+                    tracing::error!(%device, error = %e, "could not answer a guest's DHCP request");
                 }
             }
             // A guest saying an address is already in use is a datapath fault,
             // and the only place it can be noticed is here.
-            Err(e @ Ignored::Declined { .. }) => tracing::error!(%tap, "{e}"),
-            Err(e) => tracing::debug!(%tap, "{e}"),
+            Err(e @ Ignored::Declined { .. }) => tracing::error!(%device, "{e}"),
+            Err(e) => tracing::debug!(%device, "{e}"),
         }
     }
 }
@@ -616,6 +718,8 @@ mod tests {
             instance_id: instance.to_string(),
             hostname: instance.rsplit('/').next().unwrap().to_string(),
             interfaces: vec![Interface {
+                subnet: "projects/p1/subnets/s1".into(),
+                on_host_bridge: false,
                 port: "projects/p1/ports/port-a".into(),
                 mac: Some(mac),
                 cidr: Some(Cidr::parse(address).unwrap()),
@@ -641,6 +745,46 @@ mod tests {
             ),
         ]);
         guests
+    }
+
+    /// Two guests, one bridge, one socket. The frame does not say which tap it
+    /// came from, so the MAC has to pick — and picking wrong would hand one
+    /// tenant's guest the other's address.
+    #[test]
+    fn on_a_shared_bridge_the_mac_picks_the_guest_out() {
+        let guests = registry();
+        let behind = [TAP.to_string(), "vt-port-b".to_string()];
+        let server = Server::default();
+
+        let reply = answer_behind(
+            &behind,
+            &request(MessageType::Discover, OTHER_MAC, &[]),
+            &guests,
+            &server,
+        )
+        .expect("the second guest is behind this bridge");
+        assert_eq!(&reply.bytes[16..20], &[10, 20, 0, 11], "the wrong guest");
+
+        let reply = answer_behind(
+            &behind,
+            &request(MessageType::Discover, MAC, &[]),
+            &guests,
+            &server,
+        )
+        .expect("so is the first");
+        assert_eq!(&reply.bytes[16..20], &[10, 20, 0, 10], "the wrong guest");
+
+        // And a MAC behind neither is still nobody, rather than whoever was
+        // asked first.
+        assert!(matches!(
+            answer_behind(
+                &behind,
+                &request(MessageType::Discover, [9, 9, 9, 9, 9, 9], &[]),
+                &guests,
+                &server,
+            ),
+            Err(Ignored::Unknown { .. })
+        ));
     }
 
     /// A request as a client sends one.
@@ -936,5 +1080,27 @@ mod tests {
         // Two spellings of one address, and the responder has to agree with
         // the object or nothing matches.
         assert_eq!(parse_mac("52:54:00:12:34:56").unwrap(), MAC);
+    }
+}
+
+#[cfg(test)]
+mod on_a_bridge {
+    use super::*;
+
+    /// The parse that decides where this responder listens. A tap whose master
+    /// is missed here is a tap this node answers DHCP on and hears nothing from.
+    #[test]
+    fn a_tap_with_a_master_is_heard_on_the_master() {
+        let enslaved = "4: vtp1e803: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel \
+                        master vbrlan072ca state UP mode DEFAULT group default qlen 1000\\    \
+                        link/ether 0a:91:95:6d:d5:b9 brd ff:ff:ff:ff:ff:ff";
+        assert_eq!(master_of(enslaved).as_deref(), Some("vbrlan072ca"));
+
+        let alone = "4: vtp1e803: <BROADCAST,MULTICAST,UP> mtu 1500 qdisc fq_codel state UP \
+                     mode DEFAULT group default qlen 1000\\    link/ether 0a:91:95:6d:d5:b9";
+        assert_eq!(master_of(alone), None);
+
+        // And an interface *named* master is not one.
+        assert_eq!(master_of("7: master: <UP> mtu 1500 state UP"), None);
     }
 }

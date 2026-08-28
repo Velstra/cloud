@@ -792,6 +792,7 @@ mod settled {
     pub fn instance() -> InstanceStatus {
         InstanceStatus {
             running_size: None,
+            stop_requested_at: None,
             console_tail: String::new(),
             console_bytes: 0,
             devices: Vec::new(),

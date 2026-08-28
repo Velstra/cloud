@@ -348,9 +348,14 @@ async fn a_receiver_that_outlived_its_transfer_is_taken_down() {
     let datapath = FakeDatapath::new();
     let agent = node_agent(store.clone(), DESTINATION, &vmm, &datapath);
     vmm.cache_image(IMAGE);
-    vmm.create_disk(I1, 20, "projects/p1/images/sha256-abc")
-        .await
-        .unwrap();
+    vmm.create_disk(
+        I1,
+        20,
+        "projects/p1/images/sha256-abc",
+        velstra_cloud_model::resources::ImageFormat::Raw,
+    )
+    .await
+    .unwrap();
     let request = VmRequest {
         devices: Vec::new(),
         instance: I1.to_string(),

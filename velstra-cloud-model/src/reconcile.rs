@@ -58,6 +58,16 @@ pub enum Action {
     RestartCrashedVm {
         instance: String,
     },
+    /// Pull the plug: the guest was asked to shut down and did not.
+    ///
+    /// Separate from [`Action::StopVm`] rather than a flag on it, because they
+    /// are different acts. One asks an operating system to close its files; the
+    /// other takes the power away and may lose whatever was not written. A
+    /// caller reading a list of actions should be able to see which of the two
+    /// is about to happen.
+    KillVm {
+        instance: String,
+    },
     DeleteVm {
         instance: String,
     },
@@ -90,6 +100,15 @@ pub enum ControllerAction {
 /// started before its port is programmed is a guest that comes up on a dead
 /// network and has to be poked afterwards — which is an operation nobody can
 /// make idempotent.
+/// How long a guest is given to answer the ACPI button before the plug comes
+/// out.
+///
+/// Sixty seconds, the same figure Proxmox and libvirt settle on: long enough
+/// for an ordinary Linux to stop its services and unmount, short enough that
+/// somebody watching does not conclude the platform is stuck. A guest that
+/// needs longer is a guest whose operator should stop it from the inside.
+pub const STOP_GRACE_MS: u64 = 60_000;
+
 pub fn reconcile_instance(
     instance: &Instance,
     image_cached: bool,
@@ -99,6 +118,10 @@ pub fn reconcile_instance(
     // coming up. `Go` for everything a caller has no ordering opinion about,
     // which is most callers and every cell that has not asked for one.
     gate: StartGate,
+    // Time enters as a parameter, as it does everywhere else here, so this
+    // stays pure and a test can argue about a stop that has been waiting for
+    // an hour without waiting for one.
+    now: crate::meta::Timestamp,
 ) -> Vec<Action> {
     let name = instance.meta.name.to_string();
     let mut actions = Vec::new();
@@ -169,9 +192,32 @@ pub fn reconcile_instance(
             });
         }
         (DesiredState::Running, _) => {}
-        (DesiredState::Stopped, InstanceState::Running) => actions.push(Action::StopVm {
-            instance: name.clone(),
-        }),
+        (DesiredState::Stopped, InstanceState::Running) => {
+            // Ask once, then insist.
+            //
+            // `StopVm` presses the ACPI button. A guest that answers it shuts
+            // down cleanly, which is what everybody wants and what happens
+            // almost always. A guest that cannot answer — stuck in its
+            // bootloader, no ACPI daemon, a kernel that has panicked — never
+            // will, and pressing the button again every pass is a platform
+            // politely asking a corpse to leave.
+            //
+            // So after `STOP_GRACE` the plug comes out. Nothing else in this
+            // function needs a clock; this does, because "how long has it been
+            // asked" is the only thing that separates a slow shutdown from one
+            // that is never coming.
+            match instance.status.stop_requested_at {
+                Some(asked) if now.0.saturating_sub(asked.0) >= STOP_GRACE_MS => {
+                    actions.push(Action::KillVm {
+                        instance: name.clone(),
+                    })
+                }
+                Some(_) => {}
+                None => actions.push(Action::StopVm {
+                    instance: name.clone(),
+                }),
+            }
+        }
         (DesiredState::Stopped, _) => {}
     }
     actions
@@ -1133,7 +1179,7 @@ mod tests {
         },
     };
 
-    fn inst(name: &str) -> Instance {
+    pub(super) fn inst(name: &str) -> Instance {
         Resource::new(
             Meta::new(
                 ResourceName::parse(name).unwrap(),
@@ -1189,7 +1235,14 @@ mod tests {
     #[test]
     fn nothing_starts_before_what_it_needs_exists() {
         let i = inst("projects/p1/instances/i1");
-        let actions = reconcile_instance(&i, false, &[false], false, StartGate::Go);
+        let actions = reconcile_instance(
+            &i,
+            false,
+            &[false],
+            false,
+            StartGate::Go,
+            crate::meta::Timestamp::now(),
+        );
         assert!(actions.contains(&Action::PullImage {
             digest: "sha256:abc".into()
         }));
@@ -1205,7 +1258,14 @@ mod tests {
     #[test]
     fn once_everything_is_in_place_the_vm_starts() {
         let i = inst("projects/p1/instances/i1");
-        let actions = reconcile_instance(&i, true, &[true], true, StartGate::Go);
+        let actions = reconcile_instance(
+            &i,
+            true,
+            &[true],
+            true,
+            StartGate::Go,
+            crate::meta::Timestamp::now(),
+        );
         assert_eq!(
             actions,
             vec![Action::StartVm {
@@ -1220,14 +1280,31 @@ mod tests {
         // object must be empty, or every resync would churn the cluster.
         let mut i = inst("projects/p1/instances/i1");
         i.status.state = InstanceState::Running;
-        assert!(reconcile_instance(&i, true, &[true], true, StartGate::Go).is_empty());
+        assert!(
+            reconcile_instance(
+                &i,
+                true,
+                &[true],
+                true,
+                StartGate::Go,
+                crate::meta::Timestamp::now()
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn a_crashed_guest_is_restarted_and_says_so() {
         let mut i = inst("projects/p1/instances/i1");
         i.status.state = InstanceState::Failed;
-        let actions = reconcile_instance(&i, true, &[true], true, StartGate::Go);
+        let actions = reconcile_instance(
+            &i,
+            true,
+            &[true],
+            true,
+            StartGate::Go,
+            crate::meta::Timestamp::now(),
+        );
         assert_eq!(
             actions,
             vec![Action::RestartCrashedVm {
@@ -1242,7 +1319,14 @@ mod tests {
         i.status.state = InstanceState::Running;
         i.meta.deleted_at = Some(crate::meta::Timestamp::now());
         i.meta.add_finalizer(NODE_RELEASE_FINALIZER);
-        let actions = reconcile_instance(&i, true, &[true], true, StartGate::Go);
+        let actions = reconcile_instance(
+            &i,
+            true,
+            &[true],
+            true,
+            StartGate::Go,
+            crate::meta::Timestamp::now(),
+        );
         let del = actions
             .iter()
             .position(|a| matches!(a, Action::DeleteVm { .. }));
@@ -2120,5 +2204,96 @@ mod tests {
             divergence(&a).is_none(),
             "an object that may now go was counted as stuck"
         );
+    }
+}
+
+#[cfg(test)]
+mod stopping {
+    use super::*;
+    use crate::meta::Timestamp;
+
+    fn guest(state: InstanceState, asked: Option<u64>) -> Instance {
+        let mut i = super::tests::inst("projects/p1/instances/g1");
+        // No ports: what is under test is the stop, and a port that still
+        // wants programming would put its own action in front of it.
+        i.spec.ports = Vec::new();
+        i.spec.desired_state = DesiredState::Stopped;
+        i.status.state = state;
+        i.status.stop_requested_at = asked.map(Timestamp);
+        i
+    }
+
+    /// The button first. Almost every guest answers it, and one that does
+    /// should shut down cleanly rather than lose what it had not written.
+    #[test]
+    fn a_stop_asks_before_it_insists() {
+        let now = Timestamp(10 * STOP_GRACE_MS);
+        let actions = reconcile_instance(
+            &guest(InstanceState::Running, None),
+            true,
+            &[],
+            true,
+            StartGate::Go,
+            now,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::StopVm { .. }]),
+            "{actions:?}"
+        );
+    }
+
+    /// And nothing while it is still within its grace: asking twice is asking
+    /// once, and a guest halfway through unmounting is not stuck.
+    #[test]
+    fn a_guest_that_is_shutting_down_is_left_alone() {
+        let now = Timestamp(10 * STOP_GRACE_MS);
+        let asked = now.0 - STOP_GRACE_MS / 2;
+        let actions = reconcile_instance(
+            &guest(InstanceState::Running, Some(asked)),
+            true,
+            &[],
+            true,
+            StartGate::Go,
+            now,
+        );
+        assert!(actions.is_empty(), "{actions:?}");
+    }
+
+    /// The failure this exists for: an ACPI press reaches a guest with no
+    /// operating system to answer it — wedged in its bootloader, or panicked —
+    /// and before this the platform pressed the button again every pass, for
+    /// ever, while the object said "wanted Stopped, the node reports Running".
+    /// Nothing was broken and nothing would ever happen.
+    #[test]
+    fn a_guest_that_never_answers_has_its_plug_pulled() {
+        let now = Timestamp(10 * STOP_GRACE_MS);
+        let asked = now.0 - STOP_GRACE_MS;
+        let actions = reconcile_instance(
+            &guest(InstanceState::Running, Some(asked)),
+            true,
+            &[],
+            true,
+            StartGate::Go,
+            now,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::KillVm { .. }]),
+            "{actions:?}"
+        );
+    }
+
+    /// A guest that is already stopped is not killed for good measure.
+    #[test]
+    fn a_stopped_guest_is_left_stopped() {
+        let now = Timestamp(10 * STOP_GRACE_MS);
+        let actions = reconcile_instance(
+            &guest(InstanceState::Stopped, Some(0)),
+            true,
+            &[],
+            true,
+            StartGate::Go,
+            now,
+        );
+        assert!(actions.is_empty(), "{actions:?}");
     }
 }

@@ -411,9 +411,15 @@ impl Vmm for QemuVmm {
         hostfs::fetch_image(&self.layout, image, source).await
     }
 
-    async fn create_disk(&self, instance: &str, gib: u64, image: &str) -> Result<()> {
+    async fn create_disk(
+        &self,
+        instance: &str,
+        gib: u64,
+        image: &str,
+        format: velstra_cloud_model::resources::ImageFormat,
+    ) -> Result<()> {
         let source = hostfs::image_path(&self.layout, image);
-        hostfs::create_disk(&self.layout, instance, gib, source.as_deref()).await
+        hostfs::create_disk(&self.layout, instance, gib, source.as_deref(), format).await
     }
 
     /// Covered by `tests/qemu_boots_a_guest.rs`, which starts a real guest and
@@ -452,6 +458,15 @@ impl Vmm for QemuVmm {
 
     /// The teardown half of `tests/qemu_boots_a_guest.rs`: the guest is deleted and
     /// the machine is asked again, so "gone" is observed rather than assumed.
+    async fn kill(&self, instance: &str) -> Result<()> {
+        // `quit` ends the VMM process where `system_powerdown` only asks the
+        // guest to. The unit goes with it; the disk and the directory stay,
+        // because this is a stop and not a delete.
+        let _ = self.qmp(instance, "quit", json!({})).await;
+        hostfs::stop_unit(self.layout.scope, &self.unit(instance)).await;
+        Ok(())
+    }
+
     async fn delete(&self, instance: &str) -> Result<()> {
         if self.monitor(instance).exists() || self.incoming_monitor(instance).exists() {
             let _ = self.qmp(instance, "quit", json!({})).await;

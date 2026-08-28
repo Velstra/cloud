@@ -295,3 +295,51 @@ async fn the_service_is_the_nodes_own_and_needs_nothing_else_to_be_up() {
 
     handle.abort();
 }
+
+/// The two layouts want opposite answers for an instance with no user-data, and
+/// giving both the EC2 one makes the platform unable to configure a guest at
+/// all.
+///
+/// NoCloud fetches its seed as a set — `meta-data`, then `user-data` — and a
+/// failure to fetch either fails the **whole datasource**: cloud-init discards
+/// the meta-data it has already read, retries, and falls back to
+/// `DataSourceNone`. The guest boots with no user, no SSH key and nothing from
+/// the platform, and says so in one line among a thousand.
+///
+/// Measured on a real guest before the fix: `/network-config` 200, `/meta-data`
+/// 200, `/user-data` 404 eight times, `Datasource DataSourceNone`. Every
+/// instance created without user-data was that guest — which is most of them,
+/// and every one the console makes.
+#[tokio::test]
+async fn an_instance_with_no_user_data_is_still_a_datasource() {
+    let store = store();
+    create_network(&store, "127.0.0.0/8", "127.0.0.1").await;
+    create_port(&store, PORT_A, "127.0.0.2/8", "node-a").await;
+    create_instance(&store, I1, Some("node-a"), Some("node-a"), &[PORT_A]).await;
+    clear_user_data(&store, I1).await;
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+    agent.resync().await;
+    let (server, _guard) = metadata::serve("127.0.0.1:0".parse().unwrap(), agent.guests())
+        .await
+        .unwrap();
+
+    // NoCloud: an empty document, because "no user-data" is a document here.
+    let (status, body) = ask(server, "127.0.0.2", "/user-data").await;
+    assert_eq!(
+        status, 200,
+        "NoCloud reads anything but 200 as a broken seed and discards the whole datasource"
+    );
+    assert_eq!(body, "");
+
+    // And the rest of the seed is still there to be discarded, which is the
+    // point: it was never the meta-data that was missing.
+    let (status, _) = ask(server, "127.0.0.2", "/meta-data").await;
+    assert_eq!(status, 200);
+
+    // EC2: 404, which is what its datasource expects and carries on from.
+    let (status, _) = ask(server, "127.0.0.2", "/latest/user-data").await;
+    assert_eq!(status, 404);
+}

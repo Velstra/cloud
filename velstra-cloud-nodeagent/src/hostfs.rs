@@ -458,11 +458,46 @@ pub async fn publish_image(layout: &Layout, image: &str) -> Result<()> {
 }
 
 /// A sparse file of the asked-for size, made once.
+/// The magic a qcow2 file begins with: `QFI\xfb`.
+const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
+
+/// What a file's first bytes say it is, which is not always what somebody
+/// declared it to be.
+fn looks_like_qcow2(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    matches!(
+        std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)),
+        Ok(())
+    ) && head == QCOW2_MAGIC
+}
+
+/// `qemu-img convert -O raw`, which is the only sane way to read qcow2 —
+/// doing it here would be reimplementing a disk format.
+async fn convert_to_raw(from: &Path, to: &Path) -> Result<()> {
+    let out = tokio::process::Command::new("qemu-img")
+        .args(["convert", "-O", "raw"])
+        .arg(from)
+        .arg(to)
+        .output()
+        .await
+        .map_err(|e| HostError::failed(format!("running qemu-img convert: {e}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(HostError::failed(format!(
+        "qemu-img could not convert {} to raw: {}",
+        from.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
+}
+
 pub async fn create_disk(
     layout: &Layout,
     instance: &str,
     gib: u64,
     image: Option<&Path>,
+    format: velstra_cloud_model::resources::ImageFormat,
 ) -> Result<()> {
     let dir = layout.dir(instance);
     std::fs::create_dir_all(&dir)?;
@@ -480,7 +515,37 @@ pub async fn create_disk(
         // fails in the least legible way there is, and before this the image
         // was pulled, verified, and then never used for anything.
         Some(image) => {
-            std::fs::copy(image, &partial)?;
+            // A qcow2 image is *converted*, never copied.
+            //
+            // This used to be `fs::copy` whatever the image was, while the disk
+            // is handed to the VMM as `format=raw` — so a qcow2 image produced a
+            // root disk whose first four bytes were `QFI\xfb` and whose boot
+            // sector was a qcow2 header. The guest started, found no
+            // bootloader, and sat with an empty console. Nothing failed: the
+            // disk was made, the VMM ran, and the platform reported a guest
+            // that could never boot. Practically every public cloud image is
+            // qcow2, so this was the first thing a new operator hit.
+            //
+            // `ImageFormat` existed for exactly this and was read by nobody.
+            let declared_qcow2 = format == velstra_cloud_model::resources::ImageFormat::Qcow2;
+            let really_qcow2 = looks_like_qcow2(image);
+            if declared_qcow2 != really_qcow2 {
+                // The declaration and the bytes disagree, and picking one to
+                // believe is how the wrong one wins quietly. The digest proves
+                // *which* bytes these are and says nothing about what they are.
+                return Err(HostError::failed(format!(
+                    "{} is registered as {:?} and its first bytes say otherwise; \
+                     correct spec.format on the image rather than have this node \
+                     decide which of the two to believe",
+                    image.display(),
+                    format
+                )));
+            }
+            if really_qcow2 {
+                convert_to_raw(image, &partial).await?;
+            } else {
+                std::fs::copy(image, &partial)?;
+            }
         }
         None => {
             std::fs::File::create(&partial)?;
@@ -706,8 +771,24 @@ pub fn mem_total_mib(meminfo: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Free memory per NUMA node, so placement can refuse a host that has the total
-/// but not on one node.
+/// Memory a guest could actually get on each NUMA node, so placement can refuse
+/// a host that has the total but not on one node.
+///
+/// **Not `MemFree`**, and that distinction is the difference between a node that
+/// keeps working and one that stops accepting guests after a day.
+///
+/// `MemFree` is memory the kernel is holding *nothing* in, and on a healthy
+/// Linux that number trends to almost zero: everything else is page cache,
+/// which the kernel gives back the moment somebody asks. Reading it as capacity
+/// was measured on a real node with 15 GiB of memory and one 2 GiB guest —
+/// which reported **245 MiB** free, and the scheduler refused every placement
+/// with "no single NUMA node holds 1024 MiB". Nothing was wrong with the
+/// machine; it had simply been up long enough to read some files.
+///
+/// So: free, plus what the kernel would reclaim without hesitating — the file
+/// pages and the reclaimable slab. That is the same reasoning `MemAvailable`
+/// uses in `/proc/meminfo`, which has no per-node equivalent, so it is computed
+/// here from the fields a node's own `meminfo` does carry.
 pub fn numa_free_mib() -> Vec<u64> {
     let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") else {
         return Vec::new();
@@ -722,18 +803,35 @@ pub fn numa_free_mib() -> Vec<u64> {
             continue;
         };
         let info = std::fs::read_to_string(entry.path().join("meminfo")).unwrap_or_default();
-        let free = info
+        nodes.insert(index, available_mib(&info));
+    }
+    nodes.into_values().collect()
+}
+
+/// What a guest could get on one node, from that node's own `meminfo`.
+///
+/// Free plus the two things the kernel hands back without being asked twice:
+/// file-backed pages and the reclaimable slab. Pure, so the arithmetic is
+/// testable against a real file rather than against a machine.
+pub fn available_mib(meminfo: &str) -> u64 {
+    let field = |name: &str| -> u64 {
+        meminfo
             .lines()
-            .find(|line| line.contains("MemFree:"))
+            .find(|line| line.contains(name))
             .and_then(|line| {
                 let mut fields = line.split_whitespace().rev();
                 fields.next(); // "kB"
                 fields.next()?.parse::<u64>().ok()
             })
-            .unwrap_or(0);
-        nodes.insert(index, free / 1024);
-    }
-    nodes.into_values().collect()
+            .unwrap_or(0)
+    };
+    // `FilePages` is the whole file cache on a node; the active/inactive pair
+    // is what a node's meminfo carries on kernels that do not publish it, and
+    // taking the larger of the two readings is how this stays right on both
+    // rather than silently reading zero on one.
+    let file = field("FilePages:").max(field("Active(file):") + field("Inactive(file):"));
+    let kib = field("MemFree:") + file + field("SReclaimable:");
+    kib / 1024
 }
 
 /// What this machine offers, read off it.
@@ -855,6 +953,39 @@ mod tests {
             15933
         );
         assert_eq!(mem_total_mib("nothing useful"), 0);
+    }
+
+    /// A node stops accepting guests once it has read some files.
+    ///
+    /// `MemFree` on a healthy Linux trends to almost nothing: the rest is page
+    /// cache, which the kernel hands back the moment somebody asks for it.
+    /// Reading it as capacity was measured on a real machine with 15 GiB and
+    /// one 2 GiB guest — it reported 245 MiB, and the scheduler refused every
+    /// placement with "no single NUMA node holds 1024 MiB". Nothing was wrong
+    /// with the machine.
+    #[test]
+    fn what_a_guest_could_get_is_not_what_is_untouched() {
+        // A node that has been up a while: almost nothing free, almost
+        // everything cache.
+        let busy = "Node 0 MemTotal:       16316200 kB\n                    Node 0 MemFree:          251000 kB\n                    Node 0 FilePages:      11000000 kB\n                    Node 0 SReclaimable:     400000 kB\n";
+        let available = available_mib(busy);
+        assert!(
+            available > 10_000,
+            "a node with 11 GiB of reclaimable cache reported {available} MiB"
+        );
+
+        // A node that is genuinely full says so, or this would have turned the
+        // check into a rubber stamp.
+        let full = "Node 0 MemTotal:       16316200 kB\n                    Node 0 MemFree:          120000 kB\n                    Node 0 FilePages:         30000 kB\n                    Node 0 SReclaimable:      10000 kB\n";
+        assert!(available_mib(full) < 200, "{}", available_mib(full));
+
+        // A kernel that publishes the active/inactive pair instead of the total
+        // is read just as well.
+        let split = "Node 0 MemFree:          251000 kB\n                     Node 0 Active(file):    6000000 kB\n                     Node 0 Inactive(file):  5000000 kB\n                     Node 0 SReclaimable:     400000 kB\n";
+        assert!(available_mib(split) > 10_000, "{}", available_mib(split));
+
+        // And a file with none of it is zero rather than a panic.
+        assert_eq!(available_mib(""), 0);
     }
 
     #[test]

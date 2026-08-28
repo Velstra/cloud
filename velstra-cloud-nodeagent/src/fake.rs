@@ -82,6 +82,10 @@ struct Machine {
     /// out, so a test reading a published URL can see which node it points at.
     id: String,
     vms: BTreeMap<String, VmObservation>,
+    /// Guests whose plug was pulled, in order. A test about escalation has to
+    /// tell a graceful stop from a kill, and the observation alone cannot:
+    /// both end with the guest not running.
+    killed: Vec<String>,
     disks: BTreeSet<String>,
     images: BTreeSet<String>,
     /// Disks this fake machine claims to have, so a test can drive the console's
@@ -468,7 +472,13 @@ impl Vmm for FakeVmm {
         Ok(())
     }
 
-    async fn create_disk(&self, instance: &str, _gib: u64, _image: &str) -> Result<()> {
+    async fn create_disk(
+        &self,
+        instance: &str,
+        _gib: u64,
+        _image: &str,
+        _format: velstra_cloud_model::resources::ImageFormat,
+    ) -> Result<()> {
         let mut m = self.machine.lock().unwrap();
         check(&mut m, Fault::Disk, instance)?;
         m.disks.insert(instance.to_string());
@@ -522,6 +532,19 @@ impl Vmm for FakeVmm {
             vm.state = InstanceState::Stopped;
             vm.pid = None;
         }
+        Ok(())
+    }
+
+    async fn kill(&self, instance: &str) -> Result<()> {
+        // The plug, not the button: a fake that asked politely would let a
+        // test about escalation pass while the escalation did nothing.
+        let mut m = self.machine.lock().unwrap();
+        check(&mut m, Fault::Stop, instance)?;
+        if let Some(vm) = m.vms.get_mut(instance) {
+            vm.state = InstanceState::Stopped;
+            vm.pid = None;
+        }
+        m.killed.push(instance.to_string());
         Ok(())
     }
 
@@ -880,6 +903,7 @@ mod tests {
             "projects/p1/instances/i1",
             10,
             "projects/p1/images/sha256-abc",
+            velstra_cloud_model::resources::ImageFormat::Raw,
         )
         .await
         .unwrap();
@@ -899,6 +923,7 @@ mod tests {
             "projects/p1/instances/i1",
             10,
             "projects/p1/images/sha256-abc",
+            velstra_cloud_model::resources::ImageFormat::Raw,
         )
         .await
         .unwrap();
@@ -919,6 +944,7 @@ mod tests {
             "projects/p1/instances/i1",
             10,
             "projects/p1/images/sha256-abc",
+            velstra_cloud_model::resources::ImageFormat::Raw,
         )
         .await
         .unwrap();
@@ -939,6 +965,7 @@ mod tests {
             "projects/p1/instances/i1",
             10,
             "projects/p1/images/sha256-abc",
+            velstra_cloud_model::resources::ImageFormat::Raw,
         )
         .await
         .unwrap();
@@ -962,6 +989,7 @@ mod tests {
             "projects/p1/instances/i1",
             10,
             "projects/p1/images/sha256-abc",
+            velstra_cloud_model::resources::ImageFormat::Raw,
         )
         .await
         .unwrap();

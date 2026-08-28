@@ -72,6 +72,7 @@ pub mod guests;
 pub mod host;
 pub mod hostcpu;
 pub mod hostfs;
+pub mod localnet;
 pub mod metadata;
 pub mod pcidev;
 pub mod pool;

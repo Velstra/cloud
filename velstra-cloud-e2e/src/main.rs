@@ -455,6 +455,7 @@ async fn seed(store: Arc<dyn Store>) {
         Resource::new(
             meta("projects/p1/networks/net-a"),
             NetworkSpec {
+                host_bridge: String::new(),
                 vni: 4711,
                 mtu: 1450,
                 external: false,

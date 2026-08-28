@@ -157,6 +157,10 @@ impl Reconciler for NetworkController {
             // The same: who announces an address is decided here and acted on
             // by whichever agent holds the port.
             announce: _,
+            // A network on a host bridge is not on the fabric at all — its
+            // guests are on the machine's own wire, and there is no overlay to
+            // program. The node's datapath is what acts on it.
+            host_bridge: _,
         } = &network.spec;
         let spec = pb::NetworkSpec {
             vni: *vni,
@@ -419,6 +423,7 @@ mod tests {
         let network = Resource::new(
             meta("projects/p1/networks/n1"),
             NetworkSpec {
+                host_bridge: String::new(),
                 vni: 5001,
                 mtu: 1500,
                 external: false,

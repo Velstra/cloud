@@ -221,7 +221,6 @@ impl From<&v1::ProjectSpec> for resources::ProjectSpec {
             // that arrives over gRPC carries none. Empty is the safe direction:
             // it grants nothing rather than inventing a grant nobody asked for.
             // Managing them over gRPC needs a message, and until there is one,
-            // REST is where a policy is written.
             bindings: Vec::new(),
         }
     }
@@ -326,6 +325,46 @@ fn announce_str(a: velstra_cloud_model::public::Announce) -> &'static str {
     match a {
         velstra_cloud_model::public::Announce::FromGateway => "FromGateway",
         velstra_cloud_model::public::Announce::FromHost => "FromHost",
+    }
+}
+
+
+
+fn binding_out(b: &velstra_cloud_model::authz::Binding) -> v1::Binding {
+    v1::Binding {
+        role: role_str(b.role).to_string(),
+        members: b.members.clone(),
+    }
+}
+
+fn binding_in(b: &v1::Binding) -> velstra_cloud_model::authz::Binding {
+    velstra_cloud_model::authz::Binding {
+        role: parse_role(&b.role),
+        members: b.members.clone(),
+    }
+}
+
+fn role_str(role: velstra_cloud_model::authz::Role) -> &'static str {
+    use velstra_cloud_model::authz::Role;
+    match role {
+        Role::Viewer => "viewer",
+        Role::Editor => "editor",
+        Role::Admin => "admin",
+    }
+}
+
+/// A role name to a role.
+///
+/// Anything unrecognised is a **viewer**, which is the closed answer and the
+/// one a typo must land on: a client that sends `admiin` gets the least, not
+/// the most, and finds out because nothing works rather than because everything
+/// does.
+fn parse_role(s: &str) -> velstra_cloud_model::authz::Role {
+    use velstra_cloud_model::authz::Role;
+    match s {
+        "editor" => Role::Editor,
+        "admin" => Role::Admin,
+        _ => Role::Viewer,
     }
 }
 
@@ -923,6 +962,7 @@ impl From<&resources::InstanceStatus> for v1::InstanceStatus {
             console_tail: s.console_tail.clone(),
             console_bytes: s.console_bytes,
             running_size: s.running_size.as_ref().map(Into::into),
+            stop_requested_at: s.stop_requested_at.map(|t| t.0 as i64).unwrap_or(0),
         }
     }
 }
@@ -934,6 +974,9 @@ impl From<&v1::InstanceStatus> for resources::InstanceStatus {
             console_tail: s.console_tail.clone(),
             console_bytes: s.console_bytes,
             running_size: s.running_size.as_ref().map(Into::into),
+            stop_requested_at: (s.stop_requested_at != 0).then_some(
+                velstra_cloud_model::meta::Timestamp(s.stop_requested_at as u64),
+            ),
             observed_generation: s.observed_generation,
             conditions: conditions_in(&s.conditions),
             state: s.state().into(),
@@ -1095,6 +1138,7 @@ impl From<&resources::NetworkSpec> for v1::NetworkSpec {
             mtu: s.mtu,
             external: s.external,
             announce: announce_str(s.announce).to_string(),
+            host_bridge: s.host_bridge.clone(),
         }
     }
 }
@@ -1106,6 +1150,7 @@ impl From<&v1::NetworkSpec> for resources::NetworkSpec {
             mtu: s.mtu,
             external: s.external,
             announce: parse_announce(&s.announce),
+            host_bridge: s.host_bridge.clone(),
         }
     }
 }
@@ -1670,6 +1715,7 @@ mod tests {
             },
             InstanceStatus {
                 running_size: None,
+                stop_requested_at: None,
                 console_tail: String::new(),
                 console_bytes: 0,
                 devices: Vec::new(),

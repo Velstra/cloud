@@ -141,6 +141,7 @@ async fn a_tenant_network_reaches_the_fabric_without_anybody_declaring_it() {
             &Resource::new(
                 meta(NETWORK),
                 NetworkSpec {
+                    host_bridge: String::new(),
                     vni: VNI,
                     mtu: 1500,
                     external: false,

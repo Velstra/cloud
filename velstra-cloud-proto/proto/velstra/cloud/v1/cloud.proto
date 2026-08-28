@@ -166,6 +166,30 @@ message Quota {
   uint32 devices = 8;
 }
 
+// What a project is allowed to reach for, decided per project by whoever runs
+// the cell. A quota says how much; this says what kind. Every field defaults to
+// the closed answer, so a project created without one gets ordinary logical
+// networks and nothing else.
+message ProjectPolicy {
+  // Bridges on the nodes this project's networks may be put on. Empty means
+  // none. Named rather than a boolean, because what anybody means by a host
+  // bridge is a particular wire.
+  repeated string host_bridges = 1;
+  // Whether guests here may be given a piece of the host — a GPU, a NIC.
+  bool device_passthrough = 2;
+  // Whether this project may hold addresses the world can reach.
+  bool floating_ips = 3;
+}
+
+// One grant: a role, and who holds it. `role` is the role's name —
+// `viewer`, `operator`, `editor`, `admin` — carried as a string for the same
+// reason `announce` is: a name that does not parse is a name somebody typed
+// wrong, and an unknown number is a silent default.
+message Binding {
+  string role = 1;
+  repeated string members = 2;
+}
+
 message ProjectSpec {
   string display_name = 1;
   // `organizations/o1` or `folders/f2` — kept as a name so the policy
@@ -640,6 +664,9 @@ message InstanceStatus {
   // "pending change" is — the alternative, which this platform shipped, is a
   // resize that reads as applied while the guest runs on the old numbers.
   RunningSize running_size = 12;
+  // When this node asked the guest to shut down, for a stop still waiting on
+  // it. 0 means nothing is being waited for.
+  int64 stop_requested_at = 13;
 }
 
 message RunningSize {
@@ -909,6 +936,11 @@ message NetworkSpec {
   // `FromGateway` (the default) or `FromHost`. An individual address may
   // override it. Meaningless on a network that is not external.
   string announce = 4;
+  // A bridge on the node, when this network is the machine's own wire rather
+  // than one the platform builds. Empty is the ordinary case. An operator's
+  // declaration and never a tenant's: a guest on a host bridge is on whatever
+  // the machine is on, past every rule this platform has.
+  string host_bridge = 5;
 }
 
 message NetworkStatus {
