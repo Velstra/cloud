@@ -267,4 +267,31 @@ mod tests {
         }
         found
     }
+
+    /// Every asset is text a person can read, search and review.
+    ///
+    /// One of them held a literal NUL byte — written where `\u0000` was meant,
+    /// as a separator inside a string. It worked: JavaScript strings hold NUL
+    /// happily, the console shipped, and every test passed. What it broke was
+    /// everything *around* the code: `file` calls the source `data`, `grep`
+    /// treats it as binary and silently reports nothing, and a diff of it is
+    /// unreadable. It cost real time — searches of that file came back empty and
+    /// were believed, twice, about functions that were plainly there.
+    ///
+    /// Tab and newline are the only control characters a source file needs.
+    #[test]
+    fn every_asset_is_text_and_not_data() {
+        for (name, source) in SCRIPT {
+            for (n, line) in source.lines().enumerate() {
+                if let Some(c) = line.chars().find(|c| c.is_control() && *c != '\t') {
+                    panic!(
+                        "{name}.js line {} holds a literal {:#06x} — write it as an escape, or a \
+                         text tool will call this file binary and quietly find nothing in it",
+                        n + 1,
+                        c as u32
+                    );
+                }
+            }
+        }
+    }
 }
