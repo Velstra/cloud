@@ -352,6 +352,39 @@ async fn main() {
         shutdown.clone(),
         leader.clone(),
     ));
+    // Keeping a family current is one job for the cell, not one per node, so it
+    // runs where every other cell-wide loop does — behind the leader, so three
+    // control planes do not each publish the same image.
+    match velstra_cloud_controller::imagesource::OverHttps::new() {
+        Ok(fetch) => {
+            tasks.spawn(run_when_leading(
+                Arc::new(
+                    velstra_cloud_controller::imagesource::ImageSourceController::new(
+                        velstra_cloud_store::TypedStore::new(store.clone(), cell, "images"),
+                        velstra_cloud_store::TypedStore::new(store.clone(), cell, "instances"),
+                        StatusWriter::new(store.clone(), cell, "image-sources", "images"),
+                        Arc::new(fetch),
+                        &args.region,
+                        cell,
+                    ),
+                ),
+                velstra_cloud_store::TypedStore::new(store.clone(), cell, "image-sources"),
+                store.clone(),
+                config,
+                metrics.clone(),
+                shutdown.clone(),
+                leader.clone(),
+            ));
+        }
+        // A cell whose TLS stack will not build is a cell that cannot learn a
+        // digest safely, and the honest thing is to run without the loop and say
+        // so — not to fall back to fetching it over something unverified.
+        Err(why) => tracing::warn!(
+            error = %why,
+            "no image-source loop: this cell will not rotate images by itself"
+        ),
+    }
+
     tasks.spawn(run_when_leading(
         Arc::new(OperationsController::new(
             store.clone(),

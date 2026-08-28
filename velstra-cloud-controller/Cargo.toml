@@ -12,6 +12,10 @@ name = "velstra-cloud-controller"
 path = "src/bin/velstra-cloud-controller.rs"
 
 [dependencies]
+# The one place this crate reaches the outside: a checksums file, over https with
+# the certificate checked. rustls rather than the platform store, so a cell in a
+# container behaves the same as one on a distribution that ships its own openssl.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 velstra-cloud-fabric = { workspace = true }
 velstra-cloud-model = { workspace = true }
 velstra-cloud-store = { workspace = true }

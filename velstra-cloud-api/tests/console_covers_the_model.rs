@@ -168,6 +168,8 @@ mod complete {
 
     pub fn image() -> ImageSpec {
         ImageSpec {
+            family: "debian-13".into(),
+            version: "20260815".into(),
             source_instance: None,
             digest: "sha256-abc".into(),
             format: ImageFormat::Qcow2,

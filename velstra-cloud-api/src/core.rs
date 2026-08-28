@@ -50,7 +50,7 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 29] = [
+pub const COLLECTIONS: [&str; 30] = [
     "projects",
     "users",
     "ceph-clusters",
@@ -76,6 +76,7 @@ pub const COLLECTIONS: [&str; 29] = [
     "audit",
     "captures",
     "console-sessions",
+    "image-sources",
     "usage",
     "snapshot-schedules",
     "maintenance-windows",
@@ -456,6 +457,11 @@ impl Api {
                 "console-sessions",
                 velstra_cloud_model::console::ConsoleSessionSpec,
                 velstra_cloud_model::console::ConsoleSessionStatus
+            ),
+            collection!(
+                "image-sources",
+                velstra_cloud_model::images::ImageSourceSpec,
+                velstra_cloud_model::images::ImageSourceStatus
             ),
             collection!(
                 "usage",
@@ -1455,6 +1461,12 @@ impl Api {
         }
         if kind == "images" {
             refuse_an_unverified_signature(&spec)?;
+        }
+        if kind == "image-sources" {
+            refuse_an_unusable_image_source(&spec)?;
+        }
+        if kind == "instances" {
+            self.settle_image_family(parent, &mut spec).await?;
         }
         if kind == "nodes" {
             refuse_an_unusable_overcommit(&spec)?;
@@ -3586,6 +3598,95 @@ impl Api {
         .at("spec.pool"))
     }
 
+    /// Turn `families/debian-13` into the image it means, once, here.
+    ///
+    /// The resolution happens **at create time and is written down**, so the
+    /// object records the concrete image it was built from. A family reference
+    /// that stayed a family reference would be a guest whose operating system
+    /// changed on the next restart, at a moment nobody chose — which is the
+    /// opposite of what somebody asking for "the newest" wants. What they want
+    /// is that *new* machines get the newest, and that is what this does.
+    ///
+    /// The scope is the caller's: a project's own family beats the cell's, so a
+    /// tenant who publishes `debian-13` of their own gets theirs, and a tenant
+    /// who does not gets the catalogue's. Anything else would let one project's
+    /// choice of name decide what another project boots.
+    async fn settle_image_family(&self, parent: &str, spec: &mut Value) -> ApiResult<()> {
+        let Some(asked) = spec.get("image").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(family) = asked.strip_prefix(velstra_cloud_model::resources::FAMILY_PREFIX) else {
+            return Ok(());
+        };
+        let family = family.to_string();
+        if family.is_empty() {
+            return Err(ApiError::invalid(
+                "a family reference names the family after the prefix, as in `families/debian-13`",
+            )
+            .at("spec.image"));
+        }
+
+        let mut candidates: Vec<velstra_cloud_model::resources::Image> = Vec::new();
+        if !parent.is_empty() {
+            candidates.extend(self.typed_list(parent, "images").await?);
+        }
+        candidates.extend(self.typed_list("", "images").await?);
+
+        // The project's own first, then the cell's — `newest_of_family` orders by
+        // age, so the two lists are asked separately rather than merged.
+        let chosen = if parent.is_empty() {
+            velstra_cloud_model::resources::newest_of_family(candidates.iter(), &family).cloned()
+        } else {
+            let mine: Vec<_> = candidates
+                .iter()
+                .filter(|i| i.meta.name.to_string().starts_with(&format!("{parent}/")))
+                .collect();
+            velstra_cloud_model::resources::newest_of_family(mine, &family)
+                .cloned()
+                .or_else(|| {
+                    let theirs: Vec<_> = candidates
+                        .iter()
+                        .filter(|i| !i.meta.name.to_string().starts_with("projects/"))
+                        .collect();
+                    velstra_cloud_model::resources::newest_of_family(theirs, &family)
+                        .cloned()
+                })
+        };
+
+        let Some(image) = chosen else {
+            let mut families: Vec<String> = candidates
+                .iter()
+                .filter(|i| !i.spec.family.is_empty())
+                .map(|i| i.spec.family.clone())
+                .collect();
+            families.sort();
+            families.dedup();
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                if families.is_empty() {
+                    format!(
+                        "there is no image family called `{family}`, and no image here declares a \
+                         family at all. Publish one with `spec.family` set, or name an image by \
+                         its digest."
+                    )
+                } else {
+                    format!(
+                        "there is no image family called `{family}`. This cell offers {}.",
+                        families
+                            .iter()
+                            .map(|f| format!("`{f}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+            )
+            .at("spec.image"));
+        };
+
+        spec["image"] = Value::String(image.meta.name.to_string());
+        Ok(())
+    }
+
     async fn refuse_a_moved_pool(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
         let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
             return Ok(());
@@ -4714,4 +4815,21 @@ fn advice_json(a: &velstra_cloud_model::cpu::Advice) -> Value {
             "target": target.map(|l| l.as_str()),
         }),
     }
+}
+
+/// Everything about a source that can be judged before anybody waits on a
+/// network. Chief among them: the checksums file is fetched over https, because
+/// it is the one value the whole arrangement trusts.
+fn refuse_an_unusable_image_source(spec: &Value) -> ApiResult<()> {
+    let parsed: velstra_cloud_model::images::ImageSourceSpec =
+        serde_json::from_value(spec.clone()).map_err(|e| ApiError::invalid(e.to_string()))?;
+    velstra_cloud_model::images::refuse_an_unusable_source(&parsed).map_err(|e| {
+        use velstra_cloud_model::images::Unusable;
+        let field = match e {
+            Unusable::ChecksumsNotHttps => "spec.checksums",
+            Unusable::NoFamily => "spec.family",
+            Unusable::NoUrl | Unusable::NoFilename => "spec.url",
+        };
+        ApiError::invalid(e.to_string()).at(field)
+    })
 }

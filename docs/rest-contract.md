@@ -29,7 +29,8 @@ Collections, in the order the API serves them: `projects`, `users`,
 `attachments`, `networks`, `routers`, `floatingips`, `load-balancers`,
 `subnets`, `ports`, `security-groups`, `images`, `nodes`, `pools`,
 `device-classes`, `backup-targets`, `backups`, `backup-schedules`, `audit`,
-`captures`, `console-sessions`, `usage`, `snapshot-schedules`,
+`captures`, `console-sessions`, `image-sources`, `usage`,
+`snapshot-schedules`,
 `maintenance-windows`, `operations`.
 
 ### Narrowing a list by label
@@ -1731,3 +1732,62 @@ If-Match: "412"                 # the revision the agent read, for a compare-and
 A person, a service account or a cell operator has no node identity and so may
 not use it: `status` is the agent's half, and the API does not get to be more
 permissive than the store.
+
+## Image families and where images come from
+
+An image's name is its `sha256`, which is what makes fetching one verifiable and
+what made every screen ask people to choose an operating system from
+`images/sha256-cbf3e1f588f02f8d738dbecb…`. `spec.family` is the name a person
+uses — `debian-13` — and `spec.version` says which one in the family.
+
+An instance may name **`families/<family>`** instead of an image:
+
+```
+POST /api/v1/projects/p1/instances
+{ "id": "web-1", "spec": { "image": "families/debian-13", … } }
+```
+
+That is resolved **once, when the instance is created**, and what is stored is
+the concrete image. A guest never changes its operating system on a restart:
+"always the newest" means new machines get the newest, not that existing ones are
+rewritten under their owners. A project's own family beats the cell's, so a
+tenant publishing `debian-13` of their own gets theirs.
+
+`image-sources` keeps a family current:
+
+```
+POST /api/v1/image-sources
+{ "id": "debian-13", "spec": {
+    "family": "debian-13",
+    "url": "http://cloud.example/debian-13-genericcloud-amd64.qcow2",
+    "checksums": "https://cloud.example/SHA256SUMS",
+    "everyMs": 21600000,
+    "keep": 3
+} }
+```
+
+The cell reads the checksums file, finds the line for the image's filename, and
+publishes an image for that digest if it does not have one. Two different jobs
+with two different trust models, and conflating them is the hazard:
+
+* **the digest** is learned over `https://` with the certificate checked, and
+  anything else is refused at this door — whoever can rewrite that answer chooses
+  what every new guest in the cell boots;
+* **the bytes** are then fetched by the node over whatever scheme the URL names,
+  including plain `http://`, because a wrong byte gives a wrong digest and fails.
+
+`keep` is retention, and it takes away only what it is safe to take: versions
+this source published (matched by `url`, so a hand-made image sharing the family
+is left alone), past the newest `keep`, that **no instance names**. A guest keeps
+the bytes it was built from for as long as it exists, so its image survives
+whatever `keep` says — and the source says on its own object how many it spared
+and why, because "why does this family still hold eleven versions" should not
+have to be worked out from a list of guests. Retention runs only after something
+new was published: nothing can fall out of `keep` unless something came in.
+
+A `SHA512SUMS` file is not a `SHA256SUMS` file. They sit side by side in every
+distribution's directory, and a 128-digit line is refused rather than taken as a
+digest — one that no bytes will ever match would be a source that looks healthy
+and publishes something that cannot boot. The source says on its own object what
+it found, or why it could not look.
+
