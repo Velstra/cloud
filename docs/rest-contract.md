@@ -267,6 +267,100 @@ A `console-sessions` object is therefore a record rather than something to
 create by hand: posting to the collection is possible and pointless, because a
 session whose ticket nobody knows opens nothing.
 
+### Networks: logical, or the machine's own wire
+
+A network is **logical** by default: the platform allocates its addresses, the
+fabric — or the node, as a first hop — carries its segment, and its security
+groups mean something.
+
+An operator may instead put one on a bridge that already exists on the nodes:
+
+```
+POST /api/v1/projects/p1/networks
+{ "id": "lan", "spec": { "mtu": 1500, "host_bridge": "br0" } }
+```
+
+Guests on it go straight onto whatever the machine is on. Their addresses come
+from whatever serves that wire, so this platform allocates none, holds no
+gateway on it, translates nothing out of it, and **answers no DHCP** — a second
+server on one segment is how a guest ends up with an address nobody agrees on.
+The metadata service still answers them: a guest on a host bridge reaches
+`169.254.169.254` on its node like any other neighbour.
+
+**Only a cell operator may set it.** A tenant asking is refused:
+
+```
+403 { "error": { "code": "PERMISSION_DENIED", "field": "spec.hostBridge",
+                 "message": "only a cell operator may put a network on a host bridge…" } }
+```
+
+A bridge that is not there is refused by the node, on the port, rather than
+created — making one means deciding what goes in it, and the only useful answer
+involves the machine's uplink.
+
+### Usage: what a project had, and when
+
+`project.status.used` says what is in use **now**, counted from the objects that
+exist. It has no memory, so a guest that ran for three weeks and was deleted
+this morning is indistinguishable from one that never existed — which is right
+for a quota and useless for a bill.
+
+So the present is written down, once an hour, under the project:
+
+```
+GET /api/v1/projects/p1/usage
+→ { "items": [ { "meta": { "name": "projects/p1/usage/1787824800000" },
+                 "spec": { "project": "projects/p1",
+                           "at": 1787824800000,
+                           "used": { "instances": 3, "vcpus": 12, … } } } ] }
+```
+
+Ids are the millisecond, zero-padded, so a listing is in time order without an
+index. Readings are kept ninety days.
+
+**A reading is a sample, not a total.** Something created and destroyed between
+two readings is in neither, and is not billed. The alternative is charging from
+the object lifecycle, which means a counter — and a counter loses a charge for
+ever when the process holding it dies at the wrong moment, with nothing able to
+prove afterwards which happened. The interval is the knob; a provider who needs
+finer than an hour shortens it and pays for the rows.
+
+Written by the controller and by nothing else. They are not creatable, editable
+or deletable through the API: a usage record that could be changed after the
+fact is a bill nobody can stand behind.
+
+### A way into a guest: the console
+
+A guest's serial line is reachable when the network is not — which is the only
+time it matters. Ask for a console on the instance:
+
+```
+POST /api/v1/projects/p1/instances/i1:console
+→ 200 { "session": "projects/p1/console-sessions/console-3f9a2c81",
+        "ticket": "…", "readOnly": false, "expiresAt": … }
+```
+
+Then open a websocket to the API, which relays to the node holding the guest:
+
+```
+GET /api/v1/projects/p1/instances/i1:consoleStream?ticket=…
+Upgrade: websocket
+```
+
+Binary frames are the guest's bytes in both directions. A caller with `Read`
+but not `Write` on the project is given `readOnly`, and what it types is
+dropped rather than refused mid-session.
+
+**The ticket is spent once and expires in a minute.** It is minted by the API,
+stored **hashed** on the session — every node in the cell may read the cell, and
+a session carrying the ticket in the clear would hand each of them a way into a
+guest on somebody else's machine — and the node that accepts it records the fact
+so a second connection presenting it is refused.
+
+A `console-sessions` object is therefore a record rather than something to
+create by hand: posting to the collection is possible and pointless, because a
+session whose ticket nobody knows opens nothing.
+
 ### Templates: capture a guest, stamp out copies
 
 Build a guest by hand, get it right, stop it, capture it. Every guest made from

@@ -2605,6 +2605,11 @@ const OPERATION_FIELDS: &[Field] = &[
     },
 ];
 
+/// Nothing about a reading is somebody's to set. It is a fact about a moment
+/// that has passed, written once and never edited — a usage record that could
+/// be changed after the fact is a bill nobody can stand behind.
+const USAGE_FIELDS: &[Field] = &[];
+
 pub const COLLECTIONS: &[Collection] = &[
     Collection {
         id: "instances",
@@ -3478,6 +3483,64 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "usage",
+        title: "Usage",
+        singular: "usage record",
+        recheck: 0,
+        condition: "",
+        // Nothing reports on these: a usage reading is a fact about a moment that has passed.
+        group: "Access",
+        scope: Scope::Project,
+        blurb: "What this project had, read once an hour and kept for ninety \
+                days. A reading is a sample, not a total: something created and \
+                destroyed between two of them is in neither. Quota says what is \
+                in use now; this is the only thing that remembers.",
+        fields: USAGE_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.at",
+                label: "Taken",
+                cell: Cell::Ago,
+                width: 120,
+            },
+            Column {
+                path: "spec.used.instances",
+                label: "Instances",
+                cell: Cell::Number { unit: "" },
+                width: 90,
+            },
+            Column {
+                path: "spec.used.vcpus",
+                label: "vCPUs",
+                cell: Cell::Number { unit: "" },
+                width: 80,
+            },
+            Column {
+                path: "spec.used.memoryMib",
+                label: "Memory",
+                cell: Cell::Number { unit: "MiB" },
+                width: 110,
+            },
+            Column {
+                path: "spec.used.volumeGib",
+                label: "Storage",
+                cell: Cell::Number { unit: "GiB" },
+                width: 110,
+            },
+            Column {
+                path: "spec.used.floatingIps",
+                label: "Public addresses",
+                cell: Cell::Number { unit: "" },
+                width: 130,
+            },
+        ],
+        agreements: &[],
+        creatable: false,
+        editable: false,
+        deletable: false,
+        explainable: false,
+    },
+    Collection {
         id: "audit",
         title: "Audit",
         singular: "audit record",
@@ -4040,7 +4103,7 @@ mod tests {
         }
         assert_eq!(
             COLLECTIONS.len(),
-            26,
+            27,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:
