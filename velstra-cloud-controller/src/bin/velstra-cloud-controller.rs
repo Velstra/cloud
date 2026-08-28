@@ -311,33 +311,40 @@ async fn main() {
         leader.clone(),
     ));
     tasks.spawn(run_when_leading(
-        Arc::new(QuotaController::new(
-            // One in-memory copy each, fed by one watch — without it a quota
-            // resync reads every instance once per project, which is measured
-            // quadratic in tests/scaling.rs.
-            velstra_cloud_store::Cached::start(
-                instances.clone(),
-                store.clone(),
-                velstra_cloud_store::prefix_for(cell, "instances"),
-            ),
-            velstra_cloud_store::Cached::start(
-                volumes.clone(),
-                store.clone(),
-                velstra_cloud_store::prefix_for(cell, "volumes"),
-            ),
-            velstra_cloud_store::Cached::start(
-                floating_ips.clone(),
-                store.clone(),
-                velstra_cloud_store::prefix_for(cell, "floatingips"),
-            ),
-            velstra_cloud_store::Cached::start(
-                load_balancers.clone(),
-                store.clone(),
-                velstra_cloud_store::prefix_for(cell, "load-balancers"),
-            ),
-            StatusWriter::new(store.clone(), cell, "projects", "quota"),
-            cell,
-        )),
+        Arc::new(
+            QuotaController::new(
+                // One in-memory copy each, fed by one watch — without it a quota
+                // resync reads every instance once per project, which is measured
+                // quadratic in tests/scaling.rs.
+                velstra_cloud_store::Cached::start(
+                    instances.clone(),
+                    store.clone(),
+                    velstra_cloud_store::prefix_for(cell, "instances"),
+                ),
+                velstra_cloud_store::Cached::start(
+                    volumes.clone(),
+                    store.clone(),
+                    velstra_cloud_store::prefix_for(cell, "volumes"),
+                ),
+                velstra_cloud_store::Cached::start(
+                    floating_ips.clone(),
+                    store.clone(),
+                    velstra_cloud_store::prefix_for(cell, "floatingips"),
+                ),
+                velstra_cloud_store::Cached::start(
+                    load_balancers.clone(),
+                    store.clone(),
+                    velstra_cloud_store::prefix_for(cell, "load-balancers"),
+                ),
+                StatusWriter::new(store.clone(), cell, "projects", "quota"),
+                cell,
+            )
+            // What each project had, once an hour, kept for ninety days. A cell
+            // that nobody bills still gets them: the rows are small, the question
+            // "what did they use last month" has no other answer, and it is not
+            // one anybody asks in time to turn the recording on.
+            .recording_usage(store.clone()),
+        ),
         projects.clone(),
         store.clone(),
         config,

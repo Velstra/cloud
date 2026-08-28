@@ -50,7 +50,17 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 28] = [
+/// Said the same way wherever somebody tries to write a usage record.
+///
+/// A bill that can be written, edited or deleted through the same door the
+/// customer comes in is not a bill. Readings are written by the controller,
+/// straight to the store, and this is the whole of the API's part in it: no.
+const RECORDS_ARE_NOT_WRITTEN_HERE: &str = "usage records are readings taken by the platform, not documents anybody writes. They cannot \
+     be created, changed or deleted here — a record that could be would be a bill nobody can \
+     stand behind. They are read with GET, and they go away with their project or with their \
+     retention.";
+
+pub const COLLECTIONS: [&str; 29] = [
     "projects",
     "users",
     "ceph-clusters",
@@ -76,6 +86,7 @@ pub const COLLECTIONS: [&str; 28] = [
     "audit",
     "captures",
     "console-sessions",
+    "usage",
     "snapshot-schedules",
     "maintenance-windows",
     "operations",
@@ -448,6 +459,11 @@ impl Api {
                 "console-sessions",
                 velstra_cloud_model::console::ConsoleSessionSpec,
                 velstra_cloud_model::console::ConsoleSessionStatus
+            ),
+            collection!(
+                "usage",
+                velstra_cloud_model::usage::UsageRecordSpec,
+                velstra_cloud_model::usage::UsageRecordStatus
             ),
             collection!(
                 "audit",
@@ -1370,6 +1386,9 @@ impl Api {
                 "operations are minted by the API when it accepts a change, never created directly",
             ));
         }
+        if kind == "usage" {
+            return Err(ApiError::invalid(RECORDS_ARE_NOT_WRITTEN_HERE).at("spec"));
+        }
         let collection = self.collection(kind)?;
         refuse_unwritable(body)?;
 
@@ -1539,6 +1558,9 @@ impl Api {
             )
             .at("spec.policy"));
         }
+        if name.collection() == "usage" {
+            return Err(ApiError::invalid(RECORDS_ARE_NOT_WRITTEN_HERE));
+        }
         let collection = self.collection(name.collection())?;
         refuse_unwritable(body)?;
         let mut patch = Patch {
@@ -1686,6 +1708,9 @@ impl Api {
         who: &Identity,
     ) -> ApiResult<Deleted> {
         self.may_write_now(who)?;
+        if name.collection() == "usage" {
+            return Err(ApiError::invalid(RECORDS_ARE_NOT_WRITTEN_HERE));
+        }
         self.authorize(who, Verb::Write, name).await?;
         // Asked before anything is written down. Deleting an object something
         // still names does not fail loudly anywhere: the reference simply stops

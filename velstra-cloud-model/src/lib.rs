@@ -33,6 +33,7 @@ pub mod resources;
 pub mod routing;
 pub mod security;
 pub mod storage;
+pub mod usage;
 
 pub use access::{WriteRefused, Writer};
 pub use meta::{Condition, ConditionStatus, Meta, Placement, ResourceName, Revision, Timestamp};

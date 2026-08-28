@@ -101,6 +101,7 @@ impl Assigned for crate::storage::SnapshotScheduleSpec {}
 
 /// "Make an image out of this guest." See [`crate::capture`].
 pub type Capture = Resource<crate::capture::CaptureSpec, crate::capture::CaptureStatus>;
+pub type UsageRecord = Resource<crate::usage::UsageRecordSpec, crate::usage::UsageRecordStatus>;
 pub type ConsoleSession =
     Resource<crate::console::ConsoleSessionSpec, crate::console::ConsoleSessionStatus>;
 
@@ -116,6 +117,19 @@ impl Observed for crate::capture::CaptureStatus {
     }
 }
 
+impl Observed for crate::usage::UsageRecordStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    /// Nobody. A reading is a fact about a moment that has passed; there is no
+    /// party that runs it and nothing to report.
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+}
 
 impl Observed for crate::console::ConsoleSessionStatus {
     fn observed_generation(&self) -> u64 {
@@ -129,6 +143,13 @@ impl Observed for crate::console::ConsoleSessionStatus {
     }
 }
 
+impl Assigned for crate::usage::UsageRecordSpec {
+    /// Nobody. A reading is written once by the controller and belongs to no
+    /// agent afterwards — there is nothing left to run.
+    fn assigned_owner(&self) -> Option<&str> {
+        None
+    }
+}
 
 impl Assigned for crate::console::ConsoleSessionSpec {
     fn assigned_owner(&self) -> Option<&str> {
