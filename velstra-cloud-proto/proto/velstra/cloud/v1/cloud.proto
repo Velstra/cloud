@@ -202,6 +202,10 @@ message ProjectSpec {
   // copy stamped with its own cell. Empty means "wherever it is being read",
   // which is what a single-cell installation means.
   string cell = 4;
+  // Who may do what inside this project.
+  repeated Binding bindings = 5;
+  // What this project is allowed to reach for.
+  ProjectPolicy policy = 6;
 }
 
 message ProjectStatus {

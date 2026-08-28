@@ -637,6 +637,57 @@ const CEPH_FIELDS: &[Field] = &[
 ];
 
 const PROJECT_FIELDS: &[Field] = &[
+    // ---- what the cell allows this project ---------------------------------
+    //
+    // A quota says how much; these say what kind. They are the cell operator's
+    // to set and the tenant's to work within — a project admin sees them and
+    // cannot change them, which is the point: the provider decides what a
+    // customer may reach for.
+    Field {
+        key: "policy.hostBridges",
+        label: "Host bridges this project may use",
+        kind: Kind::Lines {
+            placeholder: "br0\nvmbr1",
+        },
+        required: false,
+        advanced: true,
+        help: "One bridge per line, as they are named on the nodes. A network \
+               put on one takes its guests off this platform's networks and \
+               onto whatever the machine is on — no address from us, no \
+               gateway, no security group. Empty means this project gets \
+               logical networks only, which is what a new customer should \
+               have. Named rather than a yes/no, because what anybody means by \
+               a host bridge is a particular wire.",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
+        key: "policy.devicePassthrough",
+        label: "May pass hardware through",
+        kind: Kind::Switch,
+        required: false,
+        advanced: true,
+        help: "Whether guests here may be given a GPU or a NIC of their own. A \
+               passed-through device is a physical thing one guest holds and no \
+               other guest can have, so a project that may ask for them can \
+               empty a node of the hardware everybody else was scheduled \
+               against.",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
+        key: "policy.floatingIps",
+        label: "May hold public addresses",
+        kind: Kind::Switch,
+        required: false,
+        advanced: true,
+        help: "Whether this project may claim addresses the world can reach. \
+               They come out of address space the cell was given by whoever is \
+               above it, so a project that could mint them could exhaust the \
+               pool every other project is waiting on.",
+        derived: false,
+        at_creation: true,
+    },
     Field {
         key: "displayName",
         label: "Display name",

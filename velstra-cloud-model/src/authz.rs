@@ -23,13 +23,30 @@
 //! it is what a fresh cell is bootstrapped from, and a permission stored inside
 //! the thing it protects has no answer for the first request.
 //!
-//! ## Why three roles and not a permission matrix
+//! ## Roles, and why these
 //!
-//! Because the matrix is what nobody reads. Three roles cover what a tenant
-//! actually distinguishes — look, change, and decide who else may — and a fourth
-//! is easy to add the day something needs it. Starting from a per-verb,
-//! per-collection grid would be a lot of surface for a platform whose access
-//! story has, until now, been that everyone may do everything.
+//! A ladder, not a matrix, because the matrix is what nobody reads. Each rung
+//! is a distinction somebody running a fleet actually makes:
+//!
+//! | Role | May | Cannot |
+//! |---|---|---|
+//! | `viewer` | look at everything in the project | change anything |
+//! | `operator` | run what is already there — start, stop, resize, attach, open a console | bring anything into existence or take it away |
+//! | `editor` | that, and create and delete | change who may |
+//! | `admin` | everything, including the bindings | leave the project's own limits, which are the cell's |
+//!
+//! `operator` is the rung a platform serving customers needs and a single-tenant
+//! one does not: the people who keep an estate running are usually not the
+//! people who decide what it consists of, and a role that could only do both was
+//! a role handed out too widely. It is the difference between rebooting a
+//! machine and deleting it.
+//!
+//! **A project `admin` is not a cell operator.** The cell's operators are named
+//! in the cell's own configuration; they may do anything anywhere, and they are
+//! the provider. A project admin is a customer's own administrator, and there
+//! are things they deliberately cannot do to their own project — raise its
+//! quota, or step outside the policy the cell set for it. Everything below says
+//! "cell operator" in full whenever it means the former.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,9 +57,17 @@ use crate::meta::ResourceName;
 pub enum Verb {
     /// Get, list, watch.
     Read,
-    /// Create, update, delete.
+    /// Change something that already exists: start a guest, resize it, attach a
+    /// volume, open its console.
+    ///
+    /// Kept apart from `Write` because "may run the estate" and "may decide what
+    /// the estate consists of" are different jobs in every organisation large
+    /// enough to have both — and a platform that could not express the
+    /// difference forced the second on anybody who needed the first.
+    Operate,
+    /// Bring something into existence, or take it away.
     Write,
-    /// Change who else may — kept apart from `Write` so that an editor cannot
+    /// Change who else may — kept apart from the rest so that an editor cannot
     /// grant themselves more than they were given, which is the one escalation
     /// a role system has to be closed against.
     Administer,
@@ -55,6 +80,13 @@ pub enum Role {
     /// Read everything in the project and change nothing.
     #[default]
     Viewer,
+    /// Run what is already there, and bring nothing new into existence.
+    ///
+    /// Start a guest, stop it, resize it, attach a volume, open a console. Not
+    /// create one, and not delete one — which is the whole point: the people
+    /// who keep an estate running are usually not the people who decide what it
+    /// consists of.
+    Operator,
     /// Read and change everything in the project, except who may.
     Editor,
     /// Everything, including the bindings themselves.
@@ -63,12 +95,23 @@ pub enum Role {
 
 impl Role {
     /// Whether this role admits `verb`.
+    ///
+    /// Written as a full match with no wildcard on the pair, deliberately: a new
+    /// verb is a compile error here until somebody says what each role does
+    /// about it. A wildcard would silently grant it to whichever rung the
+    /// catch-all sat on, which is how a permission system gets a hole nobody
+    /// wrote down.
     pub fn admits(self, verb: Verb) -> bool {
         match (self, verb) {
             (Role::Viewer, Verb::Read) => true,
-            (Role::Viewer, _) => false,
-            (Role::Editor, Verb::Read | Verb::Write) => true,
+            (Role::Viewer, Verb::Operate | Verb::Write | Verb::Administer) => false,
+
+            (Role::Operator, Verb::Read | Verb::Operate) => true,
+            (Role::Operator, Verb::Write | Verb::Administer) => false,
+
+            (Role::Editor, Verb::Read | Verb::Operate | Verb::Write) => true,
             (Role::Editor, Verb::Administer) => false,
+
             (Role::Admin, _) => true,
         }
     }
@@ -232,6 +275,87 @@ mod tests {
             let n = ResourceName::parse(name).unwrap();
             // Outside every project, and therefore the cell operator's.
             assert_eq!(governing_project(&n), None, "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod the_ladder {
+    use super::*;
+
+    /// The whole role table, written out once, so what each rung means is a
+    /// fact this file asserts rather than a sentence in a doc comment.
+    ///
+    /// A change to any cell of it is a change somebody has to make here on
+    /// purpose — which is the point of writing it out rather than checking a
+    /// few interesting cases.
+    #[test]
+    fn each_rung_admits_exactly_what_its_name_says() {
+        use Role::*;
+        use Verb::*;
+        let table = [
+            //          Read  Operate Write  Administer
+            (Viewer, [true, false, false, false]),
+            (Operator, [true, true, false, false]),
+            (Editor, [true, true, true, false]),
+            (Admin, [true, true, true, true]),
+        ];
+        for (role, expected) in table {
+            for (verb, want) in [Read, Operate, Write, Administer].into_iter().zip(expected) {
+                assert_eq!(
+                    role.admits(verb),
+                    want,
+                    "{role:?} and {verb:?}: the table says {want}"
+                );
+            }
+        }
+    }
+
+    /// The one escalation a role system has to be closed against.
+    ///
+    /// An editor who could change the bindings would be an admin one request
+    /// later, and an operator who could would be one two requests later.
+    #[test]
+    fn nobody_below_admin_can_grant_themselves_more() {
+        for role in [Role::Viewer, Role::Operator, Role::Editor] {
+            assert!(!role.admits(Verb::Administer), "{role:?}");
+        }
+    }
+
+    /// The rung that exists for a platform with customers.
+    ///
+    /// Somebody who keeps an estate running reboots machines and does not
+    /// delete them. Before this rung there was no way to say that, so anybody
+    /// who needed to restart a guest was given the ability to destroy one.
+    #[test]
+    fn an_operator_may_run_the_estate_and_not_change_what_it_consists_of() {
+        assert!(Role::Operator.admits(Verb::Operate));
+        assert!(!Role::Operator.admits(Verb::Write));
+    }
+
+    /// A role name that arrives misspelled must land on the least, not the
+    /// most. Serde's default is `Viewer`, and this pins it: a binding whose
+    /// role failed to parse grants looking and nothing else.
+    #[test]
+    fn a_role_nobody_recognises_is_a_viewer() {
+        let binding: Binding =
+            serde_json::from_str(r#"{"role":"viewer","members":["ada"]}"#).expect("a binding");
+        assert_eq!(binding.role, Role::Viewer);
+        assert_eq!(Role::default(), Role::Viewer);
+    }
+
+    /// Every role spells the same on the wire as in the console and the
+    /// contract. A rename here is a rename everywhere, and this is where it
+    /// gets noticed.
+    #[test]
+    fn the_role_names_are_the_ones_written_down() {
+        for (role, name) in [
+            (Role::Viewer, "viewer"),
+            (Role::Operator, "operator"),
+            (Role::Editor, "editor"),
+            (Role::Admin, "admin"),
+        ] {
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{name}\""));
         }
     }
 }

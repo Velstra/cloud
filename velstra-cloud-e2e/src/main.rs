@@ -399,6 +399,7 @@ async fn seed(store: Arc<dyn Store>) {
         Resource::new(
             meta("projects/p1"),
             ProjectSpec {
+                policy: Default::default(),
                 display_name: "Demo".into(),
                 parent: "organizations/o1".into(),
                 quota: Quota {

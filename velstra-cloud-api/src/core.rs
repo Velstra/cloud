@@ -28,8 +28,9 @@ use velstra_cloud_model::{
         AttachmentSpec, AttachmentStatus, FloatingIpSpec, FloatingIpStatus, ImageSpec, ImageStatus,
         Instance, InstanceSpec, InstanceStatus, NetworkSpec, NetworkStatus, Node, NodeSpec,
         NodeStatus, OperationSpec, OperationStatus, PoolSpec, PoolStatus, PortSpec, PortStatus,
-        Project, ProjectSpec, ProjectStatus, Resource, RouterSpec, RouterStatus, SnapshotSpec,
-        SnapshotStatus, SubnetSpec, SubnetStatus, Volume, VolumeSpec, VolumeStatus, nodes_holding,
+        Project, ProjectPolicy, ProjectSpec, ProjectStatus, Resource, RouterSpec, RouterStatus,
+        SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, Volume, VolumeSpec, VolumeStatus,
+        nodes_holding,
     },
     security::{SecurityGroupSpec, SecurityGroupStatus, group_condition, validate},
     storage::{may_create_volume, may_snapshot},
@@ -645,6 +646,7 @@ impl Api {
         let at = velstra_cloud_model::meta::Timestamp::now();
         let spelled = match verb {
             Verb::Read => "read",
+            Verb::Operate => "operate",
             Verb::Write => "write",
             Verb::Administer => "administer",
         };
@@ -816,6 +818,173 @@ impl Api {
     /// not exist yet is still allowed. It also means a caller who is refused is
     /// refused in the same words whether the thing they named is there or not,
     /// so this cannot be used to find out what another tenant has.
+    /// What the project this request lands in is allowed to reach for.
+    ///
+    /// Read once per request that needs it. A project that is not there — or
+    /// cannot be read — answers with the closed policy, which is the safe
+    /// direction: a permission question whose input is missing must not resolve
+    /// to yes.
+    async fn policy_of(&self, project: Option<&str>) -> ProjectPolicy {
+        let Some(project) = project else {
+            return ProjectPolicy::default();
+        };
+        match self.typed_project(project).await {
+            Ok(Some(p)) => p.spec.policy,
+            _ => ProjectPolicy::default(),
+        }
+    }
+
+    /// Whether this caller may put a network on the bridge it named.
+    ///
+    /// Three answers in one place, in this order:
+    ///
+    /// * an empty bridge is a logical network and is nobody's business;
+    /// * a cell operator may name anything — they are the provider;
+    /// * anybody else may name a bridge **their project was given**.
+    ///
+    /// That last one is the whole point of a per-project policy: "may use host
+    /// bridges" is not a thing anybody means. What they mean is *this* VLAN, the
+    /// one that customer's cage is on, and the cell says which per customer.
+    async fn refuse_a_bridge_this_project_was_not_given(
+        &self,
+        spec: &Value,
+        project: Option<&str>,
+        who: &Identity,
+    ) -> ApiResult<()> {
+        let bridge = spec
+            .get("host_bridge")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if bridge.is_empty() || self.is_operator(who) {
+            return Ok(());
+        }
+        let policy = self.policy_of(project).await;
+        if policy.may_use_bridge(bridge) {
+            return Ok(());
+        }
+        Err(ApiError::forbidden(if policy.host_bridges.is_empty() {
+            format!(
+                "this project may not put a network on a host bridge, so `{bridge}` is not \
+                 something it can ask for. A guest on one is on whatever the machine is on, past \
+                 this platform's addressing and its security groups — which is why it is granted \
+                 per project by whoever runs the cell, on `spec.policy.hostBridges`."
+            )
+        } else {
+            format!(
+                "this project was given {}, not `{bridge}`. Host bridges are granted by name \
+                 because what anybody means by one is a particular wire, not the ability to \
+                 name wires.",
+                policy
+                    .host_bridges
+                    .iter()
+                    .map(|b| format!("`{b}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .at("spec.hostBridge"))
+    }
+
+    /// Whether this caller may hand a guest a piece of the host.
+    async fn refuse_a_device_this_project_was_not_given(
+        &self,
+        spec: &Value,
+        project: Option<&str>,
+        who: &Identity,
+    ) -> ApiResult<()> {
+        let wants = spec
+            .get("devices")
+            .and_then(Value::as_array)
+            .is_some_and(|d| !d.is_empty());
+        if !wants || self.is_operator(who) || self.policy_of(project).await.device_passthrough {
+            return Ok(());
+        }
+        Err(ApiError::forbidden(
+            "this project may not pass hardware through to a guest. A passed-through device is a \
+             physical thing one guest holds and no other guest can have, so it is granted per \
+             project by whoever runs the cell, on `spec.policy.devicePassthrough`.",
+        )
+        .at("spec.devices"))
+    }
+
+    /// Whether this caller may claim an address the world can reach.
+    async fn refuse_a_public_address_this_project_was_not_given(
+        &self,
+        project: Option<&str>,
+        who: &Identity,
+    ) -> ApiResult<()> {
+        if self.is_operator(who) || self.policy_of(project).await.floating_ips {
+            return Ok(());
+        }
+        Err(ApiError::forbidden(
+            "this project may not hold public addresses. They are a claim on address space the \
+             cell was given by whoever is above it, so they are granted per project by whoever \
+             runs the cell, on `spec.policy.floatingIps`.",
+        )
+        .at("spec"))
+    }
+
+    /// A port belongs to one guest.
+    ///
+    /// Nothing used to say so, and the consequence was silent and total: two
+    /// instances naming one port claim one MAC on one tap, the node sees the
+    /// clash and — correctly — answers DHCP for **neither**, so *both* guests
+    /// boot with no address, no metadata, no user and no SSH key. The node says
+    /// so in its journal and nowhere else, so what an operator sees is two
+    /// machines that run and cannot be reached, with nothing on either object
+    /// to explain it.
+    ///
+    /// Refused here instead, where the second instance is still a request
+    /// somebody is making, and the sentence can name the guest that already has
+    /// it. A port with no guest is the ordinary case and costs one list.
+    async fn refuse_a_port_two_guests_would_share(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let wanted: Vec<String> = spec
+            .get("ports")
+            .and_then(Value::as_array)
+            .map(|ports| {
+                ports
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let mine = name.to_string();
+        let instances: Vec<Instance> = self.typed_list("", "instances").await?;
+        for other in instances {
+            let theirs = other.meta.name.to_string();
+            // Its own ports are not a clash, and neither are those of an
+            // instance on its way out: a port is released when the guest
+            // holding it is gone, and refusing until then would make replacing
+            // a machine a two-step wait.
+            if theirs == mine || other.meta.is_deleting() {
+                continue;
+            }
+            for port in &wanted {
+                if other.spec.ports.iter().any(|held| held == port) {
+                    return Err(ApiError::new(
+                        Code::FailedPrecondition,
+                        format!(
+                            "{port} is already {theirs}'s. A port is one guest's NIC — two \
+                             guests holding it would share a MAC on one wire, and this node \
+                             would answer DHCP for neither, so both would come up with no \
+                             address at all. Give this guest its own port."
+                        ),
+                    )
+                    .at("spec.ports"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn authorize_references(
         &self,
         who: &Identity,
@@ -1224,6 +1393,25 @@ impl Api {
         self.authorize_references(who, kind, &spec, home.as_deref())
             .await?;
         check_rules(kind, &spec)?;
+        // What this project was given, as against what this caller may do. Two
+        // different questions, both asked: a project admin may create a network,
+        // and only the cell decides whether one of this project's networks may
+        // sit on a machine's own wire.
+        let allowed_in = home.as_deref();
+        if kind == "networks" {
+            self.refuse_a_bridge_this_project_was_not_given(&spec, allowed_in, who)
+                .await?;
+        }
+        if kind == "instances" {
+            self.refuse_a_device_this_project_was_not_given(&spec, allowed_in, who)
+                .await?;
+            self.refuse_a_port_two_guests_would_share(&name, &spec)
+                .await?;
+        }
+        if kind == "floatingips" {
+            self.refuse_a_public_address_this_project_was_not_given(allowed_in, who)
+                .await?;
+        }
         if kind == "attachments" {
             self.settle_node(&mut spec, None).await?;
         }
@@ -1318,7 +1506,11 @@ impl Api {
         {
             Verb::Administer
         } else {
-            Verb::Write
+            // A change to something that already exists. Creating and deleting
+            // are `Write`; this is the rung below, so somebody who keeps an
+            // estate running can start, stop and resize without also being able
+            // to take a machine away.
+            Verb::Operate
         };
         self.authorize(who, verb, name).await?;
         // A project's quota is the cell operator's to set, and a project admin
@@ -1332,6 +1524,20 @@ impl Api {
             return Err(ApiError::forbidden(
                 "a project's quota is set by a cell operator; a project admin may not change it",
             ));
+        }
+        // The same rule about a stronger thing. Without it every check that
+        // consults the policy is decorative: a project admin who could write
+        // `policy.hostBridges` could grant themselves the machine's own wire,
+        // and one who could write `policy.floatingIps` could grant themselves
+        // the cell's address space — by editing the object that says they may
+        // not.
+        if body.get("spec").and_then(|s| s.get("policy")).is_some() && !self.is_operator(who) {
+            return Err(ApiError::forbidden(
+                "what a project may reach for is set by a cell operator; a project admin works \
+                 within it and may not widen it. Host bridges, hardware passthrough and public \
+                 addresses are the cell's to grant.",
+            )
+            .at("spec.policy"));
         }
         let collection = self.collection(name.collection())?;
         refuse_unwritable(body)?;
@@ -1371,8 +1577,20 @@ impl Api {
                 self.refuse_an_address_that_reaches_nothing(name, &merged)
                     .await?;
             }
-            if name.collection() == "networks" && spec.get("external").is_some() {
+            // Every network patch, not only one that touches `external`. The
+            // narrower condition was a gap the moment a second operator-only
+            // field arrived: a patch setting `host_bridge` alone walked past the
+            // check that exists to stop exactly that. A rule that names the
+            // fields it guards has to be edited every time one is added, and the
+            // edit is the part that gets forgotten.
+            if name.collection() == "networks" {
                 refuse_an_external_network_from_a_tenant(spec, who, self.is_operator(who))?;
+                self.refuse_a_bridge_this_project_was_not_given(
+                    spec,
+                    governing_project(name).as_deref(),
+                    who,
+                )
+                .await?;
             }
             if name.collection() == "maintenance-windows" {
                 // Merged onto what is stored, because a change that moves only
@@ -2828,7 +3046,7 @@ impl Api {
         // Typing into a guest is operating it, not creating one. Somebody who
         // may reboot a machine may also fix it from its console; somebody who
         // may only look at it gets a window.
-        let read_only = self.authorize(who, Verb::Write, name).await.is_err();
+        let read_only = self.authorize(who, Verb::Operate, name).await.is_err();
 
         let ticket = uuid::Uuid::new_v4().to_string();
         let now = Timestamp::now();
@@ -4113,6 +4331,16 @@ fn refuse_an_external_network_from_a_tenant(
         )
         .at("spec.external"));
     }
+    // `host_bridge` is deliberately **not** here, and it used to be. It was
+    // "cell operator or nobody", which is the right answer for a cell with one
+    // tenant and useless for a provider: the question is not whether a tenant
+    // may use host bridges, it is which wire this customer bought. So it moved
+    // to the project's policy, where the cell answers it per project — see
+    // `refuse_a_bridge_this_project_was_not_given`.
+    //
+    // `external` stays here because it does not decompose the same way: what it
+    // claims is that a prefix is routed to this cell by whoever is above it,
+    // which is a fact about the world and not a thing to hand out per customer.
     Ok(())
 }
 
