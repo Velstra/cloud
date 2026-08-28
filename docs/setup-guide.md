@@ -31,6 +31,35 @@ a token), then **the machine is told what it is** (and uses the token).
 
 ## 0. One machine, all of it
 
+**One command, if this box is the whole cell:**
+
+```
+sudo apt install etcd-server qemu-system-x86 qemu-utils
+sudo apt install ./velstra-cloud_*.deb
+sudo velstra-cloud-node quickstart
+```
+
+That writes the seed, brings up the control plane, creates the node and pool
+objects, moves the node's one-time token, and starts the agents. It is
+idempotent — run it again after a failure rather than reinstalling — and it
+refuses on NixOS, where the module below is the answer instead.
+
+Unattended, for config management:
+
+```
+VELSTRA_BOOTSTRAP_PASSWORD=… velstra-cloud-node quickstart \
+  --node home-1 --listen 0.0.0.0:8443
+```
+
+The password comes through the environment rather than a flag: an argument is
+in `ps` for every user on the machine, and this one is the cell's first
+administrator.
+
+The rest of this section is the same thing spelled out, for when you want to
+know what it did or do it differently.
+
+### The long way
+
 The smallest real installation is **one box that is every role**, and it is a
 supported shape rather than a degraded one. If that is what you want, this
 section is the whole guide; the rest is for when you add a second machine.
@@ -38,13 +67,14 @@ section is the whole guide; the rest is for when you add a second machine.
 On Debian:
 
 ```
-sudo dpkg -i velstra-cloud_*.deb
+sudo apt install ./velstra-cloud_*.deb
 sudo velstra-cloud-node setup
 ```
 
 Answer `1 2 3` at the roles question — control plane, hypervisor and storage
-pool together. Then enable the four units it names. A single-member etcd comes
-with the control plane, so there is nothing else to install.
+pool together. Then enable the four units it names, create the node and pool
+objects, and move the node's one-time token onto the machine. That last part is
+what `quickstart` above does for you.
 
 On NixOS, the same thing declared:
 
@@ -122,7 +152,7 @@ cell that has its own, set `store.bundledEtcd = false;` and `store.endpoints`.
 ### Debian
 
 ```
-sudo dpkg -i velstra-cloud_*.deb
+sudo apt install ./velstra-cloud_*.deb
 sudo velstra-cloud-node setup
 ```
 
@@ -131,7 +161,10 @@ units to enable. Nothing started before that, on purpose: a unit is conditional
 on its role being in the seed, and a machine that has just been unpacked has no
 seed.
 
-Either way, open `https://<host>:8443/` and sign in.
+Either way, open `http://<host>:8443/` and sign in as the administrator the
+wizard asked for. `http`, not `https`: the API serves plain HTTP and belongs
+behind something that terminates TLS — and it binds loopback unless the seed
+says otherwise, which is the question the wizard asks just before the password.
 
 ---
 

@@ -218,6 +218,15 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # `trigger` queues the event and returns; `settle` waits for the queue
+          # to drain. Without it the check below races the rule it just
+          # installed — and that race is not theoretical: it lost once, printed
+          # "this user cannot open it", and the `ls` on the very next line
+          # showed crw-rw-rw-, which is the rule having taken a moment later.
+          sudo udevadm settle --timeout=30 || true
+          # Belt and braces, because settle waits for udev and not for the node
+          # to have been relabelled by the time this shell looks at it.
+          for _ in $(seq 20); do [ -w /dev/kvm ] && break; sleep 0.5; done
           # Absent and unwritable are different problems and want different
           # answers, and saying "not writable" for a device that is not there
           # sends somebody to read about permissions for an hour.
@@ -453,6 +462,15 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # `trigger` queues the event and returns; `settle` waits for the queue
+          # to drain. Without it the check below races the rule it just
+          # installed — and that race is not theoretical: it lost once, printed
+          # "this user cannot open it", and the `ls` on the very next line
+          # showed crw-rw-rw-, which is the rule having taken a moment later.
+          sudo udevadm settle --timeout=30 || true
+          # Belt and braces, because settle waits for udev and not for the node
+          # to have been relabelled by the time this shell looks at it.
+          for _ in $(seq 20); do [ -w /dev/kvm ] && break; sleep 0.5; done
           if [ ! -e /dev/kvm ]; then
             echo "::error::/dev/kvm does not exist on this runner, so these checks would \
           emulate rather than boot. See the guests job for what that means and what to do."

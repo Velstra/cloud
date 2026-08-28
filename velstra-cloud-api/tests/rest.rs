@@ -3599,3 +3599,452 @@ async fn a_nodes_devices_say_what_comes_with_them() {
         "reading wrote something"
     );
 }
+
+/// A person creating their first machine should not have to invent an
+/// identifier first.
+///
+/// The API used to refuse a create with no id, and the refusal was defensible —
+/// a create without one cannot be retried safely. But it put the platform's
+/// naming scheme in front of every first use of it: a console cannot offer
+/// "create a machine" without first teaching what a resource id is, and a
+/// tenant with no interest in the scheme has to invent one anyway.
+///
+/// So: minted when absent, readable, and returned. A caller that needs its
+/// create to be idempotent still sends the id, which is what every controller
+/// here does.
+#[tokio::test]
+async fn a_create_with_no_id_is_given_a_readable_one() {
+    let h = Harness::new();
+
+    let created = h
+        .post(
+            "projects/p1/instances",
+            json!({ "spec": { "vcpus": 1, "memoryMib": 512 } }),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    let name = created.body["target"].as_str().unwrap();
+    assert!(
+        name.starts_with("projects/p1/instances/instance-"),
+        "an id nobody chose still has to say what it is: {name}"
+    );
+
+    // And it is a real object at that name, not only a string in an answer.
+    let read = h.get(name).await;
+    assert_eq!(read.status, StatusCode::OK, "{:?}", read.body);
+
+    // Two creates are two machines, which is exactly the trade being made here:
+    // no id means no idempotency.
+    let again = h
+        .post(
+            "projects/p1/instances",
+            json!({ "spec": { "vcpus": 1, "memoryMib": 512 } }),
+        )
+        .await;
+    assert_ne!(again.body["target"].as_str().unwrap(), name);
+}
+
+/// An object this build cannot read must still be removable.
+///
+/// The ordinary delete reads first — for the revision, for the finalizers — so
+/// an object whose stored shape no longer deserialises could not be deleted.
+/// And because a list deserialises every object it walks, that one object
+/// answered 500 for **every** list of its collection, for every caller, until
+/// somebody reached past the API into the store. A cell that can be put into a
+/// corner it cannot be got out of is the wrong shape.
+///
+/// Found by putting one there: a spec was written under one field spelling and
+/// read back under another, and consoles stopped working cell-wide.
+#[tokio::test]
+async fn an_object_this_build_cannot_read_can_still_be_taken_away() {
+    let h = Harness::new();
+
+    // Straight into the store, because the API is exactly what cannot produce
+    // this: a document that is a valid resource envelope and an invalid spec.
+    let key = "/cell-1/instances/projects/p1/instances/broken";
+    h.store
+        .put(
+            key,
+            serde_json::to_vec(&json!({
+                "meta": {
+                    "name": "projects/p1/instances/broken",
+                    "uid": "u1",
+                    "placement": { "region": "eu-central", "cell": "cell-1" },
+                    "generation": 1,
+                    "createdAt": 1,
+                    "deletedAt": null,
+                    "finalizers": [],
+                    "labels": {}
+                },
+                "spec": { "vcpus": "not a number" },
+                "status": {}
+            }))
+            .unwrap(),
+            velstra_cloud_store::Expect::Absent,
+        )
+        .await
+        .expect("a broken object");
+
+    // The collection still answers. It used not to: one object nobody could
+    // read answered 500 for every list of that kind, for every caller — every
+    // screen showing them, every agent reading its share, and the reference
+    // check a delete runs before it will remove anything.
+    let listed = h.get("projects/p1/instances").await;
+    assert_eq!(
+        listed.status,
+        StatusCode::OK,
+        "one unreadable object took the collection down: {:?}",
+        listed.body
+    );
+    // The object itself is not in it, which is the cost of the fix and is said
+    // out loud in the log rather than hidden: something nothing can read is
+    // something nothing will act on.
+    let items = listed.body["items"].as_array().expect("a list");
+    assert!(
+        !items
+            .iter()
+            .any(|i| i["meta"]["name"] == "projects/p1/instances/broken"),
+        "an object that cannot be deserialised was handed to a caller"
+    );
+
+    // And it can be taken away, which is the part that used to be impossible:
+    // the ordinary delete reads first, so the one thing that would have fixed
+    // the cell was also the thing that could not be done.
+    let deleted = h
+        .send("DELETE", "projects/p1/instances/broken", None, &[])
+        .await;
+    assert!(
+        deleted.status.is_success(),
+        "an unreadable object could not be deleted: {:?}",
+        deleted.body
+    );
+
+    // And it is gone from the store, not merely stamped for deletion: nothing
+    // can run a finalizer for an object it cannot read, so there is no second
+    // phase to wait for.
+    assert!(
+        h.store.get(key).await.expect("the store answers").is_none(),
+        "the object is still there"
+    );
+}
+
+/// A port is one guest's NIC, and the API is where that is said.
+///
+/// Nothing used to say it, and the failure was silent and total: two instances
+/// naming one port claim one MAC on one tap, so the node — correctly — answers
+/// DHCP for **neither**, and *both* guests come up with no address, no
+/// metadata, no user and no SSH key. The node writes one line in its journal
+/// and there is nothing on either object to explain it.
+///
+/// Found on a real machine, by leaving an old test instance behind: a guest
+/// that had worked stopped getting an address, and the reason was a second
+/// object nobody was looking at.
+#[tokio::test]
+async fn a_port_is_one_guests_and_the_second_asker_is_told_whose() {
+    let h = Harness::new();
+    let spec = json!({ "vcpus": 1, "memory_mib": 512, "ports": ["projects/p1/ports/nic0"] });
+
+    let first = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "one", "spec": spec }),
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{:?}", first.body);
+
+    let second = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "two", "spec": spec }),
+        )
+        .await;
+    assert_eq!(
+        second.status,
+        StatusCode::BAD_REQUEST,
+        "a second guest was given a port that already had one: {:?}",
+        second.body
+    );
+    assert_eq!(second.error_code(), "FAILED_PRECONDITION");
+    let message = second.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("projects/p1/instances/one"),
+        "the refusal has to name the guest that already holds it: {message}"
+    );
+    assert_eq!(second.body["error"]["field"], json!("spec.ports"));
+
+    // Nor by an edit, which is the same failure arriving later.
+    let bare = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "three", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        )
+        .await;
+    assert_eq!(bare.status, StatusCode::ACCEPTED, "{:?}", bare.body);
+    let stolen = h
+        .patch(
+            "projects/p1/instances/three",
+            json!({ "spec": { "ports": ["projects/p1/ports/nic0"] } }),
+        )
+        .await;
+    assert_eq!(
+        stolen.status,
+        StatusCode::BAD_REQUEST,
+        "a port was moved to a second guest by an edit: {:?}",
+        stolen.body
+    );
+
+    // And an instance keeping its own port is not a clash with itself.
+    let kept = h
+        .patch(
+            "projects/p1/instances/one",
+            json!({ "spec": { "vcpus": 2 } }),
+        )
+        .await;
+    assert_eq!(kept.status, StatusCode::OK, "{:?}", kept.body);
+    let same = h
+        .patch(
+            "projects/p1/instances/one",
+            json!({ "spec": { "ports": ["projects/p1/ports/nic0"] } }),
+        )
+        .await;
+    assert_eq!(
+        same.status,
+        StatusCode::OK,
+        "an instance was refused its own port: {:?}",
+        same.body
+    );
+}
+
+/// A console session outlives the ticket it carried, and something has to take
+/// it away.
+///
+/// The ticket is dead after a minute; the object is the record of who opened a
+/// console into which guest, which is worth keeping for as long as somebody
+/// might ask and not worth keeping for ever. Without a sweep, every click on
+/// Console leaves a row behind and a cell that has run a year holds a collection
+/// nothing reads.
+#[tokio::test]
+async fn a_spent_console_session_is_kept_for_a_day_and_then_taken_away() {
+    let h = Harness::new();
+    // A guest a node has already claimed, written the way a claimed guest
+    // exists: the status belongs to whoever runs the object, so it is created
+    // with the owner already on it rather than taken over afterwards.
+    let name = "projects/p1/instances/i1".to_string();
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut instance = velstra_cloud_model::resources::Instance::new(
+        velstra_cloud_model::meta::Meta::new(
+            name.parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        Default::default(),
+        velstra_cloud_model::resources::InstanceStatus {
+            node: Some("node-a".into()),
+            ..Default::default()
+        },
+    );
+    instance.meta.generation = 1;
+    instances
+        .create(
+            &instance,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .expect("a claimed guest");
+
+    let opened = h.post(&format!("{name}:console"), json!({})).await;
+    assert_eq!(opened.status, StatusCode::OK, "{:?}", opened.body);
+    let session = opened.body["session"]
+        .as_str()
+        .expect("a session")
+        .to_string();
+    let expires = opened.body["expiresAt"].as_u64().expect("an expiry");
+
+    // A minute later the ticket is dead and the record is not: somebody asking
+    // "who was on that machine" is asking now, not tomorrow.
+    let swept = h
+        .api
+        .sweep_spent_consoles(velstra_cloud_model::meta::Timestamp(expires + 1_000))
+        .await
+        .expect("the sweep runs");
+    assert_eq!(
+        swept, 0,
+        "a record was taken away while it was still useful"
+    );
+    assert_eq!(h.get(&session).await.status, StatusCode::OK);
+
+    // A day later it is nobody's business any more.
+    let swept = h
+        .api
+        .sweep_spent_consoles(velstra_cloud_model::meta::Timestamp(
+            expires + 25 * 60 * 60 * 1000,
+        ))
+        .await
+        .expect("the sweep runs");
+    assert_eq!(swept, 1, "the record outlived its day");
+    assert_eq!(h.get(&session).await.status, StatusCode::NOT_FOUND);
+}
+
+/// A volume named a pool nothing holds and waited for ever.
+///
+/// A pool agent watches for volumes naming **its** id. A volume naming
+/// something else — `pools/local` instead of `local`, or a pool that was never
+/// created — is claimed by nobody: it sits with an empty status and
+/// `provisioned: false`, and there is nothing on the object, in any log, or in
+/// any answer to say why. It is the quietest way this platform can fail.
+///
+/// Found live: a volume created with the pool's full resource name sat
+/// unprovisioned while an identical one beside it, created with the bare id,
+/// worked.
+#[tokio::test]
+async fn a_volume_naming_a_pool_that_is_not_there_is_refused_while_somebody_is_asking() {
+    let h = Harness::new();
+    h.pools()
+        .create(
+            &velstra_cloud_model::resources::Resource::new(
+                velstra_cloud_model::meta::Meta::new(
+                    "pools/local".parse().unwrap(),
+                    velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+                ),
+                Default::default(),
+                Default::default(),
+            ),
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .expect("a pool");
+
+    // The spelling that used to be accepted and then did nothing for ever.
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "v1", "spec": { "sizeGib": 1, "pool": "pools/local" } }),
+        )
+        .await;
+    assert!(
+        refused.status.is_client_error(),
+        "a volume naming a pool by its resource name was accepted: {:?}",
+        refused.body
+    );
+
+    // A pool that simply is not there, said with the list that ends the
+    // guessing.
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "v2", "spec": { "sizeGib": 1, "pool": "nvme" } }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("`local`"),
+        "the refusal has to say which pools there are: {message}"
+    );
+
+    // And the spelling that works, still works.
+    let ok = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "v3", "spec": { "sizeGib": 1, "pool": "local" } }),
+        )
+        .await;
+    assert_eq!(ok.status, StatusCode::ACCEPTED, "{:?}", ok.body);
+}
+
+/// A bill nobody can write is the only kind worth having.
+///
+/// Usage records are readings the platform takes, and the controller writes
+/// them straight to the store. If the same door a customer comes in could also
+/// create, edit or delete one, the whole point of recording them would be gone:
+/// a number somebody can change after the fact is not evidence of anything.
+///
+/// Found live: the API accepted a POST of a fabricated record with a timestamp
+/// of 1.
+#[tokio::test]
+async fn a_usage_record_cannot_be_written_edited_or_deleted_through_the_api() {
+    let h = Harness::new();
+
+    let forged = h
+        .post(
+            "projects/p1/usage",
+            json!({ "id": "0000000000001",
+                    "spec": { "project": "projects/p1", "at": 1, "used": {} } }),
+        )
+        .await;
+    assert!(
+        forged.status.is_client_error(),
+        "a usage record was accepted from a client: {:?}",
+        forged.body
+    );
+    let message = forged.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("readings"),
+        "the refusal has to say what these are: {message}"
+    );
+
+    // One the controller wrote, past the API, as it really does.
+    let store: TypedStore<
+        velstra_cloud_model::usage::UsageRecordSpec,
+        velstra_cloud_model::usage::UsageRecordStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "usage");
+    let at = velstra_cloud_model::meta::Timestamp(1_787_824_800_000);
+    let record = velstra_cloud_model::resources::Resource::new(
+        velstra_cloud_model::meta::Meta::new(
+            format!(
+                "projects/p1/usage/{}",
+                velstra_cloud_model::usage::id_for(at)
+            )
+            .parse()
+            .unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::usage::UsageRecordSpec {
+            project: "projects/p1".into(),
+            at,
+            used: Default::default(),
+        },
+        Default::default(),
+    );
+    store
+        .create(
+            &record,
+            &velstra_cloud_model::access::Writer::controller("quota"),
+        )
+        .await
+        .expect("the controller writes one");
+
+    let name = record.meta.name.to_string();
+    // Readable, which is the whole reason it is a resource.
+    assert_eq!(h.get(&name).await.status, StatusCode::OK);
+
+    // And not changeable.
+    let edited = h
+        .patch(&name, json!({ "spec": { "used": { "vcpus": 9999 } } }))
+        .await;
+    assert!(
+        edited.status.is_client_error(),
+        "a usage record was edited: {:?}",
+        edited.body
+    );
+    let removed = h.send("DELETE", &name, None, &[]).await;
+    assert!(
+        removed.status.is_client_error(),
+        "a usage record was deleted: {:?}",
+        removed.body
+    );
+
+    // Still there, unchanged.
+    let read = h.get(&name).await;
+    assert_eq!(read.status, StatusCode::OK);
+    assert_eq!(read.body["spec"]["used"]["vcpus"], json!(0));
+}

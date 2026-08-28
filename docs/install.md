@@ -144,12 +144,19 @@ read-only verity store and its writable partition mounts at `/var/lib/velstra`.
 
 ```
 nix build .#deb        # → result: velstra-cloud_<version>_amd64.deb
-sudo dpkg -i velstra-cloud_*.deb
+sudo apt install ./velstra-cloud_*.deb   # not `dpkg -i`: that resolves nothing
 sudo velstra-cloud-node setup
 ```
 
-The package installs five binaries and four units and **enables none of them**;
-`postinst` says so and points at the wizard. etcd, QEMU and Ceph are `Depends:`
+The package installs five binaries and five units and **enables none of them**;
+`postinst` says so and points at the two ways in:
+
+* `velstra-cloud-node quickstart` — one box that is the whole cell. Seed, units,
+  node and pool objects, the one-time token, agents. Idempotent, and unattended
+  when `VELSTRA_BOOTSTRAP_PASSWORD` is in the environment.
+* `velstra-cloud-node setup` — say what this machine is and stop there, for a
+  machine joining a cell somebody else runs. `--config <file>` takes the answers
+  from a seed instead of asking, which is the unattended path. etcd, QEMU and Ceph are `Depends:`
 and `Recommends:` resolved against Debian's own packages — a platform that
 vendored its own etcd would be a platform whose security updates are its own
 problem. Removing the package stops the units and leaves the seed: it holds
