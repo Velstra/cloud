@@ -97,7 +97,9 @@ function consoleInto(host, coll, id) {
     if (closed) return;
 
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = scheme + "//" + location.host + "/api/v1/" + consolePath(coll, id)
+    // `consolePath` already carries `/api/v1/`; prepending it again produced
+    // `/api/v1//api/v1/…`, which matched no route and answered 401.
+    const url = scheme + "//" + location.host + consolePath(coll, id)
       + ":consoleStream?session=" + encodeURIComponent(grant.session)
       + "&ticket=" + encodeURIComponent(grant.ticket);
     socket = new WebSocket(url);
