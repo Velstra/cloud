@@ -370,9 +370,28 @@ pub(crate) fn ask_yes(msg: &str, default_yes: bool) -> Result<bool> {
 /// sentence saying what a valid answer looks like — printed on the first
 /// refusal, because "invalid" alone teaches nothing.
 pub(crate) fn ask_valid(msg: &str, validate: fn(&str) -> Result<()>, hint: &str) -> Result<String> {
+    ask_valid_or("", msg, validate, hint)
+}
+
+/// [`ask_valid`] with a default that an empty answer takes.
+///
+/// Separate because the two cannot be the same function by accident: a prompt
+/// that prints a default and then refuses an empty answer with "the node name
+/// cannot be empty" is a promise the code does not keep, and it was exactly that
+/// — the default was applied *after* a loop that could never leave with an empty
+/// string, so pressing Enter at the very first question of the installer
+/// rejected itself, twice, before the operator gave up and typed the default out
+/// by hand.
+pub(crate) fn ask_valid_or(
+    default: &str,
+    msg: &str,
+    validate: fn(&str) -> Result<()>,
+    hint: &str,
+) -> Result<String> {
     loop {
         let got = prompt(msg)?;
-        let got = got.trim().to_string();
+        let got = got.trim();
+        let got = if got.is_empty() { default } else { got }.to_string();
         match validate(&got) {
             Ok(()) => break Ok(got),
             Err(e) => println!("  {e:#} — expected {hint}."),
@@ -444,10 +463,32 @@ pub(crate) fn prompt_secret(msg: &str) -> Result<String> {
         println!();
     }
     read.context("reading input")?;
-    Ok(line)
+    // The line terminator is not part of the answer, and here it is not
+    // harmless: a password carrying `\n` was sent as-is and the API refused the
+    // whole sign-in with "control character (\u0000-\u001F) found while parsing
+    // a string" — at the end of an install, after everything else had worked.
+    //
+    // Only the terminator. A password may legitimately end in a space, and
+    // trimming one away would make a credential that works here and nowhere
+    // else.
+    Ok(strip_terminator(&line).to_string())
 }
 
 // ---- Validators ------------------------------------------------------------
+
+/// The line terminator, and nothing else.
+///
+/// A password carrying its `\n` was sent as-is and the API refused the whole
+/// sign-in with "control character (\u0000-\u001F) found while parsing a
+/// string" — at the very end of an install, after everything else had worked. A
+/// trailing space, by contrast, is a strange thing to put in a password and it
+/// is theirs: trimming it away would make a credential that works at this prompt
+/// and nowhere else.
+pub(crate) fn strip_terminator(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .map(|s| s.strip_suffix('\r').unwrap_or(s))
+        .unwrap_or(line)
+}
 
 /// Refuse a value the seed could not carry verbatim. `node.env` is read by
 /// systemd's `EnvironmentFile`, whose quoting rules are their own small
@@ -482,6 +523,41 @@ pub(crate) fn validate_url(s: &str) -> Result<()> {
 }
 
 /// A node name: the id the operator created, `[a-z0-9-]`, non-empty.
+/// What to offer as this machine's node name: its hostname.
+///
+/// The operator already chose it, it means something to them, and a platform
+/// that suggests a name of its own is a platform naming somebody's estate. The
+/// first label only — a node name is an identifier in this cell, not a fully
+/// qualified domain — lowercased, and anything a node name cannot hold dropped.
+///
+/// `None` when nothing usable comes out (a hostname of `localhost`, an empty
+/// one, one that is all punctuation). Then the question is asked with no
+/// default, which is better than inventing one: naming machines is the
+/// operator's business, and a wrong suggestion accepted by pressing Enter is
+/// harder to undo than a question answered.
+pub(crate) fn suggested_node_name(hostname: &str) -> Option<String> {
+    let first = hostname.split('.').next().unwrap_or("").trim();
+    let cleaned: String = first
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .collect();
+    let cleaned = cleaned.trim_matches('-').to_string();
+    // `localhost` names every machine and therefore none of them; offering it
+    // would put the same node name on every box in a fleet.
+    if cleaned.is_empty() || cleaned == "localhost" {
+        return None;
+    }
+    Some(cleaned)
+}
+
+/// This machine's hostname, or an empty string if it cannot be read.
+pub(crate) fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 pub(crate) fn validate_node_name(s: &str) -> Result<()> {
     if s.is_empty() {
         bail!("the node name cannot be empty");
@@ -717,3 +793,56 @@ mod tests {
         assert!(resolve_picks(&disks, "").is_err(), "nothing selected");
     }
 }
+
+#[cfg(test)]
+mod reading_an_answer {
+    use super::*;
+
+    #[test]
+    fn a_password_does_not_carry_the_newline_that_ended_it() {
+        // The failure it caused, verbatim, at the last step of `quickstart`:
+        //
+        //   signing in as admin did not work: Failed to parse the request body
+        //   as JSON: password: control character (\u0000-\u001F) found while
+        //   parsing a string
+        assert_eq!(strip_terminator("hunter2hunter2\n"), "hunter2hunter2");
+        assert_eq!(strip_terminator("hunter2hunter2\r\n"), "hunter2hunter2");
+        assert_eq!(strip_terminator("hunter2hunter2"), "hunter2hunter2");
+    }
+
+    #[test]
+    fn the_node_name_offered_is_the_machines_own() {
+        // `home-1` was a laboratory name in a product meant to run somebody's
+        // estate. What a professional default looks like is the name the
+        // operator already gave the machine.
+        assert_eq!(suggested_node_name("hv-fra-03"), Some("hv-fra-03".into()));
+        // The first label: a node name is an identifier in this cell, not a
+        // fully qualified domain.
+        assert_eq!(
+            suggested_node_name("hv-fra-03.dc2.example.com"),
+            Some("hv-fra-03".into())
+        );
+        assert_eq!(suggested_node_name("HV-FRA-03"), Some("hv-fra-03".into()));
+        assert_eq!(suggested_node_name("hv_fra_03"), Some("hvfra03".into()));
+    }
+
+    #[test]
+    fn and_nothing_at_all_when_the_hostname_says_nothing() {
+        // `localhost` names every machine and so none of them: offering it would
+        // put one node name on every box in a fleet. Better to ask.
+        assert_eq!(suggested_node_name("localhost"), None);
+        assert_eq!(suggested_node_name("localhost.localdomain"), None);
+        assert_eq!(suggested_node_name(""), None);
+        assert_eq!(suggested_node_name("___"), None);
+    }
+
+    #[test]
+    fn and_nothing_a_person_may_have_meant() {
+        // A trailing space is a strange thing to put in a password and it is
+        // theirs. Trimming it would make a credential that works at this prompt
+        // and nowhere else.
+        assert_eq!(strip_terminator("with a space \n"), "with a space ");
+        assert_eq!(strip_terminator("  padded  \n"), "  padded  ");
+    }
+}
+

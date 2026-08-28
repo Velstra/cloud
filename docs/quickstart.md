@@ -75,7 +75,8 @@ and §4 below describe. Everything `quickstart` does, you can do with `curl`.
 
 Answer `1 2 3` at the roles question — control plane, hypervisor and storage
 pool, all on this box. Give it a region and a cell name (`eu-central` and
-`cell-1` are fine), a node id (`home-1`), and a pool id (`local`).
+`cell-1` are fine), a node id — it offers this machine's hostname, which is
+usually the right answer — and a pool id (`local`).
 
 Say **no** to the fabric question, and **yes** to the one after it — whether
 this node should be the gateway for its guests.
