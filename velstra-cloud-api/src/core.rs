@@ -1802,13 +1802,15 @@ impl Api {
         if target.collection() == "projects" {
             let prefix = format!("{wanted}/");
             for kind in COLLECTIONS {
-                // An operation is a *record of a request*, not a thing anybody
-                // holds. Counting them made a project undeletable the moment it
-                // was created, because creating it produced one — which the
-                // tests caught and is the right answer either way: nobody is
-                // waiting on an audit line. They outlive the project and are
-                // pruned by their own retention, not by this.
-                if kind == "projects" || kind == "operations" {
+                // A record is not a thing anybody holds. Counting operations
+                // made a project undeletable the moment it was created, because
+                // creating it produced one; counting usage readings made every
+                // project undeletable an hour after that, and *that* one had no
+                // way out at all — a usage record cannot be deleted through this
+                // API on purpose, so the advice below ("delete those first") was
+                // impossible to follow. Records outlive the project and go away
+                // with their own retention, not with this.
+                if kind == "projects" || velstra_cloud_model::reconcile::is_a_record(kind) {
                     continue;
                 }
                 for document in self.collection(kind)?.list().await? {
@@ -3180,6 +3182,73 @@ impl Api {
             .at("status.consoleEndpoint"));
         }
         Ok(node.status.console_endpoint.clone())
+    }
+
+    /// Who a console stream is opened as, when the ticket is the only credential
+    /// the caller can present.
+    ///
+    /// **A browser cannot put a header on a WebSocket.** `new WebSocket(url)`
+    /// takes a URL and nothing else — there is no options bag, and no way to add
+    /// `Authorization`. So a console that authenticated only the way every other
+    /// request here does was a console no browser could ever open, which is what
+    /// it was: the grant succeeded, the stream was refused with "no valid
+    /// credentials available", and every test passed because a test client sends
+    /// the header a browser cannot.
+    ///
+    /// The ticket already is a credential and was built as one: minted for one
+    /// person against one guest, stored only as a hash, valid for a minute,
+    /// spendable once. Reading the identity off the session it names is not a
+    /// weaker check than the bearer token — it is a *narrower* one, good for one
+    /// machine for one minute.
+    ///
+    /// Spending is still the node's to do. This only says who is asking, and the
+    /// authorisation that follows is the same `get` every reader passes.
+    pub async fn identity_from_console_ticket(
+        &self,
+        session: &ResourceName,
+        ticket: &str,
+    ) -> ApiResult<Identity> {
+        if session.collection() != "console-sessions" {
+            return Err(ApiError::new(
+                Code::Unauthenticated,
+                "that is not a console session",
+            ));
+        }
+        let session: velstra_cloud_model::resources::ConsoleSession = self
+            .typed(session)
+            .await
+            .map_err(|_| ApiError::new(Code::Unauthenticated, "no such console session"))?;
+        if session.status.attached_at.is_some() {
+            return Err(ApiError::new(
+                Code::Unauthenticated,
+                velstra_cloud_model::console::Refused::Spent.to_string(),
+            ));
+        }
+        if Timestamp::now().0 >= session.spec.expires_at.0 {
+            return Err(ApiError::new(
+                Code::Unauthenticated,
+                velstra_cloud_model::console::Refused::Expired.to_string(),
+            ));
+        }
+        if !velstra_cloud_model::console::constant_time_eq(
+            &velstra_cloud_model::console::sha256_hex(ticket),
+            &session.spec.ticket_sha256,
+        ) {
+            return Err(ApiError::new(
+                Code::Unauthenticated,
+                velstra_cloud_model::console::Refused::WrongTicket.to_string(),
+            ));
+        }
+        let mut identity = Identity::new(&session.spec.subject);
+        // Scoped to the one guest it was minted against, and nothing else. A
+        // ticket that carried the asker's own powers would be a session key with
+        // a short life, sitting in a URL.
+        identity.scopes.push(format!(
+            "{}{}",
+            crate::sessions::CONSOLE_SCOPE_PREFIX,
+            session.spec.instance
+        ));
+        Ok(identity)
     }
 
     pub async fn explain_reach(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
