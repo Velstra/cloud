@@ -37,6 +37,34 @@ const check = (kind, value) => (value === "" ? "" : (CHECKS[kind] || CHECKS.none
 /// Checks that need two fields at once. Kept apart from the per-field ones
 /// because they can only run when both have been answered, and complaining
 /// about a gateway before the range exists is nagging, not validating.
+/// Consequences of what is filled in — true, not wrong.
+///
+/// Distinct from `crossCheck`, which returns *errors* and stops the form. These
+/// are things the platform will accept and somebody would rather know before
+/// pressing Create than discover afterwards.
+///
+/// The first one is the one that sent me looking: an instance with no port is
+/// legal, is what a new person creates by default because the field sits one
+/// disclosure deeper, and produces a guest that cannot be reached, cannot be
+/// logged into, and cannot fetch its own metadata. Nothing said so anywhere —
+/// the machine simply ran and answered nobody.
+function consequences(coll, values) {
+  const out = [];
+  if (coll.id === "instances") {
+    const ports = values.ports;
+    if (!Array.isArray(ports) || !ports.length) {
+      out.push("This guest will have no network. It cannot be reached, and its "
+        + "cloud-init cannot fetch the SSH keys and hostname this platform would "
+        + "give it. Attach a port under More settings, or add one later.");
+    }
+    if (!values.sshKeys && !values.userData) {
+      out.push("No SSH key and no cloud-init. A stock cloud image has no password, "
+        + "so the only way in will be the console.");
+    }
+  }
+  return out;
+}
+
 function crossCheck(coll, values) {
   const bad = {};
   if (coll.id === "subnets" && values.cidr && values.gateway) {
@@ -709,7 +737,14 @@ function renderRefList(form, f, host) {
   const values = Array.isArray(form.values[f.key]) ? form.values[f.key] : [];
   const offered = form.refs[f.collection] || [];
   clear(host);
-  const commit = () => { form.values[f.key] = values.filter(Boolean); };
+  // The consequences beside the button are computed from the values, so a
+  // control that changes them and says nothing leaves a sentence on screen that
+  // has stopped being true — "this guest will have no network", still there
+  // after somebody attached one.
+  const commit = () => {
+    form.values[f.key] = values.filter(Boolean);
+    form.revalidate();
+  };
   values.forEach((value, i) => {
     const s = el("select");
     s.appendChild(el("option", { value: "" }, "— remove —"));
@@ -728,12 +763,19 @@ function renderRefList(form, f, host) {
       el("button.btn", { type: "button", "aria-label": "down", disabled: i === values.length - 1 ? "" : null,
         onclick: () => { [values[i + 1], values[i]] = [values[i], values[i + 1]]; renderRefList(form, f, host); commit(); } }, "↓")));
   });
-  host.appendChild(el("button.btn", { type: "button",
+  host.appendChild(el("button.btn", { type: "button", disabled: offered.length ? null : "",
     onclick: () => {
       const first = offered.length ? (f.spelling === "id" ? idOf(offered[0]) : nameOf(offered[0])) : "";
       values.push(first); form.values[f.key] = values; renderRefList(form, f, host);
+      form.revalidate();
     } },
     offered.length ? "Add" + (values.length ? " another" : "") : "Nothing to attach yet"));
+  // "Nothing to attach yet" is true and useless on its own. A project that has
+  // never had a network reaches this on its very first guest, and what it needs
+  // is the order to do things in — not a disabled button.
+  if (!offered.length && f.whenEmpty) {
+    host.appendChild(el("p.muted", f.whenEmpty));
+  }
 }
 
 // ---- the dialog ------------------------------------------------------------
@@ -802,6 +844,9 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
   const common = el("div.fields"), advanced = el("div.fields.hidden");
   const problems = el("p.err.hidden");
 
+  // Said beside the button, not on a field: these are not mistakes, and
+  // marking a field bad for one would refuse a thing the platform accepts.
+  const notes = el("div.consequences");
   form.revalidate = () => {
     const bad = crossCheck(coll, form.values);
     for (const [key, setErr] of Object.entries(form.errs)) {
@@ -809,6 +854,10 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
       if (!f) continue;
       const own = check(f.check || "none", form.values[key] ?? "");
       setErr(own || bad[key] || "");
+    }
+    clear(notes);
+    for (const line of consequences(coll, form.values)) {
+      notes.appendChild(el("p.note", line));
     }
   };
   form.refilter = (changed) => {
@@ -851,6 +900,7 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
     dialog.appendChild(toggle);
     dialog.appendChild(advanced);
   }
+  dialog.appendChild(notes);
   dialog.appendChild(problems);
 
   const submit = el("button.btn.primary", { type: "button", id: "submitform" }, submitLabel);
@@ -903,6 +953,11 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
   // The pickers are filled after the form is on screen: a select that waits for
   // a round trip before anything renders is a dialog that appears late.
   for (const p of form.pickers) fillPicker(form, p);
+  // Once, on open. The consequences of what is *already* filled in are the ones
+  // that matter most — a form that only spoke after somebody typed said nothing
+  // at all to the person who pressed Create straight away, which is exactly the
+  // person it was written for.
+  form.revalidate();
   return form;
 }
 
@@ -930,14 +985,21 @@ async function fillPicker(form, p) {
   s.appendChild(el("option", { value: "" },
     f.filterBy && !form.values[f.filterBy] ? "Choose a " + f.filterBy + " first" :
       offered.length ? (f.required ? "Choose…" : "— none —") : "none exist yet"));
+  if (!offered.length && f.whenEmpty && form.boxes[f.key]) {
+    form.boxes[f.key].appendChild(el("p.muted", f.whenEmpty));
+  }
   // How the platform spells this reference. A node is a bare id — that is what
   // the scheduler writes and what ownership is decided by — and everything else
   // is a full resource name. The API refuses the wrong one at the door, so the
   // picker has to produce the right one rather than a plausible one.
   const wire = (o) => (f.spelling === "id" ? idOf(o) : nameOf(o));
   for (const o of offered) {
-    s.appendChild(el("option", { value: wire(o) },
-      shortName(nameOf(o)) + optionNote(f.collection, o)));
+    // An image leads with what it *is*; everything else leads with its name,
+    // which for everything else is already the readable thing.
+    const label = f.collection === "images"
+      ? imageTitle(o) + optionNote(f.collection, o)
+      : shortName(nameOf(o)) + optionNote(f.collection, o);
+    s.appendChild(el("option", { value: wire(o) }, label));
   }
   if (offered.some((o) => wire(o) === keep)) { s.value = keep; return; }
   if (!keep) return;
@@ -1002,10 +1064,42 @@ function fillFromAnswer(form, p, answer) {
 
 /// What tells two options apart, beside the name. A list of digests is not a
 /// choice anybody can make.
+/// What to call an image, for somebody who has not memorised its digest.
+///
+/// An image's *name* carries its digest, because that is what makes fetching
+/// one verifiable — and it is unreadable. A picker that offered
+/// `images/sha256-cbf3e1f5…` and nothing else asked a person to choose an
+/// operating system from a hash, and two images built from the same bytes in
+/// two projects rendered identically.
+///
+/// So: the file it came from, or the guest it was captured from, and then the
+/// facts that tell two similar ones apart.
+function imageTitle(o) {
+  const sp = spec(o);
+  const from = pick(sp, "sourceInstance");
+  if (from) return "from " + shortName(from);
+  const url = String(pick(sp, "sourceUrl") || "");
+  const file = url.split("?")[0].split("/").filter(Boolean).pop() || "";
+  const base = file.replace(/\.(qcow2|raw|img|iso)$/i, "");
+  return base || "image";
+}
+
 function optionNote(collectionId, o) {
   const st = status(o), sp = spec(o);
   if (collectionId === "images") {
-    return "  " + (pick(sp, "format") || "") + " " + bytes(pick(sp, "sizeBytes"));
+    // Where it lives, because two projects may hold the same bytes and a
+    // catalogue image is not the same offer as one of your own.
+    const name = nameOf(o);
+    const where = name.startsWith("projects/")
+      ? name.split("/")[1]
+      : "catalogue";
+    const digest = (idOf(o) || "").replace(/^sha256-/, "").slice(0, 8);
+    // A size nobody has measured yet is left out. It is reported by whoever
+    // fetches the bytes, so a freshly published catalogue entry has none — and
+    // rendering that as "0" reads as an empty image rather than an unknown one.
+    const size = Number(pick(sp, "sizeBytes")) || 0;
+    return "  " + (pick(sp, "format") || "") + (size ? " " + bytes(size) : "")
+      + "  ·  " + where + "  ·  " + digest;
   }
   if (collectionId === "nodes") {
     const free = Number(pick(pick(st, "capacity") || {}, "vcpus") || 0) -
