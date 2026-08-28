@@ -344,5 +344,11 @@ window.addEventListener("hashchange", () => {
 // a token that has since been revoked means they are not, and finding that out
 // at the sign-in screen is better than finding it out one empty panel at a time.
 if (session.token) {
-  signIn(session.token).then(enter).catch(() => signedOut(""));
+  // `signInWithToken`, not `signIn`: there is no `signIn`, and calling it threw
+  // a ReferenceError *synchronously* — before the promise existed, so the
+  // `.catch` below never ran and nothing was left to say what happened. The
+  // effect was that a returning operator with a perfectly good session was
+  // asked to sign in again, every time, and the only trace was one line in a
+  // console nobody has open.
+  signInWithToken(session.token).then(enter).catch(() => signedOut(""));
 }

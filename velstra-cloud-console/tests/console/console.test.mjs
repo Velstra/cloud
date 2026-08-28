@@ -2582,6 +2582,26 @@ await test("a label filter narrows the board and says so", async () => {
 
 });
 
+await test("a reload with a live token comes back signed in", async () => {
+  // The console kept its token in `sessionStorage` and had a path to resume from
+  // it — which called a function that does not exist. The ReferenceError was
+  // thrown *synchronously*, so the `.catch` meant to fall back to the sign-in
+  // screen never ran, and the only evidence was one line in a console nobody has
+  // open. Every reload asked the operator to sign in again, with a perfectly good
+  // session in the tab.
+  await open(page, "instances");
+  const token = await page.evaluate(`sessionStorage.getItem("velstra-cloud-token")`);
+  check(!!token, "the session left no token to come back with");
+
+  await page.goto(URL);
+  const back = await page.evaluate(`({
+    inside: !document.getElementById("app").classList.contains("hidden"),
+    token: sessionStorage.getItem("velstra-cloud-token"),
+  })`);
+  check(back.inside, "a reload with a live token landed on the sign-in screen");
+  check(back.token === token, "the token did not survive the reload");
+});
+
 await test("signing out leaves nothing behind", async () => {
   // "Nothing behind" used to mean the token and the panel, and that is what this
   // checked — an assertion that held while everything the session had read was
@@ -2644,5 +2664,7 @@ await test("signing out leaves nothing behind", async () => {
 });
 
 page.close();
+
+
 
 process.exit(summary());
