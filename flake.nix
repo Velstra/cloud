@@ -1405,7 +1405,11 @@
         deb =
           pkgs.runCommand "velstra-cloud-deb-check"
             {
-              nativeBuildInputs = [ pkgs.dpkg ];
+              nativeBuildInputs = [
+                pkgs.dpkg
+                pkgs.patchelf
+                pkgs.llvm
+              ];
             }
             ''
               deb=${self.packages.${system}.deb}
@@ -1438,6 +1442,48 @@
                 exit 1
               fi
 
+              # And no binary may name the store either — which is the check
+              # that was missing, and the reason a package installed cleanly and
+              # could not run a single one of its five programs.
+              #
+              # An ELF binary carries the path of its interpreter inside itself.
+              # Copying the file out of the store does not change that path, so
+              # every binary here still demanded a /nix/store glibc that a
+              # Debian machine does not have; the kernel refused to start them
+              # and the shell said "required file not found" about a file that
+              # was plainly there.
+              mkdir -p bins
+              dpkg-deb --fsys-tarfile "$deb" | tar -x -C bins ./usr/bin
+              for b in bins/usr/bin/*; do
+                  interp=$(patchelf --print-interpreter "$b")
+                if [ "$interp" != "/lib64/ld-linux-x86-64.so.2" ]; then
+                  echo "::error::$(basename "$b") wants the interpreter $interp," >&2
+                  echo "which is not on a Debian machine — it would install and refuse to run." >&2
+                  exit 1
+                fi
+                if patchelf --print-rpath "$b" | grep -q "/nix/store"; then
+                  echo "$(basename "$b") carries an rpath into the Nix store" >&2
+                  exit 1
+                fi
+              done
+              # The glibc floor the package promises has to be the one the
+              # binaries actually need: `Depends: libc6 (>= 2.39)` is a claim,
+              # and apt believes it. Too low and it installs on a release whose
+              # loader cannot resolve the symbols; too high and it refuses
+              # machines that would have worked.
+              want=$(for b in bins/usr/bin/*; do
+                       llvm-readelf --dyn-syms "$b" | grep -oE "GLIBC_2\.[0-9]+"
+                     done | sort -V | tail -1)
+              # Asked of the package rather than of a file this script has not
+              # unpacked yet — which is what the first version of this check did,
+              # and it failed on a package whose control file said exactly the
+              # right thing.
+              dpkg-deb --field "$deb" Depends | grep -q "libc6 (>= ''${want#GLIBC_})" || {
+                echo "::error::the binaries need $want and the package does not say so" >&2
+                dpkg-deb --field "$deb" Depends >&2
+                exit 1
+              }
+
               # And nothing *inside* a unit may name the store either. The
               # binaries being copied is only half of it: the first build of
               # this package interpolated `''${velstra-cloud}/bin/…` into every
@@ -1450,8 +1496,21 @@
                 echo "a unit points into the Nix store, which is not on a Debian machine" >&2
                 exit 1
               fi
-              grep -q "ExecStart=/usr/bin/velstra-cloud-poolagent" \
-                units/lib/systemd/system/velstra-cloud-poolagent.service
+              # The binary named by an absolute path, whatever wrapper is
+              # around it — the agents are started through `sh -c` now, because
+              # their answers come out of the seed and a static ExecStart cannot
+              # carry them.
+              #
+              # With a message, because a bare `grep -q` under `set -e` fails
+              # the whole derivation and prints nothing at all: this assertion
+              # went stale when the unit changed shape and cost an hour of
+              # bisecting a check that died in silence.
+              grep -q "/usr/bin/velstra-cloud-poolagent" \
+                units/lib/systemd/system/velstra-cloud-poolagent.service || {
+                echo "the pool unit does not name its binary by absolute path:" >&2
+                cat units/lib/systemd/system/velstra-cloud-poolagent.service >&2
+                exit 1
+              }
 
               # Every unit is conditional on its own role, and starts nothing on
               # a machine that has not been told what it is for.
@@ -1551,7 +1610,8 @@
             mkdir -p seed
             # region, cell, roles (control-plane + hypervisor + pool), API url,
             # node id, token, hypervisor, pool id, backend, store, other cells,
-            # admin + password twice, fabric (no), confirm.
+            # reachable-from, admin + password twice, fabric (no), gateway
+            # (yes), confirm.
             #
             # Positional, so a question added anywhere above shifts every answer
             # below it — which is exactly what happened when the fabric question
@@ -1572,10 +1632,12 @@
             1
             10.0.0.1:2379
             cell-8=https://cell-8.example:8443
+            2
             admin
             correcthorsebattery
             correcthorsebattery
             n
+            y
             y
             ANSWERS
 
@@ -1592,6 +1654,11 @@
             grep -qx "VELSTRA_POOL_BACKEND=directory" seed/node.env
             grep -qx "VELSTRA_STORE=10.0.0.1:2379" seed/node.env
             grep -qx "VELSTRA_CELLS=cell-8=https://cell-8.example:8443" seed/node.env
+            # The answer that decides whether this node's guests can be reached
+            # at all. A cell with no fabric and no first hop runs guests that
+            # boot, report Running, and can be logged into by nobody — so the
+            # wizard asks, and the seed has to carry it.
+            grep -qx "VELSTRA_LOCAL_NETWORK=1" seed/node.env
             # The cell's first administrator. Without one the API comes up,
             # serves the console and refuses every sign-in — it says so in a
             # warning, which is not where somebody looking at a login form is
@@ -1600,6 +1667,12 @@
             # nothing, so a fresh install produced a control plane nobody could
             # get into.
             grep -qx "VELSTRA_BOOTSTRAP_ADMIN=admin" seed/node.env
+
+            # Where the API binds. The default is loopback, and a control plane
+            # nobody can reach from another machine is the first thing somebody
+            # hits and the last thing they think to look for: every unit green,
+            # and the browser saying nothing answered.
+            grep -qx "VELSTRA_LISTEN=0.0.0.0:8443" seed/node.env
 
             # The username is not a secret and the password is. Same split the
             # node token already makes, same mode.
@@ -1660,6 +1733,14 @@
             grep -qx "VELSTRA_FABRIC_VTEP=10.0.0.7" fabric-seed/node.env
             grep -qx "VELSTRA_FABRIC_UNDERLAY=eth1" fabric-seed/node.env
             grep -qx "VELSTRA_FABRIC_SRV6_LOCATOR=fc00:0:1::/64" fabric-seed/node.env
+            # And the question that only a fabric-less cell is asked is not
+            # asked here — two things owning the far end of every tap is a
+            # combination the agent refuses at startup, so the wizard must not
+            # be able to produce it.
+            if grep -q "VELSTRA_LOCAL_NETWORK" fabric-seed/node.env; then
+              echo "the wizard offered a first hop to a cell that has a fabric" >&2
+              exit 1
+            fi
             # A hypervisor is told to enable the data plane; it is not one of the
             # roles, so this line only appears when a fabric was actually named.
             grep -q "systemctl enable --now velstra-fabric-agent" fabout

@@ -19,8 +19,10 @@ the same platform with fewer boxes in it, and adding the others afterwards is
 * A machine with virtualisation enabled in its firmware — check with
   `grep -c 'vmx\|svm' /proc/cpuinfo`; zero means it is off, not absent.
 * 8 GiB of memory is comfortable. The control plane itself fits in 2.
-* Debian 12 or 13, or NixOS. Anything else works too, but you would be building
-  the package yourself.
+* **Debian 13** (trixie) or NixOS. Not Debian 12: the binaries need glibc 2.39
+  and bookworm ships 2.36, so `apt` refuses the package rather than installing
+  something that cannot start. Anything else works too, but you would be
+  building the package yourself.
 
 You do **not** need: a second machine, shared storage, a Ceph cluster, a fabric,
 or a spare public address. All of those are things you add when you have a
@@ -31,17 +33,65 @@ reason, and the platform says what changes when you do.
 ## 1. Install it
 
 ```
-sudo dpkg -i velstra-cloud_*.deb
-sudo velstra-cloud-node setup
+sudo apt install ./velstra-cloud_*.deb
+sudo velstra-cloud-node quickstart
 ```
+
+`apt install ./file.deb`, not `dpkg -i`: dpkg does not resolve dependencies, so
+it unpacks the package and then leaves it unconfigured with a complaint about
+systemd. apt pulls what is needed and configures it.
+
+**That is the whole install.** `quickstart` asks three things — a name for the
+machine, who should be able to reach the console, and the administrator's
+password — and then does what the rest of this guide describes by hand: writes
+the seed, brings up etcd and the control plane, creates the node object, moves
+its one-time token, creates the storage pool, and starts the agents.
+
+It is safe to run again. Nothing it does is created twice, so a run that failed
+half way is fixed by running it again rather than by reinstalling.
+
+Two things it deliberately does not do. It refuses on NixOS, where units are a
+declaration and a command that enabled them behind your back would be fighting
+the operating system — use the module (§0 of the [setup guide](setup-guide.md)).
+And it does not install QEMU: if there is none, the seed says `fake` and says so
+at the end, because a guest that is silently recorded instead of run is the
+worst of both.
+
+```
+sudo apt install etcd-server qemu-system-x86 qemu-utils
+```
+
+before it, and you have a cell that runs real machines.
+
+<details>
+<summary>Doing it by hand instead</summary>
+
+`velstra-cloud-node setup` asks the same questions and writes the same seed, and
+stops there — it names the units to enable and leaves the objects to you. That
+is the path for a machine joining a cell somebody else runs, and it is what §3
+and §4 below describe. Everything `quickstart` does, you can do with `curl`.
+
+</details>
 
 Answer `1 2 3` at the roles question — control plane, hypervisor and storage
 pool, all on this box. Give it a region and a cell name (`eu-central` and
 `cell-1` are fine), a node id (`home-1`), and a pool id (`local`).
 
-Say **no** to the fabric question. Without one, guests get real network
-interfaces and reach your LAN; what you do not get is tenant separation, which
-is not what one machine is for. You can add it later.
+Say **no** to the fabric question, and **yes** to the one after it — whether
+this node should be the gateway for its guests.
+
+That second answer is what makes a guest usable. Without a fabric, a tap leads
+nowhere: the guest boots, reports Running, and can be reached by nobody — and
+not only unreached but *unconfigured*, because its cloud-init looks for the
+metadata service over that same wire and finds nothing, so it comes up with no
+user and no SSH key. Saying yes puts the subnet's gateway on this machine and
+lets the guests out through it, which is what a home hypervisor does.
+
+What you get: guests reach your LAN and the internet, and you reach them **from
+this machine**. What you do not get: guests reachable *from* the LAN without a
+route to their subnet, and tenant separation — which is not what one machine is
+for. Both can come later; for a guest that sits directly on your LAN, see host
+bridges in [rest-contract.md](rest-contract.md).
 
 The wizard writes one file, `/var/lib/velstra/node.env`, and names the units to
 enable. It starts nothing itself: every unit is conditional on its role being in

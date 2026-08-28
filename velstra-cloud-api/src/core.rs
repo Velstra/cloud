@@ -50,16 +50,6 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-/// Said the same way wherever somebody tries to write a usage record.
-///
-/// A bill that can be written, edited or deleted through the same door the
-/// customer comes in is not a bill. Readings are written by the controller,
-/// straight to the store, and this is the whole of the API's part in it: no.
-const RECORDS_ARE_NOT_WRITTEN_HERE: &str = "usage records are readings taken by the platform, not documents anybody writes. They cannot \
-     be created, changed or deleted here — a record that could be would be a bill nobody can \
-     stand behind. They are read with GET, and they go away with their project or with their \
-     retention.";
-
 pub const COLLECTIONS: [&str; 29] = [
     "projects",
     "users",
@@ -94,6 +84,13 @@ pub const COLLECTIONS: [&str; 29] = [
 
 /// Said the same way wherever somebody tries to write a usage record.
 ///
+/// A bill that can be written, edited or deleted through the same door the
+/// customer comes in is not a bill. Readings are written by the controller,
+/// straight to the store, and this is the whole of the API's part in it: no.
+const RECORDS_ARE_NOT_WRITTEN_HERE: &str = "usage records are readings taken by the platform, not documents anybody writes. They cannot \
+     be created, changed or deleted here — a record that could be would be a bill nobody can \
+     stand behind. They are read with GET, and they go away with their project or with their \
+     retention.";
 
 /// How long a spent console session is kept as a record.
 ///
@@ -1592,6 +1589,13 @@ impl Api {
             }
             if name.collection() == "instances" && spec.get("root_disk_gib").is_some() {
                 self.refuse_a_smaller_disk(name, spec, who).await?;
+            }
+            // The same rule on the way in as on creation: a port handed to a
+            // second guest by an edit is the same silent failure as one handed
+            // to it at birth.
+            if name.collection() == "instances" && spec.get("ports").is_some() {
+                self.refuse_a_port_two_guests_would_share(name, spec)
+                    .await?;
             }
             // `cpu_baseline`, not `cpuBaseline`: the body was converted out of
             // its wire spelling before it got here.
@@ -4172,12 +4176,14 @@ impl Api {
             // every first use of it — a console cannot offer "create" without
             // first teaching what a resource id is.
             //
-            (None, None) => {
-                return Err(ApiError::invalid(
-                    "a create carries the id it wants: names are chosen by the caller, not minted here",
-                )
-                .at("id"));
-            }
+            // The trade is real and is the reason this used to be refused: a
+            // create with no id is **not idempotent**, so a client that retries
+            // a request whose answer it never saw gets a second object. A client
+            // that needs a retry to be safe sends the id, which is still the way
+            // every controller and every script here does it. The name is in the
+            // response either way.
+            (None, None) if parent.is_empty() => format!("{kind}/{}", minted(kind)),
+            (None, None) => format!("{parent}/{kind}/{}", minted(kind)),
         };
         let name = ResourceName::parse(&name)?;
         if name.collection() != kind {
@@ -4194,6 +4200,21 @@ impl Api {
         }
         Ok(name)
     }
+}
+
+/// An id for a caller who did not bring one.
+///
+/// The kind in the singular and enough of a uuid to be unique in a cell —
+/// `instance-3f9a2c81` — because an id nobody chose still has to be readable in
+/// a list, a URL and an error message. Not a uuid on its own: a person reading
+/// `projects/home/instances/3f9a2c81-…` cannot tell what they are looking at.
+fn minted(kind: &str) -> String {
+    // Every collection this API serves is a plain plural — instances, images,
+    // networks, floatingips — so one `s` is the whole of it. A kind that is not
+    // keeps its name rather than losing a letter.
+    let singular = kind.strip_suffix('s').unwrap_or(kind);
+    let uid = uuid::Uuid::new_v4().to_string();
+    format!("{singular}-{}", &uid[..8])
 }
 
 /// The answer to "that name is taken", as a sentence about the thing the caller

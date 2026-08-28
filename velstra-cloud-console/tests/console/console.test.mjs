@@ -324,19 +324,26 @@ await test("a collection whose scope the contract spells differently is still fo
   // The contract does not say where a node is addressed from. The console
   // declares one and falls back to the other once, so being wrong about it
   // costs a round trip rather than showing an empty fleet.
+  //
+  // **In one direction only.** A collection declared global whose objects turn
+  // out to live under a project is found. The reverse is not probed: an empty
+  // answer for a project collection is what a project looks like on its first
+  // day, and asking the cell-wide path instead returns every other tenant's
+  // rows to anybody who may read the cell — which is how a new customer's first
+  // guest came to be created outside their project entirely.
   const found = await page.evaluate(`(async () => {
-    const coll = collection("nodes");
-    const was = scopeFound.nodes;
-    delete scopeFound.nodes;
+    const coll = collection("instances");
+    const was = scopeFound.instances;
+    delete scopeFound.instances;
     const original = coll.scope;
-    coll.scope = "project";               // deliberately the wrong one
+    coll.scope = "global";                // deliberately the wrong one
     try {
       const r = await list(coll);
-      return { items: r.items.length, resolved: scopeFound.nodes };
-    } finally { coll.scope = original; scopeFound.nodes = was; }
+      return { items: r.items.length, resolved: scopeFound.instances };
+    } finally { coll.scope = original; scopeFound.instances = was; }
   })()`);
-  check(found.items >= 1, "the fallback found no nodes");
-  equal(found.resolved, "global", "the fallback did not remember where they really are");
+  check(found.items >= 1, "the fallback found no instances");
+  equal(found.resolved, "project", "the fallback did not remember where they really are");
 });
 
 // --- convergence, the whole point -------------------------------------------

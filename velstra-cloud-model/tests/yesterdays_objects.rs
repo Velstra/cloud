@@ -208,6 +208,30 @@ fn a_project_from_before_three_of_its_limits_existed_is_not_suddenly_capped() {
     // A status written before anything counted reads as nothing counted, not
     // as a refusal.
     assert_eq!(project.status.used.vcpus, 0);
+
+    // And a project stored before there *was* a policy keeps what its tenants
+    // could already do. Reading it as the closed policy would take passthrough
+    // and public addresses away from every existing project on the next
+    // upgrade, with no operator involved and nothing said — the exact failure
+    // this file exists to stop.
+    assert!(
+        project.spec.policy.device_passthrough,
+        "an upgrade took hardware passthrough away from a project that had it"
+    );
+    assert!(
+        project.spec.policy.floating_ips,
+        "an upgrade took public addresses away from a project that had them"
+    );
+    // Host bridges are the exception, and honestly so: there was no such thing
+    // before, so nobody loses one.
+    assert!(project.spec.policy.host_bridges.is_empty());
+
+    // A project made **today** is closed. Two different questions, and the
+    // difference is deliberate: `Default` answers "what should a new tenant
+    // get", serde answers "what did this object mean when it was written".
+    let fresh = velstra_cloud_model::resources::ProjectSpec::default();
+    assert!(!fresh.policy.device_passthrough);
+    assert!(!fresh.policy.floating_ips);
 }
 
 /// The smaller specs that grew a field each.

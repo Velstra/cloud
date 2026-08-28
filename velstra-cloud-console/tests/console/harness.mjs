@@ -63,11 +63,17 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
   const keep = (chunk) => { said.push(String(chunk)); if (said.length > 40) said.shift(); };
   proc.stdout.on("data", keep);
   proc.stderr.on("data", keep);
+  const lastWords = () => (said.length ? `\n--- the browser said:\n${said.join("")}` : "\n--- the browser said nothing at all");
 
   let socket = null, died = null;
   proc.on("exit", (code, signal) => { died = signal ? `signal ${signal}` : `code ${code}`; });
-  for (let i = 0; i < 120 && !socket; i++) {
-    if (died !== null) throw new Error(`the browser exited before it listened (${died})`);
+  // Two minutes, not thirty seconds. The old ceiling was enough on every
+  // machine it was written on and not enough on a loaded two-vCPU runner with a
+  // cold page cache, where this failed once with the browser still alive and
+  // simply not listening yet. Waiting longer costs nothing when it comes up
+  // fast, which is every other time.
+  for (let i = 0; i < 480 && !socket; i++) {
+    if (died !== null) throw new Error(`the browser exited before it listened (${died})${lastWords()}`);
     try {
       const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
       const target = list.find((t) => t.type === "page");
@@ -75,7 +81,14 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
     } catch (e) { /* not listening yet */ }
     if (!socket) await sleep(250);
   }
-  if (!socket) throw new Error("the browser never came up");
+  // `said` is collected precisely so this sentence can carry it, and until now
+  // neither failure path did — the harness kept the browser's last words for
+  // exactly this moment and then threw them away, so a CI failure read "the
+  // browser never came up" and nothing else.
+  if (!socket) {
+    proc.kill("SIGKILL");
+    throw new Error(`the browser never came up within 120s${lastWords()}`);
+  }
 
   const ws = new WebSocket(socket);
   await new Promise((resolve, reject) => {

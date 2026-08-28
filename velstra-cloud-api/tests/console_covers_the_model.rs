@@ -954,3 +954,131 @@ fn a_field_the_api_refuses_to_change_is_not_offered_for_editing() {
         );
     }
 }
+
+/// Every rung the model has is one the console can hand out.
+///
+/// The roles are a contract of their own — the model decides them, the wire
+/// carries their names, the contract document lists them, and the console has
+/// to offer them. A rung that existed in one place and not the others would be
+/// a role somebody is granted and nothing honours, or one nobody can grant.
+///
+/// Checked against the console's actual source rather than a copy of it, so a
+/// rung added to the model and forgotten in the picker fails here.
+#[test]
+fn every_role_the_model_has_is_offered_by_the_console() {
+    use velstra_cloud_model::authz::Role;
+
+    let page = velstra_cloud_console::page();
+    for role in [Role::Viewer, Role::Operator, Role::Editor, Role::Admin] {
+        let name = serde_json::to_value(role).unwrap();
+        let name = name.as_str().expect("a role serialises as its name");
+        assert!(
+            page.contains(&format!("id: \"{name}\"")),
+            "the model has a `{name}` role and the console does not offer it — a rung nobody \
+             can grant is a rung that does not exist"
+        );
+    }
+
+    // And the contract says the same four, in the same spelling.
+    let contract = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("docs/rest-contract.md"),
+    )
+    .expect("the contract is beside the code");
+    for name in ["viewer", "operator", "editor", "admin"] {
+        assert!(
+            contract.contains(&format!("`{name}`")),
+            "the contract does not mention the `{name}` role"
+        );
+    }
+}
+
+/// The console must not read a condition nothing writes.
+///
+/// A collection judged by a name no agent or controller ever sets reads as
+/// "not reported" for ever — for every object in it, in every cell. Measured
+/// on a real one: a hundred and nine objects on the attention list, three of
+/// which were actually wrong, and the three unfindable among them. Networks
+/// were on that list because the console read `Ready` while the controller
+/// wrote `Mirrored`.
+///
+/// Checked against the source of everything that writes a condition, so a
+/// controller renaming one and forgetting the console fails here rather than in
+/// somebody's overview.
+#[test]
+fn every_condition_the_console_reads_is_one_something_writes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the workspace is above this crate");
+
+    // Everything that could write one: the controllers, the node agent, the
+    // pool agent, and the model's own computed conditions.
+    let mut written = String::new();
+    for crate_dir in [
+        "velstra-cloud-controller/src",
+        "velstra-cloud-nodeagent/src",
+        "velstra-cloud-model/src",
+        "velstra-cloud-api/src",
+    ] {
+        let dir = root.join(crate_dir);
+        let mut stack = vec![dir];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    if let Ok(text) = std::fs::read_to_string(&p) {
+                        written.push_str(&text);
+                    }
+                }
+            }
+        }
+    }
+
+    for collection in COLLECTIONS {
+        // An empty name is the collection saying nothing reports on it, which
+        // its own guard checks.
+        if collection.condition.is_empty() {
+            continue;
+        }
+        assert!(
+            written.contains(&format!("\"{}\"", collection.condition)),
+            "the console judges {} by a `{}` condition, and nothing in this platform writes one — \
+             every object in that collection reads as \"not reported\" for ever",
+            collection.id,
+            collection.condition
+        );
+    }
+}
+
+/// The console and the model agree on what nobody reports on.
+///
+/// Two copies of that list drift, and the drift is expensive in both
+/// directions: a kind the console thinks is reported fills the attention list
+/// for ever, and a kind the model thinks is reported leaves every operation for
+/// it unfinished — which is what a client polls after a create.
+///
+/// The model's list is the one; this is what stops the console keeping a
+/// second.
+#[test]
+fn the_console_and_the_model_agree_on_what_nobody_reports_on() {
+    use velstra_cloud_model::reconcile::nobody_reports_on;
+
+    for collection in COLLECTIONS {
+        let console_says = collection.condition.is_empty();
+        let model_says = nobody_reports_on(collection.id);
+        assert_eq!(
+            console_says, model_says,
+            "the console says nothing reports on {} is {console_says}, the model says \
+             {model_says} — one of them fills an attention list for ever and the other leaves \
+             every operation for it unfinished",
+            collection.id
+        );
+    }
+}
