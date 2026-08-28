@@ -110,11 +110,35 @@ pub struct Changed {
 pub struct Ownership<'a> {
     pub assigned: Option<&'a str>,
     pub owner: Option<&'a str>,
+    /// Whether any agent will ever report on objects of this kind.
+    ///
+    /// False for almost everything: an instance, a volume, a port all have an
+    /// agent that owns their `status`, and a controller writing it would be the
+    /// second writer this whole rule exists to prevent.
+    ///
+    /// True for the kinds on [`crate::reconcile::nobody_reports_on`], where the
+    /// reasoning inverts: if no agent ever reports on a user, then no agent ever
+    /// writes a user's status, so refusing the controller does not protect the
+    /// field from a second writer — it leaves it with **no** writer at all. A
+    /// user's `lastLogin` could not be recorded by anything, and every sign-in
+    /// logged a warning saying so.
+    pub reported_by_nobody: bool,
 }
 
 impl<'a> Ownership<'a> {
     pub fn of(assigned: Option<&'a str>, owner: Option<&'a str>) -> Self {
-        Self { assigned, owner }
+        Self {
+            assigned,
+            owner,
+            reported_by_nobody: false,
+        }
+    }
+
+    /// Say that no agent reports on this kind, so the platform is its only
+    /// possible writer. Taken from the one list rather than restated per type.
+    pub fn reported_by_nobody(mut self, yes: bool) -> Self {
+        self.reported_by_nobody = yes;
+        self
     }
 
     fn admits(&self, node: &str) -> bool {
@@ -139,7 +163,12 @@ impl<'a> Ownership<'a> {
 pub fn judge(writer: &Writer, changed: Changed, held: Ownership<'_>) -> Result<(), WriteRefused> {
     match writer {
         Writer::Controller(_) => {
-            if changed.status {
+            // The exception, and the reason it is not a hole: on a kind nobody
+            // reports on there is no agent to be the other writer. Refusing here
+            // does not keep two parties out of one field — it keeps everybody
+            // out, which is how `users.status.lastLogin` became a field the
+            // platform could not write and every sign-in a logged warning.
+            if changed.status && !held.reported_by_nobody {
                 return Err(WriteRefused::StatusIsNotYours {
                     writer: writer.describe(),
                 });
@@ -372,5 +401,58 @@ mod tests {
             Err(WriteRefused::GenerationWithoutChange),
             "a bumped generation with nothing behind it makes every agent redo its work"
         );
+    }
+}
+
+#[cfg(test)]
+mod nobody_reports {
+    use super::*;
+
+    fn changed_status() -> Changed {
+        Changed {
+            status: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_platform_writes_a_status_no_agent_will_ever_write() {
+        // A user's `lastLogin` is the case: nothing assigns a user to a node, so
+        // no agent reports on one, so the login path is the only thing that can
+        // record it. Before this it recorded nothing and warned, on every single
+        // sign-in, into a log.
+        let held = Ownership::of(None, None).reported_by_nobody(true);
+        assert!(judge(&Writer::controller("sign-in"), changed_status(), held).is_ok());
+    }
+
+    #[test]
+    fn and_nowhere_else() {
+        // The kinds an agent does report on keep the rule exactly as it was —
+        // including an object that has been assigned and not yet claimed, where
+        // the agent is coming and the controller must not write ahead of it.
+        for held in [
+            Ownership::of(None, None),
+            Ownership::of(Some("node-a"), None),
+            Ownership::of(Some("node-a"), Some("node-a")),
+        ] {
+            assert!(
+                matches!(
+                    judge(&Writer::controller("scheduler"), changed_status(), held),
+                    Err(WriteRefused::StatusIsNotYours { .. })
+                ),
+                "a controller wrote a status an agent owns"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_is_not_let_in_by_the_same_door() {
+        // The exemption says "the platform may write this", not "anybody may".
+        // An agent has no business on a kind nobody assigned it.
+        let held = Ownership::of(None, None).reported_by_nobody(true);
+        assert!(matches!(
+            judge(&Writer::agent("node-a"), changed_status(), held),
+            Err(WriteRefused::NotYourObject { .. })
+        ));
     }
 }

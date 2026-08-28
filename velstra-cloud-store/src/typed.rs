@@ -319,7 +319,8 @@ where
             Ownership::of(Some(itself), Some(itself))
         } else {
             Ownership::of(previous.spec.assigned_owner(), previous.status.owner())
-        };
+        }
+        .reported_by_nobody(previous.status.written_by_the_platform());
         judge(writer, changed, held)?;
 
         let bytes = serde_json::to_vec(next).expect("a resource always serialises");

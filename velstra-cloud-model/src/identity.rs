@@ -200,6 +200,12 @@ impl crate::resources::Observed for UserStatus {
     fn owner(&self) -> Option<&str> {
         None
     }
+    /// And because nobody does, the platform may: without this the login path
+    /// was refused on every sign-in and `lastLogin` was a field nothing in the
+    /// system could write.
+    fn written_by_the_platform(&self) -> bool {
+        true
+    }
 }
 
 impl crate::resources::Observed for CredentialStatus {
