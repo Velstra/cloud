@@ -1739,7 +1739,145 @@ const PORT_FIELDS: &[Field] = &[
     },
 ];
 
+const IMAGE_SOURCE_FIELDS: &[Field] = &[
+    Field {
+        key: "family",
+        label: "Family",
+        kind: Kind::Text {
+            placeholder: "debian-13",
+            check: Check::Id,
+        },
+        required: true,
+        advanced: false,
+        help: "Everything this source publishes joins this family, and an \
+               instance asking for `families/debian-13` gets the newest of them.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "url",
+        label: "Image",
+        kind: Kind::Text {
+            placeholder: "http://cloud.example/debian-13-genericcloud-amd64.qcow2",
+            check: Check::Url,
+        },
+        required: true,
+        advanced: false,
+        help: "Where the bytes are. This may be plain http: the digest below is \
+               what makes fetching them safe, and a wrong byte gives a wrong \
+               digest and fails the fetch.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "checksums",
+        label: "Checksums",
+        kind: Kind::Text {
+            placeholder: "https://cloud.example/SHA256SUMS",
+            check: Check::Url,
+        },
+        required: true,
+        advanced: false,
+        help: "A `sha256sum`-style file covering the image's filename. **https \
+               only**, and refused otherwise — this is the one value the whole \
+               arrangement trusts, and whoever can rewrite it chooses what every \
+               new guest in this cell boots.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "paused",
+        label: "Paused",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "Stop looking, without forgetting where this came from.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "everyMs",
+        label: "Check every",
+        kind: Kind::Number {
+            unit: "ms",
+            min: 60_000,
+            max: 30 * 24 * 60 * 60 * 1000,
+            step: 60_000,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Six hours when left empty. Cloud images are published daily at \
+               best, and a cell that asks every minute spends its day fetching a \
+               checksums file to learn nothing.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "keep",
+        label: "Keep",
+        kind: Kind::Number {
+            unit: "",
+            min: 1,
+            max: 50,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "How many of this family to keep. Three when left empty. An image \
+               an instance was built from is never taken away, however old — the \
+               guest would be unable to start on its next move.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+];
+
 const IMAGE_FIELDS: &[Field] = &[
+    Field {
+        key: "family",
+        label: "Family",
+        kind: Kind::Text {
+            placeholder: "debian-13",
+            check: Check::Id,
+        },
+        required: false,
+        advanced: false,
+        help: "What this image is, in the words somebody would use to ask for it. \
+               An instance can then name `families/debian-13` and get the newest \
+               one there is, resolved when it is created and written down — so a \
+               guest never changes its operating system on a restart.",
+        when_empty: "Without a family this image can only be asked for by its \
+                     digest, and nothing will ever offer it as \"the newest\".",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "version",
+        label: "Version",
+        kind: Kind::Text {
+            placeholder: "20260815",
+            check: Check::None,
+        },
+        required: false,
+        // A step deeper than the family, because the family is what somebody
+        // has to decide and this is what they copy off the page they downloaded
+        // from. Four questions is the cap on the common path, and the four are
+        // what the image *is*, its bytes, its format and where they come from.
+        advanced: true,
+        help: "Which one in the family, for a person to read. Newest is decided \
+               by when this cell learned of the image, not by comparing this — \
+               every scheme for ordering version strings is wrong for somebody's.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
     Field {
         key: "digest",
         label: "Digest",
@@ -3158,6 +3296,47 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "image-sources",
+        title: "Image sources",
+        singular: "image source",
+        recheck: 0,
+        condition: "Checked",
+        group: "Compute",
+        scope: Scope::Global,
+        blurb: "Where a family's images come from. The cell asks the checksums file \
+                what the current digest is, over https so the certificate is \
+                checked, and publishes an image when the answer is one it does not \
+                have. Nothing about a running guest changes: a machine keeps the \
+                bytes it was built from, and \"always the newest\" means new \
+                machines get it.",
+        fields: IMAGE_SOURCE_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.family",
+                label: "Family",
+                cell: Cell::Text,
+                width: 160,
+            },
+            Column {
+                path: "status.lastChecked",
+                label: "Looked",
+                cell: Cell::Ago,
+                width: 110,
+            },
+            Column {
+                path: "status.published",
+                label: "Published",
+                cell: Cell::Text,
+                width: 220,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
         id: "images",
         title: "Images",
         singular: "image",
@@ -3170,6 +3349,18 @@ pub const COLLECTIONS: &[Collection] = &[
                 preference, never a requirement.",
         fields: IMAGE_FIELDS,
         columns: &[
+            Column {
+                path: "spec.family",
+                label: "Family",
+                cell: Cell::Text,
+                width: 160,
+            },
+            Column {
+                path: "spec.version",
+                label: "Version",
+                cell: Cell::Text,
+                width: 120,
+            },
             Column {
                 path: "spec.format",
                 label: "Format",
@@ -4292,7 +4483,7 @@ mod tests {
         }
         assert_eq!(
             COLLECTIONS.len(),
-            27,
+            28,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:

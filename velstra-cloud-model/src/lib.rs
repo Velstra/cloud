@@ -16,6 +16,7 @@ pub mod backup;
 pub mod capture;
 pub mod ceph;
 pub mod console;
+pub mod images;
 pub mod cpu;
 pub mod ha;
 pub mod identity;

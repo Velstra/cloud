@@ -39,6 +39,7 @@ pub mod network;
 pub mod operations;
 pub mod port;
 pub mod queue;
+pub mod imagesource;
 pub mod quota;
 pub mod recovery;
 pub mod router;
