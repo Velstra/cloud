@@ -215,3 +215,61 @@ async fn a_node_a_guest_is_placed_on_is_not_deleted() {
     let why = refused.to_string();
     assert!(why.contains("projects/p1/instances/i1"), "{why}");
 }
+
+#[tokio::test]
+async fn a_project_is_not_held_by_the_readings_taken_of_it() {
+    // Found on a running cell, and it is the worst shape a guard can have: the
+    // refusal said "delete those first", and those could not be deleted. Usage
+    // records are written by the platform hourly and refused to every writer on
+    // purpose — a number somebody can edit after the fact is not a bill — so a
+    // project that had existed for one hour could never be removed again, by any
+    // means the API offers. Thirty-five of them had piled up.
+    //
+    // A record is not a holder. Nobody is waiting on it, and it goes away with
+    // its own retention rather than with this.
+    let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
+    let api = Api::new(
+        store.clone(),
+        "eu-central",
+        "cell-1",
+        verifier,
+    )
+    .with_cell_admins(vec![OPS.to_string()]);
+
+    api.create(
+        "",
+        "projects",
+        &json!({"id": "spent", "spec": {"quota": {}}}),
+        &who(),
+    )
+    .await
+    .unwrap();
+
+    let usage = velstra_cloud_store::TypedStore::<
+        velstra_cloud_model::usage::UsageRecordSpec,
+        velstra_cloud_model::usage::UsageRecordStatus,
+    >::new(store, "cell-1", "usage");
+    for at in [1_787_824_800_000_u64, 1_787_828_400_000] {
+        let record = velstra_cloud_model::Resource::new(
+            velstra_cloud_model::meta::Meta::new(
+                name(&format!("projects/spent/usage/{at:013}")),
+                velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+            ),
+            velstra_cloud_model::usage::UsageRecordSpec {
+                project: "projects/spent".into(),
+                at: velstra_cloud_model::meta::Timestamp(at),
+                used: Default::default(),
+            },
+            Default::default(),
+        );
+        usage
+            .create(&record, &velstra_cloud_model::Writer::controller("quota"))
+            .await
+            .unwrap();
+    }
+
+    api.delete(&name("projects/spent"), None, &who())
+        .await
+        .expect("a project is not held by the readings taken of it");
+}

@@ -1093,6 +1093,26 @@ pub fn nobody_reports_on(kind: &str) -> bool {
     )
 }
 
+/// Whether objects of this kind are a record of something that already
+/// happened, rather than something somebody holds.
+///
+/// The distinction matters at exactly one moment: deleting the thing they are
+/// about. A machine in a project is a reason not to delete the project — the
+/// person is being told there is still something running. An hourly usage
+/// reading is not: nobody is waiting on it, it cannot be deleted through the
+/// API by design (a number somebody can edit after the fact is not a bill), and
+/// counting it made **every project older than an hour permanently
+/// undeletable**. Found on a real cell, where thirty-five projects could not be
+/// removed by any means the API offers.
+///
+/// Records outlive what they are about and go away with their own retention.
+/// That is already how `operations` behaved, for the same reason, written down
+/// once here instead of as an exception per caller — the next record kind
+/// should inherit the answer rather than repeat the bug.
+pub fn is_a_record(kind: &str) -> bool {
+    matches!(kind, "audit" | "usage" | "operations")
+}
+
 /// Whether an operation has finished, computed from its target and nothing
 /// else.
 ///
