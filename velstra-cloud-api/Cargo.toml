@@ -12,6 +12,9 @@ name = "velstra-cloud-api"
 path = "src/bin/velstra-cloud-api.rs"
 
 [dependencies]
+# Already in the tree through axum; named here because this crate parses a
+# console stream's query itself, in the middleware, before any extractor runs.
+serde_urlencoded = "0.7"
 velstra-cloud-console = { path = "../velstra-cloud-console" }
 base64 = { workspace = true }
 velstra-cloud-model = { workspace = true }

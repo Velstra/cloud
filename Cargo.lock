@@ -2074,6 +2074,7 @@ dependencies = [
  "prost 0.13.5",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",

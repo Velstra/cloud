@@ -73,6 +73,29 @@ pub fn is_cell_admin(who: &Identity) -> bool {
 /// path build `Writer::agent(node)` without a second store read.
 pub const AGENT_SCOPE_PREFIX: &str = "agent:";
 
+/// The prefix of the scope a console ticket carries: `console:projects/p/instances/i`.
+///
+/// A ticket is **not** a way to act as the person it was minted for. It opens one
+/// guest's serial line for one minute and can do nothing else — so it is written
+/// as its own scope rather than by rebuilding that person's powers, which would
+/// turn a ticket in a URL into a session key for the whole cell.
+///
+/// This is also why the ticket path does not carry `cell-admin` even when the
+/// person who asked holds it. The permission question was answered at mint time,
+/// against one machine; carrying it forward as "who they are" would answer a
+/// different, much larger question.
+pub const CONSOLE_SCOPE_PREFIX: &str = "console:";
+
+/// The one guest an identity may stream, if it authenticated with a ticket.
+///
+/// `None` for every other caller, which is what makes the stream handler ask the
+/// ordinary read question of them instead.
+pub fn console_instance(who: &Identity) -> Option<&str> {
+    who.scopes
+        .iter()
+        .find_map(|s| s.strip_prefix(CONSOLE_SCOPE_PREFIX))
+}
+
 /// The node an identity is the agent for, if it authenticated with a node token.
 ///
 /// `None` for a person, a service account or an operator — none of which may

@@ -217,6 +217,13 @@ async fn console() -> Response {
 
 /// Every request carries a bearer token, and this is the only place that knows
 /// it is a bearer token. What kind of token it is belongs to the verifier.
+///
+/// With one exception, and it is not a loophole but the reason the ticket
+/// exists: a **console stream** presents its ticket instead. `new WebSocket(url)`
+/// takes a URL and nothing else — a browser has no way to set a header on the
+/// upgrade — so a console stream that demanded one was a console no browser
+/// could open. That is exactly what shipped, and it passed every test, because a
+/// test client sends the header a browser cannot.
 async fn authenticate(
     State(api): State<Api>,
     mut request: axum::extract::Request,
@@ -227,9 +234,35 @@ async fn authenticate(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let identity = identify(api.verifier(), header.as_deref()).await?;
+    let identity = match (header.as_deref(), console_ticket(&request)) {
+        // The header wins where there is one, so nothing about an ordinary
+        // request changes and a ticket cannot be used to *widen* a session.
+        (Some(_), _) => identify(api.verifier(), header.as_deref()).await?,
+        (None, Some((session, ticket))) => {
+            let session = ResourceName::parse(&session)?;
+            api.identity_from_console_ticket(&session, &ticket).await?
+        }
+        (None, None) => identify(api.verifier(), None).await?,
+    };
     request.extensions_mut().insert(identity);
     Ok(next.run(request).await)
+}
+
+/// The session and ticket a console stream carries, and only a console stream.
+///
+/// Narrow on purpose: a GET, the `:consoleStream` verb, both values present.
+/// Anything else takes the ordinary door.
+fn console_ticket(request: &axum::extract::Request) -> Option<(String, String)> {
+    if request.method() != axum::http::Method::GET {
+        return None;
+    }
+    let uri = request.uri();
+    if !uri.path().ends_with(":consoleStream") {
+        return None;
+    }
+    let query: BTreeMap<String, String> =
+        serde_urlencoded::from_str(uri.query().unwrap_or_default()).ok()?;
+    Some((query.get("session")?.clone(), query.get("ticket")?.clone()))
 }
 
 /// What a path addresses. The distinction is the segment count, per AIP: an
@@ -335,11 +368,6 @@ async fn read(
         // the node checks, and a stream that opened on a cookie alone would be
         // one another page could open in the background.
         Target::Verb { name, verb } if verb == "consoleStream" => {
-            let Some(upgrade) = upgrade else {
-                return Err(ApiError::invalid(
-                    "a console stream is a websocket; this request did not ask to upgrade",
-                ));
-            };
             let (Some(session), Some(ticket)) =
                 (query.get("session").cloned(), query.get("ticket").cloned())
             else {
@@ -347,13 +375,37 @@ async fn read(
                     "a console stream carries the session and the ticket it was given",
                 ));
             };
-            // Read is the floor here as well, so a stream cannot be opened
-            // against a guest the caller may not even see. What the holder may
-            // *do* was decided when the ticket was minted and is on the session.
-            // Reading the guest is the floor: a stream must not open against a
-            // machine the caller may not even see. `get` is the read the API
-            // already authorises, and its answer is thrown away.
-            api.get(&name, &who).await?;
+            // Two credentials, two questions.
+            //
+            // A ticket is minted against one guest, so the question is whether
+            // it is *this* guest — exact, and stronger than any role check: a
+            // ticket that leaked out of a URL opens the machine it was made for
+            // and nothing else.
+            //
+            // A bearer token is the person, so the question is the ordinary one
+            // every reader answers. `get` is that read, and its answer is thrown
+            // away.
+            match crate::sessions::console_instance(&who) {
+                Some(instance) if instance == name.to_string() => {}
+                Some(_) => {
+                    return Err(ApiError::new(
+                        crate::error::Code::PermissionDenied,
+                        "that ticket was minted for another guest",
+                    ));
+                }
+                None => {
+                    api.get(&name, &who).await?;
+                }
+            }
+            // Only once the caller is allowed does the shape of the request
+            // matter. A refusal that leads with "you did not ask to upgrade"
+            // tells somebody presenting a ticket for another machine that their
+            // request was nearly right.
+            let Some(upgrade) = upgrade else {
+                return Err(ApiError::invalid(
+                    "a console stream is a websocket; this request did not ask to upgrade",
+                ));
+            };
             let endpoint = api
                 .console_endpoint_for(&ResourceName::parse(&session)?)
                 .await?;

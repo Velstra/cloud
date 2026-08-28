@@ -367,8 +367,10 @@ const openConsole = (coll, id) =>
   request("POST", writePath(coll) + "/" + encodeURIComponent(id) + ":console", { body: {} })
     .then((r) => r.body);
 
-/// The full resource name of an object in the current scope, which is what a
-/// console stream's URL is built from.
+/// The **request path** of an object in the current scope — `/api/v1/…`,
+/// already prefixed. Named for what it is: a caller that read this as a bare
+/// resource name prepended the prefix a second time and built a URL that
+/// matched no route.
 const consolePath = (coll, id) =>
   basePath(coll) + "/" + encodeURIComponent(id);
 

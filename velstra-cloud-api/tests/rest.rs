@@ -141,6 +141,33 @@ impl Harness {
         }
     }
 
+    /// The same request with **no** `Authorization` header — which is the only
+    /// kind of request a browser can make when it opens a WebSocket.
+    async fn send_bare(&self, path: &str) -> Answer {
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/{path}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        Answer {
+            status,
+            body,
+            etag: None,
+            revision_header: None,
+            headers: Vec::new(),
+        }
+    }
+
     async fn get(&self, path: &str) -> Answer {
         self.send("GET", path, None, &[]).await
     }
@@ -4047,4 +4074,153 @@ async fn a_usage_record_cannot_be_written_edited_or_deleted_through_the_api() {
     let read = h.get(&name).await;
     assert_eq!(read.status, StatusCode::OK);
     assert_eq!(read.body["spec"]["used"]["vcpus"], json!(0));
+}
+
+/// A guest a node has already claimed, which is what a console needs: the
+/// session names the node, and only the machine with the guest has the socket.
+async fn a_claimed_guest(h: &Harness) -> String {
+    // A guest a node has already claimed, written the way a claimed guest
+    // exists: the status belongs to whoever runs the object, so it is created
+    // with the owner already on it rather than taken over afterwards.
+    let name = "projects/p1/instances/i1".to_string();
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut instance = velstra_cloud_model::resources::Instance::new(
+        velstra_cloud_model::meta::Meta::new(
+            name.parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        Default::default(),
+        velstra_cloud_model::resources::InstanceStatus {
+            node: Some("node-a".into()),
+            ..Default::default()
+        },
+    );
+    instance.meta.generation = 1;
+    instances
+        .create(
+            &instance,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .expect("a claimed guest");
+    name
+}
+
+#[tokio::test]
+async fn a_console_stream_is_opened_with_the_ticket_because_a_browser_has_no_header() {
+    // The bug this pins shipped whole and passed every test, because every test
+    // client sends the header a browser cannot: `new WebSocket(url)` takes a URL
+    // and nothing else. The grant succeeded, the stream came back "HTTP
+    // Authentication failed; no valid credentials available", and the console
+    // was unusable from the only place it is ever used.
+    let h = Harness::new();
+    let name = a_claimed_guest(&h).await;
+
+    let opened = h.post(&format!("{name}:console"), json!({})).await;
+    assert_eq!(opened.status, StatusCode::OK, "{:?}", opened.body);
+    let session = opened.body["session"].as_str().expect("a session");
+    let ticket = opened.body["ticket"].as_str().expect("a ticket");
+
+    let path = format!(
+        "{name}:consoleStream?session={}&ticket={}",
+        urlencode(session),
+        urlencode(ticket)
+    );
+    let answered = h.send_bare(&path).await;
+    assert_ne!(
+        answered.status,
+        StatusCode::UNAUTHORIZED,
+        "the ticket was not accepted as the credential it is: {:?}",
+        answered.body
+    );
+    // It gets as far as the handler and is turned away there for the one reason
+    // a test client cannot avoid: this is not a real upgrade. That is the proof
+    // it passed the door.
+    assert_eq!(answered.status, StatusCode::BAD_REQUEST, "{:?}", answered.body);
+    assert!(
+        answered.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("upgrade"),
+        "{:?}",
+        answered.body
+    );
+
+    // A guessed ticket is still nobody.
+    let guessed = format!(
+        "{name}:consoleStream?session={}&ticket=00000000-0000-0000-0000-000000000000",
+        urlencode(session)
+    );
+    assert_eq!(
+        h.send_bare(&guessed).await.status,
+        StatusCode::UNAUTHORIZED,
+        "a guessed ticket opened a console"
+    );
+
+    // A ticket for one guest does not open another. This is the check that
+    // replaced "can this person read it": the person may well be able to, and
+    // the ticket still may not, because it was minted against one machine.
+    let elsewhere_guest = a_second_claimed_guest(&h).await;
+    let wrong_guest = format!(
+        "{elsewhere_guest}:consoleStream?session={}&ticket={}",
+        urlencode(session),
+        urlencode(ticket)
+    );
+    assert_eq!(
+        h.send_bare(&wrong_guest).await.status,
+        StatusCode::FORBIDDEN,
+        "a ticket opened a guest it was not minted for"
+    );
+
+    // And the exemption is exactly this one verb: nothing else opens without a
+    // header just because it carries a ticket in its query.
+    let elsewhere = format!("{name}?session={}&ticket={}", urlencode(session), urlencode(ticket));
+    assert_eq!(
+        h.send_bare(&elsewhere).await.status,
+        StatusCode::UNAUTHORIZED,
+        "a ticket in the query opened an ordinary read"
+    );
+}
+
+fn urlencode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+/// A second claimed guest, for the question "does this ticket open that one".
+async fn a_second_claimed_guest(h: &Harness) -> String {
+    let name = "projects/p1/instances/i2".to_string();
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut instance = velstra_cloud_model::resources::Instance::new(
+        velstra_cloud_model::meta::Meta::new(
+            name.parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        Default::default(),
+        velstra_cloud_model::resources::InstanceStatus {
+            node: Some("node-a".into()),
+            ..Default::default()
+        },
+    );
+    instance.meta.generation = 1;
+    instances
+        .create(
+            &instance,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .expect("a second claimed guest");
+    name
 }

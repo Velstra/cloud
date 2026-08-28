@@ -189,7 +189,7 @@ pub fn sha256_hex(ticket: &str) -> String {
 /// mismatch in length is simply a no. The point is the loop: an early return on
 /// the first differing byte would make the time taken a measurement of how many
 /// leading characters were right, which is all somebody guessing needs.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
