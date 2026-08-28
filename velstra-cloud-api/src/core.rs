@@ -3820,6 +3820,43 @@ impl Api {
         if parent.is_empty() {
             return Ok(());
         }
+        let named_ports = sent
+            .and_then(|s| s.get("ports"))
+            .and_then(Value::as_array)
+            .is_some_and(|p| !p.is_empty());
+        let asked = spec
+            .get("networks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        if !asked.is_empty() {
+            if named_ports {
+                return Err(ApiError::invalid(
+                    "name networks or name ports, not both: they are two answers to one \
+                     question, and picking one silently is how a machine ends up on a network \
+                     nobody asked for",
+                )
+                .at("spec.networks"));
+            }
+            let mut minted = Vec::new();
+            for entry in &asked {
+                let Some(network) = entry.as_str().filter(|n| !n.is_empty()) else {
+                    return Err(ApiError::invalid(
+                        "a network is named, as in `projects/p1/networks/default`",
+                    )
+                    .at("spec.networks"));
+                };
+                minted.push(Value::String(self.mint_a_port_on(parent, network).await?));
+            }
+            spec["ports"] = Value::Array(minted);
+            // Consumed: what gets stored is `ports`. Two fields describing one
+            // set of interfaces is two fields that drift.
+            spec["networks"] = json!([]);
+            return Ok(());
+        }
+        spec["networks"] = json!([]);
+
         // Named some: theirs. Named none at all: ours. Named an empty list: a
         // guest on no network, which the console already warns about.
         match sent.and_then(|s| s.get("ports")).and_then(Value::as_array) {
@@ -3871,6 +3908,68 @@ impl Api {
         .await?;
         spec["ports"] = json!([port]);
         Ok(())
+    }
+
+    /// One port on a named network, on that network's subnet.
+    ///
+    /// The network has to be this project's. `make` does not authorise — it is
+    /// for objects the platform decided on — so a name from somewhere else would
+    /// mint a port in a stranger's project on their behalf, which is the whole
+    /// hole. Checked here rather than trusted.
+    async fn mint_a_port_on(&self, parent: &str, network: &str) -> ApiResult<String> {
+        if !network.starts_with(&format!("{parent}/networks/")) {
+            return Err(ApiError::invalid(format!(
+                "`{network}` is not a network of this project. A guest can only be put on a \
+                 network its own project holds."
+            ))
+            .at("spec.networks"));
+        }
+        if self
+            .collection("networks")?
+            .get(network)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!("there is no network called `{network}`"),
+            )
+            .at("spec.networks"));
+        }
+
+        // The subnet is what carries the range an address comes out of, and a
+        // network without one can hold a port that never gets an address —
+        // a guest that boots with a dead NIC and no sign of why.
+        let subnets: Vec<velstra_cloud_model::resources::Subnet> =
+            self.typed_list(parent, "subnets").await?;
+        let Some(subnet) = subnets
+            .iter()
+            .find(|s| s.spec.network == network && s.meta.deleted_at.is_none())
+        else {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "`{network}` has no subnet, so a port on it could never be given an \
+                     address. Add a subnet to it first."
+                ),
+            )
+            .at("spec.networks"));
+        };
+
+        let port = format!("{parent}/ports/{}", minted("ports"));
+        self.make(
+            &port,
+            "ports",
+            json!({
+                "network": network,
+                "subnet": subnet.meta.name.to_string(),
+                "security_groups": []
+            }),
+        )
+        .await?;
+        Ok(port)
     }
 
     async fn settle_network(&self, spec: &mut Value) -> ApiResult<()> {

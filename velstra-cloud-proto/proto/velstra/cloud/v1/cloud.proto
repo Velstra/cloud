@@ -660,6 +660,14 @@ message InstanceSpec {
   // start in that group, not each member in turn — otherwise a fleet's boot is
   // the sum of every delay rather than the longest one.
   uint32 start_delay_s = 15;
+  // Networks to put this guest on — a request, not a record. The platform mints
+  // one port per entry and stores those; this comes back empty, because two
+  // fields describing one set of interfaces is two fields that drift.
+  //
+  // A port is a join — this guest, that network, this address — which is right
+  // in the model and wrong in a form. Naming both this and `ports` is refused
+  // rather than merged.
+  repeated string networks = 16;
 }
 
 message InstanceStatus {

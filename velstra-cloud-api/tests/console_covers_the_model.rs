@@ -123,6 +123,7 @@ mod complete {
             root_disk_gib: 1,
             desired_state: DesiredState::Running,
             ports: vec!["projects/p1/ports/pt1".into()],
+            networks: Vec::new(),
             ssh_keys: vec!["ssh-ed25519 AAAA".into()],
             user_data: Some("#cloud-config".into()),
             node: Some("node-a".into()),

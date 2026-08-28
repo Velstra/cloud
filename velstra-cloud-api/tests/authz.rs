@@ -1923,3 +1923,159 @@ async fn a_projects_own_family_shadows_the_catalogues_in_the_listing_too() {
         "an image under a project is that project's alone"
     );
 }
+
+#[tokio::test]
+async fn a_guest_goes_on_a_named_network_without_anybody_making_a_port() {
+    // A port is a join — this guest, that network, this address — which is right
+    // in the model and wrong in a form. Asked for one machine on their own
+    // network, a customer had to make the port themselves: knowing a port
+    // exists, that it hangs off a subnet rather than a network, and that it has
+    // to be made before the guest and not after.
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "prod", "spec": { "mtu": 1450, "vni": 0 }}),
+        &who(ADA),
+    )
+    .await
+    .expect("a tenant makes a network");
+    api.create(
+        "projects/p1",
+        "subnets",
+        &json!({ "id": "prod", "spec": {
+            "network": "projects/p1/networks/prod",
+            "cidr": "10.60.0.0/24",
+            "gateway": "10.60.0.1"
+        }}),
+        &who(ADA),
+    )
+    .await
+    .expect("with a range on it");
+
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "auf-prod", "spec": {
+            "image": "images/x", "vcpus": 1, "memory_mib": 512, "root_disk_gib": 2,
+            "networks": ["projects/p1/networks/prod"]
+        }}),
+        &who(ADA),
+    )
+    .await
+    .expect("and puts a machine on it by naming it");
+
+    let stored: velstra_cloud_model::resources::Instance = api
+        .typed(&name("projects/p1/instances/auf-prod"))
+        .await
+        .unwrap();
+    assert_eq!(stored.spec.ports.len(), 1, "no port was minted");
+    assert!(
+        stored.spec.networks.is_empty(),
+        "`networks` is a request, not a record — two fields describing one set \
+         of interfaces is two fields that drift"
+    );
+    let port: velstra_cloud_model::resources::Port =
+        api.typed(&name(&stored.spec.ports[0])).await.unwrap();
+    assert_eq!(port.spec.network, "projects/p1/networks/prod");
+    assert_eq!(
+        port.spec.subnet, "projects/p1/subnets/prod",
+        "the port was not put on the network's own subnet"
+    );
+}
+
+#[tokio::test]
+async fn naming_a_network_and_a_port_at_once_is_refused_rather_than_merged() {
+    // Two answers to one question. Picking one silently is how somebody ends up
+    // with a machine on a network they did not ask for.
+    let api = cell().await;
+    let refusal = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "beides", "spec": {
+                "image": "images/x", "vcpus": 1, "memory_mib": 512, "root_disk_gib": 2,
+                "networks": ["projects/p1/networks/prod"],
+                "ports": ["projects/p1/ports/p"]
+            }}),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("both at once is not a request anybody can answer");
+    assert_eq!(refusal.code, velstra_cloud_api::Code::InvalidArgument);
+    assert!(
+        refusal.to_string().contains("not both"),
+        "the refusal does not say what to do: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_network_in_somebody_elses_project_is_not_one_to_mint_on() {
+    // The minting path does not authorise — it is for objects the platform
+    // decided on — so a name from somewhere else would make a port in a
+    // stranger's project, on their quota, at their request.
+    let api = cell().await;
+    let refusal = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "fremd", "spec": {
+                "image": "images/x", "vcpus": 1, "memory_mib": 512, "root_disk_gib": 2,
+                "networks": ["projects/p2/networks/default"]
+            }}),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("a guest cannot be put on another project's network");
+    assert!(
+        refusal.to_string().contains("its own project"),
+        "wrong refusal: {refusal}"
+    );
+    let strangers = api
+        .list_for(
+            "projects/p2",
+            "ports",
+            &velstra_cloud_api::Filter::none(),
+            &who(OPERATOR),
+        )
+        .await
+        .unwrap();
+    assert!(
+        strangers.items.is_empty(),
+        "a port was minted in a project the caller does not hold"
+    );
+}
+
+#[tokio::test]
+async fn a_network_with_no_subnet_is_refused_before_the_guest_exists() {
+    // A port on a network with no range gets no address, and the guest boots
+    // with a dead NIC and no sign of why — the quietest failure this path has.
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "leer", "spec": { "mtu": 1450, "vni": 0 }}),
+        &who(ADA),
+    )
+    .await
+    .expect("a network with nothing on it");
+    let refusal = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "ohne-bereich", "spec": {
+                "image": "images/x", "vcpus": 1, "memory_mib": 512, "root_disk_gib": 2,
+                "networks": ["projects/p1/networks/leer"]
+            }}),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("a network with no subnet cannot carry a port");
+    assert!(
+        refusal.to_string().contains("no subnet"),
+        "wrong refusal: {refusal}"
+    );
+}

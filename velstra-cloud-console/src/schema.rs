@@ -1112,16 +1112,43 @@ const INSTANCE_FIELDS: &[Field] = &[
         // to make will have no network at all. `consequences` in form.js says
         // it, beside the button.
         advanced: true,
-        help: "Attached in this order. A guest with none has no network at all — \
-               it cannot be reached, and its cloud-init cannot fetch the keys \
-               and hostname this platform would give it.",
-        when_empty: "This project has no ports yet. A port is a guest's NIC, and \
-                     it is made in three steps: a Network, then a Subnet on it \
-                     with the range addresses come from, then a Port on that \
-                     subnet. You can create this guest without one and attach a \
-                     port later — but until you do it has no network at all.",
+        help: "For a NIC that already exists — one holding an address you want \
+               this guest to keep. To simply put a machine on a network, name the \
+               network above and the port is made for you.",
+        when_empty: "This project has no ports yet, and does not need any: name a \
+                     network above and one is made. A port of your own is for the \
+                     case where the address has to outlive the machine.",
         derived: false,
         at_creation: false,
+    },
+    Field {
+        key: "networks",
+        label: "Networks",
+        kind: Kind::RefList {
+            collection: "networks",
+            spelling: Spelling::Name,
+        },
+        required: false,
+        // Advanced, and that is the change the default network paid for.
+        //
+        // A port is a join — this guest, that network, this address — right in
+        // the model and wrong in a form. The old form asked for one and the
+        // empty-state taught the ritual: a Network, then a Subnet on it, then a
+        // Port on that subnet, in that order, before the machine. Three objects
+        // and a dependency order, to answer "put it on my network".
+        //
+        // The port field was in the common path because hiding it was *why*
+        // people ended up with a guest that had no NIC. That reason is gone:
+        // empty now means the project's default network, so the honest thing is
+        // to say which network they are getting rather than ask. The line beside
+        // the Create button says it.
+        advanced: true,
+        help: "Left empty, this guest joins your project's default network — made \
+               the first time somebody needs it, so two machines in a project can \
+               talk without anybody configuring anything.",
+        when_empty: "",
+        derived: false,
+        at_creation: true,
     },
     Field {
         key: "sshKeys",
