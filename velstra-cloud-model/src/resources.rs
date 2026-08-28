@@ -59,6 +59,30 @@ pub trait Observed {
     fn self_owned(&self) -> bool {
         false
     }
+
+    /// True when this kind's `status` is the platform's to write, because no
+    /// agent will ever write it.
+    ///
+    /// The access rule's whole point is that exactly one party writes a status,
+    /// and it enforces that by refusing every controller. On a kind no node is
+    /// ever assigned, that refusal protects nothing and costs everything: there
+    /// is no second writer to keep out, so the field ends up with **no** writer
+    /// at all. `users.status.lastLogin` was such a field — the login path tried
+    /// to record every sign-in and was refused every time, into a warning.
+    ///
+    /// Declared per type rather than read off a list of kinds, because the
+    /// question is about the *shape* of the object — does anything own its
+    /// status — and a type that answers yes here must answer `None` to
+    /// [`Observed::owner`], which the test below checks.
+    ///
+    /// Note this is not the same question as
+    /// [`crate::reconcile::nobody_reports_on`]. A controller reports on an image
+    /// source: it says when it last looked and what it found, and an operator
+    /// needs to see a source that cannot reach its checksums file. What is true
+    /// of it is that no *agent* does.
+    fn written_by_the_platform(&self) -> bool {
+        false
+    }
 }
 
 impl<S, T: Observed> Resource<S, T> {
@@ -104,6 +128,8 @@ pub type Capture = Resource<crate::capture::CaptureSpec, crate::capture::Capture
 pub type UsageRecord = Resource<crate::usage::UsageRecordSpec, crate::usage::UsageRecordStatus>;
 pub type ConsoleSession =
     Resource<crate::console::ConsoleSessionSpec, crate::console::ConsoleSessionStatus>;
+pub type ImageSource =
+    Resource<crate::images::ImageSourceSpec, crate::images::ImageSourceStatus>;
 
 impl Observed for crate::capture::CaptureStatus {
     fn observed_generation(&self) -> u64 {
@@ -116,6 +142,26 @@ impl Observed for crate::capture::CaptureStatus {
         self.node.as_deref()
     }
 }
+
+impl Observed for crate::images::ImageSourceStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn written_by_the_platform(&self) -> bool {
+        true
+    }
+    /// The image controller, which is a controller and not an agent — nothing
+    /// assigns a source to a machine, and what it reports is the result of
+    /// asking the network a question, not of running anything.
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl Assigned for crate::images::ImageSourceSpec {}
 
 impl Observed for crate::usage::UsageRecordStatus {
     fn observed_generation(&self) -> u64 {
@@ -881,6 +927,39 @@ pub type Node = Resource<NodeSpec, NodeStatus>;
 
 // ---- image ---------------------------------------------------------------
 
+/// The prefix an instance uses to ask for "the newest of this family" rather
+/// than for one image by digest.
+///
+/// `families/debian-13` is not a resource — nothing is stored under that name.
+/// It is resolved **once, when the instance is created**, and what is written
+/// down is the concrete image. That order matters more than it looks: a guest
+/// whose image changed under it on the next restart would be a guest that boots
+/// something nobody asked for, at a moment nobody chose. What an operator wants
+/// from "always the newest" is that *new* machines get it — and that is exactly
+/// what this gives them, while every existing guest keeps the bytes it was built
+/// from.
+pub const FAMILY_PREFIX: &str = "families/";
+/// The newest image of a family, by when this cell learned of it.
+///
+/// Ordering is by creation time and not by parsing `version`: every scheme for
+/// comparing version strings is wrong for somebody's — `1.10` against `1.9`,
+/// `20260815` against `2026-08-15`, a rebuild that keeps the version and changes
+/// the bytes. When the cell first saw an image is a fact it owns, and it is the
+/// same answer a person means by "the newest one we have".
+///
+/// Anything on its way out is skipped: handing a new guest an image that is
+/// being deleted is how a machine ends up unable to boot minutes after it was
+/// created.
+pub fn newest_of_family<'a, I>(images: I, family: &str) -> Option<&'a Image>
+where
+    I: IntoIterator<Item = &'a Image>,
+{
+    images
+        .into_iter()
+        .filter(|i| i.spec.family == family && i.meta.deleted_at.is_none())
+        .max_by_key(|i| i.meta.created_at.0)
+}
+
 /// Content-addressed and immutable: the id *is* the digest.
 ///
 /// There is no way to replace the bytes behind an image that instances were
@@ -888,6 +967,29 @@ pub type Node = Resource<NodeSpec, NodeStatus>;
 /// not a state this system can reach.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImageSpec {
+    /// What this image **is**, in the words somebody would use to ask for it:
+    /// `debian-13`, `ubuntu-24-04`, `our-base`.
+    ///
+    /// An image had no name at all. Its id is its digest, because that is what
+    /// makes fetching one verifiable — and the console, having nothing else,
+    /// showed people `images/sha256-cbf3e1f588f02f8d738dbecb…` and asked them to
+    /// pick an operating system from it. The picker guessed a label out of the
+    /// source URL's last path segment, which works until somebody publishes from
+    /// a URL that does not end in a filename, and is a guess everywhere else.
+    ///
+    /// A family, not a name, because the useful handle is the one that stays the
+    /// same when the bytes change: the thing an operator means by "Debian 13" is
+    /// a series of images, and what they want from it is the newest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub family: String,
+    /// Which one in the family: `20260815`, `1.29.2`, a build number.
+    ///
+    /// Free-form and **not** used for ordering — "newest" is decided by when the
+    /// cell learned about the image, not by parsing this, because every scheme
+    /// for comparing version strings is wrong for somebody's. This is what a
+    /// person reads to tell two of them apart.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
     /// `sha256:…` — carried in the resource id too, which is what makes
     /// fetching one verifiable.
     pub digest: String,

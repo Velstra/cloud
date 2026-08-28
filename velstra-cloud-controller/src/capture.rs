@@ -106,6 +106,11 @@ impl Reconciler for CaptureController {
         let image: velstra_cloud_model::resources::Image = Resource::new(
             Meta::new(image_name, capture.meta.placement.clone()),
             ImageSpec {
+                // A capture is one machine's bytes at one moment, not a series
+                // somebody rotates — so it joins no family, and asking for
+                // `families/…` will never hand somebody a snapshot of a guest.
+                family: String::new(),
+                version: String::new(),
                 digest: digest.clone(),
                 source_instance: Some(capture.spec.instance.clone()),
                 format: velstra_cloud_model::resources::ImageFormat::Raw,

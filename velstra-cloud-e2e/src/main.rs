@@ -436,6 +436,8 @@ async fn seed(store: Arc<dyn Store>) {
         Resource::new(
             meta(image),
             ImageSpec {
+                family: "debian-13".into(),
+                version: "seed".into(),
                 source_instance: None,
                 digest: "sha256:3f9a2b".into(),
                 format: ImageFormat::Raw,

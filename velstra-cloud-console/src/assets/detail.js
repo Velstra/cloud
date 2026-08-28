@@ -63,7 +63,9 @@ function nameLink(value) {
   const segs = s.split("/");
   if (segs.length < 2 || segs.length % 2 !== 0) return null;
   const coll = collection(segs[segs.length - 2]);
-  return coll ? el("button.link.mono", { type: "button", title: s, onclick: () => goTo(s) }, shortName(s)) : null;
+  return coll
+    ? nameTheImage(s, el("button.link.mono", { type: "button", title: s, onclick: () => goTo(s) }, shortName(s)))
+    : null;
 }
 
 /// A reference on a form field is followable even when it arrives as a bare id,
@@ -79,8 +81,30 @@ function refValue(f, v) {
       ? coll.id + "/" + raw
       : "projects/" + session.project + "/" + coll.id + "/" + raw;
   return coll
-    ? el("button.link.mono", { type: "button", title: name, onclick: () => goTo(name) }, shortName(name))
+    ? nameTheImage(name, el("button.link.mono", { type: "button", title: name, onclick: () => goTo(name) }, shortName(name)))
     : el("span.mono", { title: raw }, shortName(raw));
+}
+
+/// Put a readable name on a link to an image, once the object is to hand.
+///
+/// A reference is rendered from the name alone, and an image's name is its
+/// digest — so every link to one read `images/sha256-cbf3e1f5…`, on the guest's
+/// own screen, where the one thing somebody wants to know is which operating
+/// system it runs. The lookup is asynchronous and the link is already on screen,
+/// so the text is replaced when the answer arrives; the digest stays as the
+/// hover title, because that is what identifies the bytes.
+function nameTheImage(name, node) {
+  const segs = String(name).split("/");
+  if (segs[segs.length - 2] !== "images") return node;
+  const coll = collection("images");
+  if (!coll) return node;
+  listBoth(coll)
+    .then((r) => {
+      const found = (r.items || []).find((o) => nameOf(o) === name);
+      if (found) node.textContent = imageTitle(found);
+    })
+    .catch(() => {});
+  return node;
 }
 
 async function goTo(name) {

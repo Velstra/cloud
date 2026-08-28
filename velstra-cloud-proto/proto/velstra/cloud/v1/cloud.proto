@@ -519,6 +519,12 @@ message ImageSpec {
   // deleted still says where it came from, which is what somebody looking at a
   // list of near-identical templates actually needs.
   optional string source_instance = 6;
+  // What this image is, in the words somebody would use to ask for it —
+  // `debian-13` — and which one in the family it is. The family is the handle
+  // that stays the same when the bytes change; `families/<family>` on an
+  // instance means "the newest of these".
+  string family = 7;
+  string version = 8;
 }
 
 message ImageStatus {
