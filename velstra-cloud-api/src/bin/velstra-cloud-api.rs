@@ -29,6 +29,23 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8443", env = "VELSTRA_LISTEN")]
     listen: String,
 
+    /// The certificate and key to serve TLS with, as PEM files.
+    ///
+    /// Both or neither. Without them this port is plaintext and says so in the
+    /// log at startup — which used to be the only option, with "put a reverse
+    /// proxy in front" as the documented answer. That is right for a cluster and
+    /// wrong for the box that is the whole cell: it has nothing in front of it,
+    /// and an administrator's password crossed the wire in the clear while the
+    /// URL said 8443 and looked like it would not.
+    ///
+    /// `quickstart` makes a self-signed pair and points these at it. Replacing
+    /// it with a real certificate is two file copies and a restart.
+    #[arg(long, env = "VELSTRA_TLS_CERT")]
+    tls_cert: Option<String>,
+
+    #[arg(long, env = "VELSTRA_TLS_KEY")]
+    tls_key: Option<String>,
+
     /// Bearer tokens, one per line, optionally `token subject`.
     ///
     /// Service accounts and automation. People sign in with a password and get a
@@ -222,6 +239,14 @@ async fn main() -> anyhow::Result<()> {
     // used once more, which otherwise sit in the store until it is compacted by
     // hand.
     api.spawn_session_sweeper();
+    let tls = match (args.tls_cert.as_deref(), args.tls_key.as_deref()) {
+        (Some(cert), Some(key)) => Some((cert.to_string(), key.to_string())),
+        // One without the other is a mistake worth naming rather than silently
+        // serving plaintext on a port somebody believes is encrypted.
+        (Some(_), None) => return Err(anyhow::anyhow!("--tls-cert needs --tls-key")),
+        (None, Some(_)) => return Err(anyhow::anyhow!("--tls-key needs --tls-cert")),
+        (None, None) => None,
+    };
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(
         listen = %args.listen,
@@ -245,6 +270,31 @@ async fn main() -> anyhow::Result<()> {
         let router = velstra_cloud_api::proxy::Router::new(routing_store, &args.cell, cells);
         velstra_cloud_api::server_routed(api, router)
     };
-    axum::serve(listener, served).await?;
+    match tls {
+        None => {
+            tracing::warn!(
+                "serving plaintext: no --tls-cert. A password crosses this connection in \
+                 the clear, so put TLS in front of it before it leaves a network you trust"
+            );
+            axum::serve(listener, served).await?;
+        }
+        Some((cert, key)) => {
+            // Chosen here rather than left to rustls, which will not choose: with
+            // more than one provider compiled in it panics at the first
+            // handshake instead of picking, and the panic is at *use* — so an
+            // API starts, says "serving https", and dies on the first
+            // connection.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let address = listener.local_addr()?;
+            drop(listener);
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .map_err(|e| anyhow::anyhow!("reading {cert} and {key}: {e}"))?;
+            tracing::info!(cert = %cert, "serving https");
+            axum_server::bind_rustls(address, config)
+                .serve(served.into_make_service())
+                .await?;
+        }
+    }
     Ok(())
 }

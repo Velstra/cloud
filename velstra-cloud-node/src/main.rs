@@ -22,6 +22,7 @@ mod quickstart;
 mod roles;
 mod seed;
 mod setup;
+mod tls;
 mod unlock;
 mod update;
 mod wizard;
@@ -38,6 +39,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Bring an existing seed up to what this package needs.
+    ///
+    /// Run by the package's `postinst` on every upgrade, and safe to run by
+    /// hand. It changes only what is provably safe and says what it changed.
+    MigrateSeed {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: std::path::PathBuf,
+    },
+
     /// Install the node image onto internal storage (interactive wizard).
     Install {
         /// A raw node image to clone from, overriding
@@ -116,6 +126,12 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::MigrateSeed { dir } => {
+            for said in setup::migrate_seed(&dir)? {
+                println!("  · {said}");
+            }
+            Ok(())
+        }
         Cmd::Install { source } => install::run_install(source),
         Cmd::Setup { dir, nixos, config } => setup::run_with(dir, nixos, config),
         Cmd::Quickstart { dir, listen, node } => quickstart::run(dir, listen, node),

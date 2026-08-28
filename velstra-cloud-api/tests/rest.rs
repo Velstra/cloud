@@ -616,6 +616,8 @@ async fn explain_placement_answers_with_the_chain_of_rejections() {
             gateway: false,
         },
         NodeStatus {
+            vmm: "qemu".into(),
+            fetching: Vec::new(),
             pci_devices: Vec::new(),
             cpu: Some(a_cpu()),
             capacity: Capacity {
@@ -1168,6 +1170,8 @@ async fn two_nodes(h: &Harness) {
                 gateway: false,
             },
             NodeStatus {
+                vmm: "qemu".into(),
+            fetching: Vec::new(),
                 pci_devices: Vec::new(),
                 cpu: Some(a_cpu()),
                 capacity: Capacity {
@@ -1181,7 +1185,7 @@ async fn two_nodes(h: &Harness) {
                 // Which nodes hold an image is worked out from these reports, so
                 // a node that has it says so itself.
                 images: if cached {
-                    vec!["projects/p1/images/sha256-abc".into()]
+                    vec!["sha256-9df3b1ed942629573eb17b71a0b34f560a183be8811bf770586815c6138da5f5".into()]
                 } else {
                     vec![]
                 },
@@ -1213,6 +1217,8 @@ async fn two_nodes(h: &Harness) {
             gateway: false,
         },
         NodeStatus {
+            vmm: "qemu".into(),
+            fetching: Vec::new(),
             pci_devices: Vec::new(),
             cpu: Some(a_cpu()),
             capacity: Capacity {
@@ -1253,7 +1259,7 @@ async fn running_guest(h: &Harness) -> String {
                     family: "debian-13".into(),
                     version: "20260815".into(),
                     source_instance: None,
-                    digest: "sha256:abc".into(),
+                    digest: "sha256:9df3b1ed942629573eb17b71a0b34f560a183be8811bf770586815c6138da5f5".into(),
                     ..Default::default()
                 },
                 velstra_cloud_model::resources::ImageStatus::default(),
@@ -1616,6 +1622,8 @@ async fn a_destination_without_the_image_is_refused_with_the_sentence() {
             gateway: false,
         },
         NodeStatus {
+            vmm: "qemu".into(),
+            fetching: Vec::new(),
             pci_devices: Vec::new(),
             cpu: Some(a_cpu()),
             capacity: Capacity {
@@ -2451,6 +2459,8 @@ async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reaso
             gateway: false,
         },
         NodeStatus {
+            vmm: "qemu".into(),
+            fetching: Vec::new(),
             devices: vec![
                 BlockDevice {
                     path: "/dev/sdb".into(),
@@ -4226,3 +4236,237 @@ async fn a_second_claimed_guest(h: &Harness) -> String {
         .expect("a second claimed guest");
     name
 }
+
+#[tokio::test]
+async fn an_image_is_called_what_a_person_would_call_it() {
+    // Two failures, in opposite directions, one week apart on the same cell.
+    //
+    // First an image published as `images/debian13` was accepted and its guest
+    // failed at boot — "carries no sha256 digest in its name, so this node
+    // cannot verify it" — because the node parsed the digest out of the name.
+    //
+    // Then the fix that made the name *be* the digest worked and was worse:
+    // every list an operator reads offered
+    // `sha256-d2af37c5246b899b63ed999281b927e2f241ee0340d26d2a74558b7636136d76`
+    // as the thing to pick an operating system from.
+    //
+    // The name is for people. The digest is in the spec, where the node reads
+    // it, and it addresses the bytes on disk.
+    let h = Harness::new();
+    let digest = "sha256:d2af37c5246b899b63ed999281b927e2f241ee0340d26d2a74558b7636136d76";
+    let spec = json!({
+        "digest": digest,
+        "format": "Qcow2",
+        "sourceUrl": "http://example.invalid/d.qcow2",
+        "family": "debian-13"
+    });
+
+    let named = h
+        .post("images", json!({ "id": "debian-13", "spec": spec }))
+        .await;
+    assert_eq!(named.status, StatusCode::ACCEPTED, "{:?}", named.body);
+    assert_eq!(named.body["target"], json!("images/debian-13"));
+
+    // And with no id at all, something a person can say: the family and enough
+    // digest to tell two builds apart.
+    let minted = h.post("images", json!({ "spec": spec })).await;
+    assert_eq!(minted.status, StatusCode::ACCEPTED, "{:?}", minted.body);
+    assert_eq!(minted.body["target"], json!("images/debian-13-d2af37c5"));
+}
+
+#[tokio::test]
+async fn a_port_no_guest_uses_is_not_waiting_for_anybody() {
+    // Found by signing in to a real cell: the first two entries on the attention
+    // list were a port nobody was using and the operation that had created it.
+    // Nothing programs a port until a guest that names it runs on a node, so a
+    // free port sits at `observedGeneration: 0` with no conditions for ever —
+    // and every reader that treats that as "waiting" is permanently wrong about
+    // it. It is the same argument a security group already makes about itself:
+    // an alarm about nothing is the kind that teaches people to ignore the real
+    // one.
+    let h = Harness::new();
+    let made = h
+        .post(
+            "projects/p1/ports",
+            json!({ "id": "spare", "spec": {
+                "network": "projects/p1/networks/n1",
+                "subnet": "projects/p1/subnets/s1",
+                "securityGroups": []
+            }}),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    let port = h.get("projects/p1/ports/spare").await;
+    assert_eq!(port.status, StatusCode::OK, "{:?}", port.body);
+    let ready = port.body["status"]["conditions"]
+        .as_array()
+        .and_then(|c| c.iter().find(|c| c["kind"] == "Ready"))
+        .cloned()
+        .expect("a port says whether it is waiting");
+    assert_eq!(ready["status"], json!("True"), "{ready}");
+    assert_eq!(ready["reason"], json!("Unused"), "{ready}");
+    // And it has been seen by everybody who is ever going to see it, which is
+    // what stops the console reading it as "nothing has looked at this".
+    assert_eq!(
+        port.body["status"]["observedGeneration"],
+        port.body["meta"]["generation"],
+        "{:?}",
+        port.body["status"]
+    );
+}
+
+#[tokio::test]
+async fn a_volume_with_no_pool_named_is_put_somewhere_rather_than_nowhere() {
+    // Found by walking the platform as a customer. A tenant cannot list pools —
+    // they are the cell's own — yet the volume form required naming one: a form
+    // no customer could fill in. And leaving it empty was worse than either
+    // answer, because an empty pool slipped past the wrong-pool guard, matched
+    // no pool agent's filter, and the volume sat unprovisioned for ever with an
+    // empty status. The quietest failure this platform has, reachable by
+    // leaving a field blank.
+    let h = Harness::new();
+    let writer = writer();
+    // Two accepting pools with different room, and one that is not accepting.
+    for (id, free, accepting) in [("small", 50u64, true), ("roomy", 500, true), ("closed", 900, false)] {
+        let mut pool = velstra_cloud_model::resources::Pool::new(
+            velstra_cloud_model::meta::Meta::new(
+                format!("pools/{id}").parse().unwrap(),
+                velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+            ),
+            velstra_cloud_model::resources::PoolSpec {
+                accepting,
+                labels: Vec::new(),
+            },
+            velstra_cloud_model::resources::PoolStatus {
+                capacity_gib: 1000,
+                allocated_gib: 1000 - free,
+                ..Default::default()
+            },
+        );
+        pool.meta.generation = 1;
+        h.pools().create(&pool, &writer).await.unwrap();
+    }
+
+    let made = h
+        .post("projects/p1/volumes", json!({ "id": "auto", "spec": { "sizeGib": 5 } }))
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    let stored = h.get("projects/p1/volumes/auto").await;
+    // The accepting pool with the most room, written down — never the closed
+    // one, however large, and never the empty string that provisions nothing.
+    assert_eq!(stored.body["spec"]["pool"], json!("roomy"), "{:?}", stored.body["spec"]);
+}
+
+#[tokio::test]
+async fn a_network_needs_no_number_from_the_person_asking_for_one() {
+    // A tenant clicking "new network" was asked for a **VXLAN network
+    // identifier**: a number whose only correct value is "one nothing else in
+    // this cell uses", which a tenant cannot know and has no business knowing.
+    // The model's own comment already said it is "assigned by the controller
+    // from the cell's range, never chosen by a tenant" — the form asked anyway.
+    let h = Harness::new();
+    let first = h
+        .post("projects/p1/networks", json!({ "id": "a", "spec": {} }))
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{:?}", first.body);
+    let second = h
+        .post("projects/p1/networks", json!({ "id": "b", "spec": {} }))
+        .await;
+    assert_eq!(second.status, StatusCode::ACCEPTED, "{:?}", second.body);
+
+    let a = h.get("projects/p1/networks/a").await;
+    let b = h.get("projects/p1/networks/b").await;
+    let (va, vb) = (a.body["spec"]["vni"].as_u64().unwrap(), b.body["spec"]["vni"].as_u64().unwrap());
+    assert!(va >= 5000 && vb >= 5000, "{va} {vb}");
+    assert_ne!(va, vb, "two networks were given the same VNI");
+    // And an MTU that fits inside a VXLAN header rather than the wire's own,
+    // which black-holes every large packet in a way that reads as an
+    // application bug for a week.
+    assert_eq!(a.body["spec"]["mtu"], json!(1450), "{:?}", a.body["spec"]);
+
+    // An operator who does want a specific number still gets it.
+    let pinned = h
+        .post("projects/p1/networks", json!({ "id": "c", "spec": { "vni": 9001, "mtu": 9000 } }))
+        .await;
+    assert_eq!(pinned.status, StatusCode::ACCEPTED, "{:?}", pinned.body);
+    let c = h.get("projects/p1/networks/c").await;
+    assert_eq!(c.body["spec"]["vni"], json!(9001));
+    assert_eq!(c.body["spec"]["mtu"], json!(9000));
+}
+
+#[tokio::test]
+async fn one_machine_is_one_request() {
+    // The largest gap between this and a platform somebody would buy. A customer
+    // who wanted one machine had to create a network, then a subnet on it, then
+    // a port on that, in that order, and only then the guest — four objects and
+    // a dependency order, none of which they asked about, and each of which
+    // asked for something like a VXLAN identifier.
+    let h = Harness::new();
+    let made = h
+        .post(
+            "projects/p2/instances",
+            json!({ "id": "erste", "spec": {
+                "image": "projects/p1/images/sha256-abc",
+                "vcpus": 1, "memoryMib": 512, "rootDiskGib": 2
+            }}),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    let guest = h.get("projects/p2/instances/erste").await;
+    let ports = guest.body["spec"]["ports"].as_array().cloned().unwrap_or_default();
+    assert_eq!(ports.len(), 1, "a guest was created with no wire: {:?}", guest.body["spec"]);
+
+    // On this project's own default network, made for it — with an address
+    // range nobody typed.
+    let net = h.get("projects/p2/networks/default").await;
+    assert_eq!(net.status, StatusCode::OK, "{:?}", net.body);
+    let subnet = h.get("projects/p2/subnets/default").await;
+    assert_eq!(subnet.status, StatusCode::OK, "{:?}", subnet.body);
+    assert!(
+        subnet.body["spec"]["cidr"].as_str().unwrap_or_default().starts_with("10."),
+        "{:?}", subnet.body["spec"]
+    );
+
+    // A second guest joins the first one's network rather than getting another,
+    // which is what lets two machines in a project talk without anybody
+    // configuring anything.
+    let second = h
+        .post(
+            "projects/p2/instances",
+            json!({ "id": "zweite", "spec": {
+                "image": "projects/p1/images/sha256-abc",
+                "vcpus": 1, "memoryMib": 512, "rootDiskGib": 2
+            }}),
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::ACCEPTED, "{:?}", second.body);
+    let nets = h.get("projects/p2/networks").await;
+    assert_eq!(
+        nets.body["items"].as_array().map(Vec::len),
+        Some(1),
+        "a second guest made a second network"
+    );
+
+    // And a guest that genuinely wants none says so.
+    let alone = h
+        .post(
+            "projects/p2/instances",
+            json!({ "id": "allein", "spec": {
+                "image": "projects/p1/images/sha256-abc",
+                "vcpus": 1, "memoryMib": 512, "rootDiskGib": 2,
+                // Saying nothing and saying "none" are different requests.
+                "ports": []
+            }}),
+        )
+        .await;
+    assert_eq!(alone.status, StatusCode::ACCEPTED, "{:?}", alone.body);
+    let g = h.get("projects/p2/instances/allein").await;
+    assert!(
+        g.body["spec"]["ports"].as_array().is_none_or(|p| p.is_empty()),
+        "{:?}", g.body["spec"]
+    );
+}
+

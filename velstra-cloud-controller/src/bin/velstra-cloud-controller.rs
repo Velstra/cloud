@@ -573,6 +573,7 @@ async fn main() {
                 instances.clone(),
                 nodes.clone(),
                 migrations.clone(),
+                velstra_cloud_store::TypedStore::new(store.clone(), cell, "images"),
             )
             .with_maintenance(maintenance_windows.clone()),
         ),

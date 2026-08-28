@@ -723,6 +723,8 @@ mod tests {
                 gateway: false,
             },
             NodeStatus {
+                vmm: "qemu".into(),
+            fetching: Vec::new(),
                 capacity: Cap {
                     vcpus: 16,
                     memory_mib: mem,

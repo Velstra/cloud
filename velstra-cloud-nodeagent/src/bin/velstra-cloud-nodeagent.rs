@@ -332,6 +332,12 @@ enum DatapathKind {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Chosen before any TLS is spoken, because rustls will not choose: with
+    // two providers compiled in (reqwest brings one, tokio-rustls the other) it
+    // panics at first use — the same failure the API had, found the same way,
+    // on a machine serving real traffic. This time it took the whole agent
+    // down in a restart loop.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

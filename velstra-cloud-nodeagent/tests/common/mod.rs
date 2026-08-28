@@ -31,6 +31,8 @@ use velstra_cloud_store::{Entry, Event, Expect, MemoryStore, Store, StoreError, 
 pub const REGION: &str = "eu-central";
 pub const CELL: &str = "cell-1";
 pub const IMAGE: &str = "projects/p1/images/sha256-abc";
+/// What the node files that image's bytes under — its digest, not its name.
+pub const IMAGE_STORED: &str = "sha256-a563f72f58d859571895f7b2777cada5baf5c39c00560a285ad546a899833913";
 
 pub fn store() -> Arc<dyn Store> {
     Arc::new(MemoryStore::new())
@@ -247,7 +249,9 @@ pub async fn register_image(store: &Arc<dyn Store>, name: &str) {
             family: "debian-13".into(),
             version: "20260815".into(),
             source_instance: None,
-            digest: "sha256-abc".into(),
+            // A real-length digest: the bytes are filed on a node under
+            // `sha256-<64 hex>`, so a short one names nothing.
+            digest: "sha256:a563f72f58d859571895f7b2777cada5baf5c39c00560a285ad546a899833913".into(),
             format: ImageFormat::Raw,
             size_bytes: 1024,
             source_url: "file:///var/lib/velstra/images/abc.raw".into(),

@@ -137,6 +137,10 @@ pub struct IdentityStore {
     /// Per-node agent tokens, keyed by digest — the third collection the API
     /// stores and never serves, beside `credentials` and `sessions`.
     node_credentials: TypedStore<NodeCredentialSpec, NodeCredentialStatus>,
+    service_credentials: TypedStore<
+        velstra_cloud_model::identity::ServiceCredentialSpec,
+        velstra_cloud_model::identity::ServiceCredentialStatus,
+    >,
     placement: Placement,
 }
 
@@ -146,7 +150,8 @@ impl IdentityStore {
             users: TypedStore::new(store.clone(), cell, "users"),
             credentials: TypedStore::new(store.clone(), cell, "credentials"),
             sessions: TypedStore::new(store.clone(), cell, "sessions"),
-            node_credentials: TypedStore::new(store, cell, "node-credentials"),
+            node_credentials: TypedStore::new(store.clone(), cell, "node-credentials"),
+            service_credentials: TypedStore::new(store, cell, "service-credentials"),
             placement: Placement::new(region, cell),
         }
     }
@@ -186,6 +191,14 @@ impl IdentityStore {
         if user.spec.disabled {
             let _ = verify_password(password, DUMMY_HASH);
             tracing::info!(user = username, "sign-in refused: account disabled");
+            return Err(rejected());
+        }
+        // A program does not sign in. The same sentence as every other refusal,
+        // and the same hash before it: which accounts are service accounts is
+        // not something this door should teach somebody guessing.
+        if user.spec.service {
+            let _ = verify_password(password, DUMMY_HASH);
+            tracing::info!(user = username, "sign-in refused: service account");
             return Err(rejected());
         }
         let credential = self
@@ -308,6 +321,65 @@ impl IdentityStore {
             .map_err(store_error)?;
         tracing::info!(node, "minted a per-node agent token");
         Ok(token)
+    }
+
+    /// Mint a token for a service account.
+    ///
+    /// Shown once and stored only as a digest, exactly like a node's — so an
+    /// operator who loses it mints another rather than reading the first back,
+    /// and a store somebody walks off with holds no usable credential.
+    pub async fn mint_service_credential(&self, user: &str, purpose: &str) -> ApiResult<String> {
+        let token = new_node_token();
+        let credential = velstra_cloud_model::identity::ServiceCredential {
+            meta: Meta::new(
+                name_of("service-credentials", &token_digest(&token))?,
+                self.placement.clone(),
+            ),
+            spec: velstra_cloud_model::identity::ServiceCredentialSpec {
+                user: user.to_string(),
+                purpose: purpose.to_string(),
+                issued_at: Self::now(),
+            },
+            status: Default::default(),
+        };
+        self.service_credentials
+            .create(&credential, &velstra_cloud_model::Writer::controller("sessions"))
+            .await
+            .map_err(store_error)?;
+        tracing::info!(user, purpose, "minted a service account token");
+        Ok(token)
+    }
+
+    /// Who a bearer token speaks for, if it is a service account's.
+    ///
+    /// The account is read back on every request rather than trusted from the
+    /// credential, because that is what makes disabling one work: an operator
+    /// who sets `disabled` expects the tokens to stop, and a credential carrying
+    /// its own copy of the answer would keep working until somebody remembered
+    /// to delete it.
+    pub async fn identify_service(&self, token: &str) -> ApiResult<Identity> {
+        let refused = || ApiError::new(Code::Unauthenticated, "the bearer token was not accepted");
+        let digest = token_digest(token);
+        let Some(credential) = self
+            .service_credentials
+            .get(&stored("service-credentials", &digest))
+            .await
+            .map_err(store_error)?
+        else {
+            return Err(refused());
+        };
+        let user = credential.spec.user;
+        let Some(account) = self.user(&user).await? else {
+            return Err(refused());
+        };
+        if account.spec.disabled || !account.spec.service {
+            return Err(refused());
+        }
+        let mut identity = Identity::new(&user);
+        if account.spec.cell_admin {
+            identity.scopes.push(CELL_ADMIN_SCOPE.to_string());
+        }
+        Ok(identity)
     }
 
     /// The node a bearer token is the agent for, if it is a node token.
@@ -556,6 +628,7 @@ impl IdentityStore {
         let user = User {
             meta: Meta::new(name_of("users", username)?, self.placement.clone()),
             spec: UserSpec {
+                service: false,
                 display_name: username.to_string(),
                 cell_admin: true,
                 ..UserSpec::default()
@@ -750,10 +823,11 @@ impl StoreTokenVerifier {
 #[async_trait::async_trait]
 impl TokenVerifier for StoreTokenVerifier {
     async fn verify(&self, token: &str) -> ApiResult<Identity> {
-        // Three sources, tried in order, and every one that does not recognise
-        // the token answers `Unauthenticated` so the next gets a turn: a session
-        // (a person), then a per-node agent credential (a node), then whatever
-        // static verifier is configured (a service account, a test). A caller
+        // Four sources, tried in order, and every one that does not recognise the
+        // token answers `Unauthenticated` so the next gets a turn: a session (a
+        // person), a per-node agent credential (a node), a service account's
+        // token (a program), then whatever static verifier is configured (a
+        // test, or a bootstrap). A caller
         // cannot tell which recognised it — the difference shows only in what the
         // identity may then do.
         match self.identity.identify(token).await {
@@ -762,6 +836,11 @@ impl TokenVerifier for StoreTokenVerifier {
             Err(_) => {}
         }
         match self.identity.identify_node(token).await {
+            Ok(identity) => return Ok(identity),
+            Err(e) if e.code != Code::Unauthenticated => return Err(e),
+            Err(_) => {}
+        }
+        match self.identity.identify_service(token).await {
             Ok(identity) => return Ok(identity),
             Err(e) if e.code != Code::Unauthenticated => return Err(e),
             Err(e) => match &self.fallback {

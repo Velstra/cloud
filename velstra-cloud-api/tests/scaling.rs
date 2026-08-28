@@ -575,3 +575,63 @@ async fn a_node_filter_does_not_hand_out_volumes_and_a_pool_filter_does_not_hand
         .unwrap();
     assert_eq!(as_pool.items.len(), 10);
 }
+
+/// What a *tenant* pays to look at their own project.
+///
+/// The gate a non-operator's list goes through asks the authorisation question
+/// once per object. That is right — a project's bindings decide, and a filter
+/// that guessed would be a leak — but it means the cost of one tenant's board is
+/// a function of the whole cell if the bindings are read each time.
+///
+/// This is the shape that bit the quota controller: correct per object, and
+/// quadratic once the cell is real. Measured rather than reasoned about, because
+/// the first version of this claim is always wrong.
+#[tokio::test]
+async fn a_tenant_listing_their_own_project_does_not_pay_for_the_cell() {
+    let mut costs = Vec::new();
+    for n in [10usize, 40, 160] {
+        let (counting, api) = cell_of(n).await;
+        // A tenant with a real grant, because that is the path being measured:
+        // an editor on p1 and nothing else.
+        api.patch(
+            &"projects/p1".parse().unwrap(),
+            &json!({ "spec": { "bindings": [
+                { "role": "editor", "members": ["a-tenant"] }
+            ]}}),
+            None,
+            &Identity::new("scaling-test"),
+        )
+        .await
+        .expect("the operator grants the tenant their project");
+        counting.reset();
+        let listed = api
+            .list_for(
+                "projects/p1",
+                "ports",
+                &velstra_cloud_api::Filter::none(),
+                // Not the operator this harness builds the cell as: an operator's
+            // list is served whole, and what is being measured is the gate a
+            // tenant goes through — one authorisation question per object.
+            &Identity::new("a-tenant"),
+            )
+            .await
+            .expect("a tenant lists their own project");
+        let reads = counting.read();
+        println!("  cell of {n:>4}: {:>4} ports / {reads:>5} reads", listed.items.len());
+        costs.push((n, reads));
+    }
+
+    // Sixteen times the objects must not be anywhere near sixteen times squared
+    // the reads. The bar is deliberately loose — this is a shape check, not a
+    // budget — and a quadratic would blow through it by an order of magnitude.
+    let (small, cheap) = costs[0];
+    let (large, dear) = costs[2];
+    let growth = dear as f64 / cheap.max(1) as f64;
+    let objects = large as f64 / small as f64;
+    assert!(
+        growth < objects * 3.0,
+        "reads grew {growth:.1}x for {objects:.0}x the objects — that is the quadratic \
+         shape, not the linear one: {costs:?}"
+    );
+}
+

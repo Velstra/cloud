@@ -1650,7 +1650,8 @@ are the only way to reach them.
 POST   /api/v1/sessions              # sign in: {username, password} -> {token, …}
 GET    /api/v1/sessions/current      # whoami: who this token is, and what it may do
 DELETE /api/v1/sessions/current      # sign out: end the session this token names
-PUT    /api/v1/users/{id}/password   # set a password
+PUT    /api/v1/users/{id}/password   # set a password (a person)
+POST   /api/v1/users/{id}/tokens     # mint a token (a service account)
 ```
 
 - **`POST /sessions`** is the one route with no `Authorization` — it is what
@@ -1791,3 +1792,34 @@ digest — one that no bytes will ever match would be a source that looks health
 and publishes something that cannot boot. The source says on its own object what
 it found, or why it could not look.
 
+## Service accounts
+
+A caller that is a program is a `users` object with `spec.service` set. It has no
+password and does not sign in; a cell operator mints it a token:
+
+```
+POST /api/v1/users/ci/tokens
+{ "purpose": "nightly backups" }
+
+200 { "token": "…", "user": "ci", "purpose": "nightly backups", "shownOnce": true }
+```
+
+**Shown once.** The platform keeps a digest, exactly as it does for a node's
+credential, so a lost token is replaced rather than recovered — and a stolen
+store holds nothing usable. Several tokens may exist for one account, which is
+what makes rotation possible without a gap; `purpose` is what tells them apart
+when one of them has to go.
+
+Everything else about a service account is deliberately identical to a person's.
+It is named in a project's `bindings` like anybody else, gets the same four
+roles, and appears in the audit trail under its own subject — so "what may this
+pipeline do here" is answered by reading the project.
+
+Disabling one stops its tokens on the next request: the account is read back on
+every call rather than copied into the credential, so an operator shutting a door
+does not have to find the tokens first.
+
+Before this, a service account was a line in a static token file: no object, no
+bindings, nothing in the audit trail, and no way to revoke one but editing a file
+and restarting the API — so the practical answer was to hand a program a person's
+password.

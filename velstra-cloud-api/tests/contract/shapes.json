@@ -165,7 +165,8 @@
               },
               "vendorDevice": "string"
             }
-          ]
+          ],
+          "vmm": "string"
         }
       }
     ],
@@ -270,7 +271,8 @@
           },
           "vendorDevice": "string"
         }
-      ]
+      ],
+      "vmm": "string"
     }
   },
   "nodes/node-a:explainMaintenance": {

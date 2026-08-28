@@ -576,16 +576,20 @@ impl Agent {
             return Ok(false);
         }
 
-        if !host.images.contains(&instance.spec.image) {
+        let want = cell
+            .images
+            .get(&instance.spec.image)
+            .and_then(|i| crate::hostfs::stored_as(&i.digest));
+        if !want.is_some_and(|name| host.images.contains(&name)) {
             // The destination fetches from the registered source, the same way
             // an ordinary pass does. A guest cannot arrive onto a node that
             // cannot obtain its image, and finding that out here — before a
             // receiver is opened — is what keeps a half-prepared destination
             // from waiting for a transfer that will never be usable.
-            let source = cell
+            let (source, digest) = cell
                 .images
                 .get(&instance.spec.image)
-                .map(|i| i.source_url.clone())
+                .map(|i| (i.source_url.clone(), i.digest.clone()))
                 .ok_or_else(|| {
                     format!(
                         "{} is not a registered image in this cell, so this node \
@@ -594,7 +598,7 @@ impl Agent {
                     )
                 })?;
             self.vmm
-                .pull_image(&instance.spec.image, &source)
+                .pull_image(&instance.spec.image, &digest, &source)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -658,6 +662,10 @@ impl Agent {
             ports,
             self.declared_baseline().await,
             devices,
+            cell.images
+                .get(&instance.spec.image)
+                .map(|i| i.digest.as_str())
+                .unwrap_or_default(),
         )?;
         self.vmm
             .prepare_receiver(&request, mode)

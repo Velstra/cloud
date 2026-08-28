@@ -234,6 +234,8 @@ mod tests {
                 gateway: false,
             },
             NodeStatus {
+                vmm: "qemu".into(),
+            fetching: Vec::new(),
                 pci_devices: Vec::new(),
                 cpu: None,
                 observed_generation: 3,

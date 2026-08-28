@@ -80,6 +80,7 @@ async fn every_failed_sign_in_refuses_in_the_same_words() {
         &store,
         "disabled",
         UserSpec {
+            service: false,
             disabled: true,
             ..UserSpec::default()
         },
@@ -200,6 +201,7 @@ async fn an_administrator_is_marked_on_the_identity_they_authenticate_as() {
         &store,
         "root",
         UserSpec {
+            service: false,
             cell_admin: true,
             ..UserSpec::default()
         },

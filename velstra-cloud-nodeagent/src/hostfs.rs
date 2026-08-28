@@ -263,6 +263,13 @@ pub fn unslug(slug: &str) -> String {
 // ---- images --------------------------------------------------------------
 
 /// The sha256 an image name commits to, if it carries one.
+/// The hex of a `sha256:…` value, whatever spelling it arrives in.
+///
+/// Read from the image's **spec**, not from its name. It used to be parsed out
+/// of the name, which forced every image to be called `sha256-<64 hex>` — a
+/// name no operator wants to see in a list where they are choosing an operating
+/// system. The bytes are still addressed by their digest on disk; what changed
+/// is that the object above them may be called `debian-13`.
 pub fn digest_of(image: &str) -> Option<String> {
     let last = image.rsplit('/').next()?;
     let hex = last
@@ -296,9 +303,19 @@ pub async fn sha256_file(path: &Path) -> Result<String> {
 /// `None` means it has not been published, which the caller must treat as "not
 /// yet" rather than "boot without it": a disk made from no image is a disk with
 /// no operating system on it.
-pub fn image_path(layout: &Layout, image: &str) -> Option<PathBuf> {
-    let path = layout.image_dir.join(slug(image));
+pub fn image_path(layout: &Layout, digest: &str) -> Option<PathBuf> {
+    let path = layout.image_dir.join(stored_as(digest)?);
     path.exists().then_some(path)
+}
+
+/// What a verified image is called on disk: `sha256-<hex>`, from its digest.
+///
+/// The digest and not the name, so two objects carrying the same bytes — a
+/// project's copy of a catalogue image, the same image published twice under
+/// different names — are one file on every node that has it. Names are for
+/// people and there can be several; the bytes have exactly one identity.
+pub fn stored_as(digest: &str) -> Option<String> {
+    digest_of(digest).map(|hex| format!("sha256-{hex}"))
 }
 
 /// Fetch an image from `source` into the incoming directory, then verify and
@@ -316,25 +333,29 @@ pub fn image_path(layout: &Layout, image: &str) -> Option<PathBuf> {
 ///
 /// Nothing is fetched when a verified copy is already published — an image is
 /// content-addressed, so "already here" is a complete answer.
-pub async fn fetch_image(layout: &Layout, image: &str, source: &str) -> Result<()> {
-    let name = slug(image);
+pub async fn fetch_image(
+    layout: &Layout,
+    image: &str,
+    digest: &str,
+    source: &str,
+) -> Result<()> {
+    // Refuse an image with no usable digest before spending a download on it:
+    // publish would refuse it afterwards anyway, and saying so first costs the
+    // operator a wait rather than a gigabyte.
+    let name = stored_as(digest).ok_or_else(|| {
+        HostError::failed(format!(
+            "{image} carries no sha256 digest, so this node cannot verify what it downloads"
+        ))
+    })?;
     if layout.image_dir.join(&name).exists() {
         return Ok(());
     }
-    // Refuse an image whose name carries no digest before spending a download on
-    // it: publish would refuse it afterwards anyway, and saying so first costs
-    // the operator a wait rather than a gigabyte.
-    digest_of(image).ok_or_else(|| {
-        HostError::failed(format!(
-            "{image} carries no sha256 digest in its name, so this node cannot verify it"
-        ))
-    })?;
 
     let incoming = layout.incoming_dir.join(&name);
     if incoming.exists() {
         // A copy is already here — from a previous attempt, or placed by hand.
         // Verification below is what decides whether it is usable.
-        return publish_image(layout, image).await;
+        return publish_image(layout, image, digest).await;
     }
     std::fs::create_dir_all(&layout.incoming_dir)?;
 
@@ -354,10 +375,13 @@ pub async fn fetch_image(layout: &Layout, image: &str, source: &str) -> Result<(
         }
         Some(("http", _)) => fetch_http(source, &partial).await?,
         Some(("https", _)) => {
-            let _ = std::fs::remove_file(&partial);
-            return Err(HostError::failed(format!(
-                "{image} is served over https and this agent has no TLS support                  built in; publish it over http (the sha256 in its name is what                  makes that safe) or place it on a path reachable as file://"
-            )));
+            // The bytes are verified against the digest either way — that is
+            // what makes plain http safe here. What https buys is that the
+            // image can be fetched from where images actually *are*: refusing
+            // it meant telling an operator to go and find an http mirror of
+            // Debian, and it is the reason every guest built from a normal
+            // `https://cloud.debian.org/…` URL failed to start.
+            fetch_https(source, &partial).await?;
         }
         _ => {
             let _ = std::fs::remove_file(&partial);
@@ -367,13 +391,57 @@ pub async fn fetch_image(layout: &Layout, image: &str, source: &str) -> Result<(
         }
     }
     std::fs::rename(&partial, &incoming)?;
-    publish_image(layout, image).await
+    publish_image(layout, image, digest).await
 }
 
 /// Stream an `http://` URL into `dest`.
 ///
 /// Streamed rather than buffered: an image is measured in gigabytes and this
 /// runs on a hypervisor whose memory belongs to the guests.
+/// Stream an `https://` URL into `dest`, with the certificate checked.
+///
+/// A separate function from [`fetch_http`] rather than a flag on it, because
+/// they are different mechanisms: the plain one is a hand-rolled hyper request
+/// with no trust in it at all, and this one is a TLS client that verifies the
+/// server. Keeping them apart means neither can quietly become the other.
+///
+/// Streamed to disk, never held in memory: a cloud image is a gigabyte and a
+/// node has better uses for that.
+async fn fetch_https(url: &str, dest: &Path) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let response = reqwest::Client::builder()
+        .user_agent(concat!("velstra-cloud/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| HostError::failed(format!("no https client: {e}")))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| HostError::failed(format!("fetching {url}: {e}")))?;
+    if !response.status().is_success() {
+        return Err(HostError::failed(format!(
+            "fetching {url}: the server answered {}",
+            response.status()
+        )));
+    }
+
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| HostError::failed(format!("{}: {e}", dest.display())))?;
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| HostError::failed(format!("reading {url}: {e}")))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| HostError::failed(format!("writing {}: {e}", dest.display())))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| HostError::failed(format!("writing {}: {e}", dest.display())))?;
+    Ok(())
+}
+
 async fn fetch_http(url: &str, dest: &Path) -> Result<()> {
     use http_body_util::BodyExt;
     use tokio::io::AsyncWriteExt;
@@ -435,17 +503,17 @@ async fn fetch_http(url: &str, dest: &Path) -> Result<()> {
 /// Fetching them is [`fetch_image`]'s job; this one's is to refuse to boot
 /// anything it has not hashed itself. Identical on both backends because it is
 /// about bytes on a disk and not about a hypervisor.
-pub async fn publish_image(layout: &Layout, image: &str) -> Result<()> {
-    let name = slug(image);
+pub async fn publish_image(layout: &Layout, image: &str, digest: &str) -> Result<()> {
+    let expected = digest_of(digest).ok_or_else(|| {
+        HostError::failed(format!(
+            "{image} carries no sha256 digest, so this node cannot verify what it downloads"
+        ))
+    })?;
+    let name = format!("sha256-{expected}");
     let published = layout.image_dir.join(&name);
     if published.exists() {
         return Ok(());
     }
-    let expected = digest_of(image).ok_or_else(|| {
-        HostError::failed(format!(
-            "{image} carries no sha256 digest in its name, so this node cannot verify it"
-        ))
-    })?;
     let incoming = layout.incoming_dir.join(&name);
     if !incoming.exists() {
         return Err(HostError::failed(format!(

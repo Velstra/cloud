@@ -96,8 +96,8 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
             println!("\nWho should be able to reach the console?");
             println!("  [1] only this machine — right for a laptop, and the default");
             println!("  [2] anything that can reach this machine over the network");
-            println!("\nThere is no TLS here: put a reverse proxy in front before this leaves");
-            println!("a network you trust.");
+            println!("\nThis machine makes itself a certificate either way, so the console");
+            println!("is served over TLS. Its fingerprint is printed at the end.");
             loop {
                 match prompt("Reachable from [1]: ")?.trim() {
                     "" | "1" => break "127.0.0.1:8443".to_string(),
@@ -120,11 +120,47 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         ask_for_a_password()?
     };
 
+    // Before the seed, because the seed names the files. A machine that cannot
+    // make one is not a machine that should serve a password in plaintext
+    // instead — it is one whose operator has to be told, so the failure is
+    // reported and the install stops.
+    let addresses: Vec<String> = if listen.starts_with("0.0.0.0") {
+        Vec::new()
+    } else {
+        vec![listen.rsplit(':').nth(1).unwrap_or("127.0.0.1").to_string()]
+    };
+    let tls = Some(crate::tls::ensure(
+        &dir,
+        &crate::wizard::hostname(),
+        &addresses,
+    )?);
+    if let Some(cert) = &tls {
+        say(if cert.made {
+            "made a certificate for this machine"
+        } else {
+            "kept the certificate that was already here"
+        });
+    }
+
     let machine = Machine {
+        lvm_group: String::new(),
+        lvm_thin_pool: String::new(),
+        ceph_conf: String::new(),
+        ceph_user: String::new(),
+        ceph_pool: String::new(),
+        ceph_image_pool: String::new(),
         region: "eu-central".into(),
         cell: "cell-1".into(),
         roles: vec![Role::ControlPlane, Role::Hypervisor, Role::Pool],
-        api_url: "http://127.0.0.1:8443".into(),
+        api_url: if tls.is_some() {
+            format!("https://localhost:{}", listen.rsplit(':').next().unwrap_or("8443"))
+        } else {
+            "http://127.0.0.1:8443".into()
+        },
+        api_ca: tls
+            .as_ref()
+            .map(|c| c.cert.display().to_string())
+            .unwrap_or_default(),
         node: node_id.clone(),
         token: String::new(),
         vmm: if which("qemu-system-x86_64").is_some() {
@@ -137,6 +173,14 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         pool_backend: "directory".into(),
         store: "127.0.0.1:2379".into(),
         listen: listen.clone(),
+        tls_cert: tls
+            .as_ref()
+            .map(|c| c.cert.display().to_string())
+            .unwrap_or_default(),
+        tls_key: tls
+            .as_ref()
+            .map(|c| c.key.display().to_string())
+            .unwrap_or_default(),
         cells: Vec::new(),
         fabric: None,
         // A home cell has no fabric, so this node is the far end of every wire
@@ -157,7 +201,12 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     enable(&["etcd", "velstra-cloud-api", "velstra-cloud-controller"])?;
     say("brought up etcd and the control plane");
 
-    let api = local_api(&listen);
+    let api = local_api(&listen, tls.is_some());
+    if let Some(cert) = &tls {
+        // For this process's own curl calls, and for nothing else.
+        // The agents get the same path through the seed, as VELSTRA_API_CA.
+        unsafe { std::env::set_var("VELSTRA_QUICKSTART_CA", cert.cert.display().to_string()) };
+    }
     wait_for(&api)?;
     say("the API is answering");
 
@@ -168,7 +217,22 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     enable(&["velstra-cloud-nodeagent", "velstra-cloud-poolagent"])?;
     say("brought up the node and pool agents");
 
-    println!("\nDone. The console is at {}", browsable(&listen));
+    println!("\nDone. The console is at {}", browsable(&listen, tls.is_some()));
+    if let Some(cert) = &tls {
+        // Printed once, here, on the machine's own console. A browser will warn
+        // about this certificate — correctly, because nobody it trusts signed it
+        // — and the warning is only worth anything to somebody who can check
+        // what they are agreeing to. This is that one chance.
+        println!();
+        println!("It serves TLS with a certificate this machine made for itself.");
+        println!("Your browser will warn. Before clicking past it, check that the");
+        println!("fingerprint it shows is this one:");
+        println!();
+        println!("  {}", cert.fingerprint);
+        println!();
+        println!("To use a real certificate instead, put it at {} and its", cert.cert.display());
+        println!("key at {}, then restart velstra-cloud-api.", cert.key.display());
+    }
     // Not "the password you just chose": on an unattended run nobody chose
     // anything here, and a closing line that describes a conversation that did
     // not happen is the kind of small untruth that makes a reader distrust the
@@ -195,17 +259,23 @@ fn say(what: &str) {
 ///
 /// `0.0.0.0` is a bind, never a destination: connecting to it works on Linux by
 /// accident and is wrong to print at somebody.
-fn local_api(listen: &str) -> String {
+fn local_api(listen: &str, tls: bool) -> String {
     let port = listen.rsplit(':').next().unwrap_or("8443");
-    format!("http://127.0.0.1:{port}/api/v1")
+    let scheme = if tls { "https" } else { "http" };
+    // `localhost` and not `127.0.0.1`, because the certificate names hostnames
+    // and the bare address only as a subject-alternative — and curl matches
+    // what was typed. Both are in the certificate; the name is the safer bet on
+    // a machine whose resolver is untouched.
+    format!("{scheme}://localhost:{port}/api/v1")
 }
 
-fn browsable(listen: &str) -> String {
+fn browsable(listen: &str, tls: bool) -> String {
     let port = listen.rsplit(':').next().unwrap_or("8443");
+    let scheme = if tls { "https" } else { "http" };
     if listen.starts_with("0.0.0.0") {
-        format!("http://<this machine>:{port}/")
+        format!("{scheme}://<this machine>:{port}/")
     } else {
-        format!("http://127.0.0.1:{port}/")
+        format!("{scheme}://127.0.0.1:{port}/")
     }
 }
 
@@ -239,8 +309,17 @@ fn enable(units: &[&str]) -> Result<()> {
 /// binary is the installer, and giving it an HTTP stack would give the installer
 /// a TLS stack, a certificate store, and their upgrades.
 fn curl(args: &[&str]) -> Result<String> {
+    let mut base: Vec<String> = vec!["-sS".into(), "--max-time".into(), "20".into()];
+    // Against the cell's own certificate, when there is one. `-k` would also
+    // work and would also teach every reader of this script that verification
+    // is optional; the CA file is right there and pinning it costs one flag.
+    if let Ok(ca) = std::env::var("VELSTRA_QUICKSTART_CA") {
+        if !ca.is_empty() {
+            base.extend(["--cacert".into(), ca]);
+        }
+    }
     let out = Command::new("curl")
-        .args(["-sS", "--max-time", "20"])
+        .args(&base)
         .args(args)
         .output()
         .context("running curl — the package depends on it")?;

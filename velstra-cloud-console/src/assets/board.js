@@ -26,9 +26,28 @@ const view = {
 // that nothing is wrong.
 const census = {};
 
+/// What the cell keeps for itself.
+///
+/// A tenant was shown the whole rail — nodes, pools, **Ceph**, device classes,
+/// maintenance windows, the other projects — and every one of those boards
+/// answered them 403 or empty. It is not a leak, but it is worse than useless:
+/// the point of a tenant's console is the things they have, and being offered
+/// the machine room and refused at the door teaches them the platform is broken.
+///
+/// The scope is not the test, because images are cell-wide *and* everybody's.
+/// What these have in common is that they are the estate, not the tenancy.
+const CELL_ONLY = [
+  // Kept in step with `authz::belongs_to_the_cell`, which is what the API
+  // refuses — a guard checks the two agree. `ceph-clusters` is the collection's
+  // id; `ceph` is only its title.
+  "nodes", "pools", "ceph-clusters", "device-classes", "maintenance-windows",
+  "image-sources", "projects", "users", "audit", "backup-targets",
+];
+
 function groups() {
   const out = [];
   for (const c of collections()) {
+    if (CELL_ONLY.includes(c.id) && !(session.who && session.who.cellAdmin)) continue;
     let g = out.find((x) => x.name === c.group);
     if (!g) { g = { name: c.group, items: [] }; out.push(g); }
     g.items.push(c);

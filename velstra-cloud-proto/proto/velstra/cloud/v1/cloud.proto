@@ -337,6 +337,14 @@ message NodeStatus {
   // bound. Empty means this node serves no console. An address the API reaches,
   // never a browser.
   string console_endpoint = 12;
+  // Which VMM this node runs its guests under: `qemu` or
+  // `cloud-hypervisor`. Reported, not configured — it is an `--vmm` decision
+  // made when the agent starts, and an operator could make it and then not
+  // see what any machine had.
+  string vmm = 13;
+  // Images on their way in: a partial copy on the node's disk. Without it an
+  // image had two visible states, here or not, while a gigabyte takes minutes.
+  repeated string fetching = 14;
 }
 
 // One PCI device, as the node holding it sees it.

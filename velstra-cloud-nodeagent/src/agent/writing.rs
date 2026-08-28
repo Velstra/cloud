@@ -85,6 +85,8 @@ impl Agent {
         // nodes have an image can work it out from these reports rather than
         // from a shared list every node would have to write into.
         next.status.images = host.images.iter().cloned().collect();
+        next.status.vmm = self.vmm.vmm_name().to_string();
+        next.status.fetching = host.fetching.iter().cloned().collect();
         // The disks this machine has, and what each is doing. Reported for the
         // same reason the images are: nobody else can see them, and the console
         // offers them for a Ceph OSD from this list. Which of them may be

@@ -104,6 +104,10 @@ pub struct HostState {
     /// Image digests present *and verified*. An unverified copy is not in here,
     /// because "cached" is what the agent boots from without asking again.
     pub images: BTreeSet<String>,
+    /// What is on its way in: a partial or unverified copy in the incoming
+    /// directory. Observed like everything else here, so a node that died
+    /// mid-download says so on its next pass without a flag to clean up.
+    pub fetching: BTreeSet<String>,
     /// Block devices this machine has, and what each is being used for.
     ///
     /// Observed like everything else here, on every pass: a disk that was
@@ -215,6 +219,14 @@ pub trait Vmm: Send + Sync + 'static {
     /// Read the machine. Never a cache, never a file this process wrote.
     async fn observe(&self) -> Result<HostState>;
 
+    /// What this backend is called, for the node to report.
+    ///
+    /// An operator could choose between QEMU and Cloud Hypervisor with `--vmm`
+    /// and then had no way to find out which a machine was running — not in the
+    /// console, not over the API. A fleet where half the nodes do passthrough
+    /// and half do not is one you have to be able to look at.
+    fn vmm_name(&self) -> &'static str;
+
     /// Fetch and verify an image. Must be idempotent: an image already present
     /// and verified is a success, not an error.
     ///
@@ -224,7 +236,7 @@ pub trait Vmm: Send + Sync + 'static {
     /// says what the bytes must hash to, and says nothing about where they are.
     /// Passing only the digest is what left this agent able to *verify* an image
     /// and unable to *obtain* one.
-    async fn pull_image(&self, image: &str, source: &str) -> Result<()>;
+    async fn pull_image(&self, image: &str, digest: &str, source: &str) -> Result<()>;
 
     /// Make the guest's root disk: a copy of `image`, grown to `gib`.
     ///

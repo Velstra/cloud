@@ -8,5 +8,11 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+# A self-signed certificate at install. In Rust rather than by shelling out to
+# `openssl`, so a machine without it still gets one — and so the fingerprint can
+# be printed from the same bytes that were written, rather than read back and
+# hoped to be the same file.
+rcgen = "0.13"
+sha2 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

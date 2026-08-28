@@ -100,6 +100,16 @@ impl OperationsController {
             return Ok(TargetView::Gone);
         };
         let ready = condition(&peek.status.conditions, "Ready");
+        // Nothing holds it, so nothing will report on it — the same answer the
+        // model gives for a kind nobody reports on, reached one object at a
+        // time because for a port it depends on whether it is in use. Left out,
+        // an operation that created a spare port never finished: found on a real
+        // cell, on the first two entries of its attention list.
+        if name.collection() == "ports"
+            && peek.spec.node.as_deref().unwrap_or_default().is_empty()
+        {
+            return Ok(TargetView::Unwatched);
+        }
         Ok(TargetView::Present {
             observed_generation: peek.status.observed_generation,
             ready: ready.map(|c| c.status).unwrap_or(ConditionStatus::Unknown),
@@ -113,6 +123,25 @@ impl OperationsController {
 #[derive(Deserialize)]
 struct Peek {
     status: PeekStatus,
+    /// Enough of the spec to answer "is anybody going to report on this".
+    ///
+    /// A port is assigned to a node by the port controller once a guest that
+    /// names it runs there; until then no agent has it and none will report. The
+    /// status alone cannot say that — it looks exactly like an object nobody has
+    /// got to yet — so the one field that distinguishes them is read here.
+    #[serde(default)]
+    spec: PeekSpec,
+}
+
+#[derive(Default, Deserialize)]
+struct PeekSpec {
+    /// `Option`, because on an instance this field *is* one and arrives as
+    /// `null` — and a `String` here made the whole peek fail to deserialise,
+    /// which `look_at` reads as "the object is gone". An operation about a
+    /// perfectly healthy instance then reported that its target no longer
+    /// existed.
+    #[serde(default)]
+    node: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -1139,6 +1139,9 @@ impl Api {
         paging: &Paging,
         who: &Identity,
     ) -> ApiResult<Listing> {
+        if kind == velstra_cloud_model::resources::FAMILIES {
+            return self.list_families(parent, who).await;
+        }
         if !parent.is_empty() {
             let name = ResourceName::parse(parent).map_err(ApiError::from)?;
             self.authorize(who, Verb::Read, &name).await?;
@@ -1146,12 +1149,113 @@ impl Api {
         }
         // No parent: a cell-wide collection. An operator sees it whole;
         // everybody else sees the objects they may read, one decision each.
+        //
+        // Except where no object will ever pass, in which case filtering states
+        // an untruth: a customer asking for `/nodes` was answered "zero
+        // machines" by a cell that has one. "You may not look" and "there is
+        // nothing there" lead to different next steps, and only one of them is
+        // true.
+        if !self.is_operator(who) && velstra_cloud_model::authz::belongs_to_the_cell(kind) {
+            return Err(ApiError::new(
+                Code::PermissionDenied,
+                format!(
+                    "{kind} are the cell's own, and reading them is a cell operator's. \
+                     This is not an empty list: there may be plenty, and they are not yours."
+                ),
+            ));
+        }
         let gate = if self.is_operator(who) {
             Gate::Everything
         } else {
             Gate::Readable(who.clone())
         };
         self.list_gated(parent, kind, filter, paging, &gate).await
+    }
+
+    /// The catalogue, one entry per family rather than one per set of bytes.
+    ///
+    /// Derived and read-only: nothing stores a family. It exists because
+    /// `families/debian-13` is the reference somebody is *supposed* to write —
+    /// "the newest Debian 13", the one handle that stays right when the bytes
+    /// change — and until now the only way to learn that the handle existed was
+    /// to guess it and read the refusal, which helpfully lists them. A picker
+    /// cannot offer what nothing can enumerate, so the console showed people
+    /// `images/debian-13-d2af37c5` and let them pin themselves to one build.
+    ///
+    /// Scoped like resolution is, and for the same reason: a project's own
+    /// `debian-13` shadows the cell's, so the caller is shown the entry they
+    /// would actually get, not both.
+    async fn list_families(&self, parent: &str, who: &Identity) -> ApiResult<Listing> {
+        if !parent.is_empty() {
+            let name = ResourceName::parse(parent).map_err(ApiError::from)?;
+            self.authorize(who, Verb::Read, &name).await?;
+        }
+        let mut images: Vec<velstra_cloud_model::resources::Image> = Vec::new();
+        if !parent.is_empty() {
+            images.extend(self.typed_list(parent, "images").await?);
+        }
+        // The cell's catalogue is everybody's — that is what publishing one
+        // means — so it is read whole rather than gated per object.
+        images.extend(self.typed_list("", "images").await?);
+
+        let mut names: Vec<String> = images
+            .iter()
+            .filter(|i| !i.spec.family.is_empty() && i.meta.deleted_at.is_none())
+            .map(|i| i.spec.family.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+
+        let mut items = Vec::new();
+        for family in names {
+            // Whichever one a create would resolve to, by the same precedence.
+            let mine: Vec<_> = if parent.is_empty() {
+                Vec::new()
+            } else {
+                images
+                    .iter()
+                    .filter(|i| i.meta.name.to_string().starts_with(&format!("{parent}/")))
+                    .collect()
+            };
+            let chosen = velstra_cloud_model::resources::newest_of_family(mine, &family)
+                .or_else(|| {
+                    let theirs: Vec<_> = images
+                        .iter()
+                        .filter(|i| !i.meta.name.to_string().starts_with("projects/"))
+                        .collect();
+                    velstra_cloud_model::resources::newest_of_family(theirs, &family)
+                });
+            let Some(image) = chosen else { continue };
+            let private = image.meta.name.to_string().starts_with("projects/");
+            items.push(serde_json::json!({
+                "meta": {
+                    "name": format!("{}/{family}", velstra_cloud_model::resources::FAMILIES),
+                    "createdAt": image.meta.created_at,
+                },
+                "spec": {
+                    "family": family,
+                    "version": image.spec.version,
+                    "image": image.meta.name.to_string(),
+                    "sizeBytes": image.spec.size_bytes,
+                    // What "public" means here is placement, which is the only
+                    // thing that has ever decided it: an image under the cell is
+                    // the catalogue's and everybody may boot it; one under a
+                    // project is that project's alone. Said out loud because the
+                    // rule was invisible, and an operator publishing a template
+                    // had no way to check which of the two they had made.
+                    "public": !private,
+                },
+                "status": { "conditions": [] },
+            }));
+        }
+        // The revision the underlying images were read at: a family is a view
+        // of them, so a watcher resuming from here resumes from the right place.
+        let at = self.list_filtered("", "images", &Filter::none()).await?.revision;
+        Ok(Listing {
+            items,
+            revision: at,
+            next_page_token: None,
+        })
     }
 
     /// The same, for a caller that must not be handed the whole cell.
@@ -1407,6 +1511,17 @@ impl Api {
         if let Some(sent) = body.get("spec") {
             collection.check_known(sent)?;
         }
+        // Before the references are judged, because `families/debian-13` is not
+        // a resource anybody could be authorised on — it is a request that the
+        // platform pick one. Judged raw, it parsed as a two-segment name of a
+        // collection no project governs, and the whole create answered "this is
+        // a cell-wide resource; only a cell operator may touch it" — to a
+        // customer doing exactly what the catalogue is for. The *resolved*
+        // image then goes through the ordinary reference check below, which is
+        // the authorisation that means something: may this caller boot that.
+        if kind == "instances" {
+            self.settle_image_family(parent, &mut spec).await?;
+        }
         crate::refs::check(kind, &spec)?;
         // Before anything follows one of those references — `settle_volume_source`
         // reads the snapshot, `settle_migration` reads the instance — so that a
@@ -1452,8 +1567,21 @@ impl Api {
         if kind == "captures" {
             self.settle_capture(&mut spec).await?;
         }
+        if kind == "networks" {
+            self.settle_network(&mut spec).await?;
+        }
+        if kind == "instances" {
+            self.settle_default_network(parent, body.get("spec"), &mut spec)
+                .await?;
+        }
         if kind == "volumes" {
             self.settle_volume_source(&name, &mut spec).await?;
+            // After the source, on purpose: a clone inherits the pool holding
+            // its snapshot, and a choice made before that would put the copy in
+            // a different pool from the bytes it is cloned from. Only a volume
+            // that still names none gets one chosen.
+            self.settle_volume_pool(&mut spec).await?;
+            self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
         }
         if kind == "ceph-clusters" {
             self.refuse_a_second_ceph_cluster(&name).await?;
@@ -1465,9 +1593,7 @@ impl Api {
         if kind == "image-sources" {
             refuse_an_unusable_image_source(&spec)?;
         }
-        if kind == "instances" {
-            self.settle_image_family(parent, &mut spec).await?;
-        }
+
         if kind == "nodes" {
             refuse_an_unusable_overcommit(&spec)?;
         }
@@ -2154,6 +2280,7 @@ impl Api {
         self.answer_operation(document).await?;
         self.answer_migration(document).await?;
         self.answer_security_group(document, scratch).await?;
+        self.answer_port(document).await?;
         self.answer_subnet(document, scratch).await?;
         answer_instance(document);
         answer_node(document);
@@ -2194,6 +2321,43 @@ impl Api {
             velstra_cloud_model::ipam::counts(&subnet, &ports, &floating, &balancers);
         document["status"]["allocated"] = json!(allocated);
         document["status"]["available"] = json!(available);
+        Ok(())
+    }
+
+    /// Say whether a port is waiting on anybody, which for most of them is no.
+    ///
+    /// Nothing programs a port until a guest that names it runs on a node, so a
+    /// port on no guest has no reporter at all — and a reader that calls that
+    /// "not reported" puts a permanent entry on the attention list for an object
+    /// nobody can act on. Found by signing in to a real cell: two of the first
+    /// two entries were a free port and the operation that had created it.
+    async fn answer_port(&self, document: &mut Value) -> ApiResult<()> {
+        // Only a port has `spec.network` beside `status.programmed`.
+        if document
+            .get("status")
+            .and_then(|s| s.get("programmed"))
+            .is_none()
+            || document.get("spec").and_then(|s| s.get("network")).is_none()
+        {
+            return Ok(());
+        }
+        let generation = document["meta"]["generation"].as_u64().unwrap_or(0);
+        let node = document["status"]["node"].as_str().map(str::to_string);
+        let programmed = document["status"]["programmed"].as_bool().unwrap_or(false);
+        let condition = velstra_cloud_model::resources::port_condition(
+            generation,
+            node.as_deref(),
+            programmed,
+        );
+        let mut conditions: Vec<velstra_cloud_model::Condition> =
+            serde_json::from_value(document["status"]["conditions"].clone()).unwrap_or_default();
+        set_condition(&mut conditions, condition);
+        document["status"]["conditions"] = json!(conditions);
+        // A port nobody carries has been seen by everybody who is ever going to
+        // see it, which is what `observedGeneration` is for.
+        if node.is_none() {
+            document["status"]["observed_generation"] = json!(generation);
+        }
         Ok(())
     }
 
@@ -2294,13 +2458,23 @@ impl Api {
         {
             return Ok(());
         }
-        // The name is a segment list in model shape, not a string — reading it
-        // as one is a silent no-op that looks like a missing field.
-        let Some(name) = joined(&document["meta"]["name"]) else {
-            return Ok(());
-        };
-        let held = self.image_cached_on(&name, scratch).await?;
-        document["status"]["cached_on"] = json!(held);
+        // By the name the bytes are filed under, not by the object's — an image
+        // may be called `debian-13`, and a node's copy of it is the same file as
+        // every other object carrying those bytes. Comparing names left
+        // `cachedOn` permanently empty, on every image, including one a guest
+        // was demonstrably running from.
+        let stored = document["spec"]["digest"]
+            .as_str()
+            .and_then(velstra_cloud_model::images::stored_name)
+            .unwrap_or_default();
+        let nodes = scratch.nodes(self).await?;
+        document["status"]["cached_on"] =
+            json!(velstra_cloud_model::resources::nodes_holding(&stored, &nodes));
+        // And what is on its way. An image had two visible states — here or not
+        // — while a gigabyte takes minutes to arrive, so "downloading" and
+        // "stuck" looked identical to the person waiting.
+        document["status"]["fetching_on"] =
+            json!(velstra_cloud_model::resources::nodes_fetching(&stored, &nodes));
         Ok(())
     }
 
@@ -3564,6 +3738,191 @@ impl Api {
     /// Named in the refusal, because the usual cause is a spelling — `local`
     /// against `pools/local` — and a message that says which pools exist ends
     /// the guessing.
+    /// Choose the pool for a volume whose caller named none, and write it down.
+    ///
+    /// Which pool holds a volume's bytes is the platform's business, not the
+    /// customer's — no tenant of any large provider names a storage pool, and
+    /// this one *could not*: pools are the cell's own, refused to a tenant's
+    /// list, so the form asked for a name the caller had no way to learn.
+    ///
+    /// Worse than the awkwardness was the failure. An **empty** pool slipped
+    /// past the wrong-pool guard, matched no pool agent's filter, and the
+    /// volume sat unprovisioned for ever with an empty status — the quietest
+    /// failure this platform has, reachable by leaving a field blank.
+    ///
+    /// The choice: among pools that are accepting, the one with the most room
+    /// left. Settled **at create and stored**, like a family reference or a
+    /// backup's node, so the object records where its bytes are and the answer
+    /// cannot drift with the pool population. An operator who wants a specific
+    /// pool still names it, and is still checked against what exists.
+    /// The VNI, the MTU, and the CIDR nobody should have to choose.
+    ///
+    /// A tenant of any provider clicks "new network" and gets one. Here they were
+    /// asked for a **VXLAN network identifier** — a number whose only correct
+    /// value is "one nothing else in this cell uses", which a tenant cannot know
+    /// and has no business knowing. The model's own comment says as much: "the
+    /// VNI on the Velstra fabric, assigned by the controller from the cell's
+    /// range, never chosen by a tenant." The form asked anyway.
+    ///
+    /// Chosen from what exists rather than from a counter: a counter is state to
+    /// keep, to lose, and to disagree with reality after a restore. The smallest
+    /// free number above the floor is a fact about the cell, recomputed every
+    /// time and correct after anything.
+    /// Create one object the platform decided on, with no authorisation and no
+    /// quota check.
+    ///
+    /// Both omissions are deliberate and both are the point. The caller has
+    /// already been authorised for the thing they *asked* for; a default network
+    /// made on their behalf is the platform's own act, and asking whether they
+    /// may create a network would refuse a viewer their machine's NIC. The quota
+    /// is counted over what a project holds, and these are not what a customer
+    /// meant to spend it on.
+    async fn make(&self, name: &str, kind: &str, spec: Value) -> ApiResult<()> {
+        let parsed = ResourceName::parse(name)?;
+        let meta = serde_json::to_value(Meta::new(parsed, self.inner.placement.clone()))
+            .expect("meta always serialises");
+        match self.collection(kind)?.create(meta, spec).await {
+            Ok(_) => Ok(()),
+            // Two guests created at once both find no default network and both
+            // make one. The loser takes the winner's, which is the right answer
+            // and the reason this is not a transaction.
+            Err(e) if e.code == Code::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Give a guest with no ports a wire, making the project's default network
+    /// if it has none.
+    ///
+    /// The largest gap between this platform and one somebody would buy. A
+    /// customer who wanted one machine had to create a **network**, then a
+    /// **subnet** on it, then a **port** on that, in that order, and only then
+    /// the guest — four objects and a dependency order, none of which they asked
+    /// about. Every provider hands you a default network and puts the NIC on the
+    /// machine; the parts stay there for whoever needs them.
+    ///
+    /// So: no ports named means "give it the usual one". The default network,
+    /// its subnet and the port are made once per project, and after that reused
+    /// — a second guest joins the first one's network, which is what makes two
+    /// machines in a project able to talk without anybody configuring anything.
+    ///
+    /// A guest that genuinely wants no network says so by sending `ports: []`.
+    /// Saying nothing and saying "none" are different requests, and only the
+    /// **sent** body can tell them apart: the parsed spec renders both as an
+    /// empty list. So the raw body is what is asked, and a field nobody invented
+    /// carries the meaning.
+    async fn settle_default_network(
+        &self,
+        parent: &str,
+        sent: Option<&Value>,
+        spec: &mut Value,
+    ) -> ApiResult<()> {
+        if parent.is_empty() {
+            return Ok(());
+        }
+        // Named some: theirs. Named none at all: ours. Named an empty list: a
+        // guest on no network, which the console already warns about.
+        match sent.and_then(|s| s.get("ports")).and_then(Value::as_array) {
+            Some(named) if !named.is_empty() => return Ok(()),
+            Some(_) => return Ok(()),
+            None => {}
+        }
+
+        let network = format!("{parent}/networks/default");
+        let subnet = format!("{parent}/subnets/default");
+
+        if self
+            .collection("networks")?
+            .get(&network)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let mut net = json!({ "mtu": 1450, "vni": 0 });
+            self.settle_network(&mut net).await?;
+            let vni = net["vni"].as_u64().unwrap_or(5000);
+            self.make(&network, "networks", net).await?;
+            // A range that is this project's and nobody else's. Derived from the
+            // VNI rather than counted, so two cells restoring from a backup do
+            // not hand out the same /24 to different tenants.
+            let cidr = format!("10.{}.{}.0/24", (vni / 256) % 256, vni % 256);
+            let gateway = cidr.replace(".0/24", ".1");
+            self.make(
+                &subnet,
+                "subnets",
+                json!({
+                    "network": network,
+                    "cidr": cidr,
+                    "gateway": gateway,
+                    "dns": [],
+                    "reserved": []
+                }),
+            )
+            .await?;
+        }
+
+        let port = format!("{parent}/ports/{}", minted("ports"));
+        self.make(
+            &port,
+            "ports",
+            json!({ "network": network, "subnet": subnet, "security_groups": [] }),
+        )
+        .await?;
+        spec["ports"] = json!([port]);
+        Ok(())
+    }
+
+    async fn settle_network(&self, spec: &mut Value) -> ApiResult<()> {
+        const FIRST_VNI: u32 = 5000;
+        if spec.get("mtu").and_then(Value::as_u64).unwrap_or(0) == 0 {
+            // 1450, not 1500: a VXLAN header is 50 bytes, and a tenant network
+            // handed the wire's own MTU black-holes every large packet in a way
+            // that looks like an application bug for a week.
+            spec["mtu"] = json!(1450);
+        }
+        if spec.get("vni").and_then(Value::as_u64).unwrap_or(0) != 0 {
+            return Ok(());
+        }
+        let taken: std::collections::BTreeSet<u32> = self
+            .typed_list::<velstra_cloud_model::resources::NetworkSpec,
+                          velstra_cloud_model::resources::NetworkStatus>("", "networks")
+            .await?
+            .iter()
+            .map(|n| n.spec.vni)
+            .collect();
+        let vni = (FIRST_VNI..).find(|v| !taken.contains(v)).unwrap_or(FIRST_VNI);
+        spec["vni"] = json!(vni);
+        Ok(())
+    }
+
+    async fn settle_volume_pool(&self, spec: &mut Value) -> ApiResult<()> {
+        let named = spec.get("pool").and_then(Value::as_str).unwrap_or_default();
+        if !named.is_empty() {
+            return Ok(());
+        }
+        let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
+        let chosen = pools
+            .iter()
+            .filter(|p| p.spec.accepting && p.meta.deleted_at.is_none())
+            .max_by_key(|p| {
+                p.status
+                    .capacity_gib
+                    .saturating_sub(p.status.allocated_gib)
+            });
+        let Some(pool) = chosen else {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                "no storage pool is accepting volumes, so there is nowhere to put this \
+                 one. A cell operator brings a pool up or sets `accepting` on one that \
+                 exists.",
+            )
+            .at("spec.pool"));
+        };
+        spec["pool"] = Value::String(pool.meta.name.id().to_string());
+        Ok(())
+    }
+
     async fn refuse_a_pool_this_cell_does_not_have(&self, spec: &Value) -> ApiResult<()> {
         let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
             return Ok(());
@@ -4152,8 +4511,19 @@ impl Api {
         if name.collection() != "images" {
             return Ok(Vec::new());
         }
+        // Through the object, because a node files the bytes under their digest
+        // and the object's name is a name. Comparing the two directly answered
+        // "cached nowhere" about every image in the cell, including one a guest
+        // was demonstrably running from.
+        let Ok(object): ApiResult<velstra_cloud_model::resources::Image> = self.typed(&name).await
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(stored) = velstra_cloud_model::images::stored_name(&object.spec.digest) else {
+            return Ok(Vec::new());
+        };
         let nodes = scratch.nodes(self).await?;
-        Ok(nodes_holding(image, &nodes))
+        Ok(nodes_holding(&stored, &nodes))
     }
 
     // ---- quota ------------------------------------------------------------
@@ -4336,6 +4706,54 @@ impl Api {
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
+        // An image's name is for people; its bytes are addressed by their
+        // digest, which is a separate thing and lives in the spec.
+        //
+        // Those two were one string for a while and it was wrong in both
+        // directions: the node parsed the digest out of the *name*, so an image
+        // called `debian13` failed at boot with "carries no sha256 digest in its
+        // name" — and the fix that made the name *be* the digest gave every
+        // operator a list of `sha256-cbf3e1f588f02f8d738dbecb…` to choose an
+        // operating system from. The node reads `spec.digest` now, so a name can
+        // be a name.
+        //
+        // What is minted when nobody supplies one is readable: the family and
+        // enough of the digest to tell two builds apart — `debian-13-cbf3e1f5`
+        // — because an id nobody can say out loud is an id nobody will use.
+        if kind == "images"
+            && stated.is_none()
+            && id.is_none()
+            && let Some(digest) = body
+                .get("spec")
+                .and_then(|s| s.get("digest"))
+                .and_then(Value::as_str)
+                .filter(|d| !d.is_empty())
+        {
+            let short: String = digest
+                .rsplit(':')
+                .next()
+                .unwrap_or(digest)
+                .chars()
+                .take(8)
+                .collect();
+            let family = body
+                .get("spec")
+                .and_then(|s| s.get("family"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let readable = if family.is_empty() {
+                format!("image-{short}")
+            } else {
+                format!("{family}-{short}")
+            };
+            let full = if parent.is_empty() {
+                format!("{kind}/{readable}")
+            } else {
+                format!("{parent}/{kind}/{readable}")
+            };
+            return Ok(ResourceName::parse(&full)?);
+        }
         let name = match (stated, id) {
             (Some(name), _) => name,
             (None, Some(id)) if parent.is_empty() => format!("{kind}/{id}"),

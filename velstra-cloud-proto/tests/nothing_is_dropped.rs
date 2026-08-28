@@ -316,6 +316,8 @@ survives_the_wire!(
     resources::NodeStatus,
     v1::NodeStatus,
     resources::NodeStatus {
+        vmm: "qemu".into(),
+        fetching: vec!["sha256-0123456789abcdef".into()],
         pci_devices: vec![velstra_cloud_model::pci::PciDevice {
             address: "0000:41:00.0".into(),
             vendor_device: "10de:2204".into(),
@@ -406,6 +408,7 @@ survives_the_wire!(
     {
         observed_generation, conditions, capacity, allocated, agent_version,
         console_endpoint, last_heartbeat, images, devices, ceph, cpu, pci_devices,
+        vmm, fetching,
     }
 );
 
@@ -841,6 +844,8 @@ whole_object_survives!(
         gateway: false,
     },
     resources::NodeStatus {
+        vmm: "qemu".into(),
+            fetching: Vec::new(),
         pci_devices: Vec::new(),
         cpu: None,
         console_endpoint: "10.0.0.7:8447".into(),

@@ -112,6 +112,23 @@ pub fn filename_of(url: &str) -> &str {
         .unwrap_or("")
 }
 
+/// What a node files an image's bytes under: `sha256-<hex>`, from its digest.
+///
+/// The one place that spelling is decided, so the node that writes the file, the
+/// agent that reports it and the API that matches them cannot disagree — which
+/// they did: the API compared object *names* against filed *digests* and every
+/// image reported as cached nowhere.
+pub fn stored_name(digest: &str) -> Option<String> {
+    let hex = digest
+        .rsplit(':')
+        .next()?
+        .rsplit('-')
+        .next()?
+        .to_ascii_lowercase();
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| format!("sha256-{hex}"))
+}
+
 /// Why a source could not be used.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Unusable {

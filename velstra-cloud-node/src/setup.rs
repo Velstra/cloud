@@ -59,7 +59,7 @@ use crate::{
 pub const SEED_DIR: &str = "/var/lib/velstra";
 
 /// What this machine was told about itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Machine {
     pub region: String,
     pub cell: String,
@@ -73,7 +73,25 @@ pub struct Machine {
     pub vmm: String,
     /// The pool's id and backend, for a pool.
     pub pool: String,
+    /// The certificate and key the API serves TLS with. Empty means plaintext,
+    /// which the API says out loud at startup.
+    /// The certificate the agents verify the API against, when it is https.
+    /// Written into the seed as `VELSTRA_API_CA`, read by both agents.
+    pub api_ca: String,
+    pub tls_cert: String,
+    pub tls_key: String,
     pub pool_backend: String,
+    /// For the lvm backend: the volume group, and a thin pool inside it if
+    /// there is one. Empty for every other backend.
+    pub lvm_group: String,
+    pub lvm_thin_pool: String,
+    /// For the ceph backend, and the reason an **external** cluster is usable:
+    /// without these the agent falls back to `client.admin` and no config file,
+    /// which reaches a cluster this machine deployed itself and nothing else.
+    pub ceph_conf: String,
+    pub ceph_user: String,
+    pub ceph_pool: String,
+    pub ceph_image_pool: String,
     /// Where the store is, for a control plane.
     pub store: String,
     /// The other cells this installation can reach, as `cell=url` pairs.
@@ -153,6 +171,9 @@ pub fn render(m: &Machine) -> String {
     );
     if !m.api_url.is_empty() {
         out.push_str(&format!("VELSTRA_API_URL={}\n", m.api_url));
+        if !m.api_ca.is_empty() {
+            out.push_str(&format!("VELSTRA_API_CA={}\n", m.api_ca));
+        }
     }
     if m.roles.contains(&Role::Hypervisor) {
         out.push_str(&format!("VELSTRA_NODE={}\nVELSTRA_VMM={}\n", m.node, m.vmm));
@@ -162,9 +183,32 @@ pub fn render(m: &Machine) -> String {
             "VELSTRA_POOL={}\nVELSTRA_POOL_BACKEND={}\n",
             m.pool, m.pool_backend
         ));
+        // Only what was answered. An empty line here would override the
+        // agent's own default with nothing, which is a worse answer than not
+        // saying anything.
+        for (key, value) in [
+            ("VELSTRA_LVM_GROUP", &m.lvm_group),
+            ("VELSTRA_LVM_THIN_POOL", &m.lvm_thin_pool),
+            ("VELSTRA_CEPH_CONF", &m.ceph_conf),
+            ("VELSTRA_CEPH_USER", &m.ceph_user),
+            ("VELSTRA_CEPH_POOL", &m.ceph_pool),
+            ("VELSTRA_CEPH_IMAGE_POOL", &m.ceph_image_pool),
+        ] {
+            if !value.is_empty() {
+                out.push_str(&format!("{key}={value}\n"));
+            }
+        }
     }
     if m.roles.contains(&Role::ControlPlane) {
         out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
+        // Both or neither: the API refuses one without the other rather than
+        // serving plaintext on a port somebody believes is encrypted.
+        if !m.tls_cert.is_empty() && !m.tls_key.is_empty() {
+            out.push_str(&format!(
+                "VELSTRA_TLS_CERT={}\nVELSTRA_TLS_KEY={}\n",
+                m.tls_cert, m.tls_key
+            ));
+        }
         if !m.listen.is_empty() {
             out.push_str(&format!("VELSTRA_LISTEN={}\n", m.listen));
         }
@@ -241,6 +285,14 @@ pub fn parse(text: &str) -> Result<Machine> {
         );
     }
     let mut m = Machine {
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        lvm_group: String::new(),
+        lvm_thin_pool: String::new(),
+        ceph_conf: String::new(),
+        ceph_user: String::new(),
+        ceph_pool: String::new(),
+        ceph_image_pool: String::new(),
         region: or("VELSTRA_REGION", "eu-central"),
         cell: or("VELSTRA_CELL", "cell-1"),
         local_network: matches!(
@@ -249,6 +301,7 @@ pub fn parse(text: &str) -> Result<Machine> {
         ),
         roles: roles.clone(),
         api_url: or("VELSTRA_API_URL", ""),
+        api_ca: or("VELSTRA_API_CA", ""),
         node: String::new(),
         token: or("VELSTRA_TOKEN", ""),
         vmm: or("VELSTRA_VMM", "qemu"),
@@ -514,6 +567,15 @@ fn collect() -> Result<Option<Machine>> {
     };
 
     let mut m = Machine {
+        api_ca: String::new(),
+            tls_cert: String::new(),
+        tls_key: String::new(),
+        lvm_group: String::new(),
+        lvm_thin_pool: String::new(),
+        ceph_conf: String::new(),
+        ceph_user: String::new(),
+        ceph_pool: String::new(),
+        ceph_image_pool: String::new(),
         region,
         cell,
         roles: roles.clone(),
@@ -573,12 +635,52 @@ fn collect() -> Result<Option<Machine>> {
             "lowercase letters, digits and '-'",
         )?;
         m.pool_backend = loop {
-            match prompt("Backend [1] directory  [2] ceph: ")?.trim() {
+            match prompt("Backend [1] directory  [2] lvm  [3] ceph: ")?.trim() {
                 "" | "1" => break "directory".to_string(),
-                "2" => break "ceph".to_string(),
-                other => println!("  {other:?} is not a choice — 1 or 2."),
+                "2" => break "lvm".to_string(),
+                "3" => break "ceph".to_string(),
+                other => println!("  {other:?} is not a choice — 1, 2 or 3."),
             }
         };
+        if m.pool_backend == "lvm" {
+            println!("\nVolumes are logical volumes in one volume group, and the guest is");
+            println!("handed the device itself — no image format between it and the disk.");
+            m.lvm_group = ask_valid(
+                "Volume group: ",
+                crate::wizard::validate_safe_value,
+                "the name of an existing volume group, as `vgs` lists it",
+            )?;
+            println!("\nA thin pool changes what a snapshot costs and how it fails: a thick");
+            println!("snapshot reserves its space up front and is dropped by the kernel when");
+            println!("it fills; a thin one costs nothing until something is written.");
+            m.lvm_thin_pool = prompt("Thin pool inside it, if any []: ")?.trim().to_string();
+        }
+        if m.pool_backend == "ceph" {
+            println!("\nAn existing cluster, or one this machine will deploy. For an existing");
+            println!("one, give the config file and the user it should connect as — without");
+            println!("them this agent reaches only a cluster it deployed itself.");
+            m.ceph_conf = prompt("ceph.conf path, for an external cluster []: ")?
+                .trim()
+                .to_string();
+            let user = prompt("Connect as [client.admin]: ")?.trim().to_string();
+            m.ceph_user = if user.is_empty() {
+                "client.admin".to_string()
+            } else {
+                user
+            };
+            let pool = prompt("RBD pool for volumes [velstra-volumes]: ")?.trim().to_string();
+            m.ceph_pool = if pool.is_empty() {
+                "velstra-volumes".to_string()
+            } else {
+                pool
+            };
+            let images = prompt("RBD pool for images [velstra-images]: ")?.trim().to_string();
+            m.ceph_image_pool = if images.is_empty() {
+                "velstra-images".to_string()
+            } else {
+                images
+            };
+        }
     }
 
     if roles.contains(&Role::ControlPlane) {
@@ -754,6 +856,15 @@ mod tests {
 
     fn hypervisor() -> Machine {
         Machine {
+            api_ca: String::new(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            lvm_group: String::new(),
+            lvm_thin_pool: String::new(),
+            ceph_conf: String::new(),
+            ceph_user: String::new(),
+            ceph_pool: String::new(),
+            ceph_image_pool: String::new(),
             local_network: false,
             region: "eu-central".into(),
             cell: "cell-1".into(),
@@ -1032,4 +1143,175 @@ mod tests {
         assert!(!text.contains("VELSTRA_LOCAL_NETWORK"), "{text}");
         assert!(!parse(&text).unwrap().local_network);
     }
+
+    #[test]
+    fn a_pool_backend_carries_its_own_settings_into_the_seed() {
+        // The gap this closes: the pool agent's ceph arguments read only from
+        // the command line, the Debian unit passes `--backend` and nothing else,
+        // and so an **external** cluster could not be configured on a package
+        // install at all — the agent fell back to `client.admin` with no config
+        // file, which reaches a cluster this machine deployed itself and nothing
+        // else.
+        let mut m = Machine {
+            api_ca: String::new(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            roles: vec![Role::Pool],
+            pool: "nvme".into(),
+            pool_backend: "ceph".into(),
+            ceph_conf: "/etc/ceph/ceph.conf".into(),
+            ceph_user: "client.velstra".into(),
+            ceph_pool: "cloud-volumes".into(),
+            ..Default::default()
+        };
+        let seed = render(&m);
+        assert!(seed.contains("VELSTRA_CEPH_CONF=/etc/ceph/ceph.conf"), "{seed}");
+        assert!(seed.contains("VELSTRA_CEPH_USER=client.velstra"), "{seed}");
+        assert!(seed.contains("VELSTRA_CEPH_POOL=cloud-volumes"), "{seed}");
+        // Nothing that was not answered: an empty line would override the
+        // agent's own default with nothing, which is worse than silence.
+        assert!(!seed.contains("VELSTRA_CEPH_IMAGE_POOL="), "{seed}");
+        assert!(!seed.contains("VELSTRA_LVM_GROUP="), "{seed}");
+
+        m.pool_backend = "lvm".into();
+        m.ceph_conf = String::new();
+        m.ceph_user = String::new();
+        m.ceph_pool = String::new();
+        m.lvm_group = "vg0".into();
+        m.lvm_thin_pool = "thin".into();
+        let seed = render(&m);
+        assert!(seed.contains("VELSTRA_POOL_BACKEND=lvm"), "{seed}");
+        assert!(seed.contains("VELSTRA_LVM_GROUP=vg0"), "{seed}");
+        assert!(seed.contains("VELSTRA_LVM_THIN_POOL=thin"), "{seed}");
+        assert!(!seed.contains("VELSTRA_CEPH"), "{seed}");
+    }
+
 }
+
+/// Bring an existing seed up to what this package needs, and change nothing else.
+///
+/// Run by `postinst` on every upgrade. It exists because of one specific way an
+/// update can break a working machine silently: the API grew TLS, and an agent
+/// whose seed still says `http://` then talks plain HTTP to a TLS port. What it
+/// gets back is `invalid HTTP version parsed` — a TLS greeting seen by an HTTP
+/// parser — so the node stops following its cell, every guest on it goes to
+/// `Unknown`, and nothing anywhere says "your seed is out of date".
+///
+/// Two rules, both deliberate:
+///
+/// **Only what is provably safe.** The URL is rewritten only when this machine
+/// has a certificate *and* the seed already points at itself; a seed naming
+/// somebody else's control plane is left alone, because whether that one serves
+/// TLS is not knowable from here.
+///
+/// **Never overwrite an answer somebody gave.** A seed that already names a CA
+/// or an https URL is left exactly as it is.
+pub fn migrate_seed(dir: &std::path::Path) -> Result<Vec<String>> {
+    let path = dir.join("node.env");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let cert = dir.join("tls").join("cert.pem");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut changed = Vec::new();
+
+    fn value(lines: &[String], key: &str) -> Option<String> {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    // Nothing to do on a cell that serves plaintext: an agent speaking http to
+    // an http port is correct, and rewriting it would break what works.
+    if !cert.exists() {
+        return Ok(changed);
+    }
+
+    if let Some(url) = value(&lines, "VELSTRA_API_URL")
+        && url.starts_with("http://")
+        && (url.contains("127.0.0.1") || url.contains("localhost"))
+    {
+        let port = url.rsplit(':').next().unwrap_or("8443").to_string();
+        let now = format!("https://localhost:{port}");
+        for line in lines.iter_mut() {
+            if line.starts_with("VELSTRA_API_URL=") {
+                *line = format!("VELSTRA_API_URL={now}");
+            }
+        }
+        changed.push(format!("VELSTRA_API_URL is now {now}: this machine serves TLS"));
+    }
+
+    if value(&lines, "VELSTRA_API_CA").is_none()
+        && value(&lines, "VELSTRA_API_URL").is_some_and(|u| u.starts_with("https://"))
+    {
+        lines.push(format!("VELSTRA_API_CA={}", cert.display()));
+        changed.push(format!(
+            "VELSTRA_API_CA is now {}: the agents verify the API against the cell's own \
+             certificate rather than trusting whatever answers",
+            cert.display()
+        ));
+    }
+
+    if changed.is_empty() {
+        return Ok(changed);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(changed)
+}
+
+#[cfg(test)]
+mod migrating_a_seed {
+    use super::*;
+
+    fn scratch(name: &str, seed: &str, with_cert: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("velstra-seed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tls")).unwrap();
+        std::fs::write(dir.join("node.env"), seed).unwrap();
+        if with_cert {
+            std::fs::write(dir.join("tls").join("cert.pem"), "x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_seed_from_before_tls_is_pointed_at_the_certificate() {
+        // The upgrade that would otherwise cut a node off from its own cell.
+        let dir = scratch(
+            "old",
+            "VELSTRA_ROLES=control-plane,hypervisor\nVELSTRA_API_URL=http://127.0.0.1:8443\n",
+            true,
+        );
+        let said = migrate_seed(&dir).unwrap();
+        assert_eq!(said.len(), 2, "{said:?}");
+        let seed = std::fs::read_to_string(dir.join("node.env")).unwrap();
+        assert!(seed.contains("VELSTRA_API_URL=https://localhost:8443"), "{seed}");
+        assert!(seed.contains("VELSTRA_API_CA="), "{seed}");
+        // Idempotent: a second upgrade says nothing and changes nothing.
+        assert!(migrate_seed(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cell_without_a_certificate_is_left_alone() {
+        // Plaintext is a supported configuration. Rewriting it would break a
+        // machine that was working.
+        let dir = scratch("plain", "VELSTRA_API_URL=http://127.0.0.1:8443\n", false);
+        assert!(migrate_seed(&dir).unwrap().is_empty());
+        let seed = std::fs::read_to_string(dir.join("node.env")).unwrap();
+        assert!(seed.contains("http://127.0.0.1:8443"), "{seed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn somebody_elses_control_plane_is_not_guessed_at() {
+        // This machine's certificate says nothing about whether the cell it
+        // joined serves TLS, so the seed is not touched.
+        let dir = scratch("remote", "VELSTRA_API_URL=http://cell.example:8443\n", true);
+        assert!(migrate_seed(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

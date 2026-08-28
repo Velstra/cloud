@@ -359,3 +359,55 @@ mod the_ladder {
         }
     }
 }
+
+/// Whether a collection is the **cell's own** rather than any tenant's.
+///
+/// The distinction decides what a tenant is told when they ask for one. A
+/// cell-wide collection with tenant-visible objects — `images`, whose catalogue
+/// everybody may boot; `projects`, where they see theirs — is filtered, and an
+/// empty answer means "none for you". A collection where no object will *ever*
+/// pass a tenant's read is a different thing, and filtering it produces a lie:
+/// a customer asking for `/nodes` was told the cell has **zero machines**, when
+/// it has one they simply may not see.
+///
+/// So those are refused instead. It is what every large provider does, and the
+/// reason is not tidiness: "you may not look" and "there is nothing there" lead
+/// somebody to entirely different next steps, and only one of them is true.
+///
+/// Read by the API, which refuses, and checked against the console's own list,
+/// which hides them — two answers to one question that must not drift apart.
+pub fn belongs_to_the_cell(kind: &str) -> bool {
+    matches!(
+        kind,
+        "nodes"
+            | "pools"
+            | "ceph-clusters"
+            | "device-classes"
+            | "maintenance-windows"
+            | "image-sources"
+            | "backup-targets"
+            | "users"
+    )
+}
+
+#[cfg(test)]
+mod what_the_cell_keeps {
+    use super::*;
+
+    #[test]
+    fn a_tenants_own_collections_are_not_on_it() {
+        // Filtering is right for these: an empty answer means "none of yours",
+        // which is true and useful.
+        for kind in ["projects", "images", "instances", "volumes", "audit", "usage"] {
+            assert!(!belongs_to_the_cell(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn the_machine_room_is() {
+        for kind in ["nodes", "pools", "device-classes", "image-sources"] {
+            assert!(belongs_to_the_cell(kind), "{kind}");
+        }
+    }
+}
+
