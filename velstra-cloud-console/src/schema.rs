@@ -338,6 +338,13 @@ pub struct Field {
     /// Behind "More settings". The common path is what an operator sees first;
     /// everything that has a defensible default is one level deeper.
     pub advanced: bool,
+    /// What to say when there is nothing to choose from.
+    ///
+    /// A picker over an empty collection says "none exist yet", which is true
+    /// and useless: the person reading it is usually meeting the platform for
+    /// the first time, and what they need is the order to do things in. Empty
+    /// where the absence speaks for itself.
+    pub when_empty: &'static str,
     /// Why this exists, in a sentence, shown under the control. Empty when the
     /// label already says everything — a hint that repeats the label is noise.
     pub help: &'static str,
@@ -437,6 +444,18 @@ pub struct Collection {
     /// the console's promise that there is exactly one function deciding whether
     /// something is settled — it reads a different condition, not a second
     /// vocabulary.
+    ///
+    /// **Empty means nothing reports on these objects at all**, and the verdict
+    /// for them is "settled" rather than "not reported". That is not a
+    /// convenience: an audit record, a usage reading, a user account are
+    /// *records* — there is no agent that will ever write a condition on one,
+    /// so `observedGeneration` stays at zero for ever, and a console that read
+    /// that as "waiting" put every one of them on the screen an operator uses
+    /// to find what is wrong.
+    ///
+    /// Measured on a real cell before this existed: a hundred and nine objects
+    /// on the attention list, of which three were actually wrong. The three
+    /// were unfindable.
     pub condition: &'static str,
     /// The rail groups these. The groups are an operator's vocabulary, not the
     /// source layout.
@@ -471,6 +490,7 @@ const USER_FIELDS: &[Field] = &[
         // the consequence of acting on it is a permission that does not apply.
         help: "Shown on screen. Never used to decide anything — the account's id \
                is its identity.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -484,6 +504,7 @@ const USER_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -498,6 +519,7 @@ const USER_FIELDS: &[Field] = &[
         help: "Ends every session this account holds immediately, and refuses \
                new sign-ins. Its roles are kept, so turning it back on restores \
                exactly what it had.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -512,6 +534,7 @@ const USER_FIELDS: &[Field] = &[
         advanced: true,
         help: "May do anything anywhere in this cell, including inside every \
                project. Grant it to operate the platform, not to use it.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -532,6 +555,7 @@ const CEPH_FIELDS: &[Field] = &[
         help: "Where the daemons talk to each other and to clients. A node with \
                several interfaces has several answers, and the wrong one puts \
                replication traffic on the tenant network.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -546,6 +570,7 @@ const CEPH_FIELDS: &[Field] = &[
         advanced: true,
         help: "A separate network for replication. Empty means the one above \
                carries both, which is the ordinary answer for a small cluster.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -566,6 +591,7 @@ const CEPH_FIELDS: &[Field] = &[
         // obvious — it looks redundant and is not.
         help: "Three nodes, or one for a lab. Never two: a quorum of two \
                survives no failures and looks like it would.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -597,6 +623,7 @@ const CEPH_FIELDS: &[Field] = &[
                it rather than being greyed out — only a device the node can see \
                is empty is offered, so a disk you really do want to give up has \
                to be wiped outside the platform first.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -620,6 +647,7 @@ const CEPH_FIELDS: &[Field] = &[
                exist; below the floor the pool refuses writes rather than \
                holding data it cannot protect — so a floor equal to the copies \
                means one node rebooting stops writing.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -631,6 +659,7 @@ const CEPH_FIELDS: &[Field] = &[
         advanced: true,
         help: "Stops the deployment where it stands. Nothing is torn down, and \
                turning it off carries on from there.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -658,6 +687,7 @@ const PROJECT_FIELDS: &[Field] = &[
                logical networks only, which is what a new customer should \
                have. Named rather than a yes/no, because what anybody means by \
                a host bridge is a particular wire.",
+        when_empty: "",
         derived: false,
         at_creation: true,
     },
@@ -672,6 +702,7 @@ const PROJECT_FIELDS: &[Field] = &[
                other guest can have, so a project that may ask for them can \
                empty a node of the hardware everybody else was scheduled \
                against.",
+        when_empty: "",
         derived: false,
         at_creation: true,
     },
@@ -685,6 +716,7 @@ const PROJECT_FIELDS: &[Field] = &[
                They come out of address space the cell was given by whoever is \
                above it, so a project that could mint them could exhaust the \
                pool every other project is waiting on.",
+        when_empty: "",
         derived: false,
         at_creation: true,
     },
@@ -698,6 +730,7 @@ const PROJECT_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -711,6 +744,7 @@ const PROJECT_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "Policies and quota are inherited from here.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -732,6 +766,7 @@ const PROJECT_FIELDS: &[Field] = &[
         help: "Which cell this project's resources live in, and where requests \
                for them are routed. Leave empty to use whichever cell answers — \
                which is what an installation with one cell wants.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -751,6 +786,7 @@ const PROJECT_FIELDS: &[Field] = &[
         // exists, not while naming one. Creating a project is naming it.
         advanced: true,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -767,6 +803,7 @@ const PROJECT_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -783,6 +820,7 @@ const PROJECT_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -799,6 +837,7 @@ const PROJECT_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -819,6 +858,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: true,
         help: "A count, separate from the space: per-volume overhead is a \
                different worry from capacity, and the two are capped apart.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -836,6 +876,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: true,
         help: "An address that outlives the machine answering on it is scarce \
                and externally routable.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -853,6 +894,7 @@ const PROJECT_FIELDS: &[Field] = &[
         advanced: true,
         help: "Each one takes an address out of a subnet and datapath entries \
                on every ingress host.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -871,6 +913,7 @@ const PROJECT_FIELDS: &[Field] = &[
         help: "Each one is a piece of hardware that exists once and cannot be \
                oversubscribed, so without a cap one project can take every \
                accelerator in the cell.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -888,6 +931,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -904,6 +948,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -912,14 +957,19 @@ const INSTANCE_FIELDS: &[Field] = &[
         label: "Memory",
         kind: Kind::Number {
             unit: "MiB",
+            // A grid that contains the sizes people ask for. `min: 256` with a step of
+            // 512 put 2048, 4096 and 8192 all *between* two valid values, so the
+            // form opened with its own default marked invalid and every round
+            // number a person typed was refused by the control.
             min: 256,
             max: 4_194_304,
-            step: 512,
+            step: 256,
             scale: Scale::Mib,
         },
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -936,6 +986,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -950,6 +1001,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         // a choice almost nobody makes, and it is one switch away.
         advanced: true,
         help: "What it should be doing. Asking twice is the same as asking once.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -961,10 +1013,33 @@ const INSTANCE_FIELDS: &[Field] = &[
             spelling: Spelling::Name,
         },
         required: false,
-        // A guest with no NIC is unusual but it is not the thing most people
-        // are deciding while they name a machine.
+        // In the common path, not behind "More settings".
+        //
+        // The old reasoning was that a guest with no NIC is unusual and not
+        // what most people are deciding while they name a machine. Watching
+        // somebody meet this form for the first time settled it the other way:
+        // the field being hidden is exactly *why* they end up with a machine
+        // that has no NIC, and a guest with no network cannot be reached, cannot
+        // be configured, and cannot reach its own metadata service. It is not a
+        // detail; it is the difference between a usable guest and a puzzle.
+        // One level deeper, and the form says so instead.
+        //
+        // Putting it in the common path was tried and traded away: the path is
+        // capped at four on purpose, and displacing the root disk to make room
+        // moved the invisible problem rather than removing it. What somebody
+        // meeting this form needs is not the control in front of them — it is
+        // to be told, before they press Create, that the guest they are about
+        // to make will have no network at all. `consequences` in form.js says
+        // it, beside the button.
         advanced: true,
-        help: "Attached in this order.",
+        help: "Attached in this order. A guest with none has no network at all — \
+               it cannot be reached, and its cloud-init cannot fetch the keys \
+               and hostname this platform would give it.",
+        when_empty: "This project has no ports yet. A port is a guest's NIC, and \
+                     it is made in three steps: a Network, then a Subnet on it \
+                     with the range addresses come from, then a Port on that \
+                     subnet. You can create this guest without one and attach a \
+                     port later — but until you do it has no network at all.",
         derived: false,
         at_creation: false,
     },
@@ -979,6 +1054,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         // Almost always cloud-init's business rather than a field typed here.
         advanced: true,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -991,6 +1067,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "Handed to the guest on first boot.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1006,6 +1083,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "Left empty the scheduler chooses. Moving it afterwards is a \
                migration, not an edit.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1020,6 +1098,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "Instances in one group are kept off the same node — what keeps \
                a service alive when a machine dies.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1044,6 +1123,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                replicas of a database must not share a machine even if that \
                means one stays down. A wish takes a crowded node over not \
                running at all, which is what twelve web servers want.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1060,6 +1140,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                For a pair that talks constantly — an application and the cache \
                it reads on every request — where a hop between machines is the \
                whole latency budget.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1083,6 +1164,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         help: "A rule refuses every node but the one the group is already on, \
                and says which that is. A wish places elsewhere rather than not \
                at all.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1096,6 +1178,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "Only nodes carrying all of these.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1115,6 +1198,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                together. Matters after a power cut, when a node brings back \
                everything it holds at once and the database loses the race for \
                disk to a dozen web servers.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1133,6 +1217,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         help: "Measured from the newest start in that group, not each member \
                in turn — a hundred guests at thirty seconds each would be \
                fifty minutes of nothing happening.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1153,6 +1238,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                been quiet long enough that its own agent has certainly stopped \
                its guests — a node with no fencing deadline is never recovered \
                from.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1169,6 +1255,7 @@ const INSTANCE_FIELDS: &[Field] = &[
                can be read here. Off by default because it costs a report \
                every time the guest logs a line. A guest that is not running \
                shows its last output whether this is on or not.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1184,6 +1271,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         help: "A class, not a machine's address. Two of the same class means \
                two devices. A guest holding one cannot be live-migrated — a \
                device's state is in hardware and cannot be transferred.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1202,6 +1290,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "What the image needs to run. RHEL 9 and CentOS Stream 9 need \
                x86-64-v2 or they will not boot.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1221,6 +1310,7 @@ const VOLUME_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1234,6 +1324,7 @@ const VOLUME_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: true,
     },
@@ -1248,6 +1339,7 @@ const VOLUME_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "Left empty the volume comes up blank.",
+        when_empty: "",
         derived: false,
         at_creation: true,
     },
@@ -1274,6 +1366,7 @@ const VOLUME_FIELDS: &[Field] = &[
         advanced: false,
         help: "Restores that snapshot into a new volume. A volume is never \
                restored in place, so this is what restoring means.",
+        when_empty: "",
         derived: false,
         at_creation: true,
     },
@@ -1288,6 +1381,7 @@ const VOLUME_FIELDS: &[Field] = &[
         advanced: true,
         help: "Empty means the bytes are stored in the clear, which is a \
                decision rather than a default.",
+        when_empty: "",
         derived: false,
         at_creation: true,
     },
@@ -1305,6 +1399,7 @@ const ATTACHMENT_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1319,6 +1414,7 @@ const ATTACHMENT_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1339,6 +1435,7 @@ const ATTACHMENT_FIELDS: &[Field] = &[
         // because which node will open the volume is worth knowing before
         // asking for it.
         help: "Where the volume will be opened. Taken from the instance.",
+        when_empty: "",
         derived: true,
         at_creation: false,
     },
@@ -1349,12 +1446,35 @@ const ATTACHMENT_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
 ];
 
 const NETWORK_FIELDS: &[Field] = &[
+    Field {
+        key: "hostBridge",
+        label: "On the machine's own wire",
+        kind: Kind::Text {
+            placeholder: "br0",
+            // An interface name, not a resource name: it names something on the
+            // machine, and the machine's rules are the kernel's.
+            check: Check::None,
+        },
+        required: false,
+        advanced: true,
+        help: "A bridge that already exists on the nodes — `br0`, `vmbr0`. \
+               Guests on this network go straight onto whatever the machine is \
+               on: the house LAN, a VLAN, a lab network. Their addresses come \
+               from whatever serves that wire and this platform allocates \
+               none, holds no gateway and enforces no security group. Empty is \
+               the ordinary case. Only a cell operator may set it — it is a \
+               decision about the machine, not about a project.",
+        when_empty: "",
+        derived: false,
+        at_creation: true,
+    },
     Field {
         key: "external",
         label: "Carries real addresses",
@@ -1365,6 +1485,7 @@ const NETWORK_FIELDS: &[Field] = &[
                by whoever is above it, so an address from one is an address \
                the world can reach. Only a cell operator may say so — a tenant \
                who could would mint themselves a public range by typing a CIDR.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1388,6 +1509,7 @@ const NETWORK_FIELDS: &[Field] = &[
         help: "What this cell does by default for addresses from this network. \
                An individual address may say otherwise. Meaningless on a \
                network that carries no real addresses.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1404,6 +1526,7 @@ const NETWORK_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1420,6 +1543,7 @@ const NETWORK_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "Assigned by the controller from the cell's range.",
+        when_empty: "",
         derived: true,
         at_creation: false,
     },
@@ -1437,6 +1561,9 @@ const SUBNET_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "No networks in this project yet. A network is the first of \
+                     the three things a guest needs to be reachable: a network, \
+                     a subnet on it, then a port.",
         derived: false,
         at_creation: false,
     },
@@ -1450,6 +1577,7 @@ const SUBNET_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1463,6 +1591,7 @@ const SUBNET_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1476,6 +1605,7 @@ const SUBNET_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1489,6 +1619,7 @@ const SUBNET_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "Addresses the platform will not hand out.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1505,6 +1636,7 @@ const SECURITY_GROUP_FIELDS: &[Field] = &[Field {
     help: "Every rule permits; none of them forbids. A group with no rules \
                is a group that allows nothing extra, which is the platform's \
                default anyway: nothing in, everything out, replies always.",
+    when_empty: "",
     derived: false,
     at_creation: false,
 }];
@@ -1521,6 +1653,7 @@ const PORT_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1535,6 +1668,8 @@ const PORT_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "No subnets on this network yet. A subnet is the range its \
+                     addresses come from — make one before a port.",
         derived: false,
         at_creation: false,
     },
@@ -1551,6 +1686,7 @@ const PORT_FIELDS: &[Field] = &[
                two groups cannot contradict each other. With none, the port \
                keeps the platform's default: nothing in, everything out, \
                replies always.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1565,6 +1701,7 @@ const PORT_FIELDS: &[Field] = &[
         advanced: true,
         help: "Left empty IPAM allocates one. It never changes afterwards — an \
                address that moves under a running guest is an outage.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1578,19 +1715,7 @@ const PORT_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "",
-        derived: false,
-        at_creation: false,
-    },
-    Field {
-        key: "securityGroups",
-        label: "Security groups",
-        kind: Kind::TextList {
-            placeholder: "web",
-            check: Check::Id,
-        },
-        required: false,
-        advanced: false,
-        help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1608,6 +1733,7 @@ const PORT_FIELDS: &[Field] = &[
         advanced: true,
         help: "Zero is unlimited. Multi-tenancy without a ceiling is one noisy \
                neighbour away from an incident.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1625,6 +1751,7 @@ const IMAGE_FIELDS: &[Field] = &[
         advanced: false,
         help: "The bytes are addressed by this, so an image cannot be replaced \
                under an instance that was built from it.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1637,6 +1764,7 @@ const IMAGE_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1650,6 +1778,7 @@ const IMAGE_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1666,6 +1795,7 @@ const IMAGE_FIELDS: &[Field] = &[
         required: false,
         advanced: true,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1686,6 +1816,7 @@ const NODE_FIELDS: &[Field] = &[
         advanced: false,
         help: "Turning this off drains the node: nothing new is placed, what \
                runs keeps running.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1699,6 +1830,7 @@ const NODE_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "What placement policies match on.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1712,6 +1844,7 @@ const NODE_FIELDS: &[Field] = &[
                this says none of the old stays either. One migration is started \
                per guest that can move — a guest holding a passed-through \
                device cannot, and stays with the reason on it.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1732,6 +1865,7 @@ const NODE_FIELDS: &[Field] = &[
                never does is never recovered from, because nothing can tell \
                \"unreachable\" from \"stopped\". Set it and guests marked for \
                restart can be brought up elsewhere.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1745,6 +1879,7 @@ const NODE_FIELDS: &[Field] = &[
                and packets for it reach the guest over the overlay. Several \
                machines may carry it — the network above sees them as equal \
                next hops — and a cell with none simply cannot use that mode.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1766,6 +1901,7 @@ const NODE_FIELDS: &[Field] = &[
                wrong costs speed — which is how nearly every fleet in the \
                world is run. There is deliberately no setting for memory: a \
                guest promised 8 GiB and handed 4 is not slow, it is killed.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1787,6 +1923,7 @@ const NODE_FIELDS: &[Field] = &[
         help: "Present the same CPU as other nodes so guests can migrate \
                between them. Guests already running keep the CPU they started \
                with and adopt this one when they next restart.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1807,6 +1944,7 @@ const ROUTER_FIELDS: &[Field] = &[Field {
     advanced: false,
     help: "The networks whose subnets reach each other. A network belongs to \
                at most one router.",
+    when_empty: "",
     derived: false,
     at_creation: false,
 }];
@@ -1825,6 +1963,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         advanced: false,
         help: "Where the address comes from. The same counting as a port's \
                address, so the two are never the same address.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1840,6 +1979,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         // — and leaving it empty is what almost everybody wants.
         advanced: true,
         help: "Leave empty to be given the lowest address nothing else holds.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1858,6 +1998,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
         advanced: false,
         help: "The port this address reaches. Clearing it holds the address \
                while the machine behind it is replaced.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1884,6 +2025,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
                IPsec and mDNS all need. Translated means the edge answers for \
                it and the guest never knows. A held address has to come from \
                an external network.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1914,6 +2056,7 @@ const FLOATING_IP_FIELDS: &[Field] = &[
                to be allowed to peer with the router above it. A gateway node \
                needs only that one machine to peer, and costs a detour in both \
                directions.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1932,6 +2075,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "The machine going out of service.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1945,6 +2089,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
         advanced: false,
         help: "In your own timezone. A start already past means now — work \
                that has already begun is a true thing to declare.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1953,7 +2098,9 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
         label: "For",
         kind: Kind::Number {
             unit: "minutes",
-            min: 1,
+            // The grid starts where it steps, or the numbers a person means — thirty
+            // minutes, an hour, four hours — all fall between two valid ones.
+            min: 15,
             max: 20_160,
             step: 15,
             scale: Scale::None,
@@ -1963,6 +2110,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
         help: "How long it stays open. There is no end time to keep in step \
                with this one: two fields that can disagree about the same \
                fact are one field too many.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1977,6 +2125,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
                wants. On — the guests are migrated away as well, which is \
                what pulling the machine wants. A guest that cannot move is \
                left where it is, and :explainMaintenance says which.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -1996,6 +2145,7 @@ const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
         help: "Shown wherever this window is the reason something was \
                refused, so \"no capacity\" reads as \"node-b is out until \
                03:00 for the memory swap\" instead.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2014,6 +2164,7 @@ const SNAPSHOT_SCHEDULE_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "What is snapshotted.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2032,6 +2183,7 @@ const SNAPSHOT_SCHEDULE_FIELDS: &[Field] = &[
         help: "Cheap enough to run hourly. A snapshot lives in the volume's \
                own pool: it is the right tool for going back an hour, and it \
                is lost with the pool — which is what backups are for.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2050,6 +2202,7 @@ const SNAPSHOT_SCHEDULE_FIELDS: &[Field] = &[
         help: "Only finished ones count, so a run of failures never expires \
                the last one that worked. Snapshots taken by hand are never \
                expired.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2072,6 +2225,7 @@ const CAPTURE_FIELDS: &[Field] = &[
                is crash-consistent, which a template stamped out a hundred \
                times must not be — if you want a copy of a live guest, take a \
                backup instead.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2086,6 +2240,7 @@ const CAPTURE_FIELDS: &[Field] = &[
         advanced: false,
         help: "What the resulting image is called. Its digest is added to \
                this — a list of hashes is not something anybody chooses from.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2101,6 +2256,7 @@ const CAPTURE_FIELDS: &[Field] = &[
         advanced: false,
         help: "Where the bytes go. Any node that can reach the same path can \
                then boot guests from the image.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2122,6 +2278,7 @@ const BACKUP_TARGET_FIELDS: &[Field] = &[
                NFS or CIFS share is the host's job, not this platform's — one \
                that managed its own mounts would be a second, worse copy of \
                what init already does.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2133,6 +2290,7 @@ const BACKUP_TARGET_FIELDS: &[Field] = &[
         advanced: false,
         help: "Turning this off stops new copies going here. What is already \
                here stays, and can still be restored from.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2152,6 +2310,7 @@ const BACKUP_TARGET_FIELDS: &[Field] = &[
                nobody is one any agent could report on. Leave it empty and \
                nobody looks: copies are still written by the pool holding the \
                volume, and a path it cannot reach fails on the backup instead.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2175,6 +2334,7 @@ const BACKUP_TARGET_FIELDS: &[Field] = &[
                copy per pass, the one whose last check is stalest — so a target \
                holding more copies checks each of them less often rather than \
                falling behind on the work that is not optional.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2193,6 +2353,7 @@ const BACKUP_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "What is copied.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2209,6 +2370,7 @@ const BACKUP_FIELDS: &[Field] = &[
         help: "Where the copy goes. A target in the volume's own pool is \
                refused: a copy beside the original is a snapshot, and is lost \
                with the pool it is in.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2227,6 +2389,7 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "What is copied.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2241,6 +2404,7 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "Where the copies go.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2259,6 +2423,7 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
         help: "How stale the newest copy may get before another is made. An \
                interval rather than a cron line, because the only question \
                anybody asks a schedule is when it will next run.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2277,6 +2442,7 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
         help: "How many of this schedule's copies to keep. Only finished \
                copies count, so a run of failures never expires the last one \
                that worked. Copies taken by hand are never expired.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2295,6 +2461,7 @@ const DEVICE_CLASS_FIELDS: &[Field] = &[
         advanced: false,
         help: "vendor:device, as `lspci -n` prints it. Several, because a \
                fleet buys the same accelerator across board revisions.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2308,6 +2475,7 @@ const DEVICE_CLASS_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "What to call it in this console.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2329,6 +2497,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         advanced: false,
         help: "The network the address lives on. It scopes the service, so two \
                projects may front the same address on different networks.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2345,6 +2514,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         help: "Where the address comes from. The same counting as a port's \
                address and a floating IP's, so no two of them are ever the \
                same address.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2360,6 +2530,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         help: "The ports the address answers on. Traffic is spread across the \
                pool by connection, so one client's connection stays on one \
                member.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2378,6 +2549,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         help: "The ports behind the address — ports, not addresses, so a \
                migrated guest stays in the pool. Empty holds the address and \
                forwards to nothing.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2392,6 +2564,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         // Pinning one is the unusual case, exactly as it is for a floating IP.
         advanced: true,
         help: "Leave empty to be given the lowest address nothing else holds.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2408,6 +2581,7 @@ const POOL_FIELDS: &[Field] = &[
         advanced: false,
         help: "Turning this off drains the pool: nothing new is provisioned \
                into it, what it holds stays.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2421,6 +2595,7 @@ const POOL_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "What a volume's placement matches on.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2445,6 +2620,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2459,6 +2635,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "Where the guest is now. Taken from the instance.",
+        when_empty: "",
         derived: true,
         at_creation: false,
     },
@@ -2474,6 +2651,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         advanced: false,
         help: "Only the nodes that can receive this guest can be chosen. The \
                rest are shown with the reason they cannot.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2491,6 +2669,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         advanced: false,
         help: "What a failure costs. Under Live the guest stays where it is; \
                under Post-copy a failure mid-flight loses it.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2499,7 +2678,9 @@ const MIGRATION_FIELDS: &[Field] = &[
         label: "Downtime budget",
         kind: Kind::Number {
             unit: "ms",
-            min: 10,
+            // Fifty and its multiples: with a minimum of ten and a step of fifty, the
+            // grid was 10, 60, 110 — and 100, 200 and 500 were all invalid.
+            min: 50,
             max: 60_000,
             step: 50,
             scale: Scale::None,
@@ -2508,6 +2689,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         advanced: true,
         help: "The pause the guest may take at the end. A busy guest needs a \
                larger budget or the transfer never converges.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2525,6 +2707,7 @@ const MIGRATION_FIELDS: &[Field] = &[
         advanced: true,
         help: "A migration that cannot converge is one that runs until somebody \
                notices.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
@@ -2542,10 +2725,16 @@ const MIGRATION_FIELDS: &[Field] = &[
         advanced: true,
         help: "Parallel streams for the transfer. One is the only value a local \
                socket accepts.",
+        when_empty: "",
         derived: false,
         at_creation: false,
     },
 ];
+
+/// Nothing about a reading is somebody's to set. It is a fact about a moment
+/// that has passed, written once and never edited — a usage record that could
+/// be changed after the fact is a bill nobody can stand behind.
+const USAGE_FIELDS: &[Field] = &[];
 
 const OPERATION_FIELDS: &[Field] = &[
     Field {
@@ -2558,6 +2747,7 @@ const OPERATION_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: true,
         at_creation: false,
     },
@@ -2571,6 +2761,7 @@ const OPERATION_FIELDS: &[Field] = &[
         required: true,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: true,
         at_creation: false,
     },
@@ -2587,6 +2778,7 @@ const OPERATION_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: true,
         at_creation: false,
     },
@@ -2600,15 +2792,11 @@ const OPERATION_FIELDS: &[Field] = &[
         required: false,
         advanced: false,
         help: "",
+        when_empty: "",
         derived: true,
         at_creation: false,
     },
 ];
-
-/// Nothing about a reading is somebody's to set. It is a fact about a moment
-/// that has passed, written once and never edited — a usage record that could
-/// be changed after the fact is a bill nobody can stand behind.
-const USAGE_FIELDS: &[Field] = &[];
 
 pub const COLLECTIONS: &[Collection] = &[
     Collection {
@@ -3483,64 +3671,6 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
-        id: "usage",
-        title: "Usage",
-        singular: "usage record",
-        recheck: 0,
-        condition: "",
-        // Nothing reports on these: a usage reading is a fact about a moment that has passed.
-        group: "Access",
-        scope: Scope::Project,
-        blurb: "What this project had, read once an hour and kept for ninety \
-                days. A reading is a sample, not a total: something created and \
-                destroyed between two of them is in neither. Quota says what is \
-                in use now; this is the only thing that remembers.",
-        fields: USAGE_FIELDS,
-        columns: &[
-            Column {
-                path: "spec.at",
-                label: "Taken",
-                cell: Cell::Ago,
-                width: 120,
-            },
-            Column {
-                path: "spec.used.instances",
-                label: "Instances",
-                cell: Cell::Number { unit: "" },
-                width: 90,
-            },
-            Column {
-                path: "spec.used.vcpus",
-                label: "vCPUs",
-                cell: Cell::Number { unit: "" },
-                width: 80,
-            },
-            Column {
-                path: "spec.used.memoryMib",
-                label: "Memory",
-                cell: Cell::Number { unit: "MiB" },
-                width: 110,
-            },
-            Column {
-                path: "spec.used.volumeGib",
-                label: "Storage",
-                cell: Cell::Number { unit: "GiB" },
-                width: 110,
-            },
-            Column {
-                path: "spec.used.floatingIps",
-                label: "Public addresses",
-                cell: Cell::Number { unit: "" },
-                width: 130,
-            },
-        ],
-        agreements: &[],
-        creatable: false,
-        editable: false,
-        deletable: false,
-        explainable: false,
-    },
-    Collection {
         id: "audit",
         title: "Audit",
         singular: "audit record",
@@ -3849,6 +3979,64 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "usage",
+        title: "Usage",
+        singular: "usage record",
+        recheck: 0,
+        condition: "",
+        // Nothing reports on these: a usage reading is a fact about a moment that has passed.
+        group: "Access",
+        scope: Scope::Project,
+        blurb: "What this project had, read once an hour and kept for ninety \
+                days. A reading is a sample, not a total: something created and \
+                destroyed between two of them is in neither. Quota says what is \
+                in use now; this is the only thing that remembers.",
+        fields: USAGE_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.at",
+                label: "Taken",
+                cell: Cell::Ago,
+                width: 120,
+            },
+            Column {
+                path: "spec.used.instances",
+                label: "Instances",
+                cell: Cell::Number { unit: "" },
+                width: 90,
+            },
+            Column {
+                path: "spec.used.vcpus",
+                label: "vCPUs",
+                cell: Cell::Number { unit: "" },
+                width: 80,
+            },
+            Column {
+                path: "spec.used.memoryMib",
+                label: "Memory",
+                cell: Cell::Number { unit: "MiB" },
+                width: 110,
+            },
+            Column {
+                path: "spec.used.volumeGib",
+                label: "Storage",
+                cell: Cell::Number { unit: "GiB" },
+                width: 110,
+            },
+            Column {
+                path: "spec.used.floatingIps",
+                label: "Public addresses",
+                cell: Cell::Number { unit: "" },
+                width: 130,
+            },
+        ],
+        agreements: &[],
+        creatable: false,
+        editable: false,
+        deletable: false,
+        explainable: false,
+    },
+    Collection {
         id: "operations",
         title: "Operations",
         singular: "operation",
@@ -4098,6 +4286,7 @@ mod tests {
             "users",
             "ceph-clusters",
             "maintenance-windows",
+            "usage",
         ] {
             assert!(find(id).is_some(), "no screen for {id}");
         }
@@ -4159,6 +4348,48 @@ mod tests {
         assert_eq!(find("instances").unwrap().condition, "Ready");
     }
 
+    /// A stepper's grid has to contain the numbers people mean.
+    ///
+    /// A `<input type=number>` counts valid values from the **minimum**, in
+    /// steps: `min + n × step`. So a minimum of 256 with a step of 512 makes
+    /// the valid memory sizes 256, 768, 1280, 1792, 2304 — and 2048, 4096 and
+    /// 8192, which is what anybody actually asks for, all fall between two of
+    /// them.
+    ///
+    /// Found by opening the form: the new-instance sheet showed its own
+    /// default of 2048 MiB as invalid before anybody had touched it.
+    ///
+    /// The rule is that the grid starts on a round number — `min % step == 0`,
+    /// or the minimum *is* the step. That is enough to put every multiple of
+    /// the step inside the range, which is what a stepper is for.
+    #[test]
+    fn every_stepper_can_reach_the_numbers_people_mean() {
+        for c in COLLECTIONS {
+            for f in c.fields {
+                let Kind::Number { min, max, step, .. } = f.kind else {
+                    continue;
+                };
+                assert!(step > 0, "{}.{} steps by nothing", c.id, f.key);
+                assert_eq!(
+                    min % step,
+                    0,
+                    "{}.{} counts from {min} in steps of {step}, so the values it admits are \
+                     {min}, {}, {} … — every round number a person would type falls between two \
+                     of them",
+                    c.id,
+                    f.key,
+                    min + step,
+                    min + 2 * step
+                );
+                assert!(
+                    max >= min + step,
+                    "{}.{} has no room for a single step",
+                    c.id,
+                    f.key
+                );
+            }
+        }
+    }
 
     #[test]
     fn what_is_decided_by_a_clock_is_asked_again() {
@@ -4408,6 +4639,30 @@ mod tests {
         let ops = find("operations").unwrap();
         assert!(!ops.creatable && !ops.editable && !ops.deletable);
         assert!(ops.fields.iter().all(|f| f.derived));
+    }
+
+    /// One question per field, asked once.
+    ///
+    /// Two `Field`s with the same key are two controls writing one value: the
+    /// form renders both, the person answers whichever they meet first, and
+    /// whichever renders last is what gets sent. A port's form asked for its
+    /// security groups twice — once as a picker over the groups that exist and
+    /// once as free text — and it took opening the form to see it.
+    #[test]
+    fn no_collection_asks_the_same_thing_twice() {
+        for c in COLLECTIONS {
+            let mut seen: Vec<&str> = Vec::new();
+            for f in c.fields {
+                assert!(
+                    !seen.contains(&f.key),
+                    "{} has two fields for `{}` — two controls writing one value, and the \
+                     answer is whichever rendered last",
+                    c.id,
+                    f.key
+                );
+                seen.push(f.key);
+            }
+        }
     }
 
     #[test]
