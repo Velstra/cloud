@@ -2796,7 +2796,11 @@ pub const COLLECTIONS: &[Collection] = &[
         title: "Networks",
         singular: "network",
         recheck: 0,
-        condition: "Ready",
+        // `Mirrored`, not `Ready`: the network controller writes that one, and
+        // nothing writes `Ready` on a network at all. Reading the wrong name
+        // made every network in every cell say "not reported" for ever —
+        // including the ones the fabric had been told about perfectly well.
+        condition: "Mirrored",
         group: "Network",
         scope: Scope::Project,
         blurb: "One VNI on the fabric. The nodes that have it programmed are on \
@@ -2833,7 +2837,10 @@ pub const COLLECTIONS: &[Collection] = &[
         // opened, for as long as it stayed open, which is precisely the
         // staleness that computing them on read exists to remove.
         recheck: 15,
-        condition: "Ready",
+        // Nothing reports on a subnet. Its two occupancy numbers are counted
+        // by the API on the way out, and there is no agent that owns the range
+        // — the network it belongs to is what gets mirrored.
+        condition: "",
         group: "Network",
         scope: Scope::Project,
         blurb: "A range on a network, and the count of what IPAM has handed out \
@@ -2962,7 +2969,8 @@ pub const COLLECTIONS: &[Collection] = &[
         title: "Images",
         singular: "image",
         recheck: 0,
-        condition: "Ready",
+        condition: "",
+        // Nothing reports on these: an image is bytes and a digest; which nodes have it cached is counted by the API on the way out, and no agent owns the object.
         group: "Compute",
         scope: Scope::Project,
         blurb: "Content-addressed and immutable. Cached copies are a placement \
@@ -3155,7 +3163,8 @@ pub const COLLECTIONS: &[Collection] = &[
         // browser can do on numbers it already has — asking the API again would
         // be polling for an answer nobody is going to write down.
         recheck: 0,
-        condition: "Ready",
+        condition: "",
+        // Nothing reports on these: a window is a statement about time, and time needs no agent.
         group: "Cell",
         scope: Scope::Global,
         blurb: "Say in advance that a machine is going out of service, and the \
@@ -3211,7 +3220,8 @@ pub const COLLECTIONS: &[Collection] = &[
         title: "Snapshot schedules",
         singular: "snapshot schedule",
         recheck: 0,
-        condition: "Ready",
+        condition: "",
+        // Nothing reports on these: a schedule is a statement about time — the snapshots it produces report, it does not.
         group: "Storage",
         scope: Scope::Project,
         blurb: "The cheap half of the pair. A snapshot lives in the volume's \
@@ -3298,7 +3308,8 @@ pub const COLLECTIONS: &[Collection] = &[
         title: "Backup targets",
         singular: "backup target",
         recheck: 0,
-        condition: "Ready",
+        condition: "",
+        // Nothing reports on these: a target is somewhere to put bytes; the backups that use it report, it does not.
         group: "Storage",
         scope: Scope::Global,
         blurb: "Where backups are kept. Deliberately not a pool: a copy that \
@@ -3471,7 +3482,8 @@ pub const COLLECTIONS: &[Collection] = &[
         title: "Audit",
         singular: "audit record",
         recheck: 0,
-        condition: "Ready",
+        condition: "",
+        // Nothing reports on these: an audit record is a fact about something that already happened.
         group: "Fleet",
         scope: Scope::Global,
         blurb: "What was refused, and who signed in. Not a log of everything \
@@ -3528,7 +3540,8 @@ pub const COLLECTIONS: &[Collection] = &[
         title: "Device classes",
         singular: "device class",
         recheck: 0,
-        condition: "Ready",
+        condition: "",
+        // Nothing reports on these: a device class is a declaration about hardware, not a thing that converges.
         group: "Fleet",
         scope: Scope::Global,
         blurb: "Names for interchangeable hardware. An instance asks for a \
@@ -3824,7 +3837,8 @@ pub const COLLECTIONS: &[Collection] = &[
         title: "Users",
         singular: "user",
         recheck: 0,
-        condition: "Ready",
+        condition: "",
+        // Nothing reports on these: an account is a declaration; no agent runs one.
         group: "Access",
         scope: Scope::Global,
         blurb: "Who can sign in. A password is set from the row rather than \
@@ -4041,15 +4055,47 @@ mod tests {
     #[test]
     fn every_collection_says_which_condition_it_is_judged_by() {
         // The verdict comes from one function reading one condition. A
-        // collection that names a condition nothing ever writes reads as "not
-        // reported" forever, which is the failure this catches — and an empty
-        // one would make the function fall back to the whole list and guess.
+        // collection that names a condition **nothing ever writes** reads as
+        // "not reported" for ever — which is the failure this catches, and it
+        // is not hypothetical: on a real cell it put a hundred and nine objects
+        // on the attention list, three of which were actually wrong.
+        //
+        // So a collection either names a condition somebody writes, or it says
+        // outright that nobody does. The second list is written out here rather
+        // than inferred, because "nothing reports on this" is a claim about the
+        // whole platform and adding a collection to it should take a moment's
+        // thought.
+        let unreported: &[&str] = &[
+            // Records of something that already happened.
+            "audit",
+            "usage",
+            // Declarations. Nothing runs an account, a hardware class, a place
+            // to put bytes, or a statement about time.
+            "users",
+            "device-classes",
+            "backup-targets",
+            "maintenance-windows",
+            // Counted on the way out by the API, owned by no agent: the network
+            // a subnet belongs to is what gets mirrored.
+            "subnets",
+            "images",
+            "snapshot-schedules",
+        ];
         for c in COLLECTIONS {
-            assert!(!c.condition.is_empty(), "{} names no condition", c.id);
+            let says_nobody = c.condition.is_empty();
+            assert_eq!(
+                says_nobody,
+                unreported.contains(&c.id),
+                "{} {} that nothing reports on it, and the list here says {}",
+                c.id,
+                if says_nobody { "says" } else { "does not say" },
+                unreported.contains(&c.id)
+            );
         }
         assert_eq!(find("migrations").unwrap().condition, "Moved");
         assert_eq!(find("instances").unwrap().condition, "Ready");
     }
+
 
     #[test]
     fn what_is_decided_by_a_clock_is_asked_again() {

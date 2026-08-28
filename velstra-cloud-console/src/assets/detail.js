@@ -5,7 +5,17 @@
 // spec alone is a wish. So the sheet leads with the verdict, then puts the two
 // halves in the same table, and only then lists the object's own detail.
 
-const sheet = { open: false, name: null, coll: null, timer: null };
+const sheet = { open: false, name: null, coll: null, timer: null, closers: [] };
+
+/// Something to undo when the sheet closes.
+///
+/// A timer is not the only thing a sheet can leave running: a console holds a
+/// socket, and a socket left open holds a guest's serial line against a session
+/// that cannot be reused. Registered rather than remembered by name, because the
+/// sheet does not need to know what it is closing.
+function onSheetClose(undo) {
+  sheet.closers.push(undo);
+}
 
 /// A sheet that asks something again on a timer owns that timer, so it stops
 /// when the sheet does and there is never a second one running behind it.
@@ -17,6 +27,10 @@ function sheetTimer(every, tick) {
 function closeSheet() {
   sheet.open = false; sheet.name = null;
   sheetTimer(0, null);
+  for (const undo of sheet.closers) {
+    try { undo(); } catch (e) { /* one that throws must not strand the others */ }
+  }
+  sheet.closers = [];
   const s = $("sheet"), sc = $("scrim");
   if (s) s.remove();
   if (sc) sc.remove();
@@ -702,6 +716,27 @@ function renderSheet(coll, r) {
     sheetTimer(migrations ? migrations.recheck : 0, () => {
       if (sheet.open && sheet.name === nameOf(r)) migrationInto(host, r);
     });
+  }
+
+  // Who may do what in this project. Above the fields for the same reason the
+  // console is: somebody opening a project's sheet is usually here to add
+  // somebody to it, not to read its quota.
+  if (coll.id === "projects") {
+    const host = el("div", { id: "projectgrants" });
+    panel.appendChild(spread("Access", host, "who may do what in this project"));
+    // No redraw of the whole sheet on save: the panel keeps its own idea of
+    // what is stored, and rebuilding the sheet around it was what left a second
+    // save carrying the revision the first one had already moved past.
+    grantsInto(host, coll, r);
+  }
+
+  // A way in, for when the network is not one. Above the fields, because
+  // somebody opening a guest's sheet because it will not come up is here for
+  // this and not for its vCPU count.
+  if (coll.id === "instances") {
+    const host = el("div", { id: "instanceconsole" });
+    panel.appendChild(spread("Console", host, "the guest's serial line"));
+    consoleSection(host, coll, idOf(r));
   }
 
   const pairs = agreementTable(coll, r);
