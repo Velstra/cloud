@@ -324,11 +324,46 @@ async fn read(
     Path(path): Path<String>,
     Query(query): Query<BTreeMap<String, String>>,
     Extension(who): Extension<Identity>,
+    upgrade: Option<axum::extract::ws::WebSocketUpgrade>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let _ = headers;
     match target(&path)? {
         Target::Object(name) => Ok(object(StatusCode::OK, api.get(&name, &who).await?)),
+        // The stream itself. A GET because it is an upgrade, and it carries a
+        // ticket rather than resting on the session cookie: the ticket is what
+        // the node checks, and a stream that opened on a cookie alone would be
+        // one another page could open in the background.
+        Target::Verb { name, verb } if verb == "consoleStream" => {
+            let Some(upgrade) = upgrade else {
+                return Err(ApiError::invalid(
+                    "a console stream is a websocket; this request did not ask to upgrade",
+                ));
+            };
+            let (Some(session), Some(ticket)) =
+                (query.get("session").cloned(), query.get("ticket").cloned())
+            else {
+                return Err(ApiError::invalid(
+                    "a console stream carries the session and the ticket it was given",
+                ));
+            };
+            // Read is the floor here as well, so a stream cannot be opened
+            // against a guest the caller may not even see. What the holder may
+            // *do* was decided when the ticket was minted and is on the session.
+            // Reading the guest is the floor: a stream must not open against a
+            // machine the caller may not even see. `get` is the read the API
+            // already authorises, and its answer is thrown away.
+            api.get(&name, &who).await?;
+            let endpoint = api
+                .console_endpoint_for(&ResourceName::parse(&session)?)
+                .await?;
+            let url = format!("ws://{endpoint}/console?session={session}&ticket={ticket}");
+            Ok(upgrade.on_upgrade(move |socket| async move {
+                if let Err(e) = crate::console_proxy::relay(socket, url).await {
+                    tracing::warn!(error = %e, "a console stream could not be relayed");
+                }
+            }))
+        }
         Target::Verb { name, verb } if verb == "explainPlacement" => {
             Ok(Json(api.explain_placement(&name, &who).await?).into_response())
         }
@@ -460,6 +495,13 @@ async fn create(
         // `…/instances/i1:reportStatus`. It is here rather than on PATCH because
         // PATCH is the client's spec-only surface by contract, and a status write
         // is a different caller (a node) doing a different thing.
+        // A console is asked for with POST because it *makes* something — a
+        // session object, spent once. A GET that minted a credential would be
+        // one a browser could be made to issue from another page.
+        Target::Verb { name, verb } if verb == "console" => {
+            let opened = api.open_console(&name, &identity).await?;
+            return Ok(object(StatusCode::OK, opened));
+        }
         Target::Verb { name, verb } if verb == "reportStatus" => {
             let reported = api
                 .report_status(&name, &document(&body)?, if_match(&headers)?, &identity)

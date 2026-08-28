@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod collection;
+pub mod console_proxy;
 pub mod core;
 pub mod error;
 pub mod grpc;

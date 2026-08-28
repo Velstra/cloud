@@ -755,6 +755,54 @@ fn qemu_args(
         "-nodefaults".into(),
         "-display".into(),
         "none".into(),
+        // A display adapter, even though nobody is looking at it.
+        //
+        // `-nodefaults` takes away every device QEMU would have added, which is
+        // the right starting point — and then this one has to come back. A
+        // stock cloud image's kernel command line is `console=tty0
+        // console=ttyS0`: it initialises the *first* console before it can
+        // write to the second, and on a machine with no display adapter it dies
+        // there. What that looks like from outside is a guest that resets about
+        // once a second, for ever, having printed GRUB's "Booting …" and not
+        // one character of kernel output. Seven hundred and seventy-nine times,
+        // in the run that found this.
+        //
+        // `VGA` specifically, not `virtio-gpu-pci`: the legacy console is what
+        // is missing, and a virtio adapter is not one — measured, and it does
+        // not boot either.
+        //
+        // `-display none` stays: this gives the guest an adapter, not the host
+        // a window.
+        "-device".into(),
+        "VGA".into(),
+        // Where the guest's cloud-init is told to look.
+        //
+        // This platform serves NoCloud (`/meta-data`, `/user-data`) and EC2
+        // IMDS on 169.254.169.254 — and a stock cloud image asks for neither,
+        // because cloud-init does not probe. Its `ds-identify` looks the machine
+        // over first, and a plain QEMU machine matches no datasource it knows,
+        // so it **disables cloud-init entirely** and says nothing about it on
+        // the console.
+        //
+        // The consequence is a guest that boots perfectly and is configured by
+        // nobody: no user, no SSH key, no network, and `ssh.service` failing for
+        // want of host keys cloud-init would have generated. Every guest this
+        // platform ever started from a public image was that guest.
+        //
+        // `ds=nocloud;s=<url>` in the SMBIOS system serial is the documented way
+        // to say it (cloud-init 21.3 and later), and it is preferred over the
+        // alternative — claiming to be Amazon EC2 or OpenStack in DMI so that
+        // ds-identify guesses right — because this platform is neither, and a
+        // guest that believes it is on EC2 makes decisions on that basis.
+        //
+        // The trailing slash is load-bearing: cloud-init appends `meta-data` and
+        // `user-data` to it.
+        "-smbios".into(),
+        format!(
+            "type=1,serial=ds=nocloud;s=http://{}/",
+            crate::metadata::ADDRESS
+        )
+        .into(),
         "-smp".into(),
         request.vcpus.to_string().into(),
         "-m".into(),
@@ -767,12 +815,30 @@ fn qemu_args(
         .into(),
         "-qmp".into(),
         format!("unix:{},server=on,wait=off", monitor.display()).into(),
-        // Always, and to a file rather than nowhere. A guest that cannot boot is
-        // the one that most needs to be heard, and it is the one that says the
-        // least: with no console at all, the first real image started here
-        // produced not a single byte to explain itself.
+        // A socket **and** a file, which is one chardev doing both.
+        //
+        // The file half is not negotiable and predates the socket: a guest that
+        // cannot boot is the one that most needs to be heard and the one that
+        // says the least, and with no console at all the first real image
+        // started here produced not a single byte to explain itself. So
+        // `logfile=` — QEMU writes everything the line carries to it whether or
+        // not anybody is attached, which is what keeps the tail on the guest's
+        // status honest.
+        //
+        // The socket half is what a console can attach to. A file cannot be
+        // typed at, so until now there was no way into a guest at all: a machine
+        // whose network did not come up, or whose key was not installed, could
+        // be watched failing and not reached. `wait=off` because a guest must
+        // never wait for somebody to look at it.
+        "-chardev".into(),
+        format!(
+            "socket,id=serial0,path={},server=on,wait=off,logfile={},logappend=on",
+            layout.console_socket(&request.instance).display(),
+            layout.console(&request.instance).display(),
+        )
+        .into(),
         "-serial".into(),
-        format!("file:{}", layout.console(&request.instance).display()).into(),
+        "chardev:serial0".into(),
     ];
     // Passed-through hardware. `vfio-pci` is the only device model here:
     // whole-device passthrough is all this platform offers, and a mediated
@@ -963,6 +1029,121 @@ mod tests {
             timeout_s: 3600,
             connections: 1,
         }
+    }
+
+    /// Every guest gets a display adapter, and it is not decoration.
+    ///
+    /// A stock cloud image boots with `console=tty0 console=ttyS0` and
+    /// initialises the first before it can write to the second. On a machine
+    /// with no display adapter the kernel dies there — and because it dies
+    /// before the serial console exists, the only evidence is GRUB's "Booting
+    /// …" repeating about once a second with no kernel output ever. Seven
+    /// hundred and seventy-nine times, in the run that found this. Every guest
+    /// this platform started from a public image did that.
+    #[test]
+    fn a_guest_is_given_a_display_adapter_even_though_nobody_looks_at_it() {
+        let args = words(&qemu_args(
+            &layout(),
+            &request(),
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        assert!(
+            args.windows(2).any(|w| w[0] == "-device" && w[1] == "VGA"),
+            "no display adapter: every stock cloud image resets for ever\n{args:?}"
+        );
+        // And the host still opens no window: the adapter is for the guest's
+        // kernel, not for anybody to look at.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-display" && w[1] == "none"),
+            "{args:?}"
+        );
+    }
+
+    /// The guest is told where its configuration is, or nothing configures it.
+    ///
+    /// cloud-init does not probe: `ds-identify` looks the machine over, finds
+    /// nothing it recognises on a plain QEMU machine, and switches cloud-init
+    /// off — silently, with not one line on the console. The guest then boots to
+    /// a login prompt with no user, no SSH key, no network configuration and a
+    /// failed `ssh.service`, and this platform's metadata service, sitting
+    /// there answering, is asked nothing by anybody.
+    #[test]
+    fn a_guest_is_told_where_its_metadata_is_or_cloud_init_never_runs() {
+        let args = words(&qemu_args(
+            &layout(),
+            &request(),
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let hint = args
+            .windows(2)
+            .find(|w| w[0] == "-smbios")
+            .map(|w| w[1].clone())
+            .unwrap_or_else(|| panic!("no datasource hint at all: {args:?}"));
+        // The serial, because that is the field ds-identify reads.
+        assert!(hint.starts_with("type=1,serial=ds=nocloud;"), "{hint}");
+        // The address the DHCP responder hands out, from the same constant, so
+        // the two cannot drift apart.
+        assert!(
+            hint.contains(&crate::metadata::ADDRESS.to_string()),
+            "{hint}"
+        );
+        // The trailing slash is load-bearing: cloud-init appends `meta-data`
+        // and `user-data` to it, and without it they land a directory up.
+        assert!(hint.ends_with('/'), "{hint}");
+    }
+
+    /// The console is a socket now, and the log did not stop being a log.
+    ///
+    /// Both halves are load-bearing and they pull in opposite directions. A
+    /// socket is the only thing that can be typed at — with a file, a guest
+    /// whose network never came up or whose key was never installed could be
+    /// watched failing and not reached. But a socket nobody has attached to
+    /// carries nothing, and the guest that most needs to be heard is exactly the
+    /// one nobody is watching yet. `logfile=` is what makes it both.
+    #[test]
+    fn the_guests_serial_line_can_be_attached_to_and_is_recorded_regardless() {
+        let layout = layout();
+        let request = request();
+        let args = words(&qemu_args(
+            &layout,
+            &request,
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let chardev = args
+            .windows(2)
+            .find(|w| w[0] == "-chardev")
+            .map(|w| w[1].clone())
+            .unwrap_or_else(|| panic!("no serial chardev: {args:?}"));
+
+        let socket = layout.console_socket(&request.instance);
+        assert!(
+            chardev.contains(&format!("path={}", socket.display())),
+            "{chardev}"
+        );
+        // Never waiting: a guest must not be held at the door because nobody is
+        // looking at it yet.
+        assert!(chardev.contains("wait=off"), "{chardev}");
+
+        let log = layout.console(&request.instance);
+        assert!(
+            chardev.contains(&format!("logfile={}", log.display())),
+            "a socket alone loses everything said before anybody attached: {chardev}"
+        );
+        assert!(
+            chardev.contains("logappend=on"),
+            "a restart must not truncate what the last boot said: {chardev}"
+        );
+
+        // And the line is that chardev, not a second one.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-serial" && w[1] == "chardev:serial0"),
+            "{args:?}"
+        );
     }
 
     #[test]

@@ -79,6 +79,7 @@ impl Agent {
         next.status.capacity = capacity;
         next.status.allocated = allocated;
         next.status.agent_version = self.config.agent_version.clone();
+        next.status.console_endpoint = self.config.console_endpoint.clone();
         next.status.last_heartbeat = Timestamp::now();
         // What this machine holds, so that anybody who needs to know which
         // nodes have an image can work it out from these reports rather than

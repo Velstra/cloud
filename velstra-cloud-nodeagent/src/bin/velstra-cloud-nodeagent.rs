@@ -60,7 +60,25 @@ struct Args {
     #[arg(long, value_enum, default_value_t = VmmKind::Fake)]
     vmm: VmmKind,
 
+    /// Where the console service listens.
+    ///
+    /// The **API** connects here, never a browser: a tenant's browser has no
+    /// business on the machines a cell is made of, and a console it could reach
+    /// directly would be one it could reach without asking the API first.
+    ///
+    /// Not fatal to bind: a node whose console port is taken still runs guests,
+    /// and it reports no console endpoint rather than one that answers nothing.
+    #[arg(long, default_value = "0.0.0.0:8447")]
+    console_listen: SocketAddr,
 
+    /// What to tell the cell this node's console address is.
+    ///
+    /// Empty derives it, which is what a single-homed machine wants: the local
+    /// address this node would use to reach the API is by definition one the API
+    /// can reach it back on. A node behind an address translation, or one that
+    /// should be reached on a different interface, says so here.
+    #[arg(long, default_value = "")]
+    console_advertise: String,
 
     /// Where the metadata service listens. The guests' side of it is always
     /// `169.254.169.254:80`; this is configurable so a test, or a node whose
@@ -458,6 +476,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent
     };
 
+    // The console service, before the agent starts reporting: what it binds is
+    // what the node advertises, and a node that advertised an address before
+    // knowing it had it would be publishing a hope.
+    let mut agent = agent;
+    match agent.status_sink() {
+        // A console has one thing to write — that a ticket has been spent — and
+        // without somewhere to write it a ticket could be replayed. So a node
+        // with no status sink serves no console and says which it is: this is
+        // the developer cell, where the agent writes straight to a store.
+        None => tracing::info!(
+            "no console service: this agent writes to a store directly and has no status sink"
+        ),
+        Some(sink) => {
+            let consoles = velstra_cloud_nodeagent::console::Consoles {
+                node: args.node.clone(),
+                cell: agent.cell(),
+                layout: console_layout.clone(),
+                sink: Arc::new(velstra_cloud_nodeagent::console::SessionStatus {
+                    sink,
+                    node: args.node.clone(),
+                }),
+            };
+            match velstra_cloud_nodeagent::console::serve(args.console_listen, consoles).await {
+                Ok((bound, task)) => {
+                    let advertised = if args.console_advertise.is_empty() {
+                        advertise_from(bound, args.api.as_deref())
+                    } else {
+                        args.console_advertise.clone()
+                    };
+                    tracing::info!(%bound, %advertised, "serving guest consoles");
+                    agent.set_console_endpoint(&advertised);
+                    // Detached on purpose: it outlives this scope and stops when
+                    // the process does.
+                    std::mem::forget(task);
+                }
+                Err(e) => {
+                    // Not fatal. A node that cannot bind its console port still
+                    // runs guests, and it says it has no console rather than
+                    // advertising one that answers nothing.
+                    tracing::error!(
+                        listen = %args.console_listen,
+                        error = %e,
+                        "no console service on this node; guests here cannot be attached to"
+                    );
+                }
+            }
+        }
+    }
     let agent = agent;
 
     // Named, because the bare OS error is not enough to act on. A node whose

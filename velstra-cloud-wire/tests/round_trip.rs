@@ -88,6 +88,7 @@ fn every_resource_survives_its_own_wire() {
             },
             allocated: Capacity::default(),
             agent_version: "0.1.0".into(),
+            console_endpoint: "10.0.0.7:8447".into(),
             last_heartbeat: velstra_cloud_model::meta::Timestamp(1),
             images: vec!["projects/p1/images/sha256-abc".into()],
             devices: vec![BlockDevice {

@@ -306,6 +306,12 @@ impl CellReader for ApiCell {
         self.list("networks").await
     }
 
+    async fn console_sessions(
+        &self,
+    ) -> Result<Vec<velstra_cloud_model::resources::ConsoleSession>> {
+        self.list("console-sessions").await
+    }
+
     async fn images(&self) -> Result<Vec<Image>> {
         self.list("images").await
     }

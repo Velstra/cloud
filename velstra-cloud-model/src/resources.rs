@@ -101,6 +101,8 @@ impl Assigned for crate::storage::SnapshotScheduleSpec {}
 
 /// "Make an image out of this guest." See [`crate::capture`].
 pub type Capture = Resource<crate::capture::CaptureSpec, crate::capture::CaptureStatus>;
+pub type ConsoleSession =
+    Resource<crate::console::ConsoleSessionSpec, crate::console::ConsoleSessionStatus>;
 
 impl Observed for crate::capture::CaptureStatus {
     fn observed_generation(&self) -> u64 {
@@ -111,6 +113,27 @@ impl Observed for crate::capture::CaptureStatus {
     }
     fn owner(&self) -> Option<&str> {
         self.node.as_deref()
+    }
+}
+
+
+impl Observed for crate::console::ConsoleSessionStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+}
+
+
+impl Assigned for crate::console::ConsoleSessionSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        // Only the machine holding the guest has its serial socket.
+        (!self.node.is_empty()).then_some(self.node.as_str())
     }
 }
 
@@ -513,6 +536,18 @@ pub struct NodeStatus {
     pub allocated: Capacity,
     pub agent_version: String,
     pub last_heartbeat: Timestamp,
+    /// Where this node answers a console attach, as `host:port`.
+    ///
+    /// Reported rather than configured centrally, for the same reason capacity
+    /// is: only the machine knows what it actually bound, and a table saying
+    /// otherwise is a table that drifts. Empty means this node serves no
+    /// console — which is a real answer, and the API says so rather than
+    /// offering a button that leads nowhere.
+    ///
+    /// It is an address the **API** reaches, never a browser: a tenant's browser
+    /// has no business on the machines a cell is made of.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub console_endpoint: String,
     /// Block devices this node can see, and what each is being used for.
     ///
     /// Here for the same reason `images` is: it is one node's observation of its

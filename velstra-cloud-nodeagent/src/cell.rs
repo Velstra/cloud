@@ -146,6 +146,18 @@ pub trait CellReader: Send + Sync + 'static {
     /// none of them owns.
     async fn security_groups(&self) -> Result<Vec<SecurityGroup>>;
     async fn subnets(&self) -> Result<Vec<Subnet>>;
+
+    /// Consoles somebody has been granted into a guest on this node.
+    ///
+    /// A default rather than a required method: a cell whose reader is a test
+    /// double, or an agent built before consoles existed, has none and needs
+    /// none — an empty list means "nobody has asked for one", which refuses
+    /// every attach, which is the safe answer.
+    async fn console_sessions(
+        &self,
+    ) -> Result<Vec<velstra_cloud_model::resources::ConsoleSession>> {
+        Ok(Vec::new())
+    }
     async fn networks(&self) -> Result<Vec<Network>>;
     /// The cell's PCI device classes, by resource id.
     ///
@@ -233,6 +245,10 @@ pub struct StoreCell {
     groups: TypedStore<SecurityGroupSpec, SecurityGroupStatus>,
     subnets: TypedStore<SubnetSpec, SubnetStatus>,
     networks: TypedStore<NetworkSpec, NetworkStatus>,
+    console_sessions: TypedStore<
+        velstra_cloud_model::console::ConsoleSessionSpec,
+        velstra_cloud_model::console::ConsoleSessionStatus,
+    >,
     images: TypedStore<ImageSpec, ImageStatus>,
     floating_ips: TypedStore<
         velstra_cloud_model::resources::FloatingIpSpec,
@@ -272,6 +288,7 @@ impl StoreCell {
             ceph_clusters: TypedStore::new(store.clone(), cell, "ceph-clusters"),
             subnets: TypedStore::new(store.clone(), cell, "subnets"),
             networks: TypedStore::new(store.clone(), cell, "networks"),
+            console_sessions: TypedStore::new(store.clone(), cell, "console-sessions"),
             images: TypedStore::new(store.clone(), cell, "images"),
             migrations: TypedStore::new(store, cell, "migrations"),
         }
@@ -319,6 +336,15 @@ impl CellReader for StoreCell {
             .list()
             .await
             .map_err(|e| failed("networks", e))
+    }
+
+    async fn console_sessions(
+        &self,
+    ) -> Result<Vec<velstra_cloud_model::resources::ConsoleSession>> {
+        self.console_sessions
+            .list()
+            .await
+            .map_err(|e| failed("console-sessions", e))
     }
     async fn floating_ips(&self) -> Result<Vec<velstra_cloud_model::resources::FloatingIp>> {
         self.floating_ips

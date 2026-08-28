@@ -49,7 +49,7 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 27] = [
+pub const COLLECTIONS: [&str; 28] = [
     "projects",
     "users",
     "ceph-clusters",
@@ -74,10 +74,22 @@ pub const COLLECTIONS: [&str; 27] = [
     "backup-schedules",
     "audit",
     "captures",
+    "console-sessions",
     "snapshot-schedules",
     "maintenance-windows",
     "operations",
 ];
+
+/// Said the same way wherever somebody tries to write a usage record.
+///
+
+/// How long a spent console session is kept as a record.
+///
+/// A day. The ticket is dead after a minute; what lives on is the answer to
+/// "who opened a console into that machine, and when" — worth keeping for as
+/// long as somebody might ask, and not worth keeping for ever. The audit trail
+/// proper is `audit`, which has its own retention.
+const CONSOLE_RECORD_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// One stored maintenance window as the model's decisions see it.
 fn window_view(
@@ -432,6 +444,11 @@ impl Api {
                 velstra_cloud_model::capture::CaptureStatus
             ),
             collection!(
+                "console-sessions",
+                velstra_cloud_model::console::ConsoleSessionSpec,
+                velstra_cloud_model::console::ConsoleSessionStatus
+            ),
+            collection!(
                 "audit",
                 velstra_cloud_model::audit::AuditSpec,
                 velstra_cloud_model::audit::AuditStatus
@@ -740,6 +757,23 @@ impl Api {
         if verb == Verb::Read && crate::sessions::agent_node(who).is_some() {
             return Ok(());
         }
+        // The image catalogue: cell-scoped images are the cell's *published*
+        // ones, and everybody in it may read them.
+        //
+        // Without this rule the platform has no notion of a public image at all.
+        // Images live under projects, so an operator who registers Debian once
+        // has registered it for one tenant; every other project has to fetch and
+        // store its own copy of the same bytes, and nobody browsing the console
+        // can see what is on offer before they have already put something there.
+        //
+        // Read, and only read. Creating outside a project is already an
+        // operator's alone (see `create`), which is exactly the rule worth
+        // having: anybody may boot from the catalogue, only the cell may put
+        // something in it. A tenant that wants a private image still makes one
+        // under its own project, where its own bindings govern it.
+        if verb == Verb::Read && name.collection() == "images" && name.parent().is_none() {
+            return Ok(());
+        }
         let Some(project) = governing_project(name) else {
             // Outside every project: a node, a pool, the projects collection.
             // These are the cell's, and only an operator has the cell.
@@ -846,6 +880,10 @@ impl Api {
     /// `sweep_expired_sessions` directly.
     pub fn spawn_session_sweeper(&self) {
         let identity = self.inner.identity.clone();
+        // A second thing to reap on the same timer, for the same reason: a
+        // console session outlives the ticket it carried, and without this every
+        // click on Console leaves a row behind for ever.
+        let api = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(SESSION_SWEEP_INTERVAL);
             // The first tick is immediate; a fresh cell has nothing to sweep, and
@@ -854,6 +892,9 @@ impl Api {
                 ticker.tick().await;
                 if let Err(e) = identity.sweep_expired_sessions(Timestamp::now()).await {
                     tracing::warn!(error = %e, "the session sweep could not run this round");
+                }
+                if let Err(e) = api.sweep_spent_consoles(Timestamp::now()).await {
+                    tracing::warn!(error = %e, "the console sweep could not run this round");
                 }
             }
         });
@@ -2758,6 +2799,139 @@ impl Api {
     /// part of it is knowable without touching a packet: which machine is
     /// announcing it (or why nothing is), what the guest must have configured,
     /// and what the guest would have to do differently if it were moved.
+    /// Grant somebody a way into a guest's serial line.
+    ///
+    /// Returns the ticket **once**, in this answer and nowhere else: what is
+    /// stored is its hash, because every node in the cell may read the cell and
+    /// a session carrying the ticket in the clear would hand each of them a way
+    /// into a guest on somebody else's machine.
+    ///
+    /// The permission question is answered here and only here. The node has no
+    /// bindings to read and must never be the place one is decided; it is told
+    /// on the session whether the holder may type.
+    pub async fn open_console(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+        // Read is the floor: watching a guest's console is reading it. Whether
+        // the holder may also *type* is a second question, asked below and
+        // answered on the object.
+        self.authorize(who, Verb::Read, name).await?;
+        let instance: Instance = self.typed(name).await?;
+        let Some(node) = instance.status.node.clone().filter(|n| !n.is_empty()) else {
+            return Err(ApiError::new(Code::FailedPrecondition, format!(
+                "{name} is not on a node yet, so there is nothing to attach to. A guest gets a                  console when a node has claimed it."
+            ))
+            .at("status.node"));
+        };
+
+        // A viewer gets a window; somebody who may change the guest gets a
+        // keyboard. Asked as a question rather than taken from the refusal path,
+        // so a viewer is *given a console* rather than told no.
+        // Typing into a guest is operating it, not creating one. Somebody who
+        // may reboot a machine may also fix it from its console; somebody who
+        // may only look at it gets a window.
+        let read_only = self.authorize(who, Verb::Write, name).await.is_err();
+
+        let ticket = uuid::Uuid::new_v4().to_string();
+        let now = Timestamp::now();
+        let project = governing_project(name).unwrap_or_default();
+        let id = format!(
+            "console-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        let session_name = if project.is_empty() {
+            format!("console-sessions/{id}")
+        } else {
+            format!("{project}/console-sessions/{id}")
+        };
+        let session = ResourceName::parse(&session_name)?;
+        // Minted by the API on somebody's behalf, exactly as an operation is,
+        // and for the same reason: creating it *as* them would be a write, and a
+        // viewer who may watch a console has no write anywhere. The permission
+        // question was answered above; this is only the record of the answer.
+        let meta = Meta::new(session, self.inner.placement.clone());
+        let spec = serde_json::to_value(velstra_cloud_model::console::ConsoleSessionSpec {
+            instance: name.to_string(),
+            node,
+            subject: who.subject.clone(),
+            ticket_sha256: velstra_cloud_model::console::sha256_hex(&ticket),
+            expires_at: Timestamp(now.0 + velstra_cloud_model::console::TICKET_LIFETIME_MS),
+            read_only,
+        })
+        .expect("a console session spec always serialises");
+        self.collection("console-sessions")?
+            .create(
+                serde_json::to_value(&meta).expect("meta always serialises"),
+                spec,
+            )
+            .await?;
+
+        Ok(serde_json::json!({
+            "session": session_name,
+            // The one and only time this leaves the API.
+            "ticket": ticket,
+            "readOnly": read_only,
+            "expiresAt": now.0 + velstra_cloud_model::console::TICKET_LIFETIME_MS,
+        }))
+    }
+
+    /// Where a console attach should be forwarded, for a ticket the caller
+    /// holds.
+    ///
+    /// The ticket is **not** checked here: the check is against the session
+    /// object and the node reads the same one, so checking twice would be two
+    /// copies of a rule with two chances to disagree. What this answers is only
+    /// "which machine, and does it serve consoles at all" — and a node that
+    /// serves none is said out loud rather than silently connected to nothing.
+    /// Take away console sessions nobody can use any more.
+    ///
+    /// A ticket is spent in a minute and the object outlives it; without this,
+    /// every click on Console leaves one behind for ever, and a cell that has
+    /// been running a year holds a collection nothing reads.
+    ///
+    /// Kept for a day rather than deleted at expiry, because the object is also
+    /// the record of **who opened a console into which guest** — which is what
+    /// somebody investigating a machine actually needs, and it is worth more
+    /// than the row costs. Anything older than that has been read or never will
+    /// be; the audit trail proper is `audit`.
+    pub async fn sweep_spent_consoles(&self, now: Timestamp) -> ApiResult<usize> {
+        let collection = self.collection("console-sessions")?;
+        let sessions: Vec<velstra_cloud_model::resources::ConsoleSession> =
+            self.typed_list("", "console-sessions").await?;
+        let mut swept = 0;
+        for session in sessions {
+            let over = now.0.saturating_sub(session.spec.expires_at.0);
+            if over < CONSOLE_RECORD_LIFETIME_MS {
+                continue;
+            }
+            // A delete that loses a race is not a failure of this sweep: the row
+            // is gone, which is all it wanted.
+            if collection
+                .delete(&session.meta.name.to_string(), None)
+                .await
+                .is_ok()
+            {
+                swept += 1;
+            }
+        }
+        Ok(swept)
+    }
+
+    pub async fn console_endpoint_for(&self, session: &ResourceName) -> ApiResult<String> {
+        let session: velstra_cloud_model::resources::ConsoleSession = self.typed(session).await?;
+        let node = ResourceName::parse(&format!("nodes/{}", session.spec.node))?;
+        let node: velstra_cloud_model::resources::Node = self.typed(&node).await?;
+        if node.status.console_endpoint.is_empty() {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{} runs this guest and serves no console. A node serves one when its agent                      could bind the console port; check the agent's journal on that machine.",
+                    session.spec.node
+                ),
+            )
+            .at("status.consoleEndpoint"));
+        }
+        Ok(node.status.console_endpoint.clone())
+    }
+
     pub async fn explain_reach(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
         self.authorize(who, Verb::Read, name).await?;
         let fip: velstra_cloud_model::resources::FloatingIp = self.typed(name).await?;
@@ -3700,6 +3874,12 @@ impl Api {
             (Some(name), _) => name,
             (None, Some(id)) if parent.is_empty() => format!("{kind}/{id}"),
             (None, Some(id)) => format!("{parent}/{kind}/{id}"),
+            // Minted, because the alternative is asking a person to invent an
+            // identifier before they may have a machine. That was the old
+            // behaviour and it put the platform's naming scheme in front of
+            // every first use of it — a console cannot offer "create" without
+            // first teaching what a resource id is.
+            //
             (None, None) => {
                 return Err(ApiError::invalid(
                     "a create carries the id it wants: names are chosen by the caller, not minted here",
