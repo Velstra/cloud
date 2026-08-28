@@ -27,6 +27,11 @@ const TOKEN: &str = "development-token";
 struct Harness {
     router: Router,
     store: Arc<dyn Store>,
+    /// The same `Api` the router serves, for the few tests that drive something
+    /// no request reaches — a sweep, which takes the time to sweep against so
+    /// the decision is a function of the objects and the clock rather than of
+    /// waiting.
+    api: Api,
 }
 
 struct Answer {
@@ -65,8 +70,9 @@ impl Harness {
             .with_cell_admins(vec!["dev".into()])
             .with_write_rate(rate);
         Self {
-            router: velstra_cloud_api::server(api),
+            router: velstra_cloud_api::server(api.clone()),
             store,
+            api,
         }
     }
 
@@ -82,8 +88,9 @@ impl Harness {
         Self {
             // The whole server, gRPC routes and all: the REST paths have to
             // keep working next to their twins rather than only in isolation.
-            router: velstra_cloud_api::server(api),
+            router: velstra_cloud_api::server(api.clone()),
             store,
+            api,
         }
     }
 
@@ -156,6 +163,31 @@ impl Harness {
             .await;
         assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
         created.body["target"].as_str().unwrap().to_string()
+    }
+
+    /// Somewhere to put a volume.
+    ///
+    /// A cell with no pools cannot hold one, and the API says so now rather
+    /// than accepting a volume nothing will ever provision — so a test that
+    /// makes a volume has to say where it goes. Written straight to the store
+    /// because a pool is the cell's and these tests are about what a tenant
+    /// does inside a project.
+    async fn pool(&self, id: &str) {
+        let pool = velstra_cloud_model::resources::Resource::new(
+            velstra_cloud_model::meta::Meta::new(
+                format!("pools/{id}").parse().unwrap(),
+                velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+            ),
+            Default::default(),
+            Default::default(),
+        );
+        let _ = self
+            .pools()
+            .create(
+                &pool,
+                &velstra_cloud_model::access::Writer::controller("test"),
+            )
+            .await;
     }
 
     fn nodes(&self) -> TypedStore<NodeSpec, NodeStatus> {
@@ -797,7 +829,13 @@ async fn nothing_an_operator_is_shown_carries_a_store_key() {
         .await,
         h.send("DELETE", "projects/p1/instances/missing", None, &[])
             .await,
-        h.post("projects/p1/instances", json!({ "spec": {} })).await,
+        // A create that is refused for the *spec*, since a create with no id is
+        // no longer refused at all — the API mints one.
+        h.post(
+            "projects/p1/instances",
+            json!({ "id": "i9", "spec": { "nope": 1 } }),
+        )
+        .await,
         h.get("projects/p1/machines").await,
     ] {
         assert!(answer.status.is_client_error(), "{:?}", answer.body);
@@ -1687,6 +1725,8 @@ impl Harness {
 #[tokio::test]
 async fn a_snapshot_is_created_under_the_volume_it_copies() {
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
 
     let created = h
@@ -1715,6 +1755,8 @@ async fn a_snapshot_that_is_not_under_a_volume_is_refused() {
     // The source lives in the name, so a name that does not carry one is a
     // copy of nothing — and it would sit there being reconciled forever.
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     h.volume("data-1", 100).await;
     let refused = h
         .post("projects/p1/snapshots", json!({ "id": "nightly" }))
@@ -1737,6 +1779,8 @@ async fn a_copy_is_refused_of_a_volume_that_has_nothing_in_it_yet() {
     // pool fails on it, and an operator reads a backend error instead of a
     // sentence.
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let created = h
         .post(
             "projects/p1/volumes",
@@ -1771,6 +1815,8 @@ async fn a_copy_is_refused_of_a_volume_that_has_nothing_in_it_yet() {
 async fn a_copy_is_refused_of_a_volume_on_its_way_out() {
     // It would put a guard on an object nobody would ever release it from.
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
 
     // Guarded by its pool, as every provisioned volume is, so that the delete
@@ -1808,6 +1854,8 @@ async fn a_snapshot_may_not_name_a_pool_the_volume_is_not_in() {
     // attachment's node is: rewriting what somebody typed changes what the
     // object says without them asking.
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
     let refused = h
         .post(
@@ -1830,6 +1878,8 @@ async fn a_snapshot_may_not_name_a_pool_the_volume_is_not_in() {
 #[tokio::test]
 async fn a_volume_made_from_a_snapshot_takes_its_size_and_pool_from_it() {
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
     let created = h
         .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
@@ -1880,6 +1930,8 @@ async fn a_volume_made_from_a_snapshot_takes_its_size_and_pool_from_it() {
 #[tokio::test]
 async fn a_volume_comes_from_one_place() {
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
     let created = h
         .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
@@ -1926,6 +1978,8 @@ async fn a_volume_is_not_restored_in_place() {
     // restore would be a command sitting in a spec, carried out again on every
     // resync, undoing whatever the guest wrote in between.
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
     let created = h
         .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))
@@ -1962,6 +2016,8 @@ async fn a_volume_is_not_restored_in_place() {
 #[tokio::test]
 async fn a_volume_is_not_moved_between_pools_by_editing_its_pool() {
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
 
     let refused = h
@@ -1989,6 +2045,8 @@ async fn a_volume_is_not_moved_between_pools_by_editing_its_pool() {
 #[tokio::test]
 async fn sending_back_the_pool_a_volume_already_has_is_not_a_move() {
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
     let same = h.get(&volume).await.body["spec"]["pool"]
         .as_str()
@@ -2004,6 +2062,8 @@ async fn sending_back_the_pool_a_volume_already_has_is_not_a_move() {
 #[tokio::test]
 async fn where_a_volume_came_from_is_history_rather_than_a_control() {
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let created = h
         .post(
             "projects/p1/volumes",
@@ -2044,6 +2104,8 @@ async fn where_a_volume_came_from_is_history_rather_than_a_control() {
 #[tokio::test]
 async fn deleting_a_snapshot_waits_for_the_pool_like_a_volume_does() {
     let h = Harness::new();
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
     let volume = h.volume("data-1", 100).await;
     let created = h
         .post(&format!("{volume}/snapshots"), json!({ "id": "nightly" }))

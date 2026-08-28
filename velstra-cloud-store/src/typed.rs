@@ -106,12 +106,76 @@ where
         Ok(Some(self.decode(&entry.value, entry.revision)?))
     }
 
+    /// Take an object away without reading what is in it.
+    ///
+    /// The ordinary path deserialises first — for the revision, for the
+    /// finalizers, for everything a delete has to respect — and that is right
+    /// until the object is one this build **cannot** deserialise. Then the read
+    /// fails, and so does the delete, and so does every list of the collection
+    /// it is in: one unreadable object takes the whole collection down for
+    /// everybody and cannot be taken away, because taking it away requires
+    /// reading it.
+    ///
+    /// That is a corner a schema change can put a cell in, and a cell that
+    /// cannot be got out of it by any means is the wrong shape. So: a delete of
+    /// last resort, by key, at whatever revision is there. It respects no
+    /// finalizer and runs no second phase, because it cannot see them — which is
+    /// why nothing calls it except a delete whose ordinary path has already
+    /// failed on the object's contents.
+    pub async fn delete_unreadable(&self, name: &str) -> Result<()> {
+        let Some(entry) = self.store.get(&self.key(name)).await? else {
+            return Ok(());
+        };
+        self.store
+            .delete(&self.key(name), Expect::Revision(entry.revision))
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// Everything in this collection that this build can read.
+    ///
+    /// **An object that cannot be decoded is skipped, loudly.** It used to fail
+    /// the whole call, and the consequence was out of all proportion to the
+    /// cause: one object written under a shape this build no longer understands
+    /// answered an error for *every* list of that kind, for every caller —
+    /// which is every screen showing them, every agent reading its share, and
+    /// the reference check that a delete runs before it will remove anything.
+    /// So the one thing that would have fixed it, taking the object away, was
+    /// also the thing that could not be done.
+    ///
+    /// Skipping is not silent and is not safe-by-default: an object left out of
+    /// a listing is one nothing will act on, which for a running guest means an
+    /// agent that stops reporting it. It is the lesser of the two, and the log
+    /// line names the object so somebody can go and look at it.
     pub async fn list(&self) -> Result<Vec<Resource<S, T>>> {
         let entries = self.store.list(&self.prefix()).await?;
-        entries
+        Ok(entries
             .into_iter()
-            .map(|e| self.decode(&e.value, e.revision))
-            .collect()
+            .filter_map(|e| self.decoded_or_complained(&e.value, e.revision))
+            .collect())
+    }
+
+    /// [`Self::decode`], turning a failure into a log line and a `None`.
+    fn decoded_or_complained(&self, bytes: &[u8], revision: Revision) -> Option<Resource<S, T>> {
+        match self.decode(bytes, revision) {
+            Ok(resource) => Some(resource),
+            Err(e) => {
+                // Named as far as it can be: the whole object is unreadable, so
+                // the name may be the part that failed. Enough of the bytes to
+                // recognise it, and never all of them — a spec can hold a
+                // tenant's user-data.
+                let head: String = String::from_utf8_lossy(bytes).chars().take(200).collect();
+                tracing::error!(
+                    kind = self.kind,
+                    error = %e,
+                    object = %head,
+                    "skipping a stored object this build cannot read; it is invisible to \
+                     everything until it is deleted or this build is changed"
+                );
+                None
+            }
+        }
     }
 
     /// One page, resuming strictly after the object called `after`.
@@ -136,11 +200,13 @@ where
             None => None,
         };
         let page = self.store.list_page(&self.prefix(), after, limit).await?;
+        // Skipped rather than fatal, for the reason `list` gives at length: one
+        // object nobody can read must not take a collection down.
         let objects = page
             .entries
             .into_iter()
-            .map(|e| self.decode(&e.value, e.revision))
-            .collect::<Result<Vec<_>>>()?;
+            .filter_map(|e| self.decoded_or_complained(&e.value, e.revision))
+            .collect::<Vec<_>>();
         Ok((objects, page.more))
     }
 
