@@ -241,7 +241,35 @@ where
     }
 
     async fn delete_once(&self, name: &str, expect: Option<Revision>) -> ApiResult<Deleted> {
-        let mut resource = self.read(name).await?;
+        let mut resource = match self.read(name).await {
+            Ok(resource) => resource,
+            // An object this build cannot deserialise cannot be read — and the
+            // ordinary delete reads first, for the revision and the finalizers.
+            // So it could not be taken away either, and it took its whole
+            // collection down with it: every list of that kind answered 500,
+            // for every caller, until somebody reached past the API into the
+            // store. A cell that can be put into a corner it cannot be got out
+            // of is the wrong shape.
+            //
+            // Only for that one failure, and only when the caller named no
+            // revision: a delete of last resort respects no finalizer, because
+            // it cannot see one.
+            Err(e) if e.code == Code::Internal && expect.is_none() => {
+                tracing::warn!(
+                    %name,
+                    error = %e,
+                    "deleting an object this build cannot read; no finalizer can be honoured"
+                );
+                self.store.delete_unreadable(name).await.map_err(|e| {
+                    ApiError::internal(format!("{name} could not be taken away either: {e}"))
+                })?;
+                return Ok(Deleted {
+                    resource: serde_json::json!({ "meta": { "name": name } }),
+                    gone: true,
+                });
+            }
+            Err(e) => return Err(e),
+        };
         if let Some(expected) = expect {
             if expected != resource.meta.revision {
                 return Err(ApiError::conflict(resource.meta.revision));

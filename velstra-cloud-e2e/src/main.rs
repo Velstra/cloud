@@ -177,6 +177,7 @@ async fn main() {
     let volume = Arc::new(VolumeController::new(
         volumes_for_controller.clone(),
         snapshots.clone(),
+        TypedStore::new(store.clone(), CELL, "pools"),
         CELL,
     ));
     tokio::spawn(velstra_cloud_controller::run(

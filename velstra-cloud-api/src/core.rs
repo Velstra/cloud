@@ -1431,6 +1431,9 @@ impl Api {
             self.refuse_a_public_address_this_project_was_not_given(allowed_in, who)
                 .await?;
         }
+        if kind == "volumes" || kind == "backups" {
+            self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
+        }
         if kind == "attachments" {
             self.settle_node(&mut spec, None).await?;
         }
@@ -3464,6 +3467,52 @@ impl Api {
     ///
     /// So it is refused here, where the answer is still a form somebody has
     /// open, and the refusal names the way that does work.
+    /// A volume whose pool this cell does not have would never become real.
+    ///
+    /// Shape is not enough here. A pool agent watches for volumes naming *its*
+    /// id, so a volume naming a pool that is not there is claimed by nobody: it
+    /// sits with an empty status and `provisioned: false` for ever, and there is
+    /// nothing on the object, in any log, or in any answer to say why. It is the
+    /// quietest way this platform can fail, and the fix is one list at the
+    /// moment somebody is still asking.
+    ///
+    /// Named in the refusal, because the usual cause is a spelling — `local`
+    /// against `pools/local` — and a message that says which pools exist ends
+    /// the guessing.
+    async fn refuse_a_pool_this_cell_does_not_have(&self, spec: &Value) -> ApiResult<()> {
+        let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if asked.is_empty() {
+            return Ok(());
+        }
+        let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
+        let ids: Vec<String> = pools.iter().map(|p| p.meta.name.id().to_string()).collect();
+        if ids.iter().any(|id| id == asked) {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            if ids.is_empty() {
+                format!(
+                    "there is no storage pool called `{asked}` — this cell has no pools at all. \
+                     A volume names the pool that will hold its bytes, and one nothing holds is \
+                     never made."
+                )
+            } else {
+                format!(
+                    "there is no storage pool called `{asked}`. This cell has {}. A pool is \
+                     named by its id, not by its resource name.",
+                    ids.iter()
+                        .map(|i| format!("`{i}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+        )
+        .at("spec.pool"))
+    }
+
     async fn refuse_a_moved_pool(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
         let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
             return Ok(());

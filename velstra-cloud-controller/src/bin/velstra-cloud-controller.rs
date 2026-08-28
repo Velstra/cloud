@@ -386,6 +386,7 @@ async fn main() {
         Arc::new(VolumeController::new(
             volumes.clone(),
             snapshots.clone(),
+            velstra_cloud_store::TypedStore::new(store.clone(), cell, "pools"),
             cell,
         )),
         volumes.clone(),

@@ -31,7 +31,7 @@
 //! is lost by a restart — and a guard that outlived the copies it was for would
 //! leave a volume nobody can delete without editing the store.
 
-use tracing::info;
+use tracing::{info, warn};
 use velstra_cloud_model::{
     access::Writer,
     meta::{ConditionStatus, ResourceName, condition},
@@ -50,6 +50,12 @@ const WHO: &str = "volume";
 pub struct VolumeController {
     volumes: TypedStore<VolumeSpec, VolumeStatus>,
     snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
+    /// The cell's pools, read to answer one question: is there anybody who
+    /// could ever let go of this volume? See `nobody_will_ever_let_go`.
+    pools: TypedStore<
+        velstra_cloud_model::resources::PoolSpec,
+        velstra_cloud_model::resources::PoolStatus,
+    >,
     cell: String,
 }
 
@@ -57,9 +63,14 @@ impl VolumeController {
     pub fn new(
         volumes: TypedStore<VolumeSpec, VolumeStatus>,
         snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
+        pools: TypedStore<
+            velstra_cloud_model::resources::PoolSpec,
+            velstra_cloud_model::resources::PoolStatus,
+        >,
         cell: &str,
     ) -> Self {
         Self {
+            pools,
             volumes,
             snapshots,
             cell: cell.to_string(),
@@ -113,6 +124,36 @@ impl VolumeController {
 fn pool_has_let_go(volume: &Volume) -> bool {
     condition(&volume.status.conditions, "Released")
         .is_some_and(|c| c.status == ConditionStatus::True)
+}
+
+impl VolumeController {
+    /// Whether this volume is waiting for a pool that will never answer.
+    ///
+    ///  The release guard exists so a record cannot disappear while its bytes
+    ///  remain. That reasoning needs a pool: if the one named does not exist in this
+    ///  cell, and no pool ever claimed the volume, then nothing was ever
+    ///  provisioned — there are no bytes to leave behind, and the guard is waiting
+    ///  for a party that cannot arrive.
+    ///
+    ///  Found on a real cell: a volume created with a mistyped pool sat `deleting`
+    ///  for hours, undeletable by any means the API offers, because the only thing
+    ///  that could release it was a pool called `pools/local` that does not and will
+    ///  never exist. A cell that can be put into a corner it cannot be got out of is
+    ///  the wrong shape.
+    ///
+    ///  Deliberately **not** "the pool's agent is quiet". A pool that exists and is
+    ///  down may well be holding real bytes, and waiting is exactly right there.
+    async fn nobody_will_ever_let_go(&self, volume: &Volume) -> Result<bool> {
+        if volume.status.pool.is_some() {
+            return Ok(false);
+        }
+        let asked = volume.spec.pool.trim();
+        if asked.is_empty() {
+            return Ok(true);
+        }
+        let pools = self.pools.list().await?;
+        Ok(!pools.iter().any(|p| p.meta.name.id() == asked))
+    }
 }
 
 impl Reconciler for VolumeController {
@@ -171,8 +212,23 @@ impl Reconciler for VolumeController {
                 // the pool has let go; until it says so, nothing happens — which
                 // is what keeps the object visible while somebody investigates a
                 // backend that will not destroy it.
-                if !volume.meta.is_deleting() || !pool_has_let_go(volume) {
+                if !volume.meta.is_deleting() {
                     return Ok(());
+                }
+                if !pool_has_let_go(volume) {
+                    // Unless there is nobody who could ever say it. A volume
+                    // naming a pool this cell does not have, that no pool ever
+                    // claimed, has no bytes anywhere — and waiting for its
+                    // release is waiting for a party that cannot arrive.
+                    if !self.nobody_will_ever_let_go(volume).await? {
+                        return Ok(());
+                    }
+                    warn!(
+                        volume = name,
+                        pool = %volume.spec.pool,
+                        "releasing the guard: no pool by that name has ever held this, so there \
+                         is nothing to leave behind"
+                    );
                 }
                 let mut next = volume.clone();
                 next.meta.remove_finalizer(POOL_RELEASE_FINALIZER);
@@ -216,11 +272,135 @@ mod tests {
     struct Cell {
         volumes: TypedStore<VolumeSpec, VolumeStatus>,
         snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
+        /// The store underneath, so a test can put a pool in it: whether a
+        /// volume's guard can ever be lifted depends on whether the pool it
+        /// names is there at all.
+        raw: Arc<dyn Store>,
+    }
+
+    /// A volume waiting for a pool that does not exist waited for ever.
+    ///
+    /// The release guard exists so a record cannot vanish while its bytes
+    /// remain — and that reasoning needs a pool. A volume naming one this cell
+    /// does not have was never provisioned by anybody, so there is nothing to
+    /// leave behind, and the only party that could lift the guard cannot
+    /// arrive.
+    ///
+    /// Found on a real cell: a volume created with the pool's full resource
+    /// name instead of its id sat `deleting` for hours, undeletable by any
+    /// means the API offers.
+    #[tokio::test]
+    async fn a_volume_waiting_on_a_pool_that_does_not_exist_is_let_go() {
+        let (cell, controller) = fixture().await;
+
+        // The mistyped one: no pool by that name, and nobody ever claimed it.
+        let mut v = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        v.spec.pool = "pools/local".into();
+        v.status.pool = None;
+        v.meta.generation += 1;
+        v.meta.add_finalizer(POOL_RELEASE_FINALIZER);
+        v.meta.deleted_at = Some(velstra_cloud_model::meta::Timestamp::now());
+        cell.volumes
+            .update(&v, &Writer::controller("volume"))
+            .await
+            .unwrap();
+
+        let stored = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        controller
+            .reconcile("projects/p1/volumes/data-1", Some(&stored))
+            .await
+            .expect("the pass runs");
+
+        let after = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !after.meta.has_finalizer(POOL_RELEASE_FINALIZER),
+            "a volume nobody can ever release is still guarded"
+        );
+    }
+
+    /// And a volume whose pool **does** exist keeps waiting, however quiet that
+    /// pool is. A pool that is down may be holding real bytes, and letting the
+    /// record go there would be losing them silently.
+    #[tokio::test]
+    async fn a_volume_whose_pool_exists_keeps_waiting_for_it() {
+        let (cell, controller) = fixture().await;
+        let pools: TypedStore<
+            velstra_cloud_model::resources::PoolSpec,
+            velstra_cloud_model::resources::PoolStatus,
+        > = TypedStore::new(cell.raw.clone(), "cell-1", "pools");
+        pools
+            .create(
+                &velstra_cloud_model::resources::Resource::new(
+                    velstra_cloud_model::meta::Meta::new(
+                        "pools/local".parse().unwrap(),
+                        velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+                    ),
+                    Default::default(),
+                    Default::default(),
+                ),
+                &Writer::controller("test"),
+            )
+            .await
+            .unwrap();
+
+        let mut v = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        v.spec.pool = "local".into();
+        v.status.pool = None;
+        v.meta.generation += 1;
+        v.meta.add_finalizer(POOL_RELEASE_FINALIZER);
+        v.meta.deleted_at = Some(velstra_cloud_model::meta::Timestamp::now());
+        cell.volumes
+            .update(&v, &Writer::controller("volume"))
+            .await
+            .unwrap();
+
+        let stored = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        controller
+            .reconcile("projects/p1/volumes/data-1", Some(&stored))
+            .await
+            .expect("the pass runs");
+
+        let after = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.meta.has_finalizer(POOL_RELEASE_FINALIZER),
+            "a volume whose pool exists was let go without the pool saying so"
+        );
     }
 
     async fn fixture() -> (Cell, VolumeController) {
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
         let cell = Cell {
+            raw: store.clone(),
             volumes: TypedStore::new(store.clone(), "cell-1", "volumes"),
             snapshots: TypedStore::new(store, "cell-1", "snapshots"),
         };
@@ -246,8 +426,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let controller =
-            VolumeController::new(cell.volumes.clone(), cell.snapshots.clone(), "cell-1");
+        let controller = VolumeController::new(
+            cell.volumes.clone(),
+            cell.snapshots.clone(),
+            TypedStore::new(cell.raw.clone(), "cell-1", "pools"),
+            "cell-1",
+        );
         (cell, controller)
     }
 

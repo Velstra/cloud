@@ -61,6 +61,19 @@ fn fields(kind: &str) -> &'static [(&'static str, Form)] {
         "volumes" => &[
             ("source_image", Form::Name),
             ("source_snapshot", Form::Name),
+            // A pool is named by its id, like a node. Nothing checked this, and
+            // the cost was silent: `pools/local` was accepted, no pool's watch
+            // filter ever matched it, and the volume sat unprovisioned for ever
+            // with an empty status and nothing anywhere saying why.
+            ("pool", Form::BareId),
+        ],
+        // The same field, the same reason. A snapshot names no volume — the
+        // volume is in its own name — so the pool is the whole of it.
+        "snapshots" => &[("pool", Form::BareId)],
+        "backups" => &[
+            ("volume", Form::Name),
+            ("target", Form::Name),
+            ("pool", Form::BareId),
         ],
         "ports" => &[
             ("network", Form::Name),
@@ -115,6 +128,11 @@ pub const REFERRING_KINDS: &[&str] = &[
     "routers",
     "floatingips",
     "load-balancers",
+    // Both grew a `pool`, which is a reference like any other: a pool with a
+    // snapshot or a backup still in it is a pool whose deletion would leave
+    // them naming nothing.
+    "snapshots",
+    "backups",
 ];
 
 /// Every resource this spec names, in full-name form.
