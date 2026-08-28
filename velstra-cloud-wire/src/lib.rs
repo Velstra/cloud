@@ -162,11 +162,28 @@ fn to_snake(key: &str) -> String {
             // Without this the round trip is not a round trip: `l3_vni` came
             // back as `l_3_vni`, and a field that does not survive its own wire
             // is a field a client cannot write.
-            let next_is_upper = chars[i + 1..]
+            // And a third case the first two did not cover: digits that end
+            // the name, where there is no next character to decide with.
+            //
+            // `ticketSha256` was the one that found it. There is nothing after
+            // the digits, so the rule above fell through to "new word" and
+            // produced `ticket_sha_256` — a field name nothing has, which serde
+            // therefore does not find, which takes the field's `default`. For
+            // `ticket_sha256` that default is an empty string, so every console
+            // attach was refused as "that is not this session's ticket": nothing
+            // failed anywhere, and the answer was simply wrong.
+            //
+            // Trailing digits are read as part of the word before them —
+            // `sha256`, `base64`, `utf8`, `ipv4`. The cost is that a field
+            // genuinely named `foo_2` cannot survive the wire, which the guard
+            // below refuses at build time rather than leaving to be discovered.
+            let after: Vec<&char> = chars[i + 1..]
                 .iter()
-                .find(|n| !n.is_ascii_digit())
-                .is_some_and(|n| n.is_ascii_uppercase());
-            if !next_is_upper {
+                .skip_while(|n| n.is_ascii_digit())
+                .collect();
+            let ends_the_name = after.is_empty();
+            let next_is_upper = after.first().is_some_and(|n| n.is_ascii_uppercase());
+            if !next_is_upper && !ends_the_name {
                 out.push('_');
             }
         }

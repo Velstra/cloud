@@ -302,11 +302,112 @@ fn a_digit_in_a_field_name_survives_whichever_word_it_belongs_to() {
         "sha256_digest",
         "size_gib",
         "observed_generation",
+        // The digits **end** the name, so there is no next character to decide
+        // with. `ticket_sha256` is the one that found this: it came back as
+        // `ticket_sha_256`, which is a field nothing has — so serde did not
+        // find it, took its default of an empty string, and every console
+        // attach was refused as "that is not this session's ticket". Nothing
+        // failed anywhere and the answer was simply wrong.
+        "ticket_sha256",
+        "digest_sha256",
+        "encoded_base64",
     ] {
         let camel = velstra_cloud_wire::to_camel(name);
         let back = velstra_cloud_wire::to_wire(serde_json::json!({ camel.clone(): 1 }));
         let snake = velstra_cloud_wire::from_wire(back);
         let got = snake.as_object().unwrap().keys().next().unwrap().clone();
         assert_eq!(got, name, "{name} became {camel} and came back as {got}");
+    }
+}
+
+/// Every field name in the model survives the wire, checked by walking the
+/// model itself rather than by remembering to list one.
+///
+/// The two tests above check the objects somebody thought to add and the names
+/// somebody thought to name, and that is how `ticket_sha256` got through: a new
+/// spec was added and neither list grew. This one cannot be forgotten, because
+/// it does not have a list — it takes every field of every spec and status the
+/// contract serves and puts each through `to_camel` and back.
+///
+/// A failure here is not a style question. A name that does not round-trip is a
+/// field serde does not find on the way in, so it takes its `default` — and a
+/// default that happens to be an empty string or a zero is an answer that is
+/// simply wrong, with nothing failing anywhere to say so.
+#[test]
+fn every_field_name_the_model_has_survives_the_wire() {
+    fn walk(value: &serde_json::Value, path: &str, bad: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, v) in map {
+                    // Labels are a tenant's own keys, carried opaquely — the
+                    // wire layer deliberately does not touch them.
+                    if key == "labels" {
+                        continue;
+                    }
+                    let camel = velstra_cloud_wire::to_camel(key);
+                    let round =
+                        velstra_cloud_wire::from_wire(serde_json::json!({ camel.clone(): 1 }));
+                    let back = round
+                        .as_object()
+                        .and_then(|m| m.keys().next().cloned())
+                        .unwrap_or_default();
+                    if &back != key {
+                        bad.push(format!("{path}{key} → {camel} → {back}"));
+                    }
+                    walk(v, &format!("{path}{key}."), bad);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, path, bad);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut bad = Vec::new();
+    for (name, document) in every_spec_and_status() {
+        walk(&document, &format!("{name}."), &mut bad);
+    }
+    assert!(
+        bad.is_empty(),
+        "these field names do not survive the wire, so a reader takes their \
+         default instead of their value:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// One default-constructed document per kind the contract serves.
+///
+/// Defaults are enough here: this is about **names**, and a default object
+/// carries every field that is not `skip_serializing_if`. The ones that are
+/// skipped are covered by the fully-populated objects in the test above.
+fn every_spec_and_status() -> Vec<(&'static str, serde_json::Value)> {
+    use velstra_cloud_model::*;
+    macro_rules! both {
+        ($($name:literal => $spec:ty, $status:ty),* $(,)?) => {
+            vec![$(
+                ($name, serde_json::to_value(<$spec>::default()).expect("a spec serialises")),
+                ($name, serde_json::to_value(<$status>::default()).expect("a status serialises")),
+            )*]
+        };
+    }
+    both! {
+        "instances" => resources::InstanceSpec, resources::InstanceStatus,
+        "nodes" => resources::NodeSpec, resources::NodeStatus,
+        "volumes" => resources::VolumeSpec, resources::VolumeStatus,
+        "pools" => resources::PoolSpec, resources::PoolStatus,
+        "images" => resources::ImageSpec, resources::ImageStatus,
+        "networks" => resources::NetworkSpec, resources::NetworkStatus,
+        "subnets" => resources::SubnetSpec, resources::SubnetStatus,
+        "ports" => resources::PortSpec, resources::PortStatus,
+        "attachments" => resources::AttachmentSpec, resources::AttachmentStatus,
+        "projects" => resources::ProjectSpec, resources::ProjectStatus,
+        "console-sessions" => console::ConsoleSessionSpec, console::ConsoleSessionStatus,
+        "captures" => capture::CaptureSpec, capture::CaptureStatus,
+        "backups" => backup::BackupSpec, backup::BackupStatus,
+        "migrations" => migration::MigrationSpec, migration::MigrationStatus,
+        "security-groups" => security::SecurityGroupSpec, security::SecurityGroupStatus,
     }
 }
