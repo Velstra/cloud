@@ -45,6 +45,21 @@ async fn cell_and_store() -> (Api, Arc<dyn Store>) {
     let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
         .with_cell_admins(vec![OPERATOR.to_string()]);
 
+    // A cell with somewhere to put a volume. It used to have none, and the
+    // volumes these tests make were accepted anyway — which is exactly the
+    // silence that was fixed: a volume naming a pool nothing holds is never
+    // provisioned and never says so.
+    for pool in ["pool-a", "pool-b"] {
+        api.create(
+            "",
+            "pools",
+            &json!({ "id": pool, "spec": {} }),
+            &who(OPERATOR),
+        )
+        .await
+        .expect("a cell has somewhere to put a volume");
+    }
+
     for (project, admin) in [("p1", ADA), ("p2", BOB)] {
         api.create(
             "",
@@ -53,6 +68,11 @@ async fn cell_and_store() -> (Api, Arc<dyn Store>) {
                 "id": project,
                 "spec": {
                     "quota": {},
+                    // Said out loud, because a project created today is closed:
+                    // these tests are about quotas and bindings, not about what
+                    // the cell allowed the tenant, and a fixture that left it
+                    // out would be testing the policy by accident.
+                    "policy": { "floating_ips": true, "device_passthrough": true },
                     "bindings": [{"role": "admin", "members": [admin]}]
                 }
             }),
@@ -499,6 +519,7 @@ async fn a_grpc_update_of_a_project_does_not_revoke_its_grants() {
     // asserts on the spec fields it *did* send.
     let api = cell().await;
     let sent = velstra_cloud_model::resources::ProjectSpec {
+        policy: Default::default(),
         display_name: "Payments".into(),
         parent: String::new(),
         quota: Default::default(),
@@ -1175,4 +1196,491 @@ async fn listing_a_collection_does_not_fill_the_audit_with_what_was_filtered() {
         about_bob, 0,
         "listing wrote {about_bob} audit records about objects nobody asked for by name"
     );
+}
+
+/// The image catalogue: everybody may boot from it, only the cell may fill it.
+///
+/// Until this rule existed the platform had no notion of a public image at all.
+/// Images live under projects, so an operator registering Debian registered it
+/// for *one* tenant; every other project had to fetch and store its own copy of
+/// the same bytes, and nobody opening the console could see what was on offer
+/// before they had already put something there. "I do not see at a glance which
+/// images there are" was not a gap in the console — there was nothing to show.
+#[tokio::test]
+async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
+    let api = cell().await;
+
+    api.create(
+        "",
+        "images",
+        &json!({
+            "id": "debian-13",
+            "spec": {
+                "digest": "sha256:3f9a2b",
+                "format": "Qcow2",
+                "source_url": "https://example.invalid/debian-13.qcow2"
+            }
+        }),
+        &who(OPERATOR),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("an operator publishes to the catalogue");
+
+    // A tenant may read it — that is what makes it a catalogue.
+    api.get(&name("images/debian-13"), &who(ADA))
+        .await
+        .expect("a tenant may read the catalogue");
+    api.get(&name("images/debian-13"), &who(BOB))
+        .await
+        .expect("so may every other tenant");
+
+    // And boot from it: the reference out of their project into the cell is
+    // followed, where before it was refused as a cell-wide resource.
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({
+            "id": "i1",
+            "spec": { "image": "images/debian-13", "vcpus": 1, "memory_mib": 512 }
+        }),
+        &who(ADA),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("a tenant boots a catalogue image");
+
+    // Nobody but the cell puts anything there. This is the half of the question
+    // that has a security answer: an image is bytes every guest in the cell will
+    // execute.
+    let refused = api
+        .create(
+            "",
+            "images",
+            &json!({
+                "id": "mine",
+                "spec": {
+                    "digest": "sha256:beef",
+                    "format": "Qcow2",
+                        "source_url": "https://example.invalid/mine.qcow2"
+                }
+            }),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("a tenant published to the cell catalogue");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+
+    // Nor may one be deleted or changed by a tenant: read is the whole grant.
+    let refused = api
+        .patch(
+            &name("images/debian-13"),
+            &json!({ "spec": { "source_url": "https://example.invalid/other" } }),
+            None,
+            &who(ADA),
+        )
+        .await
+        .expect_err("a tenant rewrote a catalogue image");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+
+    // A tenant's own image stays their own: the catalogue rule is about the
+    // cell's images, not about everybody's.
+    api.create(
+        "projects/p2",
+        "images",
+        &json!({
+            "id": "private",
+            "spec": {
+                "digest": "sha256:cafe",
+                "format": "Qcow2",
+                "source_url": "https://example.invalid/private.qcow2"
+            }
+        }),
+        &who(BOB),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("a tenant may keep a private image");
+    let refused = api
+        .get(&name("projects/p2/images/private"), &who(ADA))
+        .await
+        .expect_err("one tenant read another's image");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+}
+
+/// A way into a guest is a permission question, answered here and only here.
+///
+/// The node has no bindings to read and must never be the place one is decided,
+/// so what it is told is the *answer*: whether this holder may type. A viewer
+/// gets a window, not a refusal — watching a console is reading a machine, and
+/// somebody who may read it should be able to see why it will not boot.
+#[tokio::test]
+async fn a_console_is_granted_to_a_reader_and_a_keyboard_only_to_a_writer() {
+    let (api, store) = cell_and_store().await;
+
+    // A guest a node has claimed. The status is the node's to write, so it is
+    // written the way a node writes it — past the API, like the snapshot tests
+    // above.
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(store.clone(), "cell-1", "instances");
+    let mut instance = velstra_cloud_model::resources::Instance::new(
+        velstra_cloud_model::meta::Meta::new(
+            "projects/p1/instances/i1".parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        Default::default(),
+        velstra_cloud_model::resources::InstanceStatus {
+            node: Some("node-a".into()),
+            ..Default::default()
+        },
+    );
+    instance.meta.generation = 1;
+    instances
+        .create(
+            &instance,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .expect("a claimed guest");
+
+    // Ada admins p1: a keyboard.
+    let opened = api
+        .open_console(&name("projects/p1/instances/i1"), &who(ADA))
+        .await
+        .map_err(|e| e.to_string())
+        .expect("an admin of the project may open a console");
+    assert_eq!(opened["readOnly"], serde_json::json!(false));
+    let ticket = opened["ticket"].as_str().expect("a ticket").to_string();
+    assert!(!ticket.is_empty());
+
+    // The ticket left the API exactly once. What is stored is its hash — every
+    // node in the cell may read the cell, and a stored ticket would be a way
+    // into a guest on somebody else's machine.
+    let session = api
+        .get(
+            &name(opened["session"].as_str().expect("a session name")),
+            &who(OPERATOR),
+        )
+        .await
+        .map_err(|e| e.to_string())
+        .expect("the session exists");
+    let text = serde_json::to_string(&session).unwrap();
+    assert!(!text.contains(&ticket), "the ticket was stored: {text}");
+    assert!(
+        text.contains(&velstra_cloud_model::console::sha256_hex(&ticket)),
+        "{text}"
+    );
+    // And it says which node, because that is what stops one node serving a
+    // session for a guest on another.
+    assert_eq!(session["spec"]["node"], serde_json::json!("node-a"));
+
+    // A viewer of the project gets a window and no keyboard. Not a refusal:
+    // somebody who may read a machine should be able to see why it will not
+    // boot, which is the whole reason a console exists.
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "bindings": [
+            { "role": "admin", "members": [ADA] },
+            { "role": "viewer", "members": ["cleo"] }
+        ] } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("an operator changes the bindings");
+
+    let watching = api
+        .open_console(&name("projects/p1/instances/i1"), &who("cleo"))
+        .await
+        .map_err(|e| e.to_string())
+        .expect("a viewer may watch");
+    assert_eq!(
+        watching["readOnly"],
+        serde_json::json!(true),
+        "a viewer was handed a keyboard"
+    );
+    assert_ne!(
+        watching["ticket"], opened["ticket"],
+        "two sessions shared a ticket"
+    );
+
+    // Bob has nothing in p1 at all: no window either.
+    let refused = api
+        .open_console(&name("projects/p1/instances/i1"), &who(BOB))
+        .await
+        .expect_err("a stranger opened a console");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+}
+
+/// Who may put a guest on the machine's own wire.
+///
+/// The strongest thing an operator can hand out, and the one a tenant most
+/// wants: "just put this VM on my LAN". A guest on a host bridge is on whatever
+/// the machine is on — past this platform's addressing, its security groups and
+/// its idea of who may talk to whom. So the operator decides, per network, and a
+/// tenant gets logical networks.
+#[tokio::test]
+async fn only_an_operator_may_put_a_network_on_the_machines_own_wire() {
+    let api = cell().await;
+
+    let refused = api
+        .create(
+            "projects/p1",
+            "networks",
+            &json!({ "id": "lan", "spec": { "mtu": 1500, "host_bridge": "br0" } }),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("a tenant put a network on a host bridge");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+    assert!(
+        refused.to_string().contains("host bridge"),
+        "the refusal has to say what was refused: {refused}"
+    );
+
+    // The operator may, in the tenant's own project — which is the shape of the
+    // answer: the admin decides, the tenant uses.
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "lan", "spec": { "mtu": 1500, "host_bridge": "br0" } }),
+        &who(OPERATOR),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("an operator may");
+
+    // And a tenant's ordinary network is still theirs to make.
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "private", "spec": { "mtu": 1500 } }),
+        &who(ADA),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("a tenant may still have a logical network");
+
+    // Nor by editing one afterwards, which is the same grant arriving later.
+    let refused = api
+        .patch(
+            &name("projects/p1/networks/private"),
+            &json!({ "spec": { "host_bridge": "br0" } }),
+            None,
+            &who(ADA),
+        )
+        .await
+        .expect_err("a tenant moved their network onto a host bridge");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+}
+
+/// What a project may reach for is the cell's to decide, per project.
+///
+/// This is the difference between a platform one company runs for itself and
+/// one a provider runs for customers. Most of what a hypervisor can do is not
+/// something every tenant should be able to ask for, and until this existed
+/// each of those was answered the same way everywhere — cell operator or
+/// nobody — which is right for one tenant and useless for a hundred.
+#[tokio::test]
+async fn a_project_reaches_only_as_far_as_the_cell_let_it() {
+    let (api, _store) = cell_and_store().await;
+
+    // p1's fixture allows passthrough and public addresses and no bridges. p2's
+    // is the same; what differs below is what each is *given*.
+    let closed = api
+        .create(
+            "projects/p1",
+            "networks",
+            &json!({ "id": "lan", "spec": { "mtu": 1500, "host_bridge": "br0" } }),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("a project with no bridges was given one");
+    assert_eq!(closed.code, Code::PermissionDenied, "{closed}");
+    assert!(
+        closed.to_string().contains("hostBridges"),
+        "the refusal has to say where the answer lives: {closed}"
+    );
+
+    // The cell grants it — naming the bridge, because what anybody means by a
+    // host bridge is a particular wire.
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "policy": { "host_bridges": ["br0"], "floating_ips": true } } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("the cell sets what a project may reach for");
+
+    // Now the tenant's own admin may make one — without ever being a cell
+    // operator, which is the whole shape of the thing.
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "lan", "spec": { "mtu": 1500, "host_bridge": "br0" } }),
+        &who(ADA),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("a project given a bridge may use it");
+
+    // And only that one. A grant is a wire, not a capability.
+    let other = api
+        .create(
+            "projects/p1",
+            "networks",
+            &json!({ "id": "other", "spec": { "mtu": 1500, "host_bridge": "br99" } }),
+            &who(ADA),
+        )
+        .await
+        .err()
+        .expect("a project used a bridge it was not given");
+    assert_eq!(other.code, Code::PermissionDenied, "{other}");
+    assert!(other.to_string().contains("br0"), "{other}");
+
+    // The neighbour got nothing, and one tenant's grant is not another's.
+    let bob = api
+        .create(
+            "projects/p2",
+            "networks",
+            &json!({ "id": "lan", "spec": { "mtu": 1500, "host_bridge": "br0" } }),
+            &who(BOB),
+        )
+        .await
+        .err()
+        .expect("a grant leaked between projects");
+    assert_eq!(bob.code, Code::PermissionDenied, "{bob}");
+}
+
+/// The escalation this policy has to be closed against.
+///
+/// Every check that consults the policy is decorative if the tenant can write
+/// the policy: a project admin who could set `hostBridges` would grant
+/// themselves the machine's own wire by editing the object that says they may
+/// not.
+#[tokio::test]
+async fn a_project_admin_cannot_widen_their_own_project() {
+    let api = cell().await;
+
+    let refused = api
+        .patch(
+            &name("projects/p1"),
+            &json!({ "spec": { "policy": { "host_bridges": ["br0"] } } }),
+            None,
+            &who(ADA),
+        )
+        .await
+        .expect_err("a project admin widened their own project");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+
+    // Their own bindings they may still change — that is what being the
+    // project's admin is.
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "bindings": [
+            { "role": "admin", "members": [ADA] },
+            { "role": "operator", "members": ["cleo"] }
+        ] } }),
+        None,
+        &who(ADA),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("a project admin manages their own bindings");
+}
+
+/// The rung a platform with customers needs.
+///
+/// Somebody who keeps an estate running reboots machines and does not delete
+/// them. Before this rung, anybody who needed to restart a guest had to be
+/// given the ability to destroy one.
+#[tokio::test]
+async fn an_operator_may_run_a_guest_and_not_create_or_destroy_one() {
+    let api = cell().await;
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "bindings": [
+            { "role": "admin", "members": [ADA] },
+            { "role": "operator", "members": ["cleo"] }
+        ] } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("the bindings are set");
+
+    // Not theirs to bring into existence.
+    let refused = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "i1", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+            &who("cleo"),
+        )
+        .await
+        .err()
+        .expect("an operator created a guest");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+
+    // The admin makes it; the operator runs it.
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "i1", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        &who(ADA),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("an admin creates a guest");
+
+    api.patch(
+        &name("projects/p1/instances/i1"),
+        &json!({ "spec": { "desired_state": "Stopped" } }),
+        None,
+        &who("cleo"),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("an operator stops a guest");
+
+    // And not theirs to take away.
+    let refused = api
+        .delete(&name("projects/p1/instances/i1"), None, &who("cleo"))
+        .await
+        .err()
+        .expect("an operator deleted a guest");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+
+    // A viewer may not even stop it.
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "bindings": [
+            { "role": "admin", "members": [ADA] },
+            { "role": "viewer", "members": ["dana"] }
+        ] } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .map_err(|e| e.to_string())
+    .expect("the bindings are set");
+    let refused = api
+        .patch(
+            &name("projects/p1/instances/i1"),
+            &json!({ "spec": { "desired_state": "Running" } }),
+            None,
+            &who("dana"),
+        )
+        .await
+        .expect_err("a viewer started a guest");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
 }

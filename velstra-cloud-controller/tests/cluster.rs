@@ -265,6 +265,7 @@ async fn settled_cell() -> Cell {
     let mut project: Project = Resource::new(
         meta("projects/p1"),
         ProjectSpec {
+            policy: Default::default(),
             display_name: "one".into(),
             parent: "organizations/o1".into(),
             quota: Quota {

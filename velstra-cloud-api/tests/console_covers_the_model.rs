@@ -31,9 +31,12 @@ use velstra_cloud_model::{
 fn exempt(collection: &str, field: &str) -> Option<&'static str> {
     match (collection, field) {
         ("projects", "bindings") => Some(
-            "IAM is its own surface: a role grant is not a form field, and a \
-             text box that silently replaced a project's whole policy is worse \
-             than no box at all",
+            "IAM is its own surface and now has one: `iam.js` renders a project's \
+             grants as rows — one person, one role, added and removed on their \
+             own, saved with the revision the sheet was drawn from. It is \
+             deliberately not a schema field, because a text box holding the \
+             whole set replaces all of it on every save and loses whatever a \
+             colleague did in between",
         ),
         ("images", "signature") => Some(
             "nothing in this platform verifies a signature, so the API refuses \
@@ -88,6 +91,7 @@ mod complete {
 
     pub fn project() -> ProjectSpec {
         ProjectSpec {
+            policy: Default::default(),
             display_name: "Payments".into(),
             parent: "organizations/o1".into(),
             quota: Quota {

@@ -162,6 +162,7 @@ mod tests {
                         Placement::new("eu", "cell-1"),
                     ),
                     ProjectSpec {
+                        policy: Default::default(),
                         display_name: "one".into(),
                         parent: "organizations/o1".into(),
                         quota: limit,

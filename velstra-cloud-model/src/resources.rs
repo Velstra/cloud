@@ -311,6 +311,127 @@ impl Assigned for crate::pci::DeviceClassSpec {}
 
 // ---- project -------------------------------------------------------------
 
+/// What a project may reach for, decided per project by whoever runs the cell.
+///
+/// ## Why this exists
+///
+/// A quota says *how much*. This says *what kind* — and the difference is what
+/// separates a platform one company runs for itself from one a provider runs
+/// for customers. Most of what a hypervisor can do is not something every
+/// tenant should be able to ask for: a guest on the machine's own bridge is
+/// past every rule this platform has, a passed-through GPU is a piece of the
+/// host handed to one guest, and a public address is a claim on somebody else's
+/// address space.
+///
+/// Until this existed, each of those was answered the same way everywhere:
+/// **cell operator or nobody**. That is right for a cell with one tenant and
+/// useless for a provider, where the answer differs per customer — this one
+/// bought bare-metal networking, that one did not — and where handing out cell
+/// operator to grant it would hand out everything else with it.
+///
+/// ## A new project is closed; yesterday's project is not
+///
+/// Two different questions, and conflating them would break a running cell.
+///
+/// [`Default`] is the **closed** policy: no bridges, no passthrough, no public
+/// addresses. That is what a project created today gets — the API writes it
+/// explicitly — and it is what a project that cannot be read answers with,
+/// because a permission question whose input is missing must not resolve to
+/// yes.
+///
+/// What serde fills in for a **missing field** is the opposite, and deliberately
+/// so. A project stored before this type existed carries no policy at all, and
+/// reading it as closed would take away, on the next upgrade and with no
+/// operator involved, capabilities its tenants already had and were using.
+/// Yesterday's object has to keep meaning what it meant. So an absent field
+/// reads as "as before" — open — and every project written since carries the
+/// answer explicitly.
+///
+/// Opening something for a new project is therefore a deliberate act by the
+/// cell, recorded on the project, and visible to everybody who can read it.
+///
+/// A cell operator is not bound by any of it — they are the provider, and a
+/// policy that could stop them would be a cell nobody can repair.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectPolicy {
+    /// Bridges on the nodes that this project's networks may be put on.
+    ///
+    /// Empty — the default — means none: this project gets logical networks,
+    /// whose addresses the platform allocates and whose segments it carries.
+    /// Naming one here lets the project's own admins put a network on it, which
+    /// is the "just put this VM on our VLAN" that a colocation customer buys
+    /// and a shared-hosting customer must never have.
+    ///
+    /// Named bridges rather than a boolean, because "may use host bridges" is
+    /// not a thing anybody means: what they mean is *this* VLAN, the one that
+    /// customer's cage is on.
+    /// No `skip_serializing_if`: an empty list is an **answer** here — "this
+    /// project gets no host bridges" — and a field left out of the document is
+    /// one that reads back as "as before" on the next upgrade.
+    #[serde(default)]
+    pub host_bridges: Vec<String>,
+    /// Whether guests here may be given a piece of the host — a GPU, a NIC.
+    ///
+    /// A passed-through device is a physical thing one guest holds and no other
+    /// guest can have, and a tenant who could ask for one could empty a node of
+    /// the hardware everybody else was scheduled against.
+    #[serde(default = "as_before")]
+    pub device_passthrough: bool,
+    /// Whether this project may hold addresses the world can reach.
+    ///
+    /// A claim on address space the cell was given by whoever is above it, and
+    /// therefore not self-service: a tenant who could mint public addresses
+    /// could exhaust the pool every other tenant is waiting on.
+    #[serde(default = "as_before")]
+    pub floating_ips: bool,
+}
+
+/// What a field that is not in the document meant before the field existed.
+///
+/// True, because it did: a cell running yesterday let every project ask for
+/// these, and an upgrade that quietly stopped it would be an outage nobody
+/// asked for. Only ever used by serde, and never by [`Default`], which answers
+/// the other question — see the type's own note.
+fn as_before() -> bool {
+    true
+}
+
+/// What a project with no policy at all meant before the field existed.
+///
+/// Everything its tenants could already ask for, because they could: a cell
+/// running yesterday allowed passthrough and public addresses in every project,
+/// and an upgrade that silently stopped it would be an outage nobody asked for.
+/// Host bridges are empty because nothing had them — there was no such thing.
+fn policy_as_before() -> ProjectPolicy {
+    ProjectPolicy {
+        host_bridges: Vec::new(),
+        device_passthrough: true,
+        floating_ips: true,
+    }
+}
+
+impl Default for ProjectPolicy {
+    /// The closed policy: what a project created today gets, and what a project
+    /// that could not be read answers with.
+    fn default() -> Self {
+        Self {
+            host_bridges: Vec::new(),
+            device_passthrough: false,
+            floating_ips: false,
+        }
+    }
+}
+
+impl ProjectPolicy {
+    /// Whether a network in this project may name `bridge`.
+    ///
+    /// An empty name is the ordinary case — a logical network — and is always
+    /// allowed; there is nothing being asked for.
+    pub fn may_use_bridge(&self, bridge: &str) -> bool {
+        bridge.is_empty() || self.host_bridges.iter().any(|b| b == bridge)
+    }
+}
+
 /// The IAM and quota anchor. Everything chargeable hangs under one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProjectSpec {
@@ -319,6 +440,24 @@ pub struct ProjectSpec {
     /// from, kept as a name so the hierarchy is walked, not guessed.
     pub parent: String,
     pub quota: Quota,
+    /// What this project is allowed to reach for. The cell operator's to set,
+    /// and the tenant's to work within. See [`ProjectPolicy`].
+    ///
+    /// The default here is **not** `ProjectPolicy::default()`, and the
+    /// difference is the whole of the upgrade story. A project stored before
+    /// this field existed has no `policy` key at all, so this is what it reads
+    /// as — and reading it as the closed policy would take away, on the next
+    /// upgrade and with no operator involved, capabilities its tenants already
+    /// had. The per-field defaults inside `ProjectPolicy` cover the narrower
+    /// case of a policy object that is present and missing a field; this covers
+    /// the object being absent entirely, which is every project that predates
+    /// it.
+    ///
+    /// A project created today does not go through here: it is built from
+    /// `ProjectSpec::default()`, which uses `ProjectPolicy::default()` and is
+    /// closed.
+    #[serde(default = "policy_as_before")]
+    pub policy: ProjectPolicy,
     /// Who may do what inside this project.
     ///
     /// Here rather than in a collection of its own because a project **is** the

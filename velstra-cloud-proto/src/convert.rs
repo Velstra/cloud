@@ -206,6 +206,8 @@ impl From<&resources::ProjectSpec> for v1::ProjectSpec {
             parent: s.parent.clone(),
             quota: Some((&s.quota).into()),
             cell: s.cell.clone(),
+            bindings: s.bindings.iter().map(binding_out).collect(),
+            policy: Some(policy_out(&s.policy)),
         }
     }
 }
@@ -217,11 +219,12 @@ impl From<&v1::ProjectSpec> for resources::ProjectSpec {
             parent: s.parent.clone(),
             quota: s.quota.as_ref().map(Into::into).unwrap_or_default(),
             cell: s.cell.clone(),
-            // The protobuf surface does not describe bindings yet, so a project
-            // that arrives over gRPC carries none. Empty is the safe direction:
-            // it grants nothing rather than inventing a grant nobody asked for.
-            // Managing them over gRPC needs a message, and until there is one,
-            bindings: Vec::new(),
+            bindings: s.bindings.iter().map(binding_in).collect(),
+            // Absent is the closed policy, which is the safe direction: a
+            // permission question whose input is missing must not resolve to
+            // yes, and an old client that does not send one is asking for
+            // nothing rather than for everything.
+            policy: s.policy.as_ref().map(policy_in).unwrap_or_default(),
         }
     }
 }
@@ -328,7 +331,21 @@ fn announce_str(a: velstra_cloud_model::public::Announce) -> &'static str {
     }
 }
 
+fn policy_out(p: &resources::ProjectPolicy) -> v1::ProjectPolicy {
+    v1::ProjectPolicy {
+        host_bridges: p.host_bridges.clone(),
+        device_passthrough: p.device_passthrough,
+        floating_ips: p.floating_ips,
+    }
+}
 
+fn policy_in(p: &v1::ProjectPolicy) -> resources::ProjectPolicy {
+    resources::ProjectPolicy {
+        host_bridges: p.host_bridges.clone(),
+        device_passthrough: p.device_passthrough,
+        floating_ips: p.floating_ips,
+    }
+}
 
 fn binding_out(b: &velstra_cloud_model::authz::Binding) -> v1::Binding {
     v1::Binding {
@@ -348,6 +365,7 @@ fn role_str(role: velstra_cloud_model::authz::Role) -> &'static str {
     use velstra_cloud_model::authz::Role;
     match role {
         Role::Viewer => "viewer",
+        Role::Operator => "operator",
         Role::Editor => "editor",
         Role::Admin => "admin",
     }
@@ -362,6 +380,7 @@ fn role_str(role: velstra_cloud_model::authz::Role) -> &'static str {
 fn parse_role(s: &str) -> velstra_cloud_model::authz::Role {
     use velstra_cloud_model::authz::Role;
     match s {
+        "operator" => Role::Operator,
         "editor" => Role::Editor,
         "admin" => Role::Admin,
         _ => Role::Viewer,

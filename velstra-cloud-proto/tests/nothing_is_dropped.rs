@@ -203,10 +203,16 @@ fn a_project_spec_survives_the_wire_except_its_bindings() {
             role: velstra_cloud_model::authz::Role::Admin,
             members: vec!["ada".into()],
         }],
+        policy: resources::ProjectPolicy {
+            host_bridges: vec!["br0".into()],
+            device_passthrough: true,
+            floating_ips: true,
+        },
         cell: "cell-2".into(),
     };
     let default = resources::ProjectSpec::default();
     let resources::ProjectSpec {
+        policy,
         display_name,
         parent,
         quota,
@@ -217,16 +223,27 @@ fn a_project_spec_survives_the_wire_except_its_bindings() {
     assert_ne!(parent, &default.parent);
     assert_ne!(quota, &default.quota);
     assert_ne!(bindings, &default.bindings);
+    assert_ne!(policy, &default.policy);
     assert_ne!(cell, &default.cell);
 
     let back = resources::ProjectSpec::from(&v1::ProjectSpec::from(&original));
     assert_eq!(back.display_name, original.display_name);
     assert_eq!(back.parent, original.parent);
     assert_eq!(back.quota, original.quota);
-    assert!(
-        back.bindings.is_empty(),
-        "gRPC grew a way to carry bindings; either give it a message and carry \
-         them properly, or this test is now wrong"
+    // gRPC carries them now. It used not to, and the note here said so — a
+    // project created over gRPC arrived with no bindings at all, which was the
+    // safe direction and made the surface useless to anybody automating a
+    // tenant's setup.
+    assert_eq!(
+        back.bindings, original.bindings,
+        "a project's bindings did not survive the wire"
+    );
+    // And what the cell allowed that tenant, which is the other half of setting
+    // one up: a policy that did not travel would leave every gRPC-created
+    // project on the closed default with no way to say otherwise.
+    assert_eq!(
+        back.policy, original.policy,
+        "a project's policy did not survive the wire"
     );
     // The home cell IS carried, and must be: a project created over gRPC that
     // lost it would silently become a project of whichever cell took the call,
@@ -775,6 +792,7 @@ whole_object_survives!(
     resources::Project,
     v1::Project,
     resources::ProjectSpec {
+        policy: Default::default(),
         display_name: "Payments".into(),
         parent: "organizations/o1".into(),
         quota: resources::Quota {
