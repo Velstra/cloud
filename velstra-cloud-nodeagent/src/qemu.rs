@@ -361,8 +361,11 @@ impl Vmm for QemuVmm {
         // Silicon only. What this node *presents* is the agent's to apply,
         // because it is declared on the node object and this backend cannot
         // see it — see `Agent::present_baseline`.
+        // Asked of this QEMU, not inferred from the architecture. A machine
+        // whose QEMU has no `x86-64-vN` models cannot be baselined, and saying
+        // it can is how an operator ends up with guests that will not start.
         host.cpu = Some(crate::hostcpu::observe(
-            std::env::consts::ARCH == "x86_64",
+            std::env::consts::ARCH == "x86_64" && presents_levels(&self.layout.binary).await,
             None,
         ));
 
@@ -385,6 +388,36 @@ impl Vmm for QemuVmm {
                 host.disks.insert(instance.clone());
             }
             if !self.monitor(&instance).exists() && !self.incoming_monitor(&instance).exists() {
+                // No monitor. Usually that means no VMM was ever asked for here
+                // — a directory left from a guest that has gone — and skipping
+                // is right.
+                //
+                // But it is also what a VMM that died *before* opening its
+                // monitor looks like, and those two must not be confused. A
+                // QEMU that exits at argument-parsing creates no socket, so the
+                // guest simply vanished from this observation: the control plane
+                // was told `Stopped`, the console was empty, and the reason
+                // existed only in the unit's journal. Found live, from a CPU
+                // baseline this platform advised.
+                if let Some(why) =
+                    hostfs::unit_failure(self.layout.scope, &self.unit(&instance)).await
+                {
+                    host.vms.insert(
+                        instance,
+                        VmObservation {
+                            size: None,
+                            // The hypervisor's own words, put where a person is
+                            // already looking. It never reached the console log,
+                            // because it never opened one.
+                            console_tail: why,
+                            console_bytes: 0,
+                            state: InstanceState::Failed,
+                            pid: None,
+                            started_at: hostfs::started_at(&dir),
+                            devices: Vec::new(),
+                        },
+                    );
+                }
                 continue;
             }
             // Read once per guest per pass, before either branch: a VMM that
@@ -821,10 +854,55 @@ fn passed_devices(command: &str) -> Vec<String> {
 fn cpu_arg(request: &VmRequest) -> String {
     match request.cpu_baseline {
         None => "host".to_string(),
-        // `CpuLevel` prints as `x86-64-v3`, which is also QEMU's name for that
-        // model. The baseline and the command line are the same string.
+        // `CpuLevel` prints as `x86-64-v3`, which is QEMU's name for that model
+        // **where QEMU has it**. Not every build does — see `presents_levels`,
+        // and the outage that taught us.
         Some(level) => format!("{level},enforce"),
     }
+}
+
+/// Whether this QEMU knows the `x86-64-vN` models a baseline is expressed in.
+///
+/// Asked of the binary, once, rather than assumed from the architecture. It was
+/// assumed, and on Debian 13's QEMU 10 the assumption is false: it has sixty
+/// versioned models and not one `x86-64-vN` among them.
+///
+/// What that cost, on two real machines: the console advised a baseline — "one
+/// migration domain, horst loses ibrs_enhanced" — the API accepted it, the agent
+/// reported presenting it, and every guest started afterwards died instantly
+/// with
+///
+/// ```text
+/// qemu-system-x86_64: unable to find CPU model 'x86-64-v1'
+/// ```
+///
+/// An operator following the platform's own advice ended with machines that
+/// would not start. A capability nobody checked is a capability the platform
+/// claims on somebody else's behalf.
+///
+/// Missing `qemu-system-*` answers `false`, which is the closed direction: a
+/// node that cannot be asked cannot be shown able.
+async fn presents_levels(binary: &str) -> bool {
+        let Ok(out) = tokio::process::Command::new(binary)
+        .args(["-cpu", "help"])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    levels_listed(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The reading half of [`presents_levels`], separated so it can be tested
+/// against what QEMU really prints.
+///
+/// Every level, not merely one: a fleet baselined to a level half of it cannot
+/// present is the same outage with extra steps.
+fn levels_listed(listing: &str) -> bool {
+    use velstra_cloud_model::cpu::CpuLevel;
+    [CpuLevel::V1, CpuLevel::V2, CpuLevel::V3, CpuLevel::V4]
+        .iter()
+        .all(|l| listing.contains(&l.to_string()))
 }
 
 fn qemu_args(
@@ -1547,5 +1625,66 @@ mod what_query_block_really_answers {
             by_qdev.is_empty(),
             "if qdev parsed, this test is asserting the wrong thing"
         );
+    }
+}
+
+#[cfg(test)]
+mod what_this_qemu_can_actually_present {
+    use super::*;
+
+    /// What Debian 13's QEMU 10 really prints, trimmed. Recorded from the
+    /// machine the outage happened on.
+    const DEBIAN_13: &str = "\
+Available CPUs:
+  486                   (alias configured by machine type)
+  486-v1
+  Broadwell-IBRS        (alias of Broadwell-v3)
+  Broadwell-noTSX       (alias of Broadwell-v2)
+  Broadwell-v2          Intel Core Processor (Broadwell, no TSX)
+  base                  base CPU model type with no features enabled
+  qemu64                (alias configured by machine type)
+  qemu64-v1             QEMU Virtual CPU version 2.5+
+";
+
+    /// A build that does carry them.
+    const WITH_LEVELS: &str = "\
+Available CPUs:
+  qemu64                (alias configured by machine type)
+  x86-64-v1             x86-64 baseline
+  x86-64-v2             x86-64 level 2
+  x86-64-v3             x86-64 level 3
+  x86-64-v4             x86-64 level 4
+";
+
+    #[test]
+    fn a_qemu_without_the_level_models_says_so() {
+        // The whole of the outage in one assertion. The platform assumed that
+        // x86_64 meant "can be baselined", the console advised one, the API took
+        // it, the agent reported presenting it — and every guest started
+        // afterwards died with `unable to find CPU model 'x86-64-v1'`.
+        //
+        // Sixty versioned models in that listing and not one `x86-64-vN`.
+        assert!(!levels_listed(DEBIAN_13));
+    }
+
+    #[test]
+    fn a_qemu_with_them_says_so_too() {
+        assert!(levels_listed(WITH_LEVELS));
+    }
+
+    #[test]
+    fn half_of_them_is_not_enough() {
+        // A fleet baselined to a level half of it cannot present is the same
+        // outage with extra steps — and harder to see, because the machines that
+        // can present it work.
+        let partial = WITH_LEVELS.replace("  x86-64-v4             x86-64 level 4\n", "");
+        assert!(!levels_listed(&partial));
+    }
+
+    #[test]
+    fn nothing_at_all_is_not_a_capability() {
+        // A binary that could not be asked cannot be shown able. The closed
+        // direction, like everywhere else a capability is claimed.
+        assert!(!levels_listed(""));
     }
 }
