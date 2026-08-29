@@ -168,12 +168,24 @@ impl Reconciler for DiskController {
             // catches those.
             return self.detach_all(name).await;
         };
-        // A guest on its way out keeps its disks until the guest itself is gone:
-        // detaching under a running teardown is how a filesystem is pulled from
-        // beneath a process that is still writing to it. The attachments go with
-        // the instance, through their own finalizers.
+        // A guest on its way out takes its disks with it, now rather than once
+        // the object is gone.
+        //
+        // The first version waited, reasoning that detaching under a running
+        // teardown pulls a filesystem from beneath a process still writing to
+        // it. That is right about detaching a disk from a *living* guest and
+        // wrong here: this guest is being destroyed entirely, and waiting
+        // deadlocks. The node stops the VM; `open_volumes` then reports nothing;
+        // the attachment reads as `attached: false` while not deleting — and
+        // `reconcile_attachment` answers that with `OpenVolume`, so the node
+        // would spend for ever plugging a disk into a guest that no longer
+        // exists.
+        //
+        // Deleting the attachment instead puts it in the branch that closes the
+        // volume and releases its finalizer, which is the sequence this whole
+        // pair of controllers is built around.
         if instance.meta.is_deleting() {
-            return Ok(());
+            return self.detach_all(name).await;
         }
 
         // Where it *is*, not where a scheduler wants it. During a migration
@@ -435,24 +447,27 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn a_guest_on_its_way_out_keeps_its_disks() {
-        // Detaching under a running teardown pulls a filesystem from beneath a
-        // process still writing to it. The attachments go with the instance,
-        // through their own finalizers.
+    async fn a_guest_on_its_way_out_takes_its_disks_with_it() {
+        // This asserted the opposite once, on the reasoning that detaching under
+        // a running teardown pulls a filesystem from beneath a process still
+        // writing to it. True of a living guest, false here — and the cost of
+        // being wrong was a deadlock found live: the machine sat at "deleting"
+        // for as long as anybody watched, because the attachment was waiting for
+        // the instance and the instance was waiting for nothing at all.
         let (disk, attachments, instances) = cell().await;
         let object = guest(&instances, &["projects/p1/volumes/data"], Some("nodes/n1")).await;
         disk.reconcile(GUEST, Some(&object)).await.unwrap();
 
         let mut going = object.clone();
-        going.spec.volumes.clear();
         going.meta.deleted_at = Some(velstra_cloud_model::meta::Timestamp::now());
         disk.reconcile(GUEST, Some(&going)).await.unwrap();
 
         let left = attachments.list().await.unwrap();
-        assert_eq!(left.len(), 1);
+        let live: Vec<_> = left.iter().filter(|a| !a.meta.is_deleting()).collect();
         assert!(
-            !left[0].meta.is_deleting(),
-            "a disk was detached from a guest that is being torn down"
+            live.is_empty(),
+            "a guest being torn down kept its disks, which is the deadlock: {:?}",
+            live.iter().map(|a| a.meta.name.to_string()).collect::<Vec<_>>()
         );
     }
 }

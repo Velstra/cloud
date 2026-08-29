@@ -273,3 +273,134 @@ async fn a_project_is_not_held_by_the_readings_taken_of_it() {
         .await
         .expect("a project is not held by the readings taken of it");
 }
+
+#[tokio::test]
+async fn a_machine_with_a_disk_can_be_deleted() {
+    // `spec.volumes` exists so that nobody has to know attachments are a thing.
+    // The delete guard did not know that, and answered
+    //
+    //   "…is still named by projects/p1/attachments/db-data.
+    //    Delete those first, or change what they point at."
+    //
+    // — which is the exact step the customer was spared at the other end, handed
+    // back to them at the worst moment. **A machine with a disk could not be
+    // deleted at all.** Found live, on the first one anybody tried.
+    //
+    // An object the platform made *for* this one is not a reason to keep it.
+    // Somebody's own attachment still is: that is theirs, and tearing it out
+    // with the guest would be a detach nobody asked for.
+    let api = cell().await;
+    api.create(
+        "",
+        "pools",
+        &json!({ "id": "local", "spec": { "accepting": true }}),
+        &who(),
+    )
+    .await
+    .expect("somewhere to put a volume");
+    api.create(
+        "projects/p1",
+        "volumes",
+        &json!({ "id": "data", "spec": { "size_gib": 1, "pool": "local" }}),
+        &who(),
+    )
+    .await
+    .expect("a volume");
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "db", "spec": {
+            "image": "images/x", "vcpus": 1, "memory_mib": 512, "root_disk_gib": 2,
+            "ports": []
+        }}),
+        &who(),
+    )
+    .await
+    .expect("a guest");
+
+    // What the disk controller makes: an attachment carrying the label that says
+    // whose it is.
+    api.create(
+        "projects/p1",
+        "attachments",
+        &json!({
+            "id": "db-data",
+            "meta": { "labels": {
+                velstra_cloud_model::resources::MINTED_FOR: "projects/p1/instances/db"
+            }},
+            "spec": {
+                "volume": "projects/p1/volumes/data",
+                "instance": "projects/p1/instances/db",
+                "node": "node-a"
+            }
+        }),
+        &who(),
+    )
+    .await
+    .expect("the platform attaches the disk");
+
+    api.delete(
+        &name("projects/p1/instances/db"),
+        None,
+        &who(),
+    )
+    .await
+    .expect("a machine with a disk the platform attached can be deleted");
+}
+
+#[tokio::test]
+async fn a_machine_with_somebody_elses_attachment_still_cannot() {
+    // The other half, and the reason the exemption is keyed on the label rather
+    // than on the kind: an attachment a person made is theirs, and taking it
+    // away with the guest is a detach nobody asked for.
+    let api = cell().await;
+    api.create(
+        "",
+        "pools",
+        &json!({ "id": "local", "spec": { "accepting": true }}),
+        &who(),
+    )
+    .await
+    .expect("somewhere to put a volume");
+    api.create(
+        "projects/p1",
+        "volumes",
+        &json!({ "id": "wichtig", "spec": { "size_gib": 1, "pool": "local" }}),
+        &who(),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "db2", "spec": {
+            "image": "images/x", "vcpus": 1, "memory_mib": 512, "root_disk_gib": 2,
+            "ports": []
+        }}),
+        &who(),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "projects/p1",
+        "attachments",
+        &json!({ "id": "von-hand", "spec": {
+            "volume": "projects/p1/volumes/wichtig",
+            "instance": "projects/p1/instances/db2",
+            "node": "node-a"
+        }}),
+        &who(),
+    )
+    .await
+    .unwrap();
+
+    let refusal = api
+        .delete(&name("projects/p1/instances/db2"), None, &who())
+        .await
+        .err()
+        .expect("an attachment somebody made by hand still holds the guest");
+    assert!(
+        refusal.to_string().contains("von-hand"),
+        "the refusal does not say what is holding it: {refusal}"
+    );
+}

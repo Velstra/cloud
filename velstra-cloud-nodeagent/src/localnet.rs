@@ -53,6 +53,15 @@ const IFNAMSIZ: usize = 15;
 /// list ruleset` on a node knows who wrote it and what deleting it would undo.
 const TABLE: &str = "velstra-localnet";
 
+/// One of our bridges as the machine has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bridge {
+    pub name: String,
+    /// IPv4 only, as `10.19.136.1/24`. The gateway is the only address this
+    /// platform puts on a bridge, so anything else here is something to remove.
+    pub addresses: Vec<String>,
+}
+
 /// One segment with a guest on this node: where it is, and who is on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
@@ -177,17 +186,126 @@ impl LocalNet {
         out
     }
 
+    /// What this node currently has of ours: bridge name, its addresses, and
+    /// whether anything is on it.
+    ///
+    /// Only ours — the prefix is what says so — because a plan that removed
+    /// interfaces it did not make would be a plan that takes a machine's own
+    /// networking away.
+    pub async fn observed(&self) -> Vec<Bridge> {
+        let Ok(out) = self.ip_output(&["-j", "addr", "show", "type", "bridge"]).await else {
+            return Vec::new();
+        };
+        let Ok(links) = serde_json::from_slice::<serde_json::Value>(&out) else {
+            return Vec::new();
+        };
+        links
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|link| {
+                let name = link.get("ifname")?.as_str()?.to_string();
+                if !name.starts_with(&self.prefix) {
+                    return None;
+                }
+                let addresses = link
+                    .get("addr_info")?
+                    .as_array()?
+                    .iter()
+                    .filter(|a| a.get("family").and_then(|f| f.as_str()) == Some("inet"))
+                    .filter_map(|a| {
+                        Some(format!(
+                            "{}/{}",
+                            a.get("local")?.as_str()?,
+                            a.get("prefixlen")?.as_u64()?
+                        ))
+                    })
+                    .collect();
+                Some(Bridge { name, addresses })
+            })
+            .collect()
+    }
+
+    /// What has to go before the plan runs.
+    ///
+    /// The plan alone is additive — `addr replace` adds and never takes away —
+    /// and additive is not convergent. Found on a live cell in the worst
+    /// possible shape: a project's network was remade with a different range,
+    /// the bridge kept the *old* gateway beside the new one, and the same
+    /// `10.19.136.1/24` ended up on two bridges at once. The kernel picks one
+    /// route for the range, it picked the bridge with nothing on it, and every
+    /// new guest in that project answered `No route to host` while the control
+    /// plane reported it Running with an address.
+    ///
+    /// Two removals, both keyed on the prefix so nothing outside this platform
+    /// is ever touched:
+    ///
+    /// * an address on one of our bridges that is not the gateway that bridge is
+    ///   for — the stale-gateway case above;
+    /// * a bridge of ours that no segment names — the network was deleted.
+    ///
+    /// A bridge with something still on it is left alone and said out loud: a
+    /// guest whose port the control plane has forgotten is a guest that is still
+    /// running, and cutting its wire is the one mistake here that a person
+    /// cannot undo from the console.
+    pub fn removals(&self, segments: &[Segment], observed: &[Bridge]) -> Vec<Step> {
+        let mut steps = Vec::new();
+        for bridge in observed {
+            // The prefix is checked *here*, where the decision is made, and not
+            // only in `observed` where the list is gathered. Two places is not
+            // belt and braces: this function is the one that emits `link del`,
+            // and a caller handing it a list from somewhere else — a test, a
+            // future observer, a refactor — would otherwise take `docker0` off a
+            // machine. Its own test proposed exactly that before this line.
+            if !bridge.name.starts_with(&self.prefix) {
+                continue;
+            }
+            let wanted = segments.iter().find(|s| self.bridge_for(&s.subnet) == bridge.name);
+            match wanted {
+                Some(segment) => {
+                    let keep = format!("{}/{}", segment.gateway, segment.prefix_len);
+                    for address in &bridge.addresses {
+                        if address != &keep {
+                            steps.push(step(["addr", "del", address, "dev", &bridge.name]));
+                        }
+                    }
+                }
+                None => steps.push(step(["link", "del", &bridge.name])),
+            }
+        }
+        steps
+    }
+
     /// Apply the plan, then the ruleset, then turn forwarding on.
     ///
     /// In that order on purpose: a segment that is forwarded before it exists is
     /// a window in which the node routes for a range it does not hold.
     pub async fn apply(&self, segments: &[Segment]) -> Result<()> {
         if segments.is_empty() {
-            // Still rewritten: the last guest leaving a node has to take its NAT
-            // rule with it, and "nothing to do" is how a stale rule outlives the
-            // segment it was written for.
+            // Still swept, and still rewritten: the last guest leaving a node
+            // has to take its NAT rule *and* its bridge with it. "Nothing to do"
+            // is how a stale rule outlives the segment it was written for, and
+            // how a bridge holding a gateway outlives the network it was for.
+            for step in self.removals(segments, &self.observed().await) {
+                let args: Vec<&str> = step.iter().map(String::as_str).collect();
+                if let Err(e) = self.ip(&args).await {
+                    tracing::warn!(error = %e, "could not clear a stale piece of the datapath");
+                }
+            }
             self.nft(&self.ruleset(segments)).await?;
             return Ok(());
+        }
+        // Removals first: a bridge on its way out may be holding the very
+        // address the bridge on its way in needs.
+        for step in self.removals(segments, &self.observed().await) {
+            let args: Vec<&str> = step.iter().map(String::as_str).collect();
+            if let Err(e) = self.ip(&args).await {
+                // Not fatal. Something that could not be taken away is a stale
+                // interface, and a stale interface is better than a pass that
+                // stops before it has built the new one.
+                tracing::warn!(error = %e, "could not clear a stale piece of the datapath");
+            }
         }
         for step in self.plan(segments) {
             let args: Vec<&str> = step.iter().map(String::as_str).collect();
@@ -203,6 +321,23 @@ impl LocalNet {
         }
         self.nft(&self.ruleset(segments)).await?;
         forwarding_on().await
+    }
+
+    /// The same, keeping what it said.
+    async fn ip_output(&self, args: &[&str]) -> Result<Vec<u8>> {
+        let output = tokio::process::Command::new(&self.ip)
+            .args(args)
+            .output()
+            .await
+            .map_err(|e| HostError::failed(format!("running `ip {}`: {e}", args.join(" "))))?;
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+        Err(HostError::failed(format!(
+            "`ip {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
     }
 
     async fn ip(&self, args: &[&str]) -> Result<()> {
@@ -620,5 +755,124 @@ mod on_the_machines_own_wire {
         let segments = segments(&ports, &subnets, &host, &taps);
         assert!(segments.is_empty(), "{segments:?}");
         assert!(!net().ruleset(&segments).contains("masquerade"));
+    }
+}
+
+#[cfg(test)]
+mod the_datapath_has_to_take_things_away_too {
+    use super::*;
+
+    fn net() -> LocalNet {
+        LocalNet::new("vbr")
+    }
+
+    fn segment(subnet: &str, gateway: &str) -> Segment {
+        Segment {
+            subnet: subnet.to_string(),
+            gateway: gateway.parse().unwrap(),
+            prefix_len: 24,
+            network: format!("{}/24", gateway.rsplit_once('.').unwrap().0.to_string() + ".0"),
+            taps: Vec::new(),
+        }
+    }
+
+    fn bridge(name: &str, addresses: &[&str]) -> Bridge {
+        Bridge {
+            name: name.to_string(),
+            addresses: addresses.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_gateway_that_moved_does_not_stay_behind() {
+        // The live shape, exactly. A project's network was remade with a
+        // different range; `addr replace` added the new gateway and left the old
+        // one, so `10.19.136.1/24` sat on two bridges at once. The kernel picks
+        // one route for a range; it picked the bridge with nothing on it, and
+        // every new guest in that project answered `No route to host` while the
+        // control plane reported it Running with an address.
+        let net = net();
+        let wanted = segment("projects/p1/subnets/default", "10.19.138.1");
+        let name = net.bridge_for(&wanted.subnet);
+        let observed = vec![bridge(&name, &["10.19.138.1/24", "10.19.136.1/24"])];
+
+        let steps = net.removals(&[wanted], &observed);
+        assert_eq!(
+            steps,
+            vec![vec![
+                "addr".to_string(),
+                "del".to_string(),
+                "10.19.136.1/24".to_string(),
+                "dev".to_string(),
+                name,
+            ]],
+            "the address that no longer belongs was left on the bridge"
+        );
+    }
+
+    #[test]
+    fn the_gateway_that_belongs_is_left_alone() {
+        // Level-triggered: a settled pass does nothing at all, which is what
+        // keeps a settled node settled. A removal-and-re-add every thirty
+        // seconds would be a gap in every guest's default route every thirty
+        // seconds.
+        let net = net();
+        let wanted = segment("projects/p1/subnets/default", "10.19.136.1");
+        let name = net.bridge_for(&wanted.subnet);
+        assert!(
+            net.removals(&[wanted], &[bridge(&name, &["10.19.136.1/24"])])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_bridge_for_a_network_that_is_gone_goes_too() {
+        // Otherwise they accumulate, each still holding a gateway, and the next
+        // network to be handed that range collides with a bridge nobody
+        // remembers making.
+        let net = net();
+        let steps = net.removals(&[], &[bridge("vbrdefaultab03", &["10.19.136.1/24"])]);
+        assert_eq!(
+            steps,
+            vec![vec![
+                "link".to_string(),
+                "del".to_string(),
+                "vbrdefaultab03".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn nothing_outside_this_platform_is_ever_touched() {
+        // The prefix is the whole boundary. A plan that removed interfaces it
+        // did not make would take a machine's own networking away — `docker0`,
+        // a libvirt bridge, whatever else is on the box.
+        let net = net();
+        let steps = net.removals(
+            &[],
+            &[
+                bridge("docker0", &["172.17.0.1/16"]),
+                bridge("virbr0", &["192.168.122.1/24"]),
+            ],
+        );
+        assert!(
+            steps.is_empty(),
+            "the datapath proposed removing something that is not ours: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn removals_are_idempotent_like_the_plan_is() {
+        let net = net();
+        let wanted = segment("projects/p1/subnets/default", "10.19.138.1");
+        let name = net.bridge_for(&wanted.subnet);
+        let observed = vec![
+            bridge(&name, &["10.19.138.1/24", "10.19.136.1/24"]),
+            bridge("vbraltab03", &["10.77.0.1/24"]),
+        ];
+        assert_eq!(
+            net.removals(std::slice::from_ref(&wanted), &observed),
+            net.removals(&[wanted], &observed)
+        );
     }
 }
