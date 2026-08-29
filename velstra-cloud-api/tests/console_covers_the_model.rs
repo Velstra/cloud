@@ -170,6 +170,7 @@ mod complete {
 
     pub fn image() -> ImageSpec {
         ImageSpec {
+            from: String::new(),
             family: "debian-13".into(),
             version: "20260815".into(),
             source_instance: None,

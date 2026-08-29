@@ -2034,6 +2034,29 @@ const IMAGE_SOURCE_FIELDS: &[Field] = &[
 
 const IMAGE_FIELDS: &[Field] = &[
     Field {
+        key: "from",
+        label: "Publish from",
+        kind: Kind::Ref {
+            collection: "images",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: false,
+        // First, and in the common path, because it is the *only* thing most
+        // people do on this form. Registering bytes by hand is the rare case; an
+        // operator here is nearly always putting a tenant's captured guest into
+        // the catalogue where everybody can boot it, and before this that meant
+        // reading four fields off one object and typing them into another.
+        advanced: false,
+        help: "Take the digest, format, size and source from an image that \
+               already exists. Nothing is copied — an image is addressed by its \
+               digest, so every node that had the bytes still has them. Anything \
+               you fill in below wins over what is taken.",
+        when_empty: "",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
         key: "family",
         label: "Family",
         kind: Kind::Text {
@@ -2078,7 +2101,13 @@ const IMAGE_FIELDS: &[Field] = &[
             placeholder: "sha256:…",
             check: Check::Digest,
         },
-        required: true,
+        // Not required *here*, and that is the truth rather than a
+        // loosening: `from` supplies this, and a form field is required or it is
+        // not — there is no way to say "unless another one is filled in". The
+        // API decides, and its refusal names the field and says what to do
+        // instead. Marking it required in the browser would block the one flow
+        // the form was rearranged for.
+        required: false,
         advanced: false,
         help: "The bytes are addressed by this, so an image cannot be replaced \
                under an instance that was built from it.",
@@ -2092,7 +2121,13 @@ const IMAGE_FIELDS: &[Field] = &[
         kind: Kind::Choice {
             options: &[choice("Raw", "Raw"), choice("Qcow2", "qcow2")],
         },
-        required: true,
+        // Not required *here*, and that is the truth rather than a
+        // loosening: `from` supplies this, and a form field is required or it is
+        // not — there is no way to say "unless another one is filled in". The
+        // API decides, and its refusal names the field and says what to do
+        // instead. Marking it required in the browser would block the one flow
+        // the form was rearranged for.
+        required: false,
         advanced: false,
         help: "",
         when_empty: "",
@@ -2106,8 +2141,20 @@ const IMAGE_FIELDS: &[Field] = &[
             placeholder: "https://…",
             check: Check::Url,
         },
-        required: true,
-        advanced: false,
+        // Not required *here*, and that is the truth rather than a
+        // loosening: `from` supplies this, and a form field is required or it is
+        // not — there is no way to say "unless another one is filled in". The
+        // API decides, and its refusal names the field and says what to do
+        // instead. Marking it required in the browser would block the one flow
+        // the form was rearranged for.
+        required: false,
+        // Behind "More settings" since publishing arrived, and it is the
+        // right one to move: it is provenance rather than a decision, and it is
+        // the one field here that fails *loudly* when it is missing — a node
+        // trying to fetch says so. The common path is four questions on purpose,
+        // and `from` now answers all four at once for the case people are
+        // actually here for.
+        advanced: true,
         help: "",
         when_empty: "",
         derived: false,

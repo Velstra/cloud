@@ -199,6 +199,7 @@ impl Cell {
                 Placement::new(REGION, CELL),
             ),
             ImageSpec {
+                from: String::new(),
                 family: "debian-13".into(),
                 version: "20260815".into(),
                 source_instance: None,

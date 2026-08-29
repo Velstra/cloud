@@ -111,6 +111,7 @@ impl<F: Fetch> ImageSourceController<F> {
         let image = Resource::new(
             Meta::new(name.clone(), Placement::new(&self.region, &self.cell)),
             ImageSpec {
+                from: String::new(),
                 family: spec.family.clone(),
                 // Dated, because a source that publishes the same file name
                 // every time gives no version of its own, and "which one is
@@ -648,6 +649,7 @@ mod tests {
                     Placement::new("eu-central", "cell-1"),
                 ),
                 ImageSpec {
+                    from: String::new(),
                     family: family.into(),
                     version: format!("v{n}"),
                     digest: format!("sha256:{d}"),
