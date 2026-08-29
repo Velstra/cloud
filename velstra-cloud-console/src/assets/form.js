@@ -155,6 +155,10 @@ function fieldControl(form, f) {
     setErr(m);
     if (control) control.classList.toggle("bad", !!m);
     form.revalidate(f.key);
+    // Any answered field can change what another picker offers, not only a
+    // reference. The migration mode is the case: it decides which destinations
+    // exist, and until this was here a cold move was offered the live answer.
+    form.refilter(f.key);
   };
 
   const current = form.values[f.key];
@@ -278,9 +282,6 @@ function fieldControl(form, f) {
             form.errs[key](value ? "" : derive.missing(chosen));
           }
         }
-        // A picker filtered by this one now offers a different set, and a
-        // choice made before the filter changed may no longer be in it.
-        form.refilter(f.key);
       });
       box.appendChild(s);
       form.pickers.push({ field: f, select: s });
@@ -964,7 +965,14 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
   };
   form.refilter = (changed) => {
     for (const p of form.pickers) {
-      if (p.field.filterBy === changed) fillPicker(form, p);
+      if (p.field.filterBy === changed) { fillPicker(form, p); continue; }
+      // A picker whose options are *the platform's answer* is asked again on
+      // any other change, because the answer is computed from the whole form.
+      // Migration is the case: `:explainMigration` refuses different things per
+      // mode — a cold move crosses processors a live one cannot — so a picker
+      // filled once, live, greys out every destination a mixed fleet has.
+      const asks = (form.candidates || {})[p.field.key];
+      if (asks && changed !== p.field.key) fillPicker(form, p);
     }
   };
 

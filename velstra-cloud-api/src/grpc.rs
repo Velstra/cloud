@@ -365,7 +365,14 @@ service! {
         ) -> Result<Response<v1::MigrationExplanation>, Status> {
             let who = self.who(&request).await?;
             let name = ResourceName::parse(&request.into_inner().name).map_err(ApiError::from)?;
-            let answer = self.api.explain_migration(&name, &who).await?;
+            // `GetRequest` carries a name and nothing else, so this asks the
+            // live question — the one a picker opens on. A gRPC caller who
+            // wants the cold answer asks over REST with `?mode=Reboot` until
+            // this request grows a field for it.
+            let answer = self
+                .api
+                .explain_migration(&name, velstra_cloud_model::migration::MigrationMode::Live, &who)
+                .await?;
             Ok(Response::new(v1::MigrationExplanation {
                 from: answer["from"].as_str().unwrap_or_default().to_string(),
                 destinations: answer["destinations"]

@@ -1118,7 +1118,7 @@ anything is created:
 
 ```
 GET /api/v1/projects/p1/instances/i1:explainMigration
-{ "from": "node-a",
+{ "from": "node-a", "mode": "Live",
   "destinations": [ { "node": "node-a", "allowed": false, "why": "AlreadyThere",
                       "detail": "it is already on node-a" },
                     { "node": "node-b", "allowed": true,  "why": "", "detail": "" },
@@ -1134,6 +1134,15 @@ create runs, so the two can never disagree. `why` is a stable token
 `DestinationTooSmall`, `VersionsTooFarApart`, `DestinationLacksImage`) and
 `detail` is the sentence; both are empty on a destination that is allowed.
 Asking creates nothing and writes nothing.
+
+**`?mode=`** picks which move is being asked about — `Live` (the default, and
+what a console's picker opens on), `PostCopy` or `Reboot` — and the answer echoes
+it back, because it is only true of one of them. The modes refuse different
+things: a cold move crosses processors and carries a guest holding hardware,
+where a live one can do neither. This used to answer for `Live` and nothing else,
+so a fleet of unlike machines was told its guests could not move at all when
+every one of them could, with a restart. A `mode` that is not one of the three is
+refused rather than read as `Live`.
 
 And so is the state of the cell's processors — the one question that is about
 the fleet rather than about any member of it, which is why it hangs off the

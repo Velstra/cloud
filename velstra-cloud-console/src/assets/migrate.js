@@ -320,16 +320,19 @@ function openMigrate(r) {
       connections: 1,
     },
     locked: ["instance"],
-    candidates: { toNode: () => askCandidates(instances, r, from) },
+    // The form is handed in: the answer depends on the mode chosen above, and
+    // it is asked again whenever that changes.
+    candidates: { toNode: (form) => askCandidates(instances, r, from, form) },
     submitLabel: "Migrate",
   });
 }
 
 /// What the platform says about each node, for this guest.
-async function askCandidates(instances, r, from) {
+async function askCandidates(instances, r, from, form) {
   const nodes = await options("nodes").catch(() => []);
+  const mode = (form && form.values && form.values.mode) || "Live";
   try {
-    return readCandidates(await explainMigration(instances, idOf(r)), nodes);
+    return readCandidates(await explainMigration(instances, idOf(r), mode), nodes);
   } catch (e) {
     // The platform could not answer. Refusing to migrate at all because the
     // explanation is missing would be worse than letting the API refuse the

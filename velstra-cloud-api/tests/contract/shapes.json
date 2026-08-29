@@ -483,7 +483,8 @@
         "why": "string"
       }
     ],
-    "from": "string"
+    "from": "string",
+    "mode": "string"
   },
   "projects/p1/instances/web-1:explainPlacement": {
     "placed": "string",
