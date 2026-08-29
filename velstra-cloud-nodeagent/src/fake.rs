@@ -304,9 +304,11 @@ impl FakeVmm {
     /// resembles, and the check it was meant to satisfy compared the other
     /// spelling.
     pub fn cache_image(&self, digest: &str) {
-        self.machine.lock().unwrap().images.insert(
-            crate::hostfs::stored_as(digest).unwrap_or_else(|| digest.to_string()),
-        );
+        self.machine
+            .lock()
+            .unwrap()
+            .images
+            .insert(crate::hostfs::stored_as(digest).unwrap_or_else(|| digest.to_string()));
     }
 
     /// Where this machine was told to fetch `image` from, if it pulled it.
@@ -480,9 +482,8 @@ impl Vmm for FakeVmm {
         check(&mut m, Fault::Pull, image)?;
         // Filed the way a real backend files it — under the digest — so a test
         // cell answers the same question the same way as a machine does.
-        m.images.insert(
-            crate::hostfs::stored_as(digest).unwrap_or_else(|| digest.to_string()),
-        );
+        m.images
+            .insert(crate::hostfs::stored_as(digest).unwrap_or_else(|| digest.to_string()));
         Ok(())
     }
 
@@ -508,8 +509,8 @@ impl Vmm for FakeVmm {
         // later.
         // By the name the bytes are filed under, which is what `request.image`
         // now carries: an image object may be called anything.
-        let want = crate::hostfs::stored_as(&request.image)
-            .unwrap_or_else(|| request.image.clone());
+        let want =
+            crate::hostfs::stored_as(&request.image).unwrap_or_else(|| request.image.clone());
         if !m.images.contains(&want) {
             return Err(HostError::failed(format!(
                 "no verified copy of {} on this node",
@@ -574,7 +575,13 @@ impl Vmm for FakeVmm {
         Ok(())
     }
 
-    async fn open_volume(&self, _instance: &str, volume: &str, _read_only: bool) -> Result<String> {
+    async fn open_volume(
+        &self,
+        _instance: &str,
+        volume: &str,
+        _at: &str,
+        _read_only: bool,
+    ) -> Result<String> {
         let mut m = self.machine.lock().unwrap();
         check(&mut m, Fault::OpenVolume, volume)?;
         // Device names are handed out in open order, which is what a guest
@@ -612,8 +619,8 @@ impl Vmm for FakeVmm {
         // of a guest it cannot run.
         // By the name the bytes are filed under, which is what `request.image`
         // now carries: an image object may be called anything.
-        let want = crate::hostfs::stored_as(&request.image)
-            .unwrap_or_else(|| request.image.clone());
+        let want =
+            crate::hostfs::stored_as(&request.image).unwrap_or_else(|| request.image.clone());
         if !m.images.contains(&want) {
             return Err(HostError::failed(format!(
                 "no verified copy of {} on this node",
@@ -1163,11 +1170,21 @@ mod tests {
         // one volume is a guest with two views of the same bytes.
         let vmm = FakeVmm::new();
         let first = vmm
-            .open_volume("i1", "projects/p1/volumes/v1", false)
+            .open_volume(
+                "i1",
+                "projects/p1/volumes/v1",
+                "/fake/projects~p1~volumes~v1",
+                false,
+            )
             .await
             .unwrap();
         let again = vmm
-            .open_volume("i1", "projects/p1/volumes/v1", false)
+            .open_volume(
+                "i1",
+                "projects/p1/volumes/v1",
+                "/fake/projects~p1~volumes~v1",
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(first, again);

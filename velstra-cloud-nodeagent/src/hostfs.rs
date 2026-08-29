@@ -260,6 +260,42 @@ pub fn unslug(slug: &str) -> String {
     slug.replace('~', "/")
 }
 
+/// A resource name as a **QMP node-name**.
+///
+/// A third spelling, for the same reason there is a second one: QEMU's block
+/// layer accepts only `[A-Za-z0-9\-._]` in a `node-name`, and [`slug`] produces
+/// `~`. Hot-plugging a disk answered
+///
+/// ```text
+/// Invalid node-name: 'projects~p1~volumes~data'
+/// ```
+///
+/// and the attachment sat at `attached: false` with that sentence on it. Found
+/// live, on the first attach that got far enough to be refused for a reason
+/// other than a path nobody wrote.
+///
+/// `_` like the unit spelling, and for the identical reason: it is in the
+/// allowed set, so nothing is escaped and the name still says what it is.
+pub fn qmp_id(name: &str) -> String {
+    name.replace(['/', '~', ':'], "_")
+}
+
+/// The resource name a QMP id was made for, if it is one of ours.
+///
+/// `None` for anything that is not shaped like a resource name — the root disk,
+/// a CD, whatever else a guest has attached. Guessing there would have the node
+/// report a volume the cell has never heard of as open.
+///
+/// Lossy in principle: `_` in the original name is indistinguishable from a
+/// separator. Resource ids do not carry one — see `ResourceName`'s own rules —
+/// so in practice the round trip holds, and a name that broke it would be
+/// reported as a volume nobody named rather than as the wrong volume.
+pub fn from_qmp_id(id: &str) -> Option<String> {
+    let name = id.replace('_', "/");
+    let parsed = velstra_cloud_model::meta::ResourceName::parse(&name).ok()?;
+    (parsed.collection() == "volumes").then_some(name)
+}
+
 // ---- images --------------------------------------------------------------
 
 /// The sha256 an image name commits to, if it carries one.
@@ -333,12 +369,7 @@ pub fn stored_as(digest: &str) -> Option<String> {
 ///
 /// Nothing is fetched when a verified copy is already published — an image is
 /// content-addressed, so "already here" is a complete answer.
-pub async fn fetch_image(
-    layout: &Layout,
-    image: &str,
-    digest: &str,
-    source: &str,
-) -> Result<()> {
+pub async fn fetch_image(layout: &Layout, image: &str, digest: &str, source: &str) -> Result<()> {
     // Refuse an image with no usable digest before spending a download on it:
     // publish would refuse it afterwards anyway, and saying so first costs the
     // operator a wait rather than a gigabyte.
@@ -1118,5 +1149,57 @@ mod tests {
     fn a_url_gives_up_its_port() {
         assert_eq!(port_of("tcp:10.0.0.2:4901"), Some(4901));
         assert_eq!(port_of("unix:/tmp/sock"), None);
+    }
+}
+
+#[cfg(test)]
+mod names_a_hypervisor_will_take {
+    use super::*;
+
+    #[test]
+    fn a_qmp_node_name_carries_nothing_qemu_refuses() {
+        // QEMU's block layer takes `[A-Za-z0-9\-._]` and nothing else. Handed a
+        // slug it answered `Invalid node-name: 'projects~p1~volumes~data'`, and
+        // the attachment carried that sentence instead of a disk.
+        let id = qmp_id("projects/p1/volumes/data");
+        assert_eq!(id, "projects_p1_volumes_data");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')),
+            "{id} carries something QEMU will refuse"
+        );
+    }
+
+    #[test]
+    fn a_slug_that_has_been_through_the_path_layout_is_taken_too() {
+        assert_eq!(
+            qmp_id("projects~p1~volumes~data"),
+            "projects_p1_volumes_data"
+        );
+    }
+
+    #[test]
+    fn the_round_trip_holds_for_the_names_this_platform_makes() {
+        // It has to: the node learns which volumes a guest has open by reading
+        // these back off `query-block`. A round trip that did not hold would
+        // leave `attached` false for ever, which is how the platform ended up
+        // asking QEMU to plug in a disk it already had — `Duplicate nodes with
+        // node-name='…'`, once a pass, while the guest ran perfectly.
+        for name in [
+            "projects/p1/volumes/data",
+            "projects/kunde-3/volumes/db-1",
+            "projects/p1/volumes/volume-e0fc2ec6",
+        ] {
+            assert_eq!(from_qmp_id(&qmp_id(name)).as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn a_device_that_is_not_ours_is_not_claimed_as_a_volume() {
+        // A guest has a root disk and may have a CD. Reading either back as a
+        // volume would have the node report one the cell never made.
+        for id in ["root", "virtio-disk0", "ide0-cd0", ""] {
+            assert_eq!(from_qmp_id(id), None, "{id} was read as a volume");
+        }
     }
 }

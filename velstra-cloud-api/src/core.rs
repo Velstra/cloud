@@ -1155,7 +1155,22 @@ impl Api {
         // machines" by a cell that has one. "You may not look" and "there is
         // nothing there" lead to different next steps, and only one of them is
         // true.
-        if !self.is_operator(who) && velstra_cloud_model::authz::belongs_to_the_cell(kind) {
+        // A node agent is not a customer, and the refusal below says something
+        // false to it: "there may be plenty, and they are not yours" — some of
+        // them are. A machine in the machine room reads the machine room, gated
+        // per object like anybody else.
+        //
+        // Found on a live cell, in the node agent's own log, four times a second
+        // for as long as the service ran: the agent looks itself up in `/nodes`,
+        // and this refusal cut it off from its own object. The refusal was
+        // written for the customer's seat and applied to every seat that is not
+        // an operator's, which is one seat too many.
+        let a_machine = crate::sessions::agent_node(who).is_some();
+        let its_own_pass = a_machine && velstra_cloud_model::authz::a_node_reads_the_cells(kind);
+        if !self.is_operator(who)
+            && !its_own_pass
+            && velstra_cloud_model::authz::belongs_to_the_cell(kind)
+        {
             return Err(ApiError::new(
                 Code::PermissionDenied,
                 format!(
@@ -1164,7 +1179,7 @@ impl Api {
                 ),
             ));
         }
-        let gate = if self.is_operator(who) {
+        let gate = if self.is_operator(who) || its_own_pass {
             Gate::Everything
         } else {
             Gate::Readable(who.clone())

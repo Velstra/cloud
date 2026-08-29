@@ -1867,11 +1867,22 @@ impl Agent {
     ) -> Result<(), String> {
         let instance = attachment.spec.instance.as_str();
         let result = match action {
-            Action::OpenVolume { volume, read_only } => self
-                .vmm
-                .open_volume(instance, volume, *read_only)
-                .await
-                .map(|_| ()),
+            Action::OpenVolume { volume, read_only } => {
+                // From the attachment, because a node is not told about volumes
+                // — the pool's own answer, mirrored here by a controller. Empty
+                // means the pool has not placed it yet, and waiting is the
+                // honest thing: the version that guessed built a path out of the
+                // guest's directory and failed for ever with `No such file`.
+                if attachment.spec.at.is_empty() {
+                    return Err(format!(
+                        "{volume} has not been placed by its pool yet, so there is nothing to open"
+                    ));
+                }
+                self.vmm
+                    .open_volume(instance, volume, &attachment.spec.at, *read_only)
+                    .await
+                    .map(|_| ())
+            }
             Action::CloseVolume { volume } => self.vmm.close_volume(instance, volume).await,
             other => Err(crate::host::HostError::failed(format!(
                 "{other:?} is not an attachment action"

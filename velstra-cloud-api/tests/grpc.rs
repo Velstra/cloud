@@ -401,6 +401,7 @@ async fn a_derived_field_is_derived_on_both_transports() {
                     volume: "projects/p1/volumes/v1".into(),
                     instance: "projects/p1/instances/i1".into(),
                     node: String::new(),
+                    at: String::new(),
                     read_only: false,
                 }),
                 status: None,

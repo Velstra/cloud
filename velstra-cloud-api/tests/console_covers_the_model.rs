@@ -124,6 +124,7 @@ mod complete {
             desired_state: DesiredState::Running,
             ports: vec!["projects/p1/ports/pt1".into()],
             networks: Vec::new(),
+            volumes: Vec::new(),
             ssh_keys: vec!["ssh-ed25519 AAAA".into()],
             user_data: Some("#cloud-config".into()),
             node: Some("node-a".into()),
@@ -834,6 +835,7 @@ mod settled {
             provisioned: true,
             actual_size_gib: 10,
             pool: Some("pool-a".into()),
+                    at: None,
         }
     }
 

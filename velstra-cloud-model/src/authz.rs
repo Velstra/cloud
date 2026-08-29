@@ -390,6 +390,23 @@ pub fn belongs_to_the_cell(kind: &str) -> bool {
     )
 }
 
+/// Which of the cell's own collections a node agent reads whole.
+///
+/// Two, and each for a stated reason rather than because a node is trusted in
+/// general. A node agent is inside the machine room, not above it: it has no
+/// business reading the cell's accounts, and `users` is on the list above.
+///
+/// - `nodes`, because a node has to find itself, and because the Ceph pass is
+///   built on every node computing the same answer over the same facts. Nothing
+///   hands a node its step; it works out whether the step is its own. A node
+///   that can see only itself computes a different answer from everybody else
+///   and takes a step nobody else expects — or, more likely, none at all. On a
+///   single-node cell that is invisible, which is why it survived.
+/// - `ceph-clusters`, for the same pass, which is meaningless without them.
+pub fn a_node_reads_the_cells(kind: &str) -> bool {
+    matches!(kind, "nodes" | "ceph-clusters")
+}
+
 #[cfg(test)]
 mod what_the_cell_keeps {
     use super::*;
@@ -400,6 +417,17 @@ mod what_the_cell_keeps {
         // which is true and useful.
         for kind in ["projects", "images", "instances", "volumes", "audit", "usage"] {
             assert!(!belongs_to_the_cell(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_node_reads_what_its_own_passes_need_and_no_more() {
+        for kind in ["nodes", "ceph-clusters"] {
+            assert!(a_node_reads_the_cells(kind), "{kind}");
+        }
+        // A node agent is inside the machine room, not above it.
+        for kind in ["users", "backup-targets", "image-sources", "projects"] {
+            assert!(!a_node_reads_the_cells(kind), "{kind}");
         }
     }
 

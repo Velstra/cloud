@@ -24,11 +24,66 @@ use crate::{Result, runner::Reconciler};
 
 pub struct AttachmentController {
     attachments: TypedStore<AttachmentSpec, AttachmentStatus>,
+    /// Read for one field — `status.at`, where the pool put the bytes — which is
+    /// mirrored onto the attachment because a node is not told about volumes.
+    volumes: TypedStore<
+        velstra_cloud_model::resources::VolumeSpec,
+        velstra_cloud_model::resources::VolumeStatus,
+    >,
 }
 
 impl AttachmentController {
-    pub fn new(attachments: TypedStore<AttachmentSpec, AttachmentStatus>) -> Self {
-        Self { attachments }
+    pub fn new(
+        attachments: TypedStore<AttachmentSpec, AttachmentStatus>,
+        volumes: TypedStore<
+            velstra_cloud_model::resources::VolumeSpec,
+            velstra_cloud_model::resources::VolumeStatus,
+        >,
+    ) -> Self {
+        Self {
+            attachments,
+            volumes,
+        }
+    }
+
+    /// Copy `volume.status.at` onto the attachment, when it has changed.
+    ///
+    /// Returns whether it wrote, so the finalizer dance below is not run on a
+    /// pass that has already written.
+    ///
+    /// Why this and not a read on the node: a node agent is told about the
+    /// collections it is assigned, and volumes are a *pool's*. Widening that so
+    /// a node could read every project's volumes to learn one string would be a
+    /// large hole for a small fact. The fact comes to the node instead, on an
+    /// object it already holds — the same move the node field itself makes.
+    async fn mirror_the_place(&self, attachment: &Attachment) -> Result<bool> {
+        if attachment.meta.is_deleting() {
+            return Ok(false);
+        }
+        let at = self
+            .volumes
+            .get(&attachment.spec.volume)
+            .await?
+            .and_then(|v| v.status.at)
+            .unwrap_or_default();
+        // Only forward: a volume that stops reporting a place has not moved, and
+        // clearing it under a guest with the disk open would make the next pass
+        // refuse to close what it can no longer name.
+        if at.is_empty() || at == attachment.spec.at {
+            return Ok(false);
+        }
+        let mut next = attachment.clone();
+        next.spec.at = at;
+        // A spec change moves the generation — the store refuses one that does
+        // not, and it is right to: an observer comparing `observedGeneration`
+        // against a spec that changed underneath it would report on a shape it
+        // never saw. The port controller bumps it for `spec.node` for the same
+        // reason.
+        next.meta.generation += 1;
+        self.attachments
+            .update(&next, &Writer::controller("attachment"))
+            .await?;
+        Ok(true)
     }
 }
 
@@ -44,6 +99,10 @@ impl Reconciler for AttachmentController {
         let Some(attachment) = object else {
             return Ok(());
         };
+
+        if self.mirror_the_place(attachment).await? {
+            return Ok(());
+        }
 
         match finalizer_step(&attachment.meta, NODE_RELEASE_FINALIZER) {
             FinalizerStep::Add => {
@@ -129,7 +188,10 @@ mod tests {
         let raw = Arc::new(MemoryStore::new());
         let store: TypedStore<AttachmentSpec, AttachmentStatus> =
             TypedStore::new(raw.clone(), "cell-1", "attachments");
-        let controller = AttachmentController::new(store.clone());
+        let controller = AttachmentController::new(
+            store.clone(),
+            TypedStore::new(raw.clone(), "cell-1", "volumes"),
+        );
         let a = Resource::new(
             Meta::new(
                 ResourceName::parse("projects/p1/attachments/a1").unwrap(),
@@ -139,6 +201,7 @@ mod tests {
                 volume: "projects/p1/volumes/v1".into(),
                 instance: "projects/p1/instances/i1".into(),
                 node: "node-a".into(),
+                at: String::new(),
                 read_only: false,
             },
             AttachmentStatus::default(),
@@ -269,8 +332,11 @@ mod release_tests {
     ) {
         let raw: Arc<dyn Store> = Arc::new(MemoryStore::new());
         let store: TypedStore<AttachmentSpec, AttachmentStatus> =
-            TypedStore::new(raw, "cell-1", "attachments");
-        let controller = AttachmentController::new(store.clone());
+            TypedStore::new(raw.clone(), "cell-1", "attachments");
+        let controller = AttachmentController::new(
+            store.clone(),
+            TypedStore::new(raw.clone(), "cell-1", "volumes"),
+        );
         store
             .create(
                 &Resource::new(
@@ -282,6 +348,7 @@ mod release_tests {
                         volume: "projects/p1/volumes/v1".into(),
                         instance: "projects/p1/instances/i1".into(),
                         node: "node-a".into(),
+                        at: String::new(),
                         read_only: false,
                     },
                     AttachmentStatus::default(),
@@ -359,6 +426,171 @@ mod release_tests {
         assert!(
             store.get(NAME).await.unwrap().is_some(),
             "a silent node was taken for a node that had let go"
+        );
+    }
+}
+
+#[cfg(test)]
+mod telling_the_node_where_the_bytes_are {
+    use std::sync::Arc;
+
+    use velstra_cloud_model::{
+        meta::{Meta, Placement, ResourceName},
+        resources::{Volume, VolumeSpec, VolumeStatus},
+    };
+    use velstra_cloud_store::{MemoryStore, Store};
+
+    use super::*;
+
+    const ATTACHMENT: &str = "projects/p1/attachments/db-data";
+    const VOLUME: &str = "projects/p1/volumes/data";
+    const PLACE: &str = "/srv/velstra/pool/projects~p1~volumes~data.qcow2";
+
+    fn meta(name: &str) -> Meta {
+        Meta::new(
+            ResourceName::parse(name).unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        )
+    }
+
+    async fn cell() -> (
+        AttachmentController,
+        TypedStore<AttachmentSpec, AttachmentStatus>,
+        TypedStore<VolumeSpec, VolumeStatus>,
+    ) {
+        let raw: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let attachments = TypedStore::new(raw.clone(), "cell-1", "attachments");
+        let volumes: TypedStore<VolumeSpec, VolumeStatus> =
+            TypedStore::new(raw.clone(), "cell-1", "volumes");
+        (
+            AttachmentController::new(attachments.clone(), volumes.clone()),
+            attachments,
+            volumes,
+        )
+    }
+
+    async fn an_attachment(store: &TypedStore<AttachmentSpec, AttachmentStatus>) -> Attachment {
+        let object = velstra_cloud_model::Resource::new(
+            meta(ATTACHMENT),
+            AttachmentSpec {
+                volume: VOLUME.into(),
+                instance: "projects/p1/instances/db".into(),
+                node: "nodes/n1".into(),
+                at: String::new(),
+                read_only: false,
+            },
+            AttachmentStatus::default(),
+        );
+        store
+            .create(&object, &Writer::controller("test"))
+            .await
+            .unwrap();
+        // Read back: the stored revision is what a later update is checked
+        // against, and the object handed to `create` still carries zero.
+        //
+        // The finalizer goes on here too, so the mirror below is exercised on
+        // the same shape a live pass sees — the guard runs first and returns,
+        // and only the pass after it reaches the place.
+        let stored = store.get(ATTACHMENT).await.unwrap().unwrap();
+        controller_free_finalizer(store, &stored).await
+    }
+
+    /// Put the release guard on, as the controller's first pass does, and hand
+    /// back what is stored afterwards.
+    async fn controller_free_finalizer(
+        store: &TypedStore<AttachmentSpec, AttachmentStatus>,
+        attachment: &Attachment,
+    ) -> Attachment {
+        let mut next = attachment.clone();
+        next.meta
+            .add_finalizer(velstra_cloud_model::resources::NODE_RELEASE_FINALIZER);
+        store
+            .update(&next, &Writer::controller("test"))
+            .await
+            .unwrap();
+        store.get(ATTACHMENT).await.unwrap().unwrap()
+    }
+
+    async fn a_placed_volume(store: &TypedStore<VolumeSpec, VolumeStatus>) {
+        let object: Volume = velstra_cloud_model::Resource::new(
+            meta(VOLUME),
+            VolumeSpec {
+                size_gib: 2,
+                ..Default::default()
+            },
+            VolumeStatus {
+                provisioned: true,
+                at: Some(PLACE.into()),
+                ..Default::default()
+            },
+        );
+        store
+            .create(&object, &Writer::controller("test"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_place_reaches_the_node_on_the_object_it_already_holds() {
+        // A node is not told about volumes — those are a pool's, and
+        // `assignment::is_pooled_collection` says so deliberately. So the one
+        // field it needs comes to it here.
+        //
+        // Without this the node built a path out of the guest's directory,
+        // `…/instances/<guest>/<volume>`, which nothing ever writes: every
+        // attach failed with `No such file or directory` and the attachment sat
+        // at `attached: false` for as long as the cell ran.
+        let (controller, attachments, volumes) = cell().await;
+        let attachment = an_attachment(&attachments).await;
+        a_placed_volume(&volumes).await;
+
+        controller
+            .reconcile(ATTACHMENT, Some(&attachment))
+            .await
+            .unwrap();
+
+        let after = attachments.get(ATTACHMENT).await.unwrap().unwrap();
+        assert_eq!(after.spec.at, PLACE, "the node was not told where to look");
+        assert!(
+            after.meta.generation > attachment.meta.generation,
+            "a spec change that does not move the generation is refused by the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_volume_the_pool_has_not_placed_yet_writes_nothing() {
+        // Level-triggered: the ordinary pass writes nothing at all, which is
+        // what keeps a settled cell settled — and an empty place written over
+        // and over would be a generation bump per pass, for ever.
+        let (controller, attachments, _volumes) = cell().await;
+        let attachment = an_attachment(&attachments).await;
+
+        controller
+            .reconcile(ATTACHMENT, Some(&attachment))
+            .await
+            .unwrap();
+
+        let after = attachments.get(ATTACHMENT).await.unwrap().unwrap();
+        assert!(after.spec.at.is_empty());
+        assert_eq!(after.meta.generation, attachment.meta.generation);
+    }
+
+    #[tokio::test]
+    async fn a_settled_attachment_is_left_alone() {
+        let (controller, attachments, volumes) = cell().await;
+        let attachment = an_attachment(&attachments).await;
+        a_placed_volume(&volumes).await;
+        controller
+            .reconcile(ATTACHMENT, Some(&attachment))
+            .await
+            .unwrap();
+        let once = attachments.get(ATTACHMENT).await.unwrap().unwrap();
+
+        controller.reconcile(ATTACHMENT, Some(&once)).await.unwrap();
+        let twice = attachments.get(ATTACHMENT).await.unwrap().unwrap();
+        assert_eq!(
+            twice.meta.generation, once.meta.generation,
+            "a settled pass wrote anyway"
         );
     }
 }

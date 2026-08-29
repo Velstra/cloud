@@ -284,7 +284,21 @@ pub trait Vmm: Send + Sync + 'static {
     async fn delete(&self, instance: &str) -> Result<()>;
 
     /// Open a volume for a guest and return the device the guest sees.
-    async fn open_volume(&self, instance: &str, volume: &str, read_only: bool) -> Result<String>;
+    /// Plug a volume into a running guest.
+    ///
+    /// `at` is where the bytes are — the pool's own answer, carried on the
+    /// volume's status. It is a parameter rather than something derived here
+    /// because a hypervisor has no idea whether a volume is a file, a logical
+    /// volume or an RBD image, and the version that guessed built
+    /// `…/instances/<guest>/<volume>`: a path nothing ever writes, so every
+    /// attach failed with `No such file or directory`.
+    async fn open_volume(
+        &self,
+        instance: &str,
+        volume: &str,
+        at: &str,
+        read_only: bool,
+    ) -> Result<String>;
 
     async fn close_volume(&self, instance: &str, volume: &str) -> Result<()>;
 

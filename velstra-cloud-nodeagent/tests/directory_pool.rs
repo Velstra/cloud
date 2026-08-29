@@ -273,3 +273,95 @@ async fn a_volume_that_asks_to_be_encrypted_is_refused_rather_than_made_in_plain
         "a plaintext volume was left behind under the name of an encrypted one"
     );
 }
+
+#[tokio::test]
+async fn one_unreadable_file_does_not_take_the_whole_pool_down() {
+    // Found live, within minutes of the first disk attach that worked. A guest
+    // holding a volume open made `qemu-img info` on that file answer
+    //
+    //   Failed to get shared "write" lock
+    //   Is another process using the image […]?
+    //
+    // and `observe` returned `Err` for the pool as a whole: "could not read this
+    // pool; doing nothing this pass", every thirty seconds, for ever. Every
+    // other volume in the pool stopped being provisioned — so attaching a disk
+    // was a way to take storage down for the whole cell.
+    //
+    // Two things were wrong and each alone was enough. The lock is fixed at the
+    // call (`qemu-img info -U`); this is the other half: a file this pool cannot
+    // measure is one volume's size unknown, not a pool that cannot be read.
+    needs_qemu_img!();
+    let dir = Dir::new("unreadable");
+    let pool = dir.pool();
+
+    pool.provision(VOLUME, 2, Origin::Blank, None)
+        .await
+        .expect("provisioning a blank volume");
+    // A file this process cannot open at all — the same shape, from `observe`'s
+    // seat, as one it is refused a lock on. Junk contents would not do: to
+    // `qemu-img info` nineteen bytes of text are a perfectly good raw image.
+    let kaputt = dir.0.join("pool").join("projects~p1~volumes~kaputt.qcow2");
+    std::fs::write(&kaputt, b"this is not a qcow2").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&kaputt, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    if std::fs::File::open(&kaputt).is_ok() {
+        // Running as root, where no file is unreadable. The half this test is
+        // about cannot be staged, and passing it silently would be a lie.
+        eprintln!("skipped: everything is readable as root");
+        return;
+    }
+
+    let seen = pool
+        .observe()
+        .await
+        .expect("one bad file made the whole pool unreadable");
+    assert_eq!(
+        seen.volumes.get(VOLUME),
+        Some(&2),
+        "the volumes this pool can measure were not reported"
+    );
+    assert!(
+        !seen.volumes.contains_key("projects/p1/volumes/kaputt"),
+        "a file that could not be measured was reported with a made-up size"
+    );
+}
+
+#[tokio::test]
+async fn a_volume_someone_has_open_is_still_measurable() {
+    // The lock half, with a real lock: `qemu-img` itself takes an exclusive one
+    // while it writes, and `info` without `-U` asks for a write lock even though
+    // it only reads. Two `info` calls at once is enough to show it.
+    needs_qemu_img!();
+    let dir = Dir::new("inuse");
+    let pool = dir.pool();
+    pool.provision(VOLUME, 1, Origin::Blank, None)
+        .await
+        .unwrap();
+
+    let path = dir.0.join("pool").join("projects~p1~volumes~data-1.qcow2");
+    // Hold an exclusive lock the way a running guest does.
+    let held = std::process::Command::new("qemu-img")
+        .args(["bench", "-c", "1000000", "-w", path.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut held) = held else {
+        eprintln!("skipped: qemu-img bench unavailable");
+        return;
+    };
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let seen = pool.observe().await;
+    let _ = held.kill();
+    let _ = held.wait();
+
+    let seen = seen.expect("a volume in use made the whole pool unreadable");
+    assert_eq!(
+        seen.volumes.get(VOLUME),
+        Some(&1),
+        "a volume somebody has open was not measured"
+    );
+}

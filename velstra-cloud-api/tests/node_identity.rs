@@ -304,3 +304,68 @@ async fn a_deleted_node_loses_its_token() {
         "a deleted node's token still authenticates"
     );
 }
+
+#[tokio::test]
+async fn a_node_may_read_the_machine_room_it_is_a_machine_in() {
+    // Found in the node agent's own log on a live cell, four times a second for
+    // as long as the service ran:
+    //
+    //   could not read this node's own object … 403 PERMISSION_DENIED
+    //   "nodes are the cell's own, and reading them is a cell operator's.
+    //    This is not an empty list: there may be plenty, and they are not yours."
+    //
+    // Every word of that is right for a customer and wrong for a node. The
+    // refusal was written for the customer's seat and applied to every seat that
+    // is not an operator's — which is one seat too many, and the extra one is
+    // the agent that keeps the cell running.
+    let (api, _store) = cell();
+    let token = register_node(&api, "node-a").await;
+    let node = api
+        .verifier()
+        .verify(&token)
+        .await
+        .expect("the node's token authenticates");
+
+    // The read it actually makes: its own object, by name.
+    api.get(&name("nodes/node-a"), &node)
+        .await
+        .expect("a node reads the object it reports on");
+
+    // And the list the Ceph pass makes, which no longer meets the customer's
+    // refusal. What matters is that it holds the *other* machines: nothing hands
+    // a node its Ceph step — it works out whether the step is its own by
+    // computing the same answer everybody else computes, over the same facts. A
+    // node that can see only itself computes a different answer and takes a step
+    // nobody expects, or none at all. Invisible on a single-node cell, which is
+    // how it survived this long.
+    register_node(&api, "node-b").await;
+    let listed = api
+        .list_for("", "nodes", &velstra_cloud_api::Filter::none(), &node)
+        .await
+        .expect("a node reading the machine room it is a machine in");
+    let ids: Vec<String> = listed
+        .items
+        .iter()
+        .filter_map(|n| n["meta"]["name"]["segments"][1].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["node-a", "node-b"],
+        "a node could not see the machines it has to agree with"
+    );
+
+    // The customer's seat is unchanged — this is not a hole, it is a seat.
+    let refusal = api
+        .list_for("", "nodes", &velstra_cloud_api::Filter::none(), &who("a-tenant"))
+        .await
+        .expect_err("a tenant still may not read the machine room");
+    assert_eq!(refusal.code, Code::PermissionDenied);
+
+    // And a node is inside the machine room, not above it: the cell's accounts
+    // are none of its business.
+    let refusal = api
+        .list_for("", "users", &velstra_cloud_api::Filter::none(), &node)
+        .await
+        .expect_err("a node read the cell's accounts");
+    assert_eq!(refusal.code, Code::PermissionDenied);
+}

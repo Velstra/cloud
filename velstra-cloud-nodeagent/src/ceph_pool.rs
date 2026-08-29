@@ -366,6 +366,12 @@ impl CephPool {
 
 #[async_trait::async_trait]
 impl Storage for CephPool {
+    /// `rbd:<pool>/<image>`, which is what QEMU's rbd driver takes — not a
+    /// path: nothing on this machine's filesystem is the volume.
+    fn at(&self, volume: &str) -> Option<String> {
+        Some(format!("rbd:{}/{}", self.config.pool, rbd_name(volume)))
+    }
+
     async fn observe(&self) -> Result<PoolState> {
         let listing = self
             .rbd(&["ls", "--long", "--format", "json", &self.config.pool])

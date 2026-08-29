@@ -118,7 +118,10 @@ async fn main() {
     ));
 
     let attachments: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "attachments");
-    let attachment = Arc::new(AttachmentController::new(attachments.clone()));
+    let attachment = Arc::new(AttachmentController::new(
+        attachments.clone(),
+        TypedStore::new(store.clone(), CELL, "volumes"),
+    ));
     tokio::spawn(velstra_cloud_controller::run(
         attachment,
         attachments,
@@ -642,6 +645,7 @@ async fn attach_once_placed(store: Arc<dyn Store>) {
             volume: "projects/p1/volumes/data-1".into(),
             instance: "projects/p1/instances/web-1".into(),
             node,
+            at: String::new(),
             read_only: false,
         },
         AttachmentStatus::default(),

@@ -668,6 +668,11 @@ message InstanceSpec {
   // in the model and wrong in a form. Naming both this and `ports` is refused
   // rather than merged.
   repeated string networks = 16;
+  // Volumes this guest should have attached. Kept, not consumed: a disk list is
+  // a standing statement about the machine, and taking an entry out is how you
+  // detach. The attachments are made by a controller, because an attachment
+  // names the node holding the guest and at create time there is none.
+  repeated string volumes = 17;
 }
 
 message InstanceStatus {
@@ -788,6 +793,11 @@ message VolumeStatus {
   // The pool that claimed this volume and reports on it. A volume lives in a
   // pool, not on a node, so the pool is the party with something to say.
   optional string pool = 5;
+  // Where the bytes are, in the words the machine opening them needs: a path
+  // for a directory or LVM pool, an `rbd:` name for Ceph. Written by the pool,
+  // because a node has no idea whether a volume is a file, a logical volume or
+  // an RBD image, and the version that guessed built a path nothing writes.
+  optional string at = 6;
 }
 
 message Volume {
@@ -905,6 +915,11 @@ message AttachmentSpec {
   // filter is a single field.
   string node = 3;
   bool read_only = 4;
+  // Where the volume's bytes are, mirrored from `volume.status.at`. Derived, and
+  // here rather than read from the volume because a node is not told about
+  // volumes — those belong to a pool. The node needs one field of one volume, so
+  // the field comes to it on the object it already holds.
+  string at = 5;
 }
 
 message AttachmentStatus {

@@ -228,6 +228,19 @@ pub trait Storage: Send + Sync {
         source: Origin<'_>,
         encryption_key: Option<&str>,
     ) -> Result<()>;
+    /// Where this backend keeps a volume's bytes, in the words the machine
+    /// opening them needs: a path for a directory or LVM pool, an `rbd:` name
+    /// for Ceph.
+    ///
+    /// `None` when the volume is not this pool's, or when this backend has
+    /// nothing a hypervisor could open directly.
+    ///
+    /// It is asked of the backend rather than derived from the volume's name
+    /// because deriving it means every backend agreeing on a layout none of them
+    /// share — which is precisely the mistake that left attaching a disk broken:
+    /// the node built `…/instances/<guest>/<volume>`, a path nothing ever writes.
+    fn at(&self, volume: &str) -> Option<String>;
+
     async fn grow(&self, volume: &str, to_gib: u64) -> Result<()>;
     async fn destroy(&self, volume: &str) -> Result<()>;
 
@@ -502,6 +515,11 @@ impl PoolAgent {
 
         next.status.provisioned = after.exists;
         next.status.actual_size_gib = after.gib;
+        // Where the bytes are, for whoever has to open them. Only once they
+        // exist: a path to a volume that is not provisioned yet is a promise
+        // this pool cannot keep, and a node acting on it fails in the confusing
+        // way rather than waiting in the obvious one.
+        next.status.at = after.exists.then(|| self.storage.at(&name)).flatten();
         next.status.observed_generation = stored.meta.generation;
         set_condition(
             &mut next.status.conditions,
@@ -1385,6 +1403,10 @@ impl FakePool {
 
 #[async_trait::async_trait]
 impl Storage for FakePool {
+    fn at(&self, volume: &str) -> Option<String> {
+        Some(format!("/fake/{}", crate::hostfs::slug(volume)))
+    }
+
     async fn observe(&self) -> Result<PoolState> {
         self.fault("observe", "")?;
         let inner = self.inner.lock().unwrap();

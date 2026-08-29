@@ -17,8 +17,8 @@ use clap::{Parser, ValueEnum};
 use velstra_cloud_nodeagent::{
     api_cell::ApiCell,
     ceph_pool::{CephConfig, CephPool},
-    lvm_pool::{LvmConfig, LvmPool},
     directory_pool::DirectoryPool,
+    lvm_pool::{LvmConfig, LvmPool},
     pool::{FakePool, PoolAgent, PoolConfig, Storage},
 };
 use velstra_cloud_store::{EtcdStore, MemoryStore, Store};
@@ -100,7 +100,11 @@ struct Args {
     /// Separate from `--ceph-pool` on purpose: an image is written once and read
     /// for years, a volume is written constantly, and the two want different
     /// replication, placement and quota. Clones across pools cost nothing.
-    #[arg(long, env = "VELSTRA_CEPH_IMAGE_POOL", default_value = "velstra-images")]
+    #[arg(
+        long,
+        env = "VELSTRA_CEPH_IMAGE_POOL",
+        default_value = "velstra-images"
+    )]
     ceph_image_pool: String,
 
     /// The Ceph client to act as. Its keyring has to be where `rbd` looks —
@@ -217,10 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // that does not know which volume group it is for cannot be
                 // pointed at one later without a restart, and a machine usually
                 // has more than one.
-                return Err("--lvm-group names the volume group this pool makes its volumes in, \
+                return Err(
+                    "--lvm-group names the volume group this pool makes its volumes in, \
                             and the lvm backend has no default for it: a machine may have several \
                             and guessing would put a tenant's bytes in whichever came first"
-                    .into());
+                        .into(),
+                );
             };
             let mut config = LvmConfig::new(&group);
             config.thin_pool = args.lvm_thin_pool.clone();

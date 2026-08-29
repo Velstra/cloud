@@ -248,6 +248,7 @@ fn every_resource_survives_its_own_wire() {
             desired_state: DesiredState::Running,
             ports: vec!["projects/p1/ports/p1".into()],
             networks: Vec::new(),
+            volumes: Vec::new(),
             ssh_keys: vec!["ssh-ed25519 …".into()],
             user_data: Some("#cloud-config".into()),
             node: Some("hv-1".into()),

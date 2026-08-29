@@ -32,7 +32,8 @@ pub const REGION: &str = "eu-central";
 pub const CELL: &str = "cell-1";
 pub const IMAGE: &str = "projects/p1/images/sha256-abc";
 /// What the node files that image's bytes under — its digest, not its name.
-pub const IMAGE_STORED: &str = "sha256-a563f72f58d859571895f7b2777cada5baf5c39c00560a285ad546a899833913";
+pub const IMAGE_STORED: &str =
+    "sha256-a563f72f58d859571895f7b2777cada5baf5c39c00560a285ad546a899833913";
 
 pub fn store() -> Arc<dyn Store> {
     Arc::new(MemoryStore::new())
@@ -251,7 +252,8 @@ pub async fn register_image(store: &Arc<dyn Store>, name: &str) {
             source_instance: None,
             // A real-length digest: the bytes are filed on a node under
             // `sha256-<64 hex>`, so a short one names nothing.
-            digest: "sha256:a563f72f58d859571895f7b2777cada5baf5c39c00560a285ad546a899833913".into(),
+            digest: "sha256:a563f72f58d859571895f7b2777cada5baf5c39c00560a285ad546a899833913"
+                .into(),
             format: ImageFormat::Raw,
             size_bytes: 1024,
             source_url: "file:///var/lib/velstra/images/abc.raw".into(),
@@ -383,12 +385,49 @@ pub async fn create_attachment(
     instance: &str,
     node: &str,
 ) -> Attachment {
+    // The volume too, and it is not decoration: an attach opens the bytes at the
+    // place the pool reported, and without one the node has nothing to open. The
+    // version of this fixture that made only the attachment let a hypervisor
+    // that derived a path from the guest's directory pass every test while
+    // failing on every real cell.
+    let placed = Resource::new(
+        meta(volume),
+        velstra_cloud_model::resources::VolumeSpec {
+            size_gib: 1,
+            ..Default::default()
+        },
+        velstra_cloud_model::resources::VolumeStatus {
+            provisioned: true,
+            actual_size_gib: 1,
+            at: Some(format!(
+                "/srv/velstra/pool/{}",
+                velstra_cloud_nodeagent::hostfs::slug(volume)
+            )),
+            ..Default::default()
+        },
+    );
+    let _ = velstra_cloud_store::TypedStore::<
+        velstra_cloud_model::resources::VolumeSpec,
+        velstra_cloud_model::resources::VolumeStatus,
+    >::new(store.clone(), CELL, "volumes")
+    .create(
+        &placed,
+        &velstra_cloud_model::access::Writer::controller("test"),
+    )
+    .await;
+
     let attachment = Resource::new(
         meta(name),
         AttachmentSpec {
             volume: volume.to_string(),
             instance: instance.to_string(),
             node: node.to_string(),
+            // Mirrored by the attachment controller on a live cell; set here
+            // because these tests drive the node agent alone.
+            at: format!(
+                "/srv/velstra/pool/{}",
+                velstra_cloud_nodeagent::hostfs::slug(volume)
+            ),
             read_only: false,
         },
         AttachmentStatus {
@@ -742,6 +781,17 @@ impl ApiShaped {
 
 #[async_trait]
 impl velstra_cloud_nodeagent::CellReader for ApiShaped {
+    async fn node(
+        &self,
+        id: &str,
+    ) -> Result<Option<velstra_cloud_model::resources::Node>, velstra_cloud_nodeagent::HostError>
+    {
+        Ok(self
+            .nodes()
+            .await?
+            .into_iter()
+            .find(|n| n.meta.name.id() == id))
+    }
     async fn ports(&self) -> velstra_cloud_nodeagent::HostResult<Vec<Port>> {
         let me = self.node.as_str();
         Ok(self

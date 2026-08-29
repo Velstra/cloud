@@ -1104,3 +1104,65 @@ async fn a_running_guest_is_refused_and_told_what_to_use_instead() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn a_volume_whose_pool_has_not_said_where_it_is_waits_instead_of_guessing() {
+    // The bug this is about, stated plainly: the node used to build a path —
+    // `…/instances/<guest>/<volume>` — out of the two names it had. Nothing ever
+    // writes that path, so every attach failed with `No such file or directory`
+    // and the attachment sat at `attached: false` for as long as the cell ran.
+    // It survived because attaching a disk took three manual steps, so nobody
+    // did it; the tests passed because their fake hypervisor opened whatever it
+    // was handed.
+    //
+    // Now the pool says where the bytes are and the node opens that. Which means
+    // there is a moment where it does not know yet — and the honest behaviour
+    // then is to wait and say so, not to invent a path.
+    let store = store();
+    let attachment = "projects/p1/attachments/a1";
+    let volume = "projects/p1/volumes/nirgends";
+    create_attachment(&store, attachment, volume, I1, "node-a").await;
+
+    // No place on it: a pool that has claimed the volume and not yet said where
+    // it put the bytes, which is what a node sees whenever an attachment is made
+    // before the volume behind it is provisioned.
+    let store_of = velstra_cloud_store::TypedStore::<
+        velstra_cloud_model::resources::AttachmentSpec,
+        velstra_cloud_model::resources::AttachmentStatus,
+    >::new(store.clone(), CELL, "attachments");
+    let mut stored = store_of.get(attachment).await.unwrap().unwrap();
+    stored.spec.at = String::new();
+    // A change to a spec bumps the generation; the store refuses one that does
+    // not, which is what stops a silent edit reading as an old object.
+    stored.meta.generation += 1;
+    store_of
+        .update(
+            &stored,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+    let pass = agent.resync().await;
+
+    let after = read_attachment(&store, attachment).await;
+    assert!(
+        !after.status.attached,
+        "a disk was reported open with nothing to open"
+    );
+    assert_eq!(
+        vmm.count(Fault::OpenVolume, I1),
+        0,
+        "the hypervisor was told to open something the pool had not placed"
+    );
+    let why = condition(&after.status.conditions, "HostActions");
+    assert!(
+        why.message.contains("has not been placed"),
+        "the attachment does not say what it is waiting for: {}",
+        why.message
+    );
+    let _ = pass;
+}

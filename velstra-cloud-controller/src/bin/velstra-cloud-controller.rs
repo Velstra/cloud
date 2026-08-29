@@ -15,6 +15,7 @@ use velstra_cloud_controller::{
     LoopConfig, Metrics,
     address::AddressController,
     attachment::AttachmentController,
+    disk::DiskController,
     ceph::CephController,
     drift,
     election::{ElectionConfig, elect},
@@ -301,8 +302,25 @@ async fn main() {
         shutdown.clone(),
         leader.clone(),
     ));
+    // Watches instances, writes attachments: the disks a guest asked for made
+    // real once it has a node. Beside the attachment controller rather than
+    // inside it, because the two answer different questions — this one decides
+    // *which* attachments should exist, that one runs the finalizer dance for
+    // each of them.
     tasks.spawn(run_when_leading(
-        Arc::new(AttachmentController::new(attachments.clone())),
+        Arc::new(DiskController::new(attachments.clone(), instances.clone())),
+        instances.clone(),
+        store.clone(),
+        config,
+        metrics.clone(),
+        shutdown.clone(),
+        leader.clone(),
+    ));
+    tasks.spawn(run_when_leading(
+        Arc::new(AttachmentController::new(
+            attachments.clone(),
+            volumes.clone(),
+        )),
         attachments.clone(),
         store.clone(),
         config,

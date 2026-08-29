@@ -217,6 +217,12 @@ pub trait CellReader: Send + Sync + 'static {
     /// A cell with no Ceph cluster answers with an empty list on both, and the
     /// pass does nothing at all.
     async fn nodes(&self) -> Result<Vec<velstra_cloud_model::resources::Node>>;
+    /// One node by id — this agent's own.
+    ///
+    /// Beside `nodes()` rather than derived from it, because they are different
+    /// reads with different entitlements: the list is the Ceph pass's, whole and
+    /// cell-wide; this is a machine asking for the object it reports on.
+    async fn node(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Node>>;
     async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>>;
 
     /// Woken whenever something this node has business with changes.
@@ -372,6 +378,12 @@ impl CellReader for StoreCell {
     }
     async fn nodes(&self) -> Result<Vec<velstra_cloud_model::resources::Node>> {
         self.all_nodes.list().await.map_err(|e| failed("nodes", e))
+    }
+    async fn node(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Node>> {
+        self.all_nodes
+            .get(&format!("nodes/{id}"))
+            .await
+            .map_err(|e| failed("nodes", e))
     }
     async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>> {
         self.ceph_clusters

@@ -1147,6 +1147,28 @@ pub struct InstanceSpec {
     /// with a machine on a network they did not ask for.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<String>,
+    /// Volumes this guest should have attached.
+    ///
+    /// The same argument as [`InstanceSpec::networks`], one layer over: an
+    /// attachment is a join — this guest, that volume, opened by that node — and
+    /// making one by hand means knowing it exists, that it takes its node from
+    /// the instance, and that it cannot be made until the guest has been placed.
+    /// A customer who wanted a machine with a second disk had to create the
+    /// volume, wait for the guest to land somewhere, and only then attach.
+    ///
+    /// Unlike `networks` this is **kept**, not consumed, and the difference is
+    /// the shape of the thing being asked for. A network is answered once, at
+    /// creation, by minting an interface that then belongs to the guest. A disk
+    /// list is a standing statement about the machine: taking an entry out is how
+    /// you detach, and a field that emptied itself could not express that.
+    ///
+    /// The attachments are made by a controller rather than by the create, and
+    /// they have to be: an attachment names the node holding the guest, and at
+    /// the moment a guest is created there is no such node. Level-triggered, so a
+    /// disk added to a stopped machine attaches when it next runs, and a disk
+    /// named before the guest is placed attaches when it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
     pub ssh_keys: Vec<String>,
     pub user_data: Option<String>,
     /// Set by the scheduler, once. Moving it is a migration, which is a
@@ -1439,6 +1461,23 @@ pub struct VolumeStatus {
     /// there could ever be. A volume lives in a pool, not on a node, so the pool
     /// is the party with something to report about it.
     pub pool: Option<String>,
+    /// Where the bytes are, in the words the machine opening them needs.
+    ///
+    /// A path for a directory or LVM pool, an `rbd:` name for Ceph. Written by
+    /// the pool, because the pool is the only party that knows: a node has no
+    /// idea whether a volume is a file, a logical volume or an RBD image, and
+    /// deriving a path from the volume's name means every backend has to agree
+    /// on a layout none of them share.
+    ///
+    /// Attaching a disk to a running guest was broken for exactly this reason,
+    /// and broken in a way nothing could see. The node looked for the volume
+    /// *inside the guest's own directory* — `…/instances/<guest>/<volume>` — a
+    /// path nothing ever writes, so every attach failed with `No such file or
+    /// directory` and the attachment sat at `attached: false` for ever. It
+    /// survived because attaching used to take three manual steps, so nobody
+    /// did it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
 }
 
 impl Observed for VolumeStatus {
@@ -1786,6 +1825,22 @@ pub struct AttachmentSpec {
     /// The node that must open it — copied from the instance so the agent's
     /// watch filter is a single field.
     pub node: String,
+    /// Where the volume's bytes are, mirrored from `volume.status.at`.
+    ///
+    /// Derived, never written by a client, and here rather than read from the
+    /// volume for one reason: a node is not told about volumes. That is
+    /// deliberate — see `assignment::is_pooled_collection`, whose own comment
+    /// names this exact case ("a volume, to a node. Not shared and not this
+    /// agent's, so the honest answer is nothing"). The node needs one field of
+    /// one volume, so the field comes to it on the object it already holds.
+    ///
+    /// Same shape as `node` right above, and derived the same way: an attachment
+    /// whose place disagrees with its volume's is a meaningless object, and
+    /// derived it cannot be written down. Empty until the pool has provisioned
+    /// the volume, which is what makes an attach wait rather than open a path
+    /// nobody wrote.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub at: String,
     pub read_only: bool,
 }
 
@@ -1816,6 +1871,14 @@ pub type Attachment = Resource<AttachmentSpec, AttachmentStatus>;
 
 /// The finalizer a node holds on an attachment until it has really let go.
 pub const NODE_RELEASE_FINALIZER: &str = "node.velstra.io/release";
+/// On an attachment the disk controller made, naming the instance that asked.
+///
+/// It exists so the controller can tell its own work from somebody else's. The
+/// rule is "make what `spec.volumes` lists, remove what it no longer lists" —
+/// and applied to *every* attachment that rule would tear out one a person made
+/// by hand, which is a detach nobody asked for and, on a mounted filesystem, a
+/// destructive one. Unmarked attachments are left alone for ever.
+pub const MINTED_FOR: &str = "attachment.velstra.io/for";
 
 // ---- network -------------------------------------------------------------
 
@@ -2161,6 +2224,7 @@ mod tests {
                 volume: "projects/p1/volumes/v1".into(),
                 instance: "projects/p1/instances/i1".into(),
                 node: "node-a".into(),
+                at: String::new(),
                 read_only: false,
             },
             AttachmentStatus::default(),
