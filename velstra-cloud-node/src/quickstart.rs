@@ -198,6 +198,11 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
 
     // The control plane, so there is something to create objects in. The node
     // and pool agents come last, once they have objects to claim.
+    match crate::setup::settle_etcd() {
+        Ok(true) => say("gave etcd room to keep working"),
+        Ok(false) => {}
+        Err(e) => say(&format!("could not configure etcd ({e}); its defaults will do for now")),
+    }
     enable(&["etcd", "velstra-cloud-api", "velstra-cloud-controller"])?;
     say("brought up etcd and the control plane");
 

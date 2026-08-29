@@ -4470,3 +4470,35 @@ async fn one_machine_is_one_request() {
     );
 }
 
+
+#[test]
+fn a_full_store_is_a_precondition_and_not_an_internal_error() {
+    // Found live. An afternoon of ordinary use filled etcd's 2 GiB default and
+    // every write in the cell answered
+    //
+    //     INTERNAL: the store refused: grpc request error: code: 'Some resource
+    //     has been exhausted', message: "etcdserver: mvcc: database space
+    //     exceeded"
+    //
+    // An operator reading that has been told the platform broke. It had not:
+    // etcd keeps every revision until somebody compacts, and the answer is two
+    // commands — which the sentence now carries, because the moment somebody
+    // needs them is the moment they cannot use the console to look them up.
+    let refusal: velstra_cloud_api::ApiError = velstra_cloud_store::StoreError::Backend(
+        "grpc request error: code: 'Some resource has been exhausted', message: \
+         \"etcdserver: mvcc: database space exceeded\""
+            .to_string(),
+    )
+    .into();
+    assert_eq!(refusal.code, velstra_cloud_api::Code::FailedPrecondition);
+    let said = refusal.to_string();
+    assert!(said.contains("etcdctl defrag"), "{said}");
+    assert!(said.contains("compacted"), "{said}");
+
+    // Anything else is still what it was: a backend that answered something
+    // nobody anticipated is an internal error, and dressing it up as advice
+    // would be worse than saying so.
+    let other: velstra_cloud_api::ApiError =
+        velstra_cloud_store::StoreError::Backend("connection reset".into()).into();
+    assert_eq!(other.code, velstra_cloud_api::Code::Internal);
+}
