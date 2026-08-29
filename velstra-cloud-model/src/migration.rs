@@ -343,6 +343,24 @@ pub fn may_migrate(
     // is the mismatch that survives a successful transfer and shows up as a
     // fault inside the guest later, so it is the one worth being strictest
     // about.
+    //
+    // **Only for a transfer.** A live move carries the guest's memory across
+    // while it runs, and the processor it was told about at boot goes with it:
+    // an instruction it has already seen advertised has to keep working, and a
+    // destination that cannot present the same thing is a guest that faults at
+    // some unrelated moment weeks later. `Reboot` has none of that. It stops the
+    // guest, starts it on the destination, and the guest reads the CPUID it is
+    // given there like any freshly booted machine — the same argument the device
+    // check above already makes, and the same one `HoldsDevices` sends people to
+    // `Reboot` for.
+    //
+    // Which makes cold migration the answer for a mixed fleet: two machines with
+    // different processors can hand guests back and forth as long as somebody is
+    // willing to pay for a restart. Refusing that was refusing the one thing
+    // that works everywhere.
+    if mode == MigrationMode::Reboot {
+        return Ok(());
+    }
     match &instance.status.cpu {
         Some(guest_cpu) => {
             if let Err(why) =
@@ -1553,5 +1571,108 @@ mod tests {
         let b = node("node-b", 16384, "0.1.0");
         assert!(a.status.shared_state && b.status.shared_state);
         assert_eq!(may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live), Ok(()));
+    }
+    #[test]
+    fn two_machines_with_different_processors_may_hand_a_guest_back_and_forth() {
+        // Found on two real machines with different silicon: a live move was
+        // refused because `horst` "presents a different cpu (lacks pti; adds
+        // ibrs_enhanced)" — correctly. But `Reboot` was refused for the same
+        // reason, and there it is wrong: the guest is stopped, started on the
+        // destination, and reads the CPUID it is given there like any freshly
+        // booted machine.
+        //
+        // Which made cold migration useless in exactly the fleet it is for.
+        let mut guest = instance(InstanceState::Running, Some("node-a"));
+        let a = node("node-a", 16384, "0.1.0");
+        // What the guest was actually told at boot. Without it the question is a
+        // different one — see `GuestCpuUnknown` below.
+        let host = a.status.cpu.clone().unwrap();
+        guest.status.cpu = Some(crate::cpu::GuestCpu {
+            model: host.presents.clone(),
+            arch: host.arch.clone(),
+            flags: host.presented_flags.clone(),
+        });
+        let mut b = node("node-b", 16384, "0.1.0");
+        // The destination *lacks* something the guest has been told about.
+        // Adding a flag would be allowed and rightly so: a machine that can do
+        // more than the guest was promised is a machine the guest runs on.
+        let cpu = b.status.cpu.as_mut().unwrap();
+        cpu.flags.remove("sse4_2");
+        cpu.presented_flags.remove("sse4_2");
+
+        assert!(
+            matches!(
+                may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live),
+                Err(Refusal::DestinationCpuIncompatible { .. })
+            ),
+            "a live move onto a different processor was allowed"
+        );
+        assert_eq!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot),
+            Ok(()),
+            "a cold move was refused for a reason that only applies to a live one"
+        );
+    }
+
+    #[test]
+    fn a_cold_move_still_needs_the_bytes_and_the_room() {
+        // Everything upstream of the CPU still holds: a guest that arrives
+        // somewhere without its image or without room to run is a guest that
+        // was stopped for nothing.
+        let guest = instance(InstanceState::Running, Some("node-a"));
+        let a = node("node-a", 16384, "0.1.0");
+        let tiny = node("node-b", 256, "0.1.0");
+        assert!(matches!(
+            may_migrate(&guest, &a, &tiny, &cached(), MigrationMode::Reboot),
+            Err(Refusal::DestinationTooSmall { .. })
+        ));
+        let b = node("node-b", 16384, "0.1.0");
+        assert!(matches!(
+            may_migrate(&guest, &a, &b, &[], MigrationMode::Reboot),
+            Err(Refusal::DestinationLacksImage { .. })
+        ));
+    }
+
+    #[test]
+    fn a_guest_that_never_said_what_cpu_it_has_may_still_move_cold() {
+        // `GuestCpuUnknown` exists because a live move cannot be shown safe
+        // without knowing what the guest was told. A cold one does not need to
+        // know: nothing is carried across.
+        let mut guest = instance(InstanceState::Running, Some("node-a"));
+        guest.status.cpu = None;
+        let a = node("node-a", 16384, "0.1.0");
+        let mut b = node("node-b", 16384, "0.1.0");
+        // Two machines that are not indistinguishable, which is what a live move
+        // needs when nobody recorded what the guest was told.
+        let cpu = b.status.cpu.as_mut().unwrap();
+        cpu.flags.remove("sse4_2");
+        cpu.presented_flags.remove("sse4_2");
+        assert!(matches!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live),
+            Err(Refusal::GuestCpuUnknown { .. })
+        ));
+        assert_eq!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_cold_move_carries_a_device_holder_which_is_what_it_is_for() {
+        // The refusal for a live move already says so: "move it with mode
+        // Reboot, which stops the guest and gives it the destination's
+        // devices". This is that sentence being true.
+        let mut guest = instance(InstanceState::Running, Some("node-a"));
+        guest.status.devices = vec!["0000:41:00.0".to_string()];
+        let a = node("node-a", 16384, "0.1.0");
+        let b = node("node-b", 16384, "0.1.0");
+        assert!(matches!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live),
+            Err(Refusal::HoldsDevices { .. })
+        ));
+        assert_eq!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot),
+            Ok(())
+        );
     }
 }
