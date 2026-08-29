@@ -1879,6 +1879,58 @@ impl Api {
         })
     }
 
+    /// Issue a fresh agent credential for a machine that already exists.
+    ///
+    /// A credential is minted once, at registration, and only its digest is
+    /// kept — which is the right shape for a secret and the wrong shape for the
+    /// only way to get one. A machine that lost its token, or a pool that was
+    /// registered before pools had credentials at all, had exactly one way back:
+    /// delete the object and make it again. For a pool that means deleting
+    /// something every volume in it is written against.
+    ///
+    /// Found on two real machines. The second one's pool agent could not start,
+    /// and nothing short of destroying the pool would have let it.
+    ///
+    /// Issuing does not revoke: the old digest still opens the door until it is
+    /// deleted. That is deliberate — an operator who mis-types the new token
+    /// into a file would otherwise take the agent down while fixing it — and it
+    /// is why this is `issueCredential` rather than `rotateCredential`, which
+    /// would be a name promising the other thing.
+    pub async fn issue_credential(
+        &self,
+        name: &ResourceName,
+        who: &Identity,
+    ) -> ApiResult<Value> {
+        let kind = name.collection();
+        if kind != "nodes" && kind != "pools" {
+            return Err(ApiError::invalid(format!(
+                "only a node or a pool has an agent credential, and {name} is a {kind}"
+            )));
+        }
+        // `Write`, the verb that brings machines into existence, not `Operate`.
+        // Somebody who may run the estate may not hand out the credential a
+        // machine speaks with — a token given to whoever can start a guest is a
+        // token given to most of the cell.
+        self.authorize_for(who, Verb::Write, name, kind).await?;
+        // It has to exist. Minting against a name nobody registered would write
+        // a credential for a machine the cell has never heard of, and it would
+        // authenticate.
+        self.get(name, who).await?;
+        let mut body = Map::new();
+        body.insert("target".into(), Value::String(name.to_string()));
+        let (field, token) = if kind == "nodes" {
+            ("nodeToken", self.inner.identity.mint_node_credential(name.id()).await?)
+        } else {
+            ("poolToken", self.inner.identity.mint_pool_credential(name.id()).await?)
+        };
+        body.insert(field.into(), Value::String(token));
+        // No `operation`: nothing converges here. A create answers with one
+        // because the object it made has not settled yet; a credential is
+        // finished the moment it is in the answer, and a field naming an
+        // operation nobody will ever finish is a field a client waits on.
+        Ok(Value::Object(body))
+    }
+
     /// Change a `spec`, and nothing else a client does not own.
     pub async fn patch(
         &self,

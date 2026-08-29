@@ -668,6 +668,42 @@ function deleteControl(coll, r, opts = {}) {
   return host;
 }
 
+/// Ask before minting: a token is a secret, and a button that hands one out on
+/// a mis-click is a secret in a screenshot.
+///
+/// It is asked *and* explained, because the thing an operator most needs to know
+/// is what it does not do: the old token keeps working. Somebody who read this
+/// as a rotation would leave a machine authenticating on a credential they
+/// believe they revoked.
+function credentialControl(coll, r) {
+  const id = idOf(r);
+  const host = el("span.confirm");
+  const ask = () => fill(host,
+    el("span.muted", { id: "issuecredwarning" },
+      "Mint a new token for " + id + "? The one it has now keeps working until " +
+      "this " + coll.singular + " is deleted — this issues, it does not revoke. "),
+    el("span.btns",
+      el("button.btn.quiet", { type: "button", id: "confirmissuecred", onclick: go }, "Issue"),
+      el("button.btn", { type: "button", onclick: rest }, "Keep the old one")));
+  const rest = () => fill(host,
+    el("button.btn.quiet", { type: "button", id: "issuecredbtn", onclick: ask },
+      "New agent token"));
+  const go = async () => {
+    try {
+      const answer = await issueCredential(coll, id);
+      const token = answer.nodeToken || answer.poolToken;
+      if (!token) throw new Error("the platform issued no token");
+      rest();
+      showAgentToken(id, token, coll.id === "nodes" ? "node" : "pool");
+    } catch (e) {
+      rest();
+      toast(String((e && e.message) || e));
+    }
+  };
+  rest();
+  return host;
+}
+
 function renderSheet(coll, r) {
   const panel = $("sheet");
   if (!panel) return;
@@ -696,6 +732,15 @@ function renderSheet(coll, r) {
   if (coll.id === "users") {
     acts.appendChild(el("button.btn", { type: "button", id: "setpasswordbtn",
       onclick: () => openPasswordDialog(idOf(r)) }, "Set password"));
+  }
+  // A machine that already exists, and a credential it needs now. Registration
+  // mints one and the platform keeps only a hash, which is right for a secret
+  // and wrong for the only way to get one: a box whose token was lost, or a
+  // pool registered before pools had credentials at all, could otherwise only
+  // be given one by deleting it and making it again — and for a pool that means
+  // deleting the thing every volume in it is written against.
+  if (coll.id === "nodes" || coll.id === "pools") {
+    acts.appendChild(credentialControl(coll, r));
   }
   // Abandoning a migration is not deleting a row: what it costs depends on the
   // mode, and the sentence is different enough that it is written where the

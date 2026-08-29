@@ -963,6 +963,24 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // `nodes/node-a:issueCredential` — a machine that already exists, handed a
+  // fresh agent token. Answers with no `operation`: nothing converges, so there
+  // is nothing for the console to wait on.
+  if (path.includes(":issueCredential")) {
+    const name = nameFrom(path.replace(":issueCredential", ""));
+    const r = store.get(name);
+    if (!r) return fail(res, 404, "NOT_FOUND", "no such object");
+    const kind = name.split("/")[0];
+    if (kind !== "nodes" && kind !== "pools") {
+      return fail(res, 400, "INVALID_ARGUMENT",
+        `only a node or a pool has an agent credential, and ${name} is a ${kind}`);
+    }
+    return json(res, 200, {
+      target: name,
+      [kind === "nodes" ? "nodeToken" : "poolToken"]: (kind === "nodes" ? "d" : "e").repeat(64),
+    });
+  }
+
   // `…/i1:explainPlacement`
   if (path.includes(":explainPlacement")) {
     const name = nameFrom(path.replace(":explainPlacement", ""));

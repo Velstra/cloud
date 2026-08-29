@@ -2520,6 +2520,48 @@ await test("a node's sheet says what its maintenance window will cost", async ()
 });
 
 /// A node that is deliberately out of service, said on the board where its
+/// The way back for a machine that already exists.
+///
+/// Registration mints a credential and the platform keeps only its hash, which
+/// is right for a secret and wrong for the only way to get one. On a real
+/// two-machine cell, the second box's pool had been registered before pools had
+/// credentials at all: its agent could not start, and the only way to hand it a
+/// token would have been to delete the pool every volume in it is written
+/// against.
+///
+/// It asks first, and what it says while asking is the part worth testing: an
+/// operator who reads this as a rotation leaves a machine authenticating on a
+/// credential they believe they revoked.
+await test("an existing machine can be handed a fresh agent token, and told what that does not do", async () => {
+  // The pool the earlier test declared, which is the shape this exists for: a
+  // machine that already exists and needs a token now.
+  await open(page, "pools");
+  await openRow(page, "nvme-2");
+
+  const asked = await waitFor(page, `(() => {
+    const button = document.getElementById("issuecredbtn");
+    if (!button) return null;
+    button.click();
+    const warn = document.getElementById("issuecredwarning");
+    return warn ? warn.textContent : "the control asked nothing";
+  })()`, { timeout: 15000 });
+  check(/does not revoke/i.test(asked), `the warning does not say what it leaves alone: ${asked}`);
+
+  await page.evaluate(`document.getElementById("confirmissuecred").click()`);
+  const shown = await waitFor(page, `(() => {
+    const box = document.getElementById("agenttoken");
+    return box ? { token: box.textContent.trim(), panel: box.closest("#dialog").textContent } : null;
+  })()`, { timeout: 15000 });
+  check(shown.token.length === 64, `the token came through mangled: ${shown.token}`);
+  check(shown.panel.includes("/etc/velstra/pool-token"),
+    `the panel does not say where a pool token goes: ${shown.panel}`);
+  await page.evaluate(`document.getElementById("tokendone").click()`);
+
+  // And back to a button, so a second one can be issued without a reload.
+  const again = await waitFor(page, `!!document.getElementById("issuecredbtn")`, { timeout: 15000 });
+  check(again, "the control did not come back after issuing");
+});
+
 /// absence would otherwise read as a fault.
 await test("the nodes board says which machines are out and when they come back", async () => {
   await open(page, "nodes");

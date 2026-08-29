@@ -1863,6 +1863,36 @@ POST /api/v1/nodes → 202
   "nodeToken": "…64 hex chars, shown once…" }
 ```
 
+A pool is the same machinery under a different name. Registering one answers
+with a `poolToken`, and its agent presents it exactly as a node agent presents a
+`nodeToken`. A registration answers with **one** of the two, and which one says
+what was registered.
+
+**A machine that already exists can be issued a fresh credential**, with
+`:issueCredential`. Minting only at registration is the right shape for a secret
+and the wrong shape for the only way to get one: a machine whose token was lost,
+or a pool registered before pools had credentials at all, would otherwise have to
+be deleted and made again — and deleting a pool means deleting the thing every
+volume in it is written against.
+
+```
+POST /api/v1/pools/local-2:issueCredential → 200
+{ "target": "pools/local-2", "poolToken": "…64 hex chars, shown once…" }
+```
+
+Three things about it are deliberate:
+
+- **No `operation`.** Nothing converges here. A create answers with one because
+  the object it made has not settled yet; a credential is finished the moment it
+  is in the answer.
+- **It does not revoke.** The old digest still opens the door until it is deleted
+  — otherwise an operator who mis-typed the new token into a file would have
+  taken the agent down while fixing it. That is why it is `issueCredential` and
+  not `rotateCredential`, which would be a name promising the other thing.
+- **It needs `Write`, not `Operate`.** Handing out the credential a machine
+  speaks with is not part of running the estate. It is also refused for a name
+  nobody registered, and for any kind that has no agent.
+
 **A node reports status with a custom method**, AIP-136's `:reportStatus`, which
 is the one write outside the `spec`-only PATCH surface because it is a different
 caller doing a different thing:
