@@ -983,6 +983,65 @@ await test("the destination list greys out a node that cannot receive, and says 
     "the refusals are listed without saying anything:\n" + seen.reasons);
 });
 
+/// The mode is not a detail behind the destination — it decides which
+/// destinations there are.
+///
+/// A live move carries the guest's memory across while it runs, so a processor
+/// it has already been told about has to keep working; a cold move stops it and
+/// starts it, and the guest reads the CPUID it is given there like any freshly
+/// booted machine. Found on two real machines whose CPUs differed by a handful
+/// of flags: every destination was greyed out, and every one of them could have
+/// taken the guest with a restart.
+///
+/// So the picker is asked again when the mode changes. A picker filled once,
+/// live, is a fleet of unlike machines told its guests cannot move at all.
+await test("changing the mode asks the platform again, and a cold move reaches further", async () => {
+  const it = await migratable();
+  await openMigrateOn(it);
+  const live = await page.evaluate(`(() => {
+    const s = document.getElementById("f-toNode");
+    return [...s.options].filter((o) => o.value && !o.disabled).map((o) => o.value);
+  })()`);
+
+  const cold = await page.evaluate(`(async () => {
+    // Three modes, so the control is a segmented row of buttons and not a
+    // select: assigning to its value would do nothing at all, quietly.
+    document.querySelector('#f-mode [data-value=Reboot]').click();
+    // The picker is refilled from an answer that has to be fetched. Waited for
+    // by the thing that is supposed to change, not by a clock.
+    const open = () => [...document.getElementById("f-toNode").options]
+      .filter((o) => o.value && !o.disabled).map((o) => o.value);
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      if (open().includes("node-d")) break;
+    }
+    return open();
+  })()`);
+
+  // node-d is a generation behind on its processor and holds the image: nothing
+  // but the CPU stands between it and this guest, and only a live move cares.
+  check(!live.includes("node-d"),
+    `a live move was offered a machine that cannot present the guest's cpu: ${live.join(", ")}`);
+  check(cold.includes("node-d"),
+    `a cold move was still refused the machine only a live one cannot use: ${cold.join(", ")}`);
+
+  // And back, so the answer follows the question rather than only widening.
+  const again = await page.evaluate(`(async () => {
+    document.querySelector('#f-mode [data-value=Live]').click();
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const d = [...document.getElementById("f-toNode").options]
+        .find((o) => o.value === "node-d");
+      if (d && d.disabled) return true;
+    }
+    return false;
+  })()`);
+  check(again, "switching back to a live move kept offering the machine it cannot use");
+
+  const said = await page.evaluate(`document.querySelector("#dialog .candidates")?.innerText || ""`);
+  check(/cpu/i.test(said), `the refusal does not say it is about the processor: ${said}`);
+});
+
 await test("a destination that stops being possible is refused at the control, in the API's words", async () => {
   // The dialog from the previous test is still up. This is the race the answer
   // cannot close on its own: the node was fine when it was asked about and is

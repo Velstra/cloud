@@ -405,9 +405,14 @@ const explainPlacement = (coll, id) =>
 /// A GET, like its sibling `:explainPlacement`. It reads and creates nothing,
 /// and two spellings for the same kind of verb is how a surface starts needing a
 /// table of exceptions to use it.
-const explainMigration = (instances, id) =>
-  request("GET", basePath(instances) + "/" + encodeURIComponent(id) + ":explainMigration")
-    .then((r) => r.body);
+///
+/// `mode` matters and is not a detail: the modes refuse different things. A cold
+/// move crosses processors and carries a guest holding hardware, where a live
+/// one can do neither — so a picker filled once, live, greys out every
+/// destination in a fleet of unlike machines.
+const explainMigration = (instances, id, mode) =>
+  request("GET", basePath(instances) + "/" + encodeURIComponent(id) + ":explainMigration" +
+    (mode ? "?mode=" + encodeURIComponent(mode) : "")).then((r) => r.body);
 
 /// What the cell's processors look like, and what to do about them.
 ///

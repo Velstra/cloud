@@ -419,6 +419,24 @@ function seed() {
         disk("/dev/disk/by-id/ata-HGST-0008", "sda", 7452, true, "HUH721010ALE600", { kind: "Osd", id: "7" }),
       ] });
 
+  // The machine that takes a guest cold and not live. Schedulable, roomy,
+  // holding the image — so nothing else refuses first — and a generation behind
+  // on its processor.
+  //
+  // It is here because the answer differs by mode, and a fixture where it does
+  // not is a fixture that cannot see the console asking again. Found on two real
+  // machines whose CPUs differed by a handful of flags: every destination was
+  // greyed out, and every one of them could have taken the guest with a restart.
+  put("nodes/node-d", { schedulable: true, labels: ["sata"] },
+    { observedGeneration: 1, conditions: ready(1),
+      capacity: { vcpus: 32, memoryMib: 131072, diskGib: 2048, numaFreeMib: [65536, 65536], hugepages1gi: 0 },
+      allocated: { vcpus: 2, memoryMib: 4096, diskGib: 40, numaFreeMib: [], hugepages1gi: 0 },
+      agentVersion: "0.1.0", lastHeartbeat: now() - 2000,
+      cpu: cpu("v2"),
+      devices: [
+        disk("/dev/disk/by-id/ata-SEAGATE-0009", "sda", 1863, false, "ST2000DM008", { kind: "Free" }),
+      ] });
+
   // Two windows: one open over node-b right now, one still to come on node-c.
   // Both are needed — the open one is what an operator is looking at, and the
   // upcoming one is the thing they would otherwise be surprised by.
@@ -443,7 +461,9 @@ function seed() {
     digest: "sha256:" + "a".repeat(64), format: "Qcow2", sizeBytes: 1_181_116_006,
     family: "debian-13", version: "20260815",
     sourceUrl: "https://images.invalid/debian-13.qcow2" },
-    { observedGeneration: 1, conditions: ready(1), cachedOn: ["node-a", "node-c"] });
+    // node-d too, so nothing but the processor stands between this guest and
+    // that machine — which is the one thing the mode changes.
+    { observedGeneration: 1, conditions: ready(1), cachedOn: ["node-a", "node-c", "node-d"] });
   put("projects/p1/images/alpine-3", {
     digest: "sha256:" + "b".repeat(64), format: "Raw", sizeBytes: 62_914_560,
     family: "alpine-3", version: "3.20",
@@ -1156,17 +1176,27 @@ const server = createServer(async (req, res) => {
     }
     const instance = store.get(nameFrom(path.replace(":explainMigration", "")));
     if (!instance) return fail(res, 404, "NOT_FOUND", "no such object");
+    // The mode decides some of the refusals, so it is part of the question, and
+    // it is read off the *query* — `path` is the pathname alone, so reading it
+    // from there answered every question as `Live` and looked exactly like a
+    // console that never asked again.
+    const mode = url.searchParams.get("mode") || "Live";
+    if (!["Live", "PostCopy", "Reboot"].includes(mode)) {
+      return fail(res, 400, "INVALID_ARGUMENT",
+        `mode is Live, PostCopy or Reboot, and was "${mode}"`, "mode");
+    }
     const destinations = [...store.values()]
       .filter((r) => r.meta.name.startsWith("nodes/"))
       .map((node) => {
         const id = node.meta.name.split("/").pop();
-        const no = whyNot(instance, id);
+        const no = whyNot(instance, id, mode);
         return no
           ? { node: id, allowed: false, why: no.why, detail: no.detail }
           : { node: id, allowed: true, why: "", detail: "" };
       });
     return json(res, 200, {
       from: instance.status.node || instance.spec.node || null,
+      mode,
       destinations,
     });
   }
@@ -1500,7 +1530,7 @@ const server = createServer(async (req, res) => {
 /// A pure function of what has already been reported — capacity from the
 /// destination's own report, the image from where it is cached — so it can be
 /// answered at the moment somebody clicks rather than after a transfer starts.
-function whyNot(instance, toId) {
+function whyNot(instance, toId, mode = "Live") {
   const to = store.get("nodes/" + toId);
   const from = instance.status.node || instance.spec.node || null;
   if (!to) return { why: "NoSuchNode", detail: "there is no node called " + toId };
@@ -1520,6 +1550,23 @@ function whyNot(instance, toId) {
   if (image && !(image.status.cachedOn || []).includes(toId)) {
     return { why: "DestinationLacksImage",
       detail: toId + " does not have " + instance.spec.image };
+  }
+  // The processor, and only for a transfer. A live move carries the guest's
+  // memory across while it runs, so an instruction it has already been told
+  // about has to keep working; a cold move stops it and starts it, and the
+  // guest reads the CPUID it is given there like any freshly booted machine.
+  //
+  // Which is what makes a mixed fleet movable at all — and what the console has
+  // to ask again for when the mode changes.
+  const source = store.get("nodes/" + from);
+  if (mode !== "Reboot" && source && to.status.cpu && source.status.cpu) {
+    const missing = (source.status.cpu.presentedFlags || [])
+      .filter((f) => !(to.status.cpu.presentedFlags || []).includes(f));
+    if (missing.length) {
+      return { why: "DestinationCpuIncompatible",
+        detail: toId + " cannot give this guest the cpu it is running with: it does not have " +
+          missing.join(", ") };
+    }
   }
   return null;
 }

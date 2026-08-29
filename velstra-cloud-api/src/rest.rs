@@ -491,8 +491,22 @@ async fn read(
         Target::Verb { name, verb } if verb == "explainPlacement" => {
             Ok(Json(api.explain_placement(&name, &who).await?).into_response())
         }
+        // `?mode=Reboot` — the answer is only true of one mode, and the two
+        // refuse different things: a cold move crosses processors a live one
+        // cannot. A spelling that is not a mode is refused rather than quietly
+        // read as `Live`, which would answer a question nobody asked.
         Target::Verb { name, verb } if verb == "explainMigration" => {
-            Ok(Json(api.explain_migration(&name, &who).await?).into_response())
+            let mode = match query.get("mode") {
+                None => velstra_cloud_model::migration::MigrationMode::default(),
+                Some(raw) => serde_json::from_value(serde_json::Value::String(raw.clone()))
+                    .map_err(|_| {
+                        ApiError::invalid(format!(
+                            "mode is Live, PostCopy or Reboot, and was {raw:?}"
+                        ))
+                        .at("mode")
+                    })?,
+            };
+            Ok(Json(api.explain_migration(&name, mode, &who).await?).into_response())
         }
         Target::Verb { name, verb } if verb == "explainReach" => {
             Ok(Json(api.explain_reach(&name, &who).await?).into_response())

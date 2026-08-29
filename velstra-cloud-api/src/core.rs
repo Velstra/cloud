@@ -5100,7 +5100,12 @@ impl Api {
     /// per-destination, so this enumerates rather than choosing — and a node
     /// missing from the list means it does not exist, never that it is
     /// undecided.
-    pub async fn explain_migration(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+    pub async fn explain_migration(
+        &self,
+        name: &ResourceName,
+        mode: velstra_cloud_model::migration::MigrationMode,
+        who: &Identity,
+    ) -> ApiResult<Value> {
         self.authorize(who, Verb::Read, name).await?;
         if name.collection() != "instances" {
             return Err(ApiError::invalid("a migration moves an instance"));
@@ -5133,22 +5138,22 @@ impl Api {
             .iter()
             .map(|to| {
                 let id = to.meta.name.id();
-                // Answered for a live migration, which is the default and
-                // what a console's picker is about. A guest holding hardware
-                // is therefore shown as unmovable here, and the refusal names
-                // `Reboot` as the way to move it anyway.
-                let verdict = may_migrate(
-                    &instance,
-                    source,
-                    to,
-                    &cached,
-                    velstra_cloud_model::migration::MigrationMode::Live,
-                );
+                // Answered for the mode being asked about, defaulting to
+                // `Live` — which is what a console's picker opens on.
+                //
+                // It used to answer for `Live` and nothing else, which was
+                // fine while the two modes refused the same things. They do
+                // not: a cold move crosses processors a live one cannot, so a
+                // fleet of unlike machines was being told its guests could not
+                // move at all when every one of them could, with a restart.
+                let verdict = may_migrate(&instance, source, to, &cached, mode);
                 let d = velstra_cloud_proto::convert::destination_of(id, verdict.as_ref().err());
                 json!({ "node": d.node, "allowed": d.allowed, "why": d.why, "detail": d.detail })
             })
             .collect();
-        Ok(json!({ "from": from, "destinations": destinations }))
+        // Echoed back, because the answer is only true of one mode and a client
+        // that asked for the other should be able to tell.
+        Ok(json!({ "from": from, "mode": mode, "destinations": destinations }))
     }
 
     async fn node(&self, id: &str) -> ApiResult<Option<Node>> {
