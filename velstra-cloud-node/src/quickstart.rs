@@ -35,7 +35,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     roles::Role,
-    setup::{Machine, SEED_DIR},
+    setup::{self, Machine, SEED_DIR},
     wizard::{prompt, prompt_secret, validate_node_name},
 };
 
@@ -47,7 +47,16 @@ use crate::{
 const API_WAIT_SECS: u64 = 90;
 
 pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -> Result<()> {
-    let dir = dir.unwrap_or_else(|| PathBuf::from(SEED_DIR));
+    // Two directories, because they answer to different owners. The state
+    // directory holds what the machine *has* — its certificate, its guests —
+    // and may be a filesystem every machine in the cell mounts. The identity
+    // directory holds who the machine *is*, and must not be.
+    //
+    // An explicit `--dir` overrides both: a test that redirects the state
+    // directory and finds the seed still landing in the real `/etc` is a test
+    // that writes to the machine running it.
+    let state = dir.clone().unwrap_or_else(|| PathBuf::from(SEED_DIR));
+    let dir = dir.unwrap_or_else(|| PathBuf::from(setup::IDENTITY_DIR));
 
     if std::path::Path::new("/etc/NIXOS").exists() {
         bail!(
@@ -130,7 +139,7 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         vec![listen.rsplit(':').nth(1).unwrap_or("127.0.0.1").to_string()]
     };
     let tls = Some(crate::tls::ensure(
-        &dir,
+        &state,
         &crate::wizard::hostname(),
         &addresses,
     )?);

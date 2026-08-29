@@ -965,6 +965,9 @@
               enable = true;
               package = velstra-cloud;
             };
+            # So an assertion can name a field instead of grepping for a word
+            # that appears in three of them.
+            environment.systemPackages = [ pkgs.jq ];
             virtualisation = {
               memorySize = 4096;
               cores = 2;
@@ -1079,9 +1082,13 @@
                 )
 
             with subtest("the guest runs, and really booted a kernel"):
+                # `.status.state`, not a grep for the word: `desiredState` is
+                # also "Running", so a substring match passes the moment the
+                # object exists and this test would only ever fail later, on
+                # the console, with the useful evidence already gone.
                 cell.wait_until_succeeds(
                     f"curl -fsS {auth} {api}/projects/p1/instances/g1"
-                    " | grep -qi running",
+                    " | jq -e '.status.state == \"Running\"'",
                     timeout=300,
                 )
                 console = "/var/lib/velstra/instances/projects~p1~instances~g1/console.log"
@@ -1581,7 +1588,7 @@
                 cat unit >&2
                 exit 1
               }
-              grep -q "EnvironmentFile=-/var/lib/velstra/node.env" unit
+              grep -q "EnvironmentFile=-/etc/velstra/node.env" unit
 
               # The fabric unit is gated twice, and both gates matter.
               #
@@ -1614,6 +1621,31 @@
               grep -q "Before=velstra-cloud-nodeagent.service" fab || {
                 echo "the fabric unit does not order itself before the node agent:" >&2
                 cat fab >&2
+                exit 1
+              }
+
+              # A machine's identity is not in the directory it may share.
+              #
+              # Two boxes mounting one state directory is the arrangement that
+              # makes moving a guest possible, and it is also the arrangement
+              # that had the second one answering to the first one's name. When
+              # the package was next upgraded, `has-role control-plane` read a
+              # hypervisor's seed and systemd skipped the API and the
+              # controller — politely, as a condition unmet, with the cell dark.
+              dpkg-deb --fsys-tarfile "$deb" | tar -tf - > files
+              grep -q "etc/velstra/" files || {
+                echo "the package ships no /etc/velstra for a machine's own identity" >&2
+                exit 1
+              }
+              if grep -q "EnvironmentFile=-/var/lib/velstra/node.env" unit; then
+                echo "a unit still reads the seed out of the shared state directory:" >&2
+                cat unit >&2
+                exit 1
+              fi
+              dpkg-deb --control "$deb" ctl
+              grep -q "migrate-seed" ctl/postinst || {
+                echo "postinst does not move an older machine's seed to /etc:" >&2
+                cat ctl/postinst >&2
                 exit 1
               }
 
@@ -1806,9 +1838,18 @@
             # roles, so this line only appears when a fabric was actually named.
             grep -q "systemctl enable --now velstra-fabric-agent" fabout
 
-            # Told what to enable, and told what it cannot do for them.
-            grep -q "systemctl enable --now velstra-cloud-nodeagent" out
-            grep -q "systemctl enable --now velstra-cloud-poolagent" out
+            # Started, not recited. Printing two commands and hoping both are
+            # run is how a machine ends up answering `pool` alongside
+            # `hypervisor` with only the node agent running — which happened,
+            # on a real box, and looked like a broken pool.
+            #
+            # There is no systemd in this sandbox, so what is asserted here is
+            # the pair of units and an honest report of not being able to start
+            # them. A wizard that swallowed that would be the same defect in a
+            # new place.
+            grep -q "velstra-cloud-nodeagent" out
+            grep -q "velstra-cloud-poolagent" out
+            grep -q "did not start" out
             grep -q "cannot mark itself a gateway" out
 
             touch $out
