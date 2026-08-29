@@ -117,6 +117,9 @@ pub struct AgentConfig {
     /// a real answer: the API then says so rather than offering a button that
     /// leads nowhere.
     pub console_endpoint: String,
+    /// Whether this machine's state directory is storage every node reaches.
+    /// Told, never worked out — see the flag's own documentation.
+    pub shared_state: bool,
 }
 
 impl AgentConfig {
@@ -127,6 +130,7 @@ impl AgentConfig {
             resync: Duration::from_secs(30),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             console_endpoint: String::new(),
+            shared_state: false,
         }
     }
 }

@@ -179,6 +179,39 @@ pub enum Refusal {
     /// without the image cannot start the receiver.
     #[error("{node} does not have {image}")]
     DestinationLacksImage { node: String, image: String },
+    /// The guest's root disk is a file on the machine it is running on, and
+    /// nothing here moves one.
+    ///
+    /// **The largest gap between this feature and a working one**, and it was
+    /// invisible until two nodes were stood up and asked for a move. A live
+    /// migration transfers memory. It does not transfer disks. The destination
+    /// builds its receiver by starting the guest's own VMM with `-incoming`, and
+    /// QEMU opens the root disk at start — before anything arrives — so a
+    /// destination without one answers
+    ///
+    /// ```text
+    /// projects/p1/instances/g1 has no root disk on this node
+    /// ```
+    ///
+    /// once a pass, for ever, while the migration sits there saying nothing.
+    /// `Reboot` mode is no better: it stops the guest and starts it on the
+    /// destination, where its disk is not either.
+    ///
+    /// A node whose state directory is storage every node reaches — one NFS
+    /// mount, one Ceph filesystem — is a node where all of this works, and the
+    /// only party that can know that is the operator. So the agent is told, and
+    /// says so in `NodeStatus.shared_state`. Both ends have to say it: the
+    /// source's disk has to be readable from the destination, and it is the
+    /// destination that opens it.
+    ///
+    /// Refused at the door with the reason, rather than accepted and left to
+    /// hang. What is *not* here — copying the disk across as part of the move —
+    /// is a real feature and a large one; this is what stops its absence being
+    /// discovered by watching a guest fail to arrive.
+    #[error(
+        "{node} keeps guest root disks on its own filesystem, and moving a guest does not move its disk. Give both machines a shared state directory — one filesystem every node in the cell mounts — and start their agents with `--shared-state`; until then a guest stays where its disk is."
+    )]
+    RootDiskIsNotShared { node: String },
     /// The destination cannot present the CPU this guest is already running
     /// with. Refused here rather than discovered later: an instruction the
     /// guest can no longer execute does not fail at the move, it faults inside
@@ -265,6 +298,23 @@ pub fn may_migrate(
         return Err(Refusal::DestinationDraining {
             node: to_id.to_string(),
         });
+    }
+
+    // Before anything about memory or CPUs, because it is the one refusal that
+    // applies to every guest this platform can currently create. A root disk is
+    // a file in the agent's state directory; a move transfers memory and not
+    // disks; so unless that directory is storage both machines reach, the guest
+    // is where its disk is and that is the end of it.
+    //
+    // Both ends, and the order of the checks says which is which: a destination
+    // that cannot read the disk is the one that fails, but a source that keeps
+    // its disks privately is the reason there is nothing to read.
+    for node in [from, to] {
+        if !node.status.shared_state {
+            return Err(Refusal::RootDiskIsNotShared {
+                node: node.meta.name.id().to_string(),
+            });
+        }
     }
 
     let free = free_memory_mib(to);
@@ -724,7 +774,12 @@ mod tests {
             },
             NodeStatus {
                 vmm: "qemu".into(),
-            fetching: Vec::new(),
+                // Every test in this file is about a refusal *downstream* of
+                // being able to move a guest at all, so these nodes are the kind
+                // where that is possible: one state directory both machines
+                // mount. The disk rule has its own tests below.
+                shared_state: true,
+                fetching: Vec::new(),
                 capacity: Cap {
                     vcpus: 16,
                     memory_mib: mem,
@@ -1411,5 +1466,92 @@ mod tests {
         nowhere.status.node = None;
         let c = migration_condition(&m, Some(&nowhere), u64::from(m.spec.timeout_s) + 1);
         assert!(c.message.contains("interrupted"), "{}", c.message);
+    }
+
+    /// Both nodes hold the image, so nothing downstream of the disk rule fires.
+    fn cached() -> Vec<String> {
+        vec!["node-a".to_string(), "node-b".to_string()]
+    }
+
+    #[test]
+    fn a_guest_whose_disk_is_on_one_machine_stays_on_that_machine() {
+        // Found by standing two nodes up and asking for a move — the first time
+        // anybody had. A live migration transfers memory; it does not transfer
+        // disks. The destination builds its receiver by starting the guest's own
+        // VMM with `-incoming`, and QEMU opens the root disk at start, before
+        // anything arrives. So a destination without one answers `has no root
+        // disk on this node` once a pass, for ever, while the migration says
+        // nothing at all.
+        //
+        // Every other refusal in this file is downstream of a move being
+        // possible. This is the one that decides whether it is.
+        let guest = instance(InstanceState::Running, Some("node-a"));
+        let mut a = node("node-a", 16384, "0.1.0");
+        let mut b = node("node-b", 16384, "0.1.0");
+        a.status.shared_state = false;
+        b.status.shared_state = false;
+
+        let refusal = may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live)
+            .expect_err("a guest was cleared to leave its disk behind");
+        assert!(
+            matches!(refusal, Refusal::RootDiskIsNotShared { .. }),
+            "{refusal:?}"
+        );
+        // The sentence has to carry the way out, because the way out is not
+        // something anybody guesses: it is a flag on the agent and a filesystem
+        // decision above it.
+        let said = refusal.to_string();
+        assert!(said.contains("--shared-state"), "{said}");
+        assert!(said.contains("shared state directory"), "{said}");
+    }
+
+    #[test]
+    fn reboot_mode_is_no_better_and_is_refused_the_same_way() {
+        // `Reboot` is the honest alternative for a guest holding a device, so it
+        // is the first thing somebody reaches for here too. It stops the guest
+        // and starts it on the destination — where its disk is not either.
+        let guest = instance(InstanceState::Running, Some("node-a"));
+        let mut a = node("node-a", 16384, "0.1.0");
+        let mut b = node("node-b", 16384, "0.1.0");
+        a.status.shared_state = false;
+        b.status.shared_state = false;
+        assert!(matches!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot),
+            Err(Refusal::RootDiskIsNotShared { .. })
+        ));
+    }
+
+    #[test]
+    fn both_ends_have_to_say_it() {
+        // The destination is what opens the disk, so it is where the failure
+        // shows — but a source keeping its disks privately is the reason there
+        // is nothing to open. One end declaring it is not enough, and a cell
+        // half-converted is exactly when somebody would find that out the hard
+        // way.
+        let guest = instance(InstanceState::Running, Some("node-a"));
+        for (source, destination) in [(true, false), (false, true)] {
+            let mut a = node("node-a", 16384, "0.1.0");
+            let mut b = node("node-b", 16384, "0.1.0");
+            a.status.shared_state = source;
+            b.status.shared_state = destination;
+            assert!(
+                matches!(
+                    may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live),
+                    Err(Refusal::RootDiskIsNotShared { .. })
+                ),
+                "source={source} destination={destination} was cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cell_that_shares_its_state_may_move_a_guest() {
+        // The other direction, so the rule cannot be satisfied by refusing
+        // everything: two nodes on one filesystem, and the move is on.
+        let guest = instance(InstanceState::Running, Some("node-a"));
+        let a = node("node-a", 16384, "0.1.0");
+        let b = node("node-b", 16384, "0.1.0");
+        assert!(a.status.shared_state && b.status.shared_state);
+        assert_eq!(may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live), Ok(()));
     }
 }

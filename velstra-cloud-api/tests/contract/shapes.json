@@ -166,6 +166,7 @@
               "vendorDevice": "string"
             }
           ],
+          "sharedState": "bool",
           "vmm": "string"
         }
       }
@@ -272,6 +273,7 @@
           "vendorDevice": "string"
         }
       ],
+      "sharedState": "bool",
       "vmm": "string"
     }
   },
@@ -385,7 +387,9 @@
             "requiredLabels": [],
             "spread": "string"
           },
-          "ports": [],
+          "ports": [
+            "string"
+          ],
           "rootDiskGib": "number",
           "sshKeys": [],
           "startDelayS": "number",
@@ -435,7 +439,9 @@
         "requiredLabels": [],
         "spread": "string"
       },
-      "ports": [],
+      "ports": [
+        "string"
+      ],
       "rootDiskGib": "number",
       "sshKeys": [],
       "startDelayS": "number",

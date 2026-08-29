@@ -1351,6 +1351,7 @@ mod tests {
                 gateway: false,
             },
             NodeStatus {
+                shared_state: false,
                 vmm: "qemu".into(),
             fetching: Vec::new(),
                 capacity: Capacity {

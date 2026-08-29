@@ -1101,6 +1101,277 @@
         # `Stopped`, so this needs no nested KVM and no image bytes — what is
         # under test is placement, not boot.
         #   nix build .#checks.x86_64-linux.maintenance -L
+        # A guest moved from one machine to another, live, with nothing faked
+        # but the bytes it boots. Two real node agents, a real QEMU on each, a
+        # real transfer over the wire between them.
+        #
+        # This is the feature with the most machinery behind it — two finalizers,
+        # a receiver, an assignment that must not move until the source has let
+        # go — and the highest price for being wrong: a guest running twice, or
+        # not at all. Everything about it was written against fakes. The disk
+        # path looked just as finished and had seven defects the first time
+        # somebody actually walked it.
+        #
+        #   nix build .#checks.x86_64-linux.migration -L
+        migration = pkgs.testers.runNixOSTest {
+          name = "velstra-cloud-migration";
+          nodes = {
+            # The control plane lives here, and so does the first node agent.
+            one =
+              { lib, ... }:
+              {
+                imports = [
+                  controlPlaneNode
+                  self.nixosModules.node
+                ];
+                velstra.cloud.node = {
+                  enable = true;
+                  package = velstra-cloud;
+                };
+                environment.systemPackages = [
+                  pkgs.curl
+                  pkgs.jq
+                ];
+                networking.firewall.allowedTCPPorts = lib.mkForce [
+                  8443
+                  # The receiver's range. A transfer that cannot reach the
+                  # destination is the failure this test exists to catch, and a
+                  # firewall in the way would make it look like the platform's.
+                  4900
+                  4901
+                  4902
+                ];
+                services.nfs.server = {
+                  enable = true;
+                  exports = "/srv/velstra 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)";
+                };
+                systemd.tmpfiles.rules = [ "d /srv/velstra 0755 root root -" ];
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation = {
+                  memorySize = 4096;
+                  cores = 2;
+                  qemu.options = [
+                    "-cpu"
+                    "max"
+                  ];
+                };
+              };
+            two =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.node ];
+                velstra.cloud.node = {
+                  enable = true;
+                  package = velstra-cloud;
+                };
+                networking.firewall.enable = lib.mkForce false;
+                boot.supportedFilesystems = [ "nfs" ];
+                environment.systemPackages = [
+                  pkgs.curl
+                  pkgs.jq
+                ];
+                virtualisation = {
+                  memorySize = 4096;
+                  cores = 2;
+                  qemu.options = [
+                    "-cpu"
+                    "max"
+                  ];
+                };
+              };
+          };
+          testScript = ''
+            import json
+
+            kernel = "${pkgs.linuxPackages.kernel}/bzImage"
+            digest = "sha256-${lib.concatStrings (lib.replicate 32 "ab")}"
+            auth = "-H 'Authorization: Bearer opstoken'"
+            ct = "-H 'Content-Type: application/json'"
+
+            start_all()
+            one.wait_for_unit("velstra-cloud-api.service")
+            one.wait_for_unit("velstra-cloud-controller.service")
+            two.wait_for_unit("multi-user.target")
+
+            # Every machine in a nixosTest is on the same segment; `one` is the
+            # only one serving an API, so both agents talk to it by address.
+            api = "http://192.168.1.1:8443/api/v1"
+            one.wait_until_succeeds(f"curl -fsS {auth} {api}/nodes")
+
+            def bring_up(machine, node, address):
+                """Register a node, hand it its token, and start its agent."""
+                created = json.loads(one.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"{node}\", \"spec\": {{\"schedulable\": true}}}}'"
+                    f" {api}/nodes"
+                ))
+                token = created["nodeToken"]
+                machine.succeed("mkdir -p /var/lib/velstra")
+                machine.succeed(f"echo {token} > /var/lib/velstra/node-token")
+                machine.succeed("chmod 600 /var/lib/velstra/node-token")
+                # The bytes, pre-placed under their published slug. Content
+                # addressing means "already here" is a complete answer, so
+                # neither agent fetches — and both have to have them, because a
+                # guest that arrives somewhere its image is not is a guest that
+                # cannot be restarted there.
+                # One directory between them, so this lands once and both
+                # agents see it. Content addressing means "already here" is a
+                # complete answer, so neither fetches.
+                machine.succeed("dd if=/dev/zero of=/root/guest.raw bs=1M count=8")
+                machine.succeed(
+                    "mkdir -p /var/lib/velstra/images && "
+                    f"cp -n /root/guest.raw '/var/lib/velstra/images/projects~p1~images~{digest}' || true"
+                )
+                machine.succeed(
+                    "mkdir -p /run/systemd/system/velstra-cloud-nodeagent.service.d && "
+                    "printf '[Service]\nExecStart=\nExecStart=${velstra-cloud}/bin/velstra-cloud-nodeagent "
+                    f"--node {node} --cell cell-1 --region eu-central "
+                    f"--api http://192.168.1.1:8443 --api-token-file /var/lib/velstra/node-token "
+                    "--vmm qemu --vmm-binary ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "
+                    "--state-dir /var/lib/velstra "
+                    f"--migration-address {address} --shared-state "
+                    f"--boot-kernel {kernel} --boot-cmdline console=ttyS0\n'"
+                    " > /run/systemd/system/velstra-cloud-nodeagent.service.d/boot.conf"
+                )
+                machine.succeed(
+                    f"printf 'VELSTRA_NODE={node}\nVELSTRA_CELL=cell-1\n"
+                    "VELSTRA_REGION=eu-central\nVELSTRA_API_URL=http://192.168.1.1:8443\n"
+                    "VELSTRA_VMM=qemu\n' > /var/lib/velstra/node.env"
+                )
+                machine.succeed("systemctl daemon-reload")
+                machine.succeed("systemctl start velstra-cloud-nodeagent")
+                one.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/nodes/{node} | grep -q vcpus",
+                    timeout=180,
+                )
+
+            with subtest("the two machines share one state directory"):
+                # Not decoration, and not something either agent could work out
+                # for itself: a migration transfers memory and not disks, so a
+                # guest whose root disk is private to the machine it is on cannot
+                # arrive anywhere. `may_migrate` refuses that outright — see
+                # `Refusal::RootDiskIsNotShared`, found by running this very
+                # test — so what is being set up here is the one arrangement in
+                # which moving a guest is possible at all.
+                #
+                # NFS because it is what a small cell would really use. The
+                # export is `one`'s; both agents mount it at the path they keep
+                # their guests in, so `two` opens the same `root.raw` file the
+                # source wrote.
+                # `/etc/exports` is generated on NixOS and read-only, so the
+                # export is declared in `one`'s own configuration above.
+                one.wait_for_unit("nfs-server.service")
+                one.wait_for_open_port(2049)
+                for machine in (one, two):
+                    machine.succeed("mkdir -p /var/lib/velstra")
+                    machine.succeed("mount -t nfs 192.168.1.1:/srv/velstra /var/lib/velstra")
+
+            with subtest("two machines join the same cell"):
+                bring_up(one, "node-1", "192.168.1.1")
+                bring_up(two, "node-2", "192.168.1.2")
+                # Both ends have to say it, and the controller reads it off the
+                # node objects rather than out of anybody's configuration.
+                for node in ("node-1", "node-2"):
+                    one.wait_until_succeeds(
+                        f"curl -fsS {auth} {api}/nodes/{node}"
+                        " | ${pkgs.jq}/bin/jq -e '.status.sharedState == true'",
+                        timeout=120,
+                    )
+
+            with subtest("a guest is placed and boots on one of them"):
+                one.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"p1\", \"spec\": {{\"quota\": {{}}}}}}'"
+                    f" {api}/projects"
+                )
+                one.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d @${pkgs.writeText "image.json" (builtins.toJSON {
+                      id = "sha256-${lib.concatStrings (lib.replicate 32 "ab")}";
+                      spec = {
+                        digest = "sha256:${lib.concatStrings (lib.replicate 32 "ab")}";
+                        format = "Raw";
+                        sizeBytes = 8388608;
+                        sourceUrl = "file:///root/guest.raw";
+                      };
+                    })}"
+                    f" {api}/projects/p1/images"
+                )
+                one.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d @${pkgs.writeText "instance.json" (builtins.toJSON {
+                      id = "g1";
+                      spec = {
+                        vcpus = 1;
+                        memoryMib = 512;
+                        image = "projects/p1/images/sha256-${lib.concatStrings (lib.replicate 32 "ab")}";
+                        rootDiskGib = 1;
+                        desiredState = "Running";
+                        ports = [ ];
+                      };
+                    })}"
+                    f" {api}/projects/p1/instances"
+                )
+                # Not `grep -qi running`: the *spec* carries
+                # `desiredState: "Running"`, so that matches the moment the
+                # object exists and says nothing about the guest. What is being
+                # waited for is a node reporting it — `status.node` — which is
+                # also the only thing that makes the next step's question
+                # answerable.
+                one.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/p1/instances/g1"
+                    " | ${pkgs.jq}/bin/jq -e '.status.state == \"Running\" and .status.node != null'",
+                    timeout=600,
+                )
+
+            def holder():
+                """Which node the guest is actually on, as the guest reports."""
+                return json.loads(one.succeed(
+                    f"curl -fsS {auth} {api}/projects/p1/instances/g1"
+                ))["status"]["node"]
+
+            here = holder()
+            there = "node-2" if here == "node-1" else "node-1"
+            print(f"the guest is on {here}; moving it to {there}")
+
+            with subtest("the guest is asked to move, and moves"):
+                one.succeed(
+                    f"curl -fsS -X POST {auth} {ct}"
+                    f" -d '{{\"id\": \"m1\", \"spec\": {{"
+                    f"\"instance\": \"projects/p1/instances/g1\","
+                    f"\"fromNode\": \"{here}\", \"toNode\": \"{there}\","
+                    f"\"mode\": \"Live\"}}}}'"
+                    f" {api}/projects/p1/migrations"
+                )
+                one.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/p1/instances/g1"
+                    f" | ${pkgs.jq}/bin/jq -e '.status.node == \"{there}\"'",
+                    timeout=900,
+                )
+
+            with subtest("it is running there, and running nowhere else"):
+                one.wait_until_succeeds(
+                    f"curl -fsS {auth} {api}/projects/p1/instances/g1"
+                    " | ${pkgs.jq}/bin/jq -e '.status.state == \"Running\"'",
+                    timeout=300,
+                )
+                # The claim the whole finalizer dance is for: one guest, one
+                # machine. A VMM left behind on the source is the failure that
+                # costs data, and it is invisible from the API — so it is asked
+                # of the machines themselves.
+                source = one if here == "node-1" else two
+                source.fail("pgrep -f 'qemu-system-x86_64.*projects~p1~instances~g1'")
+                destination = two if there == "node-2" else one
+                destination.succeed("pgrep -f 'qemu-system-x86_64.*projects~p1~instances~g1'")
+
+            with subtest("the migration says it finished"):
+                done = json.loads(one.succeed(
+                    f"curl -fsS {auth} {api}/projects/p1/migrations/m1"
+                ))
+                assert done["status"].get("phase") in ("Done", "Finished", "Complete"), done["status"]
+          '';
+        };
+
         maintenance = pkgs.testers.runNixOSTest {
           name = "velstra-cloud-maintenance";
           nodes.cell = {

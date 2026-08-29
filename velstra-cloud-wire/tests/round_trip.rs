@@ -75,6 +75,7 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "NodeStatus",
         NodeStatus {
+            shared_state: false,
             vmm: "qemu".into(),
             fetching: Vec::new(),
             pci_devices: Vec::new(),

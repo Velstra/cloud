@@ -932,6 +932,39 @@ an operation cannot disagree with the object it describes.
 
 ## Migrations
 
+### What has to be true before a guest can move at all
+
+**A migration transfers memory. It does not transfer disks.** A guest's root disk
+is a file in the node agent's state directory, and the destination starts the
+guest's own VMM with `-incoming` — which opens that disk before anything arrives.
+So a guest whose root disk is private to the machine it is running on cannot
+arrive anywhere, in any mode: `Reboot` starts it on the destination, where its
+disk is not either.
+
+A cell where machines share one state directory — one NFS export, one Ceph
+filesystem, mounted at the same path by every node — is a cell where all of this
+works. Nothing on a machine can tell a local filesystem from one mount of a
+shared one, so the agent is **told**, with `--shared-state`, and reports it as
+`node.status.sharedState`.
+
+Both ends have to say it. A migration between machines that do not is refused
+before anything is started:
+
+```
+POST /api/v1/projects/p1/migrations → 400 FAILED_PRECONDITION
+{ "error": { "field": "spec.toNode", "message":
+  "node-a keeps guest root disks on its own filesystem, and moving a guest does
+   not move its disk. …" } }
+```
+
+`:explainMigration` answers `RootDiskIsNotShared` for every candidate node, and a
+node being emptied — by `spec.evacuate` or by a maintenance window — strands its
+guests with that reason rather than creating migrations no destination could ever
+complete.
+
+**Not yet built:** copying a guest's disk as part of the move, which is what would
+let a cell on local storage migrate at all.
+
 Moving a running guest to another node is a **resource**, not a state on the
 instance. There is no `MIGRATING` anywhere to poll on, for the same reason there
 is no `PENDING`: a controller that dies mid-flight would leave it set forever,
