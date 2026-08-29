@@ -698,10 +698,17 @@ function adviceLine(a) {
     case "CannotMerge": {
       const r = a.reason || {};
       if (r.kind === "VmmCannotMask") {
+        // No product is named here, because the platform was not told one. The
+        // fact it has is that these machines cannot present a CPU other than
+        // their own — true of Cloud Hypervisor, which masks nothing, and just as
+        // true of a QEMU built without the `x86-64-vN` models, which is what
+        // Debian 13 ships. Naming the wrong one sent an operator looking for a
+        // hypervisor they were already running.
         return line("Cannot be merged",
-          (r.nodes || []).join(", ") + " run Cloud Hypervisor, which has no CPU " +
-          "model to mask with. They exchange guests only with an identical " +
-          "machine. To join them: the same CPU, or QEMU.");
+          (r.nodes || []).join(", ") + " cannot present a CPU other than their own, " +
+          "so a live move works only between identical machines. A cold move " +
+          "still works: it stops the guest and starts it on the destination, " +
+          "where it reads the processor it is given.");
       }
       return line("Cannot be merged",
         "A common baseline would fall below " + (r.level || "what guests need") + ".");
