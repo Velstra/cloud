@@ -365,7 +365,38 @@ where
         // would otherwise be refused for naming a field it does have.
         let mut merged = self.empty_spec();
         overlay(&mut merged, sent);
-        let echoed = serde_json::from_value::<S>(merged)
+        // A merged spec that will not parse is not the same thing as a spec
+        // naming a field nobody has. It is far more often a **value** somebody
+        // spelled wrong — and reported as an unknown field it sends them looking
+        // in the wrong place entirely.
+        //
+        // Live: `{"cpuBaseline": "V1"}` answered "there is no field called
+        // cpu_baseline on a nodes". The field exists; `V1` is not how the level
+        // is spelled (`x86-64-v1` is). Somebody reading that goes looking for a
+        // field, finds it in the model, and concludes the API is broken.
+        let parsed = serde_json::from_value::<S>(merged);
+        if parsed.is_err() {
+            // Which field it was. Serde's message for a bad enum value names the
+            // value and its alternatives, not the field it sat in — so the field
+            // is found by putting each one on a default spec alone and seeing
+            // which will not go.
+            //
+            // On the error path only, and at most once per field somebody sent.
+            for (key, value) in fields {
+                if is_nothing(value) {
+                    continue;
+                }
+                let mut alone = self.empty_spec();
+                overlay(&mut alone, &json!({ key: value }));
+                if let Err(why) = serde_json::from_value::<S>(alone) {
+                    return Err(ApiError::invalid(format!(
+                        "spec.{key} does not take that value: {why}"
+                    ))
+                    .at(format!("spec.{key}")));
+                }
+            }
+        }
+        let echoed = parsed
             .ok()
             .and_then(|s| serde_json::to_value(s).ok())
             .unwrap_or_else(|| json!({}));
