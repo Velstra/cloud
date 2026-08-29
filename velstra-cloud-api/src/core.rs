@@ -852,7 +852,17 @@ impl Api {
         // granted and its `Write`/`Administer` fall through to the ordinary rules
         // below, which refuse it — a node holds no binding anywhere.
         if verb == Verb::Read && crate::sessions::agent_node(who).is_some() {
-            return Ok(());
+            if velstra_cloud_model::authz::a_machine_may_read(kind) {
+                return Ok(());
+            }
+            // The cell's accounts are not the machine room. This used to be
+            // granted here and refused one screen away, in the list path — so a
+            // pool agent's token was told no for `/users` and handed
+            // `/users/admin`. Whichever of the two was right, having both was
+            // not.
+            return Err(ApiError::forbidden(format!(
+                "{kind} are the cell's own. A machine agent reads what it runs on —                  nodes, pools, backup targets, Ceph clusters — and not this."
+            )));
         }
         // The image catalogue: cell-scoped images are the cell's *published*
         // ones, and everybody in it may read them.

@@ -1840,8 +1840,14 @@ registered, and the agent reads and writes **through the API** with that token
 instead of touching the store. The token authenticates the caller as *that one
 node*, and the API enforces what it may do:
 
-- It may **read** the cell — a node needs tenant network config, images and the
-  node list to run its guests, and reads them as it always has.
+- It may **read** the machine room — a node needs tenant network config, images
+  and the node list to run its guests, and reads them as it always has. Of the
+  cell's *own* collections it reads four: `nodes`, `pools`, `backup-targets` and
+  `ceph-clusters` — what it computes over, what it is, and what it reports on.
+  The cell's accounts are not among them: `users` is refused `403
+  PERMISSION_DENIED`, by name as well as by list. Those two used to disagree —
+  `GET /users` was refused to a pool agent's token and `GET /users/admin` was
+  served to it — which was a curtain over an open door, and read as a rule.
 - It may **write status** only of objects it owns or was assigned — its own node
   object, and the instances, ports and attachments placed on it. A write for
   another node's object is refused `403 PERMISSION_DENIED`; it may not change any
