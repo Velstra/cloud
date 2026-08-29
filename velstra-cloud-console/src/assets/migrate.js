@@ -45,10 +45,15 @@ const MIGRATION_MODES = {
     grave: false,
     risk: (f) =>
       "Stop, move, start: the guest is off from the moment " + f.from + " stops it until " + f.to +
-      " has started it again. Honest about the outage, and the only option for a guest whose devices cannot be migrated.",
+      " has started it again. Nothing crosses a wire, so this is the move that works between " +
+      "machines that are not alike — a different processor, or a guest holding hardware. The " +
+      "outage is the price, and it is the length of a boot.",
+    // No receiver is opened for a cold move, so there is none to tear down.
+    // Saying otherwise sent somebody looking for one.
     abandon: (f) =>
-      "Abandon this migration? The guest stays on " + f.from + " and the receiver on " + f.to +
-      " is torn down. If it was already stopped for the move, it is the instance's own desired state that brings it back up there.",
+      "Abandon this migration? The guest stays on " + f.from + ". Nothing was opened on " + f.to +
+      " to tear down. If it was already stopped for the move, it is the instance's own desired " +
+      "state that brings it back up on " + f.from + ".",
   },
 };
 
