@@ -417,10 +417,28 @@ pub fn run_with(
         println!("fighting the operating system. Add this and rebuild:\n");
         println!("{}", nix_snippet(&machine));
     } else {
-        println!("\nEnable what the roles say:\n");
+        // Enabled, not printed. Printing two commands and hoping both are run is
+        // exactly the shape this platform keeps removing — and it cost a real
+        // cell: a machine answered `pool` alongside `hypervisor`, the node agent
+        // was started, the pool agent was not, and the console showed a pool that
+        // reported nothing at all with no hint that anybody had missed a step.
+        //
+        // A unit that will not start says so here, where somebody is still
+        // watching, rather than in a journal nobody thinks to open.
+        let mut units: Vec<String> = Vec::new();
         for role in &machine.roles {
             for unit in role.units() {
-                println!("  systemctl enable --now {unit}");
+                units.push(unit.to_string());
+            }
+        }
+        println!("\nStarting what the roles say:\n");
+        for unit in &units {
+            match enable_now(unit) {
+                Ok(()) => println!("  {unit}"),
+                Err(e) => {
+                    println!("  {unit} — did not start: {e}");
+                    println!("    systemctl status {unit}");
+                }
             }
         }
         // Not one of the roles: the data plane is a separate package this one
@@ -438,6 +456,23 @@ pub fn run_with(
         println!("the node object: PATCH /api/v1/nodes/{}", machine.node);
     }
     Ok(())
+}
+
+/// Turn one unit on, now and at boot.
+///
+/// `enable --now` on a unit that is already running is a no-op, which is what
+/// makes re-running the wizard safe.
+fn enable_now(unit: &str) -> Result<()> {
+    let out = std::process::Command::new("systemctl")
+        .args(["enable", "--now", unit])
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+    .into())
 }
 
 /// The NixOS module snippet for these answers.

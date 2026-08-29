@@ -173,11 +173,27 @@ let
           ''${VELSTRA_SHARED_STATE:+--shared-state} \
           $fab' '';
     };
+    # Two ways to run, and a token decides which. With one, this pool reads *and
+    # writes* through the API — the only way it can live on a machine that is not
+    # the control plane's, which has no etcd for it to open. The agent opened one
+    # anyway and died with `invalid uri: empty string`, so the `pool + hypervisor`
+    # answer the setup wizard offers produced a unit that could not start.
+    #
+    # Without a token it is the control plane's own machine and goes straight to
+    # the store, as it always did.
     "velstra-cloud-poolagent.service" = unit {
       role = "pool";
       description = "Velstra Cloud storage pool agent";
       exec = ''
-        /bin/sh -c 'exec ${bin "velstra-cloud-poolagent"} \
+        /bin/sh -c 'tok=/var/lib/velstra/pool-token; \
+        [ -f /etc/velstra/pool-token ] && tok=/etc/velstra/pool-token; \
+        if [ -f "$tok" ]; then \
+          exec ${bin "velstra-cloud-poolagent"} \
+            --pool "$VELSTRA_POOL" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
+            --api "$VELSTRA_API_URL" --api-token-file "$tok" \
+            --backend "$VELSTRA_POOL_BACKEND"; \
+        fi; \
+        exec ${bin "velstra-cloud-poolagent"} \
           --pool "$VELSTRA_POOL" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
           --store "$VELSTRA_STORE" --backend "$VELSTRA_POOL_BACKEND"' '';
     };
