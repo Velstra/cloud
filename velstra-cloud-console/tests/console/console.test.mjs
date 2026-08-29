@@ -1040,6 +1040,22 @@ await test("changing the mode asks the platform again, and a cold move reaches f
 
   const said = await page.evaluate(`document.querySelector("#dialog .candidates")?.innerText || ""`);
   check(/cpu/i.test(said), `the refusal does not say it is about the processor: ${said}`);
+
+  // And what a cold move costs is said *here*, before the button, not on the
+  // sheet of the migration it produces. The sentences were written for the
+  // sheet alone, which is one moment too late: the decision is made in this
+  // dialog, and the platform accepts a cold move without complaint.
+  const told = await page.evaluate(`(async () => {
+    document.querySelector('#f-mode [data-value=Reboot]').click();
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const notes = [...document.querySelectorAll("#dialog .note")].map((n) => n.textContent);
+      if (notes.some((t) => /off from the moment/i.test(t))) return notes.join(" ");
+    }
+    return [...document.querySelectorAll("#dialog .note")].map((n) => n.textContent).join(" ");
+  })()`);
+  check(/off from the moment/i.test(told),
+    `the dialog does not say what a cold move costs: ${told}`);
 });
 
 await test("a destination that stops being possible is refused at the control, in the API's words", async () => {

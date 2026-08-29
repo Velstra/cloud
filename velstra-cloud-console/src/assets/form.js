@@ -69,6 +69,22 @@ function consequences(coll, values) {
         + "so the only way in will be the console.");
     }
   }
+  // What this move costs if it goes wrong, before it is started — the same
+  // sentence the migration's own sheet shows afterwards, from the same place.
+  //
+  // It was written for the sheet alone, which is one moment too late: the
+  // decision is made here. A cold move in particular has a price nothing on this
+  // form otherwise says, because the platform accepts it without complaint: the
+  // guest is off for the length of a boot.
+  if (coll.id === "migrations") {
+    const mode = MIGRATION_MODES[values.mode];
+    if (mode) {
+      out.push(mode.risk({
+        from: values.fromNode || "the node it is on",
+        to: values.toNode || "the destination",
+      }));
+    }
+  }
   return out;
 }
 
