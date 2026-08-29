@@ -417,6 +417,15 @@ const explainMigration = (instances, id) =>
 const explainCpu = () =>
   request("GET", "/api/v1/nodes:explainCpu").then((r) => r.body);
 
+/// Give a machine that already exists a fresh agent credential.
+///
+/// A POST, unlike its `:explain…` neighbours: it *makes* something — a secret,
+/// shown once — and a GET that minted one would be a GET a browser could be made
+/// to issue from somebody else's page.
+const issueCredential = (coll, id) =>
+  request("POST", writePath(coll) + "/" + encodeURIComponent(id) + ":issueCredential",
+    { body: {} }).then((r) => r.body);
+
 /// What the cell has, what is spoken for, and what would actually still fit.
 const explainCapacity = () =>
   request("GET", "/api/v1/nodes:explainCapacity").then((r) => r.body);

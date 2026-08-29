@@ -432,3 +432,85 @@ async fn a_pools_token_is_not_a_nodes() {
     assert_eq!(a.subject, "node:node-a");
     assert_eq!(b.subject, "pool:node-a");
 }
+
+/// A machine that already exists, and a credential it needs now.
+///
+/// Minting only at registration is right for a secret and wrong for the only
+/// way to get one. On the two-machine cell this was found on, the second box's
+/// pool had been registered before pools had credentials at all: its agent
+/// could not start, and the only way to give it a token would have been to
+/// delete the pool every volume in it is written against.
+#[tokio::test]
+async fn a_pool_that_already_exists_can_still_be_given_a_credential() {
+    let (api, _store) = cell();
+    api.create(
+        "",
+        "pools",
+        &json!({ "id": "local-2", "spec": { "accepting": true }}),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator registers a pool");
+
+    let issued = api
+        .issue_credential(&name("pools/local-2"), &who(OPERATOR))
+        .await
+        .expect("an operator issues a pool a new credential");
+    let token = issued["poolToken"].as_str().expect("a pool gets a poolToken");
+    assert_eq!(token.len(), 64);
+    // No `operation`: nothing converges, so there is nothing to wait on.
+    assert!(issued.get("operation").is_none(), "{issued}");
+
+    let identity = api.verifier().verify(token).await.unwrap();
+    assert_eq!(identity.subject, "pool:local-2");
+}
+
+/// Issuing is not revoking, and the name says so.
+///
+/// An operator who mis-types the new token into a file would otherwise have
+/// taken the agent down while fixing it.
+#[tokio::test]
+async fn a_new_credential_does_not_close_the_door_on_the_old_one() {
+    let (api, _store) = cell();
+    let first = register_node(&api, "node-a").await;
+    let issued = api
+        .issue_credential(&name("nodes/node-a"), &who(OPERATOR))
+        .await
+        .unwrap();
+    let second = issued["nodeToken"].as_str().unwrap();
+
+    assert_ne!(first, second);
+    for token in [first.as_str(), second] {
+        let id = api.verifier().verify(token).await.expect("both open the door");
+        assert_eq!(velstra_cloud_api::sessions::agent_node(&id), Some("node-a"));
+    }
+}
+
+/// A name nobody registered gets no credential, and a kind that has no agent
+/// gets told so rather than getting one that authenticates as nothing.
+#[tokio::test]
+async fn a_credential_is_only_issued_for_a_machine_the_cell_knows() {
+    let (api, _store) = cell();
+    assert!(
+        api.issue_credential(&name("nodes/never-registered"), &who(OPERATOR))
+            .await
+            .is_err(),
+        "a credential was minted for a machine the cell has never heard of"
+    );
+    api.create(
+        "",
+        "projects",
+        &json!({ "id": "p1", "spec": {}}),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    let refused = api
+        .issue_credential(&name("projects/p1"), &who(OPERATOR))
+        .await
+        .expect_err("a project has no agent");
+    assert!(
+        refused.to_string().contains("node or a pool"),
+        "{refused}"
+    );
+}

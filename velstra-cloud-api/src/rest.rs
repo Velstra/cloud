@@ -626,6 +626,12 @@ async fn create(
             let opened = api.open_console(&name, &identity).await?;
             return Ok(object(StatusCode::OK, opened));
         }
+        // POST, and never GET: it mints a credential, and a GET that did that
+        // is one a browser can be made to issue from somebody else's page.
+        Target::Verb { name, verb } if verb == "issueCredential" => {
+            let issued = api.issue_credential(&name, &identity).await?;
+            return Ok((StatusCode::OK, Json(issued)).into_response());
+        }
         Target::Verb { name, verb } if verb == "reportStatus" => {
             let reported = api
                 .report_status(&name, &document(&body)?, if_match(&headers)?, &identity)
