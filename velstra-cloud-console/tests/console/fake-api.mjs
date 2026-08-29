@@ -1397,13 +1397,16 @@ const server = createServer(async (req, res) => {
       { target: full, targetGeneration: 1, verb: "create", requestedBy: "console" },
       { observedGeneration: 1, conditions: ready(1), done: false, error: null, finishedAt: null });
     announce("PUT", op);
-    // Registering a node mints its one-time token, returned exactly once —
+    // Registering an agent mints its one-time token, returned exactly once —
     // the API keeps a hash and cannot show it again. A console that did not
-    // catch it here would leave an operator with a node object and no way to
-    // register the machine.
+    // catch it here would leave an operator with an object and no way to
+    // register the machine behind it. A registration answers with exactly one
+    // of the two, and which one says what was registered.
     const created = { operation: op.meta.name, target: full };
     if (full.startsWith("nodes/")) {
       created.nodeToken = "b".repeat(64);
+    } else if (full.startsWith("pools/")) {
+      created.poolToken = "c".repeat(64);
     }
     return json(res, 202, created);
   }
