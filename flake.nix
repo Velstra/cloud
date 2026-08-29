@@ -1086,11 +1086,16 @@
                 # also "Running", so a substring match passes the moment the
                 # object exists and this test would only ever fail later, on
                 # the console, with the useful evidence already gone.
-                cell.wait_until_succeeds(
-                    f"curl -fsS {auth} {api}/projects/p1/instances/g1"
-                    " | jq -e '.status.state == \"Running\"'",
-                    timeout=300,
-                )
+                try:
+                    cell.wait_until_succeeds(
+                        f"curl -fsS {auth} {api}/projects/p1/instances/g1"
+                        " | jq -e '.status.state == \"Running\"'",
+                        timeout=300,
+                    )
+                except Exception:
+                    print(cell.succeed(f"curl -fsS {auth} {api}/projects/p1/instances/g1"))
+                    print(cell.succeed("journalctl -u velstra-cloud-nodeagent --no-pager | tail -60"))
+                    raise
                 console = "/var/lib/velstra/instances/projects~p1~instances~g1/console.log"
                 cell.wait_until_succeeds(
                     f"grep -q 'Linux version' {console}",

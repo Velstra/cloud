@@ -234,7 +234,11 @@ impl Agent {
             // what this node last said about it, which is on the object rather
             // than in this process — and is the difference between a guest that
             // has been handed over and one that was never started here.
-            let stored = self.instances.get(&name).await.ok().flatten();
+            // Through the cell, not off a store handle: under `--api` that
+            // handle is a placeholder and answers "no such object", which reads
+            // here as "this node has already let go" — the moment a migration
+            // exists, before the guest has moved anywhere.
+            let stored = self.cell.instance(&name).await.ok().flatten();
             let owner = stored.as_ref().and_then(|i| i.status.node.clone());
 
             match owner.as_deref() {
@@ -544,7 +548,7 @@ impl Agent {
             }
 
             let name = migration.spec.instance.clone();
-            let instance = match self.instances.get(&name).await {
+            let instance = match self.cell.instance(&name).await {
                 Ok(instance) => instance,
                 Err(e) => {
                     tracing::error!(error = %e, instance = %name, "could not read the instance being moved here");

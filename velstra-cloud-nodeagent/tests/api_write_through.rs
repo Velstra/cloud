@@ -245,3 +245,43 @@ async fn a_pool_reads_its_own_object_and_its_share_through_the_api() {
     assert_eq!(after["status"]["backend"], "lvm");
     assert_eq!(after["status"]["capacity_gib"], 500);
 }
+
+/// The source of a migration reads the instance where its answers live.
+///
+/// It read it off a store handle, which under `--api` is a placeholder that
+/// answers "no such object" — and on the source that reads as "this node has
+/// already let go", the moment a migration exists and before the guest has
+/// moved anywhere. Letting go is what moves the assignment, so the destination
+/// would claim a guest that is still running here.
+///
+/// Not found on a machine, and that is the point: it is the same defect as the
+/// pool's own object, in the one place where being wrong costs a second copy of
+/// a live guest.
+#[tokio::test]
+async fn a_node_reads_a_moving_instance_through_the_api_and_not_a_placeholder() {
+    let (base, token, api) = api_with_a_node("node-a").await;
+    assign_instance(&api, "node-a", "moving").await;
+
+    let client = ApiCell::for_node(&base, &token, "node-a").expect("an api client");
+    let seen = velstra_cloud_nodeagent::cell::CellReader::instance(
+        &client,
+        "projects/p1/instances/moving",
+    )
+    .await
+    .expect("the node reads the instance being moved");
+    let seen = seen.expect("the instance it was assigned");
+    assert_eq!(seen.meta.name.id(), "moving");
+    assert_eq!(seen.spec.node.as_deref(), Some("node-a"));
+
+    // And a name nobody registered is `None`, not an error: an agent starting
+    // before its objects exist is a normal order of events.
+    assert!(
+        velstra_cloud_nodeagent::cell::CellReader::instance(
+            &client,
+            "projects/p1/instances/never-made",
+        )
+        .await
+        .expect("a missing instance is an answer")
+        .is_none()
+    );
+}
