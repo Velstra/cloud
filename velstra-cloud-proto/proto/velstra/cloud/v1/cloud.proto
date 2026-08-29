@@ -533,6 +533,11 @@ message ImageSpec {
   // instance means "the newest of these".
   string family = 7;
   string version = 8;
+  // An image to publish from — a request, not a record. Everything describing
+  // the bytes is copied off it and this comes back empty. Nothing is fetched: an
+  // image is content-addressed, so the same digest is the same bytes and every
+  // node that had them cached still has them.
+  string from = 9;
 }
 
 message ImageStatus {

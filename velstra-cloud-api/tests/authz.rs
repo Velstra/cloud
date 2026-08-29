@@ -688,7 +688,7 @@ async fn a_tenant_cannot_boot_another_tenants_image() {
     api.create(
         "projects/p1",
         "images",
-        &json!({"id": "sha256-abc", "spec": {"digest": "sha256:abc"}}),
+        &json!({"id": "sha256-abc", "spec": {"source_url": "http://x.invalid/i.qcow2", "digest": "sha256:abc"}}),
         &who(ADA),
     )
     .await
@@ -734,7 +734,7 @@ async fn a_tenant_cannot_boot_another_tenants_image() {
     api.create(
         "projects/p2",
         "images",
-        &json!({"id": "sha256-def", "spec": {"digest": "sha256:def"}}),
+        &json!({"id": "sha256-def", "spec": {"source_url": "http://x.invalid/i.qcow2", "digest": "sha256:def"}}),
         &who(BOB),
     )
     .await
@@ -1832,7 +1832,7 @@ async fn the_catalogue_can_be_listed_and_not_only_guessed() {
             "",
             "images",
             &json!({ "spec": {
-                "digest": format!("sha256:{}", digest.repeat(32)),
+                "source_url": "http://x.invalid/i.qcow2", "digest": format!("sha256:{}", digest.repeat(32)),
                 "format": "Qcow2",
                 "family": family,
                 "source_url": "http://x.invalid/d.qcow2"
@@ -1893,7 +1893,7 @@ async fn a_projects_own_family_shadows_the_catalogues_in_the_listing_too() {
             parent,
             "images",
             &json!({ "spec": {
-                "digest": format!("sha256:{}", digest.repeat(32)),
+                "source_url": "http://x.invalid/i.qcow2", "digest": format!("sha256:{}", digest.repeat(32)),
                 "format": "Qcow2",
                 "family": "debian-13",
                 "version": version,
@@ -2312,4 +2312,162 @@ async fn a_folder_is_the_cells_and_a_tenant_may_not_make_one() {
         )
         .await;
     assert!(refused.is_err(), "a tenant made a folder");
+}
+
+#[tokio::test]
+async fn an_operator_publishes_a_tenants_image_without_retyping_it() {
+    // A tenant captures a guest and gets an image in their own project. Putting
+    // it in the cell's catalogue meant reading its digest, its format, its size
+    // and its source off one object and typing them into another — correctly, or
+    // publishing bytes nobody tested.
+    //
+    // Nothing is copied. An image is content-addressed, so the same digest is
+    // the same bytes: every node that had them cached still has them.
+    let api = cell().await;
+    let digest = format!("sha256:{}", "ab".repeat(32));
+    api.create(
+        "projects/p1",
+        "images",
+        &json!({ "id": "unser-basis", "spec": {
+            "digest": digest,
+            "format": "Qcow2",
+            "family": "our-base",
+            "version": "20260829",
+            "size_bytes": 4_294_967_296u64,
+            "source_url": "http://x.invalid/base.qcow2"
+        }}),
+        &who(ADA),
+    )
+    .await
+    .expect("a tenant's own image");
+
+    api.create(
+        "",
+        "images",
+        &json!({ "id": "veroeffentlicht", "spec": {
+            "from": "projects/p1/images/unser-basis"
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator publishes it");
+
+    let published: velstra_cloud_model::resources::Image =
+        api.typed(&name("images/veroeffentlicht")).await.unwrap();
+    assert_eq!(published.spec.digest, digest, "the bytes are not the same bytes");
+    assert_eq!(published.spec.family, "our-base");
+    assert_eq!(published.spec.version, "20260829");
+    assert_eq!(published.spec.size_bytes, 4_294_967_296);
+    assert!(
+        published.spec.from.is_empty(),
+        "`from` is a request, not a record — an image that remembered where it \
+         was published from would be one whose source can be deleted"
+    );
+
+    // And it is the catalogue's now: everybody may boot it.
+    let listed = api
+        .list_for("", "families", &velstra_cloud_api::Filter::none(), &who(ADA))
+        .await
+        .unwrap();
+    assert!(
+        listed
+            .items
+            .iter()
+            .any(|f| f["spec"]["family"] == json!("our-base") && f["spec"]["public"] == json!(true)),
+        "the published image is not in the catalogue"
+    );
+}
+
+#[tokio::test]
+async fn publishing_under_another_name_is_the_point_of_publishing() {
+    // Somebody promoting `our-base` out of a project usually wants it called
+    // something the whole cell will recognise. What the caller says wins; only
+    // what they leave out is copied.
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "images",
+        &json!({ "id": "roh", "spec": {
+            "source_url": "http://x.invalid/i.qcow2", "digest": format!("sha256:{}", "cd".repeat(32)),
+            "format": "Qcow2",
+            "family": "our-base",
+            "version": "roh",
+            "source_url": "http://x.invalid/base.qcow2"
+        }}),
+        &who(ADA),
+    )
+    .await
+    .unwrap();
+
+    api.create(
+        "",
+        "images",
+        &json!({ "id": "gehaertet", "spec": {
+            "from": "projects/p1/images/roh",
+            "family": "debian-13-hardened",
+            "version": "1"
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+
+    let published: velstra_cloud_model::resources::Image =
+        api.typed(&name("images/gehaertet")).await.unwrap();
+    assert_eq!(published.spec.family, "debian-13-hardened");
+    assert_eq!(published.spec.version, "1");
+    assert_eq!(
+        published.spec.digest,
+        format!("sha256:{}", "cd".repeat(32)),
+        "the bytes changed under the new name"
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_cannot_publish_their_own_image_to_the_cell() {
+    // The whole rule the catalogue rests on: anybody may boot from it, only the
+    // cell may put something in it.
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "images",
+        &json!({ "id": "meins", "spec": {
+            "source_url": "http://x.invalid/i.qcow2", "digest": format!("sha256:{}", "ef".repeat(32)),
+            "format": "Qcow2",
+            "family": "meins",
+            "source_url": "http://x.invalid/x.qcow2"
+        }}),
+        &who(ADA),
+    )
+    .await
+    .unwrap();
+
+    let refused = api
+        .create(
+            "",
+            "images",
+            &json!({ "id": "meins", "spec": { "from": "projects/p1/images/meins" }}),
+            &who(ADA),
+        )
+        .await;
+    assert!(refused.is_err(), "a tenant published to the cell catalogue");
+}
+
+#[tokio::test]
+async fn publishing_from_something_that_is_not_there_says_so() {
+    let api = cell().await;
+    let refusal = api
+        .create(
+            "",
+            "images",
+            &json!({ "id": "leer", "spec": { "from": "projects/p1/images/gibt-es-nicht" }}),
+            &who(OPERATOR),
+        )
+        .await
+        .err()
+        .expect("published from nothing");
+    assert!(
+        refusal.to_string().contains("no image called"),
+        "wrong refusal: {refusal}"
+    );
 }

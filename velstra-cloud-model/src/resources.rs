@@ -1022,6 +1022,24 @@ pub struct ImageSpec {
     /// a series of images, and what they want from it is the newest.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub family: String,
+    /// An image to copy this one from — a request, not a record.
+    ///
+    /// What it is for: **publishing**. A tenant captures a guest and gets
+    /// `projects/p1/images/…`, which is theirs alone; an operator who wants it in
+    /// the cell's catalogue had to read its digest, its format, its size and its
+    /// source by hand and type them into a new object, correctly, or publish
+    /// bytes that are not the ones anybody tested.
+    ///
+    /// It costs nothing, and that is a property of the model rather than a trick:
+    /// an image is **content-addressed**, so a cell-wide image with the same
+    /// digest is the same bytes. Every node that had them cached still has them,
+    /// under the digest, and nothing is copied or fetched.
+    ///
+    /// Consumed on the way in, like `families/…` in an instance's `image`: what
+    /// gets stored is the digest and the rest, because an image that remembered
+    /// where it was published from would be an image whose source can be deleted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from: String,
     /// Which one in the family: `20260815`, `1.29.2`, a build number.
     ///
     /// Free-form and **not** used for ordering — "newest" is decided by when the

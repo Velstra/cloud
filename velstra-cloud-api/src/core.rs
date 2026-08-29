@@ -1684,6 +1684,9 @@ impl Api {
         if kind == "networks" {
             self.settle_network(&mut spec).await?;
         }
+        if kind == "images" {
+            self.settle_published_image(&mut spec).await?;
+        }
         if kind == "folders" || kind == "projects" {
             self.refuse_a_parent_that_cannot_be_one(kind, &name, &spec)
                 .await?;
@@ -4245,6 +4248,84 @@ impl Api {
         Ok(())
     }
 
+    /// Publish an image that already exists somewhere else.
+    ///
+    /// `spec.from` names one; everything that describes the bytes is copied from
+    /// it and the field is consumed. What this is *for* is the case an operator
+    /// had no way to do: a tenant captures a guest, gets an image in their own
+    /// project, and the cell wants it in the catalogue for everybody. Before
+    /// this, that meant reading the digest, the format, the size and the source
+    /// off one object and typing them into another — correctly, or publishing
+    /// bytes nobody tested.
+    ///
+    /// Nothing is copied. An image is content-addressed, so a cell-wide image
+    /// with the same digest **is** the same bytes: every node that had them
+    /// cached still has them, under that digest, and a guest booting the
+    /// published one boots what it booted before.
+    ///
+    /// Whatever the caller also sent wins over what is copied — a published
+    /// image may be given a different family or version, which is exactly what
+    /// somebody promoting `our-base` from a project into `debian-13-hardened`
+    /// wants. Only what they did not say is taken.
+    async fn settle_published_image(&self, spec: &mut Value) -> ApiResult<()> {
+        let Some(from) = spec
+            .get("from")
+            .and_then(Value::as_str)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let name = ResourceName::parse(&from).map_err(ApiError::from)?;
+        if name.collection() != "images" {
+            return Err(
+                ApiError::invalid("`from` names an image to publish, as in \
+                                   `projects/p1/images/sha256-3f9a2b`")
+                .at("spec.from"),
+            );
+        }
+        let Some(source) = self
+            .collection("images")?
+            .get(&from)
+            .await?
+            .and_then(|d| {
+                serde_json::from_value::<velstra_cloud_model::resources::Image>(d).ok()
+            })
+        else {
+            return Err(
+                ApiError::new(Code::FailedPrecondition, format!("there is no image called `{from}`"))
+                    .at("spec.from"),
+            );
+        };
+
+        // The model's spelling, not the wire's: by the time a spec reaches a
+        // settle step the wire layer has already turned `sizeBytes` into
+        // `size_bytes`, and a camelCase key here writes a field nothing reads.
+        // It fails silently — the image publishes, with a size of zero.
+        let copied = json!({
+            "digest": source.spec.digest,
+            "format": source.spec.format,
+            "size_bytes": source.spec.size_bytes,
+            "source_url": source.spec.source_url,
+            "family": source.spec.family,
+            "version": source.spec.version,
+            "source_instance": source.spec.source_instance,
+        });
+        for (key, value) in copied.as_object().expect("an object") {
+            // Only what the caller left out. Publishing under a different family
+            // is the point of publishing.
+            let said = spec.get(key.as_str());
+            let empty = matches!(said, None | Some(Value::Null))
+                || said.and_then(Value::as_str) == Some("")
+                || said.and_then(Value::as_u64) == Some(0);
+            if empty && !value.is_null() {
+                spec[key.as_str()] = value.clone();
+            }
+        }
+        spec["from"] = Value::String(String::new());
+        Ok(())
+    }
+
     async fn settle_network(&self, spec: &mut Value) -> ApiResult<()> {
         const FIRST_VNI: u32 = 5000;
         if spec.get("mtu").and_then(Value::as_u64).unwrap_or(0) == 0 {
@@ -5489,9 +5570,57 @@ pub fn created_body(created: &Created) -> Value {
 /// node reads it — which is the failure this whole feature exists to remove, in
 /// miniature. The agent skips such a rule too, but only as the belt to this
 /// brace, for a group written by an older version of this software.
+/// An image has to say what bytes it is.
+///
+/// Checked here rather than left to the console, because the console cannot
+/// express it: `from` supplies the digest, the format and the source, so those
+/// three are required *unless* it is set — and a form field is required or it is
+/// not. The browser asks for what it can; the API is what decides.
+///
+/// Without this an image with no digest was a perfectly acceptable object, and
+/// the first thing to notice would have been a node with nothing to fetch.
+fn check_image(spec: &Value) -> ApiResult<()> {
+    let said = |key: &str| {
+        spec.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+    };
+    if said("from") {
+        // Publishing. What is missing comes off the image being published from,
+        // and `settle_published_image` has already put it here — so anything
+        // still absent means that image was itself incomplete, which the
+        // checks below then say.
+        return Ok(());
+    }
+    if !said("digest") {
+        return Err(ApiError::invalid(
+            "an image says which bytes it is — `sha256:…` — because that is what makes fetching \
+             one verifiable. Name an existing image in `from` to publish it instead, and \
+             everything describing the bytes is taken from that one.",
+        )
+        .at("spec.digest"));
+    }
+    // A URL *or* a guest. An image captured from a running machine has no URL
+    // and never did: it says which instance it came from, which is the same
+    // question answered the other way. Demanding the URL refused every capture
+    // this platform makes.
+    if !said("source_url") && !said("source_instance") {
+        return Err(ApiError::invalid(
+            "an image says where it came from: `sourceUrl` for bytes to fetch, or \
+             `sourceInstance` for a guest it was captured from. Name an existing image in \
+             `from` to publish it instead.",
+        )
+        .at("spec.source_url"));
+    }
+    Ok(())
+}
+
 fn check_rules(kind: &str, spec: &Value) -> ApiResult<()> {
     if kind == "load-balancers" {
         return check_listeners(spec);
+    }
+    if kind == "images" {
+        return check_image(spec);
     }
     if kind != "security-groups" {
         return Ok(());

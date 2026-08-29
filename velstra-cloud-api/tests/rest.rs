@@ -1256,6 +1256,7 @@ async fn running_guest(h: &Harness) -> String {
                     Placement::new("eu-central", "cell-1"),
                 ),
                 velstra_cloud_model::resources::ImageSpec {
+                    from: String::new(),
                     family: "debian-13".into(),
                     version: "20260815".into(),
                     source_instance: None,

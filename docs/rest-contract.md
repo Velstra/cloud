@@ -417,6 +417,32 @@ Changing bindings needs `admin` — kept apart from everything else so an editor
 cannot grant themselves more than they were given. A role name that does not
 parse reads as `viewer`: a typo lands on the least, not the most.
 
+### Publishing an image into the catalogue
+
+An image under a project is that project's; one under the cell is the
+catalogue's, and everybody may boot it. To move one up, name it:
+
+```
+POST /api/v1/images
+{ "id": "debian-13-hardened",
+  "spec": { "from": "projects/p1/images/unser-basis",
+            "family": "debian-13-hardened", "version": "1" } }
+```
+
+The digest, format, size and source are taken from the image named by `from`;
+anything the caller also sends wins, which is how something called `our-base`
+inside a project becomes something the whole cell recognises. `from` is a request
+and not a record: it comes back empty, because an image that remembered where it
+was published from would be one whose source can be deleted.
+
+**Nothing is copied and nothing is fetched.** An image is content-addressed, so a
+cell-wide image with the same digest *is* the same bytes: every node that had
+them cached still has them, and a guest booting the published image boots what it
+booted before.
+
+Creating outside a project is a cell operator's, so publishing is too. Anybody
+may boot from the catalogue; only the cell may put something in it.
+
 ### Folders: granting a role once instead of forty times
 
 `folders` is a cell-wide collection above projects. A folder holds a name, a

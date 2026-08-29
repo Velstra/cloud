@@ -109,6 +109,7 @@ impl Reconciler for CaptureController {
                 // A capture is one machine's bytes at one moment, not a series
                 // somebody rotates — so it joins no family, and asking for
                 // `families/…` will never hand somebody a snapshot of a guest.
+                from: String::new(),
                 family: String::new(),
                 version: String::new(),
                 digest: digest.clone(),

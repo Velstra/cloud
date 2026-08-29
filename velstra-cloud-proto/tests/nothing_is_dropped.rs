@@ -419,6 +419,7 @@ survives_the_wire!(
     resources::ImageSpec,
     v1::ImageSpec,
     resources::ImageSpec {
+        from: "projects/p1/images/sha256-abc".to_string(),
         family: "debian-13".into(),
         version: "20260815".into(),
         source_instance: Some("projects/p1/instances/golden".into()),
@@ -428,7 +429,7 @@ survives_the_wire!(
         source_url: "https://example.invalid/img.qcow2".into(),
         signature: Some("base64-signature".into()),
     },
-    { digest, format, size_bytes, source_url, signature, source_instance, family, version }
+    { digest, format, size_bytes, source_url, signature, source_instance, family, version, from }
 );
 
 survives_the_wire!(
@@ -884,6 +885,7 @@ whole_object_survives!(
     resources::Image,
     v1::Image,
     resources::ImageSpec {
+        from: String::new(),
         family: "debian-13".into(),
         version: "20260815".into(),
         source_instance: None,

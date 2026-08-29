@@ -439,6 +439,7 @@ async fn seed(store: Arc<dyn Store>) {
         Resource::new(
             meta(image),
             ImageSpec {
+                from: String::new(),
                 family: "debian-13".into(),
                 version: "seed".into(),
                 source_instance: None,
