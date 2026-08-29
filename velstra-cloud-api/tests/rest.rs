@@ -4525,3 +4525,50 @@ fn a_full_store_is_a_precondition_and_not_an_internal_error() {
         velstra_cloud_store::StoreError::Backend("connection reset".into()).into();
     assert_eq!(other.code, velstra_cloud_api::Code::Internal);
 }
+
+#[tokio::test]
+async fn a_value_the_field_does_not_take_says_so_about_the_value() {
+    // Found live, following the console's own advice. The Overview said
+    // "Setting x86-64-v1 on horst, peter would put them in one domain", and
+    //
+    //   PATCH /nodes/horst { "spec": { "cpuBaseline": "V1" } }
+    //
+    // answered "there is no field called cpu_baseline on a nodes; nothing would
+    // have been done with it". The field exists. `V1` is simply not how a level
+    // is spelled — `x86-64-v1` is. Somebody reading that refusal goes looking
+    // for a missing field, finds it in the model, and concludes the API is
+    // broken.
+    let h = Harness::new();
+    two_nodes(&h).await;
+
+    let refused = h
+        .patch("nodes/node-a", json!({ "spec": { "cpuBaseline": "V1" }}))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
+    let message = refused.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("does not take that value"),
+        "the refusal still blames the field: {message}"
+    );
+    // Snake case, like the neighbouring refusal: by the time a spec reaches
+    // this layer the wire has already turned `cpuBaseline` into `cpu_baseline`,
+    // and both errors name the field the same way.
+    assert_eq!(refused.body["error"]["field"], json!("spec.cpu_baseline"));
+
+    // The spelling the platform itself uses is accepted.
+    let ok = h
+        .patch("nodes/node-a", json!({ "spec": { "cpuBaseline": "x86-64-v2" }}))
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+
+    // And a field that really is not there still says that, which is the
+    // distinction this is about.
+    let missing = h
+        .patch("nodes/node-a", json!({ "spec": { "gibtEsNicht": 3 }}))
+        .await;
+    let message = missing.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no field called"),
+        "an unknown field stopped saying so: {message}"
+    );
+}
