@@ -1133,6 +1133,8 @@ pub fn nobody_reports_on(kind: &str) -> bool {
             | "families"
             // A place in a tree. Nothing runs one.
             | "folders"
+            // A definition of what a binding means. Nothing runs one either.
+            | "roles"
     )
 }
 

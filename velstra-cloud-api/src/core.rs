@@ -50,9 +50,10 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 31] = [
+pub const COLLECTIONS: [&str; 32] = [
     "projects",
     "folders",
+    "roles",
     "users",
     "ceph-clusters",
     "instances",
@@ -438,6 +439,11 @@ impl Api {
                 velstra_cloud_model::hierarchy::FolderSpec,
                 velstra_cloud_model::hierarchy::FolderStatus
             ),
+            collection!(
+                "roles",
+                velstra_cloud_model::hierarchy::RoleSpec,
+                velstra_cloud_model::hierarchy::RoleStatus
+            ),
             // Servable, unlike `credentials` and `sessions`, which are stored
             // beside it and deliberately have no route at all — see
             // `crate::sessions`. A user record holds no secret, so listing one
@@ -673,7 +679,29 @@ impl Api {
     /// refusal somebody forgets to write at the next one, and the call site
     /// that forgets is the one an audit is eventually about.
     async fn authorize(&self, who: &Identity, verb: Verb, name: &ResourceName) -> ApiResult<()> {
-        let verdict = self.judge(who, verb, name).await;
+        self.authorize_for(who, verb, name, name.collection()).await
+    }
+
+    /// The same, asking about a collection the name does not itself carry.
+    ///
+    /// One case: **listing**. `GET /projects/p1/instances` authorises Read on
+    /// `projects/p1`, and asking that as a question about *projects* was
+    /// harmless while every role was a rung — a viewer reads everything, so the
+    /// answer was the same either way. It stops being harmless the moment a role
+    /// can name collections: somebody granted `operate` on `instances` could not
+    /// list them, because the question asked was whether they may read the
+    /// project object, and their role says nothing about projects.
+    ///
+    /// So the list path asks about what is being listed. Nothing else changes:
+    /// reading one object already asks about that object's own kind.
+    async fn authorize_for(
+        &self,
+        who: &Identity,
+        verb: Verb,
+        name: &ResourceName,
+        kind: &str,
+    ) -> ApiResult<()> {
+        let verdict = self.judge(who, verb, name, kind).await;
         if let Err(refusal) = &verdict {
             self.record_refusal(who, verb, name, &refusal.to_string())
                 .await;
@@ -767,7 +795,7 @@ impl Api {
     /// the target, and the second is their own refusal. Everything else about
     /// the cell — who else was refused what — stays an operator's.
     async fn may_read(&self, who: &Identity, name: &ResourceName, document: &Value) -> bool {
-        if self.judge(who, Verb::Read, name).await.is_ok() {
+        if self.judge(who, Verb::Read, name, name.collection()).await.is_ok() {
             return true;
         }
         if name.collection() != "audit" {
@@ -785,10 +813,18 @@ impl Api {
         let Ok(target) = ResourceName::parse(target) else {
             return false;
         };
-        self.judge(who, Verb::Read, &target).await.is_ok()
+        self.judge(who, Verb::Read, &target, target.collection())
+            .await
+            .is_ok()
     }
 
-    async fn judge(&self, who: &Identity, verb: Verb, name: &ResourceName) -> ApiResult<()> {
+    async fn judge(
+        &self,
+        who: &Identity,
+        verb: Verb,
+        name: &ResourceName,
+        kind: &str,
+    ) -> ApiResult<()> {
         // Two ways to be an operator, and both are checked here so no call site
         // has to remember either. The started-with list is configuration and
         // cannot be revoked from inside the cell — it is the escape hatch for an
@@ -832,8 +868,15 @@ impl Api {
         // same way a project governs itself.
         if name.collection() == "folders" && name.parent().is_none() {
             let bindings = self.bindings_from(&name.to_string()).await;
-            return may(&who.subject, &self.inner.cell_admins, &bindings, verb)
-                .map_err(|denied| ApiError::forbidden(denied.to_string()));
+            return may(
+                &who.subject,
+                &self.inner.cell_admins,
+                &bindings,
+                verb,
+                kind,
+                &self.defined_roles(&bindings).await,
+            )
+            .map_err(|denied| ApiError::forbidden(denied.to_string()));
         }
         let Some(project) = governing_project(name) else {
             // Outside every project: a node, a pool, the projects collection.
@@ -852,8 +895,16 @@ impl Api {
             parent = p.spec.parent;
         }
         bindings.extend(self.bindings_above(&parent).await);
-        may(&who.subject, &self.inner.cell_admins, &bindings, verb)
-            .map_err(|denied| ApiError::forbidden(denied.to_string()))
+        let defined = self.defined_roles(&bindings).await;
+        may(
+            &who.subject,
+            &self.inner.cell_admins,
+            &bindings,
+            verb,
+            kind,
+            &defined,
+        )
+        .map_err(|denied| ApiError::forbidden(denied.to_string()))
     }
 
     /// Whether `who` may follow the references a spec carries out of its own
@@ -1114,6 +1165,48 @@ impl Api {
         out
     }
 
+    /// The roles these bindings actually name, read once.
+    ///
+    /// Only the ones named: a cell with forty roles and a project that uses one
+    /// reads one object, not forty. Nothing at all for the ordinary case, where
+    /// every binding carries a rung — which is the case this must not make
+    /// slower, because it is every request.
+    async fn defined_roles(
+        &self,
+        bindings: &[velstra_cloud_model::authz::Binding],
+    ) -> Vec<velstra_cloud_model::authz::CustomRole> {
+        use velstra_cloud_model::authz::Role;
+
+        let mut wanted: Vec<&str> = bindings
+            .iter()
+            .filter_map(|b| match &b.role {
+                Role::Custom(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        let Ok(collection) = self.collection("roles") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for name in wanted {
+            let Ok(Some(document)) = collection.get(name).await else {
+                continue;
+            };
+            let Ok(object) =
+                serde_json::from_value::<velstra_cloud_model::hierarchy::RoleObject>(document)
+            else {
+                continue;
+            };
+            out.push(velstra_cloud_model::authz::CustomRole {
+                name: name.to_string(),
+                grants: object.spec.grants,
+            });
+        }
+        out
+    }
+
     async fn typed_folder(&self, name: &str) -> Option<velstra_cloud_model::hierarchy::Folder> {
         let document = self.collection("folders").ok()?.get(name).await.ok()??;
         serde_json::from_value(document).ok()
@@ -1237,7 +1330,7 @@ impl Api {
         }
         if !parent.is_empty() {
             let name = ResourceName::parse(parent).map_err(ApiError::from)?;
-            self.authorize(who, Verb::Read, &name).await?;
+            self.authorize_for(who, Verb::Read, &name, kind).await?;
             return self.list_page(parent, kind, filter, paging).await;
         }
         // No parent: a cell-wide collection. An operator sees it whole;
@@ -1691,6 +1784,7 @@ impl Api {
             self.refuse_a_parent_that_cannot_be_one(kind, &name, &spec)
                 .await?;
         }
+        self.refuse_a_role_nobody_defined(&spec).await?;
         if kind == "instances" {
             self.settle_default_network(&name, parent, body.get("spec"), &mut spec)
                 .await?;
@@ -1849,6 +1943,7 @@ impl Api {
                 self.refuse_a_parent_that_cannot_be_one(name.collection(), name, spec)
                     .await?;
             }
+            self.refuse_a_role_nobody_defined(spec).await?;
             check_rules(name.collection(), spec)?;
             if name.collection() == "volumes" {
                 self.refuse_a_new_source(name, spec).await?;
@@ -4173,6 +4268,46 @@ impl Api {
         Ok(port)
     }
 
+    /// A binding may only name a role that exists.
+    ///
+    /// The strict half of a deliberate pair. The *read* path is lenient — a name
+    /// that is not a rung reads as `viewer`, and a `roles/…` nobody defined
+    /// grants nothing — because a typo must land on the least and never on the
+    /// most, and because a role deleted under a project must not refuse every
+    /// request in it. Neither of those tells anybody about their typo.
+    ///
+    /// This is where they are told: at the door, naming the field, while they
+    /// still have the tab open.
+    async fn refuse_a_role_nobody_defined(&self, spec: &Value) -> ApiResult<()> {
+        use velstra_cloud_model::authz::CUSTOM_ROLE_PREFIX;
+
+        let Some(bindings) = spec.get("bindings").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        for (i, binding) in bindings.iter().enumerate() {
+            let named = binding.get("role").and_then(Value::as_str).unwrap_or_default();
+            if !named.starts_with(CUSTOM_ROLE_PREFIX) {
+                continue;
+            }
+            let known = self
+                .collection("roles")?
+                .get(named)
+                .await?
+                .is_some();
+            if !known {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "there is no role called `{named}`. A binding naming one grants nothing \
+                         at all, which reads exactly like a grant that was never made."
+                    ),
+                )
+                .at(format!("spec.bindings[{i}].role")));
+            }
+        }
+        Ok(())
+    }
+
     /// A parent has to be a folder, and it has to be one that is there.
     ///
     /// Either spelling arrives: `engineering` — which is how the console writes
@@ -5570,6 +5705,47 @@ pub fn created_body(created: &Created) -> Value {
 /// node reads it — which is the failure this whole feature exists to remove, in
 /// miniature. The agent skips such a rule too, but only as the belt to this
 /// brace, for a group written by an older version of this software.
+/// A role has to grant something, and something narrower than a rung.
+///
+/// Every grant names the collections it applies to and the list may not be
+/// empty. There is no wildcard, and that is the whole shape of the feature: a
+/// custom role is **always narrower than a rung, by construction**. Somebody who
+/// wants "everything" has four of those already, and a custom role that could
+/// mean it would be a second spelling of `admin` with no way to tell them apart
+/// in a list of who may do what.
+fn check_role(spec: &Value) -> ApiResult<()> {
+    let grants = spec.get("grants").and_then(Value::as_array);
+    if grants.is_none_or(|g| g.is_empty()) {
+        return Err(ApiError::invalid(
+            "a role grants something. Name at least one verb and the collections it applies to, \
+             as in `[{\"verb\": \"operate\", \"collections\": [\"instances\"]}]`.",
+        )
+        .at("spec.grants"));
+    }
+    for (i, grant) in grants.expect("checked").iter().enumerate() {
+        let collections = grant.get("collections").and_then(Value::as_array);
+        if collections.is_none_or(|c| c.is_empty()) {
+            return Err(ApiError::invalid(
+                "a grant names the collections it applies to, and there is no wildcard: a role \
+                 that meant `everything` would be a second spelling of one of the four rungs.",
+            )
+            .at(format!("spec.grants[{i}].collections")));
+        }
+        for (j, named) in collections.expect("checked").iter().enumerate() {
+            let named = named.as_str().unwrap_or_default();
+            if !COLLECTIONS.contains(&named) {
+                return Err(ApiError::invalid(format!(
+                    "there is no collection called `{named}`. A grant over one that does not \
+                     exist is a permission nobody will ever hold, which reads exactly like a \
+                     permission that was never granted."
+                ))
+                .at(format!("spec.grants[{i}].collections[{j}]")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// An image has to say what bytes it is.
 ///
 /// Checked here rather than left to the console, because the console cannot
@@ -5621,6 +5797,9 @@ fn check_rules(kind: &str, spec: &Value) -> ApiResult<()> {
     }
     if kind == "images" {
         return check_image(spec);
+    }
+    if kind == "roles" {
+        return check_role(spec);
     }
     if kind != "security-groups" {
         return Ok(());

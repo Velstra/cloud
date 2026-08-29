@@ -349,7 +349,7 @@ fn policy_in(p: &v1::ProjectPolicy) -> resources::ProjectPolicy {
 
 fn binding_out(b: &velstra_cloud_model::authz::Binding) -> v1::Binding {
     v1::Binding {
-        role: role_str(b.role).to_string(),
+        role: b.role.to_string(),
         members: b.members.clone(),
     }
 }
@@ -361,30 +361,16 @@ fn binding_in(b: &v1::Binding) -> velstra_cloud_model::authz::Binding {
     }
 }
 
-fn role_str(role: velstra_cloud_model::authz::Role) -> &'static str {
-    use velstra_cloud_model::authz::Role;
-    match role {
-        Role::Viewer => "viewer",
-        Role::Operator => "operator",
-        Role::Editor => "editor",
-        Role::Admin => "admin",
-    }
-}
-
-/// A role name to a role.
+/// A role name to a role — the model's own reading, so a custom role and a rung
+/// are understood here exactly as they are everywhere else.
 ///
-/// Anything unrecognised is a **viewer**, which is the closed answer and the
-/// one a typo must land on: a client that sends `admiin` gets the least, not
-/// the most, and finds out because nothing works rather than because everything
-/// does.
+/// Anything unrecognised is a **viewer**, which is the closed answer and the one
+/// a typo must land on: a client that sends `admiin` gets the least, not the
+/// most, and finds out because nothing works rather than because everything
+/// does. A `roles/…` name it does not know reads the same way, and the API
+/// refuses such a binding at the door — which is where somebody is told.
 fn parse_role(s: &str) -> velstra_cloud_model::authz::Role {
-    use velstra_cloud_model::authz::Role;
-    match s {
-        "operator" => Role::Operator,
-        "editor" => Role::Editor,
-        "admin" => Role::Admin,
-        _ => Role::Viewer,
-    }
+    velstra_cloud_model::authz::Role::from(s)
 }
 
 fn parse_announce(s: &str) -> velstra_cloud_model::public::Announce {

@@ -107,6 +107,18 @@ pub enum Kind {
         #[serde(rename = "remoteCollection")]
         remote_collection: &'static str,
     },
+    /// What a role grants: a list of `{verb, collections}`.
+    ///
+    /// Modelled on [`Kind::RuleList`] and for the same reason — a grant is not a
+    /// scalar. A verb means nothing without the collections it applies to, and
+    /// two list fields side by side would let somebody assemble "write" from one
+    /// row and "networks" from another, producing a permission neither of them
+    /// meant. One control produces the pair or it produces nothing.
+    ///
+    /// There is deliberately no wildcard among the collections offered: a role
+    /// that could mean *everything* would be a second spelling of `admin` with
+    /// no way to tell them apart in a list of who may do what.
+    GrantList,
     /// The disks handed to Ceph: a list of `{node, device}` pairs.
     ///
     /// Modelled on [`Kind::RuleList`] and for the same reason — an OSD is not a
@@ -673,6 +685,52 @@ const CEPH_FIELDS: &[Field] = &[
         advanced: true,
         help: "Stops the deployment where it stands. Nothing is torn down, and \
                turning it off carries on from there.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+];
+
+const ROLE_FIELDS: &[Field] = &[
+    Field {
+        key: "displayName",
+        label: "Name",
+        kind: Kind::Text {
+            placeholder: "Database operator",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "description",
+        label: "What it is for",
+        kind: Kind::Text {
+            placeholder: "Restart the database machines, nothing else",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        // Not decoration. A list of role names tells nobody what they mean, and
+        // the person reading it is usually deciding whether to grant one.
+        help: "Somebody granting this will read this line and nothing else.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "grants",
+        label: "Grants",
+        kind: Kind::GrantList,
+        required: true,
+        advanced: false,
+        help: "A verb, and the collections it applies to. Being able to act on \
+               something carries being able to see it — anything else is a \
+               button that works above a screen that shows nothing.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -4667,6 +4725,41 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "roles",
+        title: "Roles",
+        singular: "role",
+        recheck: 0,
+        condition: "",
+        // Nothing reports on a role: it is a definition, not a thing an agent
+        // runs.
+        group: "Access",
+        scope: Scope::Global,
+        blurb: "The four rungs say how much somebody may do. A role here says \
+                *what* — collection by collection, for the case a rung cannot \
+                express: may restart the database machines, may not touch the \
+                network.",
+        fields: ROLE_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.displayName",
+                label: "Name",
+                cell: Cell::Text,
+                width: 220,
+            },
+            Column {
+                path: "spec.description",
+                label: "What it is for",
+                cell: Cell::Text,
+                width: 320,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
         id: "folders",
         title: "Folders",
         singular: "folder",
@@ -4810,12 +4903,13 @@ mod tests {
             "usage",
             "families",
             "folders",
+            "roles",
         ] {
             assert!(find(id).is_some(), "no screen for {id}");
         }
         assert_eq!(
             COLLECTIONS.len(),
-            30,
+            31,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:
@@ -4860,6 +4954,8 @@ mod tests {
             "families",
             // A place in a tree, not a thing an agent runs.
             "folders",
+            // A definition. Nothing runs one either.
+            "roles",
         ];
         for c in COLLECTIONS {
             let says_nobody = c.condition.is_empty();

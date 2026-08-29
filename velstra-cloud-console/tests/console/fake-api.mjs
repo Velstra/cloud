@@ -343,11 +343,24 @@ function cpu(level, extra = []) {
 
 function seed() {
   store.clear();
-  put("projects/p1", { displayName: "Platform", parent: "organizations/o1",
+  // A folder, because `parent` names one now and the real API refuses anything
+  // else. `organizations/o1` was what this said for as long as nothing walked
+  // the field — a fixture carrying a value the API would reject is exactly the
+  // drift this file exists to prevent.
+  put("folders/engineering", { displayName: "Engineering",
+    bindings: [{ role: "editor", members: ["ada@example.com"] }] },
+    { observedGeneration: 0, conditions: [] });
+  // A role the cell wrote down, for the case a rung cannot express.
+  put("roles/db-operator", { displayName: "Database operator",
+    description: "Restart the database machines, nothing else",
+    grants: [{ verb: "operate", collections: ["instances"] }] },
+    { observedGeneration: 0, conditions: [] });
+
+  put("projects/p1", { displayName: "Platform", parent: "folders/engineering",
     quota: { instances: 20, vcpus: 200, memoryMib: 524288, volumeGib: 4096 } },
     { observedGeneration: 1, conditions: ready(1),
       used: { instances: 3, vcpus: 10, memoryMib: 20480, volumeGib: 60 } });
-  put("projects/p2", { displayName: "Sandbox", parent: "organizations/o1",
+  put("projects/p2", { displayName: "Sandbox", parent: "folders/engineering",
     quota: { instances: 5, vcpus: 20, memoryMib: 65536, volumeGib: 512 } },
     { observedGeneration: 1, conditions: ready(1),
       used: { instances: 0, vcpus: 0, memoryMib: 0, volumeGib: 0 } });
@@ -422,14 +435,38 @@ function seed() {
   // platform verifies it. A fixture carrying a field the real API would reject
   // is the drift this file exists to prevent — the console would be built
   // against a shape that cannot exist.
+  // A `family` on both, because the catalogue is derived from it. An image
+  // without one is invisible in `families` — and the instance form picks from
+  // *there*, not from the images, so a fixture without families is a create form
+  // whose image field offers nothing at all.
   put("projects/p1/images/debian-13", {
     digest: "sha256:" + "a".repeat(64), format: "Qcow2", sizeBytes: 1_181_116_006,
+    family: "debian-13", version: "20260815",
     sourceUrl: "https://images.invalid/debian-13.qcow2" },
     { observedGeneration: 1, conditions: ready(1), cachedOn: ["node-a", "node-c"] });
   put("projects/p1/images/alpine-3", {
     digest: "sha256:" + "b".repeat(64), format: "Raw", sizeBytes: 62_914_560,
+    family: "alpine-3", version: "3.20",
     sourceUrl: "https://images.invalid/alpine-3.raw" },
     { observedGeneration: 1, conditions: ready(1), cachedOn: [] });
+
+  // The catalogue, as the real API derives it: one entry per family, naming the
+  // image a create would resolve to. Written out rather than computed, because
+  // this file's job is to be a *recording* of the contract — a fake that derived
+  // it would agree with itself rather than with the API.
+  //
+  // Both scopes, because the API answers both: `/families` is the cell's, and
+  // `/projects/p1/families` is that plus the project's own.
+  for (const [where, isPublic] of [["", true], ["projects/p1/", false]]) {
+    put(where + "families/debian-13", {
+      family: "debian-13", version: "20260815", public: isPublic,
+      image: "projects/p1/images/debian-13", sizeBytes: 1_181_116_006 },
+      { observedGeneration: 0, conditions: [] });
+    put(where + "families/alpine-3", {
+      family: "alpine-3", version: "3.20", public: isPublic,
+      image: "projects/p1/images/alpine-3", sizeBytes: 62_914_560 },
+      { observedGeneration: 0, conditions: [] });
+  }
 
   put("projects/p1/networks/prod", { vni: 4711, mtu: 9000 },
     { observedGeneration: 1, conditions: ready(1), programmedOn: ["node-a", "node-b"] });

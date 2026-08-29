@@ -1979,8 +1979,8 @@ await test("a subnet's occupancy follows the ports, with no event to announce it
 // set stays in view, only the unset advanced ones fold.
 await test("the sheet folds unset advanced settings but keeps the set ones", async () => {
   await open(page, "projects");
-  // A project that sets an advanced field (parent) and leaves another advanced
-  // field (cell) unset — so one of each is on screen at once.
+  // A project that sets an advanced field (its folder) and leaves another
+  // advanced field (cell) unset — so one of each is on screen at once.
   const proj = await pick("project with a set parent and an unset cell",
     `(x) => spec(x).parent && !spec(x).cell`);
   await openRow(page, proj.id);
@@ -2010,7 +2010,9 @@ await test("the sheet folds unset advanced settings but keeps the set ones", asy
   check(/More settings \(\d+\)/.test(r.toggleText), `the disclosure is not labelled like the form: "${r.toggleText}"`);
   check(r.foldLabels.includes("Cell"), `an unset advanced field is not folded: fold has ${JSON.stringify(r.foldLabels)}`);
   check(!r.mainLabels.includes("Cell"), "an unset advanced field is also shown in the main list");
-  check(r.mainLabels.includes("Parent"), `a set advanced field was folded away: main has ${JSON.stringify(r.mainLabels)}`);
+  // "Folder", not "Parent": the field names what it holds now that something
+  // walks it, and the label is what somebody looks for on the sheet.
+  check(r.mainLabels.includes("Folder"), `a set advanced field was folded away: main has ${JSON.stringify(r.mainLabels)}`);
   check(r.hiddenBefore === true && r.hiddenAfter === false, "the disclosure does not reveal the folded fields");
   check(r.expandedBefore === "false" && r.expandedAfter === "true", "aria-expanded does not track the disclosure");
 });
