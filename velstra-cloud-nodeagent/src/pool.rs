@@ -1196,11 +1196,22 @@ impl PoolAgent {
     /// that is incremented and decremented drifts; a count of what exists
     /// cannot.
     async fn pool_pass(&self, volumes: &[Volume], seen: &PoolState, pass: &mut Pass) {
-        let name = format!("pools/{}", self.config.pool);
-        let stored = match self.pools.get(&name).await {
+        // Through the cell reader, not off a store handle. An agent talking to
+        // the API has no store: this read came back "no such pool" from a
+        // placeholder, the pass returned early, and the pool sat `unreported`
+        // on the board while its agent logged that it was running.
+        let stored = match self.cell.pool(&self.config.pool).await {
             Ok(Some(pool)) => pool,
-            // A pool nobody registered is not this agent's to invent.
-            Ok(None) => return,
+            // A pool nobody registered is not this agent's to invent. Said out
+            // loud, because it is also what a mis-typed `--pool` looks like and
+            // silence sent somebody to read the agent's source.
+            Ok(None) => {
+                tracing::warn!(
+                    pool = %self.config.pool,
+                    "this cell has no pool by that name, so there is nothing to report on"
+                );
+                return;
+            }
             Err(e) => {
                 tracing::error!(error = %e, "could not read this pool's own object");
                 pass.failures += 1;
@@ -1242,8 +1253,10 @@ impl PoolAgent {
     /// cannot see it" into "it has no room", which is a different and much
     /// worse claim. They stay, stale, next to a condition saying they are.
     async fn unreachable(&self, why: &str, pass: &mut Pass) {
-        let name = format!("pools/{}", self.config.pool);
-        let Ok(Some(stored)) = self.pools.get(&name).await else {
+        // Through the cell reader, for the same reason `pool_pass` reads that
+        // way: an agent with no store of its own would otherwise report nothing
+        // at exactly the moment it has something to report.
+        let Ok(Some(stored)) = self.cell.pool(&self.config.pool).await else {
             // A pool nobody registered is not this agent's to invent — the same
             // rule `pool_pass` holds to. There is nowhere to say this, and
             // saying it in a place of our own choosing would be worse.
@@ -1616,6 +1629,99 @@ mod tests {
         /// tests that passed alone started failing together — and would have
         /// gone on doing it intermittently, which is the worst way to find out.
         tag: u64,
+        /// The store behind every handle above, so a test can build a second
+        /// agent that reaches it from somewhere else.
+        store: Arc<dyn Store>,
+    }
+
+    /// One status write, into whichever collection it is for.
+    async fn write_one<S, T>(
+        store: &Arc<dyn Store>,
+        kind: &'static str,
+        object: &serde_json::Value,
+        writer: &velstra_cloud_model::access::Writer,
+    ) -> crate::sink::SinkOutcome
+    where
+        S: serde::Serialize
+            + serde::de::DeserializeOwned
+            + PartialEq
+            + Clone
+            + velstra_cloud_model::resources::Assigned
+            + Send
+            + Sync,
+        T: serde::Serialize
+            + serde::de::DeserializeOwned
+            + PartialEq
+            + Clone
+            + velstra_cloud_model::resources::Observed
+            + Send
+            + Sync,
+    {
+        // The name is segments in the model and one string on the wire, which is
+        // the same conversion the real sink runs before it builds a URL.
+        let name = velstra_cloud_wire::to_wire(object.clone())["meta"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let typed: TypedStore<S, T> = TypedStore::new(store.clone(), "cell-1", kind);
+        let Ok(Some(stored)) = typed.get(&name).await else {
+            return crate::sink::SinkOutcome::Failed(format!("no {name} here"));
+        };
+        let mut next = stored.clone();
+        let Ok(status) = serde_json::from_value(object["status"].clone()) else {
+            return crate::sink::SinkOutcome::Failed(format!("{name} reported a status this could not read"));
+        };
+        next.status = status;
+        match typed.update(&next, writer).await {
+            Ok(_) => crate::sink::SinkOutcome::Wrote,
+            Err(e) => crate::sink::SinkOutcome::Failed(e.to_string()),
+        }
+    }
+
+    /// A sink that writes into a store other than the agent's own.
+    ///
+    /// The shape `--api` mode really has: the agent's own store handle is a
+    /// placeholder — a machine talking to the API has no etcd — and both the
+    /// read and the write go somewhere else. Without a test in that shape, every
+    /// pool test passes against an agent whose store *is* the cell, which is the
+    /// one arrangement the defect could not happen in.
+    struct Elsewhere(Arc<dyn Store>);
+
+    #[async_trait::async_trait]
+    impl crate::sink::StatusSink for Elsewhere {
+        async fn write_status(
+            &self,
+            kind: &str,
+            object: &serde_json::Value,
+            writer: &velstra_cloud_model::access::Writer,
+        ) -> crate::sink::SinkOutcome {
+            // Every kind this agent reports on, because the real sink is the
+            // API and it takes them all. One that knew only pools would let a
+            // test pass while the write it did not know about went nowhere.
+            use velstra_cloud_model::{backup as bk, resources as rs};
+            // `&'static str` because that is what a collection name is here;
+            // the sink is handed one of a fixed set.
+            let kind: &'static str = match kind {
+                "pools" => "pools",
+                "volumes" => "volumes",
+                "snapshots" => "snapshots",
+                "backups" => "backups",
+                "backup-targets" => "backup-targets",
+                other => return crate::sink::SinkOutcome::Failed(
+                    format!("nothing here reports on {other}")),
+            };
+            match kind {
+                "pools" => write_one::<rs::PoolSpec, rs::PoolStatus>(&self.0, kind, object, writer).await,
+                "volumes" => write_one::<rs::VolumeSpec, rs::VolumeStatus>(&self.0, kind, object, writer).await,
+                "snapshots" => write_one::<rs::SnapshotSpec, rs::SnapshotStatus>(&self.0, kind, object, writer).await,
+                "backups" => write_one::<bk::BackupSpec, bk::BackupStatus>(&self.0, kind, object, writer).await,
+                "backup-targets" => write_one::<bk::BackupTargetSpec, bk::BackupTargetStatus>(&self.0, kind, object, writer).await,
+                other => crate::sink::SinkOutcome::Failed(format!("nothing here reports on {other}")),
+            }
+        }
+        fn describe(&self) -> String {
+            "a store that is not this agent's".to_string()
+        }
     }
 
     fn cell(pool: &str) -> (Cell, PoolAgent) {
@@ -1625,6 +1731,7 @@ mod tests {
         let fake = FakePool::new(1000);
         let cell = Cell {
             tag: NEXT.fetch_add(1, Ordering::Relaxed),
+            store: store.clone(),
             volumes: TypedStore::new(store.clone(), "cell-1", "volumes"),
             snapshots: TypedStore::new(store.clone(), "cell-1", "snapshots"),
             pools: TypedStore::new(store.clone(), "cell-1", "pools"),
@@ -2766,6 +2873,51 @@ mod tests {
     /// A copy from before digests existed. Not sound and not broken — nobody
     /// can tell, and a digest recorded now would only bless whatever is on the
     /// target today, which is the very thing being asked about.
+    /// A pool agent on a machine with no store of its own still reports.
+    ///
+    /// The `--api` arrangement, in the shape it really has: the agent's own
+    /// store handle is a placeholder, and both the read and the write go
+    /// elsewhere. Reading its own object off that handle answered "no such
+    /// pool", `pool_pass` returned early on the rule that a pool nobody
+    /// registered is not an agent's to invent, and the pool sat `unreported` on
+    /// the board while the agent logged that it was running. Found on the
+    /// second of two real machines.
+    #[tokio::test]
+    async fn a_pool_agent_with_no_store_of_its_own_still_reports() {
+        let (cell, _) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        cell.volume("pool-a", 100).await;
+
+        // Everything the agent can reach is somewhere else: the reader is the
+        // cell's store, the sink writes there, and its own handle is empty.
+        let real: Arc<dyn Store> = cell.store.clone();
+        let nothing: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let agent = PoolAgent::reading(
+            nothing,
+            PoolConfig::new("pool-a", "eu", "cell-1"),
+            Arc::new(cell.fake.clone()),
+            Arc::new(crate::cell::StorePool::new(real.clone(), "cell-1")),
+        )
+        .through(Arc::new(Elsewhere(real)));
+
+        let first = agent.resync().await;
+        let second = agent.resync().await;
+        assert_eq!(first.failures + second.failures, 0, "{first:?} {second:?}");
+
+        let pool = cell.reload_pool("pool-a").await;
+        assert_eq!(pool.status.backend, "fake", "the pool never reported");
+        assert_eq!(pool.status.capacity_gib, 1000);
+        assert_eq!(pool.status.allocated_gib, 100);
+        assert!(
+            pool.status
+                .conditions
+                .iter()
+                .any(|c| c.kind == "Ready" && c.status == ConditionStatus::True),
+            "{:?}",
+            pool.status.conditions
+        );
+    }
+
     #[tokio::test]
     async fn a_copy_with_no_digest_is_called_unverifiable_rather_than_assumed_good() {
         let (cell, agent, _path) = a_verified_copy(1).await;

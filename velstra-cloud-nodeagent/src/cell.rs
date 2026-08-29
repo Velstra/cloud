@@ -70,6 +70,16 @@ pub trait PoolReader: Send + Sync + 'static {
     async fn backups(&self) -> Result<Vec<velstra_cloud_model::resources::Backup>>;
     async fn backup_targets(&self) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>>;
 
+    /// This pool's own object, or `None` if nobody registered it.
+    ///
+    /// Read through here rather than off a store handle for one reason, and it
+    /// was found on a real machine: a pool agent talking to the API has no
+    /// store at all. Reading its own object out of a placeholder answered "no
+    /// such pool", the pass returned early — a pool nobody registered is not an
+    /// agent's to invent — and the pool sat `unreported` on the board while its
+    /// agent logged that it was running perfectly.
+    async fn pool(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Pool>>;
+
     /// What this reads, for a log line at startup.
     fn describe(&self) -> String;
 }
@@ -88,6 +98,10 @@ pub struct StorePool {
         velstra_cloud_model::backup::BackupSpec,
         velstra_cloud_model::backup::BackupStatus,
     >,
+    pools: TypedStore<
+        velstra_cloud_model::resources::PoolSpec,
+        velstra_cloud_model::resources::PoolStatus,
+    >,
     targets: TypedStore<
         velstra_cloud_model::backup::BackupTargetSpec,
         velstra_cloud_model::backup::BackupTargetStatus,
@@ -100,7 +114,8 @@ impl StorePool {
             volumes: TypedStore::new(store.clone(), cell, "volumes"),
             snapshots: TypedStore::new(store.clone(), cell, "snapshots"),
             backups: TypedStore::new(store.clone(), cell, "backups"),
-            targets: TypedStore::new(store, cell, "backup-targets"),
+            targets: TypedStore::new(store.clone(), cell, "backup-targets"),
+            pools: TypedStore::new(store, cell, "pools"),
         }
     }
 }
@@ -124,6 +139,12 @@ impl PoolReader for StorePool {
             .list()
             .await
             .map_err(|e| failed("backup targets", e))
+    }
+    async fn pool(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Pool>> {
+        self.pools
+            .get(&format!("pools/{id}"))
+            .await
+            .map_err(|e| failed("this pool's own object", e))
     }
     fn describe(&self) -> String {
         "the store, unfiltered: this pool reads every volume, snapshot and backup in the cell on \

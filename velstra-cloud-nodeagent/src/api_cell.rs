@@ -573,6 +573,9 @@ impl crate::cell::PoolReader for ApiCell {
         // grows.
         self.list("backup-targets").await
     }
+    async fn pool(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Pool>> {
+        self.get_one(&format!("/api/v1/pools/{id}")).await
+    }
     fn describe(&self) -> String {
         format!(
             "{} with {}: this pool is handed the volumes, snapshots and backups it holds or has \
