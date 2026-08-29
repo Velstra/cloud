@@ -53,9 +53,14 @@ use serde::{Deserialize, Serialize};
 use crate::meta::ResourceName;
 
 /// What a request wants to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Default` is `Read`, and it is the least of them on purpose: a grant whose
+/// verb did not parse grants the smallest thing there is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Verb {
     /// Get, list, watch.
+    #[default]
     Read,
     /// Change something that already exists: start a guest, resize it, attach a
     /// volume, open its console.
@@ -73,9 +78,16 @@ pub enum Verb {
     Administer,
 }
 
+/// The prefix a role the cell defined carries in a binding.
+pub const CUSTOM_ROLE_PREFIX: &str = "roles/";
+
 /// What a member has been granted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// One field on the wire, not two. `"editor"` is a rung; `"roles/db-operator"`
+/// is a role the cell wrote down. A binding with a `role` *and* a `customRole`
+/// would be two fields with one meaning, and every one of those in this platform
+/// has eventually been read in the wrong order by something.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Role {
     /// Read everything in the project and change nothing.
     #[default]
@@ -91,6 +103,60 @@ pub enum Role {
     Editor,
     /// Everything, including the bindings themselves.
     Admin,
+    /// A role the cell defined: what it grants is written down in a `roles/…`
+    /// object, per collection.
+    ///
+    /// The four rungs above answer "what may this person do" with one word for
+    /// the whole project. That is the right shape for most people and the wrong
+    /// one for the case every operator eventually meets: somebody who may
+    /// restart the database machines and must not touch the network. A fifth
+    /// rung cannot express that — the difference is not *how much* but *what*.
+    Custom(String),
+}
+
+impl serde::Serialize for Role {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Role {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Ok(Role::from(text.as_str()))
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::Viewer => f.write_str("viewer"),
+            Role::Operator => f.write_str("operator"),
+            Role::Editor => f.write_str("editor"),
+            Role::Admin => f.write_str("admin"),
+            Role::Custom(name) => f.write_str(name),
+        }
+    }
+}
+
+impl From<&str> for Role {
+    /// A name that is neither a rung nor a `roles/…` reference reads as
+    /// `Viewer`.
+    ///
+    /// The lenient half of a deliberate pair: a typo lands on the *least*, never
+    /// the most, so a mangled binding cannot be an escalation. The strict half is
+    /// at the door — the API refuses a binding naming a role that does not exist,
+    /// which is where somebody can still be told about their typo.
+    fn from(text: &str) -> Self {
+        match text {
+            "operator" => Role::Operator,
+            "editor" => Role::Editor,
+            "admin" => Role::Admin,
+            "viewer" => Role::Viewer,
+            other if other.starts_with(CUSTOM_ROLE_PREFIX) => Role::Custom(other.to_string()),
+            _ => Role::Viewer,
+        }
+    }
 }
 
 impl Role {
@@ -101,7 +167,7 @@ impl Role {
     /// about it. A wildcard would silently grant it to whichever rung the
     /// catch-all sat on, which is how a permission system gets a hole nobody
     /// wrote down.
-    pub fn admits(self, verb: Verb) -> bool {
+    pub fn admits(&self, verb: Verb, kind: &str, defined: &[CustomRole]) -> bool {
         match (self, verb) {
             (Role::Viewer, Verb::Read) => true,
             (Role::Viewer, Verb::Operate | Verb::Write | Verb::Administer) => false,
@@ -113,7 +179,60 @@ impl Role {
             (Role::Editor, Verb::Administer) => false,
 
             (Role::Admin, _) => true,
+
+            // A role nobody defined grants nothing. Not an error here: this is
+            // the *read* path, and a binding naming a role that has since been
+            // deleted has to resolve to the least rather than refuse the whole
+            // request — the other members of that project still hold theirs.
+            (Role::Custom(name), _) => defined
+                .iter()
+                .find(|r| &r.name == name)
+                .is_some_and(|r| r.admits(verb, kind)),
         }
+    }
+}
+
+/// A role the cell wrote down: what it lets somebody do, collection by
+/// collection.
+///
+/// **Always narrower than a rung, by construction.** Every grant names the
+/// collections it applies to and the list may not be empty — there is no
+/// wildcard. Somebody who wants "everything" has four of those already, and a
+/// custom role that could mean it would be a second spelling of `admin` with no
+/// way to tell them apart in a list.
+///
+/// The cell's, never a project's. A tenant who could define a role could define
+/// one granting more than they hold, and the whole point of keeping `Administer`
+/// apart is that an editor cannot widen themselves.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomRole {
+    /// `roles/db-operator` — the same text a binding carries.
+    pub name: String,
+    pub grants: Vec<Grant>,
+}
+
+/// One verb, over the collections it applies to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Grant {
+    pub verb: Verb,
+    /// At least one, and no wildcard. See [`CustomRole`].
+    pub collections: Vec<String>,
+}
+
+impl CustomRole {
+    /// Whether this role admits `verb` on `kind`.
+    ///
+    /// `Read` is implied by every other verb on the same collection, and that is
+    /// not convenience: a person who may start a guest and may not read it is
+    /// looking at a console that shows nothing and a button that works, which is
+    /// worse than either half alone.
+    pub fn admits(&self, verb: Verb, kind: &str) -> bool {
+        self.grants.iter().any(|g| {
+            g.collections.iter().any(|c| c == kind)
+                && (g.verb == verb || (verb == Verb::Read && g.verb != Verb::Administer))
+        })
     }
 }
 
@@ -155,6 +274,8 @@ pub fn may(
     cell_admins: &[String],
     bindings: &[Binding],
     verb: Verb,
+    kind: &str,
+    defined: &[CustomRole],
 ) -> Result<(), Denied> {
     if cell_admins.iter().any(|a| a == subject) {
         return Ok(());
@@ -162,7 +283,7 @@ pub fn may(
     let granted = bindings
         .iter()
         .filter(|b| b.members.iter().any(|m| m == subject))
-        .any(|b| b.role.admits(verb));
+        .any(|b| b.role.admits(verb, kind, defined));
     if granted {
         Ok(())
     } else {
@@ -187,6 +308,7 @@ pub fn governing_project(name: &ResourceName) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn bindings(role: Role, member: &str) -> Vec<Binding> {
@@ -199,9 +321,9 @@ mod tests {
     #[test]
     fn a_viewer_may_look_and_change_nothing() {
         let b = bindings(Role::Viewer, "ada");
-        assert!(may("ada", &[], &b, Verb::Read).is_ok());
-        assert!(may("ada", &[], &b, Verb::Write).is_err());
-        assert!(may("ada", &[], &b, Verb::Administer).is_err());
+        assert!(may("ada", &[], &b, Verb::Read, "instances", &[]).is_ok());
+        assert!(may("ada", &[], &b, Verb::Write, "instances", &[]).is_err());
+        assert!(may("ada", &[], &b, Verb::Administer, "instances", &[]).is_err());
     }
 
     #[test]
@@ -209,9 +331,9 @@ mod tests {
         // The one escalation a role system has to be closed against: an editor
         // who could write the bindings would be an admin one request later.
         let b = bindings(Role::Editor, "ada");
-        assert!(may("ada", &[], &b, Verb::Write).is_ok());
+        assert!(may("ada", &[], &b, Verb::Write, "instances", &[]).is_ok());
         assert!(
-            may("ada", &[], &b, Verb::Administer).is_err(),
+            may("ada", &[], &b, Verb::Administer, "instances", &[]).is_err(),
             "an editor could change who may"
         );
     }
@@ -220,7 +342,7 @@ mod tests {
     fn somebody_with_no_binding_may_do_nothing() {
         let b = bindings(Role::Admin, "ada");
         for verb in [Verb::Read, Verb::Write, Verb::Administer] {
-            assert!(may("bob", &[], &b, verb).is_err(), "{verb:?}");
+            assert!(may("bob", &[], &b, verb, "instances", &[]).is_err(), "{verb:?}");
         }
     }
 
@@ -228,9 +350,9 @@ mod tests {
     fn the_refusal_does_not_say_whether_the_thing_exists() {
         // An error that distinguishes "not yours" from "not there" is an oracle
         // for enumerating other tenants' resources.
-        let denied = may("bob", &[], &[], Verb::Read).unwrap_err();
+        let denied = may("bob", &[], &[], Verb::Read, "instances", &[]).unwrap_err();
         assert!(denied.0.contains("does not exist"), "{denied}");
-        let also = may("bob", &[], &bindings(Role::Admin, "ada"), Verb::Read).unwrap_err();
+        let also = may("bob", &[], &bindings(Role::Admin, "ada"), Verb::Read, "instances", &[]).unwrap_err();
         assert_eq!(denied, also, "the two refusals can be told apart");
     }
 
@@ -238,8 +360,8 @@ mod tests {
     fn a_cell_operator_may_act_inside_every_project() {
         // Anything else is a cell nobody can repair.
         let admins = vec!["ops".to_string()];
-        assert!(may("ops", &admins, &[], Verb::Administer).is_ok());
-        assert!(may("ops", &admins, &bindings(Role::Viewer, "ada"), Verb::Write).is_ok());
+        assert!(may("ops", &admins, &[], Verb::Administer, "instances", &[]).is_ok());
+        assert!(may("ops", &admins, &bindings(Role::Viewer, "ada"), Verb::Write, "instances", &[]).is_ok());
     }
 
     #[test]
@@ -254,9 +376,9 @@ mod tests {
                 members: vec!["ada".into(), "bob".into()],
             },
         ];
-        assert!(may("ada", &[], &b, Verb::Write).is_ok());
-        assert!(may("bob", &[], &b, Verb::Write).is_ok());
-        assert!(may("bob", &[], &b, Verb::Administer).is_err());
+        assert!(may("ada", &[], &b, Verb::Write, "instances", &[]).is_ok());
+        assert!(may("bob", &[], &b, Verb::Write, "instances", &[]).is_ok());
+        assert!(may("bob", &[], &b, Verb::Administer, "instances", &[]).is_err());
     }
 
     #[test]
@@ -303,7 +425,7 @@ mod the_ladder {
         for (role, expected) in table {
             for (verb, want) in [Read, Operate, Write, Administer].into_iter().zip(expected) {
                 assert_eq!(
-                    role.admits(verb),
+                    role.admits(verb, "instances", &[]),
                     want,
                     "{role:?} and {verb:?}: the table says {want}"
                 );
@@ -318,7 +440,7 @@ mod the_ladder {
     #[test]
     fn nobody_below_admin_can_grant_themselves_more() {
         for role in [Role::Viewer, Role::Operator, Role::Editor] {
-            assert!(!role.admits(Verb::Administer), "{role:?}");
+            assert!(!role.admits(Verb::Administer, "instances", &[]), "{role:?}");
         }
     }
 
@@ -329,8 +451,8 @@ mod the_ladder {
     /// who needed to restart a guest was given the ability to destroy one.
     #[test]
     fn an_operator_may_run_the_estate_and_not_change_what_it_consists_of() {
-        assert!(Role::Operator.admits(Verb::Operate));
-        assert!(!Role::Operator.admits(Verb::Write));
+        assert!(Role::Operator.admits(Verb::Operate, "instances", &[]));
+        assert!(!Role::Operator.admits(Verb::Write, "instances", &[]));
     }
 
     /// A role name that arrives misspelled must land on the least, not the
@@ -439,3 +561,153 @@ mod what_the_cell_keeps {
     }
 }
 
+
+#[cfg(test)]
+mod a_role_the_cell_wrote_down {
+    use super::*;
+
+    fn role(name: &str, grants: &[(Verb, &[&str])]) -> CustomRole {
+        CustomRole {
+            name: name.to_string(),
+            grants: grants
+                .iter()
+                .map(|(verb, collections)| Grant {
+                    verb: *verb,
+                    collections: collections.iter().map(|c| c.to_string()).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn held(role: Role, who: &str) -> Vec<Binding> {
+        vec![Binding {
+            role,
+            members: vec![who.to_string()],
+        }]
+    }
+
+    #[test]
+    fn the_case_a_rung_cannot_express() {
+        // The four rungs answer "what may this person do" with one word for the
+        // whole project. That is right for most people and wrong for the case
+        // every operator eventually meets: somebody who may restart the database
+        // machines and must not touch the network. A fifth rung cannot say it —
+        // the difference is not *how much* but *what*.
+        let defined = [role(
+            "roles/db-operator",
+            &[(Verb::Operate, &["instances"])],
+        )];
+        let bindings = held(Role::Custom("roles/db-operator".into()), "ada");
+
+        assert!(may("ada", &[], &bindings, Verb::Operate, "instances", &defined).is_ok());
+        assert!(may("ada", &[], &bindings, Verb::Operate, "networks", &defined).is_err());
+        // And not a rung by another name: no creating, no deleting, anywhere.
+        assert!(may("ada", &[], &bindings, Verb::Write, "instances", &defined).is_err());
+    }
+
+    #[test]
+    fn being_able_to_act_on_something_means_being_able_to_see_it() {
+        // Not convenience. A person who may start a guest and may not read it is
+        // looking at a console that shows nothing and a button that works, which
+        // is worse than either half on its own.
+        let defined = [role("roles/db-operator", &[(Verb::Operate, &["instances"])])];
+        let bindings = held(Role::Custom("roles/db-operator".into()), "ada");
+        assert!(may("ada", &[], &bindings, Verb::Read, "instances", &defined).is_ok());
+        // Only where it may act, though. Read on everything is `viewer`.
+        assert!(may("ada", &[], &bindings, Verb::Read, "volumes", &defined).is_err());
+    }
+
+    #[test]
+    fn administering_does_not_carry_read_with_it() {
+        // The one verb kept apart from the ladder: it is about *who may*, not
+        // about the objects. Letting it imply Read would make a role granted to
+        // change bindings quietly a role that can also read the estate.
+        let defined = [role("roles/granter", &[(Verb::Administer, &["projects"])])];
+        let bindings = held(Role::Custom("roles/granter".into()), "ada");
+        assert!(may("ada", &[], &bindings, Verb::Administer, "projects", &defined).is_ok());
+        assert!(may("ada", &[], &bindings, Verb::Read, "projects", &defined).is_err());
+    }
+
+    #[test]
+    fn a_role_nobody_defined_grants_nothing() {
+        // The read path, where a binding naming a role that has since been
+        // deleted must resolve to the least rather than refuse the whole
+        // request: the other members of that project still hold theirs. Being
+        // *told* about it happens at the door, where the API refuses a binding
+        // naming a role that is not there.
+        let bindings = held(Role::Custom("roles/weg".into()), "ada");
+        for verb in [Verb::Read, Verb::Operate, Verb::Write, Verb::Administer] {
+            assert!(
+                may("ada", &[], &bindings, verb, "instances", &[]).is_err(),
+                "{verb:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typo_lands_on_the_least_and_never_on_the_most() {
+        // The lenient half of a deliberate pair. `admiin` is a viewer, not an
+        // admin; `roles/typo` grants nothing at all.
+        assert_eq!(Role::from("admiin"), Role::Viewer);
+        assert_eq!(Role::from(""), Role::Viewer);
+        assert_eq!(Role::from("admin"), Role::Admin);
+        assert_eq!(
+            Role::from("roles/db-operator"),
+            Role::Custom("roles/db-operator".into())
+        );
+    }
+
+    #[test]
+    fn a_role_goes_over_the_wire_as_the_one_string_it_is() {
+        // One field, not two. A binding with a `role` *and* a `customRole` would
+        // be two fields with one meaning, and every one of those in this
+        // platform has eventually been read in the wrong order by something.
+        for role in [
+            Role::Viewer,
+            Role::Operator,
+            Role::Editor,
+            Role::Admin,
+            Role::Custom("roles/db-operator".into()),
+        ] {
+            let text = serde_json::to_string(&role).unwrap();
+            assert!(text.starts_with('"'), "{text}");
+            assert_eq!(serde_json::from_str::<Role>(&text).unwrap(), role);
+        }
+        assert_eq!(
+            serde_json::to_string(&Role::Custom("roles/x".into())).unwrap(),
+            "\"roles/x\""
+        );
+    }
+
+    #[test]
+    fn several_roles_add_up_like_bindings_always_have() {
+        // Nothing new: two bindings for one person have always been a union.
+        // Said out loud because it is the answer to "how do I give somebody two
+        // of these" — and because a system that resolved them in an order would
+        // be one nobody can predict.
+        let defined = [
+            role("roles/db", &[(Verb::Operate, &["instances"])]),
+            role("roles/store", &[(Verb::Write, &["volumes"])]),
+        ];
+        let bindings = vec![
+            Binding {
+                role: Role::Custom("roles/db".into()),
+                members: vec!["ada".into()],
+            },
+            Binding {
+                role: Role::Custom("roles/store".into()),
+                members: vec!["ada".into()],
+            },
+        ];
+        assert!(may("ada", &[], &bindings, Verb::Operate, "instances", &defined).is_ok());
+        assert!(may("ada", &[], &bindings, Verb::Write, "volumes", &defined).is_ok());
+        assert!(may("ada", &[], &bindings, Verb::Write, "instances", &defined).is_err());
+    }
+
+    #[test]
+    fn a_cell_operator_is_still_a_cell_operator() {
+        let defined = [role("roles/nichts", &[(Verb::Read, &["instances"])])];
+        let admins = vec!["ops".to_string()];
+        assert!(may("ops", &admins, &[], Verb::Administer, "nodes", &defined).is_ok());
+    }
+}

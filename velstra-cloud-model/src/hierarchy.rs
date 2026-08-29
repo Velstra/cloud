@@ -75,6 +75,52 @@ pub struct FolderStatus {
 
 pub type Folder = Resource<FolderSpec, FolderStatus>;
 
+/// A role the cell wrote down, as an object.
+///
+/// Here beside folders rather than in `authz` because it is the same kind of
+/// thing: something cell-wide that changes what a binding means. `authz` holds
+/// the *decision*; this holds the object the decision reads.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoleSpec {
+    pub display_name: String,
+    pub description: String,
+    /// What it lets somebody do. At least one grant, each naming at least one
+    /// collection — see [`crate::authz::CustomRole`] for why there is no
+    /// wildcard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<crate::authz::Grant>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoleStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+}
+
+pub type RoleObject = Resource<RoleSpec, RoleStatus>;
+
+impl Assigned for RoleSpec {}
+
+impl Observed for RoleStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+    fn self_owned(&self) -> bool {
+        true
+    }
+    fn written_by_the_platform(&self) -> bool {
+        true
+    }
+}
+
 /// Nobody is assigned a folder. It is a place in a tree, not a thing an agent
 /// runs, and the only party that ever writes one is a person.
 impl Assigned for FolderSpec {}

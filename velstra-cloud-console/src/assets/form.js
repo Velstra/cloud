@@ -140,7 +140,7 @@ const DERIVE = {
 };
 
 function fieldControl(form, f) {
-  const WIDE = ["lines", "refList", "textList", "ruleList", "diskList", "poolList", "listenerList"];
+  const WIDE = ["lines", "refList", "textList", "ruleList", "grantList", "diskList", "poolList", "listenerList"];
   const box = el("div.field" + (WIDE.includes(f.kind) ? ".wide" : ""));
   const id = "f-" + f.key.replace(/\./g, "-");
   form.boxes[f.key] = box;
@@ -396,6 +396,101 @@ function blankRule() {
 
 function ruleRemoteKind(rule) {
   return rule && rule.remote && Object.prototype.hasOwnProperty.call(rule.remote, "group") ? "group" : "cidr";
+}
+
+/// What a role grants: rows of `{verb, collections}`.
+///
+/// A verb means nothing without the collections it applies to, so it is one
+/// control and not two — the same argument `renderRuleList` makes about a
+/// security rule. Two lists side by side would let somebody assemble "write"
+/// from one row and "networks" from another and get a permission neither of them
+/// meant.
+///
+/// The collections are checkboxes over the ones this cell actually serves, read
+/// from the schema the page was built with. Not a text field: a collection typed
+/// slightly wrong is a permission nobody will ever hold, which on screen is
+/// indistinguishable from a permission that was never granted. And no "all" box,
+/// because a role that meant everything would be a second spelling of `admin`.
+function renderGrantList(form, f, host, setErr) {
+  if (!Array.isArray(form.values[f.key])) form.values[f.key] = [];
+  const grants = form.values[f.key];
+  clear(host);
+
+  const commit = () => {
+    form.values[f.key] = grants;
+    let bad = "";
+    if (!grants.length) bad = "a role grants something";
+    for (const g of grants) {
+      if (!Array.isArray(g.collections) || !g.collections.length) {
+        bad = "each grant names at least one collection";
+      }
+    }
+    setErr(bad);
+  };
+  const redraw = () => { renderGrantList(form, f, host, setErr); commit(); };
+
+  grants.forEach((grant, i) => {
+    const verb = el("select");
+    for (const v of GRANT_VERBS) {
+      verb.appendChild(el("option", { value: v.id, selected: grant.verb === v.id ? "" : null }, v.label));
+    }
+    verb.addEventListener("change", () => { grant.verb = verb.value; commit(); });
+
+    const boxes = el("div.checks");
+    if (!Array.isArray(grant.collections)) grant.collections = [];
+    for (const c of grantableCollections()) {
+      const on = grant.collections.includes(c.id);
+      const tick = el("input", { type: "checkbox", checked: on ? "" : null });
+      tick.addEventListener("change", () => {
+        if (tick.checked) {
+          if (!grant.collections.includes(c.id)) grant.collections.push(c.id);
+        } else {
+          grant.collections = grant.collections.filter((x) => x !== c.id);
+        }
+        commit();
+      });
+      boxes.appendChild(el("label.check", {}, tick, c.title));
+    }
+
+    host.appendChild(el("div.grant",
+      el("div.grantverb", verb),
+      boxes,
+      el("button.btn", { type: "button", onclick: () => { grants.splice(i, 1); redraw(); } }, "Remove"),
+    ));
+  });
+
+  host.appendChild(el("button.btn", {
+    type: "button",
+    onclick: () => { grants.push({ verb: "operate", collections: [] }); redraw(); },
+  }, "Add a grant"));
+
+  // Said under the control rather than in the help text, because it is the thing
+  // people get wrong: they grant `operate` and expect the screen to be readable.
+  host.appendChild(el("p.hint", {},
+    "Being able to act on something carries being able to see it. "
+    + "Reading everything is what `viewer` is for."));
+}
+
+/// The verbs a role may grant, and what each one means.
+///
+/// `administer` is deliberately absent. It is about *who may*, not about
+/// objects, so a role claiming to grant it on one collection would be a lie
+/// about what it does — and the one escalation a role system has to be closed
+/// against is somebody granting themselves the ability to grant.
+const GRANT_VERBS = [
+  { id: "read", label: "Read — look at them" },
+  { id: "operate", label: "Operate — start, stop, resize, attach, open a console" },
+  { id: "write", label: "Write — create and delete" },
+];
+
+/// The collections a grant may name.
+///
+/// From the schema this page was built with, so a cell that serves one more
+/// collection offers it here without anybody editing a list. The cell's own
+/// machinery — nodes, pools, roles themselves — is left out: those are a cell
+/// operator's, and a role granting them would be a role that cannot be honoured.
+function grantableCollections() {
+  return (SCHEMA || []).filter((c) => c.scope === "project");
 }
 
 function renderRuleList(form, f, host, setErr) {

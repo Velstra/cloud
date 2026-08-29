@@ -443,6 +443,55 @@ booted before.
 Creating outside a project is a cell operator's, so publishing is too. Anybody
 may boot from the catalogue; only the cell may put something in it.
 
+### Roles the cell writes down
+
+The four rungs say **how much** somebody may do, over a whole project. That is
+the right shape for most people and the wrong one for the case every operator
+eventually meets: somebody who may restart the database machines and must not
+touch the network. A fifth rung cannot express it — the difference is not how
+much but *what*.
+
+`roles` is a cell-wide collection. A role names verbs and the collections each
+one applies to:
+
+```
+POST /api/v1/roles
+{ "id": "db-operator",
+  "spec": { "displayName": "Database operator",
+            "description": "Restart the database machines, nothing else",
+            "grants": [{ "verb": "operate", "collections": ["instances"] }] } }
+```
+
+A binding then names it in the same field a rung goes in — one field, never two:
+
+```
+PATCH /api/v1/projects/p1
+{ "spec": { "bindings": [{ "role": "roles/db-operator",
+                           "members": ["ada@example.com"] }] } }
+```
+
+**Always narrower than a rung, by construction.** Every grant names at least one
+collection and there is no wildcard: somebody who wants *everything* has four
+rungs already, and a custom role that could mean it would be a second spelling of
+`admin` with no way to tell them apart in a list of who may do what.
+
+`administer` may not be granted this way. It is about *who may*, not about
+objects, so a role claiming to grant it on one collection would be a lie about
+what it does — and the one escalation a role system has to be closed against is
+somebody granting themselves the ability to grant.
+
+**Being able to act on something carries being able to see it.** A grant of
+`operate` on `instances` implies `read` on `instances` — anything else is a
+button that works above a screen that shows nothing. It does not imply reading
+anything else; reading everything is what `viewer` is for.
+
+Defining a role is a change to the cell, so it is a **cell operator's**. A tenant
+who could define one could define one granting more than they hold.
+
+Two bindings for one person add up, as they always have. A binding naming a role
+that does not exist is refused at the door; one whose role is deleted afterwards
+grants nothing, rather than refusing every request in the project.
+
 ### Folders: granting a role once instead of forty times
 
 `folders` is a cell-wide collection above projects. A folder holds a name, a

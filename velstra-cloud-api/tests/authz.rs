@@ -2471,3 +2471,241 @@ async fn publishing_from_something_that_is_not_there_says_so() {
         "wrong refusal: {refusal}"
     );
 }
+
+// ---- roles the cell wrote down ---------------------------------------------
+
+#[tokio::test]
+async fn a_role_the_cell_wrote_down_reaches_exactly_as_far_as_it_says() {
+    // The case a rung cannot express, end to end through the API: somebody who
+    // may restart the database machines and must not touch the network.
+    let api = cell().await;
+    api.create(
+        "",
+        "roles",
+        &json!({ "id": "db-operator", "spec": {
+            "display_name": "Database operator",
+            "grants": [{ "verb": "operate", "collections": ["instances"] }]
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("the cell writes down a role");
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "bindings": [
+            { "role": "roles/db-operator", "members": ["nina"] }
+        ]}}),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .expect("and grants it");
+
+    // Reading the machines: yes, because acting on them carries seeing them.
+    api.list_for(
+        "projects/p1",
+        "instances",
+        &velstra_cloud_api::Filter::none(),
+        &who("nina"),
+    )
+    .await
+    .expect("a role that may operate instances may see them");
+
+    // The network: nothing at all.
+    let refused = api
+        .list_for(
+            "projects/p1",
+            "networks",
+            &velstra_cloud_api::Filter::none(),
+            &who("nina"),
+        )
+        .await;
+    assert!(refused.is_err(), "a role reached past what it names");
+
+    // And not a rung by another name: no creating, anywhere.
+    let refused = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "neu", "spec": {
+                "image": "images/x", "vcpus": 1, "memory_mib": 512,
+                "root_disk_gib": 2, "ports": []
+            }}),
+            &who("nina"),
+        )
+        .await;
+    assert!(refused.is_err(), "an operate grant created something");
+}
+
+#[tokio::test]
+async fn a_binding_naming_a_role_that_is_not_there_is_refused_at_the_door() {
+    // The strict half of a deliberate pair. The read path is lenient — a
+    // `roles/…` nobody defined grants nothing, so a role deleted under a project
+    // does not refuse every request in it. Neither of those tells anybody about
+    // their typo. This is where they are told, while the tab is still open.
+    let api = cell().await;
+    let refusal = api
+        .patch(
+            &name("projects/p1"),
+            &json!({ "spec": { "bindings": [
+                { "role": "roles/gibt-es-nicht", "members": ["nina"] }
+            ]}}),
+            None,
+            &who(OPERATOR),
+        )
+        .await
+        .expect_err("a binding named a role that does not exist");
+    assert!(
+        refusal.to_string().contains("no role called"),
+        "wrong refusal: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_role_that_grants_nothing_in_particular_is_refused() {
+    // No wildcard, and no empty grant. A role that could mean *everything* would
+    // be a second spelling of `admin` with no way to tell them apart in a list
+    // of who may do what.
+    let api = cell().await;
+    for (what, spec) in [
+        ("no grants", json!({ "display_name": "Leer" })),
+        (
+            "a grant over nothing",
+            json!({ "grants": [{ "verb": "operate", "collections": [] }] }),
+        ),
+        (
+            "a collection that does not exist",
+            json!({ "grants": [{ "verb": "operate", "collections": ["maschinen"] }] }),
+        ),
+    ] {
+        let refused = api
+            .create("", "roles", &json!({ "id": "leer", "spec": spec }), &who(OPERATOR))
+            .await;
+        assert!(refused.is_err(), "{what} was accepted");
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_cannot_write_down_a_role() {
+    // Somebody who could define one could define one granting more than they
+    // hold, and the whole point of keeping `Administer` apart is that an editor
+    // cannot widen themselves.
+    let api = cell().await;
+    let refused = api
+        .create(
+            "",
+            "roles",
+            &json!({ "id": "meine", "spec": {
+                "grants": [{ "verb": "write", "collections": ["instances"] }]
+            }}),
+            &who(ADA),
+        )
+        .await;
+    assert!(refused.is_err(), "a tenant wrote down a role");
+}
+
+#[tokio::test]
+async fn a_role_granted_on_a_folder_reaches_down_like_a_rung_does() {
+    // The two features meet here, and it is the arrangement somebody would
+    // actually build: one role, granted once, over an estate.
+    let api = cell().await;
+    api.create(
+        "",
+        "roles",
+        &json!({ "id": "db-operator", "spec": {
+            "grants": [{ "verb": "operate", "collections": ["instances"] }]
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "",
+        "folders",
+        &json!({ "id": "kunden", "spec": {
+            "bindings": [{ "role": "roles/db-operator", "members": ["nina"] }]
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "parent": "kunden" }}),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+
+    api.list_for(
+        "projects/p1",
+        "instances",
+        &velstra_cloud_api::Filter::none(),
+        &who("nina"),
+    )
+    .await
+    .expect("a role granted on a folder did not reach the project");
+    assert!(
+        api.list_for(
+            "projects/p1",
+            "networks",
+            &velstra_cloud_api::Filter::none(),
+            &who("nina"),
+        )
+        .await
+        .is_err(),
+        "inheriting a role widened it"
+    );
+}
+
+#[tokio::test]
+async fn listing_asks_about_what_is_being_listed_and_not_about_the_project() {
+    // `GET /projects/p1/instances` authorises Read on `projects/p1`. Asking that
+    // as a question about *projects* was harmless while every role was a rung —
+    // a viewer reads everything, so the answer was the same either way.
+    //
+    // It stops being harmless the moment a role can name collections. Somebody
+    // granted `operate` on `instances` could not list them: the question asked
+    // was whether they may read the project object, and their role says nothing
+    // about projects. A permission that reads as "you may not" when the person
+    // holds exactly the thing they are using is the worst kind — it looks like
+    // the grant never happened.
+    let api = cell().await;
+    api.create(
+        "",
+        "roles",
+        &json!({ "id": "nur-maschinen", "spec": {
+            "grants": [{ "verb": "read", "collections": ["instances"] }]
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "bindings": [
+            { "role": "roles/nur-maschinen", "members": ["nina"] }
+        ]}}),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+
+    api.list_for(
+        "projects/p1",
+        "instances",
+        &velstra_cloud_api::Filter::none(),
+        &who("nina"),
+    )
+    .await
+    .expect("the list asked about the project instead of the instances");
+
+    // And the project object itself is still not theirs to read: the grant names
+    // instances, and nothing else.
+    assert!(
+        api.get(&name("projects/p1"), &who("nina")).await.is_err(),
+        "a grant over instances read the project"
+    );
+}
