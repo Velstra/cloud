@@ -84,6 +84,41 @@ impl PortController {
         }
     }
 
+    /// A port the platform minted for a guest that is no longer there.
+    ///
+    /// Nobody asked for this port and nobody knows its name: it was made so that
+    /// a customer would not have to build a network, a subnet and a port before
+    /// they could have a machine. Which means that when the guest goes, there is
+    /// nothing left in the world that would ever think to remove it. Six of them
+    /// accumulated in one project over an afternoon, each holding an address off
+    /// the subnet, and each — until the datapath learned to take things away —
+    /// leaving a gateway on a bridge that outlived its network.
+    ///
+    /// Only marked ports, and only when the guest is really gone. A port
+    /// somebody made themselves is theirs for as long as they want it, empty or
+    /// not; and a port whose guest is merely *being deleted* still has a node
+    /// tearing the guest down around it.
+    ///
+    /// Returns whether it acted, so the assignment below is skipped on a pass
+    /// that has already written.
+    async fn collect_if_abandoned(&self, name: &str, port: &Port) -> Result<bool> {
+        let Some(guest) = port
+            .meta
+            .labels
+            .get(velstra_cloud_model::resources::MINTED_FOR)
+        else {
+            return Ok(false);
+        };
+        if port.meta.is_deleting() || self.instances.get(guest).await.is_some() {
+            return Ok(false);
+        }
+        self.ports
+            .delete(name, port.meta.revision, &Writer::controller(WHO))
+            .await?;
+        info!(port = name, guest, "the guest is gone; letting its wire go");
+        Ok(true)
+    }
+
     /// The release guard, in the same three steps every other one takes.
     ///
     /// Returns whether it did something, so the assignment below is skipped on
@@ -188,6 +223,10 @@ impl Reconciler for PortController {
         // Before the assignment, because the guard has to be on before any node
         // can be told to program the port.
         if self.guard(name, port).await? {
+            return Ok(());
+        }
+
+        if self.collect_if_abandoned(name, port).await? {
             return Ok(());
         }
 
@@ -498,5 +537,137 @@ mod tests {
             ports.get(PORT).await.unwrap().is_none(),
             "a port nobody ever carried could not be deleted"
         );
+    }
+}
+
+#[cfg(test)]
+mod a_wire_nobody_will_ever_come_back_for {
+    use std::sync::Arc;
+
+    use velstra_cloud_model::{
+        meta::{Meta, Placement, ResourceName},
+        resources::{Resource, MINTED_FOR},
+    };
+    use velstra_cloud_store::{MemoryStore, Store};
+
+    use super::*;
+
+    const PORT: &str = "projects/p1/ports/port-abc";
+    const GUEST: &str = "projects/p1/instances/eine";
+
+    fn marked(name: &str, guest: Option<&str>) -> Meta {
+        let mut meta = Meta::new(
+            ResourceName::parse(name).unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        );
+        if let Some(guest) = guest {
+            meta.labels.insert(MINTED_FOR.to_string(), guest.to_string());
+        }
+        meta
+    }
+
+    async fn cell() -> (
+        PortController,
+        TypedStore<PortSpec, PortStatus>,
+        TypedStore<InstanceSpec, InstanceStatus>,
+    ) {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let ports = TypedStore::new(store.clone(), "cell-1", "ports");
+        let instances = TypedStore::new(store.clone(), "cell-1", "instances");
+        (
+            PortController::new(
+                ports.clone(),
+                velstra_cloud_store::Cached::start(
+                    instances.clone(),
+                    store.clone(),
+                    velstra_cloud_store::prefix_for("cell-1", "instances"),
+                ),
+                "cell-1",
+            ),
+            ports,
+            instances,
+        )
+    }
+
+    async fn a_port(ports: &TypedStore<PortSpec, PortStatus>, guest: Option<&str>) -> Port {
+        let object = Resource::new(
+            marked(PORT, guest),
+            PortSpec {
+                network: "projects/p1/networks/default".into(),
+                subnet: "projects/p1/subnets/default".into(),
+                ..Default::default()
+            },
+            PortStatus::default(),
+        );
+        ports
+            .create(&object, &Writer::controller("test"))
+            .await
+            .unwrap();
+        // With its guard on, as the first pass puts it.
+        let mut next = ports.get(PORT).await.unwrap().unwrap();
+        next.meta.add_finalizer(NODE_RELEASE_FINALIZER);
+        ports.update(&next, &Writer::controller("test")).await.unwrap();
+        ports.get(PORT).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_minted_port_goes_when_its_guest_does() {
+        // Nobody asked for this port and nobody knows its name — it exists so a
+        // customer would not have to build a network, a subnet and a port before
+        // they could have a machine. Which means when the guest goes there is
+        // nothing left in the world that would think to remove it. Six of them
+        // piled up in one project over an afternoon of testing, each holding an
+        // address, and each leaving a gateway on a bridge that outlived its
+        // network.
+        let (controller, ports, _instances) = cell().await;
+        let port = a_port(&ports, Some(GUEST)).await;
+
+        controller.reconcile(PORT, Some(&port)).await.unwrap();
+
+        let after = ports.get(PORT).await.unwrap();
+        assert!(
+            after.is_none_or(|p| p.meta.is_deleting()),
+            "a wire nobody will ever come back for was left holding an address"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_minted_port_whose_guest_is_still_there_is_left_alone() {
+        let (controller, ports, instances) = cell().await;
+        let port = a_port(&ports, Some(GUEST)).await;
+        instances
+            .create(
+                &Resource::new(
+                    marked(GUEST, None),
+                    InstanceSpec {
+                        ports: vec![PORT.to_string()],
+                        ..Default::default()
+                    },
+                    InstanceStatus::default(),
+                ),
+                &Writer::controller("test"),
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile(PORT, Some(&port)).await.unwrap();
+
+        let after = ports.get(PORT).await.unwrap().expect("the port was removed");
+        assert!(!after.meta.is_deleting());
+    }
+
+    #[tokio::test]
+    async fn a_port_somebody_made_themselves_is_theirs_empty_or_not() {
+        // The reason the collection is keyed on the mark and not on "is anything
+        // using it": a port made deliberately — for an address that has to
+        // outlive the machine — is unused for exactly as long as its owner
+        // wants, and removing it is the one thing they cannot undo.
+        let (controller, ports, _instances) = cell().await;
+        let port = a_port(&ports, None).await;
+
+        controller.reconcile(PORT, Some(&port)).await.unwrap();
+
+        let after = ports.get(PORT).await.unwrap().expect("somebody's port was removed");
+        assert!(!after.meta.is_deleting());
     }
 }

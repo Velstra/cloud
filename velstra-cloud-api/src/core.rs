@@ -1586,7 +1586,7 @@ impl Api {
             self.settle_network(&mut spec).await?;
         }
         if kind == "instances" {
-            self.settle_default_network(parent, body.get("spec"), &mut spec)
+            self.settle_default_network(&name, parent, body.get("spec"), &mut spec)
                 .await?;
         }
         if kind == "volumes" {
@@ -1985,6 +1985,27 @@ impl Api {
                 // An object does not hold itself, which matters for `projects`,
                 // whose `parent` is a reference field.
                 if name == wanted {
+                    continue;
+                }
+                // An object the platform made *for* this one is not a reason to
+                // keep it: deleting a guest is a deletion of its own disks'
+                // attachments too, and the disk controller removes them.
+                //
+                // Without this, a machine with a disk could never be deleted at
+                // all. `spec.volumes` exists so that nobody has to know
+                // attachments are a thing — and the answer to
+                //
+                //   "…is still named by projects/p1/attachments/db-data.
+                //    Delete those first, or change what they point at."
+                //
+                // is a step the customer was deliberately spared at the other
+                // end. Found live, on the first machine created with a disk that
+                // somebody then tried to delete.
+                if document["meta"]["labels"]
+                    [velstra_cloud_model::resources::MINTED_FOR]
+                    .as_str()
+                    == Some(wanted.as_str())
+                {
                     continue;
                 }
                 let spec = document.get("spec").cloned().unwrap_or(Value::Null);
@@ -3793,9 +3814,46 @@ impl Api {
     /// is counted over what a project holds, and these are not what a customer
     /// meant to spend it on.
     async fn make(&self, name: &str, kind: &str, spec: Value) -> ApiResult<()> {
+        self.make_marked(None, name, kind, spec).await
+    }
+
+    /// The same, marked as made *for* one object.
+    ///
+    /// The mark is what lets it be collected again. A port minted for a guest is
+    /// the platform's own object: nobody asked for it, nobody knows its name,
+    /// and when the guest goes there is nothing left that would ever think to
+    /// remove it. Six of them accumulated in one project over an afternoon of
+    /// testing, each holding an address, and — until the datapath learned to
+    /// take things away — each leaving a gateway behind on a bridge.
+    ///
+    /// Same label the disk controller uses, for the same reason: only work this
+    /// platform made is work this platform may remove.
+    async fn make_for(
+        &self,
+        owner: &ResourceName,
+        name: &str,
+        kind: &str,
+        spec: Value,
+    ) -> ApiResult<()> {
+        self.make_marked(Some(owner), name, kind, spec).await
+    }
+
+    async fn make_marked(
+        &self,
+        owner: Option<&ResourceName>,
+        name: &str,
+        kind: &str,
+        spec: Value,
+    ) -> ApiResult<()> {
         let parsed = ResourceName::parse(name)?;
-        let meta = serde_json::to_value(Meta::new(parsed, self.inner.placement.clone()))
-            .expect("meta always serialises");
+        let mut object = Meta::new(parsed, self.inner.placement.clone());
+        if let Some(owner) = owner {
+            object.labels.insert(
+                velstra_cloud_model::resources::MINTED_FOR.to_string(),
+                owner.to_string(),
+            );
+        }
+        let meta = serde_json::to_value(object).expect("meta always serialises");
         match self.collection(kind)?.create(meta, spec).await {
             Ok(_) => Ok(()),
             // Two guests created at once both find no default network and both
@@ -3828,6 +3886,7 @@ impl Api {
     /// carries the meaning.
     async fn settle_default_network(
         &self,
+        guest: &ResourceName,
         parent: &str,
         sent: Option<&Value>,
         spec: &mut Value,
@@ -3862,7 +3921,7 @@ impl Api {
                     )
                     .at("spec.networks"));
                 };
-                minted.push(Value::String(self.mint_a_port_on(parent, network).await?));
+                minted.push(Value::String(self.mint_a_port_on(guest, parent, network).await?));
             }
             spec["ports"] = Value::Array(minted);
             // Consumed: what gets stored is `ports`. Two fields describing one
@@ -3915,7 +3974,8 @@ impl Api {
         }
 
         let port = format!("{parent}/ports/{}", minted("ports"));
-        self.make(
+        self.make_for(
+            guest,
             &port,
             "ports",
             json!({ "network": network, "subnet": subnet, "security_groups": [] }),
@@ -3931,7 +3991,12 @@ impl Api {
     /// for objects the platform decided on — so a name from somewhere else would
     /// mint a port in a stranger's project on their behalf, which is the whole
     /// hole. Checked here rather than trusted.
-    async fn mint_a_port_on(&self, parent: &str, network: &str) -> ApiResult<String> {
+    async fn mint_a_port_on(
+        &self,
+        guest: &ResourceName,
+        parent: &str,
+        network: &str,
+    ) -> ApiResult<String> {
         if !network.starts_with(&format!("{parent}/networks/")) {
             return Err(ApiError::invalid(format!(
                 "`{network}` is not a network of this project. A guest can only be put on a \
@@ -3974,7 +4039,8 @@ impl Api {
         };
 
         let port = format!("{parent}/ports/{}", minted("ports"));
-        self.make(
+        self.make_for(
+            guest,
             &port,
             "ports",
             json!({
