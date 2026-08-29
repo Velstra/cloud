@@ -165,3 +165,83 @@ async fn a_node_reporting_another_nodes_object_is_refused_by_the_api() {
         "node-a wrote node-b's object through the API: {outcome:?}"
     );
 }
+
+/// A pool agent reads its own object over HTTP, and its own volumes.
+///
+/// The half that had no test at all, and it showed twice on real machines: the
+/// pool object was read off a store handle that in `--api` mode is a
+/// placeholder, so it came back "no such pool"; and once that was fixed, the
+/// read was built as a path where a name belongs and the API answered `400 empty
+/// segment in "/api/v1/pools"`. Neither is visible to a test whose agent talks
+/// to a store — which is every other pool test in this crate.
+#[tokio::test]
+async fn a_pool_reads_its_own_object_and_its_share_through_the_api() {
+    let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let identity = IdentityStore::new(store.clone(), "eu-central", "cell-1");
+    let operator: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::new([(
+        "optok".to_string(),
+        Identity::new(OPERATOR),
+    )]));
+    let verifier: Arc<dyn TokenVerifier> =
+        Arc::new(StoreTokenVerifier::new(identity).with_fallback(operator));
+    let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+        .with_cell_admins(vec![OPERATOR.to_string()]);
+
+    let created = api
+        .create(
+            "",
+            "pools",
+            &json!({ "id": "nvme", "spec": { "accepting": true } }),
+            &Identity::new(OPERATOR),
+        )
+        .await
+        .expect("the operator registers a pool");
+    let token = created
+        .pool_token
+        .expect("a pool registration mints a token");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = api.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, velstra_cloud_api::server(served)).await;
+    });
+    let base = format!("http://{addr}");
+
+    let client = ApiCell::for_pool(&base, &token, "nvme").expect("an api client");
+
+    // Its own object, by name. This is the read that decides whether the pool
+    // reports at all: without it the pass returns early on the rule that a pool
+    // nobody registered is not an agent's to invent.
+    let mine = velstra_cloud_nodeagent::cell::PoolReader::pool(&client, "nvme")
+        .await
+        .expect("the pool reads its own object")
+        .expect("the pool it was told it is");
+    assert_eq!(mine.meta.name.id(), "nvme");
+
+    // And it can say something about it, as itself.
+    let mut next = mine.clone();
+    next.status.backend = "lvm".into();
+    next.status.capacity_gib = 500;
+    next.status.observed_generation = mine.meta.generation;
+    let value = serde_json::to_value(&next).unwrap();
+    let outcome = client
+        .write_status("pools", &value, &Writer::agent("nvme"))
+        .await;
+    assert!(
+        matches!(outcome, SinkOutcome::Wrote),
+        "the pool could not report its own status: {outcome:?}"
+    );
+
+    let after = api
+        .get(
+            &velstra_cloud_model::meta::ResourceName::parse("pools/nvme").unwrap(),
+            &Identity::new(OPERATOR),
+        )
+        .await
+        .unwrap();
+    // `api.get` answers below the wire layer, so the fields are the model's own
+    // spelling — `capacity_gib`, not `capacityGib`.
+    assert_eq!(after["status"]["backend"], "lvm");
+    assert_eq!(after["status"]["capacity_gib"], 500);
+}
