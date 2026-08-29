@@ -535,6 +535,17 @@ pub enum SourceAction {
     },
     /// Stop the transfer and keep the guest. Only ever safe under pre-copy.
     Cancel { instance: String },
+    /// Stop the guest here so it can be started there. `Reboot` only.
+    ///
+    /// A cold move is not a transfer and has no receiver to send to: the source
+    /// stops the guest, the destination starts it from the same disk, and the
+    /// guest reads whatever CPUID it is given like any freshly booted machine.
+    /// That is what makes it work across processors a live move cannot cross.
+    ///
+    /// The handover is the same one every mode uses — the source lets go once
+    /// the guest is no longer running here, and only then does the destination
+    /// claim it — so nothing about the two-copies invariant changes.
+    HandOver { instance: String },
 }
 
 /// The destination's half.
@@ -563,7 +574,12 @@ pub fn reconcile_destination(
     // Finished, or asked to go away: nothing should be left listening. A
     // receiver kept alive holds the guest's memory reservation on a node that
     // is not running it.
-    if migration.meta.is_deleting() || arrived {
+    // Nothing is going to arrive over a wire: a cold move stops the guest on the
+    // source and starts it here, and there is no memory to receive. A receiver
+    // opened for one would hold this node's memory for a transfer that is never
+    // going to come, and the source — which refuses to send under `Reboot` —
+    // would report a failure for as long as the migration stayed open.
+    if migration.meta.is_deleting() || arrived || migration.spec.mode == MigrationMode::Reboot {
         return if receiver_listening {
             vec![DestinationAction::TearDownReceiver {
                 instance: migration.spec.instance.clone(),
@@ -601,6 +617,15 @@ pub fn reconcile_source(migration: &Migration, here: bool) -> Vec<SourceAction> 
     // there is no flag to set.
     if !here {
         return Vec::new();
+    }
+    // A cold move waits for nothing. There is no receiver to be ready and no URL
+    // to send to: this node stops the guest, and the same handover every other
+    // mode uses does the rest — the source lets go once the guest is not running
+    // here, and the destination claims it only then.
+    if migration.spec.mode == MigrationMode::Reboot {
+        return vec![SourceAction::HandOver {
+            instance: migration.spec.instance.clone(),
+        }];
     }
     let Some(url) = migration.status.receiver_url.as_ref() else {
         return Vec::new();
