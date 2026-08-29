@@ -754,6 +754,27 @@ pub struct NodeStatus {
     /// has no business on the machines a cell is made of.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub console_endpoint: String,
+    /// Whether this node's guests keep their root disks somewhere every node in
+    /// the cell can reach.
+    ///
+    /// Reported by the agent, from what it was told, because nothing on a
+    /// machine can work out whether `/var/lib/velstra` is a local filesystem or
+    /// an NFS mount every other node has too — the same reason
+    /// `--migration-address` is stated rather than guessed at.
+    ///
+    /// **It is what makes moving a guest possible at all.** A live migration
+    /// transfers memory; it does not transfer disks. A guest whose root disk is
+    /// a file on the machine it is running on cannot arrive anywhere, and
+    /// nothing in this platform copies one — the destination's receiver refuses
+    /// to start with `has no root disk on this node`, once a pass, for ever.
+    /// Found by standing two nodes up and asking for a move.
+    ///
+    /// False by default, which is the safe direction and the true one for every
+    /// cell installed by `quickstart`: the state directory is local. A migration
+    /// is then refused with a sentence saying so, rather than accepted and left
+    /// to hang.
+    #[serde(default)]
+    pub shared_state: bool,
     /// Which virtual machine monitor this node runs its guests under.
     ///
     /// `qemu` or `cloud-hypervisor`, reported rather than configured from here:

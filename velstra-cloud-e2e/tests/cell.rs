@@ -56,6 +56,20 @@ const TOKEN: &str = "e2e-token";
 /// Everything a cell is made of, sharing one store — which is the point: there
 /// is one place state lives, and every component reads and writes it under its
 /// own identity.
+/// An agent on a cell whose machines share one state directory.
+///
+/// The whole of this file's migration story depends on it: a move transfers
+/// memory and not disks, so a guest whose root disk is private to its
+/// machine cannot arrive anywhere and `may_migrate` refuses outright. These
+/// are the machines where it can — and the case where it cannot has its own
+/// test in `evacuation`, which is where the cost of getting it wrong is a
+/// maintenance window that never finishes.
+fn shared(node_id: &str) -> AgentConfig {
+    let mut config = AgentConfig::new(node_id, REGION, CELL);
+    config.shared_state = true;
+    config
+}
+
 struct Cell {
     store: Arc<dyn Store>,
     address: String,
@@ -104,7 +118,7 @@ impl Cell {
         let vmm = Arc::new(network.host(node_id));
         let agent = Agent::new(
             store.clone(),
-            AgentConfig::new(node_id, REGION, CELL),
+            shared(node_id),
             vmm.clone(),
             Arc::new(FakeDatapath::new()),
         );
@@ -135,7 +149,7 @@ impl Cell {
         let vmm = Arc::new(self.network.host(node_id));
         let agent = Agent::new(
             self.store.clone(),
-            AgentConfig::new(node_id, REGION, CELL),
+            shared(node_id),
             vmm.clone(),
             Arc::new(FakeDatapath::new()),
         );
@@ -238,7 +252,14 @@ impl Cell {
                 cpu_baseline: None,
                 gateway: false,
             },
-            NodeStatus::default(),
+            NodeStatus {
+                // One state directory between these machines. It is what makes a
+                // guest movable at all — a migration transfers memory and not
+                // disks — and it is the arrangement this whole file's migration
+                // tests are written against.
+                shared_state: true,
+                ..NodeStatus::default()
+            },
         );
         self.nodes
             .create(

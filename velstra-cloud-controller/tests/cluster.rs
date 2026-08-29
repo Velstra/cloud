@@ -152,6 +152,7 @@ fn node(id: &str) -> Node {
             gateway: false,
         },
         NodeStatus {
+            shared_state: false,
             vmm: "qemu".into(),
             fetching: Vec::new(),
             pci_devices: Vec::new(),

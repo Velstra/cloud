@@ -315,6 +315,10 @@ mod tests {
                     gateway: false,
                 },
                 NodeStatus {
+                    // Both machines on one state directory. Emptying a node is
+                    // only possible where a guest can leave its machine at all,
+                    // and what happens when it cannot has its own test below.
+                    shared_state: true,
                     vmm: "qemu".into(),
             fetching: Vec::new(),
                     capacity: Capacity {
@@ -540,6 +544,41 @@ mod tests {
         assert!(
             f.asked().await.is_empty(),
             "a guest holding a PCI device was asked to migrate"
+        );
+    }
+    #[tokio::test]
+    async fn is_not_emptied_by_asking_for_the_impossible() {
+        // The finding this whole rule came from, at the place it would have hurt
+        // most. A guest's root disk is a file on the machine it runs on, and
+        // moving a guest transfers memory and not disks — so on an ordinary
+        // cell, every migration this controller creates is one the destination
+        // can never complete. The receiver answers `has no root disk on this
+        // node`, once a pass, for ever.
+        //
+        // Which means an operator opening a maintenance window on a real cell
+        // would have got: a node that never empties, one migration per guest
+        // that never finishes, and nothing at all said about why. Emptying a
+        // machine is the moment somebody is *waiting*, usually with a
+        // maintenance window booked around it.
+        //
+        // Nothing is asked for now. The guest stays, and the reason is
+        // answerable at `:explainMigration` like every other refusal.
+        let f = fixture(false, false).await;
+        for id in ["node-a", "node-b"] {
+            let mut node = f.nodes.get(&format!("nodes/{id}")).await.unwrap().unwrap();
+            node.status.shared_state = false;
+            f.nodes
+                .update(&node, &Writer::agent(id))
+                .await
+                .unwrap();
+        }
+        declare(&f, true).await;
+
+        f.pass().await;
+        assert_eq!(
+            f.asked().await,
+            Vec::<String>::new(),
+            "a migration was created that no destination could ever complete"
         );
     }
 }

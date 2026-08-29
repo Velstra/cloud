@@ -616,6 +616,10 @@ async fn explain_placement_answers_with_the_chain_of_rejections() {
             gateway: false,
         },
         NodeStatus {
+            // Like the fixture's other machines: one state directory between
+            // them, so what these tests are about is what they say they are
+            // about — capacity, an image, a CPU — and not the disk rule.
+            shared_state: true,
             vmm: "qemu".into(),
             fetching: Vec::new(),
             pci_devices: Vec::new(),
@@ -1171,6 +1175,12 @@ async fn two_nodes(h: &Harness) {
             },
             NodeStatus {
                 vmm: "qemu".into(),
+                // The fixture's two machines share one state directory, which is
+                // what makes a guest movable between them at all. Every
+                // migration test in this file is about a refusal downstream of
+                // that; the disk rule itself is tested in the model, where the
+                // node objects are built by hand.
+                shared_state: true,
             fetching: Vec::new(),
                 pci_devices: Vec::new(),
                 cpu: Some(a_cpu()),
@@ -1217,6 +1227,10 @@ async fn two_nodes(h: &Harness) {
             gateway: false,
         },
         NodeStatus {
+            // Like the fixture's other machines: one state directory between
+            // them, so what these tests are about is what they say they are
+            // about — capacity, an image, a CPU — and not the disk rule.
+            shared_state: true,
             vmm: "qemu".into(),
             fetching: Vec::new(),
             pci_devices: Vec::new(),
@@ -1623,6 +1637,10 @@ async fn a_destination_without_the_image_is_refused_with_the_sentence() {
             gateway: false,
         },
         NodeStatus {
+            // Like the fixture's other machines: one state directory between
+            // them, so what these tests are about is what they say they are
+            // about — capacity, an image, a CPU — and not the disk rule.
+            shared_state: true,
             vmm: "qemu".into(),
             fetching: Vec::new(),
             pci_devices: Vec::new(),
@@ -2460,6 +2478,10 @@ async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reaso
             gateway: false,
         },
         NodeStatus {
+            // Like the fixture's other machines: one state directory between
+            // them, so what these tests are about is what they say they are
+            // about — capacity, an image, a CPU — and not the disk rule.
+            shared_state: true,
             vmm: "qemu".into(),
             fetching: Vec::new(),
             devices: vec![

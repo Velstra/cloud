@@ -184,6 +184,7 @@ async fn seed(h: &Harness) {
                 ..Default::default()
             },
             NodeStatus {
+                shared_state: false,
                 vmm: "qemu".into(),
             fetching: Vec::new(),
                 capacity: Capacity {

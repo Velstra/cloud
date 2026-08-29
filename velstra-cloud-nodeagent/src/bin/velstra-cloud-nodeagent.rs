@@ -149,6 +149,21 @@ struct Args {
     #[arg(long)]
     migration_address: Option<String>,
 
+    /// This machine's state directory is storage every node in the cell reaches.
+    ///
+    /// Stated rather than guessed at, like `--migration-address` and for a
+    /// stronger reason: nothing on a machine can tell whether
+    /// `/var/lib/velstra` is a local filesystem or one mount of an NFS export
+    /// that every other node has too, and being wrong about it is a guest
+    /// started twice on two machines over the same disk.
+    ///
+    /// It is what makes moving a guest possible. A migration transfers memory
+    /// and not disks, so a guest whose root disk is private to one machine
+    /// cannot arrive anywhere — `may_migrate` refuses the move and says so
+    /// rather than leaving it to hang.
+    #[arg(long)]
+    shared_state: bool,
+
     /// The first port a receiver may bind. One arriving guest needs one port.
     #[arg(long, default_value = "4900")]
     migration_port_first: u16,
@@ -445,6 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = AgentConfig::new(&args.node, &args.region, &args.cell);
     config.resync = Duration::from_secs(args.resync_secs);
+    config.shared_state = args.shared_state;
     let agent = match &args.api {
         Some(url) => {
             let token = match &args.api_token_file {

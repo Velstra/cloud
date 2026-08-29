@@ -80,6 +80,10 @@ impl Agent {
         next.status.allocated = allocated;
         next.status.agent_version = self.config.agent_version.clone();
         next.status.console_endpoint = self.config.console_endpoint.clone();
+        // Reported like everything else about this machine, so a controller
+        // deciding whether a guest can move reads a fact rather than a
+        // configuration file it has no access to.
+        next.status.shared_state = self.config.shared_state;
         next.status.last_heartbeat = Timestamp::now();
         // What this machine holds, so that anybody who needs to know which
         // nodes have an image can work it out from these reports rather than

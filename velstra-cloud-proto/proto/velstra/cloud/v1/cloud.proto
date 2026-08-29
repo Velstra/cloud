@@ -345,6 +345,11 @@ message NodeStatus {
   // Images on their way in: a partial copy on the node's disk. Without it an
   // image had two visible states, here or not, while a gigabyte takes minutes.
   repeated string fetching = 14;
+  // Whether this node's guests keep their root disks somewhere every node in the
+  // cell reaches. Told to the agent, never worked out: nothing on a machine can
+  // tell a local filesystem from one mount of a shared one. It is what makes
+  // moving a guest possible — a migration transfers memory and not disks.
+  bool shared_state = 15;
 }
 
 // One PCI device, as the node holding it sees it.
