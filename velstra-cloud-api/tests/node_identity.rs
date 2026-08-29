@@ -369,3 +369,66 @@ async fn a_node_may_read_the_machine_room_it_is_a_machine_in() {
         .expect_err("a node read the cell's accounts");
     assert_eq!(refusal.code, Code::PermissionDenied);
 }
+
+#[tokio::test]
+async fn a_pool_gets_a_token_of_its_own() {
+    // Until it did, a pool could only run on the control plane's own machine.
+    // Its agent read the cell through the API — that half was built — and wrote
+    // straight to the store, so a machine with no etcd had nothing to write to.
+    // Set up a second box as `pool + hypervisor`, which is what the wizard
+    // offers, and the unit died with `Backend("invalid uri: empty string")`.
+    let (api, _store) = cell();
+    let created = api
+        .create(
+            "",
+            "pools",
+            &json!({ "id": "local-2", "spec": { "accepting": true }}),
+            &who(OPERATOR),
+        )
+        .await
+        .expect("an operator registers a pool");
+    let token = created
+        .pool_token
+        .expect("registering a pool mints a token");
+
+    let identity = api
+        .verifier()
+        .verify(&token)
+        .await
+        .expect("the pool's token authenticates");
+    assert_eq!(
+        identity.subject, "pool:local-2",
+        "a pool is not a node, and a refusal in a log should say which was refused"
+    );
+    // The same machinery either way: an agent writes what it owns, and ownership
+    // is by name.
+    assert_eq!(
+        velstra_cloud_api::sessions::agent_node(&identity),
+        Some("local-2")
+    );
+}
+
+#[tokio::test]
+async fn a_pools_token_is_not_a_nodes() {
+    // Both are minted the same way and both carry an `agent:` scope, so the one
+    // thing worth checking is that they are not interchangeable *as names*: a
+    // pool called `node-a` must not be able to write node-a's status.
+    let (api, _store) = cell();
+    let node = register_node(&api, "node-a").await;
+    let created = api
+        .create(
+            "",
+            "pools",
+            &json!({ "id": "node-a", "spec": { "accepting": true }}),
+            &who(OPERATOR),
+        )
+        .await
+        .unwrap();
+    let pool = created.pool_token.unwrap();
+    assert_ne!(node, pool, "one token was minted for two agents");
+
+    let a = api.verifier().verify(&node).await.unwrap();
+    let b = api.verifier().verify(&pool).await.unwrap();
+    assert_eq!(a.subject, "node:node-a");
+    assert_eq!(b.subject, "pool:node-a");
+}

@@ -36,7 +36,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use velstra_cloud_model::{
     identity::{
-        Credential, CredentialSpec, CredentialStatus, NodeCredential, NodeCredentialSpec,
+        AgentKind, Credential, CredentialSpec, CredentialStatus, NodeCredential, NodeCredentialSpec,
         NodeCredentialStatus, SESSION_LIFETIME_MS, SessionSpec, SessionStatus, User, UserSpec,
         UserStatus, check_password_strength, hash_password, new_node_token, new_session_token,
         session_is_live, token_digest, verify_password,
@@ -299,6 +299,21 @@ impl IdentityStore {
     /// itself may never write, in a collection with no route — which is what
     /// makes it a credential the node cannot rotate.
     pub async fn mint_node_credential(&self, node: &str) -> ApiResult<String> {
+        self.mint_agent_credential(node, AgentKind::Node).await
+    }
+
+    /// The same, for a storage pool.
+    ///
+    /// A pool needs one for the same reason a node does, and until it had one it
+    /// could not run anywhere but on the control plane's own machine: the agent
+    /// wrote straight to the store, and a machine with no etcd has no store to
+    /// write to. Reading through the API it already did; authenticating is what
+    /// was missing.
+    pub async fn mint_pool_credential(&self, pool: &str) -> ApiResult<String> {
+        self.mint_agent_credential(pool, AgentKind::Pool).await
+    }
+
+    async fn mint_agent_credential(&self, node: &str, kind: AgentKind) -> ApiResult<String> {
         let token = new_node_token();
         let now = Self::now();
         let credential = NodeCredential {
@@ -308,6 +323,7 @@ impl IdentityStore {
             ),
             spec: NodeCredentialSpec {
                 node: node.to_string(),
+                kind,
                 issued_at: now,
             },
             status: NodeCredentialStatus::default(),
@@ -319,7 +335,7 @@ impl IdentityStore {
             )
             .await
             .map_err(store_error)?;
-        tracing::info!(node, "minted a per-node agent token");
+        tracing::info!(agent = node, kind = kind.subject_prefix(), "minted a per-agent token");
         Ok(token)
     }
 
@@ -402,7 +418,10 @@ impl IdentityStore {
             ));
         };
         let node = credential.spec.node;
-        let mut identity = Identity::new(format!("node:{node}"));
+        // `node:` or `pool:` — the same machinery either way (an agent writes
+        // what it owns, and ownership is by name), but a refusal in a log should
+        // say which kind was refused.
+        let mut identity = Identity::new(format!("{}:{node}", credential.spec.kind.subject_prefix()));
         identity.scopes.push(format!("{AGENT_SCOPE_PREFIX}{node}"));
         Ok(identity)
     }
