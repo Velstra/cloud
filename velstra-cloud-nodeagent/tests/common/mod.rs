@@ -104,6 +104,7 @@ pub async fn create_migration(
     instance: &str,
     from: &str,
     to: &str,
+    mode: velstra_cloud_model::migration::MigrationMode,
     status: MigrationStatus,
 ) -> Migration {
     let migration = Resource::new(
@@ -112,6 +113,7 @@ pub async fn create_migration(
             instance: instance.to_string(),
             from_node: from.to_string(),
             to_node: to.to_string(),
+            mode,
             ..Default::default()
         },
         status,

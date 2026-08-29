@@ -1029,6 +1029,18 @@ POST /api/v1/projects/p1/migrations → 202
 `connections` may be given; omitted, they are the model's defaults — live
 pre-copy, a 300 ms final pause, an hour, one stream — never zeroes.
 
+**`Reboot` is not a transfer.** No receiver is opened and nothing crosses a
+wire: the source stops the guest, lets go by the same handover every mode uses,
+and the destination starts it from the same disk. `downtimeMs`, `timeoutS` and
+`connections` say nothing about one.
+
+That is what makes it the mode for a fleet of unlike machines. A live move
+carries the guest's memory across while it runs, so a processor it has already
+been told about has to keep working; a guest that is stopped and started reads
+the CPUID it is given like any freshly booted machine. So `Reboot` crosses
+processors — and carries a guest holding hardware — where `Live` refuses both.
+The price is stated and not hidden: the guest is off for the length of a boot.
+
 **Creating one refuses anything that cannot work**, before a byte moves:
 the destination is draining, has less free memory than the guest, does not hold
 the image, or runs an agent too many versions away. Each is a

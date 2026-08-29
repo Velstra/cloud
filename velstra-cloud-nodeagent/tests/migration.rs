@@ -41,6 +41,11 @@ struct Cell {
 }
 
 async fn two_nodes(status: MigrationStatus) -> Cell {
+    two_nodes_in(MigrationMode::Live, status).await
+}
+
+/// The same cell, moved a named way.
+async fn two_nodes_in(mode: MigrationMode, status: MigrationStatus) -> Cell {
     let store = store();
     create_port(&store, PORT_A, "10.0.0.5/24", SOURCE).await;
     create_instance(&store, I1, Some(SOURCE), Some(SOURCE), &[PORT_A]).await;
@@ -75,7 +80,7 @@ async fn two_nodes(status: MigrationStatus) -> Cell {
     // the platform allows: `may_migrate` refuses one for an instance that is not
     // running. Creating it first also asked the source to start a guest it was
     // simultaneously forbidden to start.
-    create_migration(&cell.store, M1, I1, SOURCE, DESTINATION, status).await;
+    create_migration(&cell.store, M1, I1, SOURCE, DESTINATION, mode, status).await;
     cell
 }
 
@@ -338,6 +343,7 @@ async fn a_receiver_that_outlived_its_transfer_is_taken_down() {
         I1,
         SOURCE,
         DESTINATION,
+        MigrationMode::Live,
         MigrationStatus {
             node: Some(DESTINATION.to_string()),
             receiver_url: Some("tcp:node-b:4901".to_string()),
@@ -550,6 +556,7 @@ async fn a_migration_between_two_other_nodes_is_nobody_elses_business() {
         I1,
         "node-c",
         "node-d",
+        MigrationMode::Live,
         MigrationStatus::default(),
     )
     .await;
@@ -563,4 +570,104 @@ async fn a_migration_between_two_other_nodes_is_nobody_elses_business() {
     assert_eq!(pass, Pass::default(), "{pass:?}");
     assert!(!vmm.is_receiving(I1));
     assert_eq!(read_migration(&store, M1).await.status.node, None);
+}
+
+/// A cold move: stopped here, started there, and no wire between them.
+///
+/// This is the mode a fleet of unlike machines runs on. The model has allowed
+/// it across processors for a while; the agent refused to perform one at all —
+/// "nothing in this build performs one" — so a migration asked for in `Reboot`
+/// sat at `PreparingReceiver` for ever while the guest went on running on the
+/// source. Found by asking for one between two real machines.
+#[tokio::test]
+async fn a_cold_move_stops_the_guest_here_and_starts_it_there() {
+    let cell = two_nodes_in(MigrationMode::Reboot, MigrationStatus::default()).await;
+
+    // The destination opens nothing. There is no memory coming over a wire, and
+    // a receiver would hold this node's memory for a transfer that never comes.
+    cell.destination_listens().await;
+    let m = read_migration(&cell.store, M1).await;
+    assert!(
+        m.status.receiver_url.is_none() && !m.status.receiver_ready,
+        "a cold move opened a receiver: {:?}",
+        m.status
+    );
+
+    // The source stops it, and lets go by the same path every mode uses.
+    cell.source.resync().await;
+    assert!(!cell.source_vmm.is_running(I1), "the guest is still running on the source");
+    let instance = read_instance(&cell.store, I1).await;
+    assert_eq!(
+        instance.status.node, None,
+        "the source did not let go, so nothing can ever pick it up"
+    );
+
+    // The controller moves the assignment once the source has let go — the same
+    // step every mode goes through, and the only thing that tells the
+    // destination the guest is its to run. Done here by hand because these are
+    // two agents and no controller.
+    let mut next = read_instance(&cell.store, I1).await;
+    next.spec.node = Some(DESTINATION.to_string());
+    next.meta.generation += 1;
+    instances(&cell.store)
+        .update(&next, &velstra_cloud_model::access::Writer::controller("test"))
+        .await
+        .unwrap();
+
+    // And now the destination runs it, from the same disk, as a fresh boot.
+    cell.destination.resync().await;
+    cell.destination.resync().await;
+    assert!(
+        cell.destination_vmm.is_running(I1),
+        "the destination never started the guest a cold move exists to hand it"
+    );
+    let landed = read_instance(&cell.store, I1).await;
+    assert_eq!(landed.status.node.as_deref(), Some(DESTINATION));
+    assert_eq!(landed.status.state, InstanceState::Running);
+}
+
+/// The destination does not start it while the source still has it.
+///
+/// The whole two-copies invariant, in the one mode where the destination starts
+/// the guest itself rather than receiving it. Nothing hands the destination a
+/// go-ahead: it is that the instance is not its own until the source has let go,
+/// and the source does not let go while the guest is running there.
+#[tokio::test]
+async fn a_cold_move_does_not_start_a_second_copy_while_the_source_still_has_one() {
+    let cell = two_nodes_in(MigrationMode::Reboot, MigrationStatus::default()).await;
+
+    // The destination passes as often as it likes, and the source has not run.
+    for _ in 0..4 {
+        cell.destination.resync().await;
+    }
+    assert!(cell.source_vmm.is_running(I1), "the source lost the guest to nobody");
+    assert!(
+        !cell.destination_vmm.is_running(I1),
+        "the destination started a second copy of a guest that is still running on the source"
+    );
+    let instance = read_instance(&cell.store, I1).await;
+    assert_eq!(instance.status.node.as_deref(), Some(SOURCE));
+}
+
+/// Abandoning a cold move leaves the guest where it was, stopped, and says so.
+///
+/// A cold move is the one mode where the source stops the guest before anything
+/// is confirmed anywhere, so "abandoned" has to mean the guest is the source's
+/// again — not a guest nobody is running.
+#[tokio::test]
+async fn a_cold_move_that_is_abandoned_leaves_the_guest_to_the_source() {
+    let cell = two_nodes_in(MigrationMode::Reboot, MigrationStatus::default()).await;
+    cell.source.resync().await;
+    assert!(!cell.source_vmm.is_running(I1));
+
+    request_delete_migration(&cell.store, M1).await;
+
+    // With nothing holding it back, the source runs it again — it is still what
+    // the instance asks for, and this node is still the one that has it.
+    cell.source.resync().await;
+    cell.source.resync().await;
+    assert!(
+        cell.source_vmm.is_running(I1),
+        "an abandoned cold move left a guest nobody is running"
+    );
 }

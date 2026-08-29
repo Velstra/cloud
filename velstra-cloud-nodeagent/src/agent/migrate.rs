@@ -114,6 +114,18 @@ impl Agent {
             if migration.spec.to_node != self.config.node || migration.meta.is_deleting() {
                 continue;
             }
+            // A cold move is not an arrival: nothing is coming over a wire, and
+            // starting the guest here *is* the move. Freezing it would be
+            // freezing the one action that completes the migration, for ever.
+            //
+            // Safe for the same reason the freeze is safe for the others, and
+            // by the same mechanism: the source does not let go until the guest
+            // is no longer running there, and this node is not handed the
+            // instance until it has. So by the time anything here would start
+            // it, the guest is already stopped on the source.
+            if migration.spec.mode == MigrationMode::Reboot {
+                continue;
+            }
             let name = migration.spec.instance.clone();
             if host.vms.contains_key(&name) {
                 // It has arrived. This node runs it like any other guest.
@@ -307,12 +319,12 @@ impl Agent {
                     return Ok(false);
                 }
                 if *mode == MigrationMode::Reboot {
-                    // A reboot migration is a stop here and a start there, not
-                    // a transfer. Nothing in this build performs one, and
-                    // saying so is better than sending a guest to a hypervisor
-                    // that will refuse it after the memory has been copied.
+                    // A cold move is not a transfer, and the model no longer
+                    // asks for one — it asks for `HandOver`. Reaching here at
+                    // all would mean sending a guest's memory to a hypervisor
+                    // that is not listening for it.
                     return Err(
-                        "a reboot migration is not a transfer, and this node cannot perform one"
+                        "a reboot migration is not a transfer, and this node will not send one"
                             .to_string(),
                     );
                 }
@@ -325,6 +337,34 @@ impl Agent {
                         timeout_s: *timeout_s,
                         connections: *connections,
                     })
+                    .await
+                    .map(|()| true)
+                    .map_err(|e| e.to_string())
+            }
+            SourceAction::HandOver { instance } => {
+                // Stop it, and let the ordinary handover carry the rest: once
+                // the guest is no longer running here this node lets go, and
+                // only then does the destination claim and start it. There is
+                // no second signal and no flag — the same path a live move
+                // takes once its transfer lands.
+                //
+                // Asked for on every pass while the guest is still here, which
+                // is right: `stop` on a guest that is already stopping is the
+                // same ask with the same answer. It stops being asked the
+                // moment the machine reports it is not running.
+                if host
+                    .vms
+                    .get(instance)
+                    .is_none_or(|vm| vm.state != InstanceState::Running)
+                {
+                    // Already on its way down. Asking again would count an
+                    // action on every pass and make a settled node never quiet.
+                    return Ok(false);
+                }
+                tracing::info!(%instance, migration = %migration.meta.name,
+                    "stopping this guest so it can be started on the destination");
+                self.vmm
+                    .stop(instance)
                     .await
                     .map(|()| true)
                     .map_err(|e| e.to_string())
