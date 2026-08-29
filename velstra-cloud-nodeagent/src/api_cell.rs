@@ -70,8 +70,8 @@ pub struct ApiCell {
 /// mean any machine on the path can be the API. The file the agent trusts is
 /// the file the operator was shown the fingerprint of.
 fn tls_config(ca_path: &str) -> Result<std::sync::Arc<tokio_rustls::rustls::ClientConfig>> {
-    let pem = std::fs::read(ca_path)
-        .map_err(|e| HostError::failed(format!("reading {ca_path}: {e}")))?;
+    let pem =
+        std::fs::read(ca_path).map_err(|e| HostError::failed(format!("reading {ca_path}: {e}")))?;
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
         let cert = cert.map_err(|e| HostError::failed(format!("{ca_path}: {e}")))?;
@@ -155,6 +155,23 @@ impl ApiCell {
     /// Read a cell-wide collection whole: no project in the path, no filter.
     async fn list_cell<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>> {
         self.list_at(kind, &format!("/api/v1/{kind}")).await
+    }
+
+    /// One object by name, or `None` if it is not there.
+    ///
+    /// A 404 is an answer, not a failure: an agent starting before its node is
+    /// registered is a normal order of events in a level-triggered system.
+    async fn get_one<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        let body = match self.get(&format!("/api/v1/{name}")).await {
+            Ok(body) => body,
+            Err(e) if e.to_string().contains("404") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let document: Value = serde_json::from_slice(&body)
+            .map_err(|e| HostError::failed(format!("{name}: unreadable answer: {e}")))?;
+        serde_json::from_value(velstra_cloud_wire::from_wire(document))
+            .map(Some)
+            .map_err(|e| HostError::failed(format!("{name}: {e}")))
     }
 
     async fn list_at<T: DeserializeOwned>(&self, kind: &str, path: &str) -> Result<Vec<T>> {
@@ -418,6 +435,9 @@ impl CellReader for ApiCell {
     /// reports.
     async fn nodes(&self) -> Result<Vec<velstra_cloud_model::resources::Node>> {
         self.list_cell("nodes").await
+    }
+    async fn node(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Node>> {
+        self.get_one(&format!("nodes/{id}")).await
     }
     async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>> {
         self.list_cell("ceph-clusters").await

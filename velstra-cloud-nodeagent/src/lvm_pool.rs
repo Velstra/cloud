@@ -138,7 +138,11 @@ impl LvmPool {
                 ]);
             }
             None => {
-                args.extend(["--size".into(), format!("{gib}G"), self.config.group.clone()]);
+                args.extend([
+                    "--size".into(),
+                    format!("{gib}G"),
+                    self.config.group.clone(),
+                ]);
             }
         }
         self.run(&self.config.lvcreate, &args).await.map(|_| ())
@@ -207,6 +211,10 @@ impl LvmPool {
 
 #[async_trait::async_trait]
 impl Storage for LvmPool {
+    fn at(&self, volume: &str) -> Option<String> {
+        Some(self.device(&lv_name(volume)))
+    }
+
     async fn observe(&self) -> Result<PoolState> {
         let volumes = self.list("velstra-").await?;
         let raw_snapshots = self.list("velstrasnap-").await?;
@@ -339,7 +347,10 @@ impl Storage for LvmPool {
 
     async fn destroy(&self, volume: &str) -> Result<()> {
         let device = self.device(&lv_name(volume));
-        match self.run(&self.config.lvremove, &["--yes".into(), device]).await {
+        match self
+            .run(&self.config.lvremove, &["--yes".into(), device])
+            .await
+        {
             Ok(_) => Ok(()),
             // Already gone is the answer, not a failure: a destroy that ran and
             // whose reply was lost must be safe to ask again, or a delete can
@@ -371,7 +382,10 @@ impl Storage for LvmPool {
 
     async fn destroy_snapshot(&self, snapshot: &str) -> Result<()> {
         let device = self.device(&snap_lv_name(snapshot));
-        match self.run(&self.config.lvremove, &["--yes".into(), device]).await {
+        match self
+            .run(&self.config.lvremove, &["--yes".into(), device])
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("Failed to find") => Ok(()),
             Err(e) => Err(e),
@@ -383,8 +397,9 @@ impl Storage for LvmPool {
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.exists()
         {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| HostError::failed(format!("{} is not usable: {e}", parent.display())))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                HostError::failed(format!("{} is not usable: {e}", parent.display()))
+            })?;
         }
         // Out as qcow2, not raw: a backup of a 500 GiB volume holding 4 GiB of
         // data should cost 4 GiB on the target, and a raw copy of a block device
@@ -430,8 +445,7 @@ mod tests {
         // readable without guessing, which is why there are two.
         assert!(lv_name("projects/p1/volumes/data").starts_with("velstra-"));
         assert!(
-            snap_lv_name("projects/p1/volumes/data/snapshots/nightly")
-                .starts_with("velstrasnap-")
+            snap_lv_name("projects/p1/volumes/data/snapshots/nightly").starts_with("velstrasnap-")
         );
         assert!(!snap_lv_name("x").starts_with("velstra-"));
     }

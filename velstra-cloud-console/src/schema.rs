@@ -1122,6 +1122,35 @@ const INSTANCE_FIELDS: &[Field] = &[
         at_creation: false,
     },
     Field {
+        key: "volumes",
+        label: "Extra disks",
+        kind: Kind::RefList {
+            collection: "volumes",
+            spelling: Spelling::Name,
+        },
+        required: false,
+        // Beside the root disk, which is a size rather than an object: a guest
+        // always has one and nobody picks it from a list.
+        //
+        // The same move as `networks`, one layer over. An attachment is a join —
+        // this guest, that volume, opened by that node — and making one by hand
+        // meant creating the volume, waiting for the guest to be placed, reading
+        // which node that was, and only then attaching. Three steps, one of them
+        // a wait, to say "this machine has this disk".
+        //
+        // Kept rather than consumed, unlike `networks`: taking a disk off this
+        // list is how you detach, and a field that emptied itself could not say
+        // that.
+        advanced: true,
+        help: "Attached once the guest is on a node. Take one off the list to \
+               detach it.",
+        when_empty: "This project has no volumes yet. Make one under Volumes and \
+                     it can be attached here — the attachment itself is made for \
+                     you.",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
         key: "networks",
         label: "Networks",
         kind: Kind::RefList {

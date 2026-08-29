@@ -1480,6 +1480,7 @@ mod tests {
                 volume: "projects/p1/volumes/v1".into(),
                 instance: "projects/p1/instances/i1".into(),
                 node: "node-a".into(),
+                at: String::new(),
                 read_only: false,
             },
             AttachmentStatus {

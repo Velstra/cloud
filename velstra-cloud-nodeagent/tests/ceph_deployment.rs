@@ -196,6 +196,17 @@ impl CountingCell {
 
 #[async_trait::async_trait]
 impl velstra_cloud_nodeagent::CellReader for CountingCell {
+    async fn node(
+        &self,
+        id: &str,
+    ) -> Result<Option<velstra_cloud_model::resources::Node>, velstra_cloud_nodeagent::HostError>
+    {
+        Ok(self
+            .nodes()
+            .await?
+            .into_iter()
+            .find(|n| n.meta.name.id() == id))
+    }
     async fn nodes(
         &self,
     ) -> velstra_cloud_nodeagent::HostResult<Vec<velstra_cloud_model::resources::Node>> {

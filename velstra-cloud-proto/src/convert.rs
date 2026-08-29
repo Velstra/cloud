@@ -929,6 +929,7 @@ impl From<&resources::InstanceSpec> for v1::InstanceSpec {
             desired_state: v1::DesiredState::from(s.desired_state) as i32,
             ports: s.ports.clone(),
             networks: s.networks.clone(),
+            volumes: s.volumes.clone(),
             ssh_keys: s.ssh_keys.clone(),
             user_data: s.user_data.clone(),
             node: s.node.clone(),
@@ -955,6 +956,7 @@ impl From<&v1::InstanceSpec> for resources::InstanceSpec {
             desired_state: s.desired_state().into(),
             ports: s.ports.clone(),
             networks: s.networks.clone(),
+            volumes: s.volumes.clone(),
             ssh_keys: s.ssh_keys.clone(),
             user_data: s.user_data.clone(),
             node: s.node.clone(),
@@ -1098,6 +1100,7 @@ impl From<&resources::VolumeStatus> for v1::VolumeStatus {
             provisioned: s.provisioned,
             actual_size_gib: s.actual_size_gib,
             pool: s.pool.clone(),
+            at: s.at.clone(),
         }
     }
 }
@@ -1110,6 +1113,7 @@ impl From<&v1::VolumeStatus> for resources::VolumeStatus {
             provisioned: s.provisioned,
             actual_size_gib: s.actual_size_gib,
             pool: s.pool.clone(),
+            at: s.at.clone(),
         }
     }
 }
@@ -1120,6 +1124,7 @@ impl From<&resources::AttachmentSpec> for v1::AttachmentSpec {
             volume: s.volume.clone(),
             instance: s.instance.clone(),
             node: s.node.clone(),
+            at: s.at.clone(),
             read_only: s.read_only,
         }
     }
@@ -1131,6 +1136,7 @@ impl From<&v1::AttachmentSpec> for resources::AttachmentSpec {
             volume: s.volume.clone(),
             instance: s.instance.clone(),
             node: s.node.clone(),
+            at: s.at.clone(),
             read_only: s.read_only,
         }
     }
@@ -1723,6 +1729,7 @@ mod tests {
         let original = Resource::new(
             meta,
             InstanceSpec {
+                volumes: Vec::new(),
                 start_order: 0,
                 start_delay_s: 0,
                 on_node_loss: Default::default(),

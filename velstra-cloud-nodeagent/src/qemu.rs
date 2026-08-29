@@ -50,7 +50,7 @@ use velstra_cloud_model::{
 use crate::{
     cephadm::CephAdmin,
     host::{HostError, HostState, Receiver, Result, Transfer, VmObservation, VmRequest, Vmm},
-    hostfs::{self, Boot, Layout, slug, unslug},
+    hostfs::{self, Boot, Layout, unslug},
 };
 
 pub struct QemuVmm {
@@ -230,6 +230,49 @@ impl QemuVmm {
         })
     }
 
+    /// The volumes this guest has open, as volume name to the node-name QEMU
+    /// knows it by.
+    ///
+    /// From `query-block`, and specifically from `inserted.node-name`, which is
+    /// exactly what `blockdev-add` was given. The neighbouring `qdev` is *not*
+    /// it — a real answer, recorded from a live guest holding a disk:
+    ///
+    /// ```json
+    /// { "device": "",
+    ///   "qdev": "/machine/peripheral/projects_p1_volumes_data/virtio-backend",
+    ///   "inserted": { "node-name": "projects_p1_volumes_data" } }
+    /// ```
+    ///
+    /// `device` is empty for anything added this way, and `qdev` is a QOM path
+    /// with the id buried in the middle of it. Reading `qdev` first dropped every
+    /// entry on the floor, which left `attached` false and had the agent plug the
+    /// same disk in once a pass for ever — `Duplicate nodes with node-name='…'`,
+    /// while the guest ran with the disk perfectly well attached.
+    ///
+    /// Best-effort: a VMM that will not answer is a VMM whose guest is in
+    /// trouble for larger reasons, and the pass has plenty else to report.
+    async fn open_volumes(&self, instance: &str) -> Vec<(String, String)> {
+        let Ok(answer) = self.qmp(instance, "query-block", json!({})).await else {
+            return Vec::new();
+        };
+        let Some(devices) = answer.as_array() else {
+            return Vec::new();
+        };
+        devices
+            .iter()
+            .filter_map(|d| {
+                let id = d
+                    .get("inserted")
+                    .and_then(|i| i.get("node-name"))
+                    .and_then(|v| v.as_str())?;
+                // The root disk and anything else QEMU named for itself
+                // (`#block156`) are not ours, and `from_qmp_id` says so.
+                let volume = crate::hostfs::from_qmp_id(id)?;
+                Some((volume, id.to_string()))
+            })
+            .collect()
+    }
+
     /// **Untested:** needs a live QEMU.
     async fn received_mib(&self, instance: &str) -> u64 {
         match self.qmp(instance, "query-migrate", json!({})).await {
@@ -390,6 +433,19 @@ impl Vmm for QemuVmm {
             if self.is_sending(&instance).await {
                 host.sending.insert(instance.clone());
             }
+            // Which volumes this guest has open, asked of the VMM itself.
+            //
+            // Nothing filled this in before, on either real backend, and the
+            // consequence was invisible until an attach worked: `attached` is
+            // computed from this map, so it was always false, so every pass
+            // asked the VMM to plug the disk in again — and QEMU answered
+            // `Duplicate nodes with node-name='…'` for ever while the guest sat
+            // there with the disk perfectly well attached. The fake filled it in,
+            // which is why the tests were happy.
+            for (volume, device) in self.open_volumes(&instance).await {
+                host.volumes.insert(volume, device);
+            }
+
             host.vms.insert(
                 instance.clone(),
                 VmObservation {
@@ -494,17 +550,36 @@ impl Vmm for QemuVmm {
     }
 
     /// **Untested:** hot-plugs a volume into a running guest.
-    async fn open_volume(&self, instance: &str, volume: &str, read_only: bool) -> Result<String> {
-        let id = slug(volume);
-        let path = self.layout.dir(instance).join(&id);
+    async fn open_volume(
+        &self,
+        instance: &str,
+        volume: &str,
+        at: &str,
+        read_only: bool,
+    ) -> Result<String> {
+        // Not `slug`: QEMU refuses `~` in a node-name. See `hostfs::qmp_id`.
+        let id = crate::hostfs::qmp_id(volume);
+        // `qcow2` for a file, because that is what the directory pool writes and
+        // opening a qcow2 as `raw` hands the guest the image header as its first
+        // sector. Ceph names itself.
+        let file = if let Some(image) = at.strip_prefix("rbd:") {
+            json!({ "driver": "rbd", "image": image })
+        } else {
+            json!({ "driver": "file", "filename": at })
+        };
+        let driver = if at.ends_with(".qcow2") {
+            "qcow2"
+        } else {
+            "raw"
+        };
         self.qmp(
             instance,
             "blockdev-add",
             json!({
                 "node-name": id,
-                "driver": "raw",
+                "driver": driver,
                 "read-only": read_only,
-                "file": { "driver": "file", "filename": path.to_string_lossy() },
+                "file": file,
             }),
         )
         .await?;
@@ -515,13 +590,15 @@ impl Vmm for QemuVmm {
         )
         .await?;
         // The name the guest's kernel gives it depends on the guest; what this
-        // node can honestly report is the device it plugged in.
+        // node can honestly report is the device it plugged in. The same string
+        // comes back from `query-block`, which is what makes the next pass see
+        // the disk as attached rather than plug it in again.
         Ok(id)
     }
 
     /// **Untested:** unplugs the device and drops the block node behind it.
     async fn close_volume(&self, instance: &str, volume: &str) -> Result<()> {
-        let id = slug(volume);
+        let id = crate::hostfs::qmp_id(volume);
         self.qmp(instance, "device_del", json!({ "id": id }))
             .await?;
         self.qmp(instance, "blockdev-del", json!({ "node-name": id }))
@@ -1385,6 +1462,90 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("stop here and a start there")
+        );
+    }
+}
+
+#[cfg(test)]
+mod what_query_block_really_answers {
+    /// Recorded from a live guest on 2026-08-29, holding one attached volume
+    /// beside its root disk. Kept verbatim: the shape is the whole lesson.
+    const ANSWER: &str = r##"[
+      { "device": "virtio0",
+        "qdev": "/machine/peripheral-anon/device[2]/virtio-backend",
+        "type": "unknown",
+        "inserted": { "node-name": "#block156",
+                      "file": "/var/lib/velstra/instances/projects~p1~instances~m/root.raw" } },
+      { "device": "",
+        "qdev": "/machine/peripheral/projects_p1_volumes_data/virtio-backend",
+        "type": "unknown",
+        "inserted": { "node-name": "projects_p1_volumes_data",
+                      "file": "/var/lib/velstra/pool/projects~p1~volumes~data.qcow2" } }
+    ]"##;
+
+    /// The reading `open_volumes` does, on the answer above.
+    ///
+    /// A copy of the filter rather than a call, because `open_volumes` needs a
+    /// live QMP socket. What it protects is the part that was wrong: which field
+    /// carries the id.
+    fn volumes(answer: &serde_json::Value) -> Vec<(String, String)> {
+        answer
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| {
+                let id = d
+                    .get("inserted")
+                    .and_then(|i| i.get("node-name"))
+                    .and_then(|v| v.as_str())?;
+                let volume = crate::hostfs::from_qmp_id(id)?;
+                Some((volume, id.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_id_is_in_inserted_node_name_and_not_in_qdev() {
+        let answer: serde_json::Value = serde_json::from_str(ANSWER).unwrap();
+        let open = volumes(&answer);
+        assert_eq!(
+            open,
+            vec![(
+                "projects/p1/volumes/data".to_string(),
+                "projects_p1_volumes_data".to_string()
+            )],
+            "the attached volume was not recognised"
+        );
+    }
+
+    #[test]
+    fn the_root_disk_is_not_reported_as_a_volume() {
+        // `#block156` is QEMU's own name for a node nobody named. Read as a
+        // volume it would have the node report one the cell never made.
+        let answer: serde_json::Value = serde_json::from_str(ANSWER).unwrap();
+        assert!(
+            !volumes(&answer)
+                .iter()
+                .any(|(v, _)| v.contains("block") || v.contains("root")),
+            "the root disk was claimed as a volume"
+        );
+    }
+
+    #[test]
+    fn reading_qdev_instead_finds_nothing_which_is_the_bug_this_replaced() {
+        let answer: serde_json::Value = serde_json::from_str(ANSWER).unwrap();
+        let by_qdev: Vec<_> = answer
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| {
+                let id = d.get("qdev").and_then(|v| v.as_str())?;
+                crate::hostfs::from_qmp_id(id)
+            })
+            .collect();
+        assert!(
+            by_qdev.is_empty(),
+            "if qdev parsed, this test is asserting the wrong thing"
         );
     }
 }

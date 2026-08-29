@@ -109,7 +109,10 @@ impl Cell {
     }
 
     fn attachment(&self) -> AttachmentController {
-        AttachmentController::new(self.attachments.clone())
+        AttachmentController::new(
+            self.attachments.clone(),
+            self.volumes.clone(),
+        )
     }
 
     /// Every controller, once, in the order a process would start them.
@@ -245,6 +248,7 @@ async fn settled_cell() -> Cell {
             volume: "projects/p1/volumes/v1".into(),
             instance: "projects/p1/instances/i1".into(),
             node: "node-a".into(),
+            at: String::new(),
             read_only: false,
         },
         AttachmentStatus {

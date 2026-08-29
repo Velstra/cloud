@@ -408,20 +408,31 @@ impl Vmm for CloudHypervisorVmm {
                 velstra_cloud_model::resources::CONSOLE_TAIL_BYTES,
             );
             let observation = match self.api(&instance, "GET", "/api/v1/vm.info", "").await {
-                Ok(body) => VmObservation {
-                    // Out of the VMM's own view of itself, which `vm.info`
-                    // carries beside the state — so this costs no extra call
-                    // and needs no memory of what was asked for.
-                    size: size_of(&body, hostfs::disk_gib(&self.layout.disk(&instance))),
-                    console_tail: console_tail.clone(),
-                    console_bytes,
-                    // Cloud Hypervisor passthrough is not in this phase: the
-                    // backend never passes a device, so a guest here holds none.
-                    devices: Vec::new(),
-                    state: state_of(&body),
-                    pid: hostfs::main_pid(self.layout.scope, &unit).await,
-                    started_at: hostfs::started_at(&dir),
-                },
+                Ok(body) => {
+                    // Which volumes this guest has open, out of the same answer.
+                    // Nothing filled this in on either real backend, and because
+                    // `attached` is computed from it, every pass asked the VMM to
+                    // plug a disk in that it already had. Reported here so this
+                    // backend does not have to learn it the way the other one
+                    // did — from a live cell.
+                    for (volume, device) in open_volumes(&body) {
+                        host.volumes.insert(volume, device);
+                    }
+                    VmObservation {
+                        // Out of the VMM's own view of itself, which `vm.info`
+                        // carries beside the state — so this costs no extra call
+                        // and needs no memory of what was asked for.
+                        size: size_of(&body, hostfs::disk_gib(&self.layout.disk(&instance))),
+                        console_tail: console_tail.clone(),
+                        console_bytes,
+                        // Cloud Hypervisor passthrough is not in this phase: the
+                        // backend never passes a device, so a guest here holds none.
+                        devices: Vec::new(),
+                        state: state_of(&body),
+                        pid: hostfs::main_pid(self.layout.scope, &unit).await,
+                        started_at: hostfs::started_at(&dir),
+                    }
+                }
                 // Nobody answered *and* no VMM is running: the process is gone
                 // and only its socket file is left. That is **absent**, not
                 // failed, and the difference decides whether a migration can
@@ -558,10 +569,21 @@ impl Vmm for CloudHypervisorVmm {
     }
 
     /// **Untested:** hot-plugs a volume into a running guest.
-    async fn open_volume(&self, instance: &str, volume: &str, read_only: bool) -> Result<String> {
-        let path = self.layout.run_dir.join(slug(instance)).join(slug(volume));
+    async fn open_volume(
+        &self,
+        instance: &str,
+        volume: &str,
+        at: &str,
+        read_only: bool,
+    ) -> Result<String> {
+        // `at`, not a path derived from the guest's directory. The version that
+        // derived one built `…/<guest>/<volume>` — a path nothing ever writes —
+        // and had the same defect QEMU's did, for the same reason: a hypervisor
+        // does not know whether a volume is a file, a logical volume or an RBD
+        // image, and is not in a position to guess.
+        let _ = (instance, volume);
         let body = serde_json::json!({
-            "path": path.to_string_lossy(),
+            "path": at,
             "readonly": read_only,
         })
         .to_string();
@@ -971,6 +993,35 @@ fn parse_response(raw: &[u8]) -> Result<String> {
         )));
     }
     Ok(body.to_string())
+}
+
+/// The volumes a guest has open, out of `vm.info`.
+///
+/// Cloud Hypervisor reports its disks under `config.disks`, each with the path
+/// it was given. The volume is read back from that path rather than from an id,
+/// because this backend has no node-names: the path *is* the identity, and it is
+/// the one the pool published.
+fn open_volumes(body: &str) -> Vec<(String, String)> {
+    let Ok(info) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(disks) = info
+        .get("config")
+        .and_then(|c| c.get("disks"))
+        .and_then(|d| d.as_array())
+    else {
+        return Vec::new();
+    };
+    disks
+        .iter()
+        .filter_map(|d| {
+            let path = d.get("path").and_then(|v| v.as_str())?;
+            let stem = std::path::Path::new(path).file_stem()?.to_str()?;
+            let volume = hostfs::unslug(stem);
+            let parsed = velstra_cloud_model::meta::ResourceName::parse(&volume).ok()?;
+            (parsed.collection() == "volumes").then(|| (volume, path.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]

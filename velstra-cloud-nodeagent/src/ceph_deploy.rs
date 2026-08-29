@@ -534,7 +534,7 @@ mod tests {
             },
             NodeStatus {
                 vmm: "qemu".into(),
-            fetching: Vec::new(),
+                fetching: Vec::new(),
                 ceph,
                 devices: vec![disk("/dev/sdb", DeviceUse::Free)],
                 // Reporting right now, because these tests are about who does

@@ -479,6 +479,7 @@ survives_the_wire!(
         desired_state: resources::DesiredState::Stopped,
         ports: vec!["projects/p1/ports/port-a".into()],
         networks: vec!["projects/p1/networks/prod".to_string()],
+    volumes: vec!["projects/p1/volumes/data".to_string()],
         ssh_keys: vec!["ssh-ed25519 AAAA".into()],
         user_data: Some("#cloud-config".into()),
         node: Some("node-a".into()),
@@ -492,7 +493,7 @@ survives_the_wire!(
         },
     },
     {
-        vcpus, memory_mib, image, root_disk_gib, desired_state, ports, networks, ssh_keys,
+        vcpus, memory_mib, image, root_disk_gib, desired_state, ports, networks, volumes, ssh_keys,
         user_data, node, placement_policy, devices, console, on_node_loss,
         start_order, start_delay_s,
     }
@@ -558,8 +559,9 @@ survives_the_wire!(
         provisioned: true,
         actual_size_gib: 100,
         pool: Some("rbd-standard".into()),
+        at: Some("rbd:rbd-standard/projects~p1~volumes~data".into()),
     },
-    { observed_generation, conditions, provisioned, actual_size_gib, pool }
+    { observed_generation, conditions, provisioned, actual_size_gib, pool, at }
 );
 
 survives_the_wire!(
@@ -595,9 +597,10 @@ survives_the_wire!(
         volume: "projects/p1/volumes/v1".into(),
         instance: "projects/p1/instances/i1".into(),
         node: "node-a".into(),
+        at: "/srv/velstra/pool/projects~p1~volumes~data.qcow2".into(),
         read_only: true,
     },
-    { volume, instance, node, read_only }
+    { volume, instance, node, at, read_only }
 );
 
 survives_the_wire!(
@@ -914,6 +917,7 @@ whole_object_survives!(
         provisioned: true,
         actual_size_gib: 100,
         pool: Some("rbd-standard".into()),
+        at: Some("rbd:rbd-standard/projects~p1~volumes~data".into()),
     }
 );
 
@@ -942,6 +946,7 @@ whole_object_survives!(
         volume: "projects/p1/volumes/v1".into(),
         instance: "projects/p1/instances/i1".into(),
         node: "node-a".into(),
+        at: String::new(),
         read_only: true,
     },
     resources::AttachmentStatus {
@@ -1088,6 +1093,7 @@ whole_object_survives!(
         desired_state: resources::DesiredState::Stopped,
         ports: vec!["projects/p1/ports/port-a".into()],
         networks: vec!["projects/p1/networks/prod".to_string()],
+    volumes: vec!["projects/p1/volumes/data".to_string()],
         ssh_keys: vec!["ssh-ed25519 AAAA".into()],
         user_data: Some("#cloud-config".into()),
         node: Some("node-a".into()),

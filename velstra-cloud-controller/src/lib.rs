@@ -27,6 +27,7 @@ pub mod backoff;
 pub mod backup_schedule;
 pub mod capture;
 pub mod ceph;
+pub mod disk;
 pub mod drift;
 pub mod election;
 pub mod evacuation;

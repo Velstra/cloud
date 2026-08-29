@@ -109,9 +109,31 @@ impl DirectoryPool {
     /// Up rather than down because the number is compared with what somebody
     /// asked for: a 100 GiB volume that read back as 99 would be grown on every
     /// pass, for ever.
+    /// How big a volume is, as declared rather than as occupied.
+    ///
+    /// `-U` — "force share", QEMU's own name for it — and the whole pool depends
+    /// on it. `qemu-img info` takes a **write** lock by default, so a volume a
+    /// guest has open answers
+    ///
+    /// ```text
+    /// Failed to get shared "write" lock
+    /// Is another process using the image […]?
+    /// ```
+    ///
+    /// and `observe` returned `Err` for the pool as a whole: "could not read this
+    /// pool; doing nothing this pass", every thirty seconds, for ever. **One
+    /// attached disk stopped every volume in the pool from being provisioned**,
+    /// which made attaching a disk a way to take storage down for everybody in
+    /// the cell.
+    ///
+    /// Found on a live cell within minutes of the first attach that worked. It
+    /// could not have appeared before that: nothing had ever held a volume open.
+    ///
+    /// Reading is all this does, so sharing is not a compromise — it is what the
+    /// operation actually is.
     async fn virtual_gib(&self, file: &Path) -> Result<u64> {
         let out = self
-            .run(&["info", "--output=json", &file.to_string_lossy()])
+            .run(&["info", "-U", "--output=json", &file.to_string_lossy()])
             .await?;
         let info: serde_json::Value = serde_json::from_slice(&out).map_err(|e| {
             HostError::failed(format!("{}: unreadable qemu-img info: {e}", file.display()))
@@ -203,13 +225,31 @@ impl DirectoryPool {
 
 #[async_trait::async_trait]
 impl Storage for DirectoryPool {
+    fn at(&self, volume: &str) -> Option<String> {
+        Some(self.volume_path(volume).to_string_lossy().into_owned())
+    }
+
     async fn observe(&self) -> Result<PoolState> {
         std::fs::create_dir_all(self.snapshot_dir())
             .map_err(|e| HostError::failed(format!("{} is not usable: {e}", self.dir.display())))?;
 
         let mut volumes = BTreeMap::new();
         for (name, path) in Self::files_in(&self.dir) {
-            volumes.insert(name, self.virtual_gib(&path).await?);
+            // One file this pool cannot measure is one volume's size unknown,
+            // not a pool that cannot be read. The `?` that used to be here made
+            // every volume in the pool wait on the worst file in it — and the
+            // report that comes out of a failed observe is "doing nothing this
+            // pass", which is a whole pool stopped by one bad object.
+            match self.virtual_gib(&path).await {
+                Ok(gib) => {
+                    volumes.insert(name, gib);
+                }
+                Err(e) => tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    "could not measure this volume; the rest of the pool is reported anyway"
+                ),
+            }
         }
 
         let mut snapshots = BTreeMap::new();

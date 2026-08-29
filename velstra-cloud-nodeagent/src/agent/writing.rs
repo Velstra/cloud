@@ -189,10 +189,12 @@ impl Agent {
         &self,
     ) -> crate::host::Result<Option<velstra_cloud_model::resources::Node>> {
         if self.sink.is_some() {
-            let all = self.cell.nodes().await?;
-            return Ok(all
-                .into_iter()
-                .find(|n| n.meta.name.id() == self.config.node));
+            // Its own object, by name. Listing the cell to find one row in it is
+            // a read of every machine, on every pass, by every machine — and it
+            // is the *wrong* read as well as an expensive one: what this agent
+            // is entitled to is its own node, and asking for the collection made
+            // the entitlement depend on a collection-wide rule.
+            return self.cell.node(&self.config.node).await;
         }
         let name = format!("nodes/{}", self.config.node);
         self.nodes
