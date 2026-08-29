@@ -545,7 +545,13 @@ pub enum SourceAction {
     /// The handover is the same one every mode uses — the source lets go once
     /// the guest is no longer running here, and only then does the destination
     /// claim it — so nothing about the two-copies invariant changes.
-    HandOver { instance: String },
+    ///
+    /// `timeout_s` is how long the guest is given to shut down politely. It is
+    /// the migration's own `timeout_s`, which meant nothing to a cold move
+    /// before: an ACPI power button is a *request*, and a guest that ignores it
+    /// would otherwise hold the migration open for ever while being asked again
+    /// on every pass.
+    HandOver { instance: String, timeout_s: u32 },
 }
 
 /// The destination's half.
@@ -625,6 +631,7 @@ pub fn reconcile_source(migration: &Migration, here: bool) -> Vec<SourceAction> 
     if migration.spec.mode == MigrationMode::Reboot {
         return vec![SourceAction::HandOver {
             instance: migration.spec.instance.clone(),
+            timeout_s: migration.spec.timeout_s,
         }];
     }
     let Some(url) = migration.status.receiver_url.as_ref() else {

@@ -671,3 +671,51 @@ async fn a_cold_move_that_is_abandoned_leaves_the_guest_to_the_source() {
         "an abandoned cold move left a guest nobody is running"
     );
 }
+
+/// The power button is a request, and it is pressed once.
+///
+/// `stop` is ACPI. Level-triggered and unguarded, a cold move pressed it seven
+/// times in three seconds on a real machine while the guest wound down — and a
+/// guest that ignores the button would have been asked four times a second for
+/// as long as the migration stayed open.
+///
+/// So: asked once, then waited for. And when the wait is over, the honest end is
+/// to take the guest down — a node that cannot finish a handover is a node that
+/// never drains.
+#[tokio::test]
+async fn a_guest_that_ignores_the_power_button_is_asked_once_and_then_taken_down() {
+    let cell = two_nodes_in(
+        MigrationMode::Reboot,
+        MigrationStatus::default(),
+    )
+    .await;
+    cell.source_vmm.deafen(I1);
+
+    // Several passes, and the guest goes on running: it was asked and it is
+    // being waited for, not asked again.
+    for _ in 0..5 {
+        cell.source.resync().await;
+    }
+    assert!(cell.source_vmm.is_running(I1), "the deaf guest went down by itself");
+    assert!(
+        !cell.source_vmm.was_killed(I1),
+        "the wait was never given: the guest's plug was pulled straight away"
+    );
+
+    // The migration's own timeout is what the wait is measured against, and
+    // this cell's is zero — so the very next pass is past it.
+    let mut m = read_migration(&cell.store, M1).await;
+    m.spec.timeout_s = 0;
+    m.meta.generation += 1;
+    migrations(&cell.store)
+        .update(&m, &velstra_cloud_model::access::Writer::controller("test"))
+        .await
+        .unwrap();
+
+    cell.source.resync().await;
+    assert!(
+        cell.source_vmm.was_killed(I1),
+        "a guest that never answers the power button held the move open for ever"
+    );
+    assert!(!cell.source_vmm.is_running(I1));
+}

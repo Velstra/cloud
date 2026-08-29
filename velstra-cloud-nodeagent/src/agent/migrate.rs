@@ -341,33 +341,74 @@ impl Agent {
                     .map(|()| true)
                     .map_err(|e| e.to_string())
             }
-            SourceAction::HandOver { instance } => {
+            SourceAction::HandOver {
+                instance,
+                timeout_s,
+            } => {
                 // Stop it, and let the ordinary handover carry the rest: once
                 // the guest is no longer running here this node lets go, and
                 // only then does the destination claim and start it. There is
                 // no second signal and no flag — the same path a live move
                 // takes once its transfer lands.
-                //
-                // Asked for on every pass while the guest is still here, which
-                // is right: `stop` on a guest that is already stopping is the
-                // same ask with the same answer. It stops being asked the
-                // moment the machine reports it is not running.
                 if host
                     .vms
                     .get(instance)
                     .is_none_or(|vm| vm.state != InstanceState::Running)
                 {
-                    // Already on its way down. Asking again would count an
-                    // action on every pass and make a settled node never quiet.
+                    // On its way down or already gone. Forgetting the ask here
+                    // is what makes a re-opened migration of the same guest ask
+                    // again rather than kill it on sight.
+                    self.handover_asked.lock().unwrap().remove(instance);
                     return Ok(false);
                 }
-                tracing::info!(%instance, migration = %migration.meta.name,
-                    "stopping this guest so it can be started on the destination");
-                self.vmm
-                    .stop(instance)
-                    .await
-                    .map(|()| true)
-                    .map_err(|e| e.to_string())
+                // **Asked once, not on every pass.** `stop` is a power button:
+                // ACPI, a request, and the guest takes seconds to act on it.
+                // Level-triggered and unguarded, this pressed it seven times in
+                // three seconds on a real machine — and a guest that ignores
+                // the button would have been asked four times a second for ever.
+                let now = velstra_cloud_model::meta::Timestamp::now().0;
+                let waited = {
+                    let mut asked = self.handover_asked.lock().unwrap();
+                    match asked.get(instance) {
+                        None => {
+                            asked.insert(instance.clone(), now);
+                            None
+                        }
+                        Some(at) => Some(now.saturating_sub(*at) / 1000),
+                    }
+                };
+                match waited {
+                    None => {
+                        tracing::info!(%instance, migration = %migration.meta.name,
+                            "stopping this guest so it can be started on the destination");
+                        self.vmm
+                            .stop(instance)
+                            .await
+                            .map(|()| true)
+                            .map_err(|e| e.to_string())
+                    }
+                    // Asked, and the guest is still winding down. Nothing to do
+                    // and nothing to count.
+                    Some(waited) if waited < u64::from(*timeout_s) => Ok(false),
+                    // It will not go politely. A cold move has already accepted
+                    // an outage, so the honest end is to take the guest down —
+                    // a migration that waits for ever on a guest ignoring its
+                    // power button is a node that never drains.
+                    Some(waited) => {
+                        tracing::warn!(%instance, migration = %migration.meta.name, %waited,
+                            "this guest did not shut down when asked; taking it down so the \
+                             move can finish");
+                        self.handover_asked
+                            .lock()
+                            .unwrap()
+                            .insert(instance.clone(), now);
+                        self.vmm
+                            .kill(instance)
+                            .await
+                            .map(|()| true)
+                            .map_err(|e| e.to_string())
+                    }
+                }
             }
             SourceAction::Cancel { instance } => {
                 if !host.sending.contains(instance) {

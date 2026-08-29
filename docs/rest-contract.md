@@ -1031,8 +1031,11 @@ pre-copy, a 300 ms final pause, an hour, one stream — never zeroes.
 
 **`Reboot` is not a transfer.** No receiver is opened and nothing crosses a
 wire: the source stops the guest, lets go by the same handover every mode uses,
-and the destination starts it from the same disk. `downtimeMs`, `timeoutS` and
-`connections` say nothing about one.
+and the destination starts it from the same disk. `downtimeMs` and `connections`
+say nothing about one. `timeoutS` does: it is how long the guest is given to
+shut down politely. Stopping it is an ACPI power button — a *request* — and a
+guest that ignores one would hold the migration open for ever, so when the time
+is up the source takes it down and says so.
 
 That is what makes it the mode for a fleet of unlike machines. A live move
 carries the guest's memory across while it runs, so a processor it has already

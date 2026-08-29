@@ -318,6 +318,15 @@ pub struct Agent {
     /// and giving it a grace period from startup is what stops a control plane
     /// that is merely slow to come up from taking every guest down with it.
     last_report: AtomicU64,
+    /// When this node last asked a guest to power down for a cold move, per
+    /// instance, in milliseconds since the epoch.
+    ///
+    /// Process-local on purpose, and the same shape as the `sending` guard: it
+    /// is an observation about what this machine has already done, not a fact
+    /// about the cell. An agent restarted mid-handover asks again, which is
+    /// right — level-triggered, and a power button pressed twice costs nothing
+    /// where pressing it four times a second for ever does.
+    handover_asked: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
     /// This node's fencing deadline, as last read from its own object.
     ///
     /// Cached rather than read when it is needed, and that is the whole design:
@@ -371,6 +380,7 @@ impl Agent {
             probed_ceph_reads: AtomicBool::new(false),
             warned_about_node: AtomicBool::new(false),
             sink: None,
+            handover_asked: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             last_report: AtomicU64::new(velstra_cloud_model::meta::Timestamp::now().0),
             fence_after_s: AtomicU32::new(0),
         }
