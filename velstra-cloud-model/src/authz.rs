@@ -526,7 +526,22 @@ pub fn belongs_to_the_cell(kind: &str) -> bool {
 ///   single-node cell that is invisible, which is why it survived.
 /// - `ceph-clusters`, for the same pass, which is meaningless without them.
 pub fn a_node_reads_the_cells(kind: &str) -> bool {
-    matches!(kind, "nodes" | "ceph-clusters")
+    matches!(kind, "nodes" | "pools" | "backup-targets" | "ceph-clusters")
+}
+
+/// Whether a machine agent may read one of the cell's own objects at all.
+///
+/// The same four, and it is the same question — which is the point. Until this
+/// existed the two halves disagreed: listing `users` was refused and
+/// `users/admin` was served, to a pool agent, with 200. A curtain over a door
+/// that is open is worse than either, because it reads as a rule.
+///
+/// Found by pointing a real pool agent at a real cell and asking it for things
+/// it has no business with. What a machine needs is the machine room: the nodes
+/// and pools it computes over, the backup targets it reports on, the Ceph
+/// clusters those two are meaningless without. Not the cell's accounts.
+pub fn a_machine_may_read(kind: &str) -> bool {
+    !belongs_to_the_cell(kind) || a_node_reads_the_cells(kind)
 }
 
 #[cfg(test)]
@@ -544,12 +559,36 @@ mod what_the_cell_keeps {
 
     #[test]
     fn a_node_reads_what_its_own_passes_need_and_no_more() {
-        for kind in ["nodes", "ceph-clusters"] {
+        // The machine room: the two the Ceph pass computes over, plus the pool
+        // an agent *is* and the backup targets it reports on. That last pair
+        // was added when a real pool agent, pointed at a real cell, could not
+        // list the targets it exists to answer for.
+        for kind in ["nodes", "pools", "backup-targets", "ceph-clusters"] {
             assert!(a_node_reads_the_cells(kind), "{kind}");
         }
         // A node agent is inside the machine room, not above it.
-        for kind in ["users", "backup-targets", "image-sources", "projects"] {
+        for kind in ["users", "image-sources", "device-classes"] {
             assert!(!a_node_reads_the_cells(kind), "{kind}");
+        }
+    }
+
+    /// The two halves answer the same question.
+    ///
+    /// They did not: listing `users` was refused to a pool agent's token and
+    /// `users/admin` was served to it, 200, on a live cell. A curtain over an
+    /// open door is worse than either, because it reads as a rule.
+    #[test]
+    fn what_a_machine_may_list_is_what_a_machine_may_get() {
+        for kind in ["nodes", "pools", "backup-targets", "ceph-clusters"] {
+            assert!(a_machine_may_read(kind), "{kind}");
+        }
+        for kind in ["users", "image-sources", "device-classes", "maintenance-windows"] {
+            assert!(!a_machine_may_read(kind), "{kind}");
+        }
+        // A tenant's own collections are not the cell's, and an agent reads
+        // those the way it always has — narrowed to what concerns it.
+        for kind in ["instances", "volumes", "ports", "images"] {
+            assert!(a_machine_may_read(kind), "{kind}");
         }
     }
 

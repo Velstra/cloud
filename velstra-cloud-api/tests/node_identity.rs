@@ -514,3 +514,48 @@ async fn a_credential_is_only_issued_for_a_machine_the_cell_knows() {
         "{refused}"
     );
 }
+
+/// A curtain over an open door.
+///
+/// Found by pointing a real pool agent at a real cell: `GET /users` was refused
+/// with "they are not yours", and `GET /users/admin` answered 200 to the same
+/// token. The list path and the object path were answering different questions,
+/// and only one of them was a rule.
+#[tokio::test]
+async fn a_machine_agent_reads_the_machine_room_and_not_the_cells_accounts() {
+    let (api, _store) = cell();
+    api.create(
+        "",
+        "users",
+        &json!({ "id": "someone", "spec": { "display_name": "someone" }}),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator makes a user");
+    let token = register_node(&api, "node-a").await;
+    let machine = agent(&api, &token).await;
+
+    // The machine room: the node it is, and the collections it computes over.
+    api.get(&name("nodes/node-a"), &machine)
+        .await
+        .expect("a machine reads its own node object");
+    for kind in ["nodes", "pools", "backup-targets", "ceph-clusters"] {
+        api.list_for("", kind, &Default::default(), &machine)
+            .await
+            .unwrap_or_else(|e| panic!("a machine could not list {kind}: {e}"));
+    }
+
+    // And not the accounts — by name as well as by list, which is the half that
+    // was missing.
+    let by_name = api
+        .get(&name("users/someone"), &machine)
+        .await
+        .expect_err("a machine agent read a user object");
+    assert!(by_name.to_string().contains("machine agent"), "{by_name}");
+    assert!(
+        api.list_for("", "users", &Default::default(), &machine)
+            .await
+            .is_err(),
+        "a machine agent listed the cell's users"
+    );
+}
