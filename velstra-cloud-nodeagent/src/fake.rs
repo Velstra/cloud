@@ -86,6 +86,11 @@ struct Machine {
     /// tell a graceful stop from a kill, and the observation alone cannot:
     /// both end with the guest not running.
     killed: Vec<String>,
+    /// Guests that ignore the power button. `stop` is ACPI — a *request* — and
+    /// a guest with no ACPI daemon, or one that is wedged, simply goes on
+    /// running. Without a fake that can do this, every escalation path reads as
+    /// working because the fake always obeys.
+    deaf: BTreeSet<String>,
     disks: BTreeSet<String>,
     images: BTreeSet<String>,
     fetching: BTreeSet<String>,
@@ -356,6 +361,28 @@ impl FakeVmm {
         self.machine.lock().unwrap().sending.contains_key(instance)
     }
 
+    /// Whether this guest's plug was pulled, as opposed to being asked politely.
+    /// Both end with a guest that is not running, so the observation alone
+    /// cannot tell a test which happened.
+    pub fn was_killed(&self, instance: &str) -> bool {
+        self.machine
+            .lock()
+            .unwrap()
+            .killed
+            .iter()
+            .any(|k| k == instance)
+    }
+
+    /// This guest ignores the power button from now on. Pulling the plug still
+    /// works, which is the whole point of being able to tell the two apart.
+    pub fn deafen(&self, instance: &str) {
+        self.machine
+            .lock()
+            .unwrap()
+            .deaf
+            .insert(instance.to_string());
+    }
+
     /// Hold this guest's next transfer open instead of letting it land, so a
     /// test can ask what the source does while a move is in flight.
     pub fn stall(&self, instance: &str) {
@@ -547,6 +574,11 @@ impl Vmm for FakeVmm {
     async fn stop(&self, instance: &str) -> Result<()> {
         let mut m = self.machine.lock().unwrap();
         check(&mut m, Fault::Stop, instance)?;
+        if m.deaf.contains(instance) {
+            // Asked, and ignored. Not an error: a power button that was pressed
+            // and not acted on is exactly what this reports on a real machine.
+            return Ok(());
+        }
         if let Some(vm) = m.vms.get_mut(instance) {
             vm.state = InstanceState::Stopped;
             vm.pid = None;
