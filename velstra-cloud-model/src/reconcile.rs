@@ -1131,6 +1131,8 @@ pub fn nobody_reports_on(kind: &str) -> bool {
             // A view of the images, grouped by family and computed on the way
             // out. There is no object here for anything to report on.
             | "families"
+            // A place in a tree. Nothing runs one.
+            | "folders"
     )
 }
 

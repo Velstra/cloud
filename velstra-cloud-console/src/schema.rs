@@ -679,6 +679,45 @@ const CEPH_FIELDS: &[Field] = &[
     },
 ];
 
+const FOLDER_FIELDS: &[Field] = &[
+    Field {
+        key: "displayName",
+        label: "Name",
+        kind: Kind::Text {
+            placeholder: "Engineering",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "parent",
+        label: "Inside",
+        kind: Kind::Ref {
+            collection: "folders",
+            filter_by: None,
+            spelling: Spelling::Id,
+        },
+        required: false,
+        advanced: false,
+        // No control for the bindings here, and that is deliberate: they are a
+        // *set*, and a form field holding the whole set replaces all of it on
+        // every save — somebody adding one person while a colleague adds another
+        // loses the colleague's change and never learns it happened. The Access
+        // panel on the sheet edits them a row at a time, against the revision it
+        // was drawn from.
+        help: "Left empty this folder sits at the top. Roles granted above it \
+               reach in here too.",
+        when_empty: "There are no folders yet. The first one goes at the top.",
+        derived: false,
+        at_creation: false,
+    },
+];
+
 const PROJECT_FIELDS: &[Field] = &[
     // ---- what the cell allows this project ---------------------------------
     //
@@ -750,14 +789,19 @@ const PROJECT_FIELDS: &[Field] = &[
     },
     Field {
         key: "parent",
-        label: "Parent",
-        kind: Kind::Text {
-            placeholder: "organizations/o1",
-            check: Check::Name,
+        label: "Folder",
+        kind: Kind::Ref {
+            collection: "folders",
+            filter_by: None,
+            spelling: Spelling::Id,
         },
         required: false,
         advanced: true,
-        help: "Policies and quota are inherited from here.",
+        // The help used to say "policies and quota are inherited from here",
+        // which was never true of anything: nothing walked this field at all. It
+        // is roles that inherit, and only roles.
+        help: "Roles granted on the folder reach every project under it. Quota \
+               and policy are this project's own.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -4576,6 +4620,39 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "folders",
+        title: "Folders",
+        singular: "folder",
+        recheck: 0,
+        condition: "",
+        // Nothing reports on a folder: it is a place in a tree, not a thing an
+        // agent runs.
+        group: "Access",
+        scope: Scope::Global,
+        blurb: "A place to put projects, and a place to grant a role once instead \
+                of forty times. Roles granted here reach everything below.",
+        fields: FOLDER_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.displayName",
+                label: "Name",
+                cell: Cell::Text,
+                width: 240,
+            },
+            Column {
+                path: "spec.parent",
+                label: "Inside",
+                cell: Cell::Text,
+                width: 240,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
         id: "projects",
         title: "Projects",
         singular: "project",
@@ -4685,12 +4762,13 @@ mod tests {
             "maintenance-windows",
             "usage",
             "families",
+            "folders",
         ] {
             assert!(find(id).is_some(), "no screen for {id}");
         }
         assert_eq!(
             COLLECTIONS.len(),
-            29,
+            30,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:
@@ -4733,6 +4811,8 @@ mod tests {
             // Derived on the way out of the API by grouping the images. There is
             // no object to report on.
             "families",
+            // A place in a tree, not a thing an agent runs.
+            "folders",
         ];
         for c in COLLECTIONS {
             let says_nobody = c.condition.is_empty();

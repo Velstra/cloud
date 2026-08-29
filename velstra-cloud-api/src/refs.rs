@@ -105,6 +105,10 @@ fn fields(kind: &str) -> &'static [(&'static str, Form)] {
             ("members", Form::Name),
         ],
         "projects" => &[("parent", Form::Name)],
+        // The same field, one level up. It is what makes a folder with anything
+        // under it undeletable — otherwise tidying up above somebody silently
+        // takes every role granted there away from every project below.
+        "folders" => &[("parent", Form::Name)],
         _ => &[],
     }
 }
@@ -125,6 +129,7 @@ pub const REFERRING_KINDS: &[&str] = &[
     "ports",
     "subnets",
     "projects",
+    "folders",
     "routers",
     "floatingips",
     "load-balancers",
