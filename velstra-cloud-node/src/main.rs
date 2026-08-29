@@ -46,6 +46,10 @@ enum Cmd {
     MigrateSeed {
         #[arg(long, default_value = "/var/lib/velstra")]
         dir: std::path::PathBuf,
+        /// Where this machine keeps who it is. Separate from the state
+        /// directory because that one may be shared with other machines.
+        #[arg(long, default_value = "/etc/velstra")]
+        identity: std::path::PathBuf,
     },
 
     /// Install the node image onto internal storage (interactive wizard).
@@ -126,8 +130,8 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::MigrateSeed { dir } => {
-            for said in setup::migrate_seed(&dir)? {
+        Cmd::MigrateSeed { dir, identity } => {
+            for said in setup::migrate_seed(&dir, &identity)? {
                 println!("  · {said}");
             }
             Ok(())

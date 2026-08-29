@@ -51,12 +51,27 @@ use crate::{
     },
 };
 
-/// Where the seed lives, on every kind of machine.
+/// Where a machine keeps what it holds: guests, images, pool metadata, its TLS
+/// material.
 ///
 /// The appliance decides this: its `/etc` is on a read-only verity store and
 /// its writable partition mounts here. One path on all three systems is worth
 /// more than the conventional one on two of them.
 pub const SEED_DIR: &str = "/var/lib/velstra";
+
+/// Where a machine keeps *who it is*.
+///
+/// Separate from [`SEED_DIR`] for one reason, and it is not tidiness. A cell
+/// whose machines share one filesystem — which is what makes moving a guest
+/// possible at all — has every agent reading the same state directory. Put the
+/// seed there and the second machine to mount it renames the first: it answers
+/// to the other's node id, runs the other's roles, and reports the other's
+/// pool. Found on two real machines, and it took the control plane down —
+/// `has-role control-plane` read a seed that belonged to a hypervisor.
+///
+/// So identity lives in `/etc`, which is per-machine by construction, and the
+/// state directory is left holding only what a cell shares.
+pub const IDENTITY_DIR: &str = "/etc/velstra";
 
 /// What this machine was told about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -385,7 +400,16 @@ pub fn run_with(
     assume_nixos: Option<bool>,
     config: Option<PathBuf>,
 ) -> Result<()> {
-    let dir = dir.unwrap_or_else(|| PathBuf::from(SEED_DIR));
+    let nixos = assume_nixos.unwrap_or_else(|| Path::new("/etc/NIXOS").exists());
+    // Where the seed goes is decided by which machine this is, not by taste.
+    //
+    // On Debian it goes to [`IDENTITY_DIR`], because the state directory may be
+    // a filesystem the whole cell mounts and a seed there renames whoever
+    // mounts it next. On the appliance it goes to [`SEED_DIR`]: `/etc` is on a
+    // read-only verity store there, and a machine whose state directory is
+    // its own alone has nobody to be renamed by.
+    let dir =
+        dir.unwrap_or_else(|| PathBuf::from(if nixos { SEED_DIR } else { IDENTITY_DIR }));
     let machine = match &config {
         Some(path) => {
             let text =
@@ -410,7 +434,6 @@ pub fn run_with(
     };
     write_seed(&dir, &machine)?;
 
-    let nixos = assume_nixos.unwrap_or_else(|| Path::new("/etc/NIXOS").exists());
     if nixos {
         println!("\nThis is NixOS, so nothing was enabled.");
         println!("Units there are a declaration, and a wizard reaching into them would be");
@@ -557,7 +580,7 @@ fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
 /// nothing has been written at that point.
 fn collect() -> Result<Option<Machine>> {
     println!("Velstra Cloud — set up this machine\n");
-    println!("This writes {SEED_DIR}/node.env and nothing else: no disks, no bootloader,");
+    println!("This writes {IDENTITY_DIR}/node.env and nothing else: no disks, no bootloader,");
     println!("no packages. The machine is already installed; what is missing is the answer");
     println!("to which cell it belongs to, as what, and with which credential.\n");
 
@@ -1241,14 +1264,14 @@ mod tests {
 ///
 /// **Never overwrite an answer somebody gave.** A seed that already names a CA
 /// or an https URL is left exactly as it is.
-pub fn migrate_seed(dir: &std::path::Path) -> Result<Vec<String>> {
-    let path = dir.join("node.env");
+pub fn migrate_seed(dir: &std::path::Path, identity: &std::path::Path) -> Result<Vec<String>> {
+    let mut changed = settle_identity(dir, identity)?;
+    let path = seed_path(dir, identity);
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(Vec::new());
+        return Ok(changed);
     };
     let cert = dir.join("tls").join("cert.pem");
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let mut changed = Vec::new();
 
     fn value(lines: &[String], key: &str) -> Option<String> {
         lines
@@ -1287,7 +1310,7 @@ pub fn migrate_seed(dir: &std::path::Path) -> Result<Vec<String>> {
         ));
     }
 
-    if changed.is_empty() {
+    if lines.join("\n") == text.trim_end_matches('\n') {
         return Ok(changed);
     }
     let mut out = lines.join("\n");
@@ -1296,57 +1319,145 @@ pub fn migrate_seed(dir: &std::path::Path) -> Result<Vec<String>> {
     Ok(changed)
 }
 
+/// Which file *is* the seed: the machine's own, or — on a machine installed
+/// before there was such a thing — the one in the state directory.
+///
+/// Whole-file, never merged. A merge would be the systemd behaviour and it is
+/// the wrong one here: the keys the machine's own file does not mention would
+/// still come from somebody else's, so a control plane would inherit a
+/// hypervisor's pool and a hypervisor its neighbour's node id. One file
+/// answers, or the other does.
+pub fn seed_path(state: &std::path::Path, identity: &std::path::Path) -> std::path::PathBuf {
+    let mine = identity.join("node.env");
+    if mine.exists() { mine } else { state.join("node.env") }
+}
+
+/// Move a seed out of the shared state directory and into the machine's own.
+///
+/// Run on every upgrade. A machine installed before identity was separated has
+/// its seed in the state directory, which may be — and on the cell that found
+/// this, was — the same filesystem on every machine. Moving rather than
+/// copying is the point: a copy would leave the file that does the renaming.
+///
+/// Does nothing when the machine already has its own, and nothing when there is
+/// no seed at all, which is what a freshly unpacked package looks like.
+fn settle_identity(
+    state: &std::path::Path,
+    identity: &std::path::Path,
+) -> Result<Vec<String>> {
+    let from = state.join("node.env");
+    let to = identity.join("node.env");
+    if to.exists() || !from.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&from)
+        .with_context(|| format!("reading {}", from.display()))?;
+    std::fs::create_dir_all(identity)
+        .with_context(|| format!("creating {}", identity.display()))?;
+    std::fs::write(&to, &text).with_context(|| format!("writing {}", to.display()))?;
+    // Only after the new one is on disk. A rename that failed halfway would be
+    // a machine with no seed at all, which is a machine that stops.
+    std::fs::remove_file(&from).with_context(|| format!("removing {}", from.display()))?;
+    Ok(vec![format!(
+        "the seed moved to {}: the state directory can be shared between machines, and \
+         a seed there is one machine answering to another's name",
+        to.display()
+    )])
+}
+
 #[cfg(test)]
 mod migrating_a_seed {
     use super::*;
 
-    fn scratch(name: &str, seed: &str, with_cert: bool) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("velstra-seed-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("tls")).unwrap();
-        std::fs::write(dir.join("node.env"), seed).unwrap();
+    /// A machine as an upgrade finds it: a state directory holding the seed,
+    /// and an `/etc` that does not have one yet.
+    fn scratch(name: &str, seed: &str, with_cert: bool) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("velstra-seed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (state, identity) = (root.join("var"), root.join("etc"));
+        std::fs::create_dir_all(state.join("tls")).unwrap();
+        std::fs::write(state.join("node.env"), seed).unwrap();
         if with_cert {
-            std::fs::write(dir.join("tls").join("cert.pem"), "x").unwrap();
+            std::fs::write(state.join("tls").join("cert.pem"), "x").unwrap();
         }
-        dir
+        (state, identity)
     }
 
     #[test]
     fn a_seed_from_before_tls_is_pointed_at_the_certificate() {
         // The upgrade that would otherwise cut a node off from its own cell.
-        let dir = scratch(
+        let (state, identity) = scratch(
             "old",
             "VELSTRA_ROLES=control-plane,hypervisor\nVELSTRA_API_URL=http://127.0.0.1:8443\n",
             true,
         );
-        let said = migrate_seed(&dir).unwrap();
-        assert_eq!(said.len(), 2, "{said:?}");
-        let seed = std::fs::read_to_string(dir.join("node.env")).unwrap();
+        let said = migrate_seed(&state, &identity).unwrap();
+        // Three now: the move, and the two the TLS migration makes.
+        assert_eq!(said.len(), 3, "{said:?}");
+        let seed = std::fs::read_to_string(identity.join("node.env")).unwrap();
         assert!(seed.contains("VELSTRA_API_URL=https://localhost:8443"), "{seed}");
         assert!(seed.contains("VELSTRA_API_CA="), "{seed}");
         // Idempotent: a second upgrade says nothing and changes nothing.
-        assert!(migrate_seed(&dir).unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(migrate_seed(&state, &identity).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
     }
 
     #[test]
     fn a_cell_without_a_certificate_is_left_alone() {
         // Plaintext is a supported configuration. Rewriting it would break a
-        // machine that was working.
-        let dir = scratch("plain", "VELSTRA_API_URL=http://127.0.0.1:8443\n", false);
-        assert!(migrate_seed(&dir).unwrap().is_empty());
-        let seed = std::fs::read_to_string(dir.join("node.env")).unwrap();
+        // machine that was working. The move still happens: where the seed
+        // lives is not a question about TLS.
+        let (state, identity) = scratch("plain", "VELSTRA_API_URL=http://127.0.0.1:8443\n", false);
+        assert_eq!(migrate_seed(&state, &identity).unwrap().len(), 1);
+        let seed = std::fs::read_to_string(identity.join("node.env")).unwrap();
         assert!(seed.contains("http://127.0.0.1:8443"), "{seed}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
     }
 
     #[test]
     fn somebody_elses_control_plane_is_not_guessed_at() {
         // This machine's certificate says nothing about whether the cell it
         // joined serves TLS, so the seed is not touched.
-        let dir = scratch("remote", "VELSTRA_API_URL=http://cell.example:8443\n", true);
-        assert!(migrate_seed(&dir).unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        let (state, identity) = scratch("remote", "VELSTRA_API_URL=http://cell.example:8443\n", true);
+        assert_eq!(migrate_seed(&state, &identity).unwrap().len(), 1);
+        let seed = std::fs::read_to_string(identity.join("node.env")).unwrap();
+        assert!(seed.contains("http://cell.example:8443"), "{seed}");
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
+    }
+
+    /// The one that cost a cell its control plane.
+    ///
+    /// Two machines, one shared state directory. The second to be set up wrote
+    /// its seed there, and from then on the first read it: `has-role
+    /// control-plane` answered no, the API and the controller were skipped as
+    /// "not for this machine", and the whole cell went dark on a package
+    /// upgrade — with systemd reporting it as a condition politely unmet.
+    #[test]
+    fn a_shared_state_directory_cannot_rename_the_machine_that_mounts_it() {
+        let (state, identity) = scratch(
+            "shared",
+            "VELSTRA_NODE=peter\nVELSTRA_ROLES=hypervisor,pool\nVELSTRA_POOL=local-2\n",
+            false,
+        );
+        // The other machine's, already where it belongs.
+        std::fs::create_dir_all(&identity).unwrap();
+        std::fs::write(
+            identity.join("node.env"),
+            "VELSTRA_NODE=horst\nVELSTRA_ROLES=control-plane,hypervisor\n",
+        )
+        .unwrap();
+
+        // Nothing moves: this machine already knows who it is, and the shared
+        // file is somebody else's.
+        assert!(migrate_seed(&state, &identity).unwrap().is_empty());
+        let seed = std::fs::read_to_string(seed_path(&state, &identity)).unwrap();
+        assert!(seed.contains("VELSTRA_NODE=horst"), "{seed}");
+        // And not a word of the neighbour's, which is the point of reading one
+        // file rather than merging two: a control plane does not inherit a
+        // hypervisor's pool.
+        assert!(!seed.contains("local-2"), "{seed}");
+        assert!(crate::roles::has_role(&seed, "control-plane").unwrap());
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
     }
 }
 

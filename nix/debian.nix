@@ -72,16 +72,19 @@ let
       Type=simple
       Restart=on-failure
       RestartSec=5
-      EnvironmentFile=-/var/lib/velstra/node.env
-      # Read second, so it wins. The state directory holds this machine's guests
-      # *and* its identity, and those two want opposite things: a cell whose
-      # machines share one filesystem — which is what makes moving a guest
-      # possible at all — has every agent reading the same `node.env` and
-      # answering to the same name. Found by building that arrangement on two
-      # real machines: the second one to mount it renamed the first.
+      # The machine's own, and only the machine's own. The state directory
+      # holds this machine's guests, and a cell whose machines share one
+      # filesystem — which is what makes moving a guest possible at all — has
+      # every agent there reading the same `node.env` and answering to the same
+      # name. Found by building that arrangement on two real machines: the
+      # second one to mount it renamed the first, and the next package upgrade
+      # took the control plane down, because `has-role control-plane` was
+      # reading a hypervisor's seed.
       #
-      # So identity may live in /etc, where it is per-machine by construction,
-      # and the state directory is left holding only what a cell shares.
+      # Reading both and letting /etc win is not the fix — the keys /etc does
+      # not mention would still come from the neighbour, so a control plane
+      # would inherit a hypervisor's pool. `migrate-seed` in postinst moves an
+      # older machine's seed here, so there is exactly one file to read.
       EnvironmentFile=-/etc/velstra/node.env
       ${pre}${roleGuard role}ExecStart=${exec}
 
@@ -227,8 +230,8 @@ let
     RestartSec=2
     RuntimeDirectory=velstra
     RuntimeDirectoryMode=0700
-    EnvironmentFile=-/var/lib/velstra/node.env
-    ${roleGuard "hypervisor"}ExecCondition=/bin/sh -c 'command -v velstra >/dev/null || { echo "the fabric agent (velstra) is not installed; tenant networks here separate no traffic"; exit 1; }; grep -qE "^VELSTRA_FABRIC_CONTROL=." /var/lib/velstra/node.env || { echo "no VELSTRA_FABRIC_CONTROL in the seed: this cell has no data plane"; exit 1; }'
+    EnvironmentFile=-/etc/velstra/node.env
+    ${roleGuard "hypervisor"}ExecCondition=/bin/sh -c 'command -v velstra >/dev/null || { echo "the fabric agent (velstra) is not installed; tenant networks here separate no traffic"; exit 1; }; grep -qE "^VELSTRA_FABRIC_CONTROL=." /etc/velstra/node.env || { echo "no VELSTRA_FABRIC_CONTROL in the seed: this cell has no data plane"; exit 1; }'
     ExecStart=/bin/sh -c 'exec velstra run --controller "$VELSTRA_FABRIC_CONTROL" --node-id "$VELSTRA_NODE"'
     AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
     CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
@@ -257,6 +260,11 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     root=$PWD/pkg
     mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/lib/systemd/system" \
              "$root/var/lib/velstra" "$root/usr/share/doc/velstra-cloud"
+    # Where a machine keeps who it is: its seed and its agent tokens. Shipped
+    # so that the wizard, the postinst migration and an operator dropping a
+    # pool token in all find it there, on a fresh install too. 0700 because a
+    # token in it is a credential.
+    install -d -m 0700 "$root/etc/velstra"
 
     # The binaries, copied rather than symlinked into the store — and then
     # pointed at Debian's own dynamic linker, which is the half that was
@@ -305,7 +313,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     Recommends: qemu-system-x86, qemu-utils, etcd-server, etcd-client, ceph-common, velstra
     Description: Velstra Cloud — control plane, node agent and storage pool
      One package, four roles. Which of them this machine runs is decided by
-     \`velstra-cloud-node setup\`, which writes /var/lib/velstra/node.env; every
+     \`velstra-cloud-node setup\`, which writes /etc/velstra/node.env; every
      unit is conditional on its own role being named there, so installing this
      package starts nothing until somebody has said what the machine is for.
      .
@@ -320,7 +328,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     #!/bin/sh
     set -e
     # Deliberately no `systemctl enable`. Every unit here is conditional on its
-    # role being in /var/lib/velstra/node.env, and a machine that has just been
+    # role being in /etc/velstra/node.env, and a machine that has just been
     # unpacked has no seed — so enabling them would start agents pointing at no
     # cell, with no token, retrying for ever.
     if [ "$1" = "configure" ]; then
@@ -330,8 +338,10 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
       # HTTP to a TLS port, which stops the node following its cell entirely and
       # says so only as "invalid HTTP version parsed" in a journal. Safe to run
       # on a fresh install too — there is no seed yet, and it does nothing.
+      # Also moves an older machine's seed out of the shared state directory
+      # and into /etc, where it belongs to this machine and no other.
       velstra-cloud-node migrate-seed 2>/dev/null || true
-      if [ ! -f /var/lib/velstra/node.env ]; then
+      if [ ! -f /etc/velstra/node.env ]; then
         echo ""
         echo "velstra-cloud is installed and nothing is running."
         echo ""
