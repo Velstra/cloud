@@ -2079,3 +2079,237 @@ async fn a_network_with_no_subnet_is_refused_before_the_guest_exists() {
         "wrong refusal: {refusal}"
     );
 }
+
+// ---- folders ---------------------------------------------------------------
+
+/// A folder, as an operator makes one.
+async fn folder(api: &Api, id: &str, parent: &str, role: &str, member: &str) {
+    api.create(
+        "",
+        "folders",
+        &json!({ "id": id, "spec": {
+            "display_name": id,
+            "parent": parent,
+            "bindings": [{ "role": role, "members": [member] }]
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("making {id}: {e}"));
+}
+
+#[tokio::test]
+async fn a_role_granted_on_a_folder_reaches_the_projects_under_it() {
+    // `ProjectSpec.parent` has said since the beginning that it names the
+    // parent "policies are inherited from, kept as a name so the hierarchy is
+    // walked, not guessed". Nothing walked it. A customer could set it, the
+    // console showed it, and it changed nothing about who could do what — a
+    // field that was a promise the platform did not keep.
+    let api = cell().await;
+    folder(&api, "engineering", "", "editor", "ada").await;
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "parent": "engineering" }}),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .expect("a project goes into a folder");
+
+    // Ada holds nothing on p1 itself.
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "durch-den-ordner", "spec": { "vni": 5001, "mtu": 1500 }}),
+        &who("ada"),
+    )
+    .await
+    .expect("a role granted on the folder reaches the project");
+}
+
+#[tokio::test]
+async fn a_role_reaches_all_the_way_down_a_chain() {
+    let api = cell().await;
+    folder(&api, "alles", "", "editor", "ada").await;
+    folder(&api, "eng", "alles", "viewer", "bob").await;
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "parent": "eng" }}),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+
+    // Two levels up, and it still counts.
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "von-ganz-oben", "spec": { "vni": 5002, "mtu": 1500 }}),
+        &who("ada"),
+    )
+    .await
+    .expect("a role two levels up did not reach");
+
+    // And the nearer one grants only what it grants: roles add up, nothing
+    // subtracts, but a viewer is still a viewer.
+    let refused = api
+        .create(
+            "projects/p1",
+            "networks",
+            &json!({ "id": "nur-gucken", "spec": { "vni": 5003, "mtu": 1500 }}),
+            &who("bob"),
+        )
+        .await;
+    assert!(refused.is_err(), "a viewer created something");
+}
+
+#[tokio::test]
+async fn a_project_outside_the_folder_is_untouched() {
+    // The whole risk of this feature in one test. A grant that reaches further
+    // than the tree says is a tenant looking at somebody else's estate, and it
+    // is the kind of mistake that is invisible until it is a breach.
+    let api = cell().await;
+    folder(&api, "engineering", "", "admin", "ada").await;
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "parent": "engineering" }}),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+
+    let refused = api
+        .list_for(
+            "projects/p2",
+            "instances",
+            &velstra_cloud_api::Filter::none(),
+            &who("ada"),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a folder grant reached a project that is not in it"
+    );
+}
+
+#[tokio::test]
+async fn a_folder_with_a_project_in_it_cannot_be_tidied_away() {
+    // Written the other way round first, to prove that deleting a folder does
+    // not take a tenant's own access with it — and the delete was refused, which
+    // is the better answer. Housekeeping above somebody cannot silently remove
+    // every role granted there, because it cannot happen at all while anything
+    // is inside.
+    //
+    // The walk is forgiving anyway, for the case this cannot reach: a store
+    // restored, edited by hand, or written by a version without the guard. See
+    // `hierarchy::walking_upward::a_folder_that_is_gone_does_not_take_a_tenant
+    // _down_with_it` — a missing folder grants nothing and ends the walk rather
+    // than refusing, so the project's own bindings still govern it.
+    let api = cell().await;
+    folder(&api, "weg", "", "viewer", "bob").await;
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "parent": "weg" }}),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+
+    let refusal = api
+        .delete(&name("folders/weg"), None, &who(OPERATOR))
+        .await
+        .err()
+        .expect("a folder with a project in it was deleted");
+    assert!(
+        refusal.to_string().contains("projects/p1"),
+        "the refusal does not say what is inside: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_parent_that_names_something_other_than_a_folder_is_refused() {
+    // `parent` was a free string nothing read, so any text was as good as any
+    // other. Now that it decides who may do what, a value that names nothing is
+    // a grant that silently does not apply — and one that names a *project*
+    // would be a walk climbing sideways into somebody's tenancy.
+    let api = cell().await;
+    for bad in ["projects/p2", "organizations/o1", "folders/gibt-es-nicht"] {
+        let refusal = api
+            .patch(
+                &name("projects/p1"),
+                &json!({ "spec": { "parent": bad }}),
+                None,
+                &who(OPERATOR),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("`{bad}` was accepted as a parent"));
+        let said = refusal.to_string();
+        assert!(
+            said.contains("is not one") || said.contains("no folder called"),
+            "wrong refusal for `{bad}`: {said}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_folder_cannot_be_put_inside_itself() {
+    // A loop is not an error the read path would ever report: the walk is
+    // bounded, so it would simply stop somewhere arbitrary, and a folder's
+    // grandparent would quietly be itself.
+    let api = cell().await;
+    folder(&api, "a", "", "viewer", "ada").await;
+    folder(&api, "b", "a", "viewer", "ada").await;
+
+    let refusal = api
+        .patch(
+            &name("folders/a"),
+            &json!({ "spec": { "parent": "b" }}),
+            None,
+            &who(OPERATOR),
+        )
+        .await
+        .expect_err("a loop was written down");
+    assert!(
+        refusal.to_string().contains("inside itself"),
+        "wrong refusal: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_folder_with_something_in_it_is_not_deleted_out_from_under_it() {
+    // Otherwise tidying up above somebody silently takes every role granted
+    // there away from every project below, with nothing said.
+    let api = cell().await;
+    folder(&api, "eng", "", "editor", "ada").await;
+    folder(&api, "team", "eng", "viewer", "bob").await;
+
+    let refusal = api
+        .delete(&name("folders/eng"), None, &who(OPERATOR))
+        .await
+        .err()
+        .expect("a folder with a folder in it was deleted");
+    assert!(
+        refusal.to_string().contains("folders/team"),
+        "the refusal does not say what is inside: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_folder_is_the_cells_and_a_tenant_may_not_make_one() {
+    // A tenant who could make a folder and put their project in it could grant
+    // themselves anything, which is the whole of the access model undone.
+    let api = cell().await;
+    let refused = api
+        .create(
+            "",
+            "folders",
+            &json!({ "id": "meiner", "spec": { "display_name": "Meiner" }}),
+            &who(ADA),
+        )
+        .await;
+    assert!(refused.is_err(), "a tenant made a folder");
+}

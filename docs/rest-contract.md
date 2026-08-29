@@ -417,6 +417,42 @@ Changing bindings needs `admin` — kept apart from everything else so an editor
 cannot grant themselves more than they were given. A role name that does not
 parse reads as `viewer`: a typo lands on the least, not the most.
 
+### Folders: granting a role once instead of forty times
+
+`folders` is a cell-wide collection above projects. A folder holds a name, a
+parent (another folder, or nothing at the top) and the same `bindings` a project
+carries — and **a role granted on a folder governs every project under it, at any
+depth.**
+
+```
+POST   /api/v1/folders                       # { "id": "engineering", "spec": { … } }
+PATCH  /api/v1/folders/engineering
+DELETE /api/v1/folders/engineering           # refused while anything is inside it
+```
+
+```
+PATCH /api/v1/projects/p1
+{ "spec": { "parent": "engineering" } }      # or "folders/engineering"
+```
+
+Either spelling of `parent` is accepted — bare, like every other cell-scoped
+reference the console writes, or in full — and what is stored is the full name.
+
+**Roles add up going down.** There is no deny and no way for a project to shed a
+role granted above it. "Who may do this" is answered by reading upward once and
+taking the union, which is a question a person can hold in their head; a
+resolution order is not.
+
+A parent that names something which is not a folder is refused, as is one that
+would put a folder inside itself, as is a chain more than **eight** deep — a
+permission check reads every level above the object, so the depth is what one of
+those costs. A folder that has been deleted grants nothing and ends the walk: a
+project whose folder was tidied away is a project its own bindings still govern,
+because an outage caused by housekeeping above somebody is the wrong answer.
+
+Quota and policy do **not** inherit. They are the project's own, decided by the
+cell for that project.
+
 ### What the cell allows a project
 
 A quota says **how much**. A project's policy says **what kind**, and it is the

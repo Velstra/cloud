@@ -177,7 +177,7 @@ async fn an_object_does_not_hold_itself() {
     api.create(
         "",
         "projects",
-        &json!({"id": "empty", "spec": {"quota": {}, "parent": "organizations/o1"}}),
+        &json!({"id": "empty", "spec": {"quota": {}, "parent": ""}}),
         &who(),
     )
     .await

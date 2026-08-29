@@ -50,8 +50,9 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 30] = [
+pub const COLLECTIONS: [&str; 31] = [
     "projects",
+    "folders",
     "users",
     "ceph-clusters",
     "instances",
@@ -82,6 +83,32 @@ pub const COLLECTIONS: [&str; 30] = [
     "maintenance-windows",
     "operations",
 ];
+
+/// A bare folder id becomes the full name.
+///
+/// Two spellings reach this field and both are somebody being reasonable. The
+/// console writes every cell-scoped reference bare — `hv-1`, not `nodes/hv-1` —
+/// because that is what a node and a device class are called, and a picker that
+/// spelled one collection differently would be a picker somebody has to
+/// remember. The field itself has said `folders/f2` since long before anything
+/// walked it.
+///
+/// Stored in full, because the *model's* gate is spelled that way: a `parent`
+/// of `projects/p1` must not climb sideways into somebody's tenancy, and
+/// `hierarchy::folder_above` is what stops it. A bare id carries no kind and so
+/// carries no such gate.
+fn settle_parent(spec: &mut Value) {
+    let Some(parent) = spec.get("parent").and_then(Value::as_str) else {
+        return;
+    };
+    if parent.is_empty() || parent.contains('/') {
+        return;
+    }
+    spec["parent"] = Value::String(format!(
+        "{}{parent}",
+        velstra_cloud_model::hierarchy::FOLDER_PREFIX
+    ));
+}
 
 /// Said the same way wherever somebody tries to write a usage record.
 ///
@@ -406,6 +433,11 @@ impl Api {
         }
         let collections = BTreeMap::from([
             collection!("projects", ProjectSpec, ProjectStatus),
+            collection!(
+                "folders",
+                velstra_cloud_model::hierarchy::FolderSpec,
+                velstra_cloud_model::hierarchy::FolderStatus
+            ),
             // Servable, unlike `credentials` and `sessions`, which are stored
             // beside it and deliberately have no route at all — see
             // `crate::sessions`. A user record holds no secret, so listing one
@@ -795,6 +827,14 @@ impl Api {
         if verb == Verb::Read && name.collection() == "images" && name.parent().is_none() {
             return Ok(());
         }
+        // A folder is governed by itself and by the folders above it: granting
+        // somebody Admin on `folders/eng` is what lets them manage `eng`, the
+        // same way a project governs itself.
+        if name.collection() == "folders" && name.parent().is_none() {
+            let bindings = self.bindings_from(&name.to_string()).await;
+            return may(&who.subject, &self.inner.cell_admins, &bindings, verb)
+                .map_err(|denied| ApiError::forbidden(denied.to_string()));
+        }
         let Some(project) = governing_project(name) else {
             // Outside every project: a node, a pool, the projects collection.
             // These are the cell's, and only an operator has the cell.
@@ -802,13 +842,16 @@ impl Api {
                 "this is a cell-wide resource; only a cell operator may touch it",
             ));
         };
-        // Read the project's bindings. A project that is not there refuses in
-        // the same words as one that refuses, so the error is not an oracle for
-        // which projects exist.
-        let bindings = match self.typed_project(&project).await {
-            Ok(Some(p)) => p.spec.bindings,
-            _ => Vec::new(),
-        };
+        // Read the project's bindings, then the bindings of every folder above
+        // it. A project that is not there refuses in the same words as one that
+        // refuses, so the error is not an oracle for which projects exist.
+        let mut bindings = Vec::new();
+        let mut parent = String::new();
+        if let Ok(Some(p)) = self.typed_project(&project).await {
+            bindings = p.spec.bindings;
+            parent = p.spec.parent;
+        }
+        bindings.extend(self.bindings_above(&parent).await);
         may(&who.subject, &self.inner.cell_admins, &bindings, verb)
             .map_err(|denied| ApiError::forbidden(denied.to_string()))
     }
@@ -1024,6 +1067,56 @@ impl Api {
             self.authorize(who, Verb::Read, &name).await?;
         }
         Ok(())
+    }
+
+    /// Every binding that governs something whose parent is `parent`.
+    ///
+    /// The walk upward, and the whole of what a folder does. Bounded by
+    /// [`velstra_cloud_model::hierarchy::MAX_DEPTH`] and by having seen a name
+    /// before, because this is a *permission check*: it has to answer with
+    /// whatever the store holds rather than be the place a bad store is found.
+    ///
+    /// One read per folder in the chain, which is one or two in every cell
+    /// anybody has drawn, and none at all for a project at the top — the
+    /// ordinary case costs exactly what it cost before folders existed.
+    async fn bindings_above(&self, parent: &str) -> Vec<velstra_cloud_model::authz::Binding> {
+        use velstra_cloud_model::hierarchy::{FOLDER_PREFIX, MAX_DEPTH, folder_above};
+
+        let mut out = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut here = folder_above(parent).map(str::to_string);
+        while let Some(name) = here {
+            if seen.contains(&name) || seen.len() >= MAX_DEPTH {
+                break;
+            }
+            seen.push(name.clone());
+            let Some(folder) = self.typed_folder(&name).await else {
+                // A folder that is not there grants nothing and ends the walk.
+                // A project whose folder was deleted is a project whose own
+                // bindings still govern it: an outage caused by housekeeping
+                // above somebody is the wrong answer.
+                break;
+            };
+            out.extend(folder.spec.bindings);
+            here = folder_above(&folder.spec.parent).map(str::to_string);
+        }
+        let _ = FOLDER_PREFIX;
+        out
+    }
+
+    /// A folder's own bindings, plus those of every folder above it.
+    async fn bindings_from(&self, folder: &str) -> Vec<velstra_cloud_model::authz::Binding> {
+        let mut out = Vec::new();
+        if let Some(here) = self.typed_folder(folder).await {
+            out.extend(here.spec.bindings);
+            out.extend(self.bindings_above(&here.spec.parent).await);
+        }
+        out
+    }
+
+    async fn typed_folder(&self, name: &str) -> Option<velstra_cloud_model::hierarchy::Folder> {
+        let document = self.collection("folders").ok()?.get(name).await.ok()??;
+        serde_json::from_value(document).ok()
     }
 
     async fn typed_project(&self, name: &str) -> ApiResult<Option<Project>> {
@@ -1537,6 +1630,12 @@ impl Api {
         if kind == "instances" {
             self.settle_image_family(parent, &mut spec).await?;
         }
+        // Before the shape check, not after: the bare spelling is a *spelling*
+        // and not a malformed name, and `refs::check` cannot know that without
+        // being taught about this one field. One place decides what a parent is.
+        if kind == "folders" || kind == "projects" {
+            settle_parent(&mut spec);
+        }
         crate::refs::check(kind, &spec)?;
         // Before anything follows one of those references — `settle_volume_source`
         // reads the snapshot, `settle_migration` reads the instance — so that a
@@ -1584,6 +1683,10 @@ impl Api {
         }
         if kind == "networks" {
             self.settle_network(&mut spec).await?;
+        }
+        if kind == "folders" || kind == "projects" {
+            self.refuse_a_parent_that_cannot_be_one(kind, &name, &spec)
+                .await?;
         }
         if kind == "instances" {
             self.settle_default_network(&name, parent, body.get("spec"), &mut spec)
@@ -1721,6 +1824,9 @@ impl Api {
             labels: body.get("meta").and_then(|m| m.get("labels")).cloned(),
         };
         if let Some(spec) = &mut patch.spec {
+            if name.collection() == "folders" || name.collection() == "projects" {
+                settle_parent(spec);
+            }
             crate::refs::check(name.collection(), spec)?;
             self.authorize_references(
                 who,
@@ -1729,6 +1835,17 @@ impl Api {
                 governing_project(name).as_deref(),
             )
             .await?;
+            // Only when this change carries it. A patch carries what it changes,
+            // so a project stored before folders existed — with the
+            // `organizations/o1` the field's own documentation used to promise —
+            // stays editable in every other respect. Moving it is a decision;
+            // renaming it is not the moment to make somebody make one.
+            if (name.collection() == "folders" || name.collection() == "projects")
+                && spec.get("parent").is_some()
+            {
+                self.refuse_a_parent_that_cannot_be_one(name.collection(), name, spec)
+                    .await?;
+            }
             check_rules(name.collection(), spec)?;
             if name.collection() == "volumes" {
                 self.refuse_a_new_source(name, spec).await?;
@@ -4051,6 +4168,81 @@ impl Api {
         )
         .await?;
         Ok(port)
+    }
+
+    /// A parent has to be a folder, and it has to be one that is there.
+    ///
+    /// Either spelling arrives: `engineering` — which is how the console writes
+    /// every cell-scoped reference, and how a node and a device class are named
+    /// — or `folders/engineering`, which is what the field has claimed to hold
+    /// since before anything read it. [`settle_parent`] makes them one before
+    /// this runs, so what is stored is always the full name and the model's own
+    /// gate (`hierarchy::folder_above`) still catches a `parent` that names
+    /// something which is not a folder at all.
+    ///
+    /// `parent` used to be a free string nothing read — the field said it named
+    /// "`organizations/o1` or `folders/f2`" and the platform walked nothing, so
+    /// any text at all was as good as any other. Now that it decides who may do
+    /// what, a value that names nothing is a grant that silently does not apply,
+    /// and a loop is a chain whose top is wherever the depth bound happens to
+    /// fall.
+    async fn refuse_a_parent_that_cannot_be_one(
+        &self,
+        kind: &str,
+        name: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        use velstra_cloud_model::hierarchy::folder_above;
+
+        let parent = spec.get("parent").and_then(Value::as_str).unwrap_or("");
+        if parent.is_empty() {
+            return Ok(());
+        }
+        if folder_above(parent).is_none() {
+            return Err(ApiError::invalid(format!(
+                "a parent is a folder, as in `folders/engineering` — `{parent}` is not one"
+            ))
+            .at("spec.parent"));
+        }
+        if self.typed_folder(parent).await.is_none() {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!("there is no folder called `{parent}`"),
+            )
+            .at("spec.parent"));
+        }
+        if kind == "folders" {
+            let me = name.to_string();
+            let mut seen: Vec<String> = Vec::new();
+            let mut here = Some(parent.to_string());
+            while let Some(step) = here.and_then(|p| folder_above(&p).map(str::to_string)) {
+                if step == me {
+                    return Err(ApiError::invalid(
+                        "that would put this folder inside itself. A folder above another one \
+                         cannot also be below it — the tree is what makes \"who may do this\" \
+                         answerable by reading upward once.",
+                    )
+                    .at("spec.parent"));
+                }
+                if seen.contains(&step)
+                    || seen.len() >= velstra_cloud_model::hierarchy::MAX_DEPTH
+                {
+                    break;
+                }
+                seen.push(step.clone());
+                here = self.typed_folder(&step).await.map(|f| f.spec.parent);
+            }
+            if seen.len() >= velstra_cloud_model::hierarchy::MAX_DEPTH {
+                return Err(ApiError::invalid(format!(
+                    "folders go {} deep and this would be deeper. A permission question is \
+                     answered by reading every level above the object, so the depth is what \
+                     one of those costs.",
+                    velstra_cloud_model::hierarchy::MAX_DEPTH
+                ))
+                .at("spec.parent"));
+            }
+        }
+        Ok(())
     }
 
     async fn settle_network(&self, spec: &mut Value) -> ApiResult<()> {

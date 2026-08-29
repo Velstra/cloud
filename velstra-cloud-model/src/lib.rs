@@ -18,6 +18,7 @@ pub mod ceph;
 pub mod console;
 pub mod images;
 pub mod cpu;
+pub mod hierarchy;
 pub mod ha;
 pub mod identity;
 pub mod ipam;
