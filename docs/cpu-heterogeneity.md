@@ -250,14 +250,21 @@ Read out, that is:
 > domain. Cost: node-c's guests lose `avx512_vnni`. No other node loses
 > anything.
 >
-> **node-d, node-e** (Cloud Hypervisor) run EPYC Milan and EPYC Genoa. These
-> cannot be brought together: Cloud Hypervisor has no CPU model to mask with.
-> Live migration between them will stay refused. To make them one domain they
-> must run the same CPU, or move to QEMU.
+> **node-d, node-e** run EPYC Milan and EPYC Genoa and cannot present a CPU
+> other than their own. A live move between them will stay refused. A cold move
+> still works: it stops the guest and starts it on the destination, where it
+> reads the processor it is given.
 
 The first block is a recommendation with a named price. The second is a refusal
-with a named cause and two real remedies. Neither is a warning icon that leaves
-the operator to work it out.
+with a named cause and a way through. Neither is a warning icon that leaves the
+operator to work it out.
+
+**No product is named in the second block, and that is deliberate.** It used to
+say "Cloud Hypervisor has no CPU model to mask with … or move to QEMU", which
+was true of one cause and wrong about another: Debian 13's QEMU 10 ships without
+the `x86-64-vN` models, so two machines running QEMU were told to run QEMU. What
+the platform actually knows is that these nodes cannot present a CPU other than
+their own; that is what it says.
 
 **The rule that keeps this honest:** a recommendation always states what is
 lost, per node. A baseline that quietly removes AVX-512 from a fleet whose
