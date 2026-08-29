@@ -1596,7 +1596,10 @@ function derive(kind, spec) {
     // Two different problems, two different controls: a destination that
     // cannot receive is the destination's fault, a guest that is not running
     // or is not where you said is the guest's.
-    const no = whyNot(instance, spec.toNode);
+    // With the mode, because the modes refuse different things — a cold move
+    // crosses processors a live one cannot. Judging every create as live
+    // refused the one move a mixed fleet can actually make.
+    const no = whyNot(instance, spec.toNode, spec.mode || "Live");
     if (no) {
       const guest = no.why === "NotRunning" || no.why === "NotFromThere";
       return { status: 400, code: "FAILED_PRECONDITION",

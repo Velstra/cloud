@@ -1344,6 +1344,40 @@ await test("abandoning a post-copy migration warns differently from a live one",
   check(gone, "an abandoned migration is still on the board");
 });
 
+/// A cold move's sheet does not report on a transfer that never happens.
+///
+/// "Copied 0 MiB" and "Receiver: not listening" are the honest reading of a live
+/// move that has not started. On a cold one that has *arrived* they are two
+/// things that look like they went wrong — and nothing on the page says
+/// otherwise, because for that mode there is nothing to say.
+await test("a cold move's sheet leaves out the transfer it never makes", async () => {
+  const it = await migratable();
+  const project = it.name.split("/").slice(0, 2).join("/");
+  const id = "consoletest-cold-" + Math.random().toString(36).slice(2, 6);
+  const made = await api("/api/v1/" + project + "/migrations", {
+    method: "POST",
+    body: JSON.stringify({ id, spec: { instance: it.name, toNode: "node-d", mode: "Reboot" } }),
+  });
+  if (!made.ok) skip(`this API would not start a cold migration (${made.status})`);
+  try {
+    await open(page, "migrations");
+    await openRow(page, id);
+    // The Movement section of the sheet, found by the label in its margin — it
+    // carries no id of its own.
+    const shown = await waitFor(page, `(() => {
+      const margin = [...document.querySelectorAll("#sheet .spread > .margin")]
+        .find((m) => m.textContent.trim().startsWith("Movement"));
+      const text = margin ? margin.parentElement.textContent : "";
+      return text.trim() ? text : null;
+    })()`, { timeout: 15000 });
+    check(!/Copied/i.test(shown), `a cold move's sheet counts copied bytes: ${shown}`);
+    check(!/Receiver/i.test(shown), `a cold move's sheet reports on a receiver: ${shown}`);
+    check(/off from the moment/i.test(shown), `it does not say what the move costs: ${shown}`);
+  } finally {
+    await api("/api/v1/" + project + "/migrations/" + id, { method: "DELETE" });
+  }
+});
+
 await test("only what the platform said `allowed` can be chosen", async () => {
   // The answer carries every node with its own verdict, so nothing here has to
   // infer anything — and must not. The dangerous inference is "not refused,

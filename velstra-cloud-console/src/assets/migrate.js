@@ -172,8 +172,15 @@ function movementBlock(r) {
     // A count, never a percentage: the platform promises no total and no
     // deadline, and a bar that fills to 90% and stays there for an hour is a
     // promise the page had no right to make.
-    el("div", el("span.k", "Copied"), f.copied.toLocaleString() + " MiB"),
-    el("div", el("span.k", "Receiver"), f.ready ? "listening" : "not listening"),
+    //
+    // Neither is shown for a cold move: nothing is copied and no receiver is
+    // ever opened, so "0 MiB" and "not listening" describe a transfer that was
+    // never going to happen — and read, on a move that arrived, as two things
+    // that went wrong.
+    f.mode === "Reboot" ? null : el("div", el("span.k", "Copied"),
+      f.copied.toLocaleString() + " MiB"),
+    f.mode === "Reboot" ? null : el("div", el("span.k", "Receiver"),
+      f.ready ? "listening" : "not listening"),
     gaveUp
       ? el("div", el("span.k", "Gave up"),
         el("span", { title: stamp(gaveUp) }, ago(gaveUp)))
