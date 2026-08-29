@@ -1035,11 +1035,17 @@
                 # Pre-placed under its published slug: content-addressed means
                 # "already here" is a complete answer, so the agent skips the
                 # fetch (hostfs::fetch_image's first check).
+                #
+                # The digest is the one 8 MiB of zeroes really has. It used to be
+                # thirty-two `ab`s, which was fine until the agent started
+                # checking — and then this check spent five minutes waiting for a
+                # guest the platform was correctly refusing to start, saying so
+                # on the object where nothing was looking.
                 cell.succeed("dd if=/dev/zero of=/root/guest.raw bs=1M count=8")
                 cell.succeed(
                     "mkdir -p /var/lib/velstra/images && "
                     "cp /root/guest.raw"
-                    " '/var/lib/velstra/images/projects~p1~images~sha256-${lib.concatStrings (lib.replicate 32 "ab")}'"
+                    " '/var/lib/velstra/images/projects~p1~images~sha256-2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74'"
                 )
                 cell.succeed(
                     f"curl -fsS -X POST {auth} {ct}"
@@ -1055,9 +1061,9 @@
                 cell.succeed(
                     f"curl -fsS -X POST {auth} {ct}"
                     f" -d @${pkgs.writeText "image.json" (builtins.toJSON {
-                      id = "sha256-${lib.concatStrings (lib.replicate 32 "ab")}";
+                      id = "sha256-2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74";
                       spec = {
-                        digest = "sha256:${lib.concatStrings (lib.replicate 32 "ab")}";
+                        digest = "sha256:2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74";
                         format = "Raw";
                         sizeBytes = 8388608;
                         sourceUrl = "file:///root/guest.raw";
@@ -1072,7 +1078,7 @@
                       spec = {
                         vcpus = 1;
                         memoryMib = 512;
-                        image = "projects/p1/images/sha256-${lib.concatStrings (lib.replicate 32 "ab")}";
+                        image = "projects/p1/images/sha256-2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74";
                         rootDiskGib = 1;
                         desiredState = "Running";
                         ports = [ ];
