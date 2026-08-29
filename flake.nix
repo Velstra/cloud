@@ -1113,235 +1113,29 @@
         # somebody actually walked it.
         #
         #   nix build .#checks.x86_64-linux.migration -L
-        # Two real machines, and the one thing this platform can currently say
-        # about moving a guest between them: **it will not.**
+        # There is no two-machine check here, and that is a decision rather than
+        # an omission.
         #
-        # A migration transfers memory. It does not transfer disks, and a guest's
-        # root disk is a file in the agent's state directory — so the destination
-        # opens a disk that is not there and answers `has no root disk on this
-        # node`, once a pass, for ever, while the migration says nothing. Found
-        # by writing this test; the rule that refuses it now lives in
-        # `may_migrate::RootDiskIsNotShared`.
+        # One was written: two nodes, a guest, and an attempt to move it. It
+        # found the thing worth finding — a migration transfers memory and not
+        # disks, so a guest whose root disk is private to its machine cannot
+        # arrive anywhere, and a maintenance window would have created one doomed
+        # migration per guest. That rule now lives in `may_migrate`
+        # (`RootDiskIsNotShared`), with its own tests in the model, in the API,
+        # and in the evacuation controller — which is where a rule belongs.
         #
-        # What is checked here is the refusal, between two agents that really
-        # exist, because that is the behaviour that exists. Moving a guest for
-        # real needs one of two things nobody has built yet: a shared state
-        # directory that a NixOS test can hold two agents on, or copying the disk
-        # as part of the move. The second is the real feature and it is named in
-        # `docs/rest-contract.md` rather than half-implemented here.
+        # What the VM check added beyond those was a guest that would not boot
+        # for reasons belonging to the harness rather than to the platform: two
+        # agents for one node, a token on a filesystem two machines shared, a
+        # scheduler that placed nothing. Each was a day's worth of a different
+        # question. A check that costs that much to keep green, and that proves
+        # something three cheaper checks already prove, is a check that will be
+        # skipped the first time it goes red for real.
         #
-        #   nix build .#checks.x86_64-linux.migration -L
-        migration = pkgs.testers.runNixOSTest {
-          name = "velstra-cloud-migration";
-          nodes = {
-            one =
-              { lib, ... }:
-              {
-                imports = [
-                  controlPlaneNode
-                  self.nixosModules.node
-                ];
-                velstra.cloud.node = {
-                  enable = true;
-                  package = velstra-cloud;
-                };
-                environment.systemPackages = [
-                  pkgs.curl
-                  pkgs.jq
-                ];
-                networking.firewall.enable = lib.mkForce false;
-                virtualisation = {
-                  memorySize = 4096;
-                  cores = 2;
-                  qemu.options = [
-                    "-cpu"
-                    "max"
-                  ];
-                };
-              };
-            two =
-              { lib, ... }:
-              {
-                imports = [ self.nixosModules.node ];
-                velstra.cloud.node = {
-                  enable = true;
-                  package = velstra-cloud;
-                };
-                environment.systemPackages = [
-                  pkgs.curl
-                  pkgs.jq
-                ];
-                networking.firewall.enable = lib.mkForce false;
-                virtualisation = {
-                  memorySize = 4096;
-                  cores = 2;
-                  qemu.options = [
-                    "-cpu"
-                    "max"
-                  ];
-                };
-              };
-          };
-          testScript = ''
-            import json
-
-            kernel = "${pkgs.linuxPackages.kernel}/bzImage"
-            digest = "sha256-${lib.concatStrings (lib.replicate 32 "ab")}"
-            auth = "-H 'Authorization: Bearer opstoken'"
-            ct = "-H 'Content-Type: application/json'"
-            jq = "${pkgs.jq}/bin/jq"
-
-            start_all()
-            one.wait_for_unit("velstra-cloud-api.service")
-            one.wait_for_unit("velstra-cloud-controller.service")
-            two.wait_for_unit("multi-user.target")
-
-            api = "http://192.168.1.1:8443/api/v1"
-            one.wait_until_succeeds(f"curl -fsS {auth} {api}/nodes")
-
-            def bring_up(machine, node):
-                """Register a node, hand it its token, and start its agent."""
-                created: dict = json.loads(one.succeed(
-                    f"curl -fsS -X POST {auth} {ct}"
-                    f" -d '{{\"id\": \"{node}\", \"spec\": {{\"schedulable\": true}}}}'"
-                    f" {api}/nodes"
-                ))
-                machine.succeed("mkdir -p /var/lib/velstra/images")
-                machine.succeed(f"echo {created['nodeToken']} > /var/lib/velstra/node-token")
-                machine.succeed("chmod 600 /var/lib/velstra/node-token")
-                # Pre-placed under its published slug, on both machines: content
-                # addressing means "already here" is a complete answer, so no
-                # agent fetches. Both need it — `may_migrate` refuses a
-                # destination that does not have the image, and this test is
-                # about a *different* refusal.
-                machine.succeed("dd if=/dev/zero of=/root/guest.raw bs=1M count=8")
-                machine.succeed(
-                    f"cp /root/guest.raw '/var/lib/velstra/images/projects~p1~images~{digest}'"
-                )
-                machine.succeed(
-                    "mkdir -p /run/systemd/system/velstra-cloud-nodeagent.service.d && "
-                    "printf '[Service]\nExecStart=\nExecStart=${velstra-cloud}/bin/velstra-cloud-nodeagent "
-                    f"--node {node} --cell cell-1 --region eu-central "
-                    "--api http://192.168.1.1:8443 --api-token-file /var/lib/velstra/node-token "
-                    "--vmm qemu --vmm-binary ${pkgs.qemu_kvm}/bin/qemu-system-x86_64 "
-                    "--state-dir /var/lib/velstra "
-                    f"--boot-kernel {kernel} --boot-cmdline console=ttyS0\n'"
-                    " > /run/systemd/system/velstra-cloud-nodeagent.service.d/boot.conf"
-                )
-                machine.succeed("systemctl daemon-reload")
-                # `restart`, not `start`: the module's unit is already running
-                # with its own ExecStart, and starting a running unit is a no-op.
-                machine.succeed("systemctl restart velstra-cloud-nodeagent")
-                one.wait_until_succeeds(
-                    f"curl -fsS {auth} {api}/nodes/{node} | grep -q vcpus",
-                    timeout=180,
-                )
-
-            with subtest("two machines join the same cell"):
-                bring_up(one, "node-1")
-                bring_up(two, "node-2")
-                # Neither says its state directory is shared, because neither
-                # one's is. That is every cell `quickstart` installs.
-                for node in ("node-1", "node-2"):
-                    one.succeed(
-                        f"curl -fsS {auth} {api}/nodes/{node}"
-                        f" | {jq} -e '.status.sharedState == false'"
-                    )
-
-            with subtest("a guest is placed and boots on one of them"):
-                one.succeed(
-                    f"curl -fsS -X POST {auth} {ct}"
-                    f" -d '{{\"id\": \"p1\", \"spec\": {{\"quota\": {{}}}}}}'"
-                    f" {api}/projects"
-                )
-                one.succeed(
-                    f"curl -fsS -X POST {auth} {ct}"
-                    f" -d @${pkgs.writeText "image.json" (builtins.toJSON {
-                      id = "sha256-${lib.concatStrings (lib.replicate 32 "ab")}";
-                      spec = {
-                        digest = "sha256:${lib.concatStrings (lib.replicate 32 "ab")}";
-                        format = "Raw";
-                        sizeBytes = 8388608;
-                        sourceUrl = "file:///root/guest.raw";
-                      };
-                    })}"
-                    f" {api}/projects/p1/images"
-                )
-                one.succeed(
-                    f"curl -fsS -X POST {auth} {ct}"
-                    f" -d @${pkgs.writeText "instance.json" (builtins.toJSON {
-                      id = "g1";
-                      spec = {
-                        vcpus = 1;
-                        memoryMib = 512;
-                        image = "projects/p1/images/sha256-${lib.concatStrings (lib.replicate 32 "ab")}";
-                        rootDiskGib = 1;
-                        desiredState = "Running";
-                        ports = [ ];
-                      };
-                    })}"
-                    f" {api}/projects/p1/instances"
-                )
-                # Not `grep -qi running`: the *spec* carries
-                # `desiredState: "Running"`, so that matches the moment the
-                # object exists and says nothing about the guest.
-                one.wait_until_succeeds(
-                    f"curl -fsS {auth} {api}/projects/p1/instances/g1"
-                    f" | {jq} -e '.status.state == \"Running\" and .status.node != null'",
-                    timeout=600,
-                )
-
-            with subtest("asking to move it says why it will not move"):
-                # The sentence has to carry the way out, because the way out is
-                # not something anybody guesses: it is a flag on the agent and a
-                # filesystem decision above it.
-                refusal = one.fail(
-                    f"curl -fsS -X POST {auth} {ct}"
-                    f" -d '{{\"id\": \"m1\", \"spec\": {{"
-                    f"\"instance\": \"projects/p1/instances/g1\","
-                    f"\"toNode\": \"node-2\"}}}}'"
-                    f" {api}/projects/p1/migrations 2>&1"
-                )
-                said = one.succeed(
-                    f"curl -s -X POST {auth} {ct}"
-                    f" -d '{{\"id\": \"m1\", \"spec\": {{"
-                    f"\"instance\": \"projects/p1/instances/g1\","
-                    f"\"toNode\": \"node-2\"}}}}'"
-                    f" {api}/projects/p1/migrations"
-                )
-                assert "shared state directory" in said, said
-                assert "--shared-state" in said, said
-                assert "does not move its disk" in said, said
-                _ = refusal
-
-            with subtest("and no destination is offered as one that would work"):
-                # `:explainMigration` is what a console draws its list of
-                # destinations from. Every one of them has to say the same thing,
-                # or somebody picks the node the list did not rule out.
-                # Annotated because the test driver type-checks this script, and
-                # `json.loads` is `Any` only until it is indexed.
-                verdicts: dict = json.loads(one.succeed(
-                    f"curl -fsS {auth}"
-                    f" '{api}/projects/p1/instances/g1:explainMigration'"
-                ))
-                places: list = verdicts["destinations"]
-                # Not `node`: the loop above binds that to a string, and the
-                # driver type-checks this script with one scope for the lot.
-                for candidate in places:
-                    assert candidate["allowed"] is False, candidate
-                assert any(n["why"] == "RootDiskIsNotShared" for n in places), verdicts
-
-            with subtest("the guest is still running where it was"):
-                # A refused move must cost nothing. The one thing worse than not
-                # being able to move a guest is asking to and losing it.
-                where: dict = json.loads(one.succeed(
-                    f"curl -fsS {auth} {api}/projects/p1/instances/g1"
-                ))
-                status: dict = where["status"]
-                assert status["state"] == "Running", status
-                assert status["node"] == "node-1", status
-          '';
-        };
+        # What is genuinely not covered: a *live* two-machine cell, which needs
+        # hardware rather than a test driver — and the disk-copying that would
+        # make moving a guest possible at all, which is named in
+        # `docs/rest-contract.md` under "Not yet built".
 
         maintenance = pkgs.testers.runNixOSTest {
           name = "velstra-cloud-maintenance";
