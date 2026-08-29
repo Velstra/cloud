@@ -176,12 +176,46 @@ pub type Session = Resource<SessionSpec, SessionStatus>;
 /// record; the old digest stops being accepted when its record is deleted.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeCredentialSpec {
-    /// The node this token authenticates as. Reading the credential yields the
+    /// The agent this token authenticates as. Reading the credential yields the
     /// identity `Writer::agent(node)` is built from.
+    ///
+    /// Named `node` because that is all there was when it was written, and it is
+    /// on the wire. A pool's name goes here too — see [`NodeCredentialSpec::kind`].
     pub node: String,
+    /// Which kind of agent, because the two are not interchangeable to a reader.
+    ///
+    /// A pool is not a node. It runs on a machine, it may run on a machine that
+    /// holds no guests at all, and the objects it may write are a different set.
+    /// Until this existed there were only node tokens — so a pool anywhere but
+    /// the control plane had nothing to authenticate with, and the agent there
+    /// simply could not run.
+    ///
+    /// Defaults to `Node`, which is what every credential minted before this
+    /// field is.
+    #[serde(default)]
+    pub kind: AgentKind,
     /// When it was issued, so an operator can see a credential's age.
     #[serde(default)]
     pub issued_at: Timestamp,
+}
+
+/// What a credential speaks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentKind {
+    #[default]
+    Node,
+    Pool,
+}
+
+impl AgentKind {
+    /// The prefix a subject carries, so a log line says which kind refused.
+    pub fn subject_prefix(self) -> &'static str {
+        match self {
+            AgentKind::Node => "node",
+            AgentKind::Pool => "pool",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

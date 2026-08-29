@@ -185,6 +185,14 @@ pub struct Created {
     /// `--api` presents this token, and the API serves it only its own objects
     /// and accepts status writes only for them.
     pub node_token: Option<String>,
+    /// The same, for a storage pool.
+    ///
+    /// A separate field rather than one `agentToken`, because the two are
+    /// genuinely different things a caller does different work with — unlike a
+    /// `role`/`customRole` pair, where both would have named one grant. A
+    /// registration answers with exactly one of them, and which one says what
+    /// was registered.
+    pub pool_token: Option<String>,
 }
 
 /// Which objects a caller is asking for.
@@ -1853,10 +1861,21 @@ impl Api {
         } else {
             None
         };
+        // A pool gets one for the same reason and on the same terms. Without it
+        // a pool could only ever run on the control plane's own machine: its
+        // agent wrote straight to the store, and a machine with no etcd has no
+        // store to write to. The `pool + hypervisor` answer the setup wizard
+        // offers produced a unit that could not start.
+        let pool_token = if kind == "pools" {
+            Some(self.inner.identity.mint_pool_credential(name.id()).await?)
+        } else {
+            None
+        };
         Ok(Created {
             operation,
             target: name.to_string(),
             node_token,
+            pool_token,
         })
     }
 
@@ -5694,6 +5713,9 @@ pub fn created_body(created: &Created) -> Value {
     // in this API returned once and never again — the node's agent token.
     if let Some(token) = &created.node_token {
         body.insert("nodeToken".into(), Value::String(token.clone()));
+    }
+    if let Some(token) = &created.pool_token {
+        body.insert("poolToken".into(), Value::String(token.clone()));
     }
     Value::Object(body)
 }
