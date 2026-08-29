@@ -244,6 +244,21 @@ pub trait CellReader: Send + Sync + 'static {
     /// reads with different entitlements: the list is the Ceph pass's, whole and
     /// cell-wide; this is a machine asking for the object it reports on.
     async fn node(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Node>>;
+
+    /// One instance by name, for the two questions a migration asks about a
+    /// guest that is not in this node's own list: who owns it, and what is
+    /// being brought here.
+    ///
+    /// Beside `instances()` for the same reason `node` is beside `nodes`, and
+    /// with a sharper one behind it: those two reads were going to a store
+    /// handle, which under `--api` is a placeholder that answers "no such
+    /// object". On the source that reads as "this node has already let go" —
+    /// the moment a migration exists, before the guest has moved anywhere.
+    async fn instance(
+        &self,
+        name: &str,
+    ) -> Result<Option<velstra_cloud_model::resources::Instance>>;
+
     async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>>;
 
     /// Woken whenever something this node has business with changes.
@@ -405,6 +420,12 @@ impl CellReader for StoreCell {
             .get(&format!("nodes/{id}"))
             .await
             .map_err(|e| failed("nodes", e))
+    }
+    async fn instance(
+        &self,
+        name: &str,
+    ) -> Result<Option<velstra_cloud_model::resources::Instance>> {
+        self.instances.get(name).await.map_err(|e| failed("instances", e))
     }
     async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>> {
         self.ceph_clusters

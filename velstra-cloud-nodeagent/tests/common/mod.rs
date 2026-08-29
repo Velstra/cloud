@@ -795,6 +795,19 @@ impl velstra_cloud_nodeagent::CellReader for ApiShaped {
             .into_iter()
             .find(|n| n.meta.name.id() == id))
     }
+    async fn instance(
+        &self,
+        name: &str,
+    ) -> Result<
+        Option<velstra_cloud_model::resources::Instance>,
+        velstra_cloud_nodeagent::HostError,
+    > {
+        Ok(self
+            .instances()
+            .await?
+            .into_iter()
+            .find(|i| i.meta.name.to_string() == name))
+    }
     async fn ports(&self) -> velstra_cloud_nodeagent::HostResult<Vec<Port>> {
         let me = self.node.as_str();
         Ok(self

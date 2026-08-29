@@ -439,6 +439,12 @@ impl CellReader for ApiCell {
     async fn node(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Node>> {
         self.get_one(&format!("nodes/{id}")).await
     }
+    async fn instance(
+        &self,
+        name: &str,
+    ) -> Result<Option<velstra_cloud_model::resources::Instance>> {
+        self.get_one(name).await
+    }
     async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>> {
         self.list_cell("ceph-clusters").await
     }
