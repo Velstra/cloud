@@ -1315,3 +1315,156 @@ mod migrating_a_seed {
     }
 }
 
+
+/// The etcd this cell was going to run into.
+///
+/// A cell died on this and it died completely: every write refused with
+///
+/// ```text
+/// etcdserver: mvcc: database space exceeded
+/// ```
+///
+/// after an afternoon of ordinary use. etcd keeps every revision of every object
+/// until somebody compacts, and it stops accepting writes at **2 GiB** — a
+/// default chosen for a store somebody watches, not for one a platform brings up
+/// and never mentions again. Nothing in this platform compacted, nothing raised
+/// the ceiling, and nothing said a word until the cell stopped.
+///
+/// Three settings, and each one is a different half of the same failure:
+///
+/// * `auto-compaction-retention` — throw the history away as it ages. Without
+///   it the store grows with *changes*, not with what is in it, and a busy cell
+///   fills faster than an idle one no matter how little it holds.
+/// * `quota-backend-bytes` — 8 GiB. Not a fix on its own, and not meant as one:
+///   it is the difference between an afternoon and a year, which is the
+///   difference between an outage and a maintenance window.
+/// * `etcd-client`, so that an operator staring at a full store has `etcdctl` to
+///   compact and defrag with. The box this was found on had none — the platform
+///   brought up a store and gave nobody a way to look after it.
+///
+/// Compaction does not shrink the file; only a defrag does. So this is what
+/// keeps the ceiling from being met, and `docs/install.md` says what to run when
+/// it is met anyway.
+///
+/// Written to `/etc/default/etcd`, which the Debian unit sources. Existing
+/// settings are left exactly as they are: an operator who has tuned this has
+/// tuned it, and a first install being helpful is not a licence to overwrite
+/// somebody's decision on every upgrade.
+///
+/// `Ok(false)` when there was nothing to add.
+pub fn settle_etcd() -> Result<bool> {
+    settle_etcd_at(std::path::Path::new("/etc/default/etcd"))
+}
+
+fn settle_etcd_at(path: &std::path::Path) -> Result<bool> {
+    const WANTED: &[(&str, &str)] = &[
+        // An hour of history. Long enough that a watcher which fell behind can
+        // still catch up, short enough that a busy afternoon does not become a
+        // gigabyte.
+        ("ETCD_AUTO_COMPACTION_MODE", "periodic"),
+        ("ETCD_AUTO_COMPACTION_RETENTION", "1h"),
+        ("ETCD_QUOTA_BACKEND_BYTES", "8589934592"),
+    ];
+
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let missing: Vec<&(&str, &str)> = WANTED
+        .iter()
+        .filter(|(key, _)| {
+            !existing
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{key}=")))
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(
+        "\n# Added by velstra-cloud-node. etcd keeps every revision until it is\n\
+         # compacted and stops accepting writes at 2 GiB; a cell that never\n\
+         # compacts stops working after an afternoon. Remove or change these and\n\
+         # they will not be written again.\n",
+    );
+    for (key, value) in &missing {
+        out.push_str(&format!("{key}={value}\n"));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, out)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod giving_the_store_room {
+    use super::*;
+
+    fn scratch(what: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("velstra-etcd-{}-{what}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("etcd")
+    }
+
+    #[test]
+    fn a_store_that_was_never_configured_gets_all_three() {
+        let path = scratch("fresh");
+        assert!(settle_etcd_at(&path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("ETCD_AUTO_COMPACTION_RETENTION=1h"));
+        assert!(text.contains("ETCD_QUOTA_BACKEND_BYTES=8589934592"));
+        assert!(text.contains("ETCD_AUTO_COMPACTION_MODE=periodic"));
+    }
+
+    #[test]
+    fn a_second_run_writes_nothing() {
+        // Level-triggered, like everything else here: an installer that appended
+        // its block on every upgrade would leave a file nobody can read.
+        let path = scratch("twice");
+        assert!(settle_etcd_at(&path).unwrap());
+        let once = std::fs::read_to_string(&path).unwrap();
+        assert!(!settle_etcd_at(&path).unwrap());
+        assert_eq!(once, std::fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn what_somebody_already_decided_is_left_alone() {
+        // An operator who tuned this has tuned it. A first install being helpful
+        // is not a licence to overwrite that on every upgrade.
+        let path = scratch("theirs");
+        std::fs::write(
+            &path,
+            "ETCD_QUOTA_BACKEND_BYTES=17179869184\nETCD_NAME=cell-1\n",
+        )
+        .unwrap();
+        assert!(settle_etcd_at(&path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("ETCD_QUOTA_BACKEND_BYTES=17179869184"),
+            "somebody's own quota was overwritten"
+        );
+        assert_eq!(
+            text.matches("ETCD_QUOTA_BACKEND_BYTES").count(),
+            1,
+            "a second value was appended, so which one wins is a coin toss"
+        );
+        assert!(text.contains("ETCD_AUTO_COMPACTION_RETENTION=1h"));
+        assert!(text.contains("ETCD_NAME=cell-1"), "their other settings went");
+    }
+
+    #[test]
+    fn a_commented_out_setting_is_not_mistaken_for_one() {
+        // The Debian file ships as nothing but comments. A prefix match on the
+        // whole line would read `## ETCD_QUOTA_BACKEND_BYTES=…` from the
+        // documentation as a decision somebody made.
+        let path = scratch("comments");
+        std::fs::write(&path, "## ETCD_QUOTA_BACKEND_BYTES=2147483648\n").unwrap();
+        assert!(settle_etcd_at(&path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\nETCD_QUOTA_BACKEND_BYTES=8589934592"));
+    }
+}

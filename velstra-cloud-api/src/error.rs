@@ -249,6 +249,30 @@ impl From<StoreError> for ApiError {
                     "the watch fell behind at revision {from}; list again and watch from there"
                 ),
             ),
+            // A full store is not an internal error and answering it as one is
+            // how a cell dies with nothing useful said. Found live: every write
+            // in the cell refused with
+            //
+            //     INTERNAL: the store refused: grpc request error: code:
+            //     'Some resource has been exhausted', message: "etcdserver:
+            //     mvcc: database space exceeded"
+            //
+            // which tells an operator that something inside the platform broke.
+            // Nothing inside the platform broke: etcd keeps every revision until
+            // it is compacted and stops at its quota, and the answer is two
+            // commands. Said as a precondition, with the commands in it.
+            StoreError::Backend(m) if m.contains("database space exceeded") => ApiError::new(
+                Code::FailedPrecondition,
+                "the cell's store is full and has stopped accepting writes. etcd keeps every \
+                 revision of every object until it is compacted, so this is history rather than \
+                 data. Compact and reclaim it:\n\n  \
+                 export ETCDCTL_API=3\n  \
+                 etcdctl compact \"$(etcdctl endpoint status -w json | grep -oE '\"revision\":[0-9]+' | head -1 | cut -d: -f2)\"\n  \
+                 etcdctl defrag --command-timeout=600s\n  \
+                 etcdctl alarm disarm\n\n\
+                 A cell installed by `velstra-cloud-node quickstart` compacts hourly on its own; \
+                 one that does not is missing ETCD_AUTO_COMPACTION_RETENTION in /etc/default/etcd.",
+            ),
             StoreError::Backend(m) => ApiError::internal(m),
         }
     }
