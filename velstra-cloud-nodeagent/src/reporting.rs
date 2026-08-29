@@ -12,7 +12,74 @@ use velstra_cloud_model::{
 };
 use velstra_cloud_store::{StoreError, TypedStore, typed::TypedError};
 
-use crate::agent::Pass;
+use crate::{agent::Pass, sink::StatusSink};
+
+/// Where a status write goes.
+///
+/// `None` is the store, directly, which is what an agent on the same machine as
+/// etcd does. `Some` is the API, which is what an agent anywhere else must do —
+/// and until this existed, "anywhere else" was not a place a **pool** agent could
+/// be. It opened the store unconditionally and died with
+///
+/// ```text
+/// Error: Backend("invalid uri: empty string")
+/// ```
+///
+/// on a machine whose seed named an API and no store. The node agent had grown
+/// the API path; the pool agent had grown only the *reading* half of it, and its
+/// own comment said so: "writes still go straight to the store either way".
+///
+/// Found by setting up a second machine as `pool + hypervisor`, which is the
+/// arrangement the setup wizard offers.
+pub(crate) type Sink<'a> = Option<&'a std::sync::Arc<dyn StatusSink>>;
+
+/// Write one status, wherever this agent writes.
+async fn write<S, T>(
+    store: &TypedStore<S, T>,
+    sink: Sink<'_>,
+    next: &Resource<S, T>,
+    writer: &Writer,
+    pass: &mut Pass,
+) where
+    S: Serialize + DeserializeOwned + PartialEq + Assigned + Send + Sync,
+    T: Serialize + DeserializeOwned + PartialEq + Observed + Send + Sync,
+{
+    use crate::sink::SinkOutcome;
+
+    let Some(sink) = sink else {
+        match store.update(next, writer).await {
+            Ok(_) => pass.reports += 1,
+            Err(TypedError::Store(StoreError::Conflict { .. })) => {
+                // Somebody changed the object while this pass was acting. The
+                // next pass reads the new one; there is nothing to resume.
+                tracing::debug!(name = %next.meta.name, "status write lost a race; the next pass redoes it");
+                pass.conflicts += 1;
+            }
+            Err(TypedError::Refused(why)) => {
+                tracing::warn!(name = %next.meta.name, %why, "the store refused this agent's report");
+                pass.refused += 1;
+            }
+            Err(e) => {
+                tracing::warn!(name = %next.meta.name, error = %e, "could not report status");
+                pass.failures += 1;
+            }
+        }
+        return;
+    };
+    let value = serde_json::to_value(next).expect("a resource always serialises");
+    match sink.write_status(store.kind(), &value, writer).await {
+        SinkOutcome::Wrote => pass.reports += 1,
+        SinkOutcome::Conflict => pass.conflicts += 1,
+        SinkOutcome::Refused(why) => {
+            tracing::warn!(name = %next.meta.name, %why, "the API refused this agent's report");
+            pass.refused += 1;
+        }
+        SinkOutcome::Failed(why) => {
+            tracing::warn!(name = %next.meta.name, %why, "could not report status through the API");
+            pass.failures += 1;
+        }
+    }
+}
 
 /// Report the observed status, and say what the store thought of it.
 ///
@@ -21,6 +88,7 @@ use crate::agent::Pass;
 /// taste rather than a load knob.
 pub(crate) async fn report<S, T>(
     store: &TypedStore<S, T>,
+    sink: Sink<'_>,
     stored: &Resource<S, T>,
     next: Resource<S, T>,
     writer: &Writer,
@@ -32,23 +100,7 @@ pub(crate) async fn report<S, T>(
     if next.status == stored.status {
         return;
     }
-    match store.update(&next, writer).await {
-        Ok(_) => pass.reports += 1,
-        Err(TypedError::Store(StoreError::Conflict { .. })) => {
-            // Somebody changed the object while this pass was acting. The next
-            // pass reads the new one; there is nothing to resume.
-            tracing::debug!(name = %next.meta.name, "status write lost a race; the next pass redoes it");
-            pass.conflicts += 1;
-        }
-        Err(TypedError::Refused(why)) => {
-            tracing::warn!(name = %next.meta.name, %why, "the store refused this agent's report");
-            pass.refused += 1;
-        }
-        Err(e) => {
-            tracing::warn!(name = %next.meta.name, error = %e, "could not report status");
-            pass.failures += 1;
-        }
-    }
+    write(store, sink, &next, writer, pass).await;
 }
 
 /// Say "this is mine now" and let the store answer.
@@ -58,6 +110,7 @@ pub(crate) async fn report<S, T>(
 /// meantime is how two parties end up holding one thing.
 pub(crate) async fn claim<S, T>(
     store: &TypedStore<S, T>,
+    sink: Sink<'_>,
     stored: &Resource<S, T>,
     take_ownership: impl FnOnce(&mut T),
     writer: &Writer,
@@ -68,20 +121,5 @@ pub(crate) async fn claim<S, T>(
 {
     let mut next = stored.clone();
     take_ownership(&mut next.status);
-    match store.update(&next, writer).await {
-        Ok(_) => pass.reports += 1,
-        Err(TypedError::Refused(why)) => {
-            tracing::warn!(
-                name = %stored.meta.name, %why,
-                "assigned here, but its status belongs to somebody else; \
-                 doing nothing until that is resolved"
-            );
-            pass.refused += 1;
-        }
-        Err(TypedError::Store(StoreError::Conflict { .. })) => pass.conflicts += 1,
-        Err(e) => {
-            tracing::warn!(name = %stored.meta.name, error = %e, "could not claim");
-            pass.failures += 1;
-        }
-    }
+    write(store, sink, &next, writer, pass).await;
 }

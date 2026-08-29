@@ -294,7 +294,7 @@ impl Agent {
             self.write_through_sink(store.kind(), &next, pass).await;
             return;
         }
-        crate::reporting::report(store, stored, next, &self.writer, pass).await;
+        crate::reporting::report(store, None, stored, next, &self.writer, pass).await;
     }
 
     /// Say "this is mine now". See [`crate::reporting::claim`].
@@ -314,7 +314,7 @@ impl Agent {
             self.write_through_sink(store.kind(), &next, pass).await;
             return;
         }
-        crate::reporting::claim(store, stored, take_ownership, &self.writer, pass).await;
+        crate::reporting::claim(store, None, stored, take_ownership, &self.writer, pass).await;
     }
 
     /// Send one report through the sink and count what the far end made of it.
