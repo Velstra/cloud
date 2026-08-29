@@ -803,6 +803,76 @@ pub async fn unit_command(scope: Scope, unit: &str) -> Option<String> {
     unit_property(scope, unit, "ExecStart").await
 }
 
+/// Why a guest's unit is not running, when systemd knows and nothing else does.
+///
+/// **The case this exists for is a VMM that died before it opened its monitor.**
+/// A guest is observed by connecting to that socket, and a QEMU that exits at
+/// argument-parsing never creates one — so the whole instance directory is
+/// skipped, `host.vms` has no entry, and the control plane is told the guest is
+/// stopped with no reason attached. Found live: a CPU baseline the platform
+/// itself advised produced
+///
+/// ```text
+/// qemu-system-x86_64: unable to find CPU model 'x86-64-v1'
+/// ```
+///
+/// and every screen said `Stopped`, `HostActions: Done`, empty console. The only
+/// place the reason existed was the guest unit's journal, which is not somewhere
+/// a tenant can look and not somewhere an operator thinks to look first.
+///
+/// `None` when the unit is fine, absent, or systemd cannot be asked — all three
+/// mean "nothing to say here", and inventing a failure would be worse than
+/// saying nothing.
+pub async fn unit_failure(scope: Scope, unit: &str) -> Option<String> {
+    if unit_property(scope, unit, "Result").await? == "success" {
+        return None;
+    }
+    let status = unit_property(scope, unit, "ExecMainStatus")
+        .await
+        .unwrap_or_default();
+    let result = unit_property(scope, unit, "Result")
+        .await
+        .unwrap_or_default();
+    // The last thing it said, which is the part somebody actually needs. A
+    // status code alone sends people to the journal; this saves the trip.
+    let said = last_words(scope, unit).await;
+    Some(match said {
+        Some(words) if !words.is_empty() => words,
+        _ => format!("the hypervisor exited ({result}, status {status}) without saying why"),
+    })
+}
+
+/// The last line a failed unit logged.
+async fn last_words(scope: Scope, unit: &str) -> Option<String> {
+    let mut command = tokio::process::Command::new("journalctl");
+    if scope.flag() == Some("--user") {
+        command.arg("--user");
+    }
+    let out = command
+        .args([
+            "-u",
+            &format!("{unit}.service"),
+            "-n",
+            "20",
+            "--no-pager",
+            "-o",
+            "cat",
+        ])
+        .output()
+        .await
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // systemd's own lines say a unit failed; what is wanted is what the *program*
+    // said before it did.
+    text.lines()
+        .rev()
+        .find(|l| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with("Started ") && !l.starts_with("Stopped ")
+        })
+        .map(|l| l.trim().to_string())
+}
+
 /// **Untested:** needs systemd. A unit that is already gone is the state that
 /// was wanted, so this reports nothing rather than failing.
 pub async fn stop_unit(scope: Scope, unit: &str) {
