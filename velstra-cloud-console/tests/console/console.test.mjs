@@ -2318,7 +2318,7 @@ await test("adding a node shows its registration token once, with what to do wit
   })()`);
 
   const shown = await waitFor(page, `(() => {
-    const box = document.getElementById("nodetoken");
+    const box = document.getElementById("agenttoken");
     return box ? document.getElementById("dialog").textContent : null;
   })()`, { timeout: 15000 });
 
@@ -2336,7 +2336,7 @@ await test("adding a node shows its registration token once, with what to do wit
   // It has to be dismissed deliberately: a credential that scrolls away is a
   // node that has to be deleted and made again.
   await page.evaluate(`document.getElementById("tokendone").click()`);
-  const gone = await page.evaluate(`!document.getElementById("nodetoken")`);
+  const gone = await page.evaluate(`!document.getElementById("agenttoken")`);
   check(gone, "the token panel would not close");
 });
 
@@ -2427,10 +2427,11 @@ await test("a volume's pool cannot be edited, and the rest of the form still can
 /// written against it, and a seed naming a pool nobody created is a pool that
 /// claims nothing and volumes that are never provisioned, quietly.
 ///
-/// The second half of this test is the part worth having. A pool mints no
-/// credential, and a console that grew a token panel here — by copying the node
-/// path — would be handing out a secret the API never issued.
-await test("a pool can be declared before its agent exists, and is handed no token", async () => {
+/// The second half of this test is the part worth having. A pool mints a
+/// credential of its own — that is the only thing that lets its agent run on a
+/// machine with no store of its own — and a console that swallowed it would
+/// leave an operator with a pool object and no way to make the machine speak.
+await test("a pool can be declared before its agent exists, and is handed its token", async () => {
   await open(page, "pools");
   const opened = await page.evaluate(`(() => {
     const button = document.getElementById("newbtn");
@@ -2447,6 +2448,19 @@ await test("a pool can be declared before its agent exists, and is handed no tok
     document.getElementById("submitform").click();
   })()`);
 
+  const shown = await waitFor(page, `(() => {
+    const box = document.getElementById("agenttoken");
+    if (!box) return null;
+    return { token: box.textContent.trim(), panel: box.closest("#dialog").textContent };
+  })()`, { timeout: 15000 });
+
+  check(shown.token.length === 64, `the pool's token came through mangled: ${shown.token}`);
+  // The command has to be the pool's, not the node wizard's — a token pasted
+  // into `velstra-cloud-node setup` is a token in the wrong file.
+  check(shown.panel.includes("/etc/velstra/pool-token"),
+    `the panel does not say where a pool token goes: ${shown.panel}`);
+  await page.evaluate(`document.getElementById("tokendone").click()`);
+
   const row = await waitFor(page, `(() => {
     const cell = [...document.querySelectorAll("#rows td")]
       .find((c) => c.textContent.trim() === "nvme-2");
@@ -2456,9 +2470,6 @@ await test("a pool can be declared before its agent exists, and is handed no tok
   // It exists and nothing has reported on it — which is the honest state for a
   // pool whose machine has not been installed yet, not an error.
   check(!/error/i.test(row), `a freshly declared pool reads as broken: ${row}`);
-
-  const token = await page.evaluate(`!!document.getElementById("nodetoken")`);
-  check(!token, "the console showed a registration token for a pool, which mints none");
 });
 
 /// A tenant's two questions in one answer: what am I allowed, and what would

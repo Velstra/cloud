@@ -1286,14 +1286,15 @@ function openCreate(coll, opts = {}) {
       // A registration token comes back exactly once — the platform keeps a
       // hash and cannot show it again — so it gets a panel of its own rather
       // than a toast that scrolls away, with the one command it is for.
-      if (answer && answer.nodeToken) {
+      const minted = answer && (answer.nodeToken || answer.poolToken);
+      if (minted) {
         await show(coll.id);
         // After the form's own dialog is gone, which the caller closes the
         // moment this returns. `queueMicrotask` is not enough — the close is
         // in the caller's next statement, not in a task — so the panel is
         // opened from a timer that runs after it.
-        const token = answer.nodeToken;
-        setTimeout(() => showNodeToken(id, token), 0);
+        const kind = answer.nodeToken ? "node" : "pool";
+        setTimeout(() => showAgentToken(id, minted, kind), 0);
         return;
       }
       toast(answer && answer.operation
@@ -1367,9 +1368,15 @@ function openCreate(coll, opts = {}) {
 /// The command is here rather than in a document because this is the moment it
 /// is needed: the token is on the screen, the node id is known, and the URL is
 /// the one this console is talking to.
-function showNodeToken(id, token) {
-  const line =
-    "sudo velstra-cloud-node setup   # node id: " + id + ", control plane: " + location.origin;
+function showAgentToken(id, token, kind) {
+  // Two agents, two ways in. A node's token is what the setup wizard is asked
+  // for; a pool's is a file its agent reads, because a pool is not a machine
+  // being installed — it is a store on one that already exists, and the
+  // machine may not be this cell's at all.
+  const line = kind === "node"
+    ? "sudo velstra-cloud-node setup   # node id: " + id + ", control plane: " + location.origin
+    : "sudo install -m 600 /dev/stdin /etc/velstra/pool-token   # paste it, then Ctrl-D\n" +
+      "sudo systemctl restart velstra-cloud-poolagent";
   // Its own dialog, opened after the form's has closed — the form closes on a
   // successful submit, so filling that one would put a credential into a panel
   // that is about to be removed. The scrim has no `onclick`: a mis-click
@@ -1383,13 +1390,17 @@ function showNodeToken(id, token) {
     el("p.prose",
       "Shown once. The platform keeps a hash of it and cannot show it again — " +
       "if it is lost, delete this node and add it back."),
-    el("pre.logblock", { id: "nodetoken" }, token),
+    el("pre.logblock", { id: "agenttoken" }, token),
     el("p.prose", "On the machine, with the token to hand:"),
     el("pre.logblock", line),
-    el("p.prose",
-      "The wizard asks which cell and as what — control plane, hypervisor, pool, " +
-      "or several. Whether this machine carries external traffic is not its own " +
-      "answer: set it here, on the node, once it has registered."),
+    el("p.prose", kind === "node"
+      ? "The wizard asks which cell and as what — control plane, hypervisor, pool, " +
+        "or several. Whether this machine carries external traffic is not its own " +
+        "answer: set it here, on the node, once it has registered."
+      : "The agent needs the machine's environment too: which cell it is talking " +
+        "to, in /etc/velstra/pool.env. The setup wizard writes it when the pool " +
+        "role is answered there; a pool added here is being pointed at a machine " +
+        "that already runs one."),
     el("div.formacts",
       el("button.btn", { type: "button", id: "copytoken",
         onclick: () => navigator.clipboard && navigator.clipboard.writeText(token) },
