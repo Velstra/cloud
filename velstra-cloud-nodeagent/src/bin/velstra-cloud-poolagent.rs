@@ -246,7 +246,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let store: Arc<dyn Store> = open_store(&args.store).await?;
     let mut config = PoolConfig::new(&args.pool, &args.region, &args.cell);
     config.resync = Duration::from_secs(args.resync_secs);
     let agent = match &args.api {
@@ -263,10 +262,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .into());
                 }
             };
-            let reader = Arc::new(ApiCell::for_pool(url, &token, &args.pool)?);
-            PoolAgent::reading(store, config, storage, reader)
+            let cell = Arc::new(ApiCell::for_pool(url, &token, &args.pool)?);
+            // No store at all. A pool on any machine but the control plane's has
+            // no etcd to open, and opening one anyway is what this agent used to
+            // do — it died with `invalid uri: empty string` on a machine whose
+            // seed named an API and no store, which is exactly the machine the
+            // setup wizard offers when somebody answers `pool` on a second box.
+            //
+            // The in-memory store is what the typed stores are built over so
+            // that their *types* still exist; nothing is written to it, because
+            // every write goes through the sink below. It is never read either:
+            // reading is the `ApiCell`'s.
+            let nowhere: Arc<dyn Store> = Arc::new(velstra_cloud_store::MemoryStore::new());
+            PoolAgent::reading(nowhere, config, storage, cell.clone()).through(cell)
         }
-        None => PoolAgent::new(store, config, storage),
+        None => {
+            let store: Arc<dyn Store> = open_store(&args.store).await?;
+            PoolAgent::new(store, config, storage)
+        }
     };
     match &args.api {
         Some(url) => {

@@ -73,6 +73,16 @@ let
       Restart=on-failure
       RestartSec=5
       EnvironmentFile=-/var/lib/velstra/node.env
+      # Read second, so it wins. The state directory holds this machine's guests
+      # *and* its identity, and those two want opposite things: a cell whose
+      # machines share one filesystem — which is what makes moving a guest
+      # possible at all — has every agent reading the same `node.env` and
+      # answering to the same name. Found by building that arrangement on two
+      # real machines: the second one to mount it renamed the first.
+      #
+      # So identity may live in /etc, where it is per-machine by construction,
+      # and the state directory is left holding only what a cell shares.
+      EnvironmentFile=-/etc/velstra/node.env
       ${pre}${roleGuard role}ExecStart=${exec}
 
       [Install]
@@ -112,6 +122,14 @@ let
     # are only known at runtime, and because `--vmm-binary` has to be resolved
     # from the seed: a transient guest unit does not inherit this unit's PATH,
     # so the hypervisor must be named absolutely.
+    #
+    # `tok` in the command below is the node's own token, and it is the one thing
+    # in the state directory that cannot be shared. A cell whose machines mount
+    # one filesystem — which is what makes moving a guest possible at all, see
+    # `--shared-state` — would otherwise have every agent reading the same token
+    # and speaking as the same node. `/etc/velstra/node-token` wins when it is
+    # there. It is a shell `[ -f ]` and not a comment because systemd joins these
+    # continuations into a single line, where a `#` would swallow the rest.
     "velstra-cloud-nodeagent.service" = unit {
       role = "hypervisor";
       description = "Velstra Cloud node agent";
@@ -138,6 +156,8 @@ let
           fake) vmm= ;; \
           *) echo "node.env sets VELSTRA_VMM=''${VELSTRA_VMM:-} — expected qemu, cloud-hypervisor or fake" >&2; exit 1 ;; \
         esac; \
+          tok=/var/lib/velstra/node-token; \
+          [ -f /etc/velstra/node-token ] && tok=/etc/velstra/node-token; \
         fab=; \
         if [ -n "''${VELSTRA_FABRIC:-}" ]; then \
           fab="--datapath fabric --fabric $VELSTRA_FABRIC --fabric-vtep $VELSTRA_FABRIC_VTEP --fabric-underlay $VELSTRA_FABRIC_UNDERLAY"; \
@@ -145,11 +165,12 @@ let
         fi; \
         exec ${bin "velstra-cloud-nodeagent"} \
           --node "$VELSTRA_NODE" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
-          --api "$VELSTRA_API_URL" --api-token-file /var/lib/velstra/node-token \
+          --api "$VELSTRA_API_URL" --api-token-file "$tok" \
           --vmm "$VELSTRA_VMM" ''${vmm:+--vmm-binary "$vmm"} \
           --state-dir /var/lib/velstra \
           ''${VELSTRA_CONSOLE_LISTEN:+--console-listen "$VELSTRA_CONSOLE_LISTEN"} \
           ''${VELSTRA_CONSOLE_ADVERTISE:+--console-advertise "$VELSTRA_CONSOLE_ADVERTISE"} \
+          ''${VELSTRA_SHARED_STATE:+--shared-state} \
           $fab' '';
     };
     "velstra-cloud-poolagent.service" = unit {

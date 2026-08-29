@@ -311,6 +311,15 @@ pub struct PoolAgent {
     /// the cell rather than with this pool's own work. See [`crate::cell`].
     cell: Arc<dyn PoolReader>,
     storage: Arc<dyn Storage>,
+    /// Where this pool's status writes go.
+    ///
+    /// `None` is the store, directly, which is what a pool on the same machine
+    /// as etcd does. `Some` is the API — and until this existed, a pool anywhere
+    /// else could not run at all: the agent opened the store unconditionally and
+    /// died with `invalid uri: empty string` on a machine whose seed named an
+    /// API and no store. It had grown the *reading* half of the API path and its
+    /// own comment said so.
+    sink: Option<Arc<dyn crate::sink::StatusSink>>,
 }
 
 impl PoolAgent {
@@ -322,6 +331,17 @@ impl PoolAgent {
             &config.placement.cell,
         ));
         Self::reading(store, config, storage, reader)
+    }
+
+    /// The same agent, writing through the API rather than to the store.
+    ///
+    /// What a pool on any machine but the control plane's needs. Reading was
+    /// already possible that way; writing was not, so the role the setup wizard
+    /// offers — a second machine that is `pool + hypervisor` — produced a unit
+    /// that could not start.
+    pub fn through(mut self, sink: Arc<dyn crate::sink::StatusSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     pub fn reading(
@@ -343,6 +363,7 @@ impl PoolAgent {
             config,
             cell: reader,
             storage,
+            sink: None,
         }
     }
 
@@ -476,6 +497,7 @@ impl PoolAgent {
                 let me = self.config.pool.clone();
                 reporting::claim(
                     &self.volumes,
+                    self.sink.as_ref(),
                     stored,
                     |status| status.pool = Some(me),
                     &self.writer,
@@ -548,7 +570,7 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.volumes, stored, next, &self.writer, pass).await;
+        reporting::report(&self.volumes, self.sink.as_ref(), stored, next, &self.writer, pass).await;
     }
 
     /// Every copy this pool owes a target.
@@ -659,7 +681,7 @@ impl PoolAgent {
                     ),
                 },
             );
-            reporting::report(&self.targets, target, next.clone(), &self.writer, pass).await;
+            reporting::report(&self.targets, self.sink.as_ref(), target, next.clone(), &self.writer, pass).await;
             next
         }
     }
@@ -769,7 +791,7 @@ impl PoolAgent {
                     stored.meta.generation,
                 ),
             );
-            reporting::report(&self.backups, stored, next, &self.writer, pass).await;
+            reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
             return;
         };
 
@@ -823,7 +845,7 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.backups, stored, next, &self.writer, pass).await;
+        reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
     }
 
     /// Say on the backup that reading it back did not work out.
@@ -854,7 +876,7 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.backups, stored, next, &self.writer, pass).await;
+        reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
     }
 
     /// One backup: claim it, copy the bytes out, report what is on the target.
@@ -879,6 +901,7 @@ impl PoolAgent {
                 let me = self.config.pool.clone();
                 reporting::claim(
                     &self.backups,
+                    self.sink.as_ref(),
                     stored,
                     |status| status.agent = Some(me),
                     &self.writer,
@@ -992,7 +1015,7 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.backups, stored, next, &self.writer, pass).await;
+        reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
     }
 
     /// Say on the object why a copy has not been made.
@@ -1019,7 +1042,7 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.backups, stored, next, &self.writer, pass).await;
+        reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
     }
 
     /// One snapshot: claim it, do what the model says, report what is there.
@@ -1041,6 +1064,7 @@ impl PoolAgent {
                 let me = self.config.pool.clone();
                 reporting::claim(
                     &self.snapshots,
+                    self.sink.as_ref(),
                     stored,
                     |status| status.pool = Some(me),
                     &self.writer,
@@ -1118,7 +1142,7 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.snapshots, stored, next, &self.writer, pass).await;
+        reporting::report(&self.snapshots, self.sink.as_ref(), stored, next, &self.writer, pass).await;
     }
 
     async fn perform(&self, action: &VolumeAction, copies: &Copies) -> Result<()> {
@@ -1207,7 +1231,7 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.pools, &stored, next, &self.writer, pass).await;
+        reporting::report(&self.pools, self.sink.as_ref(), &stored, next, &self.writer, pass).await;
     }
 
     /// Say on the pool that its backend could not be read.
@@ -1245,7 +1269,7 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.pools, &stored, next, &self.writer, pass).await;
+        reporting::report(&self.pools, self.sink.as_ref(), &stored, next, &self.writer, pass).await;
     }
 }
 
