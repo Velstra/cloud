@@ -852,9 +852,36 @@ function renderPoolList(form, f, host, setErr) {
   "Add" + (pools.length ? " another" : " a pool")));
 }
 
+/// What a reference list offers, in the order it offers it.
+///
+/// Usually one collection. Where the field has an `also`, a second one whose
+/// objects are a *more precise* answer to the same question is offered beneath
+/// each of the first's — and only where the imprecise answer has stopped being
+/// one. A network with a single subnet is a complete answer and naming that
+/// subnet adds nothing but a longer name; a network with two does not say which
+/// range an address comes out of, and the platform refuses it rather than
+/// choosing. So the control offers exactly what the platform accepts.
+function refListOptions(form, f) {
+  const first = form.refs[f.collection] || [];
+  if (!f.also) return first.map((o) => ({ o, under: false }));
+  const more = form.refs[f.also] || [];
+  const out = [];
+  for (const o of first) {
+    const name = nameOf(o);
+    const mine = more.filter((m) => at(spec(m), singularOf(f.collection)) === name);
+    out.push({ o, under: false, vague: mine.length > 1 });
+    if (mine.length > 1) for (const m of mine) out.push({ o: m, under: true });
+  }
+  return out;
+}
+
+/// `networks` → `network`, the field a subnet uses to name the one it slices.
+const singularOf = (collection) => collection.replace(/s$/, "");
+
 function renderRefList(form, f, host) {
   const values = Array.isArray(form.values[f.key]) ? form.values[f.key] : [];
-  const offered = form.refs[f.collection] || [];
+  const choices = refListOptions(form, f);
+  const offered = choices.map((c) => c.o);
   clear(host);
   // The consequences beside the button are computed from the values, so a
   // control that changes them and says nothing leaves a sentence on screen that
@@ -867,9 +894,16 @@ function renderRefList(form, f, host) {
   values.forEach((value, i) => {
     const s = el("select");
     s.appendChild(el("option", { value: "" }, "— remove —"));
-    for (const o of offered) {
-      const wire = f.spelling === "id" ? idOf(o) : nameOf(o);
-      s.appendChild(el("option", { value: wire, selected: wire === value ? "" : null }, shortName(nameOf(o))));
+    for (const c of choices) {
+      const wire = f.spelling === "id" ? idOf(c.o) : nameOf(c.o);
+      // A network the platform will not take on its own is offered greyed, with
+      // its subnets under it: the choice is still visible, and so is the reason
+      // it is not the one to make.
+      const label = c.under
+        ? "    " + shortName(nameOf(c.o)) + " · " + (at(spec(c.o), "cidr") || "")
+        : shortName(nameOf(c.o)) + (c.vague ? " — name a subnet below" : "");
+      s.appendChild(el("option", { value: wire, disabled: c.vague ? "" : null,
+        selected: wire === value ? "" : null }, label));
     }
     s.addEventListener("change", () => {
       if (!s.value) values.splice(i, 1); else values[i] = s.value;
@@ -884,7 +918,10 @@ function renderRefList(form, f, host) {
   });
   host.appendChild(el("button.btn", { type: "button", disabled: offered.length ? null : "",
     onclick: () => {
-      const first = offered.length ? (f.spelling === "id" ? idOf(offered[0]) : nameOf(offered[0])) : "";
+      // The first thing that can actually be chosen, which is not always the
+      // first thing on offer: a network with two subnets is shown and refused.
+      const usable = choices.find((c) => !c.vague);
+      const first = usable ? (f.spelling === "id" ? idOf(usable.o) : nameOf(usable.o)) : "";
       values.push(first); form.values[f.key] = values; renderRefList(form, f, host);
       form.revalidate();
     } },
@@ -1103,6 +1140,10 @@ async function fillPicker(form, p) {
     offered = want ? offered.filter((o) => at(spec(o), f.filterBy) === want) : [];
   }
   form.refs[f.collection] = offered;
+  // The second collection a field offers a more precise answer from — fetched
+  // here so the control has both before it draws, rather than drawing once
+  // without and again with.
+  if (f.also) form.refs[f.also] = await options(f.also).catch(() => []);
   if (p.render) { p.render(); return; }
 
   const s = p.select;

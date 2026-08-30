@@ -493,6 +493,12 @@ function seed() {
   put("projects/p1/subnets/prod-a", { network: "projects/p1/networks/prod", cidr: "10.20.0.0/24",
     gateway: "10.20.0.1", dns: ["10.20.0.2"], reserved: ["10.20.0.5"] },
     { observedGeneration: 1, conditions: ready(1), allocated: 12, available: 241 });
+  // A second range on the same network, which is what makes naming the network
+  // stop being an answer: it no longer says which of the two an address comes
+  // out of. A fixture with one subnet per network cannot see that at all.
+  put("projects/p1/subnets/prod-b", { network: "projects/p1/networks/prod", cidr: "10.21.0.0/24",
+    gateway: "10.21.0.1", dns: [], reserved: [] },
+    { observedGeneration: 1, conditions: ready(1), allocated: 0, available: 253 });
   // One address in front of the web pool. Settled: the fabric serves the
   // address that was asked for, and the observed listeners carry the pool.
   put("projects/p1/load-balancers/web", {

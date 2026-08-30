@@ -87,6 +87,19 @@ pub enum Kind {
     /// An ordered list of picked objects.
     RefList {
         collection: &'static str,
+        /// A second collection whose objects are a *more precise* answer to the
+        /// same question, offered beneath the first one's.
+        ///
+        /// One field, two spellings — the same shape the image picker has, one
+        /// control over: `families/debian-13` and a concrete build are both
+        /// answers to "which image", and the concrete one is for pinning. Here a
+        /// network and one of its subnets are both answers to "where does this
+        /// guest go", and the subnet is for the case where the network has more
+        /// than one and no longer says which range the address comes from.
+        ///
+        /// `None` for every field whose question has one kind of answer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        also: Option<&'static str>,
         spelling: Spelling,
     },
     /// A list of free strings, each one checked as it is typed.
@@ -605,6 +618,7 @@ const CEPH_FIELDS: &[Field] = &[
         label: "Monitors",
         kind: Kind::RefList {
             collection: "nodes",
+            also: None,
             // A bare id, like every other reference to a node in this platform.
             // The convention exists because a node is a cell-scoped root object
             // — `hv-1`, not `nodes/hv-1` — and one spelling everywhere is what
@@ -1192,6 +1206,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         label: "Ports",
         kind: Kind::RefList {
             collection: "ports",
+            also: None,
             spelling: Spelling::Name,
         },
         required: false,
@@ -1228,6 +1243,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         label: "Extra disks",
         kind: Kind::RefList {
             collection: "volumes",
+            also: None,
             spelling: Spelling::Name,
         },
         required: false,
@@ -1257,6 +1273,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         label: "Networks",
         kind: Kind::RefList {
             collection: "networks",
+            also: Some("subnets"),
             spelling: Spelling::Name,
         },
         required: false,
@@ -1505,6 +1522,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         label: "Passed-through devices",
         kind: Kind::RefList {
             collection: "device-classes",
+            also: None,
             spelling: Spelling::Id,
         },
         required: false,
@@ -1929,6 +1947,7 @@ const PORT_FIELDS: &[Field] = &[
         label: "Security groups",
         kind: Kind::RefList {
             collection: "security-groups",
+            also: None,
             spelling: Spelling::Name,
         },
         required: false,
@@ -2369,8 +2388,12 @@ const NODE_FIELDS: &[Field] = &[
 const ROUTER_FIELDS: &[Field] = &[Field {
     key: "networks",
     label: "Networks",
+    // No subnets here, unlike a guest's. A router joins whole networks — every
+    // subnet on a network it routes is reachable from every other — so offering
+    // one would be offering a precision the object does not have.
     kind: Kind::RefList {
         collection: "networks",
+        also: None,
         spelling: Spelling::Name,
     },
     required: true,
@@ -2975,6 +2998,7 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         label: "Members",
         kind: Kind::RefList {
             collection: "ports",
+            also: None,
             spelling: Spelling::Name,
         },
         required: false,
@@ -5167,6 +5191,7 @@ mod tests {
                     | Kind::RefList {
                         collection,
                         spelling,
+                        ..
                     } => (collection, spelling),
                     _ => continue,
                 };

@@ -1344,6 +1344,52 @@ await test("abandoning a post-copy migration warns differently from a live one",
   check(gone, "an abandoned migration is still on the board");
 });
 
+/// Where a guest goes is asked once, and the control offers what the platform
+/// takes.
+///
+/// A customer never makes a port: naming nothing gets the project's default
+/// network, and naming a network gets a port on it. The one place that stops
+/// being enough is a network with two subnets — it no longer says which range
+/// the address comes out of, and the platform refuses rather than choosing. So
+/// the picker offers the network greyed, with its subnets under it.
+await test("a guest is put on a network, or on one of its subnets when the network is not enough", async () => {
+  await open(page, "instances");
+  await page.evaluate(`document.getElementById("newbtn").click()`);
+  const shown = await waitFor(page, `(async () => {
+    // Behind More settings: the common path is "say nothing and get the default
+    // network", which is the whole point of the field being here at all.
+    const more = [...document.querySelectorAll("#dialog button, #dialog summary")]
+      .find((b) => /more settings/i.test(b.textContent));
+    if (more) more.click();
+    const host = document.getElementById("f-networks");
+    if (!host) return null;
+    const add = [...host.querySelectorAll("button")].find((b) => /^Add/.test(b.textContent));
+    if (!add) return "the networks field offers nothing to add";
+    add.click();
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const s = host.querySelector("select");
+      if (s && s.options.length > 1) {
+        return [...s.options].map((o) => o.textContent.trim() + (o.disabled ? " [aus]" : ""));
+      }
+    }
+    return "the picker never filled";
+  })()`, { timeout: 20000 });
+
+  check(Array.isArray(shown), `no picker: ${shown}`);
+  const joined = shown.join(" | ");
+  // The network with two ranges is shown and not choosable, and it says why.
+  check(/prod .*\[aus\]/.test(joined) || /prod — name a subnet below \[aus\]/.test(joined),
+    `a network with two subnets was offered as an answer: ${joined}`);
+  check(/prod-a/.test(joined) && /prod-b/.test(joined),
+    `its subnets are not offered instead: ${joined}`);
+  // And the ranges are on them, because "prod-a" alone does not say which is which.
+  check(/10\.20\.0\.0\/24/.test(joined) && /10\.21\.0\.0\/24/.test(joined),
+    `the subnets are offered without their ranges: ${joined}`);
+
+  await page.evaluate(`document.getElementById("cancelform")?.click()`);
+});
+
 /// A cold move's sheet does not report on a transfer that never happens.
 ///
 /// "Copied 0 MiB" and "Receiver: not listening" are the honest reading of a live
