@@ -1368,6 +1368,10 @@ await test("the map draws the project's network out of the objects it is made of
   // not a property of the tenant's own network.
   check(/Internet/.test(said), `no internet on the map: ${said.slice(0, 200)}`);
   check(/node-a/.test(said), `the map does not say which machine carries the way out: ${said}`);
+  // And when it last spoke. On a live cell this named a gateway that had been
+  // silent for fourteen hours, which read as a way out that was there.
+  check(/heard from/.test(said),
+    `the map names a way out without saying when that machine last reported: ${said}`);
   // An address from outside, and what it is in front of.
   check(/203\.0\.113\.7/.test(said) && /web-1-eth0/.test(said),
     `the floating address is not on the map: ${said}`);
