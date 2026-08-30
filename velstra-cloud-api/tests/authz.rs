@@ -1348,7 +1348,7 @@ async fn a_console_is_granted_to_a_reader_and_a_keyboard_only_to_a_writer() {
 
     // Ada admins p1: a keyboard.
     let opened = api
-        .open_console(&name("projects/p1/instances/i1"), &who(ADA))
+        .open_console(&name("projects/p1/instances/i1"), velstra_cloud_model::console::ConsoleKind::Serial, &who(ADA))
         .await
         .map_err(|e| e.to_string())
         .expect("an admin of the project may open a console");
@@ -1394,7 +1394,7 @@ async fn a_console_is_granted_to_a_reader_and_a_keyboard_only_to_a_writer() {
     .expect("an operator changes the bindings");
 
     let watching = api
-        .open_console(&name("projects/p1/instances/i1"), &who("cleo"))
+        .open_console(&name("projects/p1/instances/i1"), velstra_cloud_model::console::ConsoleKind::Serial, &who("cleo"))
         .await
         .map_err(|e| e.to_string())
         .expect("a viewer may watch");
@@ -1410,7 +1410,7 @@ async fn a_console_is_granted_to_a_reader_and_a_keyboard_only_to_a_writer() {
 
     // Bob has nothing in p1 at all: no window either.
     let refused = api
-        .open_console(&name("projects/p1/instances/i1"), &who(BOB))
+        .open_console(&name("projects/p1/instances/i1"), velstra_cloud_model::console::ConsoleKind::Serial, &who(BOB))
         .await
         .expect_err("a stranger opened a console");
     assert_eq!(refused.code, Code::PermissionDenied, "{refused}");

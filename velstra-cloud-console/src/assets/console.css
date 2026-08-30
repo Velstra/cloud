@@ -1050,3 +1050,31 @@ pre.terminal:focus {
 .mapsaid {
   font-size: 13px;
 }
+
+/* The guest's display. Full content width, scaled down to fit and never up:
+ * an enlarged framebuffer is blur, and the guest's own pixels are the truth
+ * this page exists to show. */
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+.screenacts {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.vncscreen {
+  max-width: 100%;
+  /* The app's darkest ground, not literal black: the frame around a screen is
+   * chrome like any other, and the guest's own pixels cover it anyway. */
+  background: var(--bg-app);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+  cursor: crosshair;
+}
+.vncscreen:focus {
+  border-color: var(--accent);
+}

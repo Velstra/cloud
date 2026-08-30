@@ -181,6 +181,14 @@ impl Layout {
     pub fn console_socket(&self, instance: &str) -> PathBuf {
         self.dir(instance).join("console.sock")
     }
+
+    /// Where the guest's display listens, as VNC's own protocol on a unix
+    /// socket. Beside the serial socket, and served by the same console
+    /// service: the two are different lines into one guest, not different
+    /// machinery.
+    pub fn vnc_socket(&self, instance: &str) -> PathBuf {
+        self.dir(instance).join("vnc.sock")
+    }
 }
 
 /// How large a guest's disk file is, in whole gibibytes.

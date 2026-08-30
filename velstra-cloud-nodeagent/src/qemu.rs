@@ -1008,6 +1008,15 @@ fn qemu_args(
         .into(),
         "-serial".into(),
         "chardev:serial0".into(),
+        // The display, reachable. `-display none` above keeps the *host*
+        // windowless; this makes what the VGA adapter is showing attachable
+        // over VNC's own protocol, on a unix socket beside the serial one.
+        // Without it, a guest whose kernel stopped writing to ttyS0 — a panic
+        // with `console=tty0` first, a graphical installer, a locked-up
+        // getty — was invisible: the serial line showed the past and the
+        // screen showed the truth, and nothing could reach the screen.
+        "-vnc".into(),
+        format!("unix:{}", layout.vnc_socket(&request.instance).display()).into(),
     ];
     // Passed-through hardware. `vfio-pci` is the only device model here:
     // whole-device passthrough is all this platform offers, and a mediated

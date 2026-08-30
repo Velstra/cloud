@@ -381,9 +381,9 @@ const remove = (coll, id, ifMatch) =>
 /// in a minute. The ticket comes back in this answer and exists nowhere else —
 /// what is stored is its hash — so it is held in memory and put in the stream's
 /// query, never in a link and never in the address bar.
-const openConsole = (coll, id) =>
-  request("POST", writePath(coll) + "/" + encodeURIComponent(id) + ":console", { body: {} })
-    .then((r) => r.body);
+const openConsole = (coll, id, kind) =>
+  request("POST", writePath(coll) + "/" + encodeURIComponent(id) + ":console",
+    { body: kind ? { kind } : {} }).then((r) => r.body);
 
 /// The **request path** of an object in the current scope — `/api/v1/…`,
 /// already prefixed. Named for what it is: a caller that read this as a bare

@@ -59,6 +59,7 @@ async function enter() {
   // was landing on one collection's answer to a question nobody had asked yet.
   if (collection(wanted)) await show(wanted);
   else if (wanted === "map") await showTopology();
+  else if (wanted.startsWith("screen/")) await showScreen(wanted.slice("screen/".length));
   else await showOverview();
   sweep();
 }

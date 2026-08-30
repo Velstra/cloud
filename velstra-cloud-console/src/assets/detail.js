@@ -806,6 +806,12 @@ function renderSheet(coll, r) {
     const host = el("div", { id: "instanceconsole" });
     panel.appendChild(spread("Console", host, "the guest's serial line"));
     consoleSection(host, coll, idOf(r));
+    // The display goes to its own page rather than into this column: a
+    // framebuffer at sheet width is a postage stamp, and unlike the serial
+    // console — whose last lines are useful at any size — a screen you cannot
+    // read is not a smaller version of the feature.
+    host.appendChild(el("button.btn.quiet", { type: "button", id: "screenbtn",
+      onclick: () => { closeSheet(); showScreen(nameOf(r)); } }, "Open screen"));
   }
 
   const pairs = agreementTable(coll, r);
