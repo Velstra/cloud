@@ -175,7 +175,13 @@ $("project").addEventListener("change", async () => {
   sessionStorage.setItem(PROJECT_KEY, session.project);
   forgetOptions();
   closeSheet();
-  await show(view.coll ? view.coll.id : "instances");
+  // Where you were, about the project you have just picked. Switching used to
+  // land on Instances from anything that was not a board — so choosing another
+  // project from the overview, or from the map, answered a question nobody
+  // asked and lost the one they were looking at.
+  if (view.map) await showTopology();
+  else if (view.home) await showOverview();
+  else await show(view.coll ? view.coll.id : "instances");
   sweep();
 });
 
