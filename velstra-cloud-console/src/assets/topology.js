@@ -48,7 +48,13 @@ async function topologyFacts() {
       // The one cell-wide fact on the page. A tenant may not read `nodes`, and
       // that is not an error here: it means this page cannot say how the
       // project reaches the internet, which it says instead of guessing.
-      options("nodes").catch(() => null),
+      //
+      // Not `options()`, which folds every failure into an empty list — and an
+      // empty list here reads as "no machine in this cell is a gateway", which
+      // told a tenant the cell had no way out when the truth was that they may
+      // not ask. A refusal and an empty fleet lead to different sentences, so
+      // the difference has to survive the fetch.
+      list(collection("nodes")).then((r) => r.items).catch(() => null),
     ]);
   return { routers, networks, subnets, ports, instances, floating, balancers, nodes, trouble };
 }

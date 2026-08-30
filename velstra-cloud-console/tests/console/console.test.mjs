@@ -1372,6 +1372,12 @@ await test("the map draws the project's network out of the objects it is made of
   // silent for fourteen hours, which read as a way out that was there.
   check(/heard from/.test(said),
     `the map names a way out without saying when that machine last reported: ${said}`);
+  // And never the false sentence. "No machine in this cell is a gateway" was
+  // what a *tenant* saw — their refused read of `nodes` folded into an empty
+  // list — when the truth was that they may not ask. The admin fixture has a
+  // gateway, so the false branch showing here would mean the fetch collapsed.
+  check(!/no machine in this cell is a gateway/.test(said),
+    `the map says the cell has no way out while node-a is a gateway: ${said}`);
   // An address from outside, and what it is in front of.
   check(/203\.0\.113\.7/.test(said) && /web-1-eth0/.test(said),
     `the floating address is not on the map: ${said}`);
