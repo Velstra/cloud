@@ -191,7 +191,18 @@ impl IntoResponse for ApiError {
             error: Envelope {
                 code: self.code.as_str(),
                 message: self.message,
-                field: self.field,
+                // The wire is camelCase everywhere, and `field` names a wire
+                // path: a console lands the refusal on the control whose key it
+                // matches, and `spec.size_gib` matched nothing — the sentence
+                // fell into the banner instead of onto the field it was about.
+                // Converted here, at the one door every REST error leaves by,
+                // so `.at()` callers keep writing the model's own spelling.
+                field: self.field.map(|f| {
+                    f.split('.')
+                        .map(velstra_cloud_wire::to_camel)
+                        .collect::<Vec<_>>()
+                        .join(".")
+                }),
                 revision: self.revision.map(|r| r.to_string()),
             },
         };

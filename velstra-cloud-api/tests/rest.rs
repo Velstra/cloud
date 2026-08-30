@@ -2069,6 +2069,59 @@ async fn a_volume_is_not_restored_in_place() {
 /// had claimed and declined it, and the volume sat converging on nothing — with
 /// no condition, no event and no log line, because every component had done
 /// exactly the right thing.
+/// A volume a pool cannot hold is refused before it exists.
+///
+/// Found on a real cell: the pool was an LVM group the operating system had
+/// filled, the volume was accepted, and `lvcreate: insufficient free space`
+/// repeated for ever in a journal on another machine — an answer, in a place
+/// nobody was looking.
+#[tokio::test]
+async fn a_volume_a_pool_cannot_hold_is_refused_at_the_door() {
+    let h = Harness::new();
+    h.pool("tight").await;
+    // The pool has spoken: 10 GiB of room, 8 already promised.
+    let mut p = h.pools().get("pools/tight").await.unwrap().unwrap();
+    p.status.backend = "lvm".into();
+    p.status.capacity_gib = 10;
+    p.status.allocated_gib = 8;
+    h.pools()
+        .update(&p, &velstra_cloud_model::access::Writer::agent("tight"))
+        .await
+        .unwrap();
+
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "zu-gross", "spec": { "pool": "tight", "sizeGib": 5 } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
+    let why = refused.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(why.contains("2 GiB left") && why.contains("5 GiB"), "{why}");
+    assert_eq!(refused.body["error"]["field"], "spec.sizeGib");
+
+    // What fits, fits.
+    let fits = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "passt", "spec": { "pool": "tight", "sizeGib": 2 } }),
+        )
+        .await;
+    assert_eq!(fits.status, StatusCode::ACCEPTED, "{:?}", fits.body);
+
+    // A pool whose agent has not spoken yet refuses nothing: its zero is
+    // "nothing is known", not "no room", and a freshly registered pool must
+    // not be unusable until its first heartbeat.
+    h.pool("neu").await;
+    let unknown = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "blind", "spec": { "pool": "neu", "sizeGib": 100 } }),
+        )
+        .await;
+    assert_eq!(unknown.status, StatusCode::ACCEPTED, "{:?}", unknown.body);
+}
+
 #[tokio::test]
 async fn a_volume_is_not_moved_between_pools_by_editing_its_pool() {
     let h = Harness::new();
@@ -4639,10 +4692,11 @@ async fn a_value_the_field_does_not_take_says_so_about_the_value() {
         message.contains("does not take that value"),
         "the refusal still blames the field: {message}"
     );
-    // Snake case, like the neighbouring refusal: by the time a spec reaches
-    // this layer the wire has already turned `cpuBaseline` into `cpu_baseline`,
-    // and both errors name the field the same way.
-    assert_eq!(refused.body["error"]["field"], json!("spec.cpu_baseline"));
+    // The wire's own spelling. `error.field` names a wire path — a console
+    // lands the refusal on the control whose key it matches — so it leaves the
+    // API camelCase like every other field name on this surface, whatever the
+    // model calls it inside.
+    assert_eq!(refused.body["error"]["field"], json!("spec.cpuBaseline"));
 
     // The spelling the platform itself uses is accepted.
     let ok = h

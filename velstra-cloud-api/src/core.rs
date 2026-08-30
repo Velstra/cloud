@@ -4678,6 +4678,37 @@ impl Api {
         }
         let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
         let ids: Vec<String> = pools.iter().map(|p| p.meta.name.id().to_string()).collect();
+        if let Some(pool) = pools.iter().find(|p| p.meta.name.id() == asked) {
+            // The pool exists — does it have the room? Refused here, before a
+            // byte moves, for the same reason a migration is: the far end
+            // refusing after the object exists is the same refusal, later and
+            // quieter. On a real cell a volume on a full pool sat unprovisioned
+            // with `lvcreate: insufficient free space` repeating in a journal
+            // on another machine — an answer, in a place nobody was looking.
+            //
+            // Only for a pool that has *reported*: one whose agent has not
+            // spoken yet has capacity 0 because nothing is known, and refusing
+            // every volume until the first heartbeat would make a freshly
+            // registered pool unusable for no stated reason.
+            let asked_gib = spec.get("size_gib").and_then(Value::as_u64).unwrap_or(0);
+            let has_reported = !pool.status.backend.is_empty();
+            let free = pool
+                .status
+                .capacity_gib
+                .saturating_sub(pool.status.allocated_gib);
+            if has_reported && asked_gib > free {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "`{asked}` has {free} GiB left and this volume wants {asked_gib} GiB. \
+                         Nothing was created: a volume on a pool that cannot hold it would sit \
+                         unprovisioned for ever."
+                    ),
+                )
+                .at("spec.size_gib"));
+            }
+            return Ok(());
+        }
         if ids.iter().any(|id| id == asked) {
             return Ok(());
         }
