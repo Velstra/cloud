@@ -58,6 +58,7 @@ async function enter() {
   // The overview, unless a link asked for something else. Landing on a board
   // was landing on one collection's answer to a question nobody had asked yet.
   if (collection(wanted)) await show(wanted);
+  else if (wanted === "map") await showTopology();
   else await showOverview();
   sweep();
 }

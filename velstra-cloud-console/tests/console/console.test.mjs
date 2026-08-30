@@ -1344,6 +1344,70 @@ await test("abandoning a post-copy migration warns differently from a live one",
   check(gone, "an abandoned migration is still on the board");
 });
 
+/// The one screen that is about how things join up rather than about what
+/// exists.
+///
+/// Every other page answers "what is in this collection". A tenant's first
+/// question is not that — it is *what does my network look like*, and the
+/// answer lives in seven collections at once and in none of them. This is the
+/// only place it is assembled, so the check is what stops it quietly becoming
+/// decoration.
+await test("the map draws the project's network out of the objects it is made of", async () => {
+  const said = await page.evaluate(`(async () => {
+    document.getElementById("railmap").click();
+    for (let i = 0; i < 80; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const box = document.getElementById("topologybox");
+      const text = box ? box.innerText : "";
+      if (text && !/Asking/.test(text)) return text;
+    }
+    return document.getElementById("topologybox")?.innerText || "";
+  })()`);
+
+  // The way out, named by the object that carries it — a machine in the cell,
+  // not a property of the tenant's own network.
+  check(/Internet/.test(said), `no internet on the map: ${said.slice(0, 200)}`);
+  check(/node-a/.test(said), `the map does not say which machine carries the way out: ${said}`);
+  // An address from outside, and what it is in front of.
+  check(/203\.0\.113\.7/.test(said) && /web-1-eth0/.test(said),
+    `the floating address is not on the map: ${said}`);
+
+  // The router, and what joining actually means — not just a list of names.
+  check(/router/i.test(said) && /reaches every other/.test(said),
+    `the map lists a router without saying what it does: ${said}`);
+
+  // Down to the guest and its address, which is the whole point: somebody
+  // looking for "which machine has 10.20.0.11" should not have to open ports.
+  check(/prod-a/.test(said) && /10\.20\.0\.0\/24/.test(said), `no subnet on the map: ${said}`);
+  check(/web-1/.test(said) && /10\.20\.0\.11/.test(said),
+    `the map does not put the guest on its address: ${said}`);
+  check(/10\.20\.0\.20/.test(said), `the load balancer's address is missing: ${said}`);
+
+  // The three shapes nothing else in this console shows at all.
+  check(/no subnet/.test(said),
+    `a network a guest cannot be put on is drawn as if it were fine: ${said}`);
+  // Case-insensitively: the headings are upper-cased by the stylesheet, and
+  // `innerText` is what is rendered rather than what was written.
+  check(/not routed/i.test(said) && /island/.test(said),
+    `a network no router joins is not marked as an island: ${said}`);
+  check(/adrift/i.test(said) && /orphan/.test(said) && /does not exist/.test(said),
+    `a subnet whose network was never made is invisible here too: ${said}`);
+  check(/gone/.test(said), `a router naming a network nobody made says nothing: ${said}`);
+
+  // And it is a way through, not a picture: the names go where they point.
+  const went = await page.evaluate(`(async () => {
+    const link = [...document.querySelectorAll("#topologybox button.linky")]
+      .find((b) => (b.dataset.goes || "").includes("/instances/"));
+    if (!link) return { found: false };
+    link.click();
+    await new Promise((r) => setTimeout(r, 1200));
+    return { found: true, list: document.getElementById("listtitle").textContent };
+  })()`);
+  check(went.found, "no guest on the map is a way through to it");
+  equal(went.list, "Instances", "following a guest on the map did not open its board");
+  await page.evaluate(`closeSheet()`);
+});
+
 /// Where a guest goes is asked once, and the control offers what the platform
 /// takes.
 ///

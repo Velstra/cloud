@@ -365,7 +365,10 @@ function seed() {
     { observedGeneration: 1, conditions: ready(1),
       used: { instances: 0, vcpus: 0, memoryMib: 0, volumeGib: 0 } });
 
-  put("nodes/node-a", { schedulable: true, labels: ["nvme", "gen4"] },
+  // One machine carries external traffic. Without one, nothing in any project
+  // in this cell reaches out — a fact that lives on a node and shows up on a
+  // tenant's map, which is why the map asks for it.
+  put("nodes/node-a", { schedulable: true, labels: ["nvme", "gen4"], gateway: true },
     { observedGeneration: 1, conditions: ready(1),
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
       allocated: { vcpus: 10, memoryMib: 20480, diskGib: 200, numaFreeMib: [], hugepages1gi: 0 },
@@ -508,6 +511,35 @@ function seed() {
     members: ["projects/p1/ports/web-1-eth0"] },
     { observedGeneration: 1, conditions: ready(1), vip: "10.20.0.20",
       listeners: [{ protocol: "Tcp", port: 443, members: 1 }] });
+
+  // The rest of a tenant's network, which no board shows joined up and the map
+  // exists to. Each of these is a shape somebody really ends up in:
+  //
+  //  * a router, so two networks reach each other — and one that names a
+  //    network nobody made, which the API accepts on purpose;
+  //  * a second network with no subnet at all, which a guest cannot be put on;
+  //  * a network no router joins, which is an island and does not say so
+  //    anywhere else;
+  //  * an address from outside, in front of one port;
+  //  * a subnet whose network was never created, which nothing refuses and
+  //    nothing shows.
+  put("projects/p1/routers/main", {
+    networks: ["projects/p1/networks/prod", "projects/p1/networks/staging",
+               "projects/p1/networks/gone"] },
+    { observedGeneration: 1, conditions: ready(1) });
+  put("projects/p1/networks/staging", { vni: 4712, mtu: 1450 },
+    { observedGeneration: 1, conditions: ready(1), programmedOn: ["node-a"] });
+  put("projects/p1/networks/island", { vni: 4713, mtu: 1450 },
+    { observedGeneration: 1, conditions: ready(1), programmedOn: [] });
+  put("projects/p1/subnets/island-a", { network: "projects/p1/networks/island",
+    cidr: "10.30.0.0/24", gateway: "10.30.0.1", dns: [], reserved: [] },
+    { observedGeneration: 1, conditions: ready(1), allocated: 0, available: 253 });
+  put("projects/p1/subnets/orphan", { network: "projects/p1/networks/nie-gebaut",
+    cidr: "10.40.0.0/24", gateway: "10.40.0.1", dns: [], reserved: [] },
+    { observedGeneration: 1, conditions: ready(1), allocated: 0, available: 253 });
+  put("projects/p1/floatingips/web", { subnet: "projects/p1/subnets/prod-a",
+    port: "projects/p1/ports/web-1-eth0" },
+    { observedGeneration: 1, conditions: ready(1), address: "203.0.113.7" });
 
   put("projects/p1/ports/web-1-eth0", { network: "projects/p1/networks/prod",
     subnet: "projects/p1/subnets/prod-a", address: "10.20.0.11", mac: "02:1a:4b:00:11:22",
