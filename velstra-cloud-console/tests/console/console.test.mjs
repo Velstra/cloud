@@ -1344,6 +1344,95 @@ await test("abandoning a post-copy migration warns differently from a live one",
   check(gone, "an abandoned migration is still on the board");
 });
 
+/// The screen's own protocol, spoken against a scripted server — one byte at
+/// a time.
+///
+/// RFB is a stream and a websocket cuts it wherever a relay's buffer ended, so
+/// the hostile framing *is* the test: every length-prefixed message arrives
+/// split between its length and its body. The first version of the parser had
+/// four places that consumed a length, found the body not yet arrived, and
+/// re-read the first body byte as the next length — one byte of drift that
+/// turns everything after it into noise, and that a whole-frames test can
+/// never see.
+await test("the screen's client survives a stream cut at every byte", async () => {
+  const result = await page.evaluate(`(async () => {
+    const sent = [];
+    const stub = { readyState: 1, binaryType: "", send: (b) => sent.push([...new Uint8Array(b)]),
+                   close: () => {}, onmessage: null };
+    const canvas = document.createElement("canvas");
+    const said = [];
+    const client = rfbClient(stub, canvas, (t) => said.push(t));
+
+    // The server's side of the conversation, as one byte stream.
+    const u16 = (n) => [(n >> 8) & 0xff, n & 0xff];
+    const u32 = (n) => [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
+    const server = [
+      ...[..."RFB 003.008\\n"].map((c) => c.charCodeAt(0)),
+      2, 2, 1,                    // two security types, None among them
+      ...u32(0),                  // SecurityResult: ok
+      ...u16(4), ...u16(3),       // ServerInit: 4x3 screen
+      ...Array(16).fill(0),       //   pixel format (ignored; we set our own)
+      ...u32(5), ...[..."guest"].map((c) => c.charCodeAt(0)),
+      3,                          // ServerCutText — length-prefixed, must not desync
+      0, 0, 0, ...u32(2), 65, 66,
+      1,                          // SetColourMapEntries — same shape hazard
+      0, ...u16(0), ...u16(1), ...Array(6).fill(0),
+      0,                          // FramebufferUpdate…
+      0, ...u16(2),               //   two rects:
+      ...u16(1), ...u16(1), ...u16(2), ...u16(1), ...u32(0),  // raw 2x1 at (1,1)
+      0x40, 0x80, 0xc0, 0, 0x40, 0x80, 0xc0, 0,               //   BGRX, twice
+    ];
+    const resize = [
+      ...u16(0), ...u16(0), ...u16(6), ...u16(4), ...u32(0xffffff21 >>> 0), // DesktopSize 6x4
+    ];
+    // One byte per message: the worst cut a relay can make, at every position.
+    for (const byte of server) stub.onmessage({ data: new Uint8Array([byte]).buffer });
+
+    // Read the pixel *before* the resize goes in: setting a canvas's size
+    // clears it, which is also why the client re-requests a full update after
+    // a DesktopSize.
+    const ctx = canvas.getContext("2d");
+    const px = ctx.getImageData(1, 1, 1, 1).data;
+    const sendsBeforeResize = sent.length;
+    for (const byte of resize) stub.onmessage({ data: new Uint8Array([byte]).buffer });
+    // The request that follows a resize must be a full one: the resize cleared
+    // the canvas, and the server believes everything it sent is on screen — an
+    // incremental ask here is a black screen until the guest next moves.
+    const afterResize = sent.slice(sendsBeforeResize).find((m) => m[0] === 3);
+    client.key(true, 0xff0d);
+    client.button(1, 3, 2);
+    return {
+      said,
+      sends: sent.length,
+      version: String.fromCharCode(...sent[0]),
+      chose: sent[1], clientInit: sent[2],
+      sizedTo: [canvas.width, canvas.height],
+      // BGRX 40/80/c0 must come back as RGB c0/80/40.
+      pixelBeforeResize: [...px],
+      fullAfterResize: afterResize ? afterResize[1] === 0 : null,
+      key: sent.filter((m) => m[0] === 4).pop(),
+      pointer: sent.filter((m) => m[0] === 5).pop(),
+    };
+  })()`);
+
+  check(result.version === "RFB 003.008\n", `the client offered ${result.version}`);
+  check(result.chose.length === 1 && result.chose[0] === 1, "the client did not choose security None");
+  check(result.clientInit[0] === 1, "the client did not ask for a shared session");
+  equal(result.sizedTo.join("x"), "6x4", "DesktopSize did not resize the canvas");
+  check(result.fullAfterResize === true,
+    "after a resize the client asked incrementally, which is a black screen until the guest moves");
+  // The swizzle, which is the whole point of naming our own pixel format: the
+  // wire's BGRX becomes the canvas's RGBA, not a blue-tinted ghost of it.
+  const p = result.pixelBeforeResize;
+  check(p[0] === 0xc0 && p[1] === 0x80 && p[2] === 0x40 && p[3] === 255,
+    `the raw rect decoded to rgba(${p.join(",")}) instead of rgba(192,128,64,255)`);
+  check(!result.said.some((t) => t && /does not know|refused/.test(t)),
+    `a one-byte stream desynchronised the parser: ${result.said.join(" | ")}`);
+  // Input encodings, straight from the spec: KeyEvent and PointerEvent.
+  equal(result.key.join(","), [4,1,0,0,0,0,0xff,0x0d].join(","), "the key event is misencoded");
+  equal(result.pointer.join(","), [5,1,0,3,0,2].join(","), "the pointer event is misencoded");
+});
+
 /// The one screen that is about how things join up rather than about what
 /// exists.
 ///

@@ -87,10 +87,12 @@ function rfbClient(ws, canvas, say) {
     send([3, incremental ? 1 : 0, ...u16(0), ...u16(0), ...u16(canvas.width), ...u16(canvas.height)]);
   };
 
-  // What the parser is in the middle of. Rect decoding spans messages, so the
-  // remainder lives here rather than on the stack.
+  // What the parser is in the middle of. Anything read before its body has
+  // arrived lives here rather than on the stack, so the next call resumes
+  // instead of re-reading — see the note in the `security` phase.
   let rects = 0;
   let rect = null;
+  let pending = null;
 
   const step = () => {
     for (;;) {
@@ -106,11 +108,20 @@ function rfbClient(ws, canvas, say) {
           break;
         }
         case "security": {
-          if (q.size() < 1) return;
-          const count = q.take(1)[0];
-          if (count === 0) { say("the server refused the handshake"); return; }
-          const types = q.take(count);
+          // The count is *held* once read, never taken twice: a websocket cuts
+          // the stream wherever the relay's buffer ended, and a parser that
+          // consumed the count, found the types not yet arrived and returned
+          // would read the first type as the next count — one byte of drift
+          // that turns every message after it into noise. The same rule holds
+          // everywhere below a length precedes its body.
+          if (pending === null) {
+            if (q.size() < 1) return;
+            pending = q.take(1)[0];
+            if (pending === 0) { say("the server refused the handshake"); return; }
+          }
+          const types = q.take(pending);
           if (!types) return;
+          pending = null;
           if (![...types].includes(1)) {
             // QEMU on a unix socket offers None — the socket itself is behind
             // the ticket check. A server wanting VNC auth is not this cell's.
@@ -130,13 +141,16 @@ function rfbClient(ws, canvas, say) {
           break;
         }
         case "serverinit": {
-          if (q.size() < 24) return;
-          const head = q.take(24);
+          if (pending === null) {
+            if (q.size() < 24) return;
+            pending = q.take(24);
+          }
+          const head = pending;
           const w = (head[0] << 8) | head[1];
           const h = (head[2] << 8) | head[3];
           const nameLen = (head[20] << 24) | (head[21] << 16) | (head[22] << 8) | head[23];
-          if (q.size() < nameLen) { /* name still coming */ q.push(head.buffer ? head : head); return; }
-          q.take(nameLen);
+          if (!q.take(nameLen)) return;
+          pending = null;
           canvas.width = w;
           canvas.height = h;
           // One format for everything after this: 32bpp, true colour,
@@ -178,11 +192,15 @@ function rfbClient(ws, canvas, say) {
             enc,
           };
           if (enc === -223) {
-            // DesktopSize: the guest changed its resolution.
+            // DesktopSize: the guest changed its resolution. Setting a
+            // canvas's size clears it, and the server believes everything it
+            // sent is on screen — an *incremental* request after this is a
+            // black screen until the guest next changes a pixel. So the next
+            // request is a full one.
             canvas.width = rect.w;
             canvas.height = rect.h;
             rect = null;
-            if (--rects === 0) { phase = "messages"; requestUpdate(true); }
+            if (--rects === 0) { phase = "messages"; requestUpdate(false); }
             break;
           }
           if (enc === 1) { phase = "copyrect"; break; }
@@ -219,18 +237,24 @@ function rfbClient(ws, canvas, say) {
           // SetColourMapEntries: header then 6 bytes per colour. Never asked
           // for (true colour was set), but a server that sends one anyway must
           // not desynchronise the stream.
-          const b = q.take(5);
-          if (!b) return;
-          const n = (b[3] << 8) | b[4];
-          if (!q.take(n * 6)) return;
+          if (pending === null) {
+            const b = q.take(5);
+            if (!b) return;
+            pending = ((b[3] << 8) | b[4]) * 6;
+          }
+          if (!q.take(pending)) return;
+          pending = null;
           phase = "messages";
           break;
         }
         case "cut-head": {
-          const b = q.take(7);
-          if (!b) return;
-          const len = (b[3] << 24) | (b[4] << 16) | (b[5] << 8) | b[6];
-          if (!q.take(len)) return;
+          if (pending === null) {
+            const b = q.take(7);
+            if (!b) return;
+            pending = ((b[3] << 24) | (b[4] << 16) | (b[5] << 8) | b[6]) >>> 0;
+          }
+          if (!q.take(pending)) return;
+          pending = null;
           phase = "messages";
           break;
         }
