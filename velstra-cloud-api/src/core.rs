@@ -4964,7 +4964,14 @@ impl Api {
     /// tell somebody a guest fits when it does not. That is the whole reason
     /// this is computed here rather than left to whoever draws the dashboard.
     pub async fn explain_capacity(&self, who: &Identity) -> ApiResult<Value> {
-        let _ = who;
+        // The whole fleet, by name — so the question is the same one listing
+        // the nodes asks, and it is asked. The comment above `explain_cpu` used
+        // to *say* this was authorised as a read of the collection while the
+        // code threw `who` away, and a tenant's overview rendered the cell's
+        // machine names, free memory and CPU domains. Found by signing in as
+        // one.
+        self.authorize_for(who, Verb::Read, &ResourceName::parse("nodes/any")?, "nodes")
+            .await?;
         let nodes: Vec<velstra_cloud_model::resources::Node> = self.typed_list("", "nodes").await?;
         let h = velstra_cloud_model::reconcile::headroom(&nodes, &self.closed_nodes().await?);
 
@@ -5052,8 +5059,9 @@ impl Api {
     pub async fn explain_cpu(&self, who: &Identity) -> ApiResult<Value> {
         // Every node in the cell, because a migration domain is a property of
         // the whole set. Authorised as a read of the node collection, which is
-        // what it is.
-        let _ = who;
+        // what it is — and enforced, not just said: see `explain_capacity`.
+        self.authorize_for(who, Verb::Read, &ResourceName::parse("nodes/any")?, "nodes")
+            .await?;
         let nodes: Vec<Node> = self.typed_list("", "nodes").await?;
         let entries: Vec<velstra_cloud_model::cpu::NodeEntry> = nodes
             .iter()

@@ -131,6 +131,13 @@ function unsettledEverywhere() {
 
 async function sweep() {
   await Promise.all(collections().map(async (c) => {
+    // The same rule the rail draws by. Sweeping a collection the rail hides
+    // from this account is ten requests whose answers are known — and, until
+    // the 403 handling below existed, ten red rows on a tenant's overview.
+    if (CELL_ONLY.includes(c.id) && !(session.who && session.who.cellAdmin)) {
+      census[c.id] = { ok: true, denied: true, total: 0, unsettled: 0 };
+      return;
+    }
     try {
       const r = await list(c);
       const unsettled = r.items.filter((x) => verdict(x, c.condition).kind !== "settled");
@@ -158,7 +165,15 @@ async function sweep() {
         unsettled: unsettled.length,
       };
     } catch (e) {
-      census[c.id] = { ok: false, total: 0, unsettled: 0, why: e.message };
+      // "You may not look" is not "something is broken". A tenant's sweep runs
+      // into the cell's own collections — nodes, pools, users — and the API
+      // refuses each with a sentence, which is right. Rendering those as eight
+      // red `unreadable` rows taught a customer's first overview that the
+      // console was on fire. A refusal is recorded as not-mine and stays off
+      // the attention list; every *other* failure is still the alarm it was.
+      census[c.id] = e && e.status === 403
+        ? { ok: true, denied: true, total: 0, unsettled: 0 }
+        : { ok: false, total: 0, unsettled: 0, why: e.message };
     }
   }));
   renderRail();
@@ -954,7 +969,13 @@ async function renderOverviewReports() {
   ]);
   clear(host);
 
-  host.appendChild(el("h2", "The cell"));
+  // The cell's own heading only when there is something of the cell's to say.
+  // For a tenant, `explainCapacity` and `explainCpu` are refused — the fleet's
+  // machine names and domains are not theirs — and an empty "THE CELL" heading
+  // over nothing would be a report that failed to load.
+  if (room || (cpu && (cpu.domains || []).length)) {
+    host.appendChild(el("h2", "The cell"));
+  }
   if (room) host.appendChild(capacityLine(room));
   for (const line of maintenanceLines(windows)) host.appendChild(line);
   const domains = (cpu && cpu.domains) || [];

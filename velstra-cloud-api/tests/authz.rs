@@ -2659,6 +2659,33 @@ async fn a_role_granted_on_a_folder_reaches_down_like_a_rung_does() {
     );
 }
 
+/// The fleet's own questions are the fleet's.
+///
+/// `nodes:explainCapacity` and `nodes:explainCpu` answer with machine names,
+/// free memory and CPU domains — the same facts listing the nodes would give,
+/// which the same caller is refused. Both used to throw `who` away with a
+/// comment claiming they were authorised; a tenant's overview rendered the
+/// cell. Found by signing in as one.
+#[tokio::test]
+async fn the_fleet_reports_are_refused_to_whoever_may_not_list_the_fleet() {
+    let api = cell().await;
+
+    api.explain_capacity(&who(OPERATOR))
+        .await
+        .expect("an operator reads the fleet");
+    api.explain_cpu(&who(OPERATOR))
+        .await
+        .expect("an operator reads the domains");
+
+    for (what, verdict) in [
+        ("capacity", api.explain_capacity(&who(ADA)).await.err()),
+        ("cpu", api.explain_cpu(&who(ADA)).await.err()),
+    ] {
+        let refused = verdict.unwrap_or_else(|| panic!("a tenant read the fleet's {what}"));
+        assert_eq!(refused.code, velstra_cloud_api::Code::PermissionDenied, "{refused}");
+    }
+}
+
 #[tokio::test]
 async fn listing_asks_about_what_is_being_listed_and_not_about_the_project() {
     // `GET /projects/p1/instances` authorises Read on `projects/p1`. Asking that
