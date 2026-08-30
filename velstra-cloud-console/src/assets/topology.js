@@ -110,9 +110,20 @@ function openFromMap(collId, item) {
 /// exactly what an address held while its machine is replaced looks like.
 function internetBlock(f) {
   const box = el("div.mapblock");
+  // Each gateway with how long ago it was heard from, and that second half is
+  // not decoration. On a live cell this page said "carried by peter" about a
+  // machine that had not reported in fourteen hours: a way out drawn as a fact
+  // when it was a hope. The platform is right not to declare a node dead — a
+  // node that does not fence has no deadline — but a page that names it as the
+  // way out has to say when it last spoke.
   const gateways = f.nodes === null
     ? null
-    : f.nodes.filter((n) => at(spec(n), "gateway") === true).map((n) => idOf(n));
+    : f.nodes
+        .filter((n) => at(spec(n), "gateway") === true)
+        .map((n) => {
+          const heard = at(status(n), "lastHeartbeat");
+          return idOf(n) + (heard ? " (heard from " + ago(heard) + ")" : " (never heard from)");
+        });
 
   box.appendChild(mapRow(0, "internet", "Internet",
     gateways === null
