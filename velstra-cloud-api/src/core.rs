@@ -4281,22 +4281,49 @@ impl Api {
         Ok(())
     }
 
-    /// One port on a named network, on that network's subnet.
+    /// One port where a guest was asked to be: a network, or one of its subnets.
     ///
-    /// The network has to be this project's. `make` does not authorise — it is
-    /// for objects the platform decided on — so a name from somewhere else would
-    /// mint a port in a stranger's project on their behalf, which is the whole
-    /// hole. Checked here rather than trusted.
+    /// Two spellings for one question, the same way `image` takes a family or a
+    /// concrete build. A network is what most people mean — "put it on my
+    /// network" — and it is a complete answer exactly when that network has one
+    /// subnet. A subnet is the answer when it does not, and it is the more
+    /// precise one: a subnet is where the range an address comes out of lives.
+    ///
+    /// Whichever is named has to be this project's. `make` does not authorise —
+    /// it is for objects the platform decided on — so a name from somewhere else
+    /// would mint a port in a stranger's project on their behalf, which is the
+    /// whole hole. Checked here rather than trusted.
     async fn mint_a_port_on(
         &self,
         guest: &ResourceName,
         parent: &str,
-        network: &str,
+        asked: &str,
     ) -> ApiResult<String> {
+        let subnets: Vec<velstra_cloud_model::resources::Subnet> =
+            self.typed_list(parent, "subnets").await?;
+        let alive = |s: &&velstra_cloud_model::resources::Subnet| s.meta.deleted_at.is_none();
+
+        // A subnet, named directly. Its network is the subnet's own — asking for
+        // both would be asking the same question twice and inviting them to
+        // disagree.
+        if asked.starts_with(&format!("{parent}/subnets/")) {
+            let Some(subnet) = subnets.iter().filter(alive).find(|s| s.meta.name.to_string() == asked) else {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!("there is no subnet called `{asked}`"),
+                )
+                .at("spec.networks"));
+            };
+            return self
+                .port_on(guest, parent, &subnet.spec.network, &subnet.meta.name.to_string())
+                .await;
+        }
+
+        let network = asked;
         if !network.starts_with(&format!("{parent}/networks/")) {
             return Err(ApiError::invalid(format!(
-                "`{network}` is not a network of this project. A guest can only be put on a \
-                 network its own project holds."
+                "`{network}` is neither a network nor a subnet of this project. A guest can \
+                 only be put on a network its own project holds."
             ))
             .at("spec.networks"));
         }
@@ -4318,12 +4345,11 @@ impl Api {
         // The subnet is what carries the range an address comes out of, and a
         // network without one can hold a port that never gets an address —
         // a guest that boots with a dead NIC and no sign of why.
-        let subnets: Vec<velstra_cloud_model::resources::Subnet> =
-            self.typed_list(parent, "subnets").await?;
-        let Some(subnet) = subnets
+        let mut on_it = subnets
             .iter()
-            .find(|s| s.spec.network == network && s.meta.deleted_at.is_none())
-        else {
+            .filter(alive)
+            .filter(|s| s.spec.network == network);
+        let Some(subnet) = on_it.next() else {
             return Err(ApiError::new(
                 Code::FailedPrecondition,
                 format!(
@@ -4333,6 +4359,38 @@ impl Api {
             )
             .at("spec.networks"));
         };
+        // More than one, and the network is no longer a complete answer. This
+        // used to take whichever came first by name — an address out of a range
+        // nobody chose, decided silently, which is the same thing this create
+        // refuses when both `networks` and `ports` are named.
+        if let Some(second) = on_it.next() {
+            let mut all: Vec<String> = vec![
+                format!("{} ({})", subnet.meta.name, subnet.spec.cidr),
+                format!("{} ({})", second.meta.name, second.spec.cidr),
+            ];
+            all.extend(on_it.map(|s| format!("{} ({})", s.meta.name, s.spec.cidr)));
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "`{network}` has more than one subnet, so naming it does not say which \
+                     range this guest's address comes out of. Name the subnet instead: {}",
+                    all.join(", ")
+                ),
+            )
+            .at("spec.networks"));
+        }
+        let subnet = subnet.meta.name.to_string();
+        self.port_on(guest, parent, network, &subnet).await
+    }
+
+    /// The port itself, once it is settled which network and which subnet.
+    async fn port_on(
+        &self,
+        guest: &ResourceName,
+        parent: &str,
+        network: &str,
+        subnet: &str,
+    ) -> ApiResult<String> {
 
         let port = format!("{parent}/ports/{}", minted("ports"));
         self.make_for(
@@ -4341,7 +4399,7 @@ impl Api {
             "ports",
             json!({
                 "network": network,
-                "subnet": subnet.meta.name.to_string(),
+                "subnet": subnet,
                 "security_groups": []
             }),
         )

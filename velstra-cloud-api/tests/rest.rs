@@ -4494,6 +4494,95 @@ async fn one_machine_is_one_request() {
 }
 
 
+/// Naming a subnet is naming a network more precisely, and with two subnets it
+/// is the only complete answer.
+///
+/// A network with one subnet is what most people mean by "put it on my network".
+/// With two, the network no longer says which range the address comes out of —
+/// and this used to take whichever came first by name, silently. That is the
+/// same thing the create refuses when both `networks` and `ports` are named:
+/// picking one of two answers on somebody's behalf.
+#[tokio::test]
+async fn a_guest_is_put_on_a_network_or_on_one_of_its_subnets() {
+    let h = Harness::new();
+    h.post(
+        "projects/p2/networks",
+        json!({ "id": "twin", "spec": { "mtu": 1450 }}),
+    )
+    .await;
+    for (id, cidr) in [("front", "10.60.0.0/24"), ("back", "10.61.0.0/24")] {
+        let made = h
+            .post(
+                "projects/p2/subnets",
+                json!({ "id": id, "spec": {
+                    "network": "projects/p2/networks/twin",
+                    "cidr": cidr, "gateway": cidr.replace(".0/24", ".1"),
+                    "dns": [], "reserved": []
+                }}),
+            )
+            .await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    }
+
+    // The network alone is no longer an answer, and the refusal lists what to
+    // choose from rather than saying only that it cannot.
+    let vague = h
+        .post(
+            "projects/p2/instances",
+            json!({ "id": "vage", "spec": {
+                "image": "projects/p1/images/sha256-abc",
+                "vcpus": 1, "memoryMib": 512, "rootDiskGib": 2,
+                "networks": ["projects/p2/networks/twin"]
+            }}),
+        )
+        .await;
+    assert_eq!(vague.status, StatusCode::BAD_REQUEST, "{:?}", vague.body);
+    let why = vague.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(why.contains("more than one subnet"), "{why}");
+    assert!(why.contains("front") && why.contains("back"), "{why}");
+    assert!(why.contains("10.60.0.0/24"), "the ranges are not named: {why}");
+    assert_eq!(vague.body["error"]["field"], "spec.networks");
+
+    // The subnet is. Its network is the subnet's own — nobody names both.
+    let precise = h
+        .post(
+            "projects/p2/instances",
+            json!({ "id": "genau", "spec": {
+                "image": "projects/p1/images/sha256-abc",
+                "vcpus": 1, "memoryMib": 512, "rootDiskGib": 2,
+                "networks": ["projects/p2/subnets/back"]
+            }}),
+        )
+        .await;
+    assert_eq!(precise.status, StatusCode::ACCEPTED, "{:?}", precise.body);
+    let guest = h.get("projects/p2/instances/genau").await;
+    let port = guest.body["spec"]["ports"][0].as_str().unwrap_or_default().to_string();
+    assert!(!port.is_empty(), "{:?}", guest.body["spec"]);
+    let p = h.get(&port).await;
+    assert_eq!(p.body["spec"]["subnet"], "projects/p2/subnets/back");
+    assert_eq!(p.body["spec"]["network"], "projects/p2/networks/twin");
+
+    // And a subnet nobody made is refused by name, not by silence.
+    let ghost = h
+        .post(
+            "projects/p2/instances",
+            json!({ "id": "geist", "spec": {
+                "image": "projects/p1/images/sha256-abc",
+                "vcpus": 1, "memoryMib": 512, "rootDiskGib": 2,
+                "networks": ["projects/p2/subnets/gibtsnicht"]
+            }}),
+        )
+        .await;
+    assert_eq!(ghost.status, StatusCode::BAD_REQUEST, "{:?}", ghost.body);
+    assert!(
+        ghost.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no subnet called"),
+        "{:?}", ghost.body
+    );
+}
+
 #[test]
 fn a_full_store_is_a_precondition_and_not_an_internal_error() {
     // Found live. An afternoon of ordinary use filled etcd's 2 GiB default and

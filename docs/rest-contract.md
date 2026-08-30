@@ -710,6 +710,58 @@ exception, and it is anchored because the moment is genuinely knowable: a
 accurate to the minute and worth showing. For every other computed condition,
 show the message and leave the time alone.
 
+## Where a guest goes
+
+**Nobody has to make a port.** A port is a join — this guest, that network, this
+address — which is right in the model and wrong in a form. Asking for one machine
+used to mean creating a network, a subnet on it, and a port on that, in that
+order, before the guest: four objects and a dependency order, none of which the
+person wanted.
+
+So an instance is created with `spec.networks`, and the platform mints the ports:
+
+```
+POST /api/v1/projects/p1/instances
+{ "id": "web-1", "spec": { "image": "families/debian-13", "vcpus": 2,
+                           "memoryMib": 4096, "rootDiskGib": 20 } }
+```
+
+- **Nothing named** — the guest joins the project's **default network**, made the
+  first time somebody needs one, with a `/24` derived from its VNI so two cells
+  restoring from a backup cannot hand the same range to different tenants. Two
+  machines in a project can talk without anybody configuring anything.
+- **`networks: [...]`** — one port per entry. An entry is a **network**, or one
+  of its **subnets** when the network is not a complete answer. Both are answers
+  to "where does this guest go", the same way `image` takes a family or a
+  concrete build.
+- **`ports: [...]`** — the explicit path, for an address that has to outlive the
+  machine. Naming both `networks` and `ports` is refused rather than merged: they
+  are two answers to one question.
+- **`ports: []`** — a guest on no network, said out loud. Different from saying
+  nothing.
+
+`networks` is **consumed**: what is stored is `ports`. Two fields describing one
+set of interfaces is two fields that drift.
+
+A network is a complete answer exactly when it has one subnet. With none, a port
+on it could never be given an address, and the create says so. With more than
+one, naming the network does not say which range the address comes out of, and
+the create refuses **listing the subnets and their ranges** rather than taking
+whichever came first:
+
+```
+POST /api/v1/projects/p1/instances → 400 FAILED_PRECONDITION
+{ "error": { "field": "spec.networks", "message":
+  "`projects/p1/networks/prod` has more than one subnet, so naming it does not
+   say which range this guest's address comes out of. Name the subnet instead:
+   projects/p1/subnets/prod-a (10.20.0.0/24), projects/p1/subnets/prod-b (10.21.0.0/24)" } }
+```
+
+The same argument one layer over gives an instance `spec.volumes`: a disk list
+rather than attachments made by hand. Unlike `networks` it is **kept**, not
+consumed — taking an entry out is how you detach, and a field that emptied itself
+could not express that.
+
 ## Networking, from the guest's side
 
 Two things a guest talks to are not part of this REST surface at all, and they
