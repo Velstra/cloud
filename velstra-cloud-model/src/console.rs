@@ -103,6 +103,26 @@ pub struct ConsoleSessionSpec {
     /// question is answered.
     #[serde(default)]
     pub read_only: bool,
+    /// Which of the guest's two lines this opens: the serial console, or the
+    /// display.
+    ///
+    /// On the session rather than in the stream's query string, because it is
+    /// part of what was *granted*: a ticket for the serial line must not be
+    /// spendable on the framebuffer, where "may only watch" means something the
+    /// serial relay cannot enforce (see the node's console service).
+    #[serde(default)]
+    pub kind: ConsoleKind,
+}
+
+/// The two lines a guest has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsoleKind {
+    /// The serial line: text, one peer at a time, the boot log's home.
+    #[default]
+    Serial,
+    /// The display, spoken over VNC's own protocol (RFB). What a guest whose
+    /// kernel has stopped writing to the serial line is still showing.
+    Vnc,
 }
 
 /// What the node says about it. The node owns this status; nobody else writes
@@ -212,6 +232,7 @@ mod tests {
             ticket_sha256: sha256_hex(ticket),
             expires_at: Timestamp(expires),
             read_only: false,
+            kind: ConsoleKind::Serial,
         }
     }
 

@@ -339,6 +339,7 @@ async function showTopology() {
   $("cpuadvisory").classList.add("hidden");
   $("listempty").classList.add("hidden");
   $("overviewbox").classList.add("hidden");
+  closeScreen();
   document.querySelector(".boardwrap").classList.add("hidden");
   $("topologybox").classList.remove("hidden");
   fill($("topologybox"), el("p.faint", "Asking…"));

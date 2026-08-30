@@ -3579,7 +3579,13 @@ impl Api {
     /// The permission question is answered here and only here. The node has no
     /// bindings to read and must never be the place one is decided; it is told
     /// on the session whether the holder may type.
-    pub async fn open_console(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+    pub async fn open_console(
+        &self,
+        name: &ResourceName,
+        kind: velstra_cloud_model::console::ConsoleKind,
+        who: &Identity,
+    ) -> ApiResult<Value> {
+        use velstra_cloud_model::console::ConsoleKind;
         // Read is the floor: watching a guest's console is reading it. Whether
         // the holder may also *type* is a second question, asked below and
         // answered on the object.
@@ -3599,6 +3605,18 @@ impl Api {
         // may reboot a machine may also fix it from its console; somebody who
         // may only look at it gets a window.
         let read_only = self.authorize(who, Verb::Operate, name).await.is_err();
+        // A read-only screen is not built. The serial relay enforces "may only
+        // watch" by dropping what the viewer types; VNC cannot be watched that
+        // way — the protocol's own handshake is bytes the client sends, so a
+        // relay that dropped client bytes would never finish opening. Refused
+        // with the way that works rather than granted and broken.
+        if kind == ConsoleKind::Vnc && read_only {
+            return Err(ApiError::forbidden(
+                "this account may watch this guest but not operate it, and a view-only screen \
+                 is not something this platform can serve yet — the serial console can be \
+                 watched read-only",
+            ));
+        }
 
         let ticket = uuid::Uuid::new_v4().to_string();
         let now = Timestamp::now();
@@ -3625,6 +3643,7 @@ impl Api {
             ticket_sha256: velstra_cloud_model::console::sha256_hex(&ticket),
             expires_at: Timestamp(now.0 + velstra_cloud_model::console::TICKET_LIFETIME_MS),
             read_only,
+            kind,
         })
         .expect("a console session spec always serialises");
         self.collection("console-sessions")?

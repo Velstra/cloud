@@ -154,7 +154,21 @@ async fn attach(
         return refusal();
     }
 
-    let socket = consoles.layout.console_socket(&session.spec.instance);
+    // Which of the guest's two lines this ticket was granted for. The session
+    // says, and the session is what was checked — a query parameter naming the
+    // other one would be a ticket spent on a line nobody granted.
+    let vnc = session.spec.kind == velstra_cloud_model::console::ConsoleKind::Vnc;
+    if vnc && session.spec.read_only {
+        // Never minted — the API refuses the combination — so meeting one is a
+        // forged or stale object, not a user. Same sentence as every refusal.
+        tracing::warn!(session = %query.session, "a read-only vnc session reached a node");
+        return refusal();
+    }
+    let socket = if vnc {
+        consoles.layout.vnc_socket(&session.spec.instance)
+    } else {
+        consoles.layout.console_socket(&session.spec.instance)
+    };
     let stream = match tokio::net::UnixStream::connect(&socket).await {
         Ok(stream) => stream,
         Err(e) => {
@@ -176,6 +190,13 @@ async fn attach(
                 if busy {
                     "another console is already attached to this guest; a serial line carries one \
                      at a time"
+                } else if vnc {
+                    // An older guest: started before its QEMU was given a
+                    // display socket. The screen appears on its next boot, and
+                    // saying so beats "not running" about a guest that plainly
+                    // is.
+                    "this guest has no display socket — it was started before this node could \
+                     offer one. Stop it and start it again, and the screen will be here."
                 } else {
                     "this guest is not running, so there is no console to attach to"
                 },
@@ -351,7 +372,8 @@ mod tests {
                 subject: "ada".into(),
                 ticket_sha256: sha256_hex(ticket),
                 expires_at: Timestamp(Timestamp::now().0 + TICKET_LIFETIME_MS),
-                read_only,
+                kind: velstra_cloud_model::console::ConsoleKind::Serial,
+            read_only,
             },
             ConsoleSessionStatus::default(),
         )

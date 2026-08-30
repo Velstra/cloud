@@ -228,6 +228,7 @@ function forgetBoard() {
   clear($("overviewbox"));
   $("overviewbox").classList.add("hidden");
   $("topologybox").classList.add("hidden");
+  closeScreen();
   view.map = false;
 }
 
@@ -874,6 +875,7 @@ async function showOverview() {
   $("listerr").classList.add("hidden");
   $("cpuadvisory").classList.add("hidden");
   $("listempty").classList.add("hidden");
+  closeScreen();
   document.querySelector(".boardwrap").classList.add("hidden");
   $("topologybox").classList.add("hidden");
   $("overviewbox").classList.remove("hidden");
@@ -1010,6 +1012,7 @@ async function show(id) {
   // about guests, read over a list of volumes, is worse than no answer.
   view.picked.clear();
   bulkOutcome = null;
+  closeScreen();
   $("overviewbox").classList.add("hidden");
   $("topologybox").classList.add("hidden");
   document.querySelector(".boardwrap").classList.remove("hidden");

@@ -636,8 +636,20 @@ async fn create(
         // A console is asked for with POST because it *makes* something — a
         // session object, spent once. A GET that minted a credential would be
         // one a browser could be made to issue from another page.
+        // `{"kind": "Vnc"}` in the body asks for the display instead of the
+        // serial line; nothing, `{}` or `{"kind": "Serial"}` is the serial
+        // console it always was. A kind that is neither is refused rather than
+        // read as the default — a ticket for a line nobody asked about.
         Target::Verb { name, verb } if verb == "console" => {
-            let opened = api.open_console(&name, &identity).await?;
+            let kind = match document(&body)?.get("kind") {
+                None | Some(serde_json::Value::Null) => {
+                    velstra_cloud_model::console::ConsoleKind::Serial
+                }
+                Some(raw) => serde_json::from_value(raw.clone()).map_err(|_| {
+                    ApiError::invalid(format!("kind is Serial or Vnc, and was {raw}")).at("kind")
+                })?,
+            };
+            let opened = api.open_console(&name, kind, &identity).await?;
             return Ok(object(StatusCode::OK, opened));
         }
         // POST, and never GET: it mints a credential, and a GET that did that

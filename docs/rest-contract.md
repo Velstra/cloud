@@ -164,6 +164,20 @@ Binary frames are the guest's bytes in both directions. A caller with `Read`
 but not `Write` on the project is given `readOnly`, and what it types is
 dropped rather than refused mid-session.
 
+**The display, over the same door.** `{"kind": "Vnc"}` in the `:console` body
+asks for the guest's screen instead of its serial line — what a guest whose
+kernel has stopped writing to `ttyS0` is still showing. The answer has the same
+shape, the ticket is spent the same way, and the stream carries VNC's own
+protocol (RFB) instead of raw bytes; the client speaks it. Nothing, `{}` or
+`{"kind": "Serial"}` is the serial console it always was, and a kind that is
+neither is refused rather than read as the default.
+
+One combination is refused at the door: a caller who may only *read* the guest
+asking for its screen. The serial relay enforces "may only watch" by dropping
+what a viewer types; RFB cannot be watched that way — its own handshake is bytes
+the client sends — so a view-only screen would be a broken screen. The refusal
+says to use the serial console, which viewers can watch.
+
 **The ticket is spent once and expires in a minute.** It is minted by the API,
 stored **hashed** on the session — every node in the cell may read the cell, and
 a session carrying the ticket in the clear would hand each of them a way into a
