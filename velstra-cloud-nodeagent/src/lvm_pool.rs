@@ -209,6 +209,56 @@ impl LvmPool {
     }
 }
 
+/// What a shared volume group can hold for this pool: its free extents, plus
+/// the extents this pool already occupies in it.
+///
+/// The second half is what makes it a number a scheduler can subtract an
+/// allocation from and be right — `capacity - what velstra allocated` comes
+/// back to the free space, whatever else is in the group. On a group full of
+/// the operating system's own logical volumes, the free half is zero and this
+/// pool's half is zero, so capacity is zero and nothing is placed there.
+fn usable_capacity_gib(
+    free_bytes: u64,
+    volume_gibs: impl Iterator<Item = u64>,
+    snapshot_gibs: impl Iterator<Item = u64>,
+) -> u64 {
+    let mine_bytes: u64 = volume_gibs.chain(snapshot_gibs).map(|gib| gib << 30).sum();
+    (free_bytes + mine_bytes) / (1 << 30)
+}
+
+impl LvmPool {
+    /// One numeric field of `vgs`, in bytes. A group that cannot be measured is
+    /// an error and not a zero: a pool reporting no room is a pool nothing is
+    /// placed on, which is a very confident thing to say out of not knowing.
+    async fn vg_number(&self, field: &str) -> Result<u64> {
+        let out = self
+            .run(
+                &self.config.vgs,
+                &[
+                    "--noheadings".into(),
+                    "--units".into(),
+                    "b".into(),
+                    "--nosuffix".into(),
+                    "-o".into(),
+                    field.into(),
+                    self.config.group.clone(),
+                ],
+            )
+            .await?;
+        String::from_utf8_lossy(&out)
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.split('.').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| {
+                HostError::failed(format!(
+                    "vgs said nothing readable about {} of {}",
+                    field, self.config.group
+                ))
+            })
+    }
+}
+
 #[async_trait::async_trait]
 impl Storage for LvmPool {
     fn at(&self, volume: &str) -> Option<String> {
@@ -241,30 +291,26 @@ impl Storage for LvmPool {
             );
         }
 
-        // `vgs`, for what the group holds in total. A pool that cannot say how
-        // large it is cannot be scheduled into.
-        let out = self
-            .run(
-                &self.config.vgs,
-                &[
-                    "--noheadings".into(),
-                    "--units".into(),
-                    "b".into(),
-                    "--nosuffix".into(),
-                    "-o".into(),
-                    "vg_size".into(),
-                    self.config.group.clone(),
-                ],
-            )
-            .await?;
-        let text = String::from_utf8_lossy(&out);
-        let capacity_gib = text
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.split('.').next())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
-            / (1 << 30);
+        // What this pool can hold for the cell — **not** the group's total size.
+        //
+        // A volume group can be shared with things that are not this pool's: the
+        // machine's own root, home and swap, most obviously, which is exactly
+        // what a first install onto an existing box looks like. Reporting the
+        // group's *total* size as capacity told the scheduler a 475 GiB group
+        // was 475 GiB free when every extent was the operating system's, and
+        // every volume creation then failed with `insufficient free space`
+        // after the scheduler had already promised the room.
+        //
+        // So capacity is the free extents plus what this pool already occupies
+        // here — the space it could hold, which is the only number a scheduler
+        // can subtract an allocation from and be right. On a group full of
+        // somebody else's logical volumes that is zero, and the pool says so.
+        let free_bytes = self.vg_number("vg_free").await?;
+        let capacity_gib = usable_capacity_gib(
+            free_bytes,
+            volumes.values().copied(),
+            snapshots.values().map(|s| s.gib),
+        );
 
         Ok(PoolState {
             volumes,
@@ -448,5 +494,22 @@ mod tests {
             snap_lv_name("projects/p1/volumes/data/snapshots/nightly").starts_with("velstrasnap-")
         );
         assert!(!snap_lv_name("x").starts_with("velstra-"));
+    }
+
+    #[test]
+    fn capacity_is_free_space_plus_what_this_pool_already_holds() {
+        // A 475 GiB group with the machine's own root, home and swap filling it
+        // and one 10 GiB velstra volume: free extents are 0, so what this pool
+        // can hold is exactly the 10 GiB it already has. Reporting 475 was the
+        // bug — the scheduler promised room every extent of which was the OS's.
+        let cap = usable_capacity_gib(0, [10].into_iter(), std::iter::empty());
+        assert_eq!(cap, 10);
+
+        // A dedicated group with room to spare: free plus mine.
+        let free = 100u64 << 30;
+        assert_eq!(usable_capacity_gib(free, [20, 5].into_iter(), [2].into_iter()), 127);
+
+        // A group full of foreign volumes and none of ours holds nothing for us.
+        assert_eq!(usable_capacity_gib(0, std::iter::empty(), std::iter::empty()), 0);
     }
 }
