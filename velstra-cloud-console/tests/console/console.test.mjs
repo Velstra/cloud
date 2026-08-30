@@ -1410,6 +1410,40 @@ await test("the map draws the project's network out of the objects it is made of
   check(went.found, "no guest on the map is a way through to it");
   equal(went.list, "Instances", "following a guest on the map did not open its board");
   await page.evaluate(`closeSheet()`);
+
+  // And picking another project from the map stays on the map, about that
+  // project. It used to land on Instances from anything that was not a board,
+  // which answers a question nobody asked and loses the one they were on.
+  const stayed = await page.evaluate(`(async () => {
+    document.getElementById("railmap").click();
+    await new Promise((r) => setTimeout(r, 1200));
+    const picker = document.getElementById("project");
+    const was = picker.value;
+    const other = [...picker.options].find((o) => o.value !== was);
+    if (!other) return { switched: false };
+    picker.value = other.value;
+    picker.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 2500));
+    const title = document.getElementById("listtitle").textContent;
+    // Put it back. Every check after this one reads the seed's own project, and
+    // a test that leaves the console looking at another one hands them an empty
+    // cell and a pile of failures that are nothing to do with them.
+    picker.value = was;
+    picker.dispatchEvent(new Event("change"));
+    // Waited for by what is on screen, not by a clock: the switch refetches,
+    // and returning while that is still in flight hands the next check a
+    // console that is still looking at somebody else's project.
+    for (let i = 0; i < 80; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const box = document.getElementById("topologybox");
+      if (box && /prod/.test(box.innerText)) break;
+    }
+    return { switched: true, title, back: picker.value === was };
+  })()`);
+  if (!stayed.switched) skip("this API has only one project to switch to");
+  equal(stayed.title, "Network map", "picking another project left the map");
+  check(stayed.back, "the project was not put back for the checks below");
+  await page.evaluate(`document.getElementById("railhome").click()`);
 });
 
 /// Where a guest goes is asked once, and the control offers what the platform
@@ -1431,7 +1465,15 @@ await test("a guest is put on a network, or on one of its subnets when the netwo
     if (more) more.click();
     const host = document.getElementById("f-networks");
     if (!host) return null;
-    const add = [...host.querySelectorAll("button")].find((b) => /^Add/.test(b.textContent));
+    // Waited for: the control renders before its options are fetched, and a
+    // cache emptied by an earlier check (a project switch does that) means the
+    // first paint really does offer nothing.
+    let add = null;
+    for (let i = 0; i < 60; i++) {
+      add = [...host.querySelectorAll("button")].find((b) => /^Add/.test(b.textContent));
+      if (add) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
     if (!add) return "the networks field offers nothing to add";
     add.click();
     for (let i = 0; i < 40; i++) {
