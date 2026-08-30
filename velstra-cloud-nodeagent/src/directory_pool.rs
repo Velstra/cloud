@@ -167,12 +167,22 @@ impl DirectoryPool {
 
     /// How large the filesystem under this pool is.
     ///
-    /// Asked of the machine, because a pool's capacity is not something an
+    /// The bytes **available** on the filesystem behind this pool — not its
+    /// total size.
+    ///
+    /// A pool's directory very often shares a filesystem with the operating
+    /// system, and reporting the filesystem's total told the scheduler a disk
+    /// was empty that the OS had half-filled. `df`'s fourth column already
+    /// accounts for everything else on the filesystem, so it is the honest
+    /// starting point; `observe` adds back what this pool itself holds, so that
+    /// `capacity - allocated` comes back to exactly this free space.
+    ///
+    /// Asked of the machine, because a pool's room is not something an
     /// operator's configuration file knows. A failure here is an error rather
-    /// than a zero: a pool reporting no capacity is a pool the scheduler will
-    /// not place anything on, which is a very confident statement to make out of
-    /// not knowing.
-    async fn capacity_gib(&self) -> Result<u64> {
+    /// than a zero: a pool reporting no room is a pool the scheduler will not
+    /// place anything on, which is a very confident statement to make out of not
+    /// knowing.
+    async fn available_gib(&self) -> Result<u64> {
         let out = tokio::process::Command::new("df")
             .args(["-B1", "-P", &self.dir.to_string_lossy()])
             .output()
@@ -188,11 +198,18 @@ impl DirectoryPool {
             )));
         }
         let text = String::from_utf8_lossy(&out.stdout);
+        // `Filesystem 1-blocks Used Available Capacity Mounted` — the fourth
+        // field is what is free, and a long device name can wrap the header
+        // onto two lines, so the data row is found by its mount point rather
+        // than by counting lines.
         let blocks = text
             .lines()
-            .nth(1)
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|n| n.parse::<u64>().ok())
+            .find_map(|line| {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                (cols.len() >= 4 && cols[0] != "Filesystem")
+                    .then(|| cols[3].parse::<u64>().ok())
+                    .flatten()
+            })
             .ok_or_else(|| {
                 HostError::failed(format!(
                     "df said something unreadable about {}: {text}",
@@ -274,9 +291,15 @@ impl Storage for DirectoryPool {
             );
         }
 
+        // Free space plus what this pool already holds, so the number a
+        // scheduler subtracts an allocation from lands back on the free space —
+        // the same accounting the LVM pool does, for the same reason: the
+        // filesystem may not be this pool's alone.
+        let mine_gib: u64 = volumes.values().sum::<u64>()
+            + snapshots.values().map(|s| s.gib).sum::<u64>();
         Ok(PoolState {
             volumes,
-            capacity_gib: self.capacity_gib().await?,
+            capacity_gib: self.available_gib().await? + mine_gib,
             backend: "directory".to_string(),
             snapshots,
         })
