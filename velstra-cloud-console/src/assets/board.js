@@ -5,6 +5,10 @@ const view = {
   /// Whether the overview is what is on screen. Distinct from `coll === null`,
   /// which is also true of a signed-out console with nothing shown at all.
   home: false,
+  /// The same, for the network map. Two flags rather than one enum because the
+  /// rail asks each of them separately and a third screen would add a third
+  /// question, not a third value to compare against.
+  map: false,
   items: [],
   // Whether `items` is the whole collection. False only when a paged walk had to
   // be abandoned — see `walk` in api.js. It is here rather than implied by the
@@ -70,6 +74,15 @@ function renderRail() {
       : el("span.n", "")));
   for (const g of groups()) {
     rail.appendChild(el("div.railgroup", g.name));
+    // The network map sits at the top of its own group, above the collections
+    // it is drawn from. Like the overview it is not a `.railitem`: it has no
+    // board, no columns and no condition, and everything that walks the rail
+    // expecting one would trip over it.
+    if (g.name === "Network") {
+      rail.appendChild(el("button.railhome" + (view.map ? ".on" : ""),
+        { type: "button", id: "railmap", onclick: () => showTopology() },
+        el("span", "Map"), el("span.n", "")));
+    }
     for (const c of g.items) {
       const seen = census[c.id];
       const unsettled = seen ? seen.unsettled : 0;
@@ -214,6 +227,8 @@ function forgetBoard() {
   clear($("boardhead"));
   clear($("overviewbox"));
   $("overviewbox").classList.add("hidden");
+  $("topologybox").classList.add("hidden");
+  view.map = false;
 }
 
 function cell(r, col) {
@@ -844,6 +859,7 @@ async function showOverview() {
   session.labels = "";
   view.coll = null;
   view.home = true;
+  view.map = false;
   view.items = [];
   view.picked.clear();
   bulkOutcome = null;
@@ -859,6 +875,7 @@ async function showOverview() {
   $("cpuadvisory").classList.add("hidden");
   $("listempty").classList.add("hidden");
   document.querySelector(".boardwrap").classList.add("hidden");
+  $("topologybox").classList.add("hidden");
   $("overviewbox").classList.remove("hidden");
 
   renderRail();
@@ -987,12 +1004,14 @@ async function show(id) {
   if (view.coll && view.coll.id !== coll.id) session.labels = "";
   view.coll = coll;
   view.home = false;
+  view.map = false;
   // A selection belongs to the board it was made on. Carrying it across would
   // arm a Delete over names from another collection entirely — and an answer
   // about guests, read over a list of volumes, is worse than no answer.
   view.picked.clear();
   bulkOutcome = null;
   $("overviewbox").classList.add("hidden");
+  $("topologybox").classList.add("hidden");
   document.querySelector(".boardwrap").classList.remove("hidden");
   location.hash = "#" + id;
   renderRail();

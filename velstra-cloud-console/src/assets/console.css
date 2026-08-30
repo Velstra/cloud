@@ -985,3 +985,68 @@ pre.terminal:focus {
   color: var(--text-muted);
   font-size: 0.9em;
 }
+
+/* The network map.
+ *
+ * An indented list and not a canvas. A drawn graph of a tenant's network is a
+ * picture that has to be laid out, cannot be read aloud, and reflows into
+ * nonsense on a narrow window; the thing somebody actually needs from it —
+ * what is under what, and which address is where — is a tree, and a tree is
+ * what the DOM is for. The rules are decoration: everything the page says is
+ * in its text. */
+.topology {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  margin-top: var(--space-4);
+}
+.mapblock {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-5) var(--space-4);
+}
+.mapblock h3 {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin: var(--space-2) 0 var(--space-2) 0;
+}
+.maprow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border-faint, var(--border));
+}
+.mapblock .maprow:first-of-type,
+.mapblock h3 + .maprow,
+.mapblock p + .maprow {
+  border-top: 0;
+}
+/* The indentation, as spaces a screen reader skips. Depth is on the row as a
+ * data attribute so a check can assert the shape without parsing whitespace. */
+.mapwire {
+  white-space: pre;
+  font-family: var(--mono);
+  color: var(--text-faint, var(--text-dim));
+}
+.maprow[data-depth="1"] { padding-left: var(--space-4); }
+.maprow[data-depth="2"] { padding-left: calc(var(--space-4) * 2); }
+.maprow[data-depth="3"] { padding-left: calc(var(--space-4) * 3); }
+.mapkind {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  min-width: 76px;
+}
+.mapname {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.mapsaid {
+  font-size: 13px;
+}
