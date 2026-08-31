@@ -1222,3 +1222,120 @@ async fn memory_jitter_alone_is_not_worth_a_write() {
     let node = read_node(&store, "node-a").await;
     assert!(node.status.capacity.memory_mib > 0);
 }
+
+/// A gateway keeps the routing daemon honest and reports the far end's answer.
+///
+/// The announcements are derived — every external subnet, a host route per
+/// floating address in front of something — and a settled cell reloads
+/// nothing: the second pass applies zero times.
+#[tokio::test]
+async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
+    use velstra_cloud_model::resources::{
+        BgpPeerSpec, BgpPeerStatus, FloatingIpSpec, FloatingIpStatus, NetworkSpec, NetworkStatus,
+        SubnetSpec, SubnetStatus,
+    };
+    use velstra_cloud_store::TypedStore;
+    use velstra_cloud_model::resources::Resource;
+    let store = store();
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let bgp = velstra_cloud_nodeagent::fake::FakeBgp::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath)
+        .with_bgp(Arc::new(bgp.clone()));
+
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+    let peers: TypedStore<BgpPeerSpec, BgpPeerStatus> =
+        TypedStore::new(store.clone(), CELL, "bgp-peers");
+    peers
+        .create(
+            &Resource::new(
+                meta("bgp-peers/edge"),
+                BgpPeerSpec {
+                    peer: "10.10.10.1".into(),
+                    peer_as: 65000,
+                    local_as: 65010,
+                    node: "node-a".into(),
+                    description: String::new(),
+                },
+                BgpPeerStatus::default(),
+            ),
+            &writer,
+        )
+        .await
+        .unwrap();
+    let networks: TypedStore<NetworkSpec, NetworkStatus> =
+        TypedStore::new(store.clone(), CELL, "networks");
+    let public = NetworkSpec { external: true, ..Default::default() };
+    networks
+        .create(
+            &Resource::new(meta("networks/public"), public, NetworkStatus::default()),
+            &writer,
+        )
+        .await
+        .unwrap();
+    let subnets: TypedStore<SubnetSpec, SubnetStatus> =
+        TypedStore::new(store.clone(), CELL, "subnets");
+    subnets
+        .create(
+            &Resource::new(
+                meta("subnets/public-v4"),
+                SubnetSpec {
+                    network: "networks/public".into(),
+                    cidr: "203.0.113.0/24".into(),
+                    gateway: String::new(),
+                    dns: vec![],
+                    reserved: vec![],
+                },
+                SubnetStatus::default(),
+            ),
+            &writer,
+        )
+        .await
+        .unwrap();
+    let floating: TypedStore<FloatingIpSpec, FloatingIpStatus> =
+        TypedStore::new(store.clone(), CELL, "floatingips");
+    let fip = FloatingIpSpec {
+        address: Some("203.0.113.7".into()),
+        port: "projects/p1/ports/x".into(),
+        ..Default::default()
+    };
+    floating
+        .create(
+            &Resource::new(meta("projects/p1/floatingips/a"), fip, FloatingIpStatus::default()),
+            &writer,
+        )
+        .await
+        .unwrap();
+
+    bgp.answer("10.10.10.1", "Established", 2);
+    agent.resync().await;
+
+    let said = bgp.applied().expect("the daemon was never programmed");
+    assert_eq!(said.networks_v4, vec!["203.0.113.0/24"]);
+    assert_eq!(said.hosts_v4, vec!["203.0.113.7/32"]);
+    let after = peers.get("bgp-peers/edge").await.unwrap().unwrap();
+    assert_eq!(after.status.node.as_deref(), Some("node-a"));
+    assert_eq!(after.status.session, "Established");
+    assert_eq!(after.status.announced, 2);
+    assert_eq!(
+        velstra_cloud_model::meta::condition(&after.status.conditions, "Ready")
+            .map(|c| c.status),
+        Some(velstra_cloud_model::meta::ConditionStatus::True)
+    );
+
+    // Settled means settled: nothing changed, so the daemon is not reloaded
+    // and the object is not rewritten.
+    let applies = bgp.applies();
+    let rev = after.meta.revision;
+    agent.resync().await;
+    assert_eq!(bgp.applies(), applies, "a settled cell reloaded the daemon");
+    let again = peers.get("bgp-peers/edge").await.unwrap().unwrap();
+    assert_eq!(again.meta.revision, rev, "a settled session was rewritten");
+
+    // A machine that is not the speaker leaves everything alone.
+    let other_bgp = velstra_cloud_nodeagent::fake::FakeBgp::new();
+    let other = node_agent(store.clone(), "node-b", &FakeVmm::new(), &FakeDatapath::new())
+        .with_bgp(Arc::new(other_bgp.clone()));
+    other.resync().await;
+    assert!(other_bgp.applied().is_none(), "a bystander programmed its daemon");
+}

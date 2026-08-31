@@ -423,6 +423,71 @@ impl Observed for FlavorStatus {
 
 impl Assigned for FlavorSpec {}
 
+// ---- bgp -----------------------------------------------------------------
+
+/// One BGP session from one gateway machine to one router outside the cell.
+///
+/// This is how the cell's public prefixes become reachable at all: a firewall
+/// or router in front of the cell learns them over BGP instead of somebody
+/// typing static routes into it. The operator writes the session — which
+/// machine speaks, to whom, as which AS — and the gateway's agent programs the
+/// host's routing daemon and reports what the far end made of it. What gets
+/// announced is not listed here: it is derived — every external subnet, and a
+/// host route for every floating address a gateway answers for — because an
+/// announcement list somebody maintains by hand goes stale the day the second
+/// address is minted.
+pub type BgpPeer = Resource<BgpPeerSpec, BgpPeerStatus>;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BgpPeerSpec {
+    /// The far end — `10.10.10.1`, or a v6 address.
+    pub peer: String,
+    pub peer_as: u32,
+    pub local_as: u32,
+    /// The machine that speaks. Named, not discovered: one session is one
+    /// speaker, and the access rule ("the assignee may claim") hangs off it
+    /// exactly as a port's does off its node.
+    pub node: String,
+    /// A sentence for the board — "edge firewall, rack 3".
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BgpPeerStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+    /// Which machine actually holds the session — the agent's claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// The far end's answer, in the daemon's own word: `Established`, `Active`,
+    /// `Idle`, … — reported verbatim because inventing a vocabulary over BGP's
+    /// would leave an operator translating back at three in the morning.
+    #[serde(default)]
+    pub session: String,
+    /// How many prefixes this machine is announcing on the session.
+    #[serde(default)]
+    pub announced: u32,
+}
+
+impl Observed for BgpPeerStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        self.node.as_deref()
+    }
+}
+
+impl Assigned for BgpPeerSpec {
+    fn assigned_owner(&self) -> Option<&str> {
+        (!self.node.is_empty()).then_some(self.node.as_str())
+    }
+}
+
 // ---- project -------------------------------------------------------------
 
 /// What a project may reach for, decided per project by whoever runs the cell.

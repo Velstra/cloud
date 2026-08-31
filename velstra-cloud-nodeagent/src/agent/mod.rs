@@ -274,6 +274,12 @@ pub struct Agent {
     /// reports on it. What this node is *told* about migrations comes through
     /// `cell`, which hands it only the ones naming it.
     migrations: TypedStore<MigrationSpec, MigrationStatus>,
+    /// Written, not read: what this gateway reports about the sessions it
+    /// speaks. What it is told comes through `cell`, like everything else.
+    bgp_peers: TypedStore<
+        velstra_cloud_model::resources::BgpPeerSpec,
+        velstra_cloud_model::resources::BgpPeerStatus,
+    >,
     /// Everything this node *reads* about the cell, and the only thing that ever
     /// grew with the cell rather than with this node's own work. See
     /// [`crate::cell`] for the two ways it can be answered and why it matters.
@@ -333,6 +339,14 @@ pub struct Agent {
     /// the moment fencing matters is the moment this agent cannot read
     /// anything. A deadline it has to fetch is a deadline it will never get.
     fence_after_s: AtomicU32,
+    /// The half of the host that speaks BGP, when it has one. `None` — the
+    /// default, and every test's — makes the whole pass a no-op: a machine
+    /// with no routing daemon must never be asked to reload one.
+    bgp: Option<Arc<dyn crate::bgp::BgpSpeaker>>,
+    /// What the speaker was last asked to say, so a settled cell reloads
+    /// nothing. Process-local like `handover_asked`: an observation about what
+    /// this machine already did.
+    bgp_applied: std::sync::Mutex<Option<crate::bgp::BgpDesired>>,
 }
 
 impl Agent {
@@ -368,6 +382,7 @@ impl Agent {
             ports: TypedStore::new(store.clone(), &cell, "ports"),
             captures: TypedStore::new(store.clone(), &cell, "captures"),
             nodes: TypedStore::new(store.clone(), &cell, "nodes"),
+            bgp_peers: TypedStore::new(store.clone(), &cell, "bgp-peers"),
             migrations: TypedStore::new(store, &cell, "migrations"),
             cell: reader,
             config,
@@ -383,7 +398,16 @@ impl Agent {
             handover_asked: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             last_report: AtomicU64::new(velstra_cloud_model::meta::Timestamp::now().0),
             fence_after_s: AtomicU32::new(0),
+            bgp: None,
+            bgp_applied: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Give this agent a routing daemon to keep honest. Production hands it
+    /// FRR; a test hands it a fake; most machines never get one at all.
+    pub fn with_bgp(mut self, speaker: Arc<dyn crate::bgp::BgpSpeaker>) -> Self {
+        self.bgp = Some(speaker);
+        self
     }
 
     /// Route this agent's status reports through `sink` — the API — instead of
@@ -1163,6 +1187,10 @@ impl Agent {
                     .await;
             }
         }
+
+        // The routing daemon, after the wires: what this cell announces is a
+        // statement about addresses the passes above have just made true.
+        self.bgp_pass(&mut pass).await;
 
         // Receiving comes last, so that on the pass where a guest arrives and
         // is claimed above, the receiver it came through is taken down in the
@@ -1990,6 +2018,115 @@ impl Agent {
             ))),
         };
         result.map_err(|e| e.to_string())
+    }
+
+    // ---- bgp -------------------------------------------------------------
+
+    /// Keep the routing daemon saying what the cell claims, and report what
+    /// the far end made of it.
+    ///
+    /// A no-op on any machine without a speaker or without a session assigned
+    /// to it — which is every machine on most cells — so the ordinary cost is
+    /// one list read. See [`crate::bgp`] for what gets announced and why it is
+    /// derived rather than listed.
+    async fn bgp_pass(&self, pass: &mut Pass) {
+        let Some(speaker) = &self.bgp else { return };
+        let peers = match self.cell.bgp_peers().await {
+            Ok(peers) => peers,
+            Err(e) => {
+                tracing::error!(error = %e, "could not list bgp peers");
+                pass.failures += 1;
+                return;
+            }
+        };
+        let me = self.config.node.as_str();
+        let mine: Vec<_> = peers.iter().filter(|p| p.spec.node == me).collect();
+        if mine.is_empty() {
+            return;
+        }
+        let (networks, subnets, floating) = match (
+            self.cell.networks().await,
+            self.cell.subnets().await,
+            self.cell.floating_ips().await,
+        ) {
+            (Ok(n), Ok(s), Ok(f)) => (n, s, f),
+            _ => {
+                // A daemon programmed from a half-read cell would announce a
+                // half-truth to the router in front of everything.
+                tracing::error!("could not read the cell for the bgp pass");
+                pass.failures += 1;
+                return;
+            }
+        };
+        let desired = crate::bgp::desired_for(me, &peers, &networks, &subnets, &floating);
+        let outcome = {
+            let unchanged = self
+                .bgp_applied
+                .lock()
+                .expect("nothing panics holding the applied-config lock")
+                .as_ref()
+                == Some(&desired);
+            if unchanged {
+                Ok(())
+            } else {
+                match speaker.apply(&desired).await {
+                    Ok(()) => {
+                        pass.actions += 1;
+                        *self
+                            .bgp_applied
+                            .lock()
+                            .expect("nothing panics holding the applied-config lock") =
+                            Some(desired.clone());
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
+        let observed = match speaker.observe().await {
+            Ok(observed) => observed,
+            Err(e) => {
+                tracing::warn!(error = %e, "the routing daemon would not say how its sessions are");
+                pass.failures += 1;
+                return;
+            }
+        };
+        for stored in mine {
+            let mut next = (*stored).clone();
+            next.status.observed_generation = stored.meta.generation;
+            next.status.node = Some(me.to_string());
+            let seen = observed.get(&stored.spec.peer);
+            next.status.session = seen.map(|o| o.state.clone()).unwrap_or_default();
+            next.status.announced = seen.map(|o| o.announced).unwrap_or(0);
+            let condition = match (&outcome, seen) {
+                (Err(why), _) => Condition::new(
+                    "Ready",
+                    ConditionStatus::False,
+                    "DaemonRefused",
+                    why,
+                    stored.meta.generation,
+                ),
+                (Ok(()), Some(o)) if o.state == "Established" => {
+                    Condition::ready(stored.meta.generation)
+                }
+                (Ok(()), Some(o)) => Condition::new(
+                    "Ready",
+                    ConditionStatus::False,
+                    "SessionDown",
+                    &format!("the far end answers {}", o.state),
+                    stored.meta.generation,
+                ),
+                (Ok(()), None) => Condition::new(
+                    "Ready",
+                    ConditionStatus::False,
+                    "NotProgrammed",
+                    "the daemon does not know this neighbour yet",
+                    stored.meta.generation,
+                ),
+            };
+            velstra_cloud_model::meta::set_condition(&mut next.status.conditions, condition);
+            self.report(&self.bgp_peers, stored, next, pass).await;
+        }
     }
 
     // ---- ports -----------------------------------------------------------

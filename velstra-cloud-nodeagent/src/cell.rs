@@ -218,6 +218,14 @@ pub trait CellReader: Send + Sync + 'static {
     async fn floating_ips(&self) -> Result<Vec<velstra_cloud_model::resources::FloatingIp>> {
         Ok(Vec::new())
     }
+    /// The BGP sessions the operator has written, cell-wide.
+    ///
+    /// A default method like the floating IPs: a cell that announces nothing
+    /// needs no extra collection, and an empty list makes the whole pass a
+    /// no-op on every machine.
+    async fn bgp_peers(&self) -> Result<Vec<velstra_cloud_model::resources::BgpPeer>> {
+        Ok(Vec::new())
+    }
     /// The registered images, which is where an image's *source* lives.
     ///
     /// A node verifies an image against the sha256 in its own name, but the
@@ -296,6 +304,10 @@ pub struct StoreCell {
         velstra_cloud_model::resources::FloatingIpSpec,
         velstra_cloud_model::resources::FloatingIpStatus,
     >,
+    bgp_peers: TypedStore<
+        velstra_cloud_model::resources::BgpPeerSpec,
+        velstra_cloud_model::resources::BgpPeerStatus,
+    >,
     captures: TypedStore<
         velstra_cloud_model::capture::CaptureSpec,
         velstra_cloud_model::capture::CaptureStatus,
@@ -325,6 +337,7 @@ impl StoreCell {
             groups: TypedStore::new(store.clone(), cell, "security-groups"),
             all_nodes: TypedStore::new(store.clone(), cell, "nodes"),
             floating_ips: TypedStore::new(store.clone(), cell, "floatingips"),
+            bgp_peers: TypedStore::new(store.clone(), cell, "bgp-peers"),
             captures: TypedStore::new(store.clone(), cell, "captures"),
             backup_targets: TypedStore::new(store.clone(), cell, "backup-targets"),
             ceph_clusters: TypedStore::new(store.clone(), cell, "ceph-clusters"),
@@ -393,6 +406,13 @@ impl CellReader for StoreCell {
             .list()
             .await
             .map_err(|e| failed("floating ips", e))
+    }
+
+    async fn bgp_peers(&self) -> Result<Vec<velstra_cloud_model::resources::BgpPeer>> {
+        self.bgp_peers
+            .list()
+            .await
+            .map_err(|e| failed("bgp peers", e))
     }
 
     async fn captures(&self) -> Result<Vec<velstra_cloud_model::resources::Capture>> {

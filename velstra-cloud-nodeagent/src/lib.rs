@@ -57,6 +57,7 @@
 
 pub mod agent;
 pub mod api_cell;
+pub mod bgp;
 pub mod cell;
 pub mod ceph_deploy;
 pub mod ceph_pool;

@@ -31,7 +31,21 @@ Collections, in the order the API serves them: `projects`, `users`,
 `device-classes`, `backup-targets`, `backups`, `backup-schedules`, `audit`,
 `captures`, `console-sessions`, `image-sources`, `usage`,
 `snapshot-schedules`,
-`maintenance-windows`, `operations`, `flavors`.
+`maintenance-windows`, `operations`, `flavors`, `bgp-peers`.
+
+### BGP peers: announcing the cell to the router in front of it
+
+`bgp-peers` are the cell's own (operator-only, like nodes): one object is one
+BGP session from one gateway machine — `spec.node` — to one router outside the
+cell (`spec.peer`, `spec.peerAs`, `spec.localAs`). The gateway's agent renders
+the host's FRR configuration from it and reports back `status.session` (FRR's
+own word: `Established`, `Active`, …) and `status.announced`.
+
+**What gets announced is derived, never listed**: every external subnet whole,
+plus a `/32` (or `/128`) host route for each floating address that names a
+port. An address in front of nothing is a reservation and is not announced.
+The list is computed from the same objects `:explainReach` reads, so the
+router in front of the cell cannot disagree with what the console says.
 
 ### Flavors: the size menu
 

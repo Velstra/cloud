@@ -509,6 +509,9 @@ pub fn belongs_to_the_cell(kind: &str) -> bool {
             | "image-sources"
             | "backup-targets"
             | "users"
+            // A session to the router in front of the cell names machines on
+            // both ends; nothing about it is any tenant's.
+            | "bgp-peers"
     )
 }
 
@@ -526,7 +529,12 @@ pub fn belongs_to_the_cell(kind: &str) -> bool {
 ///   single-node cell that is invisible, which is why it survived.
 /// - `ceph-clusters`, for the same pass, which is meaningless without them.
 pub fn a_node_reads_the_cells(kind: &str) -> bool {
-    matches!(kind, "nodes" | "pools" | "backup-targets" | "ceph-clusters")
+    matches!(
+        kind,
+        "nodes" | "pools" | "backup-targets" | "ceph-clusters"
+            // A gateway machine programs its routing daemon from these.
+            | "bgp-peers"
+    )
 }
 
 /// Whether a machine agent may read one of the cell's own objects at all.
