@@ -133,7 +133,10 @@ function internetBlock(f) {
 
   box.appendChild(mapRow(0, "internet", "Internet",
     gateways === null
-      ? "this account may not read the cell's machines, so this page cannot say whether any of them carries external traffic"
+      // A tenant cannot read the machines, and does not need to: whether the
+      // cell's edge answers for their addresses is the provider's promise, and
+      // `:explainReach` on the address is where doubt about one gets answered.
+      ? "the cell's edge answers for your public addresses"
       : gateways.length
         ? "carried by " + gateways.join(", ")
         : "no machine in this cell is a gateway, so nothing in any project reaches out",
@@ -228,6 +231,180 @@ function networkRows(box, f, index, network, depth) {
   }
 }
 
+// ---- the drawing --------------------------------------------------------
+//
+// Nodes and edges, in SVG, above the prose. The picture is for the eye; the
+// sentences below it stay the record — a screen reader and the coverage check
+// read the same words they always did, and every claim the drawing makes is a
+// claim a sentence below it also makes.
+
+const GLYPH = {
+  internet: "\u{1F310}", router: "\u21C4", network: "\u2637",
+  guest: "\u25A3", port: "\u25CB", balancer: "\u2696",
+};
+
+function svgEl(tag, attrs = {}, ...kids) {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
+  for (const kid of kids) n.appendChild(kid);
+  return n;
+}
+
+/// Lay the project out in layers — internet, routers, networks, machines —
+/// and hand back positioned nodes plus the edges between them.
+function graphOf(f, index) {
+  const nodes = [];   // {id, kind, label, sub, x, y, w, state, goes:{coll,item}}
+  const edges = [];   // {from, to, label, dashed, state}
+  const SLOT = 190, ROW = 118, W = 168;
+
+  // Networks first: each owns a horizontal span wide enough for its guests.
+  const membersOf = new Map();
+  for (const network of f.networks) {
+    const subnetNames = f.subnets
+      .filter((s) => String(at(spec(s), "network")) === nameOf(network))
+      .map(nameOf);
+    const on = [...index.values()]
+      .filter((e) => subnetNames.includes(String(at(spec(e.port), "subnet"))));
+    const lbs = f.balancers
+      .filter((lb) => subnetNames.includes(String(at(spec(lb), "subnet"))));
+    membersOf.set(nameOf(network), { on, lbs });
+  }
+
+  let slot = 0;
+  for (const network of f.networks) {
+    const { on, lbs } = membersOf.get(nameOf(network));
+    const span = Math.max(1, on.length + lbs.length);
+    const first = slot;
+    for (const entry of on) {
+      const address = at(status(entry.port), "address") || at(spec(entry.port), "address") || "";
+      if (entry.guest) {
+        const state = at(status(entry.guest), "state") || "unknown";
+        nodes.push({ id: nameOf(entry.guest), kind: "guest", label: idOf(entry.guest),
+          sub: address, x: slot * SLOT, y: 3 * ROW, w: W,
+          state: state === "Running" ? "settled" : (state === "Failed" ? "failing" : "drifting"),
+          goes: { coll: "instances", item: entry.guest } });
+        edges.push({ from: nameOf(entry.guest), to: nameOf(network), label: "" });
+        for (const fip of entry.floating) {
+          const pub = at(status(fip), "address") || at(spec(fip), "address") || "";
+          edges.push({ from: "internet", to: nameOf(entry.guest), label: pub, dashed: true });
+        }
+      } else {
+        nodes.push({ id: nameOf(entry.port), kind: "port", label: idOf(entry.port),
+          sub: (address || "held") + " · no guest", x: slot * SLOT, y: 3 * ROW, w: W,
+          state: "drifting", goes: { coll: "ports", item: entry.port } });
+        edges.push({ from: nameOf(entry.port), to: nameOf(network), label: "" });
+      }
+      slot += 1;
+    }
+    for (const lb of lbs) {
+      const vip = at(status(lb), "vip") || at(spec(lb), "vip") || "";
+      nodes.push({ id: nameOf(lb), kind: "balancer", label: idOf(lb), sub: vip,
+        x: slot * SLOT, y: 3 * ROW, w: W, goes: { coll: "load-balancers", item: lb } });
+      edges.push({ from: nameOf(lb), to: nameOf(network), label: "" });
+      slot += 1;
+    }
+    if (on.length + lbs.length === 0) slot += 1;
+    const centre = ((first + Math.max(first, slot - 1)) / 2) * SLOT;
+    const subnets = f.subnets.filter((s) => String(at(spec(s), "network")) === nameOf(network));
+    nodes.push({ id: nameOf(network), kind: "network", label: idOf(network),
+      sub: subnets.map((s) => at(spec(s), "cidr") || "no range").join(" · ") || "no subnet",
+      x: centre, y: 2 * ROW, w: W, state: subnets.length ? undefined : "failing",
+      goes: { coll: "networks", item: network } });
+    slot = Math.max(slot, first + span);
+  }
+
+  // Routers sit over the centre of what they join.
+  for (const router of f.routers) {
+    const joins = (at(spec(router), "networks") || []).map(String);
+    const xs = joins
+      .map((n) => nodes.find((k) => k.id === n && k.kind === "network"))
+      .filter(Boolean)
+      .map((k) => k.x);
+    const x = xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : slot * SLOT;
+    nodes.push({ id: nameOf(router), kind: "router", label: idOf(router),
+      sub: joins.length + (joins.length === 1 ? " network" : " networks"),
+      x, y: ROW, w: W, goes: { coll: "routers", item: router } });
+    for (const n of joins) {
+      if (nodes.some((k) => k.id === n)) edges.push({ from: nameOf(router), to: n, label: "" });
+    }
+    if (!joins.length) slot += 1;
+  }
+
+  // The internet crowns the middle of everything that reaches it.
+  const width = Math.max(1, slot) * SLOT;
+  nodes.push({ id: "internet", kind: "internet", label: "Internet",
+    sub: "", x: (width - SLOT) / 2, y: 0, w: W });
+  return { nodes, edges, width };
+}
+
+/// The layered drawing itself.
+function drawGraph(f, index) {
+  if (!f.networks.length) return null;
+  const { nodes, edges, width } = graphOf(f, index);
+  const H = 4 * 118 - 28;
+  const PAD = 12;
+  const svg = svgEl("svg", { viewBox: (-PAD) + " " + (-PAD) + " " + (width + 2 * PAD) + " " + (H + 2 * PAD),
+    class: "mapgraph", role: "img",
+    "aria-label": "The project drawn as nodes and edges; the text below says the same." });
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const NH = 56;
+  const centre = (n) => n.x + n.w / 2;
+  // Two addresses in front of one guest are two edges on one pair of nodes;
+  // fanned apart, or the second draws exactly over the first and the labels
+  // print on top of each other.
+  const seen = new Map();
+  for (const e of edges) {
+    const a = byId.get(e.from), b = byId.get(e.to);
+    if (!a || !b) continue;
+    const key = e.from + "\u0000" + e.to;
+    const nth = seen.get(key) || 0;
+    seen.set(key, nth + 1);
+    // The public edges bow out sideways: a guest sits directly under its
+    // network, and a straight line from the internet would draw through the
+    // network's own box.
+    const fan = (e.dashed ? 70 : 0) + nth * 30;
+    // Leave from the lower edge of the upper box and arrive at the upper edge
+    // of the lower one — an edge that starts at a box's far side draws a line
+    // straight through the box it came from.
+    const [upper, lower] = a.y <= b.y ? [a, b] : [b, a];
+    const y1 = upper.y + NH, y2 = lower.y;
+    const x1 = centre(upper), x2 = centre(lower);
+    const mid = (y1 + y2) / 2;
+    const d = "M " + x1 + " " + y1 +
+      " C " + (x1 + fan) + " " + mid + ", " + (x2 + fan) + " " + mid + ", " + x2 + " " + y2;
+    svg.appendChild(svgEl("path", { d, class: "gedge" + (e.dashed ? " dashed" : "") }));
+    if (e.label) {
+      const t = svgEl("text", { x: (x1 + x2) / 2 + fan + 6, y: mid - 6 - nth * 15,
+        class: "gedgelabel" });
+      t.textContent = e.label;
+      svg.appendChild(t);
+    }
+  }
+  for (const n of nodes) {
+    const g = svgEl("g", { class: "gnode " + n.kind + (n.state ? " " + n.state : "")
+      + (n.goes ? " goes" : ""), transform: "translate(" + n.x + " " + n.y + ")" });
+    g.appendChild(svgEl("rect", { width: n.w, height: NH, rx: 10 }));
+    const glyph = svgEl("text", { x: 12, y: 24, class: "gglyph" });
+    glyph.textContent = GLYPH[n.kind] || "";
+    g.appendChild(glyph);
+    const label = svgEl("text", { x: 36, y: 24, class: "glabel" });
+    label.textContent = n.label;
+    g.appendChild(label);
+    const sub = svgEl("text", { x: 12, y: 44, class: "gsub" });
+    sub.textContent = n.sub || "";
+    g.appendChild(sub);
+    if (n.goes) g.addEventListener("click", () => openFromMap(n.goes.coll, n.goes.item));
+    svg.appendChild(g);
+  }
+  // Drawn at one unit to the pixel and scrolled when wide — a viewBox left to
+  // stretch made a one-network project into wall art.
+  svg.setAttribute("width", width + 2 * PAD);
+  svg.setAttribute("height", H + 2 * PAD);
+  const clip = el("div.mapgraphbox");
+  clip.appendChild(svg);
+  return clip;
+}
+
 /// The whole picture.
 function renderTopology(f) {
   const box = $("topologybox");
@@ -237,6 +414,9 @@ function renderTopology(f) {
   for (const why of f.trouble) {
     box.appendChild(el("p.err", "This map is missing something: " + why));
   }
+
+  const graph = drawGraph(f, index);
+  if (graph) box.appendChild(graph);
 
   box.appendChild(internetBlock(f));
 
