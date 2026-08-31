@@ -53,6 +53,11 @@
 
 <div id="app" class="hidden">
   <header id="top">
+    <!-- Off-canvas rail toggle. Hidden by the sheet on anything wide enough to
+         keep the rail in the grid; on a phone it is the only way to the rail,
+         so it comes before the brand where a thumb expects it. -->
+    <button class="btn" id="menu" type="button" aria-label="Menu"
+            aria-controls="rail" aria-expanded="false">&#9776;</button>
     <span id="brand">Velstra <b>Cloud</b></span>
     <!-- No inline sizing: an inline style outranks the stylesheet, so the
          `min-width: 180px` that used to be here made the tenancy switch the
@@ -74,6 +79,7 @@
     <button class="btn" id="signout" type="button">Sign out</button>
   </header>
 
+  <div id="scrim" class="hidden"></div>
   <aside id="rail" aria-label="Collections"></aside>
 
   <!-- No margin label over the board. The rail already says which group this

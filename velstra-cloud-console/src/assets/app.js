@@ -329,6 +329,20 @@ function closePalette() {
 
 $("jump").addEventListener("click", openPalette);
 
+// The drawer. On a narrow screen the rail is off-canvas and this is the only
+// way in; picking anything in it puts it away again, because the pick *was*
+// the errand.
+function railOpen(open) {
+  $("rail").classList.toggle("open", open);
+  $("scrim").classList.toggle("hidden", !open);
+  $("menu").setAttribute("aria-expanded", String(open));
+}
+$("menu").addEventListener("click", () => railOpen(!$("rail").classList.contains("open")));
+$("scrim").addEventListener("click", () => railOpen(false));
+$("rail").addEventListener("click", (e) => {
+  if (e.target.closest("button")) railOpen(false);
+});
+
 // Never trap anybody: Escape leaves whatever is on top, innermost first. And
 // Cmd/Ctrl-K is the palette, from anywhere the board is up.
 document.addEventListener("keydown", (e) => {
@@ -341,6 +355,7 @@ document.addEventListener("keydown", (e) => {
   if (palette.open) closePalette();
   else if ($("dialog")) closeDialog();
   else if (sheet.open) closeSheet();
+  else if ($("rail").classList.contains("open")) railOpen(false);
 });
 
 window.addEventListener("hashchange", () => {

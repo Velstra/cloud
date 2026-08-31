@@ -2750,6 +2750,16 @@ impl Api {
     /// would believe the wrong one.
     pub async fn explain_placement(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
         self.authorize(who, Verb::Read, name).await?;
+        // The sixth door. The other five were shut and this verb still answered
+        // a tenant `"placed": "horst"` — found by pressing the button in the
+        // tenant's own seat. Placement is a statement about the machine room,
+        // and machines are invisible to a tenant through every window at once.
+        if !self.is_operator(who) {
+            return Err(ApiError::new(
+                Code::PermissionDenied,
+                "placement names the cell's machines, and those are a cell operator's                  to see. Whether the guest runs is on the instance itself.",
+            ));
+        }
         if name.collection() != "instances" {
             return Err(ApiError::invalid("only an instance is placed on a node"));
         }
@@ -5808,6 +5818,16 @@ impl Api {
         who: &Identity,
     ) -> ApiResult<Value> {
         self.authorize(who, Verb::Read, name).await?;
+        // The seventh door, and the widest: this answered a tenant with both
+        // machine names *and their CPU models*. Migrations are a cell
+        // operator's entirely — the create, the read, the list, and the
+        // rehearsal alike.
+        if !self.is_operator(who) {
+            return Err(ApiError::new(
+                Code::PermissionDenied,
+                "migrations are a cell operator's: they name the machines a guest moves                  between, and those are not part of a project's view.",
+            ));
+        }
         if name.collection() != "instances" {
             return Err(ApiError::invalid("a migration moves an instance"));
         }

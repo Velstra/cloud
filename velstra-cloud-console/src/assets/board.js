@@ -918,8 +918,11 @@ async function showOverview() {
   location.hash = "#overview";
 
   $("listtitle").textContent = "Overview";
-  fill($("listblurb"), "What needs attention, what the machines look like, and " +
-    "what this project has left.");
+  // The admin's overview shows the machines; a tenant's shows their project
+  // and their bill. The subtitle promises only what the page below delivers.
+  fill($("listblurb"), session.who && session.who.cellAdmin
+    ? "What needs attention, what the machines look like, and what this project has left."
+    : "What needs attention, and what this project uses and has left.");
   clear($("listacts"));
   $("listfilter").classList.add("hidden");
   $("listerr").classList.add("hidden");
@@ -953,7 +956,9 @@ function renderOverviewBody() {
     // Said plainly rather than by an empty space. A page that shows nothing
     // when nothing is wrong reads as a page that failed to load.
     panel.appendChild(el("p", el("span.state.settled", mark("settled"), "Everything has settled."),
-      el("span.muted", " Nothing in this cell is drifting or failing.")));
+      el("span.muted", (session.who && session.who.cellAdmin
+        ? " Nothing in this cell is drifting or failing."
+        : " Nothing in this project is drifting or failing."))));
   } else {
     for (const { coll, item } of attention) {
       const v = verdict(item, coll.condition);

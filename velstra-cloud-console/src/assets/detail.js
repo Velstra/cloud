@@ -318,7 +318,17 @@ function fieldValue(r, f) {
 // object, and a console that hid it here while showing it in the form would be
 // lying about what is set. "Set" is the spec carrying the key; only advanced
 // fields the object left unset fold away.
+//
+// A spread/affinity *mode* without its group is the model's default, not a
+// choice anybody made — and "Keeping them apart is: a rule" on a guest in no
+// group reads as a rule that exists. The mode folds away with its group.
+const MODE_OF = {
+  "placementPolicy.spread": "placementPolicy.antiAffinityGroup",
+  "placementPolicy.affinity": "placementPolicy.affinityGroup",
+};
 function carriesKey(r, f) {
+  const partner = MODE_OF[f.key];
+  if (partner && !at(spec(r), partner)) return false;
   const v = at(spec(r), f.key);
   return v !== undefined && v !== null;
 }
@@ -749,7 +759,10 @@ function renderSheet(coll, r) {
     acts.appendChild(el("button.btn.primary", { type: "button", id: "editbtn",
       onclick: () => openEdit(coll, r) }, "Edit"));
   }
-  if (coll.explainable) {
+  // Placement is a statement about the machine room, and the API refuses the
+  // verb to anybody who cannot see machines — so the button only exists where
+  // pressing it answers.
+  if (coll.explainable && session.who && session.who.cellAdmin) {
     acts.appendChild(el("button.btn", { type: "button", id: "explainbtn",
       onclick: () => explainInto($("explain"), coll, r) }, "Explain placement"));
   }
@@ -890,7 +903,7 @@ function renderSheet(coll, r) {
     }
   }
 
-  if (coll.explainable) {
+  if (coll.explainable && session.who && session.who.cellAdmin) {
     const host = el("div", { id: "explain" });
     panel.appendChild(spread("Placement", host));
     // An object that is not settled is the one somebody is looking at because

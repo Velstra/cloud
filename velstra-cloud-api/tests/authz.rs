@@ -2876,6 +2876,31 @@ async fn a_tenant_sees_no_machines_through_any_window() {
         .await
         .unwrap();
     assert!(whole.get("on").is_some(), "{whole}");
+
+    // The sixth and seventh doors, found by pressing the buttons from the
+    // tenant's seat: `:explainPlacement` answered `"placed": "horst"`, and
+    // `:explainMigration` answered with both machine names and their CPU
+    // models. Placement and migration are statements about the machine room.
+    let refused = api
+        .explain_placement(&name("projects/p1/instances/web"), &who(ADA))
+        .await
+        .map(|_| ())
+        .expect_err("a tenant was told which machine holds their guest");
+    assert!(refused.to_string().contains("cell operator"), "{refused}");
+    let refused = api
+        .explain_migration(
+            &name("projects/p1/instances/web"),
+            velstra_cloud_model::migration::MigrationMode::Live,
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a tenant rehearsed a migration and read the machine room");
+    assert!(refused.to_string().contains("cell operator"), "{refused}");
+    // And the operator still gets both answers.
+    api.explain_placement(&name("projects/p1/instances/web"), &who(OPERATOR))
+        .await
+        .expect("the operator reads placement");
 }
 
 /// The cell's public pools are readable by everyone, like the image catalogue.
