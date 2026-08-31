@@ -592,6 +592,7 @@ mod tests {
             osds: vec![OsdSpec {
                 node: "b".into(),
                 device: "/dev/sdb".into(),
+                even_if_unsuitable: false,
             }],
             pools: vec![CephPoolSpec {
                 pool: "velstra-volumes".into(),

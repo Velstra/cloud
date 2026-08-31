@@ -159,6 +159,7 @@ mod complete {
             osds: vec![velstra_cloud_model::ceph::OsdSpec {
                 node: "node-a".into(),
                 device: "/dev/disk/by-id/nvme-x".into(),
+                even_if_unsuitable: false,
             }],
             pools: vec![velstra_cloud_model::ceph::CephPoolSpec {
                 pool: "volumes".into(),
@@ -872,6 +873,7 @@ mod settled {
             osds_up: vec![OsdSpec {
                 node: "hv-1".into(),
                 device: "/dev/sdb".into(),
+                even_if_unsuitable: false,
             }],
             pools_present: vec!["velstra-volumes".into()],
         }
