@@ -112,6 +112,7 @@ mod complete {
 
     pub fn instance() -> InstanceSpec {
         InstanceSpec {
+            flavor: None,
             start_order: 0,
             start_delay_s: 0,
             on_node_loss: Default::default(),

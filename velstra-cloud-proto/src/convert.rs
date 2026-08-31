@@ -336,6 +336,7 @@ fn policy_out(p: &resources::ProjectPolicy) -> v1::ProjectPolicy {
         host_bridges: p.host_bridges.clone(),
         device_passthrough: p.device_passthrough,
         floating_ips: p.floating_ips,
+        custom_sizes: p.custom_sizes,
     }
 }
 
@@ -344,6 +345,7 @@ fn policy_in(p: &v1::ProjectPolicy) -> resources::ProjectPolicy {
         host_bridges: p.host_bridges.clone(),
         device_passthrough: p.device_passthrough,
         floating_ips: p.floating_ips,
+        custom_sizes: p.custom_sizes,
     }
 }
 
@@ -916,6 +918,7 @@ impl From<&resources::InstanceSpec> for v1::InstanceSpec {
             memory_mib: s.memory_mib,
             image: s.image.clone(),
             root_disk_gib: s.root_disk_gib,
+            flavor: s.flavor.clone(),
             desired_state: v1::DesiredState::from(s.desired_state) as i32,
             ports: s.ports.clone(),
             networks: s.networks.clone(),
@@ -943,6 +946,7 @@ impl From<&v1::InstanceSpec> for resources::InstanceSpec {
             memory_mib: s.memory_mib,
             image: s.image.clone(),
             root_disk_gib: s.root_disk_gib,
+            flavor: s.flavor.clone(),
             desired_state: s.desired_state().into(),
             ports: s.ports.clone(),
             networks: s.networks.clone(),
@@ -1728,6 +1732,7 @@ mod tests {
         let original = Resource::new(
             meta,
             InstanceSpec {
+            flavor: None,
                 volumes: Vec::new(),
                 start_order: 0,
                 start_delay_s: 0,

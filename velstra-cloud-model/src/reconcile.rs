@@ -1135,6 +1135,8 @@ pub fn nobody_reports_on(kind: &str) -> bool {
             | "folders"
             // A definition of what a binding means. Nothing runs one either.
             | "roles"
+            // A named machine size. A definition, like a device class.
+            | "flavors"
     )
 }
 

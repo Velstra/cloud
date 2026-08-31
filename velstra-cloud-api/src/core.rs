@@ -50,8 +50,9 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 32] = [
+pub const COLLECTIONS: [&str; 33] = [
     "projects",
+    "flavors",
     "folders",
     "roles",
     "users",
@@ -494,6 +495,11 @@ impl Api {
                 "device-classes",
                 velstra_cloud_model::pci::DeviceClassSpec,
                 velstra_cloud_model::resources::DeviceClassStatus
+            ),
+            collection!(
+                "flavors",
+                velstra_cloud_model::resources::FlavorSpec,
+                velstra_cloud_model::resources::FlavorStatus
             ),
             collection!(
                 "backup-targets",
@@ -980,6 +986,13 @@ impl Api {
         if verb == Verb::Read && name.collection() == "images" && name.parent().is_none() {
             return Ok(());
         }
+        // The size menu, by the same argument again: a tenant picks a flavor
+        // by name, so they must be able to read the list of them. Read, and
+        // only read — defining a size is capacity planning, and that is the
+        // cell's.
+        if verb == Verb::Read && name.collection() == "flavors" {
+            return Ok(());
+        }
         // The cell's public networks, by the same argument as the catalogue.
         //
         // A public address pool is an external network the operator made at
@@ -1168,6 +1181,72 @@ impl Api {
              runs the cell, on `spec.policy.floatingIps`.",
         )
         .at("spec"))
+    }
+
+    /// Resolve a named size into the three numbers everything else reads.
+    ///
+    /// `flavor: m1-small` (or `flavors/m1-small` — both spellings, like every
+    /// cell-scoped reference) copies the flavor's vcpus, memory and root disk
+    /// into the spec, overwriting whatever was typed beside it: a guest that
+    /// says `m1-small` *is* one, and two of the fields disagreeing with the
+    /// name would be a label, not a size. Stored with the name kept, so a
+    /// person can see what was picked.
+    async fn settle_flavor(&self, spec: &mut Value) -> ApiResult<()> {
+        let Some(named) = spec.get("flavor").and_then(Value::as_str).map(str::to_string) else {
+            return Ok(());
+        };
+        if named.is_empty() {
+            spec.as_object_mut().map(|m| m.remove("flavor"));
+            return Ok(());
+        }
+        let full = if named.starts_with("flavors/") { named.clone() } else { format!("flavors/{named}") };
+        let flavor: velstra_cloud_model::resources::Flavor = self
+            .typed(&ResourceName::parse(&full).map_err(ApiError::from)?)
+            .await
+            .map_err(|_| {
+                ApiError::invalid(format!(
+                    "{named} is not a flavor this cell offers — the flavors list says what is"
+                ))
+                .at("spec.flavor")
+            })?;
+        spec["flavor"] = json!(full);
+        spec["vcpus"] = json!(flavor.spec.vcpus);
+        spec["memory_mib"] = json!(flavor.spec.memory_mib);
+        spec["root_disk_gib"] = json!(flavor.spec.root_disk_gib);
+        Ok(())
+    }
+
+    /// Hand-sized guests are a project privilege once the cell has a menu.
+    ///
+    /// A cell with no flavors has no menu to hold anybody to — refusing every
+    /// size then would be a cell where nothing can be made — so the rule only
+    /// exists once the operator has defined at least one. From then on a
+    /// tenant picks by name unless their project was opened for custom sizes,
+    /// which is the same deliberate, recorded act as opening floating IPs.
+    async fn refuse_a_hand_sized_guest_without_leave(
+        &self,
+        spec: &Value,
+        project: Option<&str>,
+        who: &Identity,
+    ) -> ApiResult<()> {
+        if self.is_operator(who) {
+            return Ok(());
+        }
+        if spec.get("flavor").and_then(Value::as_str).is_some_and(|f| !f.is_empty()) {
+            return Ok(());
+        }
+        if self.policy_of(project).await.custom_sizes {
+            return Ok(());
+        }
+        let offered: Vec<velstra_cloud_model::resources::Flavor> =
+            self.typed_list("", "flavors").await.unwrap_or_default();
+        if offered.is_empty() {
+            return Ok(());
+        }
+        Err(ApiError::forbidden(
+            "this project sizes guests by flavor: pick one from the flavors list. Sizing by              hand is granted per project by whoever runs the cell, on `spec.policy.customSizes`.",
+        )
+        .at("spec.flavor"))
     }
 
     /// A port belongs to one guest.
@@ -1922,6 +2001,12 @@ impl Api {
         // the authorisation that means something: may this caller boot that.
         if kind == "instances" {
             self.settle_image_family(parent, &mut spec).await?;
+            // The named size becomes numbers before anything reads them —
+            // quota counts vCPUs, the scheduler reads memory — and the
+            // hand-sizing rule runs on the settled spec.
+            self.settle_flavor(&mut spec).await?;
+            self.refuse_a_hand_sized_guest_without_leave(&spec, governing_project(&ResourceName::parse(parent).map_err(ApiError::from)?).as_deref(), who)
+                .await?;
         }
         // Before the shape check, not after: the bare spelling is a *spelling*
         // and not a malformed name, and `refs::check` cannot know that without
@@ -2246,6 +2331,27 @@ impl Api {
             }
             if name.collection() == "instances" && spec.get("root_disk_gib").is_some() {
                 self.refuse_a_smaller_disk(name, spec, who).await?;
+            }
+            if name.collection() == "instances" {
+                // A resize is either the next size on the menu or a hand-typed
+                // number, and the two must not blur: a patch that names a
+                // flavor gets that flavor's numbers, and a patch that types a
+                // size takes the name off — a guest labelled m1-small with
+                // somebody else's numbers inside would be a label, not a size.
+                if spec.get("flavor").is_some() {
+                    self.settle_flavor(spec).await?;
+                } else if spec.get("vcpus").is_some()
+                    || spec.get("memory_mib").is_some()
+                    || spec.get("root_disk_gib").is_some()
+                {
+                    self.refuse_a_hand_sized_guest_without_leave(
+                        spec,
+                        governing_project(name).as_deref(),
+                        who,
+                    )
+                    .await?;
+                    spec["flavor"] = Value::Null;
+                }
             }
             // Pinning a guest to a machine names a host, and hosts are not part
             // of a project's view — a tenant cannot list them and does not see

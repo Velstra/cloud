@@ -3225,3 +3225,168 @@ async fn listing_asks_about_what_is_being_listed_and_not_about_the_project() {
         "a grant over instances read the project"
     );
 }
+
+/// Sizes come off a menu the cell writes, unless a project was opened by hand.
+///
+/// The flavor list is the operator's capacity planning made visible: anybody
+/// may read it, only the cell may add to it, and once it exists a tenant's
+/// guest is an `m1-small` — not a hand-entered triple — unless their project
+/// carries `policy.customSizes`. The name resolves to numbers at create and
+/// at patch, and typing a size takes the name off rather than leaving a label
+/// with somebody else's numbers inside.
+#[tokio::test]
+async fn a_flavor_is_a_menu_the_cell_writes_and_a_tenant_orders_from() {
+    let api = cell().await;
+    api.create(
+        "",
+        "flavors",
+        &json!({ "id": "m1-small", "spec": {
+            "vcpus": 2, "memory_mib": 2048, "root_disk_gib": 10,
+            "description": "the ordinary box" } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("the cell defines a size");
+    api.create(
+        "",
+        "flavors",
+        &json!({ "id": "m1-big", "spec": {
+            "vcpus": 8, "memory_mib": 16384, "root_disk_gib": 40 } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("and a second one");
+
+    // The menu is readable by everybody and writable by the cell alone.
+    let listed = api
+        .list_for("", "flavors", &Default::default(), &who(ADA))
+        .await
+        .expect("a tenant reads the menu");
+    assert_eq!(listed.items.len(), 2, "the menu is short a size");
+    api.create(
+        "",
+        "flavors",
+        &json!({ "id": "mine", "spec": { "vcpus": 64, "memory_mib": 1, "root_disk_gib": 1 } }),
+        &who(ADA),
+    )
+    .await
+    .map(|_| ())
+    .expect_err("a tenant wrote the cell's menu");
+
+    // p1 is closed for hand sizing.
+    api.patch(
+        &name("projects/p1"),
+        &json!({ "spec": { "policy": {
+            "floating_ips": true, "device_passthrough": true, "custom_sizes": false } } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .expect("the operator closes hand sizing");
+
+    let refused = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "typed", "spec": { "vcpus": 3, "memory_mib": 3072 } }),
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a hand-sized guest in a project sized by flavor");
+    assert!(refused.to_string().contains("flavor"), "{refused}");
+
+    // Picking a flavor resolves the numbers; the name stays on the object.
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "web", "spec": { "flavor": "m1-small" } }),
+        &who(ADA),
+    )
+    .await
+    .expect("a guest ordered by name");
+    let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
+    assert_eq!(seen["spec"]["flavor"], "flavors/m1-small", "{:?}", seen["spec"]);
+    assert_eq!(seen["spec"]["vcpus"], 2);
+    assert_eq!(seen["spec"]["memory_mib"], 2048);
+    assert_eq!(seen["spec"]["root_disk_gib"], 10);
+
+    // A resize is the next size on the menu.
+    api.patch(
+        &name("projects/p1/instances/web"),
+        &json!({ "spec": { "flavor": "m1-big" } }),
+        None,
+        &who(ADA),
+    )
+    .await
+    .expect("the next size up");
+    let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
+    assert_eq!(seen["spec"]["vcpus"], 8);
+    assert_eq!(seen["spec"]["memory_mib"], 16384);
+
+    // Typing a size instead is what the policy closed.
+    let refused = api
+        .patch(
+            &name("projects/p1/instances/web"),
+            &json!({ "spec": { "vcpus": 5 } }),
+            None,
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a hand resize in a project sized by flavor");
+    assert!(refused.to_string().contains("flavor"), "{refused}");
+
+    // The operator is the provider and types what they like — and the label
+    // comes off, because the numbers are no longer the flavor's.
+    api.patch(
+        &name("projects/p1/instances/web"),
+        &json!({ "spec": { "vcpus": 5 } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .expect("the provider hand-sizes");
+    let seen = api.get(&name("projects/p1/instances/web"), &who(OPERATOR)).await.unwrap();
+    assert_eq!(seen["spec"]["vcpus"], 5);
+    assert!(
+        seen["spec"].get("flavor").map_or(true, serde_json::Value::is_null),
+        "a hand-sized guest still wears the flavor's name: {:?}",
+        seen["spec"]
+    );
+
+    // A project the operator opens sizes by hand again — the same recorded
+    // act as opening floating IPs. (A project written before the field existed
+    // reads as open too; that is serde's `as_before`, and the fixture's
+    // explicit policies are the after picture.)
+    api.patch(
+        &name("projects/p2"),
+        &json!({ "spec": { "policy": {
+            "floating_ips": true, "device_passthrough": true, "custom_sizes": true } } }),
+        None,
+        &who(OPERATOR),
+    )
+    .await
+    .expect("the operator opens hand sizing for p2");
+    api.create(
+        "projects/p2",
+        "instances",
+        &json!({ "id": "typed", "spec": { "vcpus": 3, "memory_mib": 3072 } }),
+        &who(BOB),
+    )
+    .await
+    .expect("an open project sizes by hand");
+
+    // A name the menu does not have is a refusal that names the menu.
+    let refused = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "off-menu", "spec": { "flavor": "m9-imaginary" } }),
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("an imaginary size");
+    assert!(refused.to_string().contains("not a flavor"), "{refused}");
+}

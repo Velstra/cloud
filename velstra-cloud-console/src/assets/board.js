@@ -516,7 +516,11 @@ function renderListHead() {
   $("listtitle").textContent = coll.title;
   $("listblurb").textContent = coll.blurb;
   const acts = fill($("listacts"));
-  if (coll.creatable) {
+  // Catalogue boards a tenant may read and only the cell may write: the button
+  // exists where pressing it can work.
+  const OPERATOR_WRITES = ["flavors"];
+  const mayCreate = !OPERATOR_WRITES.includes(coll.id) || (session.who && session.who.cellAdmin);
+  if (coll.creatable && mayCreate) {
     acts.appendChild(el("button.btn.primary", { type: "button", id: "newbtn",
       onclick: () => openCreate(coll) }, "New " + coll.singular));
   }

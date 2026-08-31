@@ -846,6 +846,20 @@ const PROJECT_FIELDS: &[Field] = &[
         at_creation: true,
     },
     Field {
+        key: "policy.customSizes",
+        label: "May size guests by hand",
+        kind: Kind::Switch,
+        required: false,
+        advanced: true,
+        help: "Whether guests here may be sized by typed numbers instead of a \
+               flavor. Only asked once the cell has flavors at all: with a menu \
+               defined, the closed answer is the sold one, and this is the \
+               deliberate exception for the customer whose shapes are their own.",
+        when_empty: "",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
         key: "displayName",
         label: "Display name",
         kind: Kind::Text {
@@ -1109,7 +1123,69 @@ const FAMILY_FIELDS: &[Field] = &[
     },
 ];
 
+const FLAVOR_FIELDS: &[Field] = &[
+    Field {
+        key: "vcpus",
+        label: "vCPUs",
+        kind: Kind::Number { unit: "", min: 1, max: 256, step: 1, scale: Scale::None },
+        required: true,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "memoryMib",
+        label: "Memory",
+        kind: Kind::Number { unit: "MiB", min: 256, max: 4_194_304, step: 256, scale: Scale::Mib },
+        required: true,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "rootDiskGib",
+        label: "Root disk",
+        kind: Kind::Number { unit: "GiB", min: 1, max: 65_536, step: 1, scale: Scale::None },
+        required: true,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "description",
+        label: "Description",
+        kind: Kind::Text { placeholder: "burstable, for dev boxes", check: Check::None },
+        required: false,
+        advanced: false,
+        help: "One sentence for the picker. The numbers already say most of it.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+];
+
 const INSTANCE_FIELDS: &[Field] = &[
+    Field {
+        key: "flavor",
+        label: "Flavor",
+        kind: Kind::Ref {
+            collection: "flavors",
+            filter_by: None,
+            spelling: Spelling::Id,
+        },
+        required: false,
+        advanced: false,
+        help: "A named size from the cell's menu. Picking one sets the vCPUs,                memory and root disk below; typing sizes instead needs the                project's leave.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
     Field {
         key: "image",
         // The catalogue, not the bytes. Picking `debian-13` gets the newest of
@@ -1179,9 +1255,12 @@ const INSTANCE_FIELDS: &[Field] = &[
             step: 1,
             scale: Scale::None,
         },
-        required: true,
-        advanced: false,
-        help: "",
+        required: false,
+        // One disclosure deeper since the flavor arrived: a size picked by
+        // name sets this anyway, and the control keeps its default for the
+        // hand-sized path. The form still submits it either way.
+        advanced: true,
+        help: "Set by the flavor when one is picked.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -4364,6 +4443,49 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "flavors",
+        title: "Flavors",
+        singular: "flavor",
+        recheck: 0,
+        condition: "",
+        // Nothing reports on these: a flavor is a named size, not a thing that converges.
+        group: "Compute",
+        scope: Scope::Global,
+        blurb: "Named machine sizes, offered by the cell. A guest is an                 m1-small, not a hand-entered triple of numbers — the sizes that                 land on the fleet are the shapes it was bought for. Whether a                 project may also size by hand is that project's policy.",
+        fields: FLAVOR_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.vcpus",
+                label: "vCPUs",
+                cell: Cell::Text,
+                width: 72,
+            },
+            Column {
+                path: "spec.memoryMib",
+                label: "Memory (MiB)",
+                cell: Cell::Text,
+                width: 112,
+            },
+            Column {
+                path: "spec.rootDiskGib",
+                label: "Root disk (GiB)",
+                cell: Cell::Text,
+                width: 120,
+            },
+            Column {
+                path: "spec.description",
+                label: "Description",
+                cell: Cell::Text,
+                width: 260,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
         id: "routers",
         title: "Routers",
         singular: "router",
@@ -4963,7 +5085,7 @@ mod tests {
         }
         assert_eq!(
             COLLECTIONS.len(),
-            31,
+            32,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:
@@ -5010,6 +5132,8 @@ mod tests {
             "folders",
             // A definition. Nothing runs one either.
             "roles",
+            // A named size. A definition, like a device class.
+            "flavors",
         ];
         for c in COLLECTIONS {
             let says_nobody = c.condition.is_empty();

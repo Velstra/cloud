@@ -179,6 +179,9 @@ message ProjectPolicy {
   bool device_passthrough = 2;
   // Whether this project may hold addresses the world can reach.
   bool floating_ips = 3;
+  // Whether guests here may be sized by hand instead of by flavor. Only asked
+  // once the cell has flavors at all.
+  bool custom_sizes = 4;
 }
 
 // One grant: a role, and who holds it. `role` is the role's name —
@@ -683,6 +686,9 @@ message InstanceSpec {
   // detach. The attachments are made by a controller, because an attachment
   // names the node holding the guest and at create time there is none.
   repeated string volumes = 17;
+  // The named size this guest was asked for, when it was. The API resolves it
+  // into vcpus, memory_mib and root_disk_gib at create; the name stays.
+  optional string flavor = 18;
 }
 
 message InstanceStatus {

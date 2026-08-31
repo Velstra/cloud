@@ -755,7 +755,9 @@ function renderSheet(coll, r) {
     el("button.btn", { type: "button", id: "closesheet", onclick: closeSheet }, "Close")));
 
   const acts = el("div.sheetacts");
-  if (coll.editable) {
+  const cellsPen = ["flavors"];
+  const holdsThePen = !cellsPen.includes(coll.id) || (session.who && session.who.cellAdmin);
+  if (coll.editable && holdsThePen) {
     acts.appendChild(el("button.btn.primary", { type: "button", id: "editbtn",
       onclick: () => openEdit(coll, r) }, "Edit"));
   }
@@ -786,7 +788,8 @@ function renderSheet(coll, r) {
   // Abandoning a migration is not deleting a row: what it costs depends on the
   // mode, and the sentence is different enough that it is written where the
   // modes are.
-  if (coll.deletable && (coll.id !== "audit" || (session.who && session.who.cellAdmin))) {
+  if (coll.deletable && holdsThePen
+      && (coll.id !== "audit" || (session.who && session.who.cellAdmin))) {
     acts.appendChild(coll.id === "migrations"
       ? deleteControl(coll, r, abandonAsk(r))
       : deleteControl(coll, r));
