@@ -1090,7 +1090,9 @@ pre.terminal:focus {
 .mapgraph .gedge.dashed { stroke-dasharray: 5 4; stroke: var(--text-faint); }
 .mapgraph .gedgelabel {
   fill: var(--text-muted); font: var(--fw-regular) 11px var(--font-mono);
-  text-anchor: middle;
+  text-anchor: start;
+  /* Legible over whatever the bow crosses, in both appearances. */
+  paint-order: stroke; stroke: var(--bg-app); stroke-width: 3px;
 }
 .mapgraph .gnode rect {
   fill: var(--surface-raised); stroke: var(--border); stroke-width: 1;
