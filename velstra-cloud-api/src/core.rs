@@ -1440,7 +1440,15 @@ impl Api {
         if !parent.is_empty() {
             let name = ResourceName::parse(parent).map_err(ApiError::from)?;
             self.authorize_for(who, Verb::Read, &name, kind).await?;
-            return self.list_page(parent, kind, filter, paging).await;
+            let mut listing = self.list_page(parent, kind, filter, paging).await?;
+            // The third door, after the read and the watch. A project list is
+            // authorised at the parent and served whole — and it was serving
+            // the machine names the other two doors had already stopped, which
+            // is where the tenant's board actually got them from.
+            for item in &mut listing.items {
+                self.redact_for(who, kind, item);
+            }
+            return Ok(listing);
         }
         // No parent: a cell-wide collection. An operator sees it whole;
         // everybody else sees the objects they may read, one decision each.

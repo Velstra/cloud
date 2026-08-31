@@ -2707,10 +2707,19 @@ async fn a_tenant_sees_no_machines_through_any_window() {
     .await
     .expect("an operator may pin");
 
-    // Reading it as the tenant: the machine's name is not in the answer.
+    // Reading it as the tenant: the machine's name is not in the answer —
+    // through the read, and through the project list the boards are built
+    // from, which was the door the console actually used.
     let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
     assert!(seen["spec"].get("node").is_none(), "{:?}", seen["spec"]);
     assert!(seen["status"].get("node").is_none(), "{:?}", seen["status"]);
+    let listed = api
+        .list_for("projects/p1", "instances", &Default::default(), &who(ADA))
+        .await
+        .unwrap();
+    for item in &listed.items {
+        assert!(item["spec"].get("node").is_none(), "the project list leaks: {:?}", item["spec"]);
+    }
     // And the operator still sees it whole: redaction is a view, not a change.
     let whole = api.get(&name("projects/p1/instances/web"), &who(OPERATOR)).await.unwrap();
     assert_eq!(whole["spec"]["node"], "hv-1");
