@@ -928,6 +928,36 @@ async fn last_words(scope: Scope, unit: &str) -> Option<String> {
         .map(|l| l.trim().to_string())
 }
 
+/// **Untested:** needs systemd. The `velstra-vm-*` units that are actually
+/// running, by unit name (without `.service`).
+///
+/// The guests systemd holds, asked of systemd — not of this agent's run
+/// directory. The two can disagree: a delete that removed the directory while
+/// the agent was down leaves a VMM running with no bookkeeping around it, and
+/// an observation built from the directory alone reports a machine that is
+/// running a guest as running nothing. Found live as a QEMU two days older
+/// than the deletion of its instance.
+pub async fn vm_units(scope: Scope, prefix: &str) -> Vec<String> {
+    let mut command = tokio::process::Command::new("systemctl");
+    if let Some(flag) = scope.flag() {
+        command.arg(flag);
+    }
+    let result = command
+        .args(["list-units", "--plain", "--no-legend", "--state=running"])
+        .arg(format!("{prefix}*.service"))
+        .output()
+        .await;
+    let Ok(output) = result else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter_map(|u| u.strip_suffix(".service"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// **Untested:** needs systemd. A unit that is already gone is the state that
 /// was wanted, so this reports nothing rather than failing.
 pub async fn stop_unit(scope: Scope, unit: &str) {

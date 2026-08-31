@@ -512,6 +512,37 @@ impl Vmm for QemuVmm {
             );
         }
 
+        // The guests systemd is running that the run directory said nothing
+        // about. A delete that took the directory while this agent was down
+        // leaves the VMM running with no bookkeeping around it — invisible to
+        // the loop above, so the control plane was told this machine runs
+        // nothing while a two-day-old QEMU held a tap on it. Both unit
+        // prefixes: a guest that arrived by migration lives in `velstra-in-`
+        // for the rest of its life here.
+        for prefix in ["velstra-vm-", "velstra-in-"] {
+            for unit in hostfs::vm_units(self.layout.scope, prefix).await {
+                let Some(slugged) = unit.strip_prefix(prefix) else {
+                    continue;
+                };
+                let instance = hostfs::from_unit_slug(slugged);
+                if host.vms.contains_key(&instance) || host.receivers.contains_key(&instance) {
+                    continue;
+                }
+                host.vms.insert(
+                    instance.clone(),
+                    VmObservation {
+                        size: None,
+                        console_tail: String::new(),
+                        console_bytes: 0,
+                        state: InstanceState::Running,
+                        pid: hostfs::main_pid(self.layout.scope, &unit).await,
+                        started_at: None,
+                        devices: Vec::new(),
+                    },
+                );
+            }
+        }
+
         Ok(host)
     }
 
