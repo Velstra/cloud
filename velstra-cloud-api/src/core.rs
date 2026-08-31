@@ -1250,7 +1250,8 @@ impl Api {
             return Ok(());
         }
         Err(ApiError::forbidden(
-            "this project sizes guests by flavor: pick one from the flavors list. Sizing by              hand is granted per project by whoever runs the cell, on `spec.policy.customSizes`.",
+            "this project sizes guests by flavor: pick one from the flavors list. Sizing by \
+             hand is granted per project by whoever runs the cell, on `spec.policy.customSizes`.",
         )
         .at("spec.flavor"))
     }
