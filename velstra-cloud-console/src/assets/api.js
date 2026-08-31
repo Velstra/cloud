@@ -431,6 +431,11 @@ const issueCredential = (coll, id) =>
   request("POST", writePath(coll) + "/" + encodeURIComponent(id) + ":issueCredential",
     { body: {} }).then((r) => r.body);
 
+/// One month's consumption, summed the way a bill is.
+const explainUsage = (project, month) =>
+  request("GET", "/api/v1/" + project + ":explainUsage" +
+    (month ? "?month=" + encodeURIComponent(month) : "")).then((r) => r.body);
+
 /// What the cell has, what is spoken for, and what would actually still fit.
 const explainCapacity = () =>
   request("GET", "/api/v1/nodes:explainCapacity").then((r) => r.body);

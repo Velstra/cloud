@@ -511,6 +511,11 @@ async fn read(
         Target::Verb { name, verb } if verb == "explainReach" => {
             Ok(Json(api.explain_reach(&name, &who).await?).into_response())
         }
+        // `?month=2026-08`; nothing means the current one.
+        Target::Verb { name, verb } if verb == "explainUsage" => {
+            let month = query.get("month").map(String::as_str);
+            return Ok(Json(api.explain_usage(&name, month, &who).await?).into_response());
+        }
         Target::Verb { name, verb } if verb == "explainQuota" => {
             Ok(Json(api.explain_quota(&name, &who).await?).into_response())
         }

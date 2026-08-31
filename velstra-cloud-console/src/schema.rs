@@ -2849,9 +2849,14 @@ const BACKUP_FIELDS: &[Field] = &[
             filter_by: None,
             spelling: Spelling::Id,
         },
-        required: true,
-        advanced: false,
-        help: "Where the copy goes. A target in the volume's own pool is \
+        required: false,
+        // Behind More settings: where the cell keeps copies is the cell's
+        // business, and a tenant cannot even list the targets — for them this
+        // picker is empty, which is fine, because empty means the cell's most
+        // roomy accepting target answers.
+        advanced: true,
+        help: "Where the copy goes. Left empty, the cell's most roomy \
+               accepting target answers. A target in the volume's own pool is \
                refused: a copy beside the original is a snapshot, and is lost \
                with the pool it is in.",
         when_empty: "",

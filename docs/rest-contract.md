@@ -142,6 +142,26 @@ Written by the controller and by nothing else. They are not creatable, editable
 or deletable through the API: a usage record that could be changed after the
 fact is a bill nobody can stand behind.
 
+**The month, added up** — because forty-nine rows of "at 14:00 you had one
+guest" are readings, not a bill:
+
+```
+GET /api/v1/projects/p1:explainUsage?month=2026-08
+{ "month": "2026-08", "hours": 49, "hoursInMonthSoFar": 744,
+  "vcpuHours": 49, "memoryGibHours": 49, "volumeGibHours": 196,
+  "instanceHours": 49, "floatingIpHours": 12 }
+```
+
+Each reading is one hour at what the reading says — the industry's own
+arithmetic. `month` omitted means the current one; a spelling that is not
+`YYYY-MM` is refused. **`hours` is the number of readings, and that is the
+honest count**: a cell that was down took none, those hours are missing from
+the sum rather than invented, and `hoursInMonthSoFar` is what makes the gap a
+number instead of a suspicion. Authorised as a read of the project, so a tenant
+sums their own bill and nobody else's. What the platform deliberately does not
+have is prices: metric-hours times a price list is the billing system's line of
+business, and this answer is what it multiplies.
+
 ### A way into a guest: the console
 
 A guest's serial line is reachable when the network is not — which is the only
