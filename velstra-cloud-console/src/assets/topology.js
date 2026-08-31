@@ -374,7 +374,7 @@ function drawGraph(f, index) {
       " C " + (x1 + fan) + " " + mid + ", " + (x2 + fan) + " " + mid + ", " + x2 + " " + y2;
     svg.appendChild(svgEl("path", { d, class: "gedge" + (e.dashed ? " dashed" : "") }));
     if (e.label) {
-      const t = svgEl("text", { x: (x1 + x2) / 2 + fan + 6, y: mid - 6 - nth * 15,
+      const t = svgEl("text", { x: (x1 + x2) / 2 + fan + 10, y: mid - 6 - nth * 15,
         class: "gedgelabel" });
       t.textContent = e.label;
       svg.appendChild(t);
