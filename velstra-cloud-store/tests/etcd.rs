@@ -428,14 +428,10 @@ async fn a_watch_from_a_revision_that_is_gone_ends_instead_of_pretending() {
     }
     let now = store.revision().await.unwrap();
 
-    // Compaction is not on the `Store` trait — nothing above this crate should
-    // be able to throw history away — so the test reaches for etcd directly.
-    etcd_client::Client::connect([etcd.endpoint()], None)
-        .await
-        .unwrap()
-        .compact(now.0 as i64, None)
-        .await
-        .unwrap();
+    // Through the trait, which grew `compact` after a live cell filled its
+    // quota with history nobody was throwing away. "Nothing above this crate
+    // should compact" was the old rule; the incident is why the API now must.
+    store.compact(now).await.unwrap();
 
     let mut rx = store.watch(&prefix, Some(listed_at));
     assert!(
@@ -445,4 +441,58 @@ async fn a_watch_from_a_revision_that_is_gone_ends_instead_of_pretending() {
             .is_none(),
         "a watch on history that no longer exists delivered something anyway"
     );
+}
+
+/// Compaction throws history away and keeps every object.
+///
+/// The case this exists for was found live: a two-day-old cell held 393 kB of
+/// objects under two gigabytes of their history, hit etcd's 2 GiB quota, and
+/// answered `mvcc: database space exceeded` to a login. Nothing anywhere
+/// compacted, so nothing could recover without an operator and etcdctl.
+#[tokio::test]
+async fn compacting_keeps_the_objects_and_drops_the_history() {
+    let etcd = etcd_or_skip!();
+    let store = etcd.store().await;
+    let cell = "cell-compact";
+
+    // An object with history: written, then rewritten.
+    let before = store.revision().await.unwrap();
+    let rev1 = store
+        .put(&key_for(cell, "instances", "i1"), b"v1".to_vec(), Expect::Absent)
+        .await
+        .unwrap();
+    store
+        .put(
+            &key_for(cell, "instances", "i1"),
+            b"v2".to_vec(),
+            Expect::Revision(store.get(&key_for(cell, "instances", "i1")).await.unwrap().unwrap().revision),
+        )
+        .await
+        .unwrap();
+    let now = store.revision().await.unwrap();
+
+    store.compact(now).await.unwrap();
+
+    // The object is whole; only the past is gone.
+    let read = store.get(&key_for(cell, "instances", "i1")).await.unwrap().unwrap();
+    assert_eq!(read.value, b"v2");
+
+    // Compacting a second time to the same point is not an error — another
+    // replica or an operator's etcdctl may always have got there first.
+    store.compact(now).await.unwrap();
+    // Nor is asking for a revision that is itself compacted away.
+    store.compact(rev1).await.unwrap();
+
+    // And a watch from before the compaction ends rather than pretending,
+    // which is the recovery the API's watch path already performs: re-list.
+    // From *before* the first write: `rev1 + 1` is exactly the compaction
+    // point and survives, so a watch from `rev1` is valid and rightly stays
+    // open — which is what this test first asserted the opposite of.
+    let mut watch =
+        store.watch(&velstra_cloud_store::prefix_for(cell, "instances"), Some(before));
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(_event) = watch.recv().await {}
+    })
+    .await;
+    assert!(ended.is_ok(), "a watch across the compaction neither ended nor erred");
 }

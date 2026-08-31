@@ -376,6 +376,9 @@ impl Scratch {
 }
 
 struct Inner {
+    /// The store itself, beside the typed views over it — for the one job no
+    /// collection can carry: compacting the history they all share.
+    store: Arc<dyn Store>,
     collections: BTreeMap<&'static str, Arc<dyn Collection>>,
     /// Subjects that may do anything, anywhere in this cell.
     ///
@@ -535,6 +538,7 @@ impl Api {
         ]);
         Self {
             inner: Arc::new(Inner {
+                store: store.clone(),
                 collections,
                 cell_admins: Vec::new(),
                 served: RwLock::new(BTreeMap::new()),
@@ -1335,8 +1339,24 @@ impl Api {
         let api = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(SESSION_SWEEP_INTERVAL);
-            // The first tick is immediate; a fresh cell has nothing to sweep, and
-            // sweeping an empty collection costs one list.
+            // The store's history, on the same heartbeat. A store that keeps
+            // every revision for ever fills up and stops taking writes — found
+            // live: a two-day-old cell held 393 kB of objects under two
+            // gigabytes of their history, hit etcd's quota, and answered
+            // `database space exceeded` to a login. Nobody was compacting, so
+            // nothing could recover without an operator and etcdctl.
+            //
+            // Compacted to where the revision stood a full interval ago, never
+            // to now: a watcher that reconnects resumes from the revision its
+            // list gave it, and a window of one interval is what makes an
+            // ordinary reconnect land inside history that still exists. One
+            // that sleeps longer gets the compaction error the watch path
+            // already turns into a clean resync.
+            //
+            // The file does not shrink — freed pages are reused, which is what
+            // stops the growth; `etcdctl defrag` is the operator's tool for
+            // reclaiming disk after an incident.
+            let mut behind: Option<Revision> = None;
             loop {
                 ticker.tick().await;
                 if let Err(e) = identity.sweep_expired_sessions(Timestamp::now()).await {
@@ -1344,6 +1364,20 @@ impl Api {
                 }
                 if let Err(e) = api.sweep_spent_consoles(Timestamp::now()).await {
                     tracing::warn!(error = %e, "the console sweep could not run this round");
+                }
+                match api.inner.store.revision().await {
+                    Ok(now) => {
+                        if let Some(keep) = behind.take()
+                            && keep.0 > 1
+                            && let Err(e) = api.inner.store.compact(keep).await
+                        {
+                            tracing::warn!(error = %e, "the store's history could not be compacted this round");
+                        }
+                        behind = Some(now);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not read the store's revision, so nothing was compacted");
+                    }
                 }
             }
         });

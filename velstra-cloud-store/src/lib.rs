@@ -172,6 +172,26 @@ pub trait Store: Send + Sync + 'static {
     /// The store's current revision, for a watcher that wants to list first and
     /// then watch from exactly where the list ended.
     async fn revision(&self) -> Result<Revision>;
+
+    /// Throw away revision history older than `keep`.
+    ///
+    /// A store that keeps every revision for ever fills up and stops taking
+    /// writes — found live, on a two-day-old cell: etcd's default 2 GiB quota
+    /// held 393 kB of objects and two gigabytes of their history, and the
+    /// whole control plane answered `mvcc: database space exceeded` to a
+    /// login. Nothing anywhere compacted, so nothing could recover on its own.
+    ///
+    /// `keep` is a revision watchers may still resume from: the caller keeps a
+    /// window (see the API's compactor) so an ordinary reconnect lands inside
+    /// it, and one that does not gets the compaction error the watch path
+    /// already turns into a clean resync.
+    ///
+    /// A default that does nothing, because only a backend with history has
+    /// anything to throw away: the memory store keeps none.
+    async fn compact(&self, keep: Revision) -> Result<()> {
+        let _ = keep;
+        Ok(())
+    }
 }
 
 /// How a resource name becomes a key. One function, so a key layout change is
