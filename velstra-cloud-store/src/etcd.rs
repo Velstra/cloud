@@ -317,6 +317,17 @@ impl Store for EtcdStore {
         rx
     }
 
+    async fn compact(&self, keep: Revision) -> Result<()> {
+        match self.client.kv_client().compact(keep.0 as i64, None).await {
+            Ok(_) => Ok(()),
+            // Somebody — another API replica, an operator's etcdctl — got
+            // there first. The history is gone either way, which is all this
+            // asked for.
+            Err(e) if e.to_string().contains("has been compacted") => Ok(()),
+            Err(e) => Err(backend(e)),
+        }
+    }
+
     async fn revision(&self) -> Result<Revision> {
         // An empty transaction is the cheapest thing that returns a header and
         // nothing else. It compares nothing and writes nothing, so it does not
