@@ -2974,6 +2974,74 @@ async fn a_public_address_is_assigned_by_instance_out_of_the_cells_pool() {
     assert!(refused.to_string().contains("no public addresses"), "{refused}");
 }
 
+/// The month added up, for whoever may read the project — and nobody else.
+#[tokio::test]
+async fn a_tenant_sums_their_own_bill_and_not_a_neighbours() {
+    // Two readings this month, written the way the controller writes them —
+    // past the API, because readings are not creatable through it on purpose.
+    let (api2, raw) = cell_and_store().await;
+    let usage = TypedStore::<
+        velstra_cloud_model::usage::UsageRecordSpec,
+        velstra_cloud_model::usage::UsageRecordStatus,
+    >::new(raw, "cell-1", "usage");
+    let now = velstra_cloud_model::meta::Timestamp::now();
+    for (i, vcpus) in [(1u64, 2u32), (2, 4)] {
+        let at = velstra_cloud_model::meta::Timestamp(
+            now.0 - i * velstra_cloud_model::usage::INTERVAL_MS,
+        );
+        let record = velstra_cloud_model::resources::Resource::new(
+            velstra_cloud_model::meta::Meta::new(
+                format!("projects/p1/usage/{}", velstra_cloud_model::usage::id_for(at))
+                    .parse()
+                    .unwrap(),
+                velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+            ),
+            velstra_cloud_model::usage::UsageRecordSpec {
+                project: "projects/p1".into(),
+                at,
+                used: velstra_cloud_model::resources::Quota {
+                    vcpus,
+                    memory_mib: 2048,
+                    volume_gib: 10,
+                    instances: 1,
+                    ..Default::default()
+                },
+            },
+            Default::default(),
+        );
+        usage
+            .create(&record, &velstra_cloud_model::access::Writer::controller("usage"))
+            .await
+            .unwrap();
+    }
+    let sum = api2
+        .explain_usage(&name("projects/p1"), None, &who(ADA))
+        .await
+        .expect("a tenant reads their own bill");
+    // Two readings might straddle a month boundary at exactly the wrong hour;
+    // both fields still have to agree with what was counted.
+    let hours = sum["hours"].as_u64().unwrap();
+    assert!(hours >= 1, "{sum}");
+    if hours == 2 {
+        assert_eq!(sum["vcpuHours"], 6, "{sum}");
+        assert_eq!(sum["memoryGibHours"], 4, "{sum}");
+        assert_eq!(sum["volumeGibHours"], 20, "{sum}");
+    }
+    assert!(sum["hoursInMonthSoFar"].as_u64().unwrap() >= hours, "{sum}");
+
+    // Somebody else's bill is somebody else's.
+    assert!(
+        api2.explain_usage(&name("projects/p1"), None, &who(BOB)).await.is_err(),
+        "a tenant summed a neighbour's project"
+    );
+    // And a spelling that is not a month is refused, not read as now.
+    let refused = api2
+        .explain_usage(&name("projects/p1"), Some("August"), &who(ADA))
+        .await
+        .expect_err("a month called August");
+    assert!(refused.to_string().contains("2026-08"), "{refused}");
+}
+
 #[tokio::test]
 async fn listing_asks_about_what_is_being_listed_and_not_about_the_project() {
     // `GET /projects/p1/instances` authorises Read on `projects/p1`. Asking that

@@ -1039,6 +1039,18 @@ const server = createServer(async (req, res) => {
     });
   }
 
+  // `projects/p1:explainUsage` — the month, added up.
+  if (path.includes(":explainUsage")) {
+    if (req.method !== "GET") {
+      return fail(res, 405, "INVALID_ARGUMENT", "that method is not allowed here");
+    }
+    return json(res, 200, {
+      month: "2026-08", hours: 12, hoursInMonthSoFar: 744,
+      vcpuHours: 24, memoryGibHours: 24, volumeGibHours: 96,
+      instanceHours: 12, floatingIpHours: 0,
+    });
+  }
+
   // `…/i1:explainPlacement`
   if (path.includes(":explainPlacement")) {
     const name = nameFrom(path.replace(":explainPlacement", ""));

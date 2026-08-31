@@ -2834,6 +2834,24 @@ await test("a pool can be declared before its agent exists, and is handed its to
 
 /// A tenant's two questions in one answer: what am I allowed, and what would
 /// actually start.
+/// The bill's raw material, added up where the tenant looks — beside the
+/// allowance, because "what may I use" and "what have I used" are the same
+/// conversation. The gap is a number, not a suspicion: hours with no reading
+/// are named as uncounted rather than invented.
+await test("a project's sheet sums the month, and names the hours nobody counted", async () => {
+  await open(page, "projects");
+  await openRow(page, "p1");
+  const said = await waitFor(page, `(() => {
+    const box = document.getElementById("consumption");
+    return box && !box.textContent.includes("Asking") ? box.innerText : null;
+  })()`);
+  check(/2026-08/.test(said), `no month on the panel: ${said}`);
+  check(/24/.test(said) && /vCPU-hours/.test(said), `no vCPU-hours: ${said}`);
+  check(/732 hours of the month have no reading/.test(said),
+    `the gap is not named: ${said}`);
+  await page.evaluate(`closeSheet()`);
+});
+
 await test("a project's sheet says what is left and which limit is in the way", async () => {
   await open(page, "projects");
   await openRow(page, "p1");

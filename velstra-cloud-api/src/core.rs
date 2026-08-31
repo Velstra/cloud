@@ -3323,11 +3323,39 @@ impl Api {
             )
             .await?;
 
-        let target_name = spec
+        let mut target_name = spec
             .get("target")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // Left empty, the cell answers — the same shape as a volume's pool. A
+        // target is the cell's infrastructure, invisible to a tenant by
+        // design, so requiring its name made tenant backups impossible by
+        // construction: the form's picker was empty and the refusal named an
+        // object they may not list. Chosen: accepting, writable, most room.
+        if target_name.is_empty() {
+            let targets: Vec<velstra_cloud_model::resources::BackupTarget> =
+                self.typed_list("", "backup-targets").await?;
+            let chosen = targets
+                .iter()
+                .filter(|t| {
+                    t.spec.accepting
+                        && t.meta.deleted_at.is_none()
+                        && t.status.writable == Some(true)
+                })
+                .max_by_key(|t| t.status.free_gib);
+            let Some(target) = chosen else {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    "nowhere in this cell takes backups: no backup target is accepting and \
+                     writable. A cell operator declares one — a directory on a machine, or a \
+                     mount every pool agent reaches.",
+                )
+                .at("spec.target"));
+            };
+            target_name = target.meta.name.to_string();
+            spec["target"] = Value::String(target_name.clone());
+        }
         let target: velstra_cloud_model::resources::BackupTarget = self
             .typed(
                 &ResourceName::parse(&target_name).map_err(|e| {
@@ -4044,6 +4072,113 @@ impl Api {
             }
         }
         Ok(answer)
+    }
+
+    /// One month's consumption, summed the way a bill is.
+    ///
+    /// The hourly readings exist for exactly this and were only ever served
+    /// raw: forty-nine rows of "at 14:00 you had one guest" that nobody was
+    /// going to add up by hand. This adds them up — each reading is one hour
+    /// at what the reading says, which is the industry's own arithmetic — and
+    /// answers in metric-hours: vCPU-hours, memory-GiB-hours, storage
+    /// GiB-hours, address-hours.
+    ///
+    /// **`hours` is the number of readings, and that is the honest count.** A
+    /// cell that was down took no readings; those hours are missing from the
+    /// sum rather than invented, and a caller reconciling an invoice can see
+    /// the gap (`hours` vs. the hours in the month so far).
+    ///
+    /// Authorised as a read of the project, so a tenant sums their own bill
+    /// and nobody else's.
+    pub async fn explain_usage(
+        &self,
+        name: &ResourceName,
+        month: Option<&str>,
+        who: &Identity,
+    ) -> ApiResult<Value> {
+        self.authorize(who, Verb::Read, name).await?;
+        if name.collection() != "projects" {
+            return Err(ApiError::invalid("usage is summed for a project"));
+        }
+        let now = Timestamp::now();
+        let (year, month_no) = match month {
+            Some(text) => {
+                let mut halves = text.splitn(2, '-');
+                let parsed = (
+                    halves.next().and_then(|y| y.parse::<i64>().ok()),
+                    halves.next().and_then(|m| m.parse::<u32>().ok()),
+                );
+                match parsed {
+                    (Some(y), Some(m)) if (1..=12).contains(&m) => (y, m),
+                    _ => {
+                        return Err(ApiError::invalid(format!(
+                            "month is spelled 2026-08, and was {text:?}"
+                        ))
+                        .at("month"));
+                    }
+                }
+            }
+            None => {
+                let days = now.0 / 86_400_000;
+                // Civil-from-days (Howard Hinnant's algorithm), which is how a
+                // millisecond timestamp becomes "which month" without pulling a
+                // calendar crate in for one division.
+                let z = days as i64 + 719_468;
+                let era = z.div_euclid(146_097);
+                let doe = z.rem_euclid(146_097);
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                let y = yoe + era * 400 + i64::from(m <= 2);
+                (y, m as u32)
+            }
+        };
+        // The month's bounds, in the same civil arithmetic, run forward.
+        let days_from = |y: i64, m: u32| -> i64 {
+            let y = if m <= 2 { y - 1 } else { y };
+            let era = y.div_euclid(400);
+            let yoe = y.rem_euclid(400);
+            let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+            let doy = (153 * mp + 2) / 5;
+            era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+        };
+        let start = Timestamp(days_from(year, month_no) as u64 * 86_400_000);
+        let (next_y, next_m) = if month_no == 12 { (year + 1, 1) } else { (year, month_no + 1) };
+        let end = Timestamp(days_from(next_y, next_m) as u64 * 86_400_000);
+
+        let records: Vec<velstra_cloud_model::resources::UsageRecord> =
+            self.typed_list(&name.to_string(), "usage").await?;
+        let mut hours: u64 = 0;
+        let mut vcpu_hours: u64 = 0;
+        let mut memory_mib_hours: u64 = 0;
+        let mut volume_gib_hours: u64 = 0;
+        let mut instance_hours: u64 = 0;
+        let mut floating_ip_hours: u64 = 0;
+        for r in &records {
+            if r.spec.at.0 < start.0 || r.spec.at.0 >= end.0 {
+                continue;
+            }
+            hours += 1;
+            vcpu_hours += u64::from(r.spec.used.vcpus);
+            memory_mib_hours += r.spec.used.memory_mib;
+            volume_gib_hours += r.spec.used.volume_gib;
+            instance_hours += u64::from(r.spec.used.instances);
+            floating_ip_hours += u64::from(r.spec.used.floating_ips);
+        }
+        // How many billable hours the month has held so far, so a gap is a
+        // number and not a suspicion.
+        let elapsed_ms = now.0.clamp(start.0, end.0).saturating_sub(start.0);
+        Ok(json!({
+            "month": format!("{year:04}-{month_no:02}"),
+            "hours": hours,
+            "hoursInMonthSoFar": elapsed_ms / velstra_cloud_model::usage::INTERVAL_MS,
+            "vcpuHours": vcpu_hours,
+            "memoryGibHours": memory_mib_hours / 1024,
+            "volumeGibHours": volume_gib_hours,
+            "instanceHours": instance_hours,
+            "floatingIpHours": floating_ip_hours,
+        }))
     }
 
     /// What maintenance is planned for one node, and what it will cost.

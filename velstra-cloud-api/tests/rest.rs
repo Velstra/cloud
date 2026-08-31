@@ -4636,6 +4636,57 @@ async fn a_guest_is_put_on_a_network_or_on_one_of_its_subnets() {
     );
 }
 
+/// A backup asked for the way a customer asks: no target named.
+///
+/// A target is the cell's infrastructure, invisible to a tenant by design —
+/// so requiring its name made tenant backups impossible by construction: the
+/// form's picker was empty and the refusal named an object they may not list.
+/// Left empty, the cell's most roomy accepting target answers.
+#[tokio::test]
+async fn a_backup_without_a_target_goes_to_the_cells_most_roomy_one() {
+    let h = Harness::new();
+    h.pool("nvme").await;
+    // Two targets, reported by their agent: the roomier one wins.
+    for (id, free) in [("small", 5u64), ("big", 500u64)] {
+        h.post(
+            "backup-targets",
+            json!({ "id": id, "spec": { "kind": "directory", "path": format!("/srv/{id}"), "accepting": true, "agent": "nvme" } }),
+        )
+        .await;
+        let mut t = h.backup_targets().get(&format!("backup-targets/{id}")).await.unwrap().unwrap();
+        t.status.writable = Some(true);
+        t.status.free_gib = free;
+        h.backup_targets()
+            .update(&t, &velstra_cloud_model::access::Writer::agent("nvme"))
+            .await
+            .unwrap();
+    }
+    let vol = h
+        .post("projects/p1/volumes", json!({ "id": "data", "spec": { "pool": "nvme", "sizeGib": 1 } }))
+        .await;
+    assert_eq!(vol.status, StatusCode::ACCEPTED, "{:?}", vol.body);
+
+    let made = h
+        .post("projects/p1/backups", json!({ "id": "b1", "spec": { "volume": "projects/p1/volumes/data" } }))
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    let stored = h.get("projects/p1/backups/b1").await;
+    assert_eq!(stored.body["spec"]["target"], "backup-targets/big", "{:?}", stored.body["spec"]);
+
+    // A cell with nowhere to put a copy says so, with what an operator must do.
+    let h2 = Harness::new();
+    h2.pool("nvme").await;
+    h2.post("projects/p1/volumes", json!({ "id": "data", "spec": { "pool": "nvme", "sizeGib": 1 } })).await;
+    let refused = h2
+        .post("projects/p1/backups", json!({ "id": "b1", "spec": { "volume": "projects/p1/volumes/data" } }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
+    assert!(
+        refused.body["error"]["message"].as_str().unwrap_or_default().contains("nowhere in this cell takes backups"),
+        "{:?}", refused.body
+    );
+}
+
 #[test]
 fn a_full_store_is_a_precondition_and_not_an_internal_error() {
     // Found live. An afternoon of ordinary use filled etcd's 2 GiB default and

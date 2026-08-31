@@ -135,6 +135,11 @@ pub struct BackupSpec {
     /// The volume copied.
     pub volume: String,
     /// Where the copy goes.
+    ///
+    /// Left empty, the API settles it to the cell's most roomy accepting
+    /// target — a tenant cannot list targets and should not have to: where the
+    /// cell keeps copies is the cell's business. Stored, it is always filled.
+    #[serde(default)]
     pub target: String,
     /// The pool holding the source, derived by the API rather than asked for —
     /// the same reason a snapshot carries one: a pool agent's watch filter is

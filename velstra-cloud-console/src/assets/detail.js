@@ -534,6 +534,34 @@ async function historyInto(host, name) {
 /// tenant reads before creating a guest that will never be placed; "no valid
 /// host" is what they get afterwards, several minutes and one support ticket
 /// later.
+/// One month, as metric-hours. The gap between `hours` and the hours the
+/// month has held is shown rather than smoothed over: a cell that was down
+/// took no readings, and a bill with invented hours is worse than one with a
+/// stated gap.
+async function consumptionInto(host, project) {
+  fill(host, el("p.faint", "Asking…"));
+  try {
+    const u = await explainUsage(project);
+    const rows = [
+      ["vCPU-hours", u.vcpuHours],
+      ["Memory GiB-hours", u.memoryGibHours],
+      ["Storage GiB-hours", u.volumeGibHours],
+      ["Instance-hours", u.instanceHours],
+      ["Public-address-hours", u.floatingIpHours],
+    ].filter(([, v]) => Number(v) > 0);
+    const gap = Number(u.hoursInMonthSoFar || 0) - Number(u.hours || 0);
+    fill(host,
+      el("p.muted", u.month + " · " + u.hours + " hourly readings" +
+        (gap > 0 ? " — " + gap + " hours of the month have no reading and are not counted" : "")),
+      rows.length
+        ? el("table.kv", el("tbody",
+            rows.map(([label, v]) => el("tr", el("td", label), el("td", String(v))))))
+        : el("p.muted", "Nothing was in use this month."));
+  } catch (e) {
+    fill(host, el("p.err", String((e && e.message) || e)));
+  }
+}
+
 async function allowanceInto(host, project) {
   fill(host, el("p.faint", "Asking…"));
   try {
@@ -830,6 +858,12 @@ function renderSheet(coll, r) {
     const host = el("div", { id: "allowance" });
     panel.appendChild(spread("Allowance", host, "what is left, and what could actually start"));
     allowanceInto(host, idOf(r));
+    // And what this month has cost so far — the hourly readings, added up the
+    // way a bill is. Beside the allowance because the two are the same
+    // conversation: what may I use, and what have I used.
+    const used = el("div", { id: "consumption" });
+    panel.appendChild(spread("Consumption", used, "this month, summed from the hourly readings"));
+    consumptionInto(used, nameOf(r));
   }
 
   // What a maintenance window will cost, on the machine it is about. Fetched
