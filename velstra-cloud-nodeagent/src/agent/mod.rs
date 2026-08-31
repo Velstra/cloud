@@ -1060,6 +1060,62 @@ impl Agent {
             .iter()
             .flat_map(|i| i.spec.ports.iter().map(String::as_str))
             .collect();
+        // Every port of every guest that concerns this node — assigned here,
+        // still reported here, or named by an open migration with this node at
+        // either end. A migration names both ends on purpose: the source keeps
+        // its half of the wire standing until the record is gone, and the
+        // destination may program its half before the guest lands.
+        let me = self.config.node.as_str();
+        let in_my_share: BTreeSet<&str> = instances
+            .iter()
+            .filter(|i| {
+                i.spec.node.as_deref() == Some(me)
+                    || i.status.node.as_deref() == Some(me)
+                    || migrations.iter().any(|m| {
+                        // A record on its way out no longer holds the wire
+                        // open — asking for the migration's deletion is the
+                        // gesture that lets the source's half go.
+                        !m.meta.is_deleting()
+                            && m.spec.instance == i.meta.name.to_string()
+                            && (m.spec.from_node == me || m.spec.to_node == me)
+                    })
+            })
+            .flat_map(|i| i.spec.ports.iter().map(String::as_str))
+            .collect();
+        // Taps for nobody. A cold move stops the guest here and starts it
+        // there — and left this node's half of the wire standing: the tap
+        // stayed programmed, the port went on reporting `node=<here>`, and the
+        // node actually running the guest politely refused to claim a port
+        // another machine spoke for. Found live as a write ping-pong on one
+        // port object. Once the guest stops concerning this node (the
+        // migration record is gone), its tap does too.
+        for (port_name, _tap) in taps.clone() {
+            if in_my_share.contains(port_name.as_str()) {
+                continue;
+            }
+            // A deleting port's teardown is the owner path's below — it is the
+            // one that reports `Released`, and a second unprogram here would
+            // count the same failure twice.
+            if ports.get(&port_name).is_some_and(|p| p.meta.is_deleting()) {
+                continue;
+            }
+            tracing::info!(port = %port_name,
+                "tearing down a tap for a port no guest of this node's uses");
+            if let Err(e) = self.datapath.unprogram(&port_name).await {
+                tracing::warn!(port = %port_name, error = %e, "the leftover tap would not go");
+                pass.failures += 1;
+            } else {
+                pass.actions += 1;
+            }
+        }
+        let taps = match self.datapath.observe().await {
+            Ok(programmed) => taps_of(&programmed),
+            Err(e) => {
+                tracing::error!(error = %e, "could not re-read the datapath after the sweep");
+                pass.failures += 1;
+                return pass;
+            }
+        };
         for port in ports.values() {
             let name = port.meta.name.to_string();
             let owner = port.status.node.as_deref();
@@ -1073,7 +1129,8 @@ impl Agent {
             let mine_to_report = owner == Some(self.config.node.as_str())
                 || (owner.is_none() && referenced.contains(name.as_str()));
             if mine_to_report {
-                self.port_pass(port, &taps, &mut pass).await;
+                self.port_pass(port, &taps, in_my_share.contains(name.as_str()), &mut pass)
+                    .await;
             }
         }
 
@@ -1911,7 +1968,13 @@ impl Agent {
     /// it, because a port exists to be plugged into something. What is left is
     /// to say what the datapath actually has, and to clean up a port that is
     /// being deleted on its own.
-    async fn port_pass(&self, stored: &Port, taps: &BTreeMap<String, String>, pass: &mut Pass) {
+    async fn port_pass(
+        &self,
+        stored: &Port,
+        taps: &BTreeMap<String, String>,
+        in_my_share: bool,
+        pass: &mut Pass,
+    ) {
         let name = stored.meta.name.to_string();
         let mut outcome = Ok(());
         let mut taps = taps.clone();
@@ -1941,7 +2004,16 @@ impl Agent {
         }
 
         let mut next = stored.clone();
-        next.status.node = Some(self.config.node.clone());
+        // A port whose guest is nobody of this node's is let go of, not
+        // re-claimed: writing `node=<here>` back would keep the true holder
+        // refusing to speak for it for ever. The sweep above has already taken
+        // the tap; clearing the owner is what lets the node running the guest
+        // claim the object on its next pass.
+        next.status.node = if in_my_share || stored.meta.is_deleting() {
+            Some(self.config.node.clone())
+        } else {
+            None
+        };
         next.status.observed_generation = stored.meta.generation;
         next.status.programmed = taps.contains_key(&name);
         next.status.tap_device = taps.get(&name).cloned();
