@@ -2757,7 +2757,8 @@ impl Api {
         if !self.is_operator(who) {
             return Err(ApiError::new(
                 Code::PermissionDenied,
-                "placement names the cell's machines, and those are a cell operator's                  to see. Whether the guest runs is on the instance itself.",
+                "placement names the cell's machines, and those are a cell operator's to \
+                 see. Whether the guest runs is on the instance itself.",
             ));
         }
         if name.collection() != "instances" {
@@ -5825,7 +5826,8 @@ impl Api {
         if !self.is_operator(who) {
             return Err(ApiError::new(
                 Code::PermissionDenied,
-                "migrations are a cell operator's: they name the machines a guest moves                  between, and those are not part of a project's view.",
+                "migrations are a cell operator's: they name the machines a guest moves \
+                 between, and those are not part of a project's view.",
             ));
         }
         if name.collection() != "instances" {
