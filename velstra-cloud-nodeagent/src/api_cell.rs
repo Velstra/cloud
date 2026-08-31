@@ -428,6 +428,10 @@ impl CellReader for ApiCell {
         self.list("floatingips").await
     }
 
+    async fn bgp_peers(&self) -> Result<Vec<velstra_cloud_model::resources::BgpPeer>> {
+        self.list("bgp-peers").await
+    }
+
     /// Cell-wide, so no project in the path and no `?node=` filter: these are
     /// the two collections a node reads whole. Filtering the node list to this
     /// node would defeat the point of reading it — the Ceph pass decides

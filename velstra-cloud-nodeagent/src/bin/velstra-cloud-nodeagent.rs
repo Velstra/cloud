@@ -484,6 +484,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => Agent::new(store, config, vmm, datapath),
     };
+    // Every agent gets the speaker; the pass is a no-op until an operator
+    // writes a `bgp-peers` object naming this machine, so a host without FRR
+    // installed is never asked to reload it.
+    let agent = agent.with_bgp(Arc::new(velstra_cloud_nodeagent::bgp::FrrSpeaker::new()));
     // Both would own the far end of the same taps, and the fabric's answer is
     // the one with the tenant separation in it. Said here rather than letting
     // the last writer win.

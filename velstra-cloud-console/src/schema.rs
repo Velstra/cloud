@@ -1170,6 +1170,65 @@ const FLAVOR_FIELDS: &[Field] = &[
     },
 ];
 
+const BGP_PEER_FIELDS: &[Field] = &[
+    Field {
+        key: "peer",
+        label: "Peer address",
+        kind: Kind::Text { placeholder: "10.10.10.1", check: Check::None },
+        required: true,
+        advanced: false,
+        help: "The router or firewall in front of the cell.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "peerAs",
+        label: "Peer AS",
+        kind: Kind::Number { unit: "", min: 1, max: 4_294_967_295, step: 1, scale: Scale::None },
+        required: true,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "localAs",
+        label: "Local AS",
+        kind: Kind::Number { unit: "", min: 1, max: 4_294_967_295, step: 1, scale: Scale::None },
+        required: true,
+        advanced: false,
+        help: "",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "node",
+        label: "Speaks from",
+        kind: Kind::Ref { collection: "nodes", filter_by: None, spelling: Spelling::Id },
+        required: true,
+        advanced: false,
+        help: "The machine that holds the session — a gateway, with FRR \
+               installed. One session is one speaker.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "description",
+        label: "Description",
+        kind: Kind::Text { placeholder: "edge firewall, rack 3", check: Check::None },
+        required: false,
+        advanced: true,
+        help: "",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+];
+
 const INSTANCE_FIELDS: &[Field] = &[
     Field {
         key: "flavor",
@@ -4486,6 +4545,58 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "bgp-peers",
+        title: "BGP peers",
+        singular: "BGP peer",
+        recheck: 0,
+        condition: "Ready",
+        group: "Network",
+        scope: Scope::Global,
+        blurb: "Sessions from the cell's gateways to the routers in front of \
+                it. What gets announced is derived, never listed: every \
+                external subnet, and a host route for each public address that \
+                is in front of something — so the router ahead of the cell and \
+                this console cannot disagree about what the cell claims.",
+        fields: BGP_PEER_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.peer",
+                label: "Peer",
+                cell: Cell::Mono,
+                width: 140,
+            },
+            Column {
+                path: "spec.peerAs",
+                label: "Peer AS",
+                cell: Cell::Text,
+                width: 88,
+            },
+            Column {
+                path: "spec.node",
+                label: "Speaks from",
+                cell: Cell::Mono,
+                width: 112,
+            },
+            Column {
+                path: "status.session",
+                label: "Session",
+                cell: Cell::Text,
+                width: 112,
+            },
+            Column {
+                path: "status.announced",
+                label: "Announced",
+                cell: Cell::Text,
+                width: 96,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
         id: "routers",
         title: "Routers",
         singular: "router",
@@ -5085,7 +5196,7 @@ mod tests {
         }
         assert_eq!(
             COLLECTIONS.len(),
-            32,
+            33,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:

@@ -50,9 +50,10 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 33] = [
+pub const COLLECTIONS: [&str; 34] = [
     "projects",
     "flavors",
+    "bgp-peers",
     "folders",
     "roles",
     "users",
@@ -500,6 +501,11 @@ impl Api {
                 "flavors",
                 velstra_cloud_model::resources::FlavorSpec,
                 velstra_cloud_model::resources::FlavorStatus
+            ),
+            collection!(
+                "bgp-peers",
+                velstra_cloud_model::resources::BgpPeerSpec,
+                velstra_cloud_model::resources::BgpPeerStatus
             ),
             collection!(
                 "backup-targets",

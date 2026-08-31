@@ -69,7 +69,7 @@ const CELL_ONLY = [
   // `projects` stays: a tenant's gated list of it is the one project already
   // in the header switcher, and a board of one row is furniture.
   "nodes", "pools", "ceph-clusters", "device-classes", "maintenance-windows",
-  "image-sources", "projects", "users", "backup-targets",
+  "image-sources", "projects", "users", "backup-targets", "bgp-peers",
 ];
 
 function groups() {
