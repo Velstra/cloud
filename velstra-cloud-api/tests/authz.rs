@@ -2696,7 +2696,7 @@ async fn the_fleet_reports_are_refused_to_whoever_may_not_list_the_fleet() {
 /// name was honoured silently by the scheduler.
 #[tokio::test]
 async fn a_tenant_sees_no_machines_through_any_window() {
-    let api = cell().await;
+    let (api, store) = cell_and_store().await;
     // A placed guest, as the cell sees it.
     api.create(
         "projects/p1",
@@ -2723,6 +2723,74 @@ async fn a_tenant_sees_no_machines_through_any_window() {
     // And the operator still sees it whole: redaction is a view, not a change.
     let whole = api.get(&name("projects/p1/instances/web"), &who(OPERATOR)).await.unwrap();
     assert_eq!(whole["spec"]["node"], "hv-1");
+
+    // Ports: the fifth door, found live in a tenant's own list after the
+    // other four were shut. A port names the machine twice — `status.node`,
+    // and again in the words of the computed Ready condition ("carried by
+    // hv-1"). Both are taken off the tenant's answer; the condition's status
+    // and reason stay, because whether their wire is programmed is theirs.
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "net", "spec": { "mtu": 1450, "vni": 0 } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "projects/p1",
+        "subnets",
+        &json!({ "id": "net", "spec": {
+            "network": "projects/p1/networks/net",
+            "cidr": "10.9.0.0/24", "gateway": "10.9.0.1" } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "projects/p1",
+        "ports",
+        &json!({ "id": "wire", "spec": {
+            "network": "projects/p1/networks/net",
+            "subnet": "projects/p1/subnets/net" } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    {
+        use velstra_cloud_model::access::Writer;
+        use velstra_cloud_model::resources::{PortSpec, PortStatus};
+        let ports: velstra_cloud_store::TypedStore<PortSpec, PortStatus> =
+            velstra_cloud_store::TypedStore::new(store.clone(), "cell-1", "ports");
+        let mut port = ports.get("projects/p1/ports/wire").await.unwrap().unwrap();
+        port.spec.node = Some("hv-1".to_string());
+        port.meta.generation += 1;
+        ports.update(&port, &Writer::controller("test")).await.unwrap();
+        let mut port = ports.get("projects/p1/ports/wire").await.unwrap().unwrap();
+        port.status.node = Some("hv-1".to_string());
+        port.status.programmed = true;
+        ports.update(&port, &Writer::agent("hv-1")).await.unwrap();
+    }
+    let port_seen = api.get(&name("projects/p1/ports/wire"), &who(ADA)).await.unwrap();
+    assert!(port_seen["spec"].get("node").is_none(), "{:?}", port_seen["spec"]);
+    assert!(port_seen["status"].get("node").is_none(), "{:?}", port_seen["status"]);
+    let ready = port_seen["status"]["conditions"]
+        .as_array().unwrap().iter().find(|c| c["kind"] == "Ready").cloned().unwrap();
+    assert_eq!(ready["reason"], "Programmed");
+    assert!(
+        !ready["message"].as_str().unwrap_or_default().contains("hv-1"),
+        "the condition's words leak the machine: {ready}"
+    );
+    let port_listed = api
+        .list_for("projects/p1", "ports", &Default::default(), &who(ADA))
+        .await
+        .unwrap();
+    for item in &port_listed.items {
+        assert!(item["status"].get("node").is_none(), "the port list leaks: {:?}", item["status"]);
+    }
+    // The operator's view keeps the machine, words and all.
+    let port_whole = api.get(&name("projects/p1/ports/wire"), &who(OPERATOR)).await.unwrap();
+    assert_eq!(port_whole["status"]["node"], "hv-1");
 
     // Migrations: refused whole — create and read alike.
     let refused = api
