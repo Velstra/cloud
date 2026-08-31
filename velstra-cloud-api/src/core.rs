@@ -2512,7 +2512,20 @@ impl Api {
             self.authorize(who, Verb::Read, &name).await?;
             Gate::Everything
         };
-        self.watch_gated(parent, kind, from, filter, gate)
+        let stream = self.watch_gated(parent, kind, from, filter, gate)?;
+        // The same trimming a read gets, or the watch is the hole: the list
+        // arrives redacted and the first event puts the machine name back on
+        // the tenant's screen — which is exactly where it was seen.
+        let api = self.clone();
+        let who = who.clone();
+        let kind = kind.to_string();
+        Ok(stream.map(move |event| match event {
+            WatchEvent::Put(mut document) => {
+                api.redact_for(&who, &kind, &mut document);
+                WatchEvent::Put(document)
+            }
+            delete => delete,
+        }))
     }
 
     /// The same, for a caller that must not be sent every event in the cell.
