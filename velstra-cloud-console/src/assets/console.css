@@ -1107,7 +1107,7 @@ pre.terminal:focus {
     border-right: 1px solid var(--border);
     box-shadow: none;
   }
-  aside#rail.open { transform: none; box-shadow: 0 12px 40px rgb(0 0 0 / .45); }
+  aside#rail.open { transform: none; box-shadow: var(--shadow-lg); }
   /* The header sheds what a narrow bar cannot carry: the census line is on the
      overview one tap away, and the keystroke hint teaches a key a phone does
      not have. Who is signed in stays — acting as the wrong account costs the
