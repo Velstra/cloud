@@ -77,3 +77,28 @@ decides what happens:
 The safe pairing for machines that flap (laptops, Wi-Fi) is the default. The
 available pairing for real servers on real power is `fenceAfterS: 120` and
 `onNodeLoss: restart` on the guests that may move.
+
+
+## Announcing the cell over BGP
+
+A gateway that should speak BGP needs one thing installed by hand: `apt-get
+install frr`. Everything else is the platform's — the agent enables `bgpd`
+(and `staticd`, for the blackhole routes that satisfy `network` statements),
+renders `/etc/frr/frr.conf` from the `bgp-peers` objects, and reloads FRR only
+when the derived announcement set actually changed.
+
+Create a session as the operator:
+
+```
+POST /api/v1/bgp-peers
+{ "id": "edge", "spec": { "peer": "10.10.10.1", "peerAs": 65000,
+                          "localAs": 65010, "node": "gw-1" } }
+```
+
+`status.session` reports FRR's own word (`Established`, `Active`, …) and
+`status.announced` the prefix count. What is announced is derived: every
+external subnet, plus a host route per floating address that names a port.
+The far end must accept eBGP without an import policy or carry its own
+(RFC 8212 — modern FRR filters everything until a policy exists; the rendered
+config on our side already says `no bgp ebgp-requires-policy` because the
+network statements *are* the policy).

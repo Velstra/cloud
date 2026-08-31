@@ -152,12 +152,29 @@ pub fn render_frr(desired: &BgpDesired) -> String {
          log syslog informational\n\
          !\n",
     );
+    // A `network` statement only announces what the RIB carries, and a
+    // gateway that NATs a pool holds no route for it — the address is
+    // answered in PREROUTING, before routing ever sees it. Blackhole routes
+    // put the prefixes in the RIB so BGP will speak them, and drop only the
+    // traffic to addresses nothing has claimed, which is where such traffic
+    // belongs.
+    for p in desired.networks_v4.iter().chain(&desired.hosts_v4) {
+        let _ = writeln!(out, "ip route {p} blackhole");
+    }
+    for p in desired.networks_v6.iter().chain(&desired.hosts_v6) {
+        let _ = writeln!(out, "ipv6 route {p} blackhole");
+    }
     let mut by_as: BTreeMap<u32, Vec<&BgpSession>> = BTreeMap::new();
     for s in &desired.sessions {
         by_as.entry(s.local_as).or_default().push(s);
     }
     for (local_as, sessions) in by_as {
         let _ = writeln!(out, "router bgp {local_as}");
+        // RFC 8212: modern FRR announces nothing over eBGP until a policy
+        // says so. The policy *is* this file — the network statements are
+        // already the exact list — so the gate would only ever mean "say
+        // nothing", silently.
+        let _ = writeln!(out, " no bgp ebgp-requires-policy");
         // The daemon must not guess an id from whichever interface it saw
         // first: derive one stable answer from the AS so two gateways never
         // collide by accident. An operator who needs a specific id sets up
@@ -225,8 +242,11 @@ impl BgpSpeaker for FrrSpeaker {
         // none it does not own.
         let daemons = self.config.with_file_name("daemons");
         if let Ok(current) = tokio::fs::read_to_string(&daemons).await {
-            if current.contains("bgpd=no") {
-                let turned_on = current.replace("bgpd=no", "bgpd=yes");
+            if current.contains("bgpd=no") || current.contains("staticd=no") {
+                let turned_on = current
+                    .replace("bgpd=no", "bgpd=yes")
+                    // The blackhole routes below are staticd's to install.
+                    .replace("staticd=no", "staticd=yes");
                 tokio::fs::write(&daemons, turned_on).await.map_err(|e| {
                     crate::host::HostError::failed(format!(
                         "could not enable bgpd in {}: {e}",
@@ -423,6 +443,9 @@ mod what_the_cell_announces {
         );
         let conf = render_frr(&desired);
         assert!(conf.contains("router bgp 65010"), "{conf}");
+        assert!(conf.contains(" no bgp ebgp-requires-policy"), "{conf}");
+        assert!(conf.contains("ip route 203.0.113.0/24 blackhole"), "{conf}");
+        assert!(conf.contains("ipv6 route 2001:db8:77::/64 blackhole"), "{conf}");
         assert!(conf.contains("neighbor 10.10.10.1 remote-as 65000"), "{conf}");
         assert!(conf.contains("  network 203.0.113.0/24"), "{conf}");
         assert!(conf.contains("  network 203.0.113.7/32"), "{conf}");
