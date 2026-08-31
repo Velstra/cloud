@@ -41,10 +41,14 @@ async function topologyFacts() {
       return [];
     }
   };
-  const [routers, networks, subnets, ports, instances, floating, balancers, nodes] =
+  const [routers, networks, subnets, ports, instances, floating, balancers, bgp, nodes] =
     await Promise.all([
       want("routers"), want("networks"), want("subnets"), want("ports"),
       want("instances"), want("floatingips"), want("load-balancers"),
+      // The operator's sessions to the routers in front of the cell. Refused
+      // to a tenant, and that is not an error here: their map simply has no
+      // such rows.
+      list(collection("bgp-peers")).then((r) => r.items).catch(() => []),
       // The one cell-wide fact on the page. A tenant may not read `nodes`, and
       // that is not an error here: it means this page cannot say how the
       // project reaches the internet, which it says instead of guessing.
@@ -56,7 +60,7 @@ async function topologyFacts() {
       // the difference has to survive the fetch.
       list(collection("nodes")).then((r) => r.items).catch(() => null),
     ]);
-  return { routers, networks, subnets, ports, instances, floating, balancers, nodes, trouble };
+  return { routers, networks, subnets, ports, instances, floating, balancers, bgp, nodes, trouble };
 }
 
 /// Everything a port knows about itself, gathered once.
@@ -144,6 +148,14 @@ function internetBlock(f) {
       ? { trouble: "no way out" }
       : {}));
 
+  for (const peer of f.bgp || []) {
+    const state = at(status(peer), "session") || "no session yet";
+    const announced = at(status(peer), "announced");
+    box.appendChild(mapRow(1, "bgp", idOf(peer),
+      at(spec(peer), "peer") + " · AS " + at(spec(peer), "peerAs") + " · " + state +
+        (announced ? " · " + announced + " prefixes" : ""),
+      { goes: nameOf(peer), onclick: () => openFromMap("bgp-peers", peer) }));
+  }
   for (const fip of f.floating) {
     const port = at(spec(fip), "port");
     const address = at(status(fip), "address") || at(spec(fip), "address") || "no address yet";
@@ -332,8 +344,11 @@ function graphOf(f, index) {
 
   // The internet crowns the middle of everything that reaches it.
   const width = Math.max(1, slot) * SLOT;
+  const sessions = (f.bgp || [])
+    .map((p) => at(spec(p), "peer") + " " + (at(status(p), "session") || ""))
+    .join(" · ");
   nodes.push({ id: "internet", kind: "internet", label: "Internet",
-    sub: "", x: (width - SLOT) / 2, y: 0, w: W });
+    sub: sessions, x: (width - SLOT) / 2, y: 0, w: W });
   return { nodes, edges, width };
 }
 
