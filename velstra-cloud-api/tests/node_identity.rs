@@ -559,3 +559,88 @@ async fn a_machine_agent_reads_the_machine_room_and_not_the_cells_accounts() {
         "a machine agent listed the cell's users"
     );
 }
+
+/// A machine reads the object as it is stored; a person reads it decorated.
+///
+/// The computed answers (`answer_port` and friends) rewrite conditions on the
+/// way out — presentation for people. An agent that read the decorated object
+/// wrote its own undecorated one straight back, on every pass, for ever: three
+/// writes a second on a settled two-node cell, each one waking the watch that
+/// started the next pass. The store's own bytes are what an agent must see.
+#[tokio::test]
+async fn a_machine_reads_the_stored_object_not_the_presentation() {
+    let (api, _store) = cell();
+    let token = register_node(&api, "node-a").await;
+    let node_a = agent(&api, &token).await;
+
+    // A network with a subnet, so creating an instance mints a port.
+    api.create(
+        "projects/p1",
+        "networks",
+        &json!({ "id": "default", "spec": { "mtu": 1450, "vni": 0 } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("a network");
+    api.create(
+        "projects/p1",
+        "subnets",
+        &json!({ "id": "default", "spec": {
+            "network": "projects/p1/networks/default",
+            "cidr": "10.0.0.0/24", "gateway": "10.0.0.1"
+        } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("a subnet");
+    api.create(
+        "projects/p1",
+        "ports",
+        &json!({ "id": "p", "spec": {
+            "network": "projects/p1/networks/default",
+            "subnet": "projects/p1/subnets/default"
+        } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("a port");
+    let port = name("projects/p1/ports/p");
+
+    // The operator's read is decorated: a port nobody carries answers Ready
+    // with the computed "Unused" explanation.
+    let seen_by_person = api.get(&port, &who(OPERATOR)).await.unwrap();
+    let decorated = seen_by_person["status"]["conditions"]
+        .as_array()
+        .and_then(|c| c.iter().find(|c| c["kind"] == "Ready"))
+        .cloned()
+        .expect("a person's read answers whether the port waits on anybody");
+    assert_eq!(decorated["reason"], json!("Unused"));
+
+    // The machine's read is raw: no computed condition, because the agent
+    // never wrote one — and what it reads is what it will compare its next
+    // report against.
+    let seen_by_machine = api.get(&port, &node_a).await.unwrap();
+    let raw = seen_by_machine["status"]["conditions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        raw.iter().all(|c| c["kind"] != "Ready"),
+        "a machine was served the presentation, which it would write straight \
+         back: {raw:?}"
+    );
+
+    // The list a machine's pass is built from answers the same way.
+    let listed = api
+        .list_for("projects/p1", "ports", &Default::default(), &node_a)
+        .await
+        .expect("a machine lists the ports");
+    let from_list = listed.items[0]["status"]["conditions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        from_list.iter().all(|c| c["kind"] != "Ready"),
+        "the list decorated what the read did not: {from_list:?}"
+    );
+}

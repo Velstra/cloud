@@ -619,7 +619,12 @@ impl Api {
             .get(&name.to_string())
             .await?
             .ok_or_else(|| ApiError::not_found(name))?;
-        self.answer(&mut document, &mut Scratch::default()).await?;
+        // Raw for a machine, for the reason `Gate::Machine` gives: an agent
+        // that reads a decorated object writes its own undecorated one back,
+        // every pass, for ever.
+        if crate::sessions::agent_node(who).is_none() {
+            self.answer(&mut document, &mut Scratch::default()).await?;
+        }
         self.redact_for(who, name.collection(), &mut document);
         Ok(document)
     }
@@ -1474,7 +1479,14 @@ impl Api {
         if !parent.is_empty() {
             let name = ResourceName::parse(parent).map_err(ApiError::from)?;
             self.authorize_for(who, Verb::Read, &name, kind).await?;
-            let mut listing = self.list_page(parent, kind, filter, paging).await?;
+            // Raw for a machine here too — a project-scoped list is the same
+            // pass an agent builds its view from. See `Gate::Machine`.
+            let gate = if crate::sessions::agent_node(who).is_some() {
+                Gate::Machine
+            } else {
+                Gate::Everything
+            };
+            let mut listing = self.list_gated(parent, kind, filter, paging, &gate).await?;
             // The third door, after the read and the watch. A project list is
             // authorised at the parent and served whole — and it was serving
             // the machine names the other two doors had already stopped, which
@@ -1516,7 +1528,9 @@ impl Api {
                 ),
             ));
         }
-        let gate = if self.is_operator(who) || its_own_pass {
+        let gate = if a_machine {
+            Gate::Machine
+        } else if self.is_operator(who) {
             Gate::Everything
         } else {
             Gate::Readable(who.clone())
@@ -1758,7 +1772,9 @@ impl Api {
                         continue;
                     }
                 }
-                self.answer(&mut document, &mut scratch).await?;
+                if !matches!(gate, Gate::Machine) {
+                    self.answer(&mut document, &mut scratch).await?;
+                }
                 // The same trimming a single read gets. A list gated on the
                 // reader is a tenant's list, and their board is where the
                 // machine names were actually on screen.
@@ -2326,10 +2342,11 @@ impl Api {
         };
         let collection = self.collection(name.collection())?;
         let writer = velstra_cloud_model::Writer::agent(node);
-        let mut document = collection
+        let document = collection
             .report_status(&name.to_string(), status, expect, &writer)
             .await?;
-        self.answer(&mut document, &mut Scratch::default()).await?;
+        // Raw, not decorated: the caller here is an agent by definition, and
+        // the computed answers are presentation for people — see `Gate::Machine`.
         Ok(document)
     }
 
@@ -2541,10 +2558,13 @@ impl Api {
         filter: Filter,
         who: &Identity,
     ) -> ApiResult<impl Stream<Item = WatchEvent> + Send + use<>> {
+        let a_machine = crate::sessions::agent_node(who).is_some();
         let gate = if parent.is_empty() {
             // A cell-wide stream. An operator is asking about the cell on
             // purpose; anybody else is told about what they may read.
-            if self.is_operator(who) {
+            if a_machine {
+                Gate::Machine
+            } else if self.is_operator(who) {
                 Gate::Everything
             } else {
                 Gate::Readable(who.clone())
@@ -2552,7 +2572,7 @@ impl Api {
         } else {
             let name = ResourceName::parse(parent).map_err(ApiError::from)?;
             self.authorize(who, Verb::Read, &name).await?;
-            Gate::Everything
+            if a_machine { Gate::Machine } else { Gate::Everything }
         };
         let stream = self.watch_gated(parent, kind, from, filter, gate)?;
         // The same trimming a read gets, or the watch is the hole: the list
@@ -2669,9 +2689,11 @@ impl Api {
                     let name = name_of(&document).and_then(|n| ResourceName::parse(&n).ok())?;
                     self.authorize(who, Verb::Read, &name).await.ok()?;
                 }
-                self.answer(&mut document, &mut Scratch::default())
-                    .await
-                    .ok()?;
+                if !matches!(gate, Gate::Machine) {
+                    self.answer(&mut document, &mut Scratch::default())
+                        .await
+                        .ok()?;
+                }
                 Some(WatchEvent::Put(document))
             }
             Event::Delete { key, revision } => {
@@ -6192,6 +6214,13 @@ fn exceeded(limit: u64, wanted: u64, what: &str, field: &str) -> ApiResult<()> {
 #[derive(Clone)]
 enum Gate {
     Everything,
+    /// A node agent's stream. Everything it may read, and *raw*: the computed
+    /// answers below are presentation for people, and an agent that reads a
+    /// decorated object writes its own undecorated one straight back — every
+    /// pass, for ever. Found live as three writes a second on a settled cell:
+    /// `answer_port` rewrote `Ready` on the way out, the agent rewrote it on
+    /// the way back, and each write woke the watch that started the next pass.
+    Machine,
     Readable(Identity),
 }
 

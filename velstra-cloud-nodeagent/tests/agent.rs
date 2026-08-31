@@ -1166,3 +1166,59 @@ async fn a_volume_whose_pool_has_not_said_where_it_is_waits_instead_of_guessing(
     );
     let _ = pass;
 }
+
+/// A guest whose instance is gone from the cell is stopped, not carried.
+///
+/// The delete pipeline stops a guest while its record still exists; a guest
+/// that survives past that (an agent that was down for the whole deletion) has
+/// nobody left to ask for its end. Found live as a QEMU running two days after
+/// its instance was deleted, holding a tap the sweep could never remove.
+#[tokio::test]
+async fn a_guest_whose_instance_is_gone_is_stopped() {
+    let store = store();
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+
+    // The guest is running and the store has never heard of it.
+    vmm.start_detached(I1);
+    assert!(vmm.is_running(I1));
+
+    agent.resync().await;
+    assert!(
+        !vmm.is_running(I1),
+        "a guest with no instance anywhere kept running"
+    );
+}
+
+/// A small wobble in the free-memory reading is not a report.
+///
+/// /proc never answers the same twice on a busy machine, so "did anything
+/// change" was answered yes on every pass — and every write woke the watch
+/// that started the next pass. The fresh figure still goes out on the
+/// heartbeat cadence.
+#[tokio::test]
+async fn memory_jitter_alone_is_not_worth_a_write() {
+    let (store, vmm, _datapath, agent) = one_instance_on("node-a").await;
+    create_node(&store, "node-a").await;
+    agent.resync().await;
+    agent.resync().await;
+    let settled = agent.resync().await;
+    assert_eq!(settled, Pass::default());
+
+    // A few MiB of jitter, as any second look at /proc produces.
+    vmm.wobble_free_memory(16);
+    let jittered = agent.resync().await;
+    assert_eq!(
+        jittered,
+        Pass::default(),
+        "a MiB-scale wobble in free memory was written to the store"
+    );
+
+    // A real movement is reported without waiting for the heartbeat.
+    vmm.wobble_free_memory(2048);
+    let moved = agent.resync().await;
+    assert_eq!(moved.reports, 1, "a real memory movement was not reported: {moved:?}");
+    let node = read_node(&store, "node-a").await;
+    assert!(node.status.capacity.memory_mib > 0);
+}
