@@ -1117,6 +1117,9 @@ pre.terminal:focus {
   #jump kbd { display: none; }
 }
 @media (max-width: 560px) {
+  /* The sheet's gutter column is a third of a phone; the labels go above
+     their content instead of beside it. */
+  .spread { grid-template-columns: 1fr; }
   #whoami { display: none; }
   /* The theme toggle is the one header control that is pure preference; on a
      phone it gives its place to the controls that do work. */

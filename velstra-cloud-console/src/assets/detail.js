@@ -786,7 +786,7 @@ function renderSheet(coll, r) {
   // Abandoning a migration is not deleting a row: what it costs depends on the
   // mode, and the sentence is different enough that it is written where the
   // modes are.
-  if (coll.deletable) {
+  if (coll.deletable && (coll.id !== "audit" || (session.who && session.who.cellAdmin))) {
     acts.appendChild(coll.id === "migrations"
       ? deleteControl(coll, r, abandonAsk(r))
       : deleteControl(coll, r));

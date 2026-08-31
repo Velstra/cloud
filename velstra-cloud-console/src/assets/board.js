@@ -393,7 +393,11 @@ function bulkActions(coll) {
     out.push({ id: "start", label: "Start", body: { spec: { desiredState: "Running" } } });
     out.push({ id: "stop", label: "Stop", body: { spec: { desiredState: "Stopped" } } });
   }
-  if (coll.deletable) out.push({ id: "delete", label: "Delete", destroys: true });
+  // Deleting an audit record is reading-room housekeeping, and the API keeps
+  // it for the cell operator — a tenant would get a column of checkboxes whose
+  // one action answers 403. Everything else deletable is the owner's own.
+  const mayDelete = coll.id !== "audit" || (session.who && session.who.cellAdmin);
+  if (coll.deletable && mayDelete) out.push({ id: "delete", label: "Delete", destroys: true });
   return out;
 }
 
