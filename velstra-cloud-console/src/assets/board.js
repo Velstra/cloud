@@ -981,11 +981,18 @@ async function openFrom(coll, item) {
 async function renderOverviewReports() {
   const host = $("overviewreports");
   if (!host) return;
-  const [room, cpu, windows, allowance] = await Promise.all([
+  const [room, cpu, windows, allowance, consumption] = await Promise.all([
     explainCapacity().catch(() => null),
     explainCpu().catch(() => null),
     windowsNow().catch(() => []),
     session.project ? explainQuota(session.project).catch(() => null) : Promise.resolve(null),
+    // The month so far, because this is the only page a tenant has that is
+    // *about their project* — they cannot open the projects board, so a
+    // consumption panel that lived only on the project's sheet was a panel
+    // customers could never reach.
+    session.project
+      ? explainUsage("projects/" + session.project).catch(() => null)
+      : Promise.resolve(null),
   ]);
   clear(host);
 
@@ -1024,6 +1031,19 @@ async function renderOverviewReports() {
     // Only the dimensions that are close to their limit. A tenant with room to
     // spare is told so by the line above; a list of eight numbers they are
     // nowhere near is chrome.
+    if (consumption && consumption.hours) {
+      const parts = [
+        [consumption.vcpuHours, "vCPU-h"],
+        [consumption.memoryGibHours, "GiB-h memory"],
+        [consumption.volumeGibHours, "GiB-h storage"],
+        [consumption.floatingIpHours, "address-h"],
+      ].filter(([v]) => Number(v) > 0).map(([v, u]) => v + " " + u);
+      const gap = Number(consumption.hoursInMonthSoFar || 0) - Number(consumption.hours || 0);
+      host.appendChild(el("div.cpuline",
+        el("span.cpukey", "Used in " + consumption.month),
+        el("span.cpuval", (parts.join(" · ") || "nothing") +
+          (gap > 0 ? " — " + gap + " hours have no reading and are not counted" : "") + ".")));
+    }
     const tight = (allowance.dimensions || [])
       .filter((d) => !d.unlimited && d.limit > 0 && d.used / d.limit >= 0.8);
     if (tight.length) {
