@@ -1549,10 +1549,13 @@ merged.
 
 **Machines are invisible to a tenant, through every window at once:**
 
-* `spec.node` and `status.node` are **taken off** instances, attachments and
-  console sessions on the way out to anybody who is neither a cell operator nor
-  a machine agent. Nothing stored changes; operators and agents read the same
-  objects whole.
+* `spec.node` and `status.node` are **taken off** instances, attachments,
+  console sessions and ports on the way out to anybody who is neither a cell
+  operator nor a machine agent. Nothing stored changes; operators and agents
+  read the same objects whole. A port's computed `Ready` condition is
+  rewritten without the machine's name too ("programmed and carried") — the
+  words were the fifth place the name appeared, found live in a tenant's own
+  list after the other four were shut.
 * **Migrations are the operator's entirely** — create, read and list. A
   migration names the machines a guest moves between, and its record is
   meaningless with them removed. The guest's own object tells a tenant
@@ -2024,6 +2027,14 @@ node*, and the API enforces what it may do:
   object, and the instances, ports and attachments placed on it. A write for
   another node's object is refused `403 PERMISSION_DENIED`; it may not change any
   `spec`, and it may not create or delete anything.
+- What it reads is **the store's own bytes**, not the presentation. The API
+  computes answers on the way out to people — an operation's `done`, a port's
+  `Ready`, a subnet's `allocated` — and a machine that read the decorated
+  object would write its own undecorated one straight back, on every pass,
+  for ever. That loop was found live: three writes a second on a settled
+  two-node cell, each write waking the watch that started the next pass, and
+  the traffic filled the store's quota. Reads, lists, watches and the answer
+  to a status report all serve an agent raw.
 
 So a compromised node holds a credential that can write only its own objects'
 status, which the operator token never was.
