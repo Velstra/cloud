@@ -62,8 +62,14 @@ const CELL_ONLY = [
   // Kept in step with `authz::belongs_to_the_cell`, which is what the API
   // refuses — a guard checks the two agree. `ceph-clusters` is the collection's
   // id; `ceph` is only its title.
+  //
+  // `audit` is deliberately NOT here: the API serves a tenant the records
+  // about objects they may read, and hiding the board threw that capability
+  // away — who touched my machines is a question a customer gets to ask.
+  // `projects` stays: a tenant's gated list of it is the one project already
+  // in the header switcher, and a board of one row is furniture.
   "nodes", "pools", "ceph-clusters", "device-classes", "maintenance-windows",
-  "image-sources", "projects", "users", "audit", "backup-targets",
+  "image-sources", "projects", "users", "backup-targets",
 ];
 
 function groups() {
@@ -71,8 +77,12 @@ function groups() {
   for (const c of collections()) {
     const admin = session.who && session.who.cellAdmin;
     if ((CELL_ONLY.includes(c.id) || OPERATOR_ONLY.includes(c.id)) && !admin) continue;
-    let g = out.find((x) => x.name === c.group);
-    if (!g) { g = { name: c.group, items: [] }; out.push(g); }
+    // "Fleet" is the operator's word for the machine room. What survives the
+    // filter above for a tenant — operations, audit — is their own activity,
+    // and the heading says so instead of borrowing the operator's map.
+    const name = c.group === "Fleet" && !admin ? "Activity" : c.group;
+    let g = out.find((x) => x.name === name);
+    if (!g) { g = { name, items: [] }; out.push(g); }
     g.items.push(c);
   }
   return out;
@@ -122,7 +132,12 @@ function renderFleet() {
   clear(box);
   const known = Object.values(census).filter((c) => c.ok);
   if (!known.length) return;
-  const total = known.reduce((n, c) => n + c.total, 0);
+  // Records — audit entries, usage readings — are facts about the past, not
+  // objects anybody manages. Counting them made a customer with one machine
+  // read "81 objects" off a header that was mostly their own hourly meter
+  // readings, and the number only ever grows.
+  const managed = collections().filter((c) => c.id !== "audit" && c.id !== "usage");
+  const total = managed.reduce((n, c) => n + ((census[c.id] || {}).total || 0), 0);
   const unsettled = known.reduce((n, c) => n + c.unsettled, 0);
   const failed = Object.values(census).filter((c) => !c.ok).length;
   const partial = known.some((c) => c.complete === false);
