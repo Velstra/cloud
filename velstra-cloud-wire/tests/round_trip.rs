@@ -172,6 +172,7 @@ fn every_resource_survives_its_own_wire() {
             osds: vec![OsdSpec {
                 node: "hv-1".into(),
                 device: "/dev/sdb".into(),
+                even_if_unsuitable: false,
             }],
             pools: vec![velstra_cloud_model::ceph::CephPoolSpec {
                 pool: "velstra-volumes".into(),
@@ -193,6 +194,7 @@ fn every_resource_survives_its_own_wire() {
             osds_up: vec![OsdSpec {
                 node: "hv-1".into(),
                 device: "/dev/sdb".into(),
+                even_if_unsuitable: false,
             }],
             pools_present: vec!["velstra-volumes".into()],
         },

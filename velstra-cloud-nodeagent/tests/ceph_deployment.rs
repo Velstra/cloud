@@ -530,6 +530,7 @@ async fn a_disk_that_is_not_free_is_never_handed_to_ceph() {
     spec.osds = vec![OsdSpec {
         node: "a".into(),
         device: "/dev/sdb".into(),
+        even_if_unsuitable: false,
     }];
     cluster_with_key(&store, spec).await;
 
@@ -761,6 +762,7 @@ async fn a_free_disk_becomes_an_osd_and_then_the_pool_is_created() {
     spec.osds = vec![OsdSpec {
         node: "a".into(),
         device: "/dev/sdb".into(),
+        even_if_unsuitable: false,
     }];
     cluster_with_key(&store, spec).await;
 

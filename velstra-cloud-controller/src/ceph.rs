@@ -108,6 +108,7 @@ fn osds_up(observed: &CephObserved) -> Vec<OsdSpec> {
             n.osd_devices.iter().map(move |device| OsdSpec {
                 node: n.node.clone(),
                 device: device.clone(),
+                even_if_unsuitable: false,
             })
         })
         .collect()
@@ -298,6 +299,7 @@ mod tests {
             osds: vec![OsdSpec {
                 node: "a".into(),
                 device: "/dev/sdb".into(),
+                even_if_unsuitable: false,
             }],
             pools: vec![CephPoolSpec {
                 pool: "velstra-volumes".into(),

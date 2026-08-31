@@ -257,6 +257,17 @@ pub struct OsdSpec {
     pub node: String,
     /// The device path, as the node reported it.
     pub device: String,
+    /// Take a device the platform calls unsuitable — removable media, mostly.
+    ///
+    /// A lab's answer, spelled out per disk so it cannot be a default anybody
+    /// inherits: a home cell testing Ceph on the USB stick it has is doing
+    /// something legitimate, and a platform that only ever says no to it
+    /// teaches people to test nothing. Every *other* refusal stands — a disk
+    /// with a filesystem, a mounted disk, the root disk — because those are
+    /// not judgement calls; this only waives the "is this sensible hardware"
+    /// opinion, and the cluster board still shows what the disk is.
+    #[serde(default)]
+    pub even_if_unsuitable: bool,
 }
 
 /// A pool to create once the cluster is up.
@@ -1021,10 +1032,12 @@ mod tests {
                 OsdSpec {
                     node: "a".into(),
                     device: "/dev/disk/by-id/one".into(),
+                    even_if_unsuitable: false,
                 },
                 OsdSpec {
                     node: "b".into(),
                     device: "/dev/disk/by-id/two".into(),
+                    even_if_unsuitable: false,
                 },
             ],
             pools: vec![CephPoolSpec {

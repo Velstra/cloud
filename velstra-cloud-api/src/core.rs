@@ -4605,6 +4605,18 @@ impl Api {
             if matches!(disk.state, velstra_cloud_model::ceph::DeviceUse::Osd { .. }) {
                 continue;
             }
+            // The lab waiver, and only for the one refusal that is an opinion:
+            // a removable disk asked for with `evenIfUnsuitable` is the
+            // operator overriding taste, not safety. Everything else —
+            // filesystems, mounts, the root disk — still refuses.
+            if osd.get("even_if_unsuitable").and_then(Value::as_bool) == Some(true)
+                && matches!(
+                    disk.state,
+                    velstra_cloud_model::ceph::DeviceUse::Unsuitable { .. }
+                )
+            {
+                continue;
+            }
             if let Err(why) = velstra_cloud_model::ceph::may_consume(disk) {
                 return Err(
                     ApiError::invalid(format!("{node} will not give up {device}: {why}"))
