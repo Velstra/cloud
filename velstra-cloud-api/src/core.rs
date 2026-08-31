@@ -645,12 +645,39 @@ impl Api {
         if self.is_operator(who) || crate::sessions::agent_node(who).is_some() {
             return;
         }
-        if !matches!(kind, "instances" | "attachments" | "console-sessions") {
+        if !matches!(
+            kind,
+            "instances" | "attachments" | "console-sessions" | "ports"
+        ) {
             return;
         }
         for half in ["spec", "status"] {
             if let Some(part) = document.get_mut(half).and_then(Value::as_object_mut) {
                 part.remove("node");
+            }
+        }
+        // The fifth door, found live in a tenant's own list after the other
+        // four were shut: a port carries the machine's name twice — the two
+        // `node` fields above, and again in the words of the computed Ready
+        // condition ("carried by horst"). The fields go the same way as an
+        // instance's; the sentence is rewritten without the name, keeping the
+        // status and reason a tenant legitimately reads.
+        if kind == "ports" {
+            if let Some(conditions) = document
+                .pointer_mut("/status/conditions")
+                .and_then(Value::as_array_mut)
+            {
+                for c in conditions.iter_mut() {
+                    if c.get("kind").and_then(Value::as_str) != Some("Ready") {
+                        continue;
+                    }
+                    let message = match c.get("reason").and_then(Value::as_str) {
+                        Some("Programmed") => "programmed and carried",
+                        Some("NotProgrammed") => "the guest that uses it is not up yet",
+                        _ => continue,
+                    };
+                    c["message"] = json!(message);
+                }
             }
         }
     }
