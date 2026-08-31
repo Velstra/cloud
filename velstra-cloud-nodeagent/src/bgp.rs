@@ -218,6 +218,27 @@ impl Default for FrrSpeaker {
 #[async_trait]
 impl BgpSpeaker for FrrSpeaker {
     async fn apply(&self, desired: &BgpDesired) -> Result<()> {
+        // Debian ships FRR with `bgpd=no`, and a daemon that is not started
+        // reads every config in silence. Turned on here, next to the file that
+        // needs it, so "install frr" is the whole of what an operator does by
+        // hand. Only ever no→yes: this agent starts daemons it needs and stops
+        // none it does not own.
+        let daemons = self.config.with_file_name("daemons");
+        if let Ok(current) = tokio::fs::read_to_string(&daemons).await {
+            if current.contains("bgpd=no") {
+                let turned_on = current.replace("bgpd=no", "bgpd=yes");
+                tokio::fs::write(&daemons, turned_on).await.map_err(|e| {
+                    crate::host::HostError::failed(format!(
+                        "could not enable bgpd in {}: {e}",
+                        daemons.display()
+                    ))
+                })?;
+                let _ = tokio::process::Command::new("systemctl")
+                    .args(["restart", "frr"])
+                    .output()
+                    .await;
+            }
+        }
         let rendered = render_frr(desired);
         let current = tokio::fs::read_to_string(&self.config)
             .await
