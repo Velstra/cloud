@@ -1133,6 +1133,22 @@ async function fillPicker(form, p) {
   const ask = (form.candidates || {})[f.key];
   if (ask) return fillFromAnswer(form, p, await ask(form));
   let offered = await options(f.collection);
+  // The cell's public pools, beside the project's own ranges. A floating IP
+  // draws from an external network the operator declared at cell scope; a
+  // picker that only knew the project's subnets could never offer the one
+  // thing the form exists to hand out.
+  if (form.coll.id === "floatingips" && f.key === "subnet") {
+    try {
+      const [nets, subs] = await Promise.all([
+        request("GET", "/api/v1/networks").then((r) => itemsOf(r.body, collection("networks"))),
+        request("GET", "/api/v1/subnets").then((r) => itemsOf(r.body, collection("subnets"))),
+      ]);
+      const external = new Set(nets.filter((n) => at(spec(n), "external") === true).map(nameOf));
+      const pools = subs.filter((sn) => external.has(String(at(spec(sn), "network"))));
+      const known = new Set(offered.map(nameOf));
+      offered = [...pools.filter((sn) => !known.has(nameOf(sn))), ...offered];
+    } catch (e) { /* a cell with no pools offers what the project has */ }
+  }
   if (f.filterBy) {
     const want = form.values[f.filterBy];
     // Only what belongs: a subnet picker on a chosen network offers that

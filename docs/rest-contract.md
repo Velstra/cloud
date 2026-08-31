@@ -1501,6 +1501,46 @@ wire. The field is `hugepages_1gi`, and `hugepages_1_gi` — which would read
 uppercase letter is how `l3Vni` is told from `hugepages1gi`, and one convention
 cannot serve both.
 
+### Public address pools, and who sees machines
+
+**A pool is an external network at cell scope.** An operator declares one —
+`POST /api/v1/networks {"id": "public", "spec": {"external": true, ...}}` — and
+puts real prefixes on its subnets, v4 and v6 alike. Cell-scoped networks and
+subnets are **readable by everybody**, by the same argument as the image
+catalogue: a tenant draws an address from the pool, so they must be able to see
+its name and whether the cell offers v4, v6 or both. Creating or editing at
+cell scope stays an operator's alone.
+
+**A tenant asks the way a customer asks**: which of my machines gets a public
+address.
+
+```
+POST /api/v1/projects/p1/floatingips
+{ "id": "web-ip", "spec": { "instance": "projects/p1/instances/web" } }
+```
+
+`instance` is consumed: the API resolves the guest's interface and stores
+`port`, the same way an instance's `networks` becomes `ports`. A guest with two
+interfaces is asked which, by name. `subnet` left out settles to one of the
+cell's public subnets — IPv4 first; naming `subnets/public-v6` is how you say
+v6, or choose among pools. A cell with no pool refuses with what an operator
+would have to declare. Naming both `instance` and `port` is refused rather than
+merged.
+
+**Machines are invisible to a tenant, through every window at once:**
+
+* `spec.node` and `status.node` are **taken off** instances, attachments and
+  console sessions on the way out to anybody who is neither a cell operator nor
+  a machine agent. Nothing stored changes; operators and agents read the same
+  objects whole.
+* **Migrations are the operator's entirely** — create, read and list. A
+  migration names the machines a guest moves between, and its record is
+  meaningless with them removed. The guest's own object tells a tenant
+  everything they were going to learn.
+* A tenant may not **pin**: `spec.node` written by a non-operator is refused on
+  instances and attachments, at create and at patch. A name they cannot see is
+  a name they may not write.
+
 ### Public addresses: the ones the guest actually holds
 
 Two ways an address can reach a guest, and they are not variants of one thing:

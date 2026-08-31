@@ -1260,6 +1260,10 @@ impl From<&v1::FloatingIpSpec> for resources::FloatingIpSpec {
     fn from(s: &v1::FloatingIpSpec) -> Self {
         Self {
             subnet: s.subnet.clone(),
+            // Never on the wire out of the store: `instance` is consumed at
+            // create — what is stored, and therefore what gRPC ever carries,
+            // is `port`.
+            instance: String::new(),
             address: (!s.address.is_empty()).then(|| s.address.clone()),
             port: s.port.clone(),
             delivery: parse_delivery(&s.delivery),

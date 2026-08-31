@@ -602,7 +602,34 @@ impl Api {
             .await?
             .ok_or_else(|| ApiError::not_found(name))?;
         self.answer(&mut document, &mut Scratch::default()).await?;
+        self.redact_for(who, name.collection(), &mut document);
         Ok(document)
+    }
+
+    /// Take the cell's machine names off an answer that is leaving for a tenant.
+    ///
+    /// Hosts are not part of a project's view — a tenant cannot list them, and a
+    /// migration is refused to them whole — yet `status.node` on every instance
+    /// and attachment named the machine anyway, so the console dutifully showed
+    /// a customer which hypervisor runs their guest. What a tenant needs from
+    /// those fields is nothing: placement is the cell's business, and where the
+    /// guest is running is not something they can act on.
+    ///
+    /// Removed rather than blanked (`skip_serializing_if` keeps an absent field
+    /// absent), on the way *out* only: agents and operators read the same
+    /// objects unredacted, and nothing stored changes.
+    fn redact_for(&self, who: &Identity, kind: &str, document: &mut Value) {
+        if self.is_operator(who) || crate::sessions::agent_node(who).is_some() {
+            return;
+        }
+        if !matches!(kind, "instances" | "attachments" | "console-sessions") {
+            return;
+        }
+        for half in ["spec", "status"] {
+            if let Some(part) = document.get_mut(half).and_then(Value::as_object_mut) {
+                part.remove("node");
+            }
+        }
     }
 
     /// Everything in a collection under `parent`, plus the revision the list is
@@ -864,6 +891,20 @@ impl Api {
                 "{kind} are the cell's own. A machine agent reads what it runs on —                  nodes, pools, backup targets, Ceph clusters — and not this."
             )));
         }
+        // A migration is about machines, whoever's project holds the record.
+        // Its spec names two hosts, and hosts are invisible to a tenant by
+        // design — so the object is the operator's whole, reads included. The
+        // guest's own sheet tells a tenant everything they were ever going to
+        // learn from it: where their machine is running is not on it.
+        //
+        // Below the agent pass, above the project bindings: node agents read
+        // migrations to do the moving, and a project editor must not.
+        if kind == "migrations" {
+            return Err(ApiError::forbidden(
+                "migrations are a cell operator's: they name the machines a guest moves \
+                 between, and machines are not part of a project's view",
+            ));
+        }
         // The image catalogue: cell-scoped images are the cell's *published*
         // ones, and everybody in it may read them.
         //
@@ -879,6 +920,22 @@ impl Api {
         // something in it. A tenant that wants a private image still makes one
         // under its own project, where its own bindings govern it.
         if verb == Verb::Read && name.collection() == "images" && name.parent().is_none() {
+            return Ok(());
+        }
+        // The cell's public networks, by the same argument as the catalogue.
+        //
+        // A public address pool is an external network the operator made at
+        // cell scope, with real prefixes on its subnets. A tenant assigns an
+        // address out of it to their guest — which means they have to be able
+        // to *see* the pool: its name to write into a floating IP, its subnets
+        // to know whether the cell offers v4, v6 or both. Read, and only read:
+        // creating at cell scope is already an operator's alone, which is
+        // exactly the split — anybody may draw from the pool, only the cell
+        // may declare one.
+        if verb == Verb::Read
+            && matches!(name.collection(), "networks" | "subnets")
+            && name.parent().is_none()
+        {
             return Ok(());
         }
         // A folder is governed by itself and by the folders above it: granting
@@ -1626,6 +1683,12 @@ impl Api {
                     }
                 }
                 self.answer(&mut document, &mut scratch).await?;
+                // The same trimming a single read gets. A list gated on the
+                // reader is a tenant's list, and their board is where the
+                // machine names were actually on screen.
+                if let Gate::Readable(who) = gate {
+                    self.redact_for(who, kind, &mut document);
+                }
                 items.push(document);
             }
 
@@ -1773,14 +1836,40 @@ impl Api {
         if kind == "floatingips" {
             self.refuse_a_public_address_this_project_was_not_given(allowed_in, who)
                 .await?;
+            self.settle_floating_ip(parent, &mut spec).await?;
         }
         if kind == "volumes" || kind == "backups" {
             self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
+        }
+        if matches!(kind, "instances" | "attachments")
+            && spec.get("node").and_then(Value::as_str).is_some_and(|n| !n.is_empty())
+            && !self.is_operator(who)
+        {
+            // The same rule the patch enforces, at birth: see there.
+            return Err(ApiError::forbidden(
+                "which machine runs a guest is the cell's decision — a tenant does not see \
+                 hosts and cannot pin to one",
+            )
+            .at("spec.node"));
         }
         if kind == "attachments" {
             self.settle_node(&mut spec, None).await?;
         }
         if kind == "migrations" {
+            // Moving a guest between machines is running the *cell*, not the
+            // project: the object names two hosts, and its whole point is which
+            // hardware runs what. A tenant has no hosts to choose between and no
+            // way to see them — a migration they created would be an ask about
+            // machines they cannot name. Refused here even though the object
+            // lives under the project, because that is where the record of the
+            // move belongs, not where the decision does.
+            if !self.is_operator(who) {
+                return Err(ApiError::forbidden(
+                    "moving a guest between machines is a cell operator's decision — a \
+                     migration names hosts, and hosts are the cell's. The guest itself is \
+                     unaffected by who moves it.",
+                ));
+            }
             self.settle_migration(&mut spec).await?;
         }
         if kind == "snapshots" {
@@ -2038,6 +2127,20 @@ impl Api {
             }
             if name.collection() == "instances" && spec.get("root_disk_gib").is_some() {
                 self.refuse_a_smaller_disk(name, spec, who).await?;
+            }
+            // Pinning a guest to a machine names a host, and hosts are not part
+            // of a project's view — a tenant cannot list them and does not see
+            // where their guest runs. A pin they wrote would be a name they
+            // guessed, honoured silently by the scheduler.
+            if matches!(name.collection(), "instances" | "attachments")
+                && spec.get("node").is_some()
+                && !self.is_operator(who)
+            {
+                return Err(ApiError::forbidden(
+                    "which machine runs a guest is the cell's decision — a tenant does not \
+                     see hosts and cannot pin to one",
+                )
+                .at("spec.node"));
             }
             // The same rule on the way in as on creation: a port handed to a
             // second guest by an edit is the same silent failure as one handed
@@ -4639,6 +4742,121 @@ impl Api {
             .collect();
         let vni = (FIRST_VNI..).find(|v| !taken.contains(v)).unwrap_or(FIRST_VNI);
         spec["vni"] = json!(vni);
+        Ok(())
+    }
+
+    /// Answer a floating IP's two questions the way a customer asks them.
+    ///
+    /// **The guest, not the port.** `spec.instance` names a VM; the API
+    /// resolves its port and stores that, the same way an instance's
+    /// `networks` becomes `ports`. Naming both is refused rather than merged.
+    /// A guest with two NICs is asked which, by name — silently picking one
+    /// would put a public address in front of an interface nobody chose.
+    ///
+    /// **The pool, not the subnet.** Left empty, `spec.subnet` settles to one
+    /// of the cell's public subnets — an external network at cell scope, which
+    /// is what an operator declares a pool *as*. IPv4 wins a tie because it is
+    /// what "give my VM a public IP" means until somebody says `v6`; naming
+    /// the subnet is how they say it.
+    async fn settle_floating_ip(&self, parent: &str, spec: &mut Value) -> ApiResult<()> {
+        let named_instance = spec
+            .get("instance")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !named_instance.is_empty() {
+            if spec.get("port").and_then(Value::as_str).is_some_and(|p| !p.is_empty()) {
+                return Err(ApiError::invalid(
+                    "name instance or name port, not both: they are two answers to one \
+                     question, and picking one silently is how an address ends up in front \
+                     of an interface nobody chose",
+                )
+                .at("spec.instance"));
+            }
+            if !named_instance.starts_with(&format!("{parent}/instances/")) {
+                return Err(ApiError::invalid(format!(
+                    "`{named_instance}` is not an instance of this project. A public address \
+                     can only be put in front of a guest its own project holds."
+                ))
+                .at("spec.instance"));
+            }
+            let instance: Instance = self
+                .typed(&ResourceName::parse(&named_instance)?)
+                .await
+                .map_err(|e| {
+                    if e.code == Code::NotFound {
+                        ApiError::new(
+                            Code::FailedPrecondition,
+                            format!("there is no instance called `{named_instance}`"),
+                        )
+                        .at("spec.instance")
+                    } else {
+                        e
+                    }
+                })?;
+            let port = match instance.spec.ports.as_slice() {
+                [] => {
+                    return Err(ApiError::new(
+                        Code::FailedPrecondition,
+                        format!(
+                            "`{named_instance}` has no network interface, so there is nothing \
+                             to put an address in front of"
+                        ),
+                    )
+                    .at("spec.instance"));
+                }
+                [one] => one.clone(),
+                many => {
+                    return Err(ApiError::new(
+                        Code::FailedPrecondition,
+                        format!(
+                            "`{named_instance}` has {} interfaces, so naming it does not say \
+                             which one the address fronts. Name the port instead: {}",
+                            many.len(),
+                            many.join(", ")
+                        ),
+                    )
+                    .at("spec.instance"));
+                }
+            };
+            spec["port"] = Value::String(port);
+            // Consumed: what is stored is `port`.
+            spec["instance"] = Value::String(String::new());
+        }
+
+        let named_subnet = spec
+            .get("subnet")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !named_subnet.is_empty() {
+            return Ok(());
+        }
+        let networks: Vec<Resource<NetworkSpec, NetworkStatus>> =
+            self.typed_list("", "networks").await?;
+        let public: Vec<String> = networks
+            .iter()
+            .filter(|n| n.spec.external && n.meta.deleted_at.is_none())
+            .map(|n| n.meta.name.to_string())
+            .collect();
+        let subnets: Vec<velstra_cloud_model::resources::Subnet> =
+            self.typed_list("", "subnets").await?;
+        let mut candidates: Vec<&velstra_cloud_model::resources::Subnet> = subnets
+            .iter()
+            .filter(|s| s.meta.deleted_at.is_none() && public.contains(&s.spec.network))
+            .collect();
+        // IPv4 first, then by name, so the same cell always answers the same.
+        candidates.sort_by_key(|s| (s.spec.cidr.contains(':'), s.meta.name.to_string()));
+        let Some(chosen) = candidates.first() else {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                "this cell offers no public addresses: no external network with a subnet \
+                 exists at cell scope. A cell operator declares one — a network with \
+                 `external: true` and a subnet carrying a real prefix.",
+            )
+            .at("spec.subnet"));
+        };
+        spec["subnet"] = Value::String(chosen.meta.name.to_string());
         Ok(())
     }
 

@@ -651,6 +651,7 @@ mod tests {
                     Placement::new("eu", "cell-1"),
                 ),
                 FloatingIpSpec {
+                    instance: String::new(),
                     subnet: "projects/p1/subnets/public".into(),
                     address: Some("203.0.113.7".into()),
                     port: "projects/p1/ports/port-a".into(),

@@ -268,6 +268,7 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
             &Resource::new(
                 meta(FIP),
                 FloatingIpSpec {
+                    instance: String::new(),
                     subnet: SUBNET.into(),
                     address: None,
                     port: "projects/p1/ports/web".into(),
@@ -559,6 +560,7 @@ async fn a_routed_address_is_bound_to_the_port_rather_than_translated() {
             &Resource::new(
                 meta(FIP),
                 FloatingIpSpec {
+                    instance: String::new(),
                     subnet: SUBNET.into(),
                     address: None,
                     port: "projects/p1/ports/web".into(),

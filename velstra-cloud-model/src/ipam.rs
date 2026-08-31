@@ -370,7 +370,8 @@ mod tests {
         Resource::new(
             meta(&format!("projects/p1/floatingips/{id}")),
             crate::resources::FloatingIpSpec {
-                subnet: SUBNET.into(),
+                instance: String::new(),
+            subnet: SUBNET.into(),
                 address: address.map(str::to_string),
                 port: String::new(),
                 delivery: Default::default(),

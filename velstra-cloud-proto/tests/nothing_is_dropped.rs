@@ -1004,7 +1004,8 @@ whole_object_survives!(
     resources::FloatingIp,
     v1::FloatingIp,
     resources::FloatingIpSpec {
-        subnet: "projects/p1/subnets/s1".into(),
+        instance: String::new(),
+            subnet: "projects/p1/subnets/s1".into(),
         // Present, not `None`: an absent address is the *default*, and a
         // round-trip of the default proves only that nothing was written.
         address: Some("203.0.113.7".into()),
