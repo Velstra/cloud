@@ -926,7 +926,7 @@ async function showOverview() {
   // and their bill. The subtitle promises only what the page below delivers.
   fill($("listblurb"), session.who && session.who.cellAdmin
     ? "What needs attention, what the machines look like, and what this project has left."
-    : "What needs attention, and what this project uses and has left.");
+    : "What needs attention, your machines, and what this project uses and has left.");
   clear($("listacts"));
   $("listfilter").classList.add("hidden");
   $("listerr").classList.add("hidden");
@@ -1001,6 +1001,61 @@ async function openFrom(coll, item) {
   openSheet(coll, item);
 }
 
+/// A tenant's machines, on the page a tenant lands on.
+///
+/// The overview used to greet a customer with the fleet's arithmetic —
+/// "largest guest, limited by the machines" — which is the provider's view of
+/// their project. What a customer wants first is their own machines: which are
+/// up, what they are, and how to reach them. The infrastructure stays where it
+/// belongs, on the operator's overview.
+async function machinesInto(host) {
+  const instances = collection("instances");
+  const [got, fips] = await Promise.all([
+    list(instances).catch(() => null),
+    list(collection("floatingips")).catch(() => null),
+  ]);
+  if (!got) return;
+  const guests = got.items || [];
+  const floating = (fips && fips.items) || [];
+  host.appendChild(el("h2", "Your machines"));
+  if (!guests.length) {
+    host.appendChild(el("p.muted",
+      "None yet. “New instance” on the Instances board starts one."));
+    return;
+  }
+  // Which public address reaches which guest, by the port both sides name.
+  const publicOf = new Map();
+  for (const f of floating) {
+    const port = at(f, "spec.port");
+    const address = at(f, "spec.address");
+    // A list per port, not one slot: a guest with a v4 and a v6 public
+    // address is the ordinary dual-stack case, not a collision.
+    if (port && address) publicOf.set(port, [...(publicOf.get(port) || []), address]);
+  }
+  const running = guests.filter((g) => at(g, "status.state") === "Running").length;
+  host.appendChild(el("p.muted", running + " of " + guests.length + " running."));
+  const SHOWN = 8;
+  for (const g of guests.slice(0, SHOWN)) {
+    const state = at(g, "status.state") || "unknown";
+    const kind = state === "Running" ? "settled" : (state === "Failed" ? "failing" : "drifting");
+    const size = (at(g, "spec.vcpus") || "?") + " vCPU · " +
+      Math.round((at(g, "spec.memoryMib") || 0) / 1024 * 10) / 10 + " GiB";
+    const addresses = (at(g, "status.addresses") || []).slice();
+    for (const p of at(g, "spec.ports") || []) {
+      for (const pub of publicOf.get(p) || []) addresses.push(pub + " (public)");
+    }
+    host.appendChild(el("div.overrow",
+      el("button.linky", { type: "button",
+        onclick: () => openFrom(instances, g) }, nameOf(g).split("/").pop()),
+      el("span.state." + kind, mark(kind), state),
+      el("span.muted", size + (addresses.length ? " · " + addresses.join(", ") : ""))));
+  }
+  if (guests.length > SHOWN) {
+    host.appendChild(el("p.muted",
+      (guests.length - SHOWN) + " more are on the Instances board."));
+  }
+}
+
 /// The half nothing lists: capacity, processors, maintenance, allowance.
 async function renderOverviewReports() {
   const host = $("overviewreports");
@@ -1027,6 +1082,12 @@ async function renderOverviewReports() {
   if (room || (cpu && (cpu.domains || []).length)) {
     host.appendChild(el("h2", "The cell"));
   }
+  // The customer's own machines come before their arithmetic. Not for the
+  // operator: their overview is about the cell, and their guests are a board
+  // away in every project at once.
+  if (!(session.who && session.who.cellAdmin)) {
+    await machinesInto(host).catch(() => {});
+  }
   if (room) host.appendChild(capacityLine(room));
   for (const line of maintenanceLines(windows)) host.appendChild(line);
   const domains = (cpu && cpu.domains) || [];
@@ -1042,7 +1103,9 @@ async function renderOverviewReports() {
   if (allowance) {
     const most = allowance.largestStartable || {};
     const gib = (mib) => Math.round(Number(mib || 0) / 1024);
-    const because = { quota: "your quota", cell: "the machines", both: "both" };
+    const because = session.who && session.who.cellAdmin
+      ? { quota: "your quota", cell: "the machines", both: "both" }
+      : { quota: "your quota", cell: "what the cell has free", both: "both" };
     host.appendChild(el("h2", session.project));
     host.appendChild(most.none
       ? el("div.cpuline",
