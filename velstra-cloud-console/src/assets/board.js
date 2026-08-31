@@ -1059,6 +1059,15 @@ async function renderOverviewReports() {
 async function show(id) {
   const coll = collection(id);
   if (!coll) return;
+  // The same rule the rail draws by, for the doors the rail does not draw: a
+  // deep link, a stale bookmark, another account's copied URL. Without this a
+  // tenant landed on a board whose every button answers 403 — a "New project"
+  // over a list they may not read.
+  if ((CELL_ONLY.includes(id) || OPERATOR_ONLY.includes(id))
+      && !(session.who && session.who.cellAdmin)) {
+    await showOverview();
+    return;
+  }
   if (view.watcher) { view.watcher.stop(); view.watcher = null; }
   stopRecheck();
   // A filter belongs to the board it was typed on. Carrying it across would
