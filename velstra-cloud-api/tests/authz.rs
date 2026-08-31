@@ -2754,6 +2754,51 @@ async fn a_tenant_sees_no_machines_through_any_window() {
         .await
         .expect_err("a tenant re-pinned a guest by patch");
     assert!(refused.to_string().contains("cannot pin"), "{refused}");
+
+    // And not through `:explainReach` either, which used to answer a tenant
+    // with `"on": "<machine>"` and the list of announcing nodes.
+    api.create(
+        "",
+        "networks",
+        &json!({ "id": "public", "spec": { "external": true, "mtu": 1500 } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "",
+        "subnets",
+        &json!({ "id": "public-v4", "spec": {
+            "network": "networks/public", "cidr": "203.0.113.0/24",
+            "gateway": "203.0.113.1", "dns": [], "reserved": [] } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "",
+        "nodes",
+        &json!({ "id": "gw", "spec": { "gateway": true } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "projects/p1",
+        "floatingips",
+        &json!({ "id": "ip", "spec": { "instance": "projects/p1/instances/web" } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    let reach = api.explain_reach(&name("projects/p1/floatingips/ip"), &who(ADA)).await.unwrap();
+    assert!(reach.get("on").is_none(), "{reach}");
+    assert!(reach["announced"].get("nodes").is_none(), "{reach}");
+    let whole = api
+        .explain_reach(&name("projects/p1/floatingips/ip"), &who(OPERATOR))
+        .await
+        .unwrap();
+    assert!(whole.get("on").is_some(), "{whole}");
 }
 
 /// The cell's public pools are readable by everyone, like the image catalogue.

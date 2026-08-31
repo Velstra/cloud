@@ -3998,7 +3998,7 @@ impl Api {
                 })
             });
 
-        Ok(json!({
+        let mut answer = json!({
             "address": fip.spec.address,
             "delivery": match view.delivery {
                 Delivery::Routed => "Routed",
@@ -4011,7 +4011,18 @@ impl Api {
             // `null` for a translated address: there is nothing for the guest
             // to configure, which is the whole difference between the two.
             "guest": guest,
-        }))
+        });
+        // The same rule every other answer keeps: machines are not part of a
+        // tenant's view. `on` and the announcing nodes are the operator's half
+        // of this explanation; the tenant's half — the address, how it is
+        // delivered, what the guest configures — stands on its own.
+        if !self.is_operator(who) {
+            answer.as_object_mut().unwrap().remove("on");
+            if let Some(a) = answer.get_mut("announced").and_then(Value::as_object_mut) {
+                a.remove("nodes");
+            }
+        }
+        Ok(answer)
     }
 
     /// What maintenance is planned for one node, and what it will cost.
