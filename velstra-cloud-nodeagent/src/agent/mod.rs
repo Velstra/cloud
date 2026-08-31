@@ -1032,7 +1032,10 @@ impl Agent {
             }
             tracing::warn!(instance = %name,
                 "stopping a guest whose instance is gone from the cell");
-            if let Err(e) = self.vmm.stop(name).await {
+            // `kill`, not `stop`: the graceful path asks over the monitor, and
+            // an orphan whose directory was deleted has no monitor left to ask
+            // — its unit is the only handle that still works.
+            if let Err(e) = self.vmm.kill(name).await {
                 tracing::warn!(instance = %name, error = %e, "the orphaned guest would not stop");
                 pass.failures += 1;
             } else {
