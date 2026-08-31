@@ -3350,7 +3350,7 @@ async fn a_flavor_is_a_menu_the_cell_writes_and_a_tenant_orders_from() {
     let seen = api.get(&name("projects/p1/instances/web"), &who(OPERATOR)).await.unwrap();
     assert_eq!(seen["spec"]["vcpus"], 5);
     assert!(
-        seen["spec"].get("flavor").map_or(true, serde_json::Value::is_null),
+        seen["spec"].get("flavor").is_none_or(serde_json::Value::is_null),
         "a hand-sized guest still wears the flavor's name: {:?}",
         seen["spec"]
     );
