@@ -446,7 +446,23 @@ impl Reconciler for FloatingIpController {
             return Ok(());
         };
         let Some(endpoint) = self.fabric.clone() else {
-            return Ok(());
+            // No fabric, no data path — but not no answer. Returning here
+            // without a word left the object at `observedGeneration: 0` with no
+            // conditions for ever: an "unreported" entry on the owner's
+            // attention list, and a create-operation that never finished,
+            // both about work that was in fact done. The address is allocated
+            // — that is this controller's own half, and it is complete. What a
+            // fabric would add (the programmed path) is said plainly instead
+            // of implied by silence.
+            return self
+                .settle(
+                    fip,
+                    ConditionStatus::True,
+                    "Allocated",
+                    "the address is allocated; this cell runs no fabric, so no                      translation path is programmed for it",
+                    None,
+                )
+                .await;
         };
 
         let mut client = match velstra_cloud_fabric::connect(&endpoint).await {
@@ -794,6 +810,44 @@ mod tests {
 
         let after = f.floating.get(FIP).await.unwrap().unwrap();
         assert_eq!(after.spec.address.as_deref(), Some("10.20.0.4"));
+    }
+
+    /// A cell with no fabric still answers. Silence here left the object at
+    /// `observedGeneration: 0` with no conditions for ever — an "unreported"
+    /// entry on the owner's attention list, and a create-operation that never
+    /// finished, both about work that was done.
+    #[tokio::test]
+    async fn a_fabricless_cell_settles_the_address_it_allocated() {
+        let f = Fixture::new();
+        f.subnet("10.20.0.0/24").await;
+        f.fip(None).await;
+
+        let controller = f.controller();
+        // Two passes: the first allocates the address (a spec write ends the
+        // pass), the second settles the status.
+        let fip = f.floating.get(FIP).await.unwrap().unwrap();
+        controller.reconcile(FIP, Some(&fip)).await.unwrap();
+        let fip = f.floating.get(FIP).await.unwrap().unwrap();
+        controller.reconcile(FIP, Some(&fip)).await.unwrap();
+        let fip = f.floating.get(FIP).await.unwrap().unwrap();
+        controller.reconcile(FIP, Some(&fip)).await.unwrap();
+
+        let after = f.floating.get(FIP).await.unwrap().unwrap();
+        assert_eq!(
+            after.status.observed_generation, after.meta.generation,
+            "the object still reads as unreported: {:?}",
+            after.status
+        );
+        let allocated = condition(&after.status.conditions, ALLOCATED)
+            .expect("the allocation is said on the object");
+        assert_eq!(allocated.status, ConditionStatus::True, "{allocated:?}");
+        assert_eq!(allocated.reason, "Allocated");
+
+        // And settled means settled: another pass writes nothing.
+        let rev = after.meta.revision;
+        controller.reconcile(FIP, Some(&after)).await.unwrap();
+        let again = f.floating.get(FIP).await.unwrap().unwrap();
+        assert_eq!(again.meta.revision, rev, "a settled object was written");
     }
 
     /// A second pass over an addressed floating IP writes nothing. A settled
