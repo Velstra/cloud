@@ -154,6 +154,11 @@ fn window_view(
 /// that matters within the hour.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// How many store snapshots stay. Hourly, so a day of history — enough to step
+/// back over a bad afternoon, small enough that the directory never becomes
+/// the thing that fills a disk.
+const KEEP_STORE_SNAPSHOTS: usize = 24;
+
 /// One event on a watch, in the two shapes the contract defines.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WatchEvent {
@@ -379,6 +384,14 @@ struct Inner {
     /// The store itself, beside the typed views over it — for the one job no
     /// collection can carry: compacting the history they all share.
     store: Arc<dyn Store>,
+    /// Where the store's snapshots go, when an operator named a place.
+    ///
+    /// `None` — the default — takes none, which is the honest state of a dev
+    /// cell. Named, the sweeper writes one per round and keeps the newest few:
+    /// guests survive their control plane dying, but a cell whose store is
+    /// gone is a cell nobody will ever manage again. Point it somewhere that
+    /// is not this machine's own disk.
+    store_backup_dir: Option<std::path::PathBuf>,
     collections: BTreeMap<&'static str, Arc<dyn Collection>>,
     /// Subjects that may do anything, anywhere in this cell.
     ///
@@ -539,6 +552,7 @@ impl Api {
         Self {
             inner: Arc::new(Inner {
                 store: store.clone(),
+                store_backup_dir: None,
                 collections,
                 cell_admins: Vec::new(),
                 served: RwLock::new(BTreeMap::new()),
@@ -654,6 +668,14 @@ impl Api {
         let inner =
             Arc::get_mut(&mut self.inner).expect("cell admins are named before the API is shared");
         inner.cell_admins = admins;
+        self
+    }
+
+    /// Name where the store's snapshots go. See `Inner::store_backup_dir`.
+    pub fn with_store_backups(mut self, dir: std::path::PathBuf) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("the backup dir is named before the API is shared");
+        inner.store_backup_dir = Some(dir);
         self
     }
 
@@ -1364,6 +1386,18 @@ impl Api {
                 }
                 if let Err(e) = api.sweep_spent_consoles(Timestamp::now()).await {
                     tracing::warn!(error = %e, "the console sweep could not run this round");
+                }
+                if let Some(dir) = &api.inner.store_backup_dir {
+                    match api.inner.store.snapshot(dir).await {
+                        Ok(Some(wrote)) => {
+                            tracing::info!(snapshot = %wrote.display(), "the store was snapshotted");
+                            prune_snapshots(dir, KEEP_STORE_SNAPSHOTS).await;
+                        }
+                        Ok(None) => { /* a backend with nothing durable to copy */ }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "the store could not be snapshotted this round");
+                        }
+                    }
                 }
                 match api.inner.store.revision().await {
                     Ok(now) => {
@@ -4181,6 +4215,89 @@ impl Api {
         }))
     }
 
+    /// The cell as numbers, in Prometheus' text format.
+    ///
+    /// What a person watches the overview for, made scrapeable — because
+    /// production is when nobody is watching the overview. Deliberately small:
+    /// the numbers an alert would fire on (a silent node, a full pool, guests
+    /// off their asked state), not a metric per field. An operator's read,
+    /// like the overview it mirrors: these lines carry machine names.
+    pub async fn metrics(&self, who: &Identity) -> ApiResult<String> {
+        self.authorize_for(who, Verb::Read, &ResourceName::parse("nodes/any")?, "nodes")
+            .await?;
+        let now = Timestamp::now();
+        let mut out = String::new();
+        use std::fmt::Write;
+
+        let nodes: Vec<Node> = self.typed_list("", "nodes").await?;
+        let _ = writeln!(out, "# TYPE velstra_node_heartbeat_age_seconds gauge");
+        for n in &nodes {
+            let age = now.0.saturating_sub(n.status.last_heartbeat.0) / 1000;
+            let _ = writeln!(
+                out,
+                "velstra_node_heartbeat_age_seconds{{node=\"{}\"}} {age}",
+                n.meta.name.id()
+            );
+        }
+        let _ = writeln!(out, "# TYPE velstra_node_memory_mib gauge");
+        for n in &nodes {
+            let _ = writeln!(
+                out,
+                "velstra_node_memory_mib{{node=\"{}\",kind=\"capacity\"}} {}",
+                n.meta.name.id(),
+                n.status.capacity.memory_mib
+            );
+            let _ = writeln!(
+                out,
+                "velstra_node_memory_mib{{node=\"{}\",kind=\"allocated\"}} {}",
+                n.meta.name.id(),
+                n.status.allocated.memory_mib
+            );
+        }
+
+        let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
+        let _ = writeln!(out, "# TYPE velstra_pool_gib gauge");
+        for p in &pools {
+            for (kind, v) in [("capacity", p.status.capacity_gib), ("allocated", p.status.allocated_gib)] {
+                let _ = writeln!(
+                    out,
+                    "velstra_pool_gib{{pool=\"{}\",kind=\"{kind}\"}} {v}",
+                    p.meta.name.id()
+                );
+            }
+        }
+
+        // Guests by state, cell-wide — and, the alertable one, how many are
+        // not in the state they were asked for.
+        let instances: Vec<Instance> = self.typed_list("", "instances").await?;
+        let mut by_state: BTreeMap<String, u64> = BTreeMap::new();
+        let mut drifting = 0u64;
+        for i in &instances {
+            *by_state.entry(format!("{:?}", i.status.state)).or_default() += 1;
+            let wants_running =
+                i.spec.desired_state == velstra_cloud_model::resources::DesiredState::Running;
+            let is_running =
+                i.status.state == velstra_cloud_model::resources::InstanceState::Running;
+            if wants_running != is_running && i.meta.deleted_at.is_none() {
+                drifting += 1;
+            }
+        }
+        let _ = writeln!(out, "# TYPE velstra_instances gauge");
+        for (state, n) in &by_state {
+            let _ = writeln!(out, "velstra_instances{{state=\"{state}\"}} {n}");
+        }
+        let _ = writeln!(out, "# TYPE velstra_instances_off_desired_state gauge");
+        let _ = writeln!(out, "velstra_instances_off_desired_state {drifting}");
+
+        // The store's high-water mark: rising fast is the alarm the quota
+        // incident would have fired.
+        if let Ok(rev) = self.inner.store.revision().await {
+            let _ = writeln!(out, "# TYPE velstra_store_revision counter");
+            let _ = writeln!(out, "velstra_store_revision {}", rev.0);
+        }
+        Ok(out)
+    }
+
     /// What maintenance is planned for one node, and what it will cost.
     ///
     /// The question an operator asks *before* the window opens: is anything
@@ -6304,6 +6421,34 @@ fn refuse_unwritable(body: &Value) -> ApiResult<()> {
 
 /// The shape a create answers with, per the contract: the operation to follow
 /// and the object it is about.
+/// Keep the newest `keep` snapshots in `dir`, quietly.
+///
+/// Quietly, because this runs on a timer with nobody watching: a prune that
+/// cannot read the directory logs and moves on, and the next round tries
+/// again. The names sort by time by construction (`etcd-<ms>.snap`).
+async fn prune_snapshots(dir: &std::path::Path, keep: usize) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut snaps: Vec<std::path::PathBuf> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("snap") {
+            snaps.push(path);
+        }
+    }
+    snaps.sort();
+    if snaps.len() <= keep {
+        return;
+    }
+    let excess = snaps.len() - keep;
+    for old in &snaps[..excess] {
+        if let Err(e) = tokio::fs::remove_file(old).await {
+            tracing::warn!(snapshot = %old.display(), error = %e, "an old snapshot would not go");
+        }
+    }
+}
+
 pub fn created_body(created: &Created) -> Value {
     let mut body = Map::new();
     body.insert(

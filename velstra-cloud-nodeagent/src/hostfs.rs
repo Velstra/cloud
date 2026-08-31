@@ -232,6 +232,53 @@ pub fn console_tail(path: &Path, cap: usize) -> (String, u64) {
     (String::from_utf8_lossy(&buf).into_owned(), total)
 }
 
+/// Keep a guest's console log from becoming the thing that fills the host.
+///
+/// QEMU appends to the log for as long as the guest runs, and a guest stuck in
+/// a boot loop — or simply chatty — writes for ever into a file nothing ever
+/// read back whole. Above `cap`, the newest `keep` bytes are kept and the rest
+/// is gone: the tail is what a console exists to show, and everything a person
+/// was going to read is in it.
+///
+/// **Copy-truncate, not rename.** QEMU holds the file open; a renamed file is
+/// one QEMU goes on writing into while a fresh one sits empty at the old name.
+/// The chardev writes with `O_APPEND`, so writes that land during the shuffle
+/// append after the kept tail rather than at a stale offset — the worst race
+/// costs interleaving, never a hole the reader cannot see.
+pub fn trim_console(path: &Path, cap: u64, keep: u64) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let Ok(total) = std::fs::metadata(path).map(|m| m.len()) else {
+        return;
+    };
+    if total <= cap {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+        return;
+    };
+    let keep = keep.min(total);
+    if file.seek(SeekFrom::End(-(keep as i64))).is_err() {
+        return;
+    }
+    let mut tail = vec![0u8; keep as usize];
+    if file.read_exact(&mut tail).is_err() {
+        return;
+    }
+    // Start the kept tail on a line: a log whose first line is half a line
+    // reads as corruption to whoever opens it.
+    let from = tail.iter().position(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+    if file.set_len(0).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
+        return;
+    }
+    let _ = file.write_all(format!(
+        "[... {} earlier bytes trimmed by the node agent ...]\n",
+        total - (keep - from as u64)
+    ).as_bytes());
+    let _ = file.write_all(&tail[from..]);
+    let _ = file.flush();
+}
+
 // ---- names ---------------------------------------------------------------
 
 /// A resource name as one path segment, reversibly.
@@ -1279,5 +1326,46 @@ mod names_a_hypervisor_will_take {
         for id in ["root", "virtio-disk0", "ide0-cd0", ""] {
             assert_eq!(from_qmp_id(id), None, "{id} was read as a volume");
         }
+    }
+}
+
+#[cfg(test)]
+mod trimming_the_console {
+    use super::*;
+    use std::io::Write;
+
+    fn scratch(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("velstra-trim-{name}-{}", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_log_under_the_cap_is_left_exactly_alone() {
+        let path = scratch("small", b"boot line one\nboot line two\n");
+        trim_console(&path, 1024, 512);
+        assert_eq!(std::fs::read(&path).unwrap(), b"boot line one\nboot line two\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_log_over_the_cap_keeps_its_tail_and_says_what_went() {
+        // A boot loop's worth of lines, far over the cap.
+        let mut big = Vec::new();
+        for i in 0..5000 {
+            big.extend_from_slice(format!("console line {i}\n").as_bytes());
+        }
+        let path = scratch("big", &big);
+        trim_console(&path, 16 * 1024, 4 * 1024);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.len() < 8 * 1024, "still {} bytes", after.len());
+        // The newest line survived; the note says bytes were trimmed; and the
+        // kept tail starts on a whole line, not the middle of one.
+        assert!(after.ends_with("console line 4999\n"), "the tail is not the newest output");
+        assert!(after.starts_with("[... "), "{}", &after[..60]);
+        let second_line = after.lines().nth(1).unwrap();
+        assert!(second_line.starts_with("console line "), "half a line survived: {second_line:?}");
+        let _ = std::fs::remove_file(&path);
     }
 }

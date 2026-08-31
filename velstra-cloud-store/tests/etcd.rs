@@ -496,3 +496,37 @@ async fn compacting_keeps_the_objects_and_drops_the_history() {
     .await;
     assert!(ended.is_ok(), "a watch across the compaction neither ended nor erred");
 }
+
+/// A snapshot is written whole or not at all, and is a real etcd snapshot.
+#[tokio::test]
+async fn a_snapshot_is_written_whole_and_restorable_in_shape() {
+    let etcd = etcd_or_skip!();
+    let store = etcd.store().await;
+    store
+        .put(&key_for("cell-snap", "instances", "i1"), b"spec".to_vec(), Expect::Absent)
+        .await
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("velstra-snap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let wrote = store
+        .snapshot(&dir)
+        .await
+        .unwrap()
+        .expect("etcd has something durable to copy");
+    let bytes = std::fs::read(&wrote).unwrap();
+    // A bbolt file starts with a meta page whose magic is 0xED0CDAED at offset
+    // 16 (little-endian). Checking it is what tells "a snapshot" from "an
+    // empty file the stream never filled".
+    assert!(bytes.len() > 4096, "the snapshot is {} bytes", bytes.len());
+    assert_eq!(&bytes[16..20], &[0xED, 0xDA, 0x0C, 0xED], "not a bbolt database");
+    // Nothing partial is left beside it.
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(
+            !name.to_string_lossy().ends_with(".partial"),
+            "a partial snapshot survived: {name:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

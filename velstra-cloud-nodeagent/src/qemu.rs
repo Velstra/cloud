@@ -420,6 +420,11 @@ impl Vmm for QemuVmm {
                 }
                 continue;
             }
+            // Trimmed before it is read: a guest stuck in a boot loop writes
+            // its console for ever into a file nothing reads back whole, and
+            // on a small host the log becomes the thing that fills the disk.
+            // 32 MiB cap, 4 MiB kept — the tail is what a console shows.
+            hostfs::trim_console(&self.layout.console(&instance), 32 << 20, 4 << 20);
             // Read once per guest per pass, before either branch: a VMM that
             // has just died still has its log on disk, and this is the moment
             // to pick it up.

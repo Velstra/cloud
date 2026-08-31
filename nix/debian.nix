@@ -104,7 +104,16 @@ let
       exec = ''
         /bin/sh -c 'if [ -f /var/lib/velstra/bootstrap-password ]; then \
           VELSTRA_BOOTSTRAP_PASSWORD="$(cat /var/lib/velstra/bootstrap-password)"; \
-          export VELSTRA_BOOTSTRAP_PASSWORD; fi; exec ${bin "velstra-cloud-api"}' '';
+          export VELSTRA_BOOTSTRAP_PASSWORD; fi; \
+          : "''${VELSTRA_STORE_BACKUP_DIR:=/var/lib/velstra/store-backups}"; \
+          export VELSTRA_STORE_BACKUP_DIR; \
+          exec ${bin "velstra-cloud-api"}' '';
+      # The backup dir defaults on rather than off: a cell whose store is gone
+      # is a cell nobody will ever manage again, and the price of a day of
+      # hourly snapshots is megabytes. The default lands on the machine's own
+      # disk, which survives a crashed process and a bad upgrade but not the
+      # disk itself — the seed can point VELSTRA_STORE_BACKUP_DIR somewhere
+      # better, and docs/operations.md says to.
     };
     "velstra-cloud-controller.service" = unit {
       role = "control-plane";

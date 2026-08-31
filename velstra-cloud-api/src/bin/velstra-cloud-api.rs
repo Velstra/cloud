@@ -29,6 +29,15 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8443", env = "VELSTRA_LISTEN")]
     listen: String,
 
+    /// Where hourly snapshots of the store go; empty takes none.
+    ///
+    /// The guests survive their control plane dying — a cell whose store is
+    /// gone is a cell nobody will ever manage again, which is why this exists.
+    /// Point it at storage that is not this machine's own disk, and restore
+    /// with `etcdctl snapshot restore` (see docs/operations.md).
+    #[arg(long, env = "VELSTRA_STORE_BACKUP_DIR", default_value = "")]
+    store_backup_dir: String,
+
     /// The certificate and key to serve TLS with, as PEM files.
     ///
     /// Both or neither. Without them this port is plaintext and says so in the
@@ -217,6 +226,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut api = velstra_cloud_api::Api::new(store, &args.region, &args.cell, verifier)
         .with_cell_admins(args.cell_admin.clone());
+    if !args.store_backup_dir.is_empty() {
+        api = api.with_store_backups(std::path::PathBuf::from(&args.store_backup_dir));
+    }
     if args.writes_per_second > 0 {
         let rate = velstra_cloud_model::limit::Rate {
             per_second: args.writes_per_second,

@@ -317,6 +317,41 @@ impl Store for EtcdStore {
         rx
     }
 
+    async fn snapshot(&self, dir: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+        use tokio::io::AsyncWriteExt;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| StoreError::Backend(format!("creating {}: {e}", dir.display())))?;
+        // Named by the moment, so a listing is a history and pruning is a sort.
+        let at = velstra_cloud_model::meta::Timestamp::now().0;
+        let final_path = dir.join(format!("etcd-{at:013}.snap"));
+        let partial = dir.join(format!("etcd-{at:013}.partial"));
+        let mut stream = self
+            .client
+            .maintenance_client()
+            .snapshot()
+            .await
+            .map_err(backend)?;
+        let mut file = tokio::fs::File::create(&partial)
+            .await
+            .map_err(|e| StoreError::Backend(format!("creating {}: {e}", partial.display())))?;
+        while let Some(chunk) = stream.message().await.map_err(backend)? {
+            file.write_all(chunk.blob())
+                .await
+                .map_err(|e| StoreError::Backend(format!("writing the snapshot: {e}")))?;
+        }
+        // Flushed before the rename: a snapshot that exists but is missing its
+        // tail is worse than one that plainly never finished.
+        file.sync_all()
+            .await
+            .map_err(|e| StoreError::Backend(format!("syncing the snapshot: {e}")))?;
+        drop(file);
+        tokio::fs::rename(&partial, &final_path)
+            .await
+            .map_err(|e| StoreError::Backend(format!("finishing the snapshot: {e}")))?;
+        Ok(Some(final_path))
+    }
+
     async fn compact(&self, keep: Revision) -> Result<()> {
         match self.client.kv_client().compact(keep.0 as i64, None).await {
             Ok(_) => Ok(()),
