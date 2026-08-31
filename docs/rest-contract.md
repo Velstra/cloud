@@ -1884,6 +1884,28 @@ guests on node-c stopped booting" is a long way from the sentence above.
 Clearing the field is always allowed: going back to the host's own processor
 asks nothing of the machine.
 
+## Watching the cell from outside
+
+`GET /metrics` answers Prometheus' text format, behind the same bearer token as
+everything else (Prometheus scrapes with `authorization.credentials_file`
+natively; an open metrics port would hand the cell's machine names and
+capacities to whoever finds it). Deliberately few series — the numbers an alert
+fires on, not a metric per field:
+
+```
+velstra_node_heartbeat_age_seconds{node="hv-1"} 4
+velstra_node_memory_mib{node="hv-1",kind="capacity"} 262144
+velstra_pool_gib{pool="nvme",kind="allocated"} 120
+velstra_instances{state="Running"} 12
+velstra_instances_off_desired_state 0
+velstra_store_revision 457027
+```
+
+`velstra_instances_off_desired_state` counts guests not in the state they were
+asked for — the one to page on. `velstra_store_revision` rising unusually fast
+is the early warning for the store-quota incident class. It is an operator's
+read: the lines carry machine names.
+
 ## Authentication
 
 **Who may do what.** Authentication says *who*; the bindings on a project say

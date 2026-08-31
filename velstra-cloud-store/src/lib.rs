@@ -192,6 +192,21 @@ pub trait Store: Send + Sync + 'static {
         let _ = keep;
         Ok(())
     }
+
+    /// Write a restorable copy of everything into `dir`, and say where.
+    ///
+    /// The one file that makes a dead control plane a recoverable one: the
+    /// guests survive their control plane dying, but a cell whose store is
+    /// gone is a cell nobody will ever manage again. `None` means this backend
+    /// has nothing durable to copy — the memory store's honest answer, since a
+    /// snapshot of it would outlive the process that is its only truth.
+    ///
+    /// The file is written under a temporary name and renamed into place, so a
+    /// snapshot that dies half way is never mistaken for one that finished.
+    async fn snapshot(&self, dir: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+        let _ = dir;
+        Ok(None)
+    }
 }
 
 /// How a resource name becomes a key. One function, so a key layout change is

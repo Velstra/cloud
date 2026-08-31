@@ -55,6 +55,11 @@ pub fn router(api: Api) -> Router {
             "/api/v1/users/:id/password",
             axum::routing::put(set_password),
         )
+        // Prometheus' text format, behind the same bearer token as everything
+        // else: Prometheus scrapes with `authorization: credentials_file`
+        // natively, and an unauthenticated metrics port would hand the cell's
+        // machine names and capacity to whoever finds it.
+        .route("/metrics", get(metrics))
         .route(
             // A token for a service account. POST because it **makes** one, and
             // the answer carries it — once. Nothing can read it back.
@@ -225,6 +230,19 @@ async fn mint_service_token(
         "purpose": purpose,
         "shownOnce": true,
     })))
+}
+
+async fn metrics(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+) -> ApiResult<Response> {
+    let body = api.metrics(&who).await?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
+        .into_response())
 }
 
 async fn set_password(

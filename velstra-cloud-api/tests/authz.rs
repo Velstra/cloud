@@ -3042,6 +3042,46 @@ async fn a_tenant_sums_their_own_bill_and_not_a_neighbours() {
     assert!(refused.to_string().contains("2026-08"), "{refused}");
 }
 
+/// The numbers an alert fires on, behind the same door as the fleet.
+///
+/// The lines carry machine names and capacities, so they are an operator's
+/// read — an unauthenticated metrics endpoint would hand the cell's layout to
+/// whoever finds the port.
+#[tokio::test]
+async fn metrics_are_the_operators_and_carry_what_an_alert_needs() {
+    let api = cell().await;
+    api.create(
+        "",
+        "nodes",
+        &json!({ "id": "hv-1", "spec": { "schedulable": true } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "web", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        &who(ADA),
+    )
+    .await
+    .unwrap();
+
+    let text = api.metrics(&who(OPERATOR)).await.expect("an operator scrapes");
+    for needle in [
+        "velstra_node_heartbeat_age_seconds{node=\"hv-1\"}",
+        "# TYPE velstra_pool_gib gauge",
+        "velstra_instances_off_desired_state",
+        "velstra_store_revision",
+    ] {
+        assert!(text.contains(needle), "missing {needle} in:\n{text}");
+    }
+    // A guest asked to run and not yet running is the alertable number.
+    assert!(text.contains("velstra_instances_off_desired_state 1"), "{text}");
+
+    assert!(api.metrics(&who(ADA)).await.is_err(), "a tenant scraped the cell");
+}
+
 #[tokio::test]
 async fn listing_asks_about_what_is_being_listed_and_not_about_the_project() {
     // `GET /projects/p1/instances` authorises Read on `projects/p1`. Asking that
