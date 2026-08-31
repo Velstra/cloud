@@ -37,6 +37,7 @@ struct Cell {
     source_vmm: FakeVmm,
     destination: Agent,
     destination_vmm: FakeVmm,
+    source_datapath: FakeDatapath,
     destination_datapath: FakeDatapath,
 }
 
@@ -69,6 +70,7 @@ async fn two_nodes_in(mode: MigrationMode, status: MigrationStatus) -> Cell {
         ),
         source_vmm,
         destination_vmm,
+        source_datapath,
         destination_datapath,
         store,
     };
@@ -718,4 +720,73 @@ async fn a_guest_that_ignores_the_power_button_is_asked_once_and_then_taken_down
         "a guest that never answers the power button held the move open for ever"
     );
     assert!(!cell.source_vmm.is_running(I1));
+}
+
+/// After a cold move the source's half of the wire goes too.
+///
+/// Found live as a write ping-pong: the guest moved, the source kept its tap,
+/// the port went on saying `node=<source>`, and the node actually running the
+/// guest politely refused to claim a port another machine spoke for. Eight
+/// store writes a second on an idle cell — the traffic class that filled
+/// etcd's quota.
+#[tokio::test]
+async fn a_cold_move_takes_the_sources_tap_and_hands_the_port_over() {
+    let cell = two_nodes_in(MigrationMode::Reboot, MigrationStatus::default()).await;
+    // The source carries the wire while it runs the guest.
+    assert!(cell.source_datapath.is_programmed(PORT_A));
+
+    // The move: source stops and lets go, controller reassigns, destination runs.
+    cell.source.resync().await;
+    let mut next = read_instance(&cell.store, I1).await;
+    next.spec.node = Some(DESTINATION.to_string());
+    next.meta.generation += 1;
+    instances(&cell.store)
+        .update(&next, &velstra_cloud_model::access::Writer::controller("test"))
+        .await
+        .unwrap();
+    cell.destination.resync().await;
+    cell.destination.resync().await;
+    assert!(cell.destination_vmm.is_running(I1));
+
+    // While the migration record is open, the source's share still names the
+    // guest and its wire is left alone — tearing it down mid-handover would be
+    // a different bug.
+    cell.source.resync().await;
+    assert!(
+        cell.source_datapath.is_programmed(PORT_A),
+        "the source dropped the wire while the migration was still open"
+    );
+
+    // The record removed, the guest stops concerning the source — and the tap
+    // goes, and the port is let go of rather than re-claimed.
+    request_delete_migration(&cell.store, M1).await;
+    cell.source.resync().await;
+    cell.source.resync().await;
+    assert!(
+        !cell.source_datapath.is_programmed(PORT_A),
+        "the source kept a tap for a guest that lives elsewhere"
+    );
+    let port = read_port(&cell.store, PORT_A).await;
+    assert_ne!(
+        port.status.node.as_deref(),
+        Some(SOURCE),
+        "the source still speaks for the port"
+    );
+
+    // The port controller's half, played by hand here (it has its own tests):
+    // the guest's status now names the destination, so the assignment follows.
+    let mut reassigned = read_port(&cell.store, PORT_A).await;
+    reassigned.spec.node = Some(DESTINATION.to_string());
+    reassigned.meta.generation += 1;
+    ports(&cell.store)
+        .update(&reassigned, &velstra_cloud_model::access::Writer::controller("test"))
+        .await
+        .unwrap();
+
+    // And the destination claims and carries it on its next pass.
+    cell.destination.resync().await;
+    cell.destination.resync().await;
+    let port = read_port(&cell.store, PORT_A).await;
+    assert_eq!(port.status.node.as_deref(), Some(DESTINATION), "{:?}", port.status);
+    assert!(port.status.programmed, "{:?}", port.status);
 }

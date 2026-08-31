@@ -84,7 +84,26 @@ impl Agent {
         // deciding whether a guest can move reads a fact rather than a
         // configuration file it has no access to.
         next.status.shared_state = self.config.shared_state;
-        next.status.last_heartbeat = Timestamp::now();
+        // The heartbeat moves only when it is old enough to matter.
+        //
+        // It used to move on every pass — and a pass is woken by watch events,
+        // including the event this very write produces. The agent woke on its
+        // own echo, ran a pass, wrote a fresh heartbeat, woke again: eight
+        // store writes a second on an idle two-node cell, which is the traffic
+        // that filled etcd's quota and took the control plane down. Found by
+        // watching the store, not the code.
+        //
+        // Ten seconds is far below anything that reads it: fencing deadlines
+        // are minutes, the console prints ages in seconds. When anything
+        // *else* in the status changed, the report carries a fresh heartbeat
+        // with it for free.
+        let heartbeat_due =
+            Timestamp::now().0.saturating_sub(stored.status.last_heartbeat.0) >= 10_000;
+        next.status.last_heartbeat = if heartbeat_due {
+            Timestamp::now()
+        } else {
+            stored.status.last_heartbeat
+        };
         // What this machine holds, so that anybody who needs to know which
         // nodes have an image can work it out from these reports rather than
         // from a shared list every node would have to write into.
@@ -116,6 +135,13 @@ impl Agent {
             ),
         );
 
+        // Nothing changed, nothing written — through either door. The direct
+        // store path had this via `reporting::report`; the sink path posted
+        // every pass regardless, and an unconditional write per pass is half
+        // of the echo loop the heartbeat note above describes.
+        if next.status == stored.status {
+            return;
+        }
         // `--api`: the report goes through the API as this node's own token; the
         // once-only warning below is the same one, moved onto the sink's refusal.
         if let Some(sink) = &self.sink {
