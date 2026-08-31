@@ -1079,6 +1079,42 @@ pre.terminal:focus {
   border-color: var(--accent);
 }
 
+/* ---- the network drawing ------------------------------------------------ */
+/* Nodes and edges over the prose. Colour comes from the same three-state ramp
+   as everything else; the drawing may not invent a vocabulary of its own. */
+.mapgraphbox { overflow-x: auto; margin-bottom: var(--space-6); }
+.mapgraph { display: block; }
+.mapgraph .gedge {
+  fill: none; stroke: var(--border); stroke-width: 1.5;
+}
+.mapgraph .gedge.dashed { stroke-dasharray: 5 4; stroke: var(--text-faint); }
+.mapgraph .gedgelabel {
+  fill: var(--text-muted); font: var(--fw-regular) 11px var(--font-mono);
+  text-anchor: middle;
+}
+.mapgraph .gnode rect {
+  fill: var(--surface-raised); stroke: var(--border); stroke-width: 1;
+}
+.mapgraph .gnode.goes { cursor: pointer; }
+.mapgraph .gnode.goes:hover rect { stroke: var(--brand); }
+.mapgraph .gnode.internet rect { stroke: var(--product); }
+.mapgraph .gnode.router rect { stroke: var(--brand); }
+.mapgraph .gnode.settled rect { stroke: var(--settled); }
+.mapgraph .gnode.failing rect { stroke: var(--failing); }
+.mapgraph .gnode.drifting rect { stroke: var(--drifting); }
+.mapgraph .glabel {
+  fill: var(--text-strong); font: var(--fw-medium) 13px var(--font-sans);
+}
+.mapgraph .gglyph { fill: var(--text-muted); font: 14px var(--font-sans); }
+.mapgraph .gsub {
+  fill: var(--text-muted); font: var(--fw-regular) 11px var(--font-mono);
+}
+
+/* Two reports stacked in one panel breathe between headings; the first sits
+   flush under the panel's own edge. */
+#overviewreports h2 { margin-top: var(--space-6); }
+#overviewreports h2:first-child { margin-top: 0; }
+
 /* ---- small screens ------------------------------------------------------ */
 /* One breakpoint, chosen where the fixed rail stops leaving the content a
    readable column: below it the rail leaves the grid and becomes a drawer.
