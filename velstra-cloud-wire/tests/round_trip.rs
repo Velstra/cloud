@@ -237,6 +237,7 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "InstanceSpec",
         InstanceSpec {
+            flavor: None,
             start_order: 0,
             start_delay_s: 0,
             on_node_loss: Default::default(),

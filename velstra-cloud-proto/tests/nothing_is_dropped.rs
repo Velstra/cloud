@@ -204,6 +204,7 @@ fn a_project_spec_survives_the_wire_except_its_bindings() {
             members: vec!["ada".into()],
         }],
         policy: resources::ProjectPolicy {
+            custom_sizes: true,
             host_bridges: vec!["br0".into()],
             device_passthrough: true,
             floating_ips: true,
@@ -468,6 +469,7 @@ survives_the_wire!(
     resources::InstanceSpec,
     v1::InstanceSpec,
     resources::InstanceSpec {
+        flavor: Some("flavors/m1-small".into()),
         start_order: 2,
         start_delay_s: 30,
         on_node_loss: velstra_cloud_model::ha::OnNodeLoss::Restart,
@@ -497,7 +499,7 @@ survives_the_wire!(
     {
         vcpus, memory_mib, image, root_disk_gib, desired_state, ports, networks, volumes, ssh_keys,
         user_data, node, placement_policy, devices, console, on_node_loss,
-        start_order, start_delay_s,
+        start_order, start_delay_s, flavor,
     }
 );
 
@@ -1086,6 +1088,7 @@ whole_object_survives!(
     resources::Instance,
     v1::Instance,
     resources::InstanceSpec {
+        flavor: Some("flavors/m1-small".into()),
         start_order: 0,
         start_delay_s: 0,
         on_node_loss: Default::default(),

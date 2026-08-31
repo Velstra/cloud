@@ -31,7 +31,24 @@ Collections, in the order the API serves them: `projects`, `users`,
 `device-classes`, `backup-targets`, `backups`, `backup-schedules`, `audit`,
 `captures`, `console-sessions`, `image-sources`, `usage`,
 `snapshot-schedules`,
-`maintenance-windows`, `operations`.
+`maintenance-windows`, `operations`, `flavors`.
+
+### Flavors: the size menu
+
+`flavors` are named machine sizes at cell scope — `vcpus`, `memoryMib`,
+`rootDiskGib`, and a sentence of `description`. Everybody may read the list
+(a tenant orders by name, so they must see the menu); only a cell operator may
+write it. An instance carrying `spec.flavor` (either spelling: `m1-small` or
+`flavors/m1-small`) has the flavor's numbers copied into `vcpus`, `memoryMib`
+and `rootDiskGib` when it is created — and again on any patch that names a
+flavor — with the name kept on the object. A patch that types a size instead
+takes the name off: a guest labelled `m1-small` with other numbers inside
+would be a label, not a size.
+
+Once the cell has at least one flavor, a tenant's guest **must** be sized by
+one unless their project carries `spec.policy.customSizes` — granted by the
+cell operator, the same recorded act as `policy.floatingIps`. A cell with no
+flavors has no menu to hold anybody to, and behaves as before.
 
 ### Narrowing a list by label
 

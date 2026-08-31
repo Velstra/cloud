@@ -376,6 +376,53 @@ impl Observed for DeviceClassStatus {
 
 impl Assigned for crate::pci::DeviceClassSpec {}
 
+// ---- flavors -------------------------------------------------------------
+
+/// A named machine size, offered by the cell.
+///
+/// What every large provider sells: a guest is a `m1.small`, not a
+/// hand-entered triple of numbers. The sizes are the operator's to define —
+/// capacity planning only works when the shapes that land on the fleet are
+/// the shapes it was bought for — and a tenant picks one by name. Whether a
+/// project may *also* size a guest by hand is that project's policy
+/// ([`ProjectPolicy::custom_sizes`]), so the flexible arrangement stays
+/// possible without being the default sold to everybody.
+pub type Flavor = Resource<FlavorSpec, FlavorStatus>;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FlavorSpec {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    /// The root disk a guest of this size gets. Part of the flavor rather than
+    /// a separate ask, because "how big is an m1.small" has one answer.
+    pub root_disk_gib: u64,
+    /// A sentence for the picker — "burstable, for dev boxes" — not a second
+    /// name. Empty is fine; the numbers already say most of it.
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FlavorStatus {
+    pub observed_generation: u64,
+    pub conditions: Vec<Condition>,
+}
+
+impl Observed for FlavorStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        // A definition, like a device class: nothing runs one, nothing owns one.
+        None
+    }
+}
+
+impl Assigned for FlavorSpec {}
+
 // ---- project -------------------------------------------------------------
 
 /// What a project may reach for, decided per project by whoever runs the cell.
@@ -451,6 +498,16 @@ pub struct ProjectPolicy {
     /// could exhaust the pool every other tenant is waiting on.
     #[serde(default = "as_before")]
     pub floating_ips: bool,
+    /// Whether guests here may be sized by hand instead of by flavor.
+    ///
+    /// Only asked once the cell *has* flavors: a cell that never defined any
+    /// has no menu to hold anybody to, and refusing every size then would be a
+    /// cell where nothing can be made. With flavors defined, the closed answer
+    /// is the sold one — a tenant picks from the menu, and the operator's
+    /// capacity planning holds — and opening it for a project is the same
+    /// deliberate act as opening floating IPs.
+    #[serde(default = "as_before")]
+    pub custom_sizes: bool,
 }
 
 /// What a field that is not in the document meant before the field existed.
@@ -474,6 +531,7 @@ fn policy_as_before() -> ProjectPolicy {
         host_bridges: Vec::new(),
         device_passthrough: true,
         floating_ips: true,
+        custom_sizes: true,
     }
 }
 
@@ -485,6 +543,7 @@ impl Default for ProjectPolicy {
             host_bridges: Vec::new(),
             device_passthrough: false,
             floating_ips: false,
+            custom_sizes: false,
         }
     }
 }
@@ -1151,6 +1210,17 @@ pub type Image = Resource<ImageSpec, ImageStatus>;
 pub struct InstanceSpec {
     pub vcpus: u32,
     pub memory_mib: u64,
+    /// The named size this guest was asked for — `m1-small` — when it was.
+    ///
+    /// Resolved at create and at every patch that names one: the API copies
+    /// the flavor's numbers into `vcpus`, `memory_mib` and `root_disk_gib`, so
+    /// everything that schedules, bills or migrates keeps reading the three
+    /// fields it always read. The name stays so a person can see what was
+    /// picked, and so a later resize can be "the next size up" rather than
+    /// arithmetic. Absent means the sizes were written by hand — which
+    /// [`ProjectPolicy::custom_sizes`] decides a project may do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flavor: Option<String>,
     /// `projects/p1/images/sha256-…`
     pub image: String,
     pub root_disk_gib: u64,
