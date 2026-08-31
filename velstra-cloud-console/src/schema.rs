@@ -2410,6 +2410,28 @@ const ROUTER_FIELDS: &[Field] = &[Field {
 
 /// A floating IP: the address, where it comes from, and what it points at.
 const FLOATING_IP_FIELDS: &[Field] = &[
+    // The question as a customer asks it: which of my machines gets a public
+    // address. The platform finds the guest's port and the cell's pool; the
+    // subnet moved behind More settings, where naming it is how you say v6 or
+    // pick among pools.
+    Field {
+        key: "instance",
+        label: "Instance",
+        kind: Kind::Ref {
+            collection: "instances",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: false,
+        advanced: false,
+        help: "The guest this address sits in front of. Its interface and the \
+               cell's public pool are found for you — name the subnet under \
+               More settings to choose v6, or a particular pool.",
+        when_empty: "This project has no guests yet; a public address goes in \
+                     front of one.",
+        derived: false,
+        at_creation: true,
+    },
     Field {
         key: "subnet",
         label: "Subnet",
@@ -2418,10 +2440,13 @@ const FLOATING_IP_FIELDS: &[Field] = &[
             filter_by: None,
             spelling: Spelling::Name,
         },
-        required: true,
-        advanced: false,
-        help: "Where the address comes from. The same counting as a port's \
-               address, so the two are never the same address.",
+        required: false,
+        // Behind More settings since the pool is found for you: naming the
+        // subnet is how you say v6, or choose among several pools.
+        advanced: true,
+        help: "Where the address comes from. Left empty, the cell's public \
+               pool answers — IPv4 first. Naming a subnet is how you choose \
+               v6, or a particular pool.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -2451,10 +2476,10 @@ const FLOATING_IP_FIELDS: &[Field] = &[
             spelling: Spelling::Name,
         },
         required: false,
-        // Not advanced, and not required: detaching is the ordinary state a
-        // floating IP exists to be in, so it has to be as easy to clear as to
-        // set.
-        advanced: false,
+        // Behind More settings now that the instance above is the ordinary
+        // ask. Clearing it still detaches — the state a floating IP exists to
+        // be in while the machine behind it is replaced.
+        advanced: true,
         help: "The port this address reaches. Clearing it holds the address \
                while the machine behind it is replaced.",
         when_empty: "",

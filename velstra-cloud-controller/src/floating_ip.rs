@@ -430,6 +430,7 @@ impl Reconciler for FloatingIpController {
         // is a compile error here until somebody says how.
         let FloatingIpSpec {
             subnet: _,   // where the address comes from — used by `address`
+            instance: _, // consumed at create; what is stored is `port`
             address: _,  // the address itself — allocated on the fabric below
             port: _,     // what it reaches — associated or detached below
             delivery: _, // how it reaches the guest — see `crate::public`
@@ -744,7 +745,8 @@ mod tests {
             let f = Resource::new(
                 meta(FIP),
                 FloatingIpSpec {
-                    subnet: SUBNET.into(),
+                    instance: String::new(),
+            subnet: SUBNET.into(),
                     address: address.map(str::to_string),
                     port: String::new(),
                     delivery: Default::default(),

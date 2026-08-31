@@ -773,7 +773,11 @@ function renderSheet(coll, r) {
   // Where this guest is, and where it is going. Rendered from the migrations
   // that exist rather than from anything on the instance, because there is no
   // field on an instance that says "moving" — and there must not be one.
-  if (coll.id === "instances") {
+  // Which machine runs the guest, and the way to move it — the operator's
+  // half of the sheet. A tenant's answer has no node in it (the API takes the
+  // name off the object) and no migrations to read, so for them this section
+  // could only be a heading over an error.
+  if (coll.id === "instances" && session.who && session.who.cellAdmin) {
     const host = el("div", { id: "instancemigration" });
     panel.appendChild(spread("Node", host, "where the guest runs"));
     migrationInto(host, r);

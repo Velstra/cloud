@@ -2686,6 +2686,240 @@ async fn the_fleet_reports_are_refused_to_whoever_may_not_list_the_fleet() {
     }
 }
 
+/// A tenant sees machines nowhere: not on the fleet, not on their own guests,
+/// not through migrations, and not by pinning.
+///
+/// Hosts are the cell's, and "invisible" is only true if it is true through
+/// every window at once. Each of these was a real pane: the instance sheet
+/// showed which hypervisor runs the guest, a project editor could create a
+/// migration between hosts they cannot list, and a pin to a guessed machine
+/// name was honoured silently by the scheduler.
+#[tokio::test]
+async fn a_tenant_sees_no_machines_through_any_window() {
+    let api = cell().await;
+    // A placed guest, as the cell sees it.
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "web", "spec": { "vcpus": 1, "memory_mib": 512, "node": "hv-1" } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator may pin");
+
+    // Reading it as the tenant: the machine's name is not in the answer.
+    let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
+    assert!(seen["spec"].get("node").is_none(), "{:?}", seen["spec"]);
+    assert!(seen["status"].get("node").is_none(), "{:?}", seen["status"]);
+    // And the operator still sees it whole: redaction is a view, not a change.
+    let whole = api.get(&name("projects/p1/instances/web"), &who(OPERATOR)).await.unwrap();
+    assert_eq!(whole["spec"]["node"], "hv-1");
+
+    // Migrations: refused whole — create and read alike.
+    let refused = api
+        .create(
+            "projects/p1",
+            "migrations",
+            &json!({ "id": "m", "spec": { "instance": "projects/p1/instances/web", "to_node": "hv-2" } }),
+            &who(ADA),
+        )
+        .await
+        .map(|_| ()).expect_err("a tenant moved a guest between machines");
+    assert!(refused.to_string().contains("cell operator"), "{refused}");
+    assert!(
+        api.list_for("projects/p1", "migrations", &Default::default(), &who(ADA))
+            .await
+            .is_err(),
+        "a tenant listed migrations, which name the machines"
+    );
+
+    // Pinning: a name they cannot see is not a name they may write.
+    for (kind, spec) in [
+        ("instances", json!({ "vcpus": 1, "memory_mib": 512, "node": "hv-1" })),
+        ("attachments", json!({ "volume": "projects/p1/volumes/v", "instance": "projects/p1/instances/web", "node": "hv-1" })),
+    ] {
+        let refused = api
+            .create("projects/p1", kind, &json!({ "id": "pinned", "spec": spec }), &who(ADA))
+            .await
+            .map(|_| ()).expect_err(&format!("a tenant pinned a {kind} to a machine"));
+        assert!(refused.to_string().contains("cannot pin"), "{refused}");
+    }
+    let refused = api
+        .patch(
+            &name("projects/p1/instances/web"),
+            &json!({ "spec": { "node": "hv-2" } }),
+            None,
+            &who(ADA),
+        )
+        .await
+        .expect_err("a tenant re-pinned a guest by patch");
+    assert!(refused.to_string().contains("cannot pin"), "{refused}");
+}
+
+/// The cell's public pools are readable by everyone, like the image catalogue.
+///
+/// A pool is an external network the operator declared at cell scope; a tenant
+/// draws an address from it, which means they must be able to see it — its
+/// name, and whether the cell offers v4, v6 or both.
+#[tokio::test]
+async fn the_cells_public_networks_are_readable_and_only_readable_by_tenants() {
+    let api = cell().await;
+    api.create(
+        "",
+        "networks",
+        &json!({ "id": "public", "spec": { "external": true, "mtu": 1500 } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator declares a pool");
+    api.create(
+        "",
+        "subnets",
+        &json!({ "id": "public-v4", "spec": {
+            "network": "networks/public", "cidr": "203.0.113.0/24",
+            "gateway": "203.0.113.1", "dns": [], "reserved": [] } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("and its range");
+
+    // A tenant reads the offer…
+    let net = api.get(&name("networks/public"), &who(ADA)).await.unwrap();
+    assert_eq!(net["spec"]["external"], true);
+    let listed = api.list_for("", "subnets", &Default::default(), &who(ADA)).await.unwrap();
+    assert!(
+        listed
+            .items
+            .iter()
+            .any(|s| serde_json::to_string(&s["meta"]["name"]).unwrap().contains("public-v4")),
+        "the public subnet is not in a tenant's list ({} items)",
+        listed.items.len()
+    );
+    // …and may not touch it.
+    assert!(
+        api.patch(&name("networks/public"), &json!({ "spec": { "mtu": 1400 } }), None, &who(ADA))
+            .await
+            .is_err(),
+        "a tenant edited the cell's pool"
+    );
+}
+
+/// A public address is asked for the way a customer asks: "give my VM an IP".
+///
+/// The instance is named and the platform finds the port; the subnet is left
+/// out and the platform finds the pool, v4 first. Nobody has to know that
+/// ports exist or what the pool is called.
+#[tokio::test]
+async fn a_public_address_is_assigned_by_instance_out_of_the_cells_pool() {
+    let api = cell().await;
+    // Somewhere to announce from: the door check rightly refuses a public
+    // address in a cell where no machine carries external traffic.
+    api.create(
+        "",
+        "nodes",
+        &json!({ "id": "gw", "spec": { "gateway": true, "schedulable": true } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    for (id, spec) in [
+        ("public", json!({ "external": true, "mtu": 1500 })),
+    ] {
+        api.create("", "networks", &json!({ "id": id, "spec": spec }), &who(OPERATOR))
+            .await
+            .unwrap();
+    }
+    for (id, cidr, gw) in [
+        ("public-v6", "2001:db8::/64", "2001:db8::1"),
+        ("public-v4", "203.0.113.0/24", "203.0.113.1"),
+    ] {
+        api.create(
+            "",
+            "subnets",
+            &json!({ "id": id, "spec": {
+                "network": "networks/public", "cidr": cidr, "gateway": gw,
+                "dns": [], "reserved": [] } }),
+            &who(OPERATOR),
+        )
+        .await
+        .unwrap();
+    }
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "web", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        &who(ADA),
+    )
+    .await
+    .expect("a tenant makes a guest");
+
+    api.create(
+        "projects/p1",
+        "floatingips",
+        &json!({ "id": "web-ip", "spec": { "instance": "projects/p1/instances/web" } }),
+        &who(ADA),
+    )
+    .await
+    .expect("a tenant gives their VM a public address");
+    let stored = api.get(&name("projects/p1/floatingips/web-ip"), &who(ADA)).await.unwrap();
+    // The port was derived from the guest's one interface, and the pool chosen
+    // v4-first; `instance` was consumed.
+    let port = stored["spec"]["port"].as_str().unwrap_or_default();
+    assert!(port.contains("/ports/"), "{stored}");
+    assert!(
+        serde_json::to_string(&stored["spec"]["subnet"]).unwrap().contains("public-v4"),
+        "{:?}",
+        stored["spec"]["subnet"]
+    );
+    assert!(
+        stored["spec"].get("instance").is_none()
+            || stored["spec"]["instance"].as_str() == Some(""),
+        "{:?}",
+        stored["spec"]
+    );
+
+    // The v6 pool is one name away.
+    api.create(
+        "projects/p1",
+        "floatingips",
+        &json!({ "id": "web-ip6", "spec": {
+            "instance": "projects/p1/instances/web", "subnet": "subnets/public-v6" } }),
+        &who(ADA),
+    )
+    .await
+    .expect("naming the v6 subnet is how you say v6");
+
+    // And a cell with no pool says so instead of accepting an address from
+    // nowhere — checked against a fresh cell.
+    let bare = cell().await;
+    bare.create(
+        "",
+        "nodes",
+        &json!({ "id": "gw", "spec": { "gateway": true, "schedulable": true } }),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    bare.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "web", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        &who(ADA),
+    )
+    .await
+    .unwrap();
+    let refused = bare
+        .create(
+            "projects/p1",
+            "floatingips",
+            &json!({ "id": "ip", "spec": { "instance": "projects/p1/instances/web" } }),
+            &who(ADA),
+        )
+        .await
+        .map(|_| ()).expect_err("an address out of no pool");
+    assert!(refused.to_string().contains("no public addresses"), "{refused}");
+}
+
 #[tokio::test]
 async fn listing_asks_about_what_is_being_listed_and_not_about_the_project() {
     // `GET /projects/p1/instances` authorises Read on `projects/p1`. Asking that

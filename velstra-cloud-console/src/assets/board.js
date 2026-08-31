@@ -40,6 +40,24 @@ const census = {};
 ///
 /// The scope is not the test, because images are cell-wide *and* everybody's.
 /// What these have in common is that they are the estate, not the tenancy.
+// Project collections that are nonetheless the operator's business. A
+// migration names the machines a guest moves between, and machines are not
+// part of a tenant's view — the API refuses them the whole object. Ports exist
+// so an address can outlive its machine; they are made and removed by the
+// platform, and a board of them is plumbing a customer never asked to see.
+const OPERATOR_ONLY = ["migrations", "ports"];
+
+/// The columns a board shows this account.
+///
+/// One filter, one reason: machine names are not part of a tenant's view. The
+/// API already takes them off the objects, so for a tenant these columns could
+/// only ever be a header over blanks — a question the page keeps asking with
+/// no answer coming.
+function columnsFor(coll) {
+  if (session.who && session.who.cellAdmin) return coll.columns;
+  return coll.columns.filter((c) => !/(^|\.)node$/.test(c.path));
+}
+
 const CELL_ONLY = [
   // Kept in step with `authz::belongs_to_the_cell`, which is what the API
   // refuses — a guard checks the two agree. `ceph-clusters` is the collection's
@@ -51,7 +69,8 @@ const CELL_ONLY = [
 function groups() {
   const out = [];
   for (const c of collections()) {
-    if (CELL_ONLY.includes(c.id) && !(session.who && session.who.cellAdmin)) continue;
+    const admin = session.who && session.who.cellAdmin;
+    if ((CELL_ONLY.includes(c.id) || OPERATOR_ONLY.includes(c.id)) && !admin) continue;
     let g = out.find((x) => x.name === c.group);
     if (!g) { g = { name: c.group, items: [] }; out.push(g); }
     g.items.push(c);
@@ -134,7 +153,8 @@ async function sweep() {
     // The same rule the rail draws by. Sweeping a collection the rail hides
     // from this account is ten requests whose answers are known — and, until
     // the 403 handling below existed, ten red rows on a tenant's overview.
-    if (CELL_ONLY.includes(c.id) && !(session.who && session.who.cellAdmin)) {
+    if ((CELL_ONLY.includes(c.id) || OPERATOR_ONLY.includes(c.id))
+        && !(session.who && session.who.cellAdmin)) {
       census[c.id] = { ok: true, denied: true, total: 0, unsettled: 0 };
       return;
     }
@@ -305,7 +325,7 @@ function renderBoard() {
     })) : null,
     el("th", { style: "width:220px" }, coll.singular === "project" ? "Project" : "Name"),
     el("th", { style: "width:150px" }, "Convergence"),
-    coll.columns.map((c) => el("th", { style: "width:" + c.width + "px" }, c.label)));
+    columnsFor(coll).map((c) => el("th", { style: "width:" + c.width + "px" }, c.label)));
 
   const body = $("boardbody");
   clear(body);
@@ -329,7 +349,7 @@ function renderBoard() {
     }
     tr.appendChild(el("td.name", el("span.id", { title: nameOf(r) }, idOf(r))));
     tr.appendChild(el("td", stateOf(r, coll.condition)));
-    for (const c of coll.columns) tr.appendChild(cell(r, c));
+    for (const c of columnsFor(coll)) tr.appendChild(cell(r, c));
     body.appendChild(tr);
   }
 

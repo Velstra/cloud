@@ -1635,7 +1635,21 @@ pub type Router = Resource<RouterSpec, RouterStatus>;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FloatingIpSpec {
     /// The subnet the address comes from, by resource name.
+    ///
+    /// Left empty, the API settles it to one of the cell's public subnets —
+    /// see `settle_floating_ip` there. Stored, it is always filled in.
+    #[serde(default)]
     pub subnet: String,
+    /// The guest this address should sit in front of — a request, not a record.
+    ///
+    /// The same shape as an instance's `networks`: a floating IP forwards to a
+    /// **port**, which is right in the model and wrong in a form — a customer
+    /// assigning a public address to their VM should not have to know that
+    /// ports exist. Consumed on the way in: the API resolves the guest's port
+    /// and stores `port`, because two fields describing one destination are two
+    /// fields that drift.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance: String,
     /// The address, once something has decided it.
     ///
     /// `None` means "any", and a controller fills it in — the same arrangement
