@@ -1013,6 +1013,33 @@ impl Agent {
             }
         }
 
+        // A guest with no instance anywhere in the cell. Nothing will ever ask
+        // for it to be stopped: the delete pipeline stops a guest while its
+        // record is still there, and once the record is gone no pass looks at
+        // the guest again. Found live as a QEMU that outlived its instance by
+        // two days, holding a tap for a port that no longer existed — which the
+        // tap sweep below then tried to remove, and was refused, every pass,
+        // for ever ("Device or resource busy").
+        //
+        // Cell-wide, not this node's share: a guest mid-arrival or mid-handover
+        // still has its record, so the only guests this touches are the ones
+        // nobody's books mention at all. The list read failing returns early
+        // above, so an unreadable store never looks like an empty one.
+        let known: BTreeSet<String> = instances.iter().map(|i| i.meta.name.to_string()).collect();
+        for name in host.vms.keys() {
+            if known.contains(name) {
+                continue;
+            }
+            tracing::warn!(instance = %name,
+                "stopping a guest whose instance is gone from the cell");
+            if let Err(e) = self.vmm.stop(name).await {
+                tracing::warn!(instance = %name, error = %e, "the orphaned guest would not stop");
+                pass.failures += 1;
+            } else {
+                pass.actions += 1;
+            }
+        }
+
         match self.cell.attachments().await {
             Ok(attachments) => {
                 for attachment in &attachments {

@@ -74,16 +74,6 @@ impl Agent {
         self.fence_after_s
             .store(stored.spec.fence_after_s, Ordering::Relaxed);
 
-        let mut next = stored.clone();
-        next.status.observed_generation = stored.meta.generation;
-        next.status.capacity = capacity;
-        next.status.allocated = allocated;
-        next.status.agent_version = self.config.agent_version.clone();
-        next.status.console_endpoint = self.config.console_endpoint.clone();
-        // Reported like everything else about this machine, so a controller
-        // deciding whether a guest can move reads a fact rather than a
-        // configuration file it has no access to.
-        next.status.shared_state = self.config.shared_state;
         // The heartbeat moves only when it is old enough to matter.
         //
         // It used to move on every pass — and a pass is woken by watch events,
@@ -99,6 +89,43 @@ impl Agent {
         // with it for free.
         let heartbeat_due =
             Timestamp::now().0.saturating_sub(stored.status.last_heartbeat.0) >= 10_000;
+
+        let mut next = stored.clone();
+        next.status.observed_generation = stored.meta.generation;
+        next.status.capacity = capacity;
+        // Free-memory readings jitter by a few MiB between any two looks at
+        // /proc, and on a machine that also runs the control plane they never
+        // repeat — so "did anything change" was answered yes on every pass,
+        // and the equality skip below never fired. They are telemetry, not
+        // facts a controller acts on to the MiB: a movement smaller than this
+        // carries the stored figure forward and lets the heartbeat cadence
+        // publish the fresh one.
+        const MIB_WORTH_REPORTING: u64 = 256;
+        if !heartbeat_due {
+            let close = |a: u64, b: u64| a.abs_diff(b) < MIB_WORTH_REPORTING;
+            if close(next.status.capacity.memory_mib, stored.status.capacity.memory_mib) {
+                next.status.capacity.memory_mib = stored.status.capacity.memory_mib;
+            }
+            if next.status.capacity.numa_free_mib.len()
+                == stored.status.capacity.numa_free_mib.len()
+                && next
+                    .status
+                    .capacity
+                    .numa_free_mib
+                    .iter()
+                    .zip(&stored.status.capacity.numa_free_mib)
+                    .all(|(a, b)| close(*a, *b))
+            {
+                next.status.capacity.numa_free_mib = stored.status.capacity.numa_free_mib.clone();
+            }
+        }
+        next.status.allocated = allocated;
+        next.status.agent_version = self.config.agent_version.clone();
+        next.status.console_endpoint = self.config.console_endpoint.clone();
+        // Reported like everything else about this machine, so a controller
+        // deciding whether a guest can move reads a fact rather than a
+        // configuration file it has no access to.
+        next.status.shared_state = self.config.shared_state;
         next.status.last_heartbeat = if heartbeat_due {
             Timestamp::now()
         } else {

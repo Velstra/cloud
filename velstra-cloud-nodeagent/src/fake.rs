@@ -218,6 +218,36 @@ impl FakeVmm {
         }
     }
 
+    /// Put a running guest on the machine with no request behind it — the
+    /// state a node is in when a guest outlives its instance record.
+    pub fn start_detached(&self, instance: &str) {
+        let mut m = self.machine.lock().unwrap();
+        let pid = m.next_pid;
+        m.next_pid += 1;
+        m.vms.insert(
+            instance.to_string(),
+            VmObservation {
+                size: None,
+                console_tail: String::new(),
+                console_bytes: 0,
+                devices: Vec::new(),
+                state: InstanceState::Running,
+                pid: Some(pid),
+                started_at: Some(Timestamp::now()),
+            },
+        );
+    }
+
+    /// Nudge the free-memory readings by `mib`, the way any two looks at
+    /// /proc disagree on a busy machine.
+    pub fn wobble_free_memory(&self, mib: u64) {
+        let mut m = self.machine.lock().unwrap();
+        m.capacity.memory_mib = m.capacity.memory_mib.saturating_sub(mib);
+        for n in &mut m.capacity.numa_free_mib {
+            *n = n.saturating_sub(mib / 2);
+        }
+    }
+
     /// Give a guest a real file to be its disk.
     ///
     /// A real one, because the one caller that asks — making an image out of a
