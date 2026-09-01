@@ -138,13 +138,13 @@ fn classify(disk: &Node) -> BlockDevice {
 
     // Removable first: a USB stick with nothing on it passes every other check,
     // and building cluster storage on one is not a thing anybody meant.
-    let state = if disk.rm {
-        DeviceUse::Unsuitable {
-            why: "it is removable, and cluster storage on a removable device is not something \
-                  anybody means"
-                .to_string(),
-        }
-    } else if disk.size == 0 {
+    // What a disk *is* comes before what the platform thinks of it: a
+    // removable device that already carries an OSD, a volume or a filesystem
+    // is that thing, and reporting it as "unsuitable" hid a running OSD from
+    // the deploy for ever — the step could never be seen as done. The
+    // removable opinion now applies only to an empty disk, where it is the
+    // only thing left to say.
+    let state = if disk.size == 0 {
         DeviceUse::Unsuitable {
             why: "it reports no size, so there is nothing here to use".to_string(),
         }
@@ -170,6 +170,12 @@ fn classify(disk: &Node) -> BlockDevice {
     } else if let Some(fstype) = disk.fstype.as_deref().filter(|f| !f.is_empty()) {
         DeviceUse::Filesystem {
             fstype: fstype.to_string(),
+        }
+    } else if disk.rm {
+        DeviceUse::Unsuitable {
+            why: "it is removable, and cluster storage on a removable device is not something \
+                  anybody means"
+                .to_string(),
         }
     } else {
         DeviceUse::Free
