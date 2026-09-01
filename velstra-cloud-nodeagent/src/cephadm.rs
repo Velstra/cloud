@@ -228,7 +228,21 @@ pub fn add_osd_argv(host: &str, device: &str) -> Vec<String> {
 /// durability is whatever somebody set globally, which is exactly the thing the
 /// spec was written to pin.
 pub fn create_pool_argv(pool: &CephPoolSpec) -> Vec<Vec<String>> {
-    vec![
+    let mut argv = Vec::new();
+    // One copy needs two permissions: the monitors' blanket refusal lifted,
+    // and the per-command incantation. Both found live — the set failed, the
+    // sequence stopped there, and the pool kept size 2 with no application
+    // enabled either, because one `?` ended the whole list.
+    if pool.size < 2 {
+        argv.push(vec![
+            "config".into(),
+            "set".into(),
+            "global".into(),
+            "mon_allow_pool_size_one".into(),
+            "true".into(),
+        ]);
+    }
+    argv.extend(vec![
         vec![
             "osd".into(),
             "pool".into(),
@@ -272,7 +286,8 @@ pub fn create_pool_argv(pool: &CephPoolSpec) -> Vec<Vec<String>> {
             pool.pool.clone(),
             "rbd".into(),
         ],
-    ]
+    ]);
+    argv
 }
 
 /// What `ceph orch ps --format json` says is running on this host.
