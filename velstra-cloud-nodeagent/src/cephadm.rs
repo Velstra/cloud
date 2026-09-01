@@ -235,14 +235,24 @@ pub fn create_pool_argv(pool: &CephPoolSpec) -> Vec<Vec<String>> {
             "create".into(),
             pool.pool.clone(),
         ],
-        vec![
-            "osd".into(),
-            "pool".into(),
-            "set".into(),
-            pool.pool.clone(),
-            "size".into(),
-            pool.size.to_string(),
-        ],
+        {
+            let mut argv = vec![
+                "osd".into(),
+                "pool".into(),
+                "set".into(),
+                pool.pool.clone(),
+                "size".into(),
+                pool.size.to_string(),
+            ];
+            // Ceph refuses size 1 without the incantation — rightly, and a lab
+            // that asked for one copy on its one disk meant it. Found live: the
+            // set failed, the pool kept the default of 2, and nothing ever came
+            // back for it because "settled" only checks the pool exists.
+            if pool.size < 2 {
+                argv.push("--yes-i-really-mean-it".into());
+            }
+            argv
+        },
         vec![
             "osd".into(),
             "pool".into(),
