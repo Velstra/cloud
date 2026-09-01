@@ -471,7 +471,15 @@ pub fn may_create_volume(
         let Ok(named) = ResourceName::parse(source) else {
             continue;
         };
-        if named.project() != project {
+        // The catalogue is the one legitimate crossing: a cell-scoped image is
+        // *published* — everybody may boot it, and a volume made from it is a
+        // copy of the operator's bytes, not an exfiltration of anybody's. An
+        // instance's root disk crosses this line on every create already; a
+        // volume asked for by hand was refused the same bytes for no reason a
+        // sentence could defend. Snapshots and project images keep the rule.
+        let published_catalogue =
+            named.collection() == "images" && named.project().is_none();
+        if named.project() != project && !published_catalogue {
             return Err(Refusal::AnotherProject {
                 origin: source.to_string(),
                 origin_project: named.project().unwrap_or("no project").to_string(),
@@ -948,6 +956,16 @@ mod tests {
             Err(Refusal::AnotherProject { .. })
         ));
         assert!(may_create_volume(&in_p1("data-2"), &spec, None).is_ok());
+
+        // The catalogue is the one legitimate crossing: a cell-scoped image is
+        // published, and a volume made from it copies the operator's bytes,
+        // not another tenant's. An instance's root disk already crosses this
+        // line on every create; a hand-made volume was refused the same bytes.
+        spec.source_image = Some("images/sha256-abc".into());
+        assert!(
+            may_create_volume(&stolen, &spec, None).is_ok(),
+            "a published image was refused to a project"
+        );
     }
 
     #[test]
