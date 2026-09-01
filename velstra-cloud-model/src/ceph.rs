@@ -502,6 +502,11 @@ pub struct NodeCephState {
     /// against — the only place both facts are in one hand is here, where the
     /// reports have been collected.
     pub consumable: Vec<String>,
+    /// Devices whose *only* fault is the platform's taste — `Unsuitable`,
+    /// which today means removable media. These may be taken when the spec
+    /// says `even_if_unsuitable` for them; a mounted disk or one with a
+    /// filesystem is never in this list, so the waiver cannot reach it.
+    pub waivable: Vec<String>,
 }
 
 /// Everything the controller knows when it decides.
@@ -706,6 +711,18 @@ pub fn next_step(spec: &CephClusterSpec, observed: &CephObserved) -> CephStep {
                     why: format!("{} does not have Ceph installed yet", osd.node),
                 };
             }
+            // The lab waiver, honoured here too: a disk whose only fault is
+            // the platform's taste may be taken when the spec says so for it.
+            // `waivable` never contains a mounted disk or one with data, so
+            // the flag cannot reach those.
+            Some(state)
+                if osd.even_if_unsuitable && state.waivable.contains(&osd.device) =>
+            {
+                return CephStep::AddOsd {
+                    node: osd.node.clone(),
+                    device: osd.device.clone(),
+                };
+            }
             // The disk is not one the node offers. Refused rather than
             // attempted, because `orch daemon add osd` on a disk with something
             // on it is the one mistake in this file with no undo — and the node
@@ -828,6 +845,16 @@ pub fn observe_at(nodes: &[crate::resources::Node], now: crate::meta::Timestamp)
                     .devices
                     .iter()
                     .filter(|d| may_consume(d).is_ok())
+                    .map(|d| d.path.clone())
+                    .collect(),
+                waivable: node
+                    .status
+                    .devices
+                    .iter()
+                    .filter(|d| {
+                        matches!(d.state, DeviceUse::Unsuitable { .. })
+                            && d.size_gib >= MIN_OSD_GIB
+                    })
                     .map(|d| d.path.clone())
                     .collect(),
             }
@@ -1009,6 +1036,7 @@ mod tests {
                 "/dev/disk/by-id/one".to_string(),
                 "/dev/disk/by-id/two".to_string(),
             ],
+            waivable: Vec::new(),
         }
     }
 
@@ -1395,6 +1423,45 @@ mod tests {
     /// disk, so it has no inventory to check against and would carry the
     /// command out. This is where the refusal has to live, and the reason is
     /// the one an operator needs: the disk is not empty.
+    /// The lab waiver reaches the deploy, and only for taste.
+    ///
+    /// A removable disk asked for with `evenIfUnsuitable` is added; the same
+    /// flag on a disk that is unoffered for a real reason (a filesystem, a
+    /// mount) still refuses, because `waivable` never contains one.
+    #[test]
+    fn the_lab_waiver_takes_a_removable_disk_and_nothing_else() {
+        let mut spec = spec();
+        spec.osds[0].even_if_unsuitable = true;
+        let mut observed = seen(
+            vec![
+                node("a", true, &[]),
+                node("b", true, &[]),
+                node("c", true, &[]),
+            ],
+            &[],
+            true,
+        );
+        // The disk stopped being consumable because the platform dislikes it —
+        // removable — which is exactly what the flag waives.
+        observed.nodes[0].consumable.clear();
+        observed.nodes[0].waivable.push("/dev/disk/by-id/one".into());
+        assert_eq!(
+            next_step(&spec, &observed),
+            CephStep::AddOsd {
+                node: "a".into(),
+                device: "/dev/disk/by-id/one".into(),
+            },
+            "a waived removable disk was not taken"
+        );
+        // A disk unoffered for a real reason is not in `waivable`, and the
+        // flag does not reach it.
+        observed.nodes[0].waivable.clear();
+        match next_step(&spec, &observed) {
+            CephStep::Blocked { why } => assert!(why.contains("provably empty"), "{why}"),
+            other => panic!("the waiver reached a disk with data on it: {other:?}"),
+        }
+    }
+
     #[test]
     fn an_osd_on_a_disk_the_node_does_not_offer_is_refused_by_name() {
         let spec = spec();
