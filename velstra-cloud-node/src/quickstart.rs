@@ -158,6 +158,7 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         ceph_user: String::new(),
         ceph_pool: String::new(),
         ceph_image_pool: String::new(),
+        ceph_pool_id: String::new(),
         region: "eu-central".into(),
         cell: "cell-1".into(),
         roles: vec![Role::ControlPlane, Role::Hypervisor, Role::Pool],
