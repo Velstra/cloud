@@ -39,7 +39,16 @@ Collections, in the order the API serves them: `projects`, `users`,
 BGP session from one gateway machine — `spec.node` — to one router outside the
 cell (`spec.peer`, `spec.peerAs`, `spec.localAs`). The gateway's agent renders
 the host's FRR configuration from it and reports back `status.session` (FRR's
-own word: `Established`, `Active`, …) and `status.announced`.
+own word: `Established`, `Active`, …) and `status.announced`. Two optional
+knobs cover the sessions real firewalls insist on: `spec.password` (TCP-MD5,
+RFC 2385 — the same string on both ends; it sits on the spec because nobody
+who is not already allowed to write this object can read it) and
+`spec.multihop` (the distance to a peer that is not on the same wire; absent
+means directly connected). Each gateway speaks with its own router-id,
+derived from the node's name, so two gateways sharing an AS never present to
+the router as one speaker. Deleting the last `bgp-peers` object naming a
+machine silences that machine's daemon on the next pass — a session does not
+outlive the object that made it.
 
 **What gets announced is derived, never listed**: every external subnet whole,
 plus a `/32` (or `/128`) host route for each floating address that names a
@@ -1581,12 +1590,15 @@ merged.
 **Machines are invisible to a tenant, through every window at once:**
 
 * `spec.node` and `status.node` are **taken off** instances, attachments,
-  console sessions and ports on the way out to anybody who is neither a cell
-  operator nor a machine agent. Nothing stored changes; operators and agents
+  console sessions, ports and captures on the way out to anybody who is
+  neither a cell operator nor a machine agent. Nothing stored changes; operators and agents
   read the same objects whole. A port's computed `Ready` condition is
   rewritten without the machine's name too ("programmed and carried") — the
   words were the fifth place the name appeared, found live in a tenant's own
-  list after the other four were shut.
+  list after the other four were shut. Captures were the sixth: the API
+  itself writes the guest's machine onto `spec.node` (the machine with the
+  disk is the only one that can copy it) and served it back to the tenant
+  who asked for the template.
 * **Migrations are the operator's entirely** — create, read and list. A
   migration names the machines a guest moves between, and its record is
   meaningless with them removed. The guest's own object tells a tenant

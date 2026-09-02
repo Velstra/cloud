@@ -1234,6 +1234,7 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
         BgpPeerSpec, BgpPeerStatus, FloatingIpSpec, FloatingIpStatus, NetworkSpec, NetworkStatus,
         SubnetSpec, SubnetStatus,
     };
+    use velstra_cloud_nodeagent::bgp::BgpSpeaker as _;
     use velstra_cloud_store::TypedStore;
     use velstra_cloud_model::resources::Resource;
     let store = store();
@@ -1255,7 +1256,7 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
                     peer_as: 65000,
                     local_as: 65010,
                     node: "node-a".into(),
-                    description: String::new(),
+                    ..Default::default()
                 },
                 BgpPeerStatus::default(),
             ),
@@ -1338,4 +1339,32 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
         .with_bgp(Arc::new(other_bgp.clone()));
     other.resync().await;
     assert!(other_bgp.applied().is_none(), "a bystander programmed its daemon");
+
+    // The last session naming this machine is deleted — no finalizer, so it is
+    // simply gone by the next pass. The daemon must be told to stop: a
+    // gateway still announcing the cell after the operator removed the
+    // session is the one outcome the object's deletion was meant to end.
+    let edge = peers.get("bgp-peers/edge").await.unwrap().unwrap();
+    peers.delete("bgp-peers/edge", edge.meta.revision, &writer).await.unwrap();
+    agent.resync().await;
+    let silence = bgp.applied().expect("the daemon was never told to stop");
+    assert!(silence.sessions.is_empty(), "the session outlived its object: {silence:?}");
+    assert!(silence.hosts_v4.is_empty(), "prefixes announced on no session: {silence:?}");
+    // And once silent, silent: a settled empty cell is not rewritten either.
+    let applies = bgp.applies();
+    agent.resync().await;
+    assert_eq!(bgp.applies(), applies, "an already-silent daemon was reloaded");
+
+    // An agent that starts after the deletion finds no session of its own and
+    // a daemon still speaking (the fake remembers what it was last told).
+    // Asking the daemon, not the store, is what lets it notice.
+    let stale = velstra_cloud_nodeagent::fake::FakeBgp::new();
+    stale.apply(&said).await.unwrap();
+    let restarted = node_agent(store.clone(), "node-a", &FakeVmm::new(), &FakeDatapath::new())
+        .with_bgp(Arc::new(stale.clone()));
+    restarted.resync().await;
+    assert!(
+        stale.applied().is_some_and(|d| d.sessions.is_empty()),
+        "a restarted agent left a deleted session running"
+    );
 }

@@ -2901,6 +2901,46 @@ async fn a_tenant_sees_no_machines_through_any_window() {
     api.explain_placement(&name("projects/p1/instances/web"), &who(OPERATOR))
         .await
         .expect("the operator reads placement");
+
+    // Captures: the API writes the guest's machine onto the spec itself (the
+    // assignee), and the agent that copies the disk claims the status. A
+    // tenant asking for their own template got both names back.
+    {
+        use velstra_cloud_model::access::Writer;
+        use velstra_cloud_model::capture::{CaptureSpec, CaptureStatus};
+        use velstra_cloud_model::meta::{Meta, Placement, ResourceName};
+        let captures: velstra_cloud_store::TypedStore<CaptureSpec, CaptureStatus> =
+            velstra_cloud_store::TypedStore::new(store.clone(), "cell-1", "captures");
+        let mut capture = velstra_cloud_model::resources::Resource::new(
+            Meta::new(
+                ResourceName::parse("projects/p1/captures/golden").unwrap(),
+                Placement::new("eu-central", "cell-1"),
+            ),
+            CaptureSpec {
+                instance: "projects/p1/instances/web".into(),
+                target: "backup-targets/shelf".into(),
+                node: "hv-1".into(),
+                label: "golden".into(),
+            },
+            CaptureStatus::default(),
+        );
+        captures.create(&capture, &Writer::controller("test")).await.unwrap();
+        capture = captures.get("projects/p1/captures/golden").await.unwrap().unwrap();
+        capture.status.node = Some("hv-1".into());
+        captures.update(&capture, &Writer::agent("hv-1")).await.unwrap();
+    }
+    let seen = api.get(&name("projects/p1/captures/golden"), &who(ADA)).await.unwrap();
+    assert!(seen["spec"].get("node").is_none(), "a capture's spec leaks: {:?}", seen["spec"]);
+    assert!(seen["status"].get("node").is_none(), "a capture's status leaks: {:?}", seen["status"]);
+    let listed = api
+        .list_for("projects/p1", "captures", &Default::default(), &who(ADA))
+        .await
+        .unwrap();
+    for item in &listed.items {
+        assert!(item["spec"].get("node").is_none(), "the capture list leaks: {:?}", item["spec"]);
+    }
+    let whole = api.get(&name("projects/p1/captures/golden"), &who(OPERATOR)).await.unwrap();
+    assert_eq!(whole["spec"]["node"], "hv-1");
 }
 
 /// The cell's public pools are readable by everyone, like the image catalogue.
@@ -3323,6 +3363,26 @@ async fn a_flavor_is_a_menu_the_cell_writes_and_a_tenant_orders_from() {
     let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
     assert_eq!(seen["spec"]["vcpus"], 8);
     assert_eq!(seen["spec"]["memory_mib"], 16384);
+    assert_eq!(seen["spec"]["root_disk_gib"], 40);
+
+    // The size *down* the menu carries a smaller disk, and the menu is not a
+    // way round the rule that a disk is never shrunk. Refused, at the field
+    // the person actually wrote.
+    let refused = api
+        .patch(
+            &name("projects/p1/instances/web"),
+            &json!({ "spec": { "flavor": "m1-small" } }),
+            None,
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a flavor with a smaller disk shrank the root disk");
+    assert_eq!(refused.field.as_deref(), Some("spec.flavor"), "{refused}");
+    assert!(refused.to_string().contains("shrunk"), "{refused}");
+    let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
+    assert_eq!(seen["spec"]["root_disk_gib"], 40, "the refusal still shrank it");
+    assert_eq!(seen["spec"]["flavor"], "flavors/m1-big");
 
     // Typing a size instead is what the policy closed.
     let refused = api

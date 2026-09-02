@@ -451,6 +451,25 @@ pub struct BgpPeerSpec {
     /// A sentence for the board — "edge firewall, rack 3".
     #[serde(default)]
     pub description: String,
+    /// TCP-MD5 on the session (RFC 2385), the same string on both ends.
+    ///
+    /// Most firewalls in front of a cell will not bring a session up without
+    /// one, and an operator who cannot set it here sets it in FRR by hand —
+    /// where the next render of the file takes it away again. Stored on the
+    /// spec because this collection is the cell's own: a tenant never reads a
+    /// `bgp-peers` object, so there is nobody to hide it from who is not
+    /// already allowed to write it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// How many hops away the far end is, when it is not on the wire.
+    ///
+    /// An eBGP session assumes its neighbour is directly connected and refuses
+    /// one that is not (TTL 1). A firewall one router further along — the
+    /// ordinary shape when the gateway sits behind a switch's SVI — needs this
+    /// set to the distance, and there is nothing a person can do about it in
+    /// the objects otherwise. Absent means directly connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multihop: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
