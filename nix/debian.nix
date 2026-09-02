@@ -209,6 +209,44 @@ let
           --pool "$VELSTRA_POOL" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
           --store "$VELSTRA_STORE" --backend "$VELSTRA_POOL_BACKEND"' '';
     };
+    # A second pool on the same machine, for the cell's Ceph cluster.
+    #
+    # Separate from the unit above rather than a mode of it: a machine that
+    # holds local disks *and* reaches a Ceph cluster is the ordinary
+    # arrangement, not an either/or — the local pool keeps a guest's scratch
+    # disk on the node, and Ceph holds what has to outlive it. One agent per
+    # pool object is what the platform's own model says, and two units is how
+    # systemd spells that.
+    #
+    # `VELSTRA_CEPH_POOL_ID` is the **pool object's id** in this cell — what a
+    # volume's `spec.pool` names — and is not `VELSTRA_CEPH_POOL`, which is the
+    # RBD pool inside the cluster. Two different namespaces, and spelling them
+    # alike is how somebody points an agent at the wrong one.
+    #
+    # Gated on it being set: a cell without Ceph has nothing for this to run
+    # against, and the unit must read as "not for this box" rather than as a
+    # failure. Found while building the first real cluster, where the agent had
+    # to be started by hand with `systemd-run` — which survives no reboot and
+    # is in no package.
+    "velstra-cloud-poolagent-ceph.service" = unit {
+      role = "pool";
+      description = "Velstra Cloud storage pool agent (Ceph)";
+      exec = ''
+        /bin/sh -c 'if [ -z "''${VELSTRA_CEPH_POOL_ID:-}" ]; then \
+          echo "node.env names no VELSTRA_CEPH_POOL_ID; this machine serves no Ceph pool" >&2; \
+          exit 0; \
+        fi; \
+        tok=/var/lib/velstra/ceph-pool-token; \
+        [ -f /etc/velstra/ceph-pool-token ] && tok=/etc/velstra/ceph-pool-token; \
+        if [ -f "$tok" ]; then \
+          exec ${bin "velstra-cloud-poolagent"} \
+            --pool "$VELSTRA_CEPH_POOL_ID" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
+            --api "$VELSTRA_API_URL" --api-token-file "$tok" --backend ceph; \
+        fi; \
+        exec ${bin "velstra-cloud-poolagent"} \
+          --pool "$VELSTRA_CEPH_POOL_ID" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
+          --store "$VELSTRA_STORE" --backend ceph' '';
+    };
     "velstra-fabric-agent.service" = fabricUnit;
   };
 
@@ -377,7 +415,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     if [ "$1" = "remove" ]; then
       for u in velstra-cloud-api velstra-cloud-controller \
                velstra-cloud-nodeagent velstra-cloud-poolagent \
-               velstra-fabric-agent; do
+               velstra-cloud-poolagent-ceph velstra-fabric-agent; do
         systemctl stop "$u" >/dev/null 2>&1 || true
       done
     fi

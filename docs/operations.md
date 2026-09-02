@@ -102,3 +102,35 @@ The far end must accept eBGP without an import policy or carry its own
 (RFC 8212 — modern FRR filters everything until a policy exists; the rendered
 config on our side already says `no bgp ebgp-requires-policy` because the
 network statements *are* the policy).
+
+
+## A Ceph pool for the cell
+
+Two units serve pools on one machine: `velstra-cloud-poolagent` for its local
+disks and `velstra-cloud-poolagent-ceph` for the cluster. The second does
+nothing unless the seed names `VELSTRA_CEPH_POOL_ID` — **the pool object's id
+in this cell**, what a volume's `spec.pool` names, as against
+`VELSTRA_CEPH_POOL` / `VELSTRA_CEPH_IMAGE_POOL`, which are RBD pools inside
+the cluster.
+
+Bringing one up, in the order the platform expects:
+
+1. `apt-get install cephadm podman` on the machines that will run daemons.
+2. Create the `ceph-clusters` object (monitors, OSDs, pools). The agents
+   bootstrap, add hosts and create the pools by themselves; the board says
+   which step is outstanding and who owns it.
+3. Create a `pools` object for it (`POST /api/v1/pools`, id `ceph`), put its
+   id in the seed as `VELSTRA_CEPH_POOL_ID`, and start
+   `velstra-cloud-poolagent-ceph`.
+4. Publish images into the cluster once, from any machine with the keyring:
+   `velstra-cloud-poolagent --import-image images/sha256-… --from <file>
+   --backend ceph`. The image lands in the image pool with a protected
+   `@base` snapshot, and every volume made from it is an `rbd clone` — no
+   bytes move, and "which nodes hold this image" stops being a question.
+
+Two things Ceph itself insists on, both handled by the platform and both worth
+knowing when reading a cluster by hand: a pool with `size: 1` needs
+`mon_allow_pool_size_one` set globally *and* `--yes-i-really-mean-it` on the
+`set`; and `ceph-volume` refuses a whole disk that carries a partition table,
+so a disk that was something else has to be wiped (`wipefs -a`) before it can
+be an OSD.

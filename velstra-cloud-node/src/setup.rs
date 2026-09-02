@@ -107,6 +107,11 @@ pub struct Machine {
     pub ceph_user: String,
     pub ceph_pool: String,
     pub ceph_image_pool: String,
+    /// The **pool object's** id in this cell — what a volume's `spec.pool`
+    /// names — as against the two RBD pool names above, which live inside the
+    /// cluster. Set on a machine that serves the cell's Ceph pool; empty
+    /// everywhere else, and the Ceph unit then does nothing.
+    pub ceph_pool_id: String,
     /// Where the store is, for a control plane.
     pub store: String,
     /// The other cells this installation can reach, as `cell=url` pairs.
@@ -208,6 +213,11 @@ pub fn render(m: &Machine) -> String {
             ("VELSTRA_CEPH_USER", &m.ceph_user),
             ("VELSTRA_CEPH_POOL", &m.ceph_pool),
             ("VELSTRA_CEPH_IMAGE_POOL", &m.ceph_image_pool),
+            // The pool *object's* id in this cell — what a volume's
+            // `spec.pool` names — as against the two keys above, which are RBD
+            // pools inside the cluster. Empty on a machine that serves only a
+            // local pool, and the Ceph unit then reads as "not for this box".
+            ("VELSTRA_CEPH_POOL_ID", &m.ceph_pool_id),
         ] {
             if !value.is_empty() {
                 out.push_str(&format!("{key}={value}\n"));
@@ -304,10 +314,15 @@ pub fn parse(text: &str) -> Result<Machine> {
         tls_key: String::new(),
         lvm_group: String::new(),
         lvm_thin_pool: String::new(),
-        ceph_conf: String::new(),
-        ceph_user: String::new(),
-        ceph_pool: String::new(),
-        ceph_image_pool: String::new(),
+        // Read from the seed like everything else, which they were not: an
+        // unattended install could name a Ceph backend and had no way to say
+        // which cluster, which pools or which client — so `--config` could
+        // configure every backend but that one.
+        ceph_conf: or("VELSTRA_CEPH_CONF", ""),
+        ceph_user: or("VELSTRA_CEPH_USER", ""),
+        ceph_pool: or("VELSTRA_CEPH_POOL", ""),
+        ceph_image_pool: or("VELSTRA_CEPH_IMAGE_POOL", ""),
+        ceph_pool_id: or("VELSTRA_CEPH_POOL_ID", ""),
         region: or("VELSTRA_REGION", "eu-central"),
         cell: or("VELSTRA_CELL", "cell-1"),
         local_network: matches!(
@@ -634,6 +649,7 @@ fn collect() -> Result<Option<Machine>> {
         ceph_user: String::new(),
         ceph_pool: String::new(),
         ceph_image_pool: String::new(),
+        ceph_pool_id: String::new(),
         region,
         cell,
         roles: roles.clone(),
@@ -738,6 +754,11 @@ fn collect() -> Result<Option<Machine>> {
             } else {
                 images
             };
+            // The cell's own name for this storage, which is a different
+            // namespace from the RBD pools above: a volume asks for
+            // `pool: ceph`, and the cluster is where `velstra-volumes` lives.
+            let id = prompt("Pool object id in this cell [ceph]: ")?.trim().to_string();
+            m.ceph_pool_id = if id.is_empty() { "ceph".to_string() } else { id };
         }
     }
 
@@ -923,6 +944,7 @@ mod tests {
             ceph_user: String::new(),
             ceph_pool: String::new(),
             ceph_image_pool: String::new(),
+            ceph_pool_id: String::new(),
             local_network: false,
             region: "eu-central".into(),
             cell: "cell-1".into(),
