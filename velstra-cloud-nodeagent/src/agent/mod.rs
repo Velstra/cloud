@@ -2042,6 +2042,39 @@ impl Agent {
         let me = self.config.node.as_str();
         let mine: Vec<_> = peers.iter().filter(|p| p.spec.node == me).collect();
         if mine.is_empty() {
+            // Nothing to say — which is different from nothing to do. A
+            // `bgp-peers` object has no finalizer, so the last one naming this
+            // machine vanishes between two passes, and the daemon it
+            // programmed is still up, still announcing the cell to a router
+            // that was told to stop trusting it. The one write this branch
+            // may make is the empty file; whether it has to is asked of the
+            // daemon (a machine that never spoke is not written to).
+            let held = self
+                .bgp_applied
+                .lock()
+                .expect("nothing panics holding the applied-config lock")
+                .clone();
+            let still_speaking = match &held {
+                Some(applied) => !applied.sessions.is_empty(),
+                None => speaker.is_speaking().await,
+            };
+            if still_speaking {
+                let silence = crate::bgp::desired_for(me, &[], &[], &[], &[]);
+                match speaker.apply(&silence).await {
+                    Ok(()) => {
+                        pass.actions += 1;
+                        *self
+                            .bgp_applied
+                            .lock()
+                            .expect("nothing panics holding the applied-config lock") =
+                            Some(silence);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "could not silence the routing daemon");
+                        pass.failures += 1;
+                    }
+                }
+            }
             return;
         }
         let (networks, subnets, floating) = match (

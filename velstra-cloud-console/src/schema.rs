@@ -1217,6 +1217,30 @@ const BGP_PEER_FIELDS: &[Field] = &[
         at_creation: false,
     },
     Field {
+        key: "password",
+        label: "TCP-MD5 password",
+        kind: Kind::Text { placeholder: "", check: Check::None },
+        required: false,
+        advanced: true,
+        help: "The same string the router has for this session (RFC 2385). Most \
+               firewalls will not bring a session up without one.",
+        when_empty: "none — the session is unauthenticated",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "multihop",
+        label: "Hops to the peer",
+        kind: Kind::Number { unit: "", min: 1, max: 255, step: 1, scale: Scale::None },
+        required: false,
+        advanced: true,
+        help: "Only when the router is not on the same wire: eBGP refuses a \
+               neighbour more than one hop away unless told the distance.",
+        when_empty: "directly connected",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
         key: "description",
         label: "Description",
         kind: Kind::Text { placeholder: "edge firewall, rack 3", check: Check::None },

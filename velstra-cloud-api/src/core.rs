@@ -657,9 +657,14 @@ impl Api {
         if self.is_operator(who) || crate::sessions::agent_node(who).is_some() {
             return;
         }
+        // `captures` is the sixth door: the API itself writes the guest's
+        // machine onto `spec.node` (it is the assignee — only the machine with
+        // the disk can copy it), and the agent claims `status.node`. Both
+        // right, both the cell's, and both were served to the tenant who asked
+        // for the template.
         if !matches!(
             kind,
-            "instances" | "attachments" | "console-sessions" | "ports"
+            "instances" | "attachments" | "console-sessions" | "ports" | "captures"
         ) {
             return;
         }
@@ -2336,9 +2341,6 @@ impl Api {
             if name.collection() == "images" {
                 refuse_an_unverified_signature(spec)?;
             }
-            if name.collection() == "instances" && spec.get("root_disk_gib").is_some() {
-                self.refuse_a_smaller_disk(name, spec, who).await?;
-            }
             if name.collection() == "instances" {
                 // A resize is either the next size on the menu or a hand-typed
                 // number, and the two must not blur: a patch that names a
@@ -2347,6 +2349,29 @@ impl Api {
                 // somebody else's numbers inside would be a label, not a size.
                 if spec.get("flavor").is_some() {
                     self.settle_flavor(spec).await?;
+                    // The flavor's disk is a number this patch now carries, and
+                    // it goes through the same door a typed one does. Before
+                    // this the shrink check ran first and saw no disk in the
+                    // patch, so picking the next size *down* the menu shrank a
+                    // root disk that a typed number would have been refused
+                    // for — the menu was a way round the one rule that
+                    // protects bytes.
+                    self.refuse_a_smaller_disk(name, spec, who).await.map_err(|e| {
+                        let picked = spec
+                            .get("flavor")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        ApiError::new(
+                            e.code,
+                            format!(
+                                "{picked} comes with a smaller root disk than this guest has, \
+                                 and a disk is not shrunk: {}",
+                                e.message
+                            ),
+                        )
+                        .at("spec.flavor")
+                    })?;
                 } else if spec.get("vcpus").is_some()
                     || spec.get("memory_mib").is_some()
                     || spec.get("root_disk_gib").is_some()
@@ -2358,6 +2383,7 @@ impl Api {
                     )
                     .await?;
                     spec["flavor"] = Value::Null;
+                    self.refuse_a_smaller_disk(name, spec, who).await?;
                 }
             }
             // Pinning a guest to a machine names a host, and hosts are not part

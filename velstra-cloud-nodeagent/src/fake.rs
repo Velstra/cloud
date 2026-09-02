@@ -1299,4 +1299,12 @@ impl crate::bgp::BgpSpeaker for FakeBgp {
     async fn observe(&self) -> Result<BTreeMap<String, crate::bgp::PeerObservation>> {
         Ok(self.inner.lock().unwrap().peers.clone())
     }
+    async fn is_speaking(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .applied
+            .as_ref()
+            .is_some_and(|d| !d.sessions.is_empty())
+    }
 }

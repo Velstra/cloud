@@ -29,6 +29,15 @@ use crate::host::Result;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BgpDesired {
     pub sessions: Vec<BgpSession>,
+    /// The id this machine speaks with — `10.255.x.y`, derived from the
+    /// node's name and nothing else.
+    ///
+    /// Not from the AS: two gateways in one cell share an AS by design, and
+    /// a router-id derived from it made them present as one speaker to the
+    /// router in front of them. Two sessions from "the same" router is a
+    /// thing BGP tolerates and an operator debugging it at three in the
+    /// morning does not. The name is unique in the cell, so its hash is.
+    pub router_id: String,
     /// Prefixes announced on every session: the external subnets, verbatim.
     pub networks_v4: Vec<String>,
     pub networks_v6: Vec<String>,
@@ -43,6 +52,10 @@ pub struct BgpSession {
     pub peer: String,
     pub peer_as: u32,
     pub local_as: u32,
+    /// TCP-MD5, verbatim from the object.
+    pub password: Option<String>,
+    /// `ebgp-multihop N`; absent is directly connected.
+    pub multihop: Option<u8>,
 }
 
 /// What the daemon says about one neighbour.
@@ -68,6 +81,17 @@ pub trait BgpSpeaker: Send + Sync + 'static {
     async fn apply(&self, desired: &BgpDesired) -> Result<()>;
     /// What the daemon reports, keyed by neighbour address.
     async fn observe(&self) -> Result<BTreeMap<String, PeerObservation>>;
+    /// Whether the daemon is currently saying something this agent told it
+    /// to — sessions, not just the header.
+    ///
+    /// Asked once, when an agent starts and finds no session of its own in
+    /// the cell: the object that programmed the daemon may have been deleted
+    /// while the agent was down, and an agent that only ever wrote when it
+    /// had something to say would leave that session up for ever. On a
+    /// machine that was never a gateway this answers `false` and the file
+    /// is not touched, so a fleet full of nodes without FRR stays a fleet
+    /// full of nodes without FRR.
+    async fn is_speaking(&self) -> bool;
 }
 
 /// Compute what this node should be announcing.
@@ -83,7 +107,10 @@ pub fn desired_for(
     subnets: &[Subnet],
     floating: &[FloatingIp],
 ) -> BgpDesired {
-    let mut desired = BgpDesired::default();
+    let mut desired = BgpDesired {
+        router_id: router_id_for(me),
+        ..BgpDesired::default()
+    };
     for p in peers {
         if p.spec.node != me || p.meta.is_deleting() {
             continue;
@@ -92,6 +119,8 @@ pub fn desired_for(
             peer: p.spec.peer.clone(),
             peer_as: p.spec.peer_as,
             local_as: p.spec.local_as,
+            password: p.spec.password.clone().filter(|s| !s.is_empty()),
+            multihop: p.spec.multihop.filter(|n| *n > 1),
         });
     }
     if desired.sessions.is_empty() {
@@ -137,6 +166,26 @@ pub fn desired_for(
     desired
 }
 
+/// The first line of every file this agent writes, and the mark by which it
+/// recognises its own work on a later start.
+const WRITTEN_BY_US: &str = "! Written by velstra-cloud-nodeagent. Edits are overwritten;\n";
+
+/// A stable, per-node router id in `10.255.0.0/16`.
+///
+/// FNV-1a over the name, folded to sixteen bits. Private space, so it can
+/// never be mistaken for an address something routes to; deterministic, so
+/// an agent restarted a hundred times presents as one router a hundred
+/// times.
+pub fn router_id_for(node: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in node.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    let folded = (h ^ (h >> 16) ^ (h >> 32) ^ (h >> 48)) & 0xffff;
+    format!("10.255.{}.{}", folded >> 8, folded & 0xff)
+}
+
 /// The `frr.conf` that says `desired`, whole.
 ///
 /// One router block per local AS (FRR allows one `router bgp` per AS/VRF), a
@@ -145,9 +194,9 @@ pub fn desired_for(
 /// what the *cell* claims, not whatever the kernel picked up.
 pub fn render_frr(desired: &BgpDesired) -> String {
     use std::fmt::Write;
-    let mut out = String::from(
-        "! Written by velstra-cloud-nodeagent. Edits are overwritten;\n\
-         ! the bgp-peers objects are where this file comes from.\n\
+    let mut out = String::from(WRITTEN_BY_US);
+    out.push_str(
+        "! the bgp-peers objects are where this file comes from.\n\
          frr defaults traditional\n\
          log syslog informational\n\
          !\n",
@@ -176,18 +225,18 @@ pub fn render_frr(desired: &BgpDesired) -> String {
         // nothing", silently.
         let _ = writeln!(out, " no bgp ebgp-requires-policy");
         // The daemon must not guess an id from whichever interface it saw
-        // first: derive one stable answer from the AS so two gateways never
-        // collide by accident. An operator who needs a specific id sets up
-        // FRR's own config for it — this file is the derived truth, not a
-        // hand-edited one.
-        let _ = writeln!(
-            out,
-            " bgp router-id 10.255.{}.{}",
-            (local_as >> 8) & 0xff,
-            local_as & 0xff
-        );
+        // first: the node's own, see [`router_id_for`]. An operator who needs
+        // a specific id sets up FRR's own config for it — this file is the
+        // derived truth, not a hand-edited one.
+        let _ = writeln!(out, " bgp router-id {}", desired.router_id);
         for s in &sessions {
             let _ = writeln!(out, " neighbor {} remote-as {}", s.peer, s.peer_as);
+            if let Some(password) = &s.password {
+                let _ = writeln!(out, " neighbor {} password {password}", s.peer);
+            }
+            if let Some(hops) = s.multihop {
+                let _ = writeln!(out, " neighbor {} ebgp-multihop {hops}", s.peer);
+            }
         }
         let _ = writeln!(out, " address-family ipv4 unicast");
         for p in desired.networks_v4.iter().chain(&desired.hosts_v4) {
@@ -290,6 +339,15 @@ impl BgpSpeaker for FrrSpeaker {
         Ok(())
     }
 
+    async fn is_speaking(&self) -> bool {
+        match tokio::fs::read_to_string(&self.config).await {
+            Ok(current) => {
+                current.starts_with(WRITTEN_BY_US) && current.contains("\nrouter bgp ")
+            }
+            Err(_) => false,
+        }
+    }
+
     async fn observe(&self) -> Result<BTreeMap<String, PeerObservation>> {
         let output = tokio::process::Command::new("vtysh")
             .args(["-c", "show bgp summary json"])
@@ -356,7 +414,7 @@ mod what_the_cell_announces {
                 peer_as: 65000,
                 local_as: 65010,
                 node: node.into(),
-                description: String::new(),
+                ..Default::default()
             },
             BgpPeerStatus::default(),
         )
@@ -426,7 +484,44 @@ mod what_the_cell_announces {
             &[subnet("subnets/public-v4", "networks/public", "203.0.113.0/24")],
             &[],
         );
-        assert_eq!(desired, BgpDesired::default());
+        assert!(desired.sessions.is_empty());
+        assert!(desired.networks_v4.is_empty() && desired.hosts_v4.is_empty());
+        // Rendered, that is a file with no `router bgp` block at all — the
+        // silence an agent writes once the last session naming it is gone.
+        assert!(!render_frr(&desired).contains("router bgp"));
+    }
+
+    #[test]
+    fn the_router_id_is_the_nodes_own_and_stable() {
+        let a = router_id_for("horst");
+        let b = router_id_for("peter");
+        assert_ne!(a, b, "two gateways in one AS presented as one router");
+        assert_eq!(a, router_id_for("horst"));
+        assert!(a.starts_with("10.255."), "{a}");
+        let conf = render_frr(&desired_for(
+            "horst",
+            &[peer("bgp-peers/edge", "horst")],
+            &[network("networks/public", true)],
+            &[subnet("subnets/public-v4", "networks/public", "203.0.113.0/24")],
+            &[],
+        ));
+        assert!(conf.contains(&format!(" bgp router-id {a}")), "{conf}");
+    }
+
+    #[test]
+    fn a_password_and_a_distance_reach_the_neighbour_line() {
+        let mut p = peer("bgp-peers/edge", "gw-1");
+        p.spec.password = Some("s3cret".into());
+        p.spec.multihop = Some(3);
+        let conf = render_frr(&desired_for("gw-1", &[p.clone()], &[], &[], &[]));
+        assert!(conf.contains(" neighbor 10.10.10.1 password s3cret"), "{conf}");
+        assert!(conf.contains(" neighbor 10.10.10.1 ebgp-multihop 3"), "{conf}");
+        // An empty password and a distance of one are the defaults spelled
+        // out, and the defaults render as nothing.
+        p.spec.password = Some(String::new());
+        p.spec.multihop = Some(1);
+        let conf = render_frr(&desired_for("gw-1", &[p], &[], &[], &[]));
+        assert!(!conf.contains("password") && !conf.contains("multihop"), "{conf}");
     }
 
     #[test]
