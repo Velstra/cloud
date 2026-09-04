@@ -1094,11 +1094,20 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
     }
     problems.classList.add("hidden");
     submit.setAttribute("disabled", "");
+    // The verb in the present tense and a spinner: the request can take a
+    // second, and a dimmed button for that second says nothing about whether
+    // anything was sent.
+    const label = submit.textContent;
+    submit.classList.add("busy");
+    submit.textContent = (/^(Create|Save|Add|Move|Migrate|Attach|Apply)\b/.exec(label) || ["Working"])[0]
+      .replace(/e?$/, "") + "ing…";
     try {
       await onSubmit(form);
       closeDialog();
     } catch (e) {
       submit.removeAttribute("disabled");
+      submit.classList.remove("busy");
+      submit.textContent = label;
       // The API points at the offending path when there is one, so the message
       // lands on the control rather than in a banner nobody can act on. When it
       // does not, one refusal is still placeable without guessing: the only

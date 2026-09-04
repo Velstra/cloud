@@ -17,7 +17,7 @@ use futures::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
 use velstra_cloud_model::{
     assignment::Assignee,
-    authz::{Verb, governing_project, may},
+    authz::{Role, Verb, governing_project, may},
     ceph::{CephClusterSpec, CephClusterStatus},
     identity::{UserSpec, UserStatus},
     loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
@@ -437,6 +437,24 @@ struct Inner {
 #[derive(Clone)]
 pub struct Api {
     inner: Arc<Inner>,
+}
+
+/// The higher of two rungs. A custom role sits between Viewer and Operator:
+/// it may admit more than a viewer, and nothing here can say how much more,
+/// so beside a named rung the named rung wins and beside Viewer the custom
+/// name is reported — the console draws everything for a name it does not
+/// know and lets the API refuse.
+fn strongest(a: Role, b: Role) -> Role {
+    fn rank(r: &Role) -> u8 {
+        match r {
+            Role::Viewer => 0,
+            Role::Custom(_) => 1,
+            Role::Operator => 2,
+            Role::Editor => 3,
+            Role::Admin => 4,
+        }
+    }
+    if rank(&b) > rank(&a) { b } else { a }
 }
 
 impl Api {
@@ -926,6 +944,46 @@ impl Api {
         self.judge(who, Verb::Read, &target, target.collection())
             .await
             .is_ok()
+    }
+
+    /// The strongest rung this subject holds in each project, by project id —
+    /// what `whoami` reports so a console can draw only what the account may
+    /// do, instead of every button and a refusal behind half of them.
+    ///
+    /// Folders count: a grant above a project reaches into it, exactly as
+    /// [`Self::judge`] reads it. A custom role is reported by its name, since
+    /// only the API can say what it admits; a console draws everything for
+    /// one and lets the refusal speak. A cell operator gets the map too —
+    /// it is the projects they are *named* in, not what they may do, which
+    /// is everything and is said by `cellAdmin`.
+    pub async fn project_roles(&self, who: &Identity) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let Ok(projects) = self.typed_list::<ProjectSpec, ProjectStatus>("", "projects").await
+        else {
+            return out;
+        };
+        for project in projects {
+            if project.meta.is_deleting() {
+                continue;
+            }
+            let mut bindings = project.spec.bindings.clone();
+            bindings.extend(self.bindings_above(&project.spec.parent).await);
+            let held = bindings
+                .iter()
+                .filter(|b| b.members.iter().any(|m| m == &who.subject))
+                .map(|b| b.role.clone());
+            let mut best: Option<Role> = None;
+            for role in held {
+                best = Some(match best {
+                    None => role,
+                    Some(have) => strongest(have, role),
+                });
+            }
+            if let Some(role) = best {
+                out.insert(project.meta.name.id().to_string(), role.to_string());
+            }
+        }
+        out
     }
 
     async fn judge(

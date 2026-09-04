@@ -366,7 +366,10 @@ await test("a drifting object shows the gap, and the reason for it", async () =>
   await openRow(page, it.id);
   const g = await gens(it.id);
   const text = await sheetText(page);
-  check(/Drifting/.test(text), `${it.id} does not read as drifting`);
+  // "Drifting" is the class; the word on the sheet says what is under way
+  // when it can ("Stopping…", "Applying…") — either is the amber state.
+  check(/Drifting|Applying…|Stopping…|Starting…|Restarting…/.test(text),
+    `${it.id} does not read as drifting`);
   check(text.includes(`generation ${g.generation}`) && text.includes(`reported at ${g.observed}`),
     "the gap is not stated in generations:\n" + text.slice(0, 500));
   // A drifting object need not carry a Ready condition — but if it does, the
@@ -2108,6 +2111,57 @@ await test("editing a guest keeps the image it was built from, and still saves",
   equal(after.image, "projects/p1/images/debian-13", "saving the edit changed the image");
   equal(after.vcpus, 6, "the size change did not reach the API");
   await page.evaluate(`closeSheet()`);
+});
+
+await test("a viewer is drawn no New, Edit or Delete; an operator gets Edit alone", async () => {
+  // `whoami` reports the rung held in each project, and the console draws
+  // only what that rung admits. Every button was drawn for every account
+  // before, and a viewer learned their rung by being refused.
+  await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
+  const seen = await page.evaluate(`(async () => {
+    const was = session.who;
+    const out = {};
+    for (const rung of ["viewer", "operator", "editor"]) {
+      session.who = { ...was, cellAdmin: false, projects: { [session.project]: rung } };
+      await show("instances");
+      await new Promise((r) => setTimeout(r, 400));
+      const row = document.querySelector("#boardbody tr");
+      row.click();
+      await new Promise((r) => setTimeout(r, 400));
+      out[rung] = {
+        create: !!document.getElementById("newbtn"),
+        edit: !!document.getElementById("editbtn"),
+        del: !!document.getElementById("deletebtn"),
+      };
+      closeSheet();
+    }
+    session.who = was;
+    await show("instances");
+    return out;
+  })()`);
+  equal(seen.viewer, { create: false, edit: false, del: false }, "a viewer is offered a change");
+  equal(seen.operator, { create: false, edit: true, del: false }, "an operator's buttons are wrong");
+  equal(seen.editor, { create: true, edit: true, del: true }, "an editor's buttons are wrong");
+});
+
+await test("work in progress reads as the verb, and the mark moves", async () => {
+  // A migration copying memory read "Not reported" — the opposite of what
+  // was happening. An Unknown condition with a reason is the agent saying
+  // what it is doing, and the table quotes it.
+  await open(page, "instances");
+  const seen = await page.evaluate(`(() => {
+    const rows = [...document.querySelectorAll("#boardbody tr")];
+    return rows.map((r) => ({ name: r.dataset.name.split("/").pop(),
+      word: (r.querySelector(".state") || {}).textContent || "",
+      busy: !!r.querySelector(".state.busy") }));
+  })()`);
+  // The seed holds a guest whose ask moved and one the node is converging;
+  // both are work in progress, and both say so in the present tense.
+  const working = seen.filter((r) => /ing…$/.test(r.word));
+  check(working.length >= 2, "guests being worked on do not say so: " + JSON.stringify(seen));
+  check(working.every((r) => r.busy), "a guest being worked on does not show it: " + JSON.stringify(working));
+  check(seen.every((r) => !/Not reported|Settled|Failing/.test(r.word) || !r.busy),
+    "a guest nothing is happening to is drawn as busy: " + JSON.stringify(seen));
 });
 
 await test("a disk already given to this cluster can still be taken back", async () => {

@@ -698,6 +698,10 @@ function deleteControl(coll, r, opts = {}) {
   const rest = () => fill(host,
     el("button.btn.quiet", { type: "button", id: "deletebtn", onclick: ask }, verb));
   const go = async () => {
+    // Say so while it runs: a delete that answers in a second reads as one
+    // that did nothing until the row is gone.
+    const pressed = host.querySelector("#confirmdelete");
+    if (pressed) { pressed.disabled = true; pressed.classList.add("busy"); pressed.textContent = "Deleting…"; }
     try {
       await remove(coll, idOf(r), revision(r));
       toast(opts.done || "Deletion asked for. It stays visible until its finalizers let go.");
@@ -766,7 +770,11 @@ function renderSheet(coll, r) {
   // Edit that would send the quota back and be refused for it.
   const cellsPen = ["flavors", "projects"];
   const holdsThePen = !cellsPen.includes(coll.id) || (session.who && session.who.cellAdmin);
-  if (coll.editable && holdsThePen) {
+  // And what this account's rung admits: an operator gets Edit (resize,
+  // power, attach — the API refuses the rest of the form for them), a viewer
+  // gets neither. Drawn from `whoami`, so the button that appears is one
+  // that will be accepted.
+  if (coll.editable && holdsThePen && allows("edit")) {
     acts.appendChild(el("button.btn.primary", { type: "button", id: "editbtn",
       onclick: () => openEdit(coll, r) }, "Edit"));
   }
@@ -797,7 +805,7 @@ function renderSheet(coll, r) {
   // Abandoning a migration is not deleting a row: what it costs depends on the
   // mode, and the sentence is different enough that it is written where the
   // modes are.
-  if (coll.deletable && holdsThePen
+  if (coll.deletable && holdsThePen && allows("delete")
       && (coll.id !== "audit" || (session.who && session.who.cellAdmin))) {
     acts.appendChild(coll.id === "migrations"
       ? deleteControl(coll, r, abandonAsk(r))

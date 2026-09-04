@@ -399,6 +399,29 @@ async fn seed(store: Arc<dyn Store>) {
         ),
     )
     .await;
+    // The same bytes in the cell's catalogue, where every project may boot
+    // them: without one, a second tenant had nothing to choose from — "none
+    // exist yet" in the image picker and no way to make a guest at all.
+    put(
+        &store,
+        "images",
+        Resource::new(
+            meta("images/sha256-3f9a2b"),
+            ImageSpec {
+                from: String::new(),
+                family: "debian-13".into(),
+                version: "seed".into(),
+                source_instance: None,
+                digest: SEED_IMAGE_DIGEST.into(),
+                format: ImageFormat::Raw,
+                size_bytes: 1_073_741_824,
+                source_url: SEED_IMAGE_URL.into(),
+                signature: None,
+            },
+            ImageStatus::default(),
+        ),
+    )
+    .await;
 
     // A network, a subnet on it, and a port — three boards that are otherwise
     // empty, and the only way to see that a subnet picker offers the subnets of

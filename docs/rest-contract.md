@@ -2024,10 +2024,15 @@ POST   /api/v1/users/{id}/tokens     # mint a token (a service account)
   password, disabled account — is the same `401` sentence, so the response is not
   an oracle for which usernames exist.
 - **`GET /sessions/current`** (`whoami`) returns `{subject, displayName,
-  cellAdmin, session}`. `cellAdmin` is the combined operator answer (config list
-  or stored flag). `session` is true only when *this token* is a live session —
-  a static token or service account reads `false`, because there is no session
-  behind it for a sign-out to end.
+  cellAdmin, session, projects}`. `cellAdmin` is the combined operator answer
+  (config list or stored flag). `session` is true only when *this token* is a
+  live session — a static token or service account reads `false`, because there
+  is no session behind it for a sign-out to end. `projects` maps each project
+  the subject is named in to the strongest rung they hold there
+  (`{"p1": "admin", "p2": "viewer"}`), folders included; a custom role appears
+  by its name. It is what lets a console draw the buttons an account can use
+  rather than every button and a refusal behind half of them — the API still
+  decides, this only says in advance.
 - **`DELETE /sessions/current`** ends the session the caller presented, and only
   that one. It names no session: a route that ended a session by name would be a
   way to sign somebody else out. Idempotent — a token already gone is not an
