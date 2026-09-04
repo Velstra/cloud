@@ -2073,6 +2073,43 @@ await test("picking a disk stages the node and the device together", async () =>
   equal(stored.spec.pools[0].minSize, 2, "the pool lost its write floor");
 });
 
+await test("editing a guest keeps the image it was built from, and still saves", async () => {
+  // The picker offers families; the guest carries the build its family
+  // resolved to when it was made. The two never match, and clearing the field
+  // on that mismatch stopped every edit at "Still needed: Image" — so nobody
+  // could change a guest's size or power without pretending to choose an OS.
+  await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
+  await open(page, "instances");
+  await openRow(page, "web-1");
+  await page.evaluate(`document.getElementById("editbtn").click()`);
+  await sleep(800);
+  const seen = await page.evaluate(`({
+    image: document.getElementById("f-image").value,
+    locked: document.getElementById("f-image").hasAttribute("disabled"),
+    shown: [...document.getElementById("f-image").options].find((o) => o.selected)?.textContent || "",
+  })`);
+  equal(seen.image, "projects/p1/images/debian-13", "the edit form dropped the guest's image");
+  check(seen.locked, "the image of an existing guest is offered for change");
+  check(/as built|debian/i.test(seen.shown), `the kept image is shown as "${seen.shown}"`);
+  await page.evaluate(`(() => {
+    const v = document.getElementById("f-vcpus");
+    v.value = "6"; v.dispatchEvent(new Event("input", { bubbles: true }));
+    document.getElementById("submitform").click();
+  })()`);
+  await sleep(1500);
+  const after = await page.evaluate(`(async () => {
+    const r = await fetch("/api/v1/projects/p1/instances/web-1",
+      { headers: { authorization: "Bearer " + sessionStorage.getItem("velstra-cloud-token") } });
+    const d = await r.json();
+    return { dialog: !!document.getElementById("dialog"), image: d.spec.image, vcpus: d.spec.vcpus,
+             err: (document.querySelector("#dialog .err") || {}).textContent || "" };
+  })()`);
+  check(!after.dialog, "the edit did not save: " + after.err);
+  equal(after.image, "projects/p1/images/debian-13", "saving the edit changed the image");
+  equal(after.vcpus, 6, "the size change did not reach the API");
+  await page.evaluate(`closeSheet()`);
+});
+
 await test("a disk already given to this cluster can still be taken back", async () => {
   // The trap in an edit form: once Ceph owns a disk the node reports it as an
   // OSD, which `may_consume` refuses — so a picker that believed the refusal

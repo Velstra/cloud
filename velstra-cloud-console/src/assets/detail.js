@@ -376,7 +376,11 @@ function statusTable(r) {
   const body = el("tbody");
   for (const [k, v] of Object.entries(status(r))) {
     if (k === "conditions" || k === "observedGeneration" || k === "observed_generation") continue;
-    const isTime = /(at|heartbeat|transition)$/i.test(k) && typeof v === "number" && v > 1e12;
+    // A millisecond timestamp reads as one wherever the name says "when":
+    // `startedAt`, `lastHeartbeat`, and a user's `lastLogin` — which showed as
+    // a thirteen-digit number until "login" was on this list.
+    const isTime = /(at|heartbeat|transition|login|seen|expires|since|until)$/i.test(k)
+      && typeof v === "number" && v > 1e12;
     body.appendChild(el("tr",
       el("td", label(k)),
       el("td", isTime ? el("span", { title: stamp(v) }, ago(v)) : valueNode(v), isTime ? null : alsoIn(k, v))));
@@ -755,7 +759,12 @@ function renderSheet(coll, r) {
     el("button.btn", { type: "button", id: "closesheet", onclick: closeSheet }, "Close")));
 
   const acts = el("div.sheetacts");
-  const cellsPen = ["flavors"];
+  // Objects whose fields are the cell's even when a tenant may open the sheet:
+  // a project's quota, policy and parent are set by a cell operator, and the
+  // API refuses a patch that carries them from anybody else. A project admin
+  // reaches this sheet for the Access panel — who may do what — and gets no
+  // Edit that would send the quota back and be refused for it.
+  const cellsPen = ["flavors", "projects"];
   const holdsThePen = !cellsPen.includes(coll.id) || (session.who && session.who.cellAdmin);
   if (coll.editable && holdsThePen) {
     acts.appendChild(el("button.btn.primary", { type: "button", id: "editbtn",

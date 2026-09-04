@@ -76,6 +76,7 @@ pub fn router(api: Api) -> Router {
         // door whose key is on the other side of it.
         .route("/api/v1/sessions", post(sign_in))
         .route("/", get(console))
+        .route("/favicon.ico", get(favicon))
         // A deep link into the console is a path this API does not serve and
         // the page does: reloading `/instances/i1` has to return the console
         // rather than a 404, because a single-page console routes it itself.
@@ -303,6 +304,18 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 /// rebuilt per request — it is one document and it never changes.
 async fn console() -> Response {
     axum::response::Html(velstra_cloud_console::page_ref()).into_response()
+}
+
+/// `GET /favicon.ico` — the tab icon (see `velstra_cloud_console::FAVICON_PNG`).
+async fn favicon() -> axum::response::Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        velstra_cloud_console::FAVICON_PNG,
+    )
+        .into_response()
 }
 
 /// Every request carries a bearer token, and this is the only place that knows

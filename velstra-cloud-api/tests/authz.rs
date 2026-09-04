@@ -676,6 +676,88 @@ async fn a_tenant_cannot_make_a_volume_from_another_tenants_snapshot() {
         .expect_err("the volume exists, so the refusal came too late to matter");
 }
 
+/// A machine keeps the image it was built from.
+///
+/// The console sends the whole form back on an edit, so saying the image again
+/// — by its name, or by the family that still resolves to it — has to be
+/// accepted as the nothing it is. Saying a different one is refused at the
+/// field, with the precondition it failed rather than a sentence about
+/// cell-wide resources (which is what judging `families/…` as a reference
+/// used to produce).
+#[tokio::test]
+async fn an_instance_keeps_the_image_it_was_built_from() {
+    let api = cell().await;
+    for (id, version) in [("sha256-old", "1"), ("sha256-new", "2")] {
+        // The family's newest is the newest by creation time, and two creates
+        // in one millisecond would tie.
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        api.create(
+            "projects/p1",
+            "images",
+            &json!({"id": id, "spec": {
+                "source_url": format!("http://x.invalid/{id}.qcow2"),
+                "digest": format!("sha256:{id}"),
+                "family": "debian-13", "version": version}}),
+            &who(ADA),
+        )
+        .await
+        .expect("ada uploads a build of debian-13");
+    }
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({"id": "web-1", "spec": {"vcpus": 2, "image": "projects/p1/images/sha256-old"}}),
+        &who(ADA),
+    )
+    .await
+    .expect("ada boots the older build by name");
+    let web = name("projects/p1/instances/web-1");
+
+    // The same image, said again: accepted, and nothing else in the patch is
+    // held up by it.
+    api.patch(
+        &web,
+        &json!({"spec": {"image": "projects/p1/images/sha256-old", "vcpus": 4}}),
+        None,
+        &who(ADA),
+    )
+    .await
+    .expect("repeating the image the guest already has is refused");
+
+    // A different build — even the family's newest — is a different machine.
+    let refused = api
+        .patch(
+            &web,
+            &json!({"spec": {"image": "families/debian-13"}}),
+            None,
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("the guest was moved onto another build");
+    assert_eq!(refused.code, Code::FailedPrecondition, "{refused}");
+    assert_eq!(refused.field.as_deref(), Some("spec.image"), "{refused}");
+    assert!(
+        !refused.message.contains("cell-wide"),
+        "a tenant editing their own guest was told about cell-wide resources: {refused}"
+    );
+    let refused = api
+        .patch(
+            &web,
+            &json!({"spec": {"image": "projects/p1/images/sha256-new"}}),
+            None,
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("the guest was moved onto another build by name");
+    assert_eq!(refused.code, Code::FailedPrecondition, "{refused}");
+
+    let stored = api.get(&web, &who(ADA)).await.expect("the guest is still there");
+    assert_eq!(stored["spec"]["image"], "projects/p1/images/sha256-old");
+    assert_eq!(stored["spec"]["vcpus"], 4, "the size change beside the repeated image was lost");
+}
+
 /// The same hole, on the field a machine boots from.
 ///
 /// An image is smaller than a volume and worse to leak: it is the disk a guest

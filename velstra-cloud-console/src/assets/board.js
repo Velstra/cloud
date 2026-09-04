@@ -124,7 +124,27 @@ function renderRail() {
           ? el("span.state.drifting", mark("drifting"), String(unsettled))
           : el("span.n", seen ? String(seen.total) + (seen.complete === false ? "+" : "") : "")));
     }
+    // Who may do what in this project. The Projects board is the operator's
+    // (a tenant's list of it is one row), but the Access panel on the
+    // project's sheet is the one place bindings are edited — and a project
+    // admin, who may edit them, had no way to reach it: "admin: everything,
+    // including the bindings" was true of the API and false of the console.
+    // Not a `.railitem`: it has no board and no census, like the map.
+    if (g.name === "Access" && !(session.who && session.who.cellAdmin)) {
+      rail.appendChild(el("button.railhome",
+        { type: "button", id: "railmembers", onclick: () => openMyProject() },
+        el("span", "Members"), el("span.n", "")));
+    }
   }
+}
+
+/// The current project's own sheet — for its Access panel. A tenant reads the
+/// project they are in; what the sheet lets them change is decided by the API,
+/// which refuses an editor or a viewer with its own sentence, in place.
+async function openMyProject() {
+  if (!session.project) return;
+  const r = await request("GET", "/api/v1/projects/" + session.project);
+  openSheet(collection("projects"), r.body);
 }
 
 function renderFleet() {

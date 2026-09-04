@@ -2310,6 +2310,14 @@ impl Api {
             if name.collection() == "folders" || name.collection() == "projects" {
                 settle_parent(spec);
             }
+            // Before the references are judged, for the same reason the create
+            // path settles a family first: `families/debian-13` is not a
+            // resource anybody is authorised on, and judged raw it answered a
+            // customer editing their own guest with "this is a cell-wide
+            // resource; only a cell operator may touch it".
+            if name.collection() == "instances" {
+                self.refuse_an_image_change(name, spec).await?;
+            }
             crate::refs::check(name.collection(), spec)?;
             self.authorize_references(
                 who,
@@ -3477,6 +3485,57 @@ impl Api {
     /// that will be stamped out a hundred times by people who assume it is
     /// clean. The corruption then arrives a hundred times, later, with nothing
     /// pointing back at this moment.
+    /// An existing machine keeps the bytes it was built from.
+    ///
+    /// The family is resolved once, when the guest is made, and what is stored
+    /// is the concrete image — "always the newest" means new machines get the
+    /// newest, not that existing ones are rewritten under their owners. So a
+    /// patch may say the image again (the console sends the whole form back,
+    /// and a family that still resolves to the same build is the same thing
+    /// said differently), and it may not say a different one: a different
+    /// image is a different machine, and the way to get one is to make one.
+    ///
+    /// The field is taken out of the patch when it changes nothing, so the
+    /// reference check downstream never sees `families/…` — which it would
+    /// otherwise judge as a cell-wide resource and refuse with the wrong
+    /// sentence.
+    async fn refuse_an_image_change(
+        &self,
+        name: &ResourceName,
+        spec: &mut Value,
+    ) -> ApiResult<()> {
+        let Some(asked) = spec.get("image").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let asked = asked.to_string();
+        let stored: Instance = self.typed(name).await?;
+        let mut resolved = json!({ "image": asked });
+        if asked.starts_with(velstra_cloud_model::resources::FAMILY_PREFIX) {
+            let parent = governing_project(name).unwrap_or_default();
+            self.settle_image_family(&parent, &mut resolved).await?;
+        }
+        let same = resolved
+            .get("image")
+            .and_then(Value::as_str)
+            .is_some_and(|image| image == stored.spec.image);
+        if same {
+            if let Some(fields) = spec.as_object_mut() {
+                fields.remove("image");
+            }
+            return Ok(());
+        }
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            format!(
+                "{name} was built from {} and keeps those bytes: a machine's image is decided \
+                 when it is made, and a different image is a different machine. Make a new \
+                 one from {asked} — a capture of this one keeps its disk.",
+                stored.spec.image
+            ),
+        )
+        .at("spec.image"))
+    }
+
     async fn settle_capture(&self, spec: &mut Value) -> ApiResult<()> {
         let instance_name = spec
             .get("instance")

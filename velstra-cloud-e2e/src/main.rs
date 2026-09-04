@@ -23,21 +23,31 @@
 use std::{sync::Arc, time::Duration};
 
 use velstra_cloud_api::{Api, StaticTokenVerifier};
-use velstra_cloud_controller::{
-    LoopConfig, Metrics, address::AddressController, attachment::AttachmentController,
-    quota::QuotaController, scheduler::Scheduler, snapshot::SnapshotController,
-    status::StatusWriter, volume::VolumeController,
-};
+use velstra_cloud_controller::{LoopConfig, Metrics};
 use velstra_cloud_nodeagent::{
-    Agent, AgentConfig, FakeDatapath, FakePool, FakeVmm, PoolAgent, PoolConfig,
+    Agent, AgentConfig, FakeDatapath, FakeNetwork, FakePool, FakeVmm, PoolAgent, PoolConfig,
 };
 use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
 const REGION: &str = "eu-central";
+/// The one image the seed publishes, and that every fake node holds.
+const SEED_IMAGE: &str = "projects/p1/images/sha256-3f9a2b";
+const SEED_IMAGE_DIGEST: &str =
+    "sha256:bed9c5091e4cb31402af634b1c7a4494cb07c2119bb1a470cd12f9c3323a3b6f";
+const SEED_IMAGE_URL: &str = "https://example.invalid/debian-13-amd64.raw";
 const CELL: &str = "cell-1";
 
 #[tokio::main]
 async fn main() {
+    // What the controllers and agents say, at `warn` unless `RUST_LOG` asks
+    // for more: a dev cell whose loops could not say why a drain moved
+    // nothing was one whose operator read the code instead.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let listen = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
@@ -47,168 +57,48 @@ async fn main() {
     // The dev cell's one token is its operator. It registers nodes and pools,
     // which are the cell's and not any tenant's — and a demo where half the
     // requests are refused teaches nothing about the platform.
-    let api = Api::new(
-        store.clone(),
-        REGION,
-        CELL,
-        Arc::new(StaticTokenVerifier::single(&token)),
-    )
-    .with_cell_admins(vec!["dev".into()]);
+    //
+    // Sessions first, the static token second — the same chain the real
+    // binary builds. With the static verifier alone, a user created here could
+    // sign in (that route needs no verifier) and then be refused by every
+    // other route with the very token the sign-in had just minted; the
+    // console's password form was a door painted on a wall.
+    let identity = velstra_cloud_api::sessions::IdentityStore::new(store.clone(), REGION, CELL);
+    let verifier = velstra_cloud_api::sessions::StoreTokenVerifier::new(identity)
+        .with_fallback(Arc::new(StaticTokenVerifier::single(&token)));
+    let api = Api::new(store.clone(), REGION, CELL, Arc::new(verifier))
+        .with_cell_admins(vec!["dev".into()]);
 
     let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let metrics = Metrics::default();
-    let config = LoopConfig::default();
+    // A short resync: a maintenance window opening, a clock crossing a
+    // schedule — the loops that notice by looking notice in seconds here,
+    // not in the five minutes a production cell can afford.
+    let config = LoopConfig {
+        resync: Duration::from_secs(15),
+        ..LoopConfig::default()
+    };
 
-    // The scheduler, the attachment controller and the quota counter, each the
-    // same loop over a different pure function.
-    let instances: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "instances");
-    let nodes: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "nodes");
-    let scheduler = Arc::new(Scheduler::new(
-        instances.clone(),
-        nodes.clone(),
-        StatusWriter::new(store.clone(), CELL, "instances", "scheduler"),
-        CELL,
-    ));
-    tokio::spawn(velstra_cloud_controller::run(
-        scheduler,
-        instances.clone(),
-        store.clone(),
+    // Every controller the real cell runs, from the one list the controller
+    // binary uses — not a hand-picked few. Seven of twenty used to run here,
+    // and the demo showed the rest as features that never did anything: a
+    // maintenance window that drained nothing, a network "unreported" for
+    // ever, a migration with no controller to move it.
+    let wiring = velstra_cloud_controller::wiring::Cell {
+        store: store.clone(),
+        region: REGION.into(),
+        cell: CELL.into(),
+        fabric: None,
+    };
+    let loops = velstra_cloud_controller::wiring::Loops::unelected(
         config,
         metrics.clone(),
         shutdown.clone(),
-    ));
+    );
+    for (_, task) in velstra_cloud_controller::wiring::every_controller(&wiring, &loops) {
+        tokio::spawn(task);
+    }
 
-    // Addresses, so a port created here comes up on the network without an
-    // operator picking one — which is also what makes the node's DHCP responder
-    // have something to publish.
-    let ports: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "ports");
-    let address = Arc::new(AddressController::new(
-        ports.clone(),
-        TypedStore::new(store.clone(), CELL, "subnets"),
-        TypedStore::new(store.clone(), CELL, "floatingips"),
-        TypedStore::new(store.clone(), CELL, "load-balancers"),
-        StatusWriter::new(store.clone(), CELL, "ports", "address"),
-        CELL,
-    ));
-    tokio::spawn(velstra_cloud_controller::run(
-        address,
-        ports,
-        store.clone(),
-        config,
-        metrics.clone(),
-        shutdown.clone(),
-    ));
-
-    let port_controller = Arc::new(velstra_cloud_controller::port::PortController::new(
-        TypedStore::new(store.clone(), CELL, "ports"),
-        velstra_cloud_store::Cached::start(
-            TypedStore::new(store.clone(), CELL, "instances"),
-            store.clone(),
-            velstra_cloud_store::prefix_for(CELL, "instances"),
-        ),
-        CELL,
-    ));
-    tokio::spawn(velstra_cloud_controller::run(
-        port_controller,
-        TypedStore::new(store.clone(), CELL, "ports"),
-        store.clone(),
-        config,
-        metrics.clone(),
-        shutdown.clone(),
-    ));
-
-    let attachments: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "attachments");
-    let attachment = Arc::new(AttachmentController::new(
-        attachments.clone(),
-        TypedStore::new(store.clone(), CELL, "volumes"),
-    ));
-    tokio::spawn(velstra_cloud_controller::run(
-        attachment,
-        attachments,
-        store.clone(),
-        config,
-        metrics.clone(),
-        shutdown.clone(),
-    ));
-
-    let projects: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "projects");
-    let quota = Arc::new(QuotaController::new(
-        velstra_cloud_store::Cached::start(
-            instances,
-            store.clone(),
-            velstra_cloud_store::prefix_for(CELL, "instances"),
-        ),
-        velstra_cloud_store::Cached::start(
-            TypedStore::new(store.clone(), CELL, "volumes"),
-            store.clone(),
-            velstra_cloud_store::prefix_for(CELL, "volumes"),
-        ),
-        velstra_cloud_store::Cached::start(
-            TypedStore::<
-                velstra_cloud_model::resources::FloatingIpSpec,
-                velstra_cloud_model::resources::FloatingIpStatus,
-            >::new(store.clone(), CELL, "floatingips"),
-            store.clone(),
-            velstra_cloud_store::prefix_for(CELL, "floatingips"),
-        ),
-        velstra_cloud_store::Cached::start(
-            TypedStore::<
-                velstra_cloud_model::loadbalancer::LoadBalancerSpec,
-                velstra_cloud_model::loadbalancer::LoadBalancerStatus,
-            >::new(store.clone(), CELL, "load-balancers"),
-            store.clone(),
-            velstra_cloud_store::prefix_for(CELL, "load-balancers"),
-        ),
-        StatusWriter::new(store.clone(), CELL, "projects", "quota"),
-        CELL,
-    ));
-    tokio::spawn(velstra_cloud_controller::run(
-        quota,
-        projects,
-        store.clone(),
-        config,
-        metrics.clone(),
-        shutdown.clone(),
-    ));
-
-    // Storage, on the same principle as the node below: a development cell that
-    // cannot make a volume is a development cell you have to set up before it is
-    // useful. The volume controller guards the deletion; the pool agent does the
-    // work.
-    let volumes_for_controller: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "volumes");
-    let snapshots: TypedStore<_, _> = TypedStore::new(store.clone(), CELL, "snapshots");
-    let volume = Arc::new(VolumeController::new(
-        volumes_for_controller.clone(),
-        snapshots.clone(),
-        TypedStore::new(store.clone(), CELL, "pools"),
-        CELL,
-    ));
-    tokio::spawn(velstra_cloud_controller::run(
-        volume,
-        volumes_for_controller,
-        store.clone(),
-        config,
-        metrics.clone(),
-        shutdown.clone(),
-    ));
-
-    // The copies' own guard. Separate from the volume controller because it
-    // answers a different question — has the pool let go of *this* copy — and
-    // because a controller that writes two collections is one that has to be
-    // read twice to see what it writes.
-    let snapshot = Arc::new(SnapshotController::new(snapshots.clone()));
-    tokio::spawn(velstra_cloud_controller::run(
-        snapshot,
-        snapshots,
-        store.clone(),
-        config,
-        metrics.clone(),
-        shutdown.clone(),
-    ));
-
-    // Named for what the seed asks for: a development cell whose one volume
-    // names a pool that does not exist would demonstrate the bug rather than
-    // the feature.
     let pool_id = "rbd-standard";
     register_pool(store.clone(), pool_id).await;
     let mut pool_config = PoolConfig::new(pool_id, REGION, CELL);
@@ -230,32 +120,86 @@ async fn main() {
     // One node, with a hypervisor that does not exist. Registering it here
     // rather than making the operator do it is the difference between a
     // development cell you can use and one you have to set up first.
-    let node_id = "node-a";
-    register_node(store.clone(), node_id).await;
-    let agent = Agent::new(
-        store.clone(),
-        AgentConfig::new(node_id, REGION, CELL),
-        Arc::new(FakeVmm::with_capacity(
-            velstra_cloud_model::resources::Capacity {
-                vcpus: 32,
-                memory_mib: 131_072,
-                disk_gib: 4096,
-                numa_free_mib: vec![65_536, 65_536],
-                hugepages_1gi: 0,
-            },
-        )),
-        Arc::new(FakeDatapath::new()),
-    );
-    let mut agent_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        agent
-            .run(async move {
-                let _ = agent_shutdown.changed().await;
-            })
-            .await;
-    });
+    // Two machines by default, and `VELSTRA_DEV_NODES` for more or fewer. One
+    // node made every second feature answer "nowhere to go": a maintenance
+    // window drained nothing, a migration had no destination, anti-affinity
+    // could not spread — and a demo of a scheduler that never schedules
+    // anywhere teaches nothing about the platform. The second is smaller, so
+    // "room" and "largest guest" have something to say.
+    let node_count: usize = std::env::var("VELSTRA_DEV_NODES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (1..=26).contains(n))
+        .unwrap_or(2);
+    let mut node_lines = Vec::new();
+    let mut vmms: Vec<Arc<FakeVmm>> = Vec::new();
+    // One wire between the fake machines, so a live migration has a far end
+    // to hand the guest to. Each on its own wire, the copy started and the
+    // receiver was never found.
+    let wire = FakeNetwork::new();
+    for i in 0..node_count {
+        let node_id = format!("node-{}", (b'a' + i as u8) as char);
+        let (vcpus, memory_mib) = if i == 0 { (32, 131_072) } else { (16, 65_536) };
+        register_node(store.clone(), &node_id).await;
+        // One process holds every fake disk, so a guest's root disk is where
+        // any node can reach it — which is what `--shared-state` declares on a
+        // real machine, and without which a drain has nowhere to move a guest.
+        let mut agent_config = AgentConfig::new(&node_id, REGION, CELL);
+        agent_config.shared_state = true;
+        let vmm = wire.host(&node_id);
+        vmm.set_capacity(velstra_cloud_model::resources::Capacity {
+            vcpus,
+            memory_mib,
+            disk_gib: 4096,
+            numa_free_mib: vec![memory_mib / 2, memory_mib / 2],
+            hugepages_1gi: 0,
+        });
+        // Every node holds the seed image, as a cell whose nodes have booted
+        // the family once would: a guest can only move to a node that has its
+        // image, and a second node that had never pulled it was a drain with
+        // nowhere to go — "node-b does not have projects/p1/images/…".
+        vmm.cache_image(SEED_IMAGE_DIGEST);
+        let vmm = Arc::new(vmm);
+        vmms.push(vmm.clone());
+        let agent = Agent::new(
+            store.clone(),
+            agent_config,
+            vmm,
+            Arc::new(FakeDatapath::new()),
+        );
+        let mut agent_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            agent
+                .run(async move {
+                    let _ = agent_shutdown.changed().await;
+                })
+                .await;
+        });
+        node_lines.push(format!(
+            "  node     {node_id} (fake hypervisor, {vcpus} vCPU / {} GiB)",
+            memory_mib / 1024
+        ));
+    }
 
     seed(store.clone()).await;
+    // The wire itself. A fake copy finishes when something says it has —
+    // in a test, the test; here, a thread that finishes every transfer a
+    // machine has open a moment after it starts, which is what a live
+    // migration of an idle fake guest looks like.
+    for vmm in vmms.clone() {
+        tokio::spawn(async move {
+            use velstra_cloud_nodeagent::host::Vmm as _;
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let Ok(host) = vmm.observe().await else { continue };
+                for instance in host.sending {
+                    if let Err(e) = vmm.finish_transfer(&instance) {
+                        tracing::debug!(instance, error = %e, "a fake transfer did not finish");
+                    }
+                }
+            }
+        });
+    }
     attach_once_placed(store.clone()).await;
 
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -266,7 +210,9 @@ async fn main() {
     println!("  console  http://{address}/");
     println!("  api      http://{address}/api/v1");
     println!("  token    {token}");
-    println!("  node     {node_id} (fake hypervisor, 32 vCPU / 128 GiB)");
+    for line in &node_lines {
+        println!("{line}");
+    }
     println!();
     println!("nothing here is persistent and no guest is real.");
 
@@ -432,7 +378,7 @@ async fn seed(store: Arc<dyn Store>) {
     )
     .await;
 
-    let image = "projects/p1/images/sha256-3f9a2b";
+    let image = SEED_IMAGE;
     put(
         &store,
         "images",
@@ -443,10 +389,10 @@ async fn seed(store: Arc<dyn Store>) {
                 family: "debian-13".into(),
                 version: "seed".into(),
                 source_instance: None,
-                digest: "sha256:bed9c5091e4cb31402af634b1c7a4494cb07c2119bb1a470cd12f9c3323a3b6f".into(),
+                digest: SEED_IMAGE_DIGEST.into(),
                 format: ImageFormat::Raw,
                 size_bytes: 1_073_741_824,
-                source_url: "https://example.invalid/debian-13-amd64.raw".into(),
+                source_url: SEED_IMAGE_URL.into(),
                 signature: None,
             },
             ImageStatus::default(),

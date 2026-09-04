@@ -262,8 +262,14 @@ impl FakeVmm {
 
     pub fn with_capacity(capacity: Capacity) -> Self {
         let vmm = Self::new();
-        vmm.machine.lock().unwrap().capacity = capacity;
+        vmm.set_capacity(capacity);
         vmm
+    }
+
+    /// Resize a machine that already exists — one made by
+    /// [`FakeNetwork::host`], which has a wire and a name but the default size.
+    pub fn set_capacity(&self, capacity: Capacity) {
+        self.machine.lock().unwrap().capacity = capacity;
     }
 
     /// Give this machine some disks.

@@ -32,7 +32,17 @@ const CHECKS = {
     ? "" : "a resource name is collection/id pairs, like projects/p1/images/x",
 };
 
-const check = (kind, value) => (value === "" ? "" : (CHECKS[kind] || CHECKS.none)(String(value)));
+// A list is checked entry by entry — not as the string it stringifies to. It
+// used to be: `[]` became "" (which is not the empty string the shortcut below
+// looks for) and failed the id check, and `["a", "b"]` became "a,b" and failed
+// it on the comma. So an edit of any guest with no required node labels — which
+// is every guest — was stopped at "Fix Required node labels first", with no
+// entry on screen to fix.
+const check = (kind, value) => {
+  if (Array.isArray(value)) return value.map((v) => check(kind, v)).find(Boolean) || "";
+  if (value === "" || value === null || value === undefined) return "";
+  return (CHECKS[kind] || CHECKS.none)(String(value));
+};
 
 /// Checks that need two fields at once. Kept apart from the per-field ones
 /// because they can only run when both have been answered, and complaining
@@ -1202,8 +1212,27 @@ async function fillPicker(form, p) {
   // without anybody asking. If the API refuses it, it says so, loudly.
   const same = offered.find((o) => nameOf(o) === keep || idOf(o) === keep);
   const option = same && [...s.options].find((o) => o.value === wire(same));
-  if (option) { option.value = keep; s.value = keep; }
-  else { form.values[f.key] = ""; s.value = ""; }
+  if (option) { option.value = keep; s.value = keep; return; }
+  // Not offered at all — and still what the object says. A guest's image is
+  // the case: the picker offers families, the object carries the build the
+  // family resolved to when it was made, and the two never match. Clearing
+  // the field here made every edit of an existing guest stop at "Still needed:
+  // Image", so nobody could change its size or power without pretending to
+  // choose an operating system. The value stays, shown as itself; whether it
+  // may change is the API's call, and the schema locks it where it may not.
+  s.appendChild(el("option", { value: keep }, await keptLabel(form, f, keep)));
+  s.value = keep;
+}
+
+/// What to call a value the picker did not offer: an image by its title, when
+/// it can be found; anything else by its short name.
+async function keptLabel(form, f, keep) {
+  if (f.collection === "families" || f.collection === "images") {
+    const images = form.refs.images || await options("images").catch(() => []);
+    const image = images.find((o) => nameOf(o) === keep);
+    if (image) return imageTitle(image) + " — as built";
+  }
+  return shortName(keep) + " — as it is";
 }
 
 /// An answer of the shape `{ candidates: [{ id, ok, why, detail }], trouble }`,

@@ -1123,7 +1123,9 @@ pre.terminal:focus {
    Nothing about the boards changes — tables already scroll inside their own
    container — so this is only the shell learning to fold. */
 #menu { display: none; font-size: var(--text-lg); line-height: 1; padding: 4px 10px; }
-#scrim {
+/* Its own id: a rule named `#scrim` here silently restyled the sheet's scrim
+   too (same id, later rule), pushing it under the header and above nothing. */
+#railscrim {
   position: fixed; inset: 60px 0 0 0; z-index: 35;
   background: color-mix(in srgb, var(--bg-app) 55%, transparent);
 }
