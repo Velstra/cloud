@@ -392,7 +392,7 @@ function renderBoard() {
   empty.classList.toggle("hidden", rows.length > 0);
   empty.textContent = rows.length ? "" :
     "No " + coll.title.toLowerCase() + " here yet." +
-    (coll.creatable ? " Create the first one above." : "");
+    (coll.creatable && allows("create") ? " Create the first one above." : "");
   $("board").classList.toggle("hidden", rows.length === 0);
   renderPicked();
 }
@@ -539,7 +539,8 @@ function renderListHead() {
   // Catalogue boards a tenant may read and only the cell may write: the button
   // exists where pressing it can work.
   const OPERATOR_WRITES = ["flavors"];
-  const mayCreate = !OPERATOR_WRITES.includes(coll.id) || (session.who && session.who.cellAdmin);
+  const mayCreate = (!OPERATOR_WRITES.includes(coll.id) || (session.who && session.who.cellAdmin))
+    && allows("create");
   if (coll.creatable && mayCreate) {
     acts.appendChild(el("button.btn.primary", { type: "button", id: "newbtn",
       onclick: () => openCreate(coll) }, "New " + coll.singular));

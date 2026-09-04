@@ -163,7 +163,8 @@ function verdict(r, kind) {
   if (obs < gen) {
     return {
       kind: "drifting",
-      word: "Drifting",
+      word: underway(r) || "Applying…",
+      busy: true,
       why: "The ask moved to generation " + gen + "; the world is reported at " + obs + ".",
       since: ready ? pick(ready, "lastTransition") : null,
       ready,
@@ -189,6 +190,18 @@ function verdict(r, kind) {
     };
   }
   if (ready.status === "Unknown") {
+    // Unknown with a reason is work in progress — the agent said what it is
+    // doing ("Transferring", "Converging") — and a table that read "Not
+    // reported" beside a migration copying memory said the opposite of what
+    // was happening. Quoted as the verb it is, marked as moving.
+    const doing = pick(ready, "reason");
+    if (doing && doing !== "Unknown") {
+      return {
+        kind: "drifting", word: doing + "…", busy: true,
+        why: ready.message || "The owning agent is working on generation " + gen + ".",
+        since: pick(ready, "lastTransition"), ready,
+      };
+    }
     return {
       kind: "unreported", word: "Not reported",
       why: ready.message || "The owning agent has not reported on generation " + gen + ".",
@@ -204,6 +217,18 @@ function verdict(r, kind) {
 
 /// A condition recorded against an older generation is visibly stale rather
 /// than quietly wrong.
+/// What a guest is in the middle of, when the ask and the report disagree on
+/// the one thing a person is usually waiting for: "Stopping…" beats
+/// "Drifting" for somebody who just pressed Stop.
+function underway(r) {
+  const asked = pick(spec(r), "desiredState");
+  const is = pick(status(r), "state");
+  if (!asked || !is || asked === is) return "";
+  if (asked === "Stopped") return "Stopping…";
+  if (asked === "Running") return is === "Stopped" ? "Starting…" : "Restarting…";
+  return "";
+}
+
 function conditionStale(r, c) {
   return Number(pick(c, "observedGeneration") || 0) < generation(r);
 }
@@ -212,9 +237,38 @@ function conditionStale(r, c) {
 /// the word is always beside it.
 function mark(kind) { return el("span.mark." + kind); }
 
+// ---- what this account may do here --------------------------------------
+//
+// Asked of the API (`whoami` reports the strongest rung per project) rather
+// than decided here: the console draws the buttons that will be accepted and
+// leaves the refusal to the API for the rest. A cell operator may do
+// everything; an account the API says nothing about (a static token from
+// before `projects` existed, a custom role the console cannot evaluate) is
+// drawn everything, so nothing that used to work goes missing.
+function roleHere() {
+  const who = session.who || {};
+  if (who.cellAdmin) return "admin";
+  if (!who.projects) return "admin";
+  const rung = who.projects[session.project];
+  if (!rung) return "viewer";
+  return ["viewer", "operator", "editor", "admin"].includes(rung) ? rung : "custom";
+}
+
+/// `create`/`delete` need editor or above; `edit` — resize, power, attach —
+/// operator or above; a custom role is trusted with all of it.
+function allows(verb) {
+  const rung = roleHere();
+  if (rung === "custom" || rung === "admin" || rung === "editor") return true;
+  if (rung === "operator") return verb === "edit";
+  return false;
+}
+
 function stateOf(r, kind) {
   const v = verdict(r, kind);
-  return el("span.state." + v.kind, mark(v.kind), v.word);
+  // `busy` pulses the mark: something is happening to this object right now,
+  // and a table that changes only when the change is over shows nothing while
+  // the person who asked for it is watching.
+  return el("span.state." + v.kind + (v.busy ? ".busy" : ""), mark(v.kind), v.word);
 }
 
 // ---- formatting ------------------------------------------------------------

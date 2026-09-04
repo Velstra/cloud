@@ -418,6 +418,21 @@ table.board td.blank { color: var(--text-faint); }
 .state.failing { color: var(--red-300); }
 .state.drifting { color: var(--amber-300); }
 .state.unreported, .state.deleting { color: var(--text-muted); }
+/* Something is happening to this object right now: the mark breathes. Not
+   the word — a word that pulses is a word that cannot be read — and only
+   while the ask and the report disagree, so a settled table is still. */
+.state.busy .mark { animation: breathe 1.2s var(--ease-out) infinite; }
+@keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+/* A button whose request is in flight: the verb in the present tense, and a
+   spinner that keeps saying so for as long as it takes. */
+.btn.busy { position: relative; padding-right: 2.2em; }
+.btn.busy::after {
+  content: ""; position: absolute; right: .7em; top: 50%; width: .9em; height: .9em;
+  margin-top: -.45em; border-radius: 50%;
+  border: 2px solid currentColor; border-right-color: transparent;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---- the sheet ---------------------------------------------------------- */
 
@@ -454,6 +469,8 @@ table.board td.blank { color: var(--text-faint); }
   /* Gentler, not off: the cross-fade still says something appeared, and it is
      the vestibular half — the travel — that goes, not the feedback. */
   #sheet, #dialog { animation: fade var(--dur-base) ease; }
+  .state.busy .mark { animation: none; }
+  .btn.busy::after { animation-duration: 2s; }
   .switch::after { transition: none; }
   .btn:active, .railitem:active, .segmented button:active, .stepper button:active {
     transform: none;

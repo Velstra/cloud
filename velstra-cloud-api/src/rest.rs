@@ -151,6 +151,9 @@ async fn whoami(
         // record behind those, so there is nothing for a sign-out to end and the
         // console should not offer one.
         "session": session,
+        // The strongest rung held in each project, by id — so a console draws
+        // the buttons an account can use and not every button plus a refusal.
+        "projects": api.project_roles(&who).await,
     })))
 }
 
