@@ -124,6 +124,14 @@ fn script() -> String {
     js
 }
 
+/// The tab icon, for whoever serves the page to answer `/favicon.ico` with —
+/// a 16×16 PNG of a few dozen bytes. Browsers ask for it on every load whether
+/// the page names one or not, and a console with none answered every load
+/// with a 404 in the API log and the browser console. Served as bytes rather
+/// than named by a `<link>`, which `nothing_is_fetched_from_outside_the_page`
+/// refuses on sight.
+pub const FAVICON_PNG: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 16, 0, 0, 0, 16, 8, 6, 0, 0, 0, 31, 243, 255, 97, 0, 0, 0, 50, 73, 68, 65, 84, 120, 218, 99, 96, 24, 5, 4, 129, 126, 254, 181, 255, 100, 105, 194, 133, 201, 214, 72, 148, 65, 20, 25, 64, 138, 102, 170, 24, 66, 155, 48, 32, 214, 16, 138, 99, 130, 118, 233, 128, 106, 41, 145, 20, 0, 0, 39, 173, 222, 226, 101, 234, 134, 193, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+
 #[cfg(test)]
 mod tests {
     use super::*;

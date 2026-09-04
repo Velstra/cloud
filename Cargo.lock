@@ -2556,6 +2556,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "velstra-cloud-api",
  "velstra-cloud-console",
  "velstra-cloud-controller",

@@ -15,9 +15,13 @@ nix run .#dev
 One process, one in-memory store, and a whole seeded cell in it: the command
 prints the console URL and the token to sign in with, and the console has a
 project, a network, volumes and instances to show — one of them deliberately
-unschedulable, so the *why not* surfaces are populated too. No `/dev/kvm`
-needed; the dev cell's hypervisor is fake and no guest is real, which the
-banner says out loud.
+unschedulable, so the *why not* surfaces are populated too. Two fake nodes
+(`VELSTRA_DEV_NODES` for another number) with shared state between them, so a
+maintenance window drains, a migration moves and anti-affinity spreads; and
+every controller the real cell runs, not a demo subset. Users made through
+the API or the console sign in with their password like anywhere else. No
+`/dev/kvm` needed; the dev cell's hypervisors are fake and no guest is real,
+which the banner says out loud.
 
 Installing the real thing — the immutable compute-node image, its installer
 ISO with the first-boot registration wizard, and the control plane as OCI

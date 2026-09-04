@@ -2160,6 +2160,12 @@ the concrete image. A guest never changes its operating system on a restart:
 rewritten under their owners. A project's own family beats the cell's, so a
 tenant publishing `debian-13` of their own gets theirs.
 
+Nor does it change on a `PATCH`: `spec.image` may be said again — by name, or as
+a family that still resolves to the same build, which is what a form sending
+everything back does — and a different image is refused with
+`FAILED_PRECONDITION` at `spec.image`. A different image is a different machine;
+make one, and let a capture of this one keep its disk.
+
 `image-sources` keeps a family current:
 
 ```

@@ -1288,7 +1288,10 @@ const INSTANCE_FIELDS: &[Field] = &[
                An existing machine keeps the bytes it was built from.",
         when_empty: "",
         derived: false,
-        at_creation: false,
+        // Decided when the machine is made: the API refuses a change, so the
+        // form does not offer one. Until it was locked, an edit showed the
+        // family picker with nothing chosen and would not save without a pick.
+        at_creation: true,
     },
     Field {
         key: "vcpus",

@@ -332,13 +332,19 @@ $("jump").addEventListener("click", openPalette);
 // The drawer. On a narrow screen the rail is off-canvas and this is the only
 // way in; picking anything in it puts it away again, because the pick *was*
 // the errand.
+// `railscrim`, not `scrim`: the sheet builds and removes an element called
+// `scrim` of its own, and with the drawer's scrim under the same id the
+// sheet's close removed the drawer's (first in document order) — after which
+// the first tap on the menu threw, and the sheet's scrim was never removed at
+// all. Found by the console check, not by anybody's eyes: on a wide screen
+// the drawer is never opened.
 function railOpen(open) {
   $("rail").classList.toggle("open", open);
-  $("scrim").classList.toggle("hidden", !open);
+  $("railscrim").classList.toggle("hidden", !open);
   $("menu").setAttribute("aria-expanded", String(open));
 }
 $("menu").addEventListener("click", () => railOpen(!$("rail").classList.contains("open")));
-$("scrim").addEventListener("click", () => railOpen(false));
+$("railscrim").addEventListener("click", () => railOpen(false));
 $("rail").addEventListener("click", (e) => {
   if (e.target.closest("button")) railOpen(false);
 });

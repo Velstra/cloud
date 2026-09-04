@@ -50,6 +50,7 @@ pub mod snapshot;
 pub mod snapshot_schedule;
 pub mod status;
 pub mod volume;
+pub mod wiring;
 
 pub use metrics::Metrics;
 pub use runner::{LoopConfig, Reconciler, Related, run, run_when_leading, sweep};
