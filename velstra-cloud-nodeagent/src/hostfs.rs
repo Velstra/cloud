@@ -254,7 +254,11 @@ pub fn trim_console(path: &Path, cap: u64, keep: u64) {
     if total <= cap {
         return;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
         return;
     };
     let keep = keep.min(total);
@@ -267,14 +271,21 @@ pub fn trim_console(path: &Path, cap: u64, keep: u64) {
     }
     // Start the kept tail on a line: a log whose first line is half a line
     // reads as corruption to whoever opens it.
-    let from = tail.iter().position(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+    let from = tail
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
     if file.set_len(0).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
         return;
     }
-    let _ = file.write_all(format!(
-        "[... {} earlier bytes trimmed by the node agent ...]\n",
-        total - (keep - from as u64)
-    ).as_bytes());
+    let _ = file.write_all(
+        format!(
+            "[... {} earlier bytes trimmed by the node agent ...]\n",
+            total - (keep - from as u64)
+        )
+        .as_bytes(),
+    );
     let _ = file.write_all(&tail[from..]);
     let _ = file.flush();
 }
@@ -1361,12 +1372,16 @@ mod names_a_hypervisor_will_take {
 
 #[cfg(test)]
 mod trimming_the_console {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     fn scratch(name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("velstra-trim-{name}-{}", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
         path
     }
 
@@ -1374,7 +1389,10 @@ mod trimming_the_console {
     fn a_log_under_the_cap_is_left_exactly_alone() {
         let path = scratch("small", b"boot line one\nboot line two\n");
         trim_console(&path, 1024, 512);
-        assert_eq!(std::fs::read(&path).unwrap(), b"boot line one\nboot line two\n");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"boot line one\nboot line two\n"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1392,10 +1410,16 @@ mod trimming_the_console {
         assert!(after.len() < 8 * 1024, "still {} bytes", after.len());
         // The newest line survived; the note says bytes were trimmed; and the
         // kept tail starts on a whole line, not the middle of one.
-        assert!(after.ends_with("console line 4999\n"), "the tail is not the newest output");
+        assert!(
+            after.ends_with("console line 4999\n"),
+            "the tail is not the newest output"
+        );
         assert!(after.starts_with("[... "), "{}", &after[..60]);
         let second_line = after.lines().nth(1).unwrap();
-        assert!(second_line.starts_with("console line "), "half a line survived: {second_line:?}");
+        assert!(
+            second_line.starts_with("console line "),
+            "half a line survived: {second_line:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

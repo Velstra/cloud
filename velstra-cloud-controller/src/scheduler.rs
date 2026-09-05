@@ -370,7 +370,7 @@ mod tests {
                 NodeStatus {
                     shared_state: false,
                     vmm: "qemu".into(),
-            fetching: Vec::new(),
+                    fetching: Vec::new(),
                     capacity: Capacity {
                         vcpus: 16,
                         memory_mib,

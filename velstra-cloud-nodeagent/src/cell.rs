@@ -445,7 +445,10 @@ impl CellReader for StoreCell {
         &self,
         name: &str,
     ) -> Result<Option<velstra_cloud_model::resources::Instance>> {
-        self.instances.get(name).await.map_err(|e| failed("instances", e))
+        self.instances
+            .get(name)
+            .await
+            .map_err(|e| failed("instances", e))
     }
     async fn ceph_clusters(&self) -> Result<Vec<velstra_cloud_model::ceph::CephCluster>> {
         self.ceph_clusters

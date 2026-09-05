@@ -1218,7 +1218,10 @@ async fn memory_jitter_alone_is_not_worth_a_write() {
     // A real movement is reported without waiting for the heartbeat.
     vmm.wobble_free_memory(2048);
     let moved = agent.resync().await;
-    assert_eq!(moved.reports, 1, "a real memory movement was not reported: {moved:?}");
+    assert_eq!(
+        moved.reports, 1,
+        "a real memory movement was not reported: {moved:?}"
+    );
     let node = read_node(&store, "node-a").await;
     assert!(node.status.capacity.memory_mib > 0);
 }
@@ -1232,17 +1235,16 @@ async fn memory_jitter_alone_is_not_worth_a_write() {
 async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
     use velstra_cloud_model::resources::{
         BgpPeerSpec, BgpPeerStatus, FloatingIpSpec, FloatingIpStatus, NetworkSpec, NetworkStatus,
-        SubnetSpec, SubnetStatus,
+        Resource, SubnetSpec, SubnetStatus,
     };
     use velstra_cloud_nodeagent::bgp::BgpSpeaker as _;
     use velstra_cloud_store::TypedStore;
-    use velstra_cloud_model::resources::Resource;
     let store = store();
     let vmm = FakeVmm::new();
     let datapath = FakeDatapath::new();
     let bgp = velstra_cloud_nodeagent::fake::FakeBgp::new();
-    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath)
-        .with_bgp(Arc::new(bgp.clone()));
+    let agent =
+        node_agent(store.clone(), "node-a", &vmm, &datapath).with_bgp(Arc::new(bgp.clone()));
 
     let writer = velstra_cloud_model::access::Writer::controller("test");
     let peers: TypedStore<BgpPeerSpec, BgpPeerStatus> =
@@ -1266,7 +1268,10 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
         .unwrap();
     let networks: TypedStore<NetworkSpec, NetworkStatus> =
         TypedStore::new(store.clone(), CELL, "networks");
-    let public = NetworkSpec { external: true, ..Default::default() };
+    let public = NetworkSpec {
+        external: true,
+        ..Default::default()
+    };
     networks
         .create(
             &Resource::new(meta("networks/public"), public, NetworkStatus::default()),
@@ -1302,7 +1307,11 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
     };
     floating
         .create(
-            &Resource::new(meta("projects/p1/floatingips/a"), fip, FloatingIpStatus::default()),
+            &Resource::new(
+                meta("projects/p1/floatingips/a"),
+                fip,
+                FloatingIpStatus::default(),
+            ),
             &writer,
         )
         .await
@@ -1319,8 +1328,7 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
     assert_eq!(after.status.session, "Established");
     assert_eq!(after.status.announced, 2);
     assert_eq!(
-        velstra_cloud_model::meta::condition(&after.status.conditions, "Ready")
-            .map(|c| c.status),
+        velstra_cloud_model::meta::condition(&after.status.conditions, "Ready").map(|c| c.status),
         Some(velstra_cloud_model::meta::ConditionStatus::True)
     );
 
@@ -1335,33 +1343,59 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
 
     // A machine that is not the speaker leaves everything alone.
     let other_bgp = velstra_cloud_nodeagent::fake::FakeBgp::new();
-    let other = node_agent(store.clone(), "node-b", &FakeVmm::new(), &FakeDatapath::new())
-        .with_bgp(Arc::new(other_bgp.clone()));
+    let other = node_agent(
+        store.clone(),
+        "node-b",
+        &FakeVmm::new(),
+        &FakeDatapath::new(),
+    )
+    .with_bgp(Arc::new(other_bgp.clone()));
     other.resync().await;
-    assert!(other_bgp.applied().is_none(), "a bystander programmed its daemon");
+    assert!(
+        other_bgp.applied().is_none(),
+        "a bystander programmed its daemon"
+    );
 
     // The last session naming this machine is deleted — no finalizer, so it is
     // simply gone by the next pass. The daemon must be told to stop: a
     // gateway still announcing the cell after the operator removed the
     // session is the one outcome the object's deletion was meant to end.
     let edge = peers.get("bgp-peers/edge").await.unwrap().unwrap();
-    peers.delete("bgp-peers/edge", edge.meta.revision, &writer).await.unwrap();
+    peers
+        .delete("bgp-peers/edge", edge.meta.revision, &writer)
+        .await
+        .unwrap();
     agent.resync().await;
     let silence = bgp.applied().expect("the daemon was never told to stop");
-    assert!(silence.sessions.is_empty(), "the session outlived its object: {silence:?}");
-    assert!(silence.hosts_v4.is_empty(), "prefixes announced on no session: {silence:?}");
+    assert!(
+        silence.sessions.is_empty(),
+        "the session outlived its object: {silence:?}"
+    );
+    assert!(
+        silence.hosts_v4.is_empty(),
+        "prefixes announced on no session: {silence:?}"
+    );
     // And once silent, silent: a settled empty cell is not rewritten either.
     let applies = bgp.applies();
     agent.resync().await;
-    assert_eq!(bgp.applies(), applies, "an already-silent daemon was reloaded");
+    assert_eq!(
+        bgp.applies(),
+        applies,
+        "an already-silent daemon was reloaded"
+    );
 
     // An agent that starts after the deletion finds no session of its own and
     // a daemon still speaking (the fake remembers what it was last told).
     // Asking the daemon, not the store, is what lets it notice.
     let stale = velstra_cloud_nodeagent::fake::FakeBgp::new();
     stale.apply(&said).await.unwrap();
-    let restarted = node_agent(store.clone(), "node-a", &FakeVmm::new(), &FakeDatapath::new())
-        .with_bgp(Arc::new(stale.clone()));
+    let restarted = node_agent(
+        store.clone(),
+        "node-a",
+        &FakeVmm::new(),
+        &FakeDatapath::new(),
+    )
+    .with_bgp(Arc::new(stale.clone()));
     restarted.resync().await;
     assert!(
         stale.applied().is_some_and(|d| d.sessions.is_empty()),

@@ -28,8 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::meta::Timestamp;
-use crate::meta::Condition;
+use crate::meta::{Condition, Timestamp};
 
 /// How often a source is looked at when it does not say.
 ///
@@ -99,7 +98,11 @@ pub fn every(spec: &ImageSourceSpec) -> u64 {
 
 /// How many of the family to keep.
 pub fn keep(spec: &ImageSourceSpec) -> u32 {
-    if spec.keep == 0 { DEFAULT_KEEP } else { spec.keep }
+    if spec.keep == 0 {
+        DEFAULT_KEEP
+    } else {
+        spec.keep
+    }
 }
 
 /// The filename `url` ends in, which is what a checksums file names its lines by.
@@ -125,8 +128,7 @@ pub fn stored_name(digest: &str) -> Option<String> {
         .rsplit('-')
         .next()?
         .to_ascii_lowercase();
-    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| format!("sha256-{hex}"))
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256-{hex}"))
 }
 
 /// Why a source could not be used.

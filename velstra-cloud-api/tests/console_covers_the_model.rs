@@ -838,7 +838,7 @@ mod settled {
             provisioned: true,
             actual_size_gib: 10,
             pool: Some("pool-a".into()),
-                    at: None,
+            at: None,
         }
     }
 
@@ -1127,4 +1127,3 @@ fn the_console_hides_exactly_what_the_api_keeps_for_the_cell() {
         }
     }
 }
-

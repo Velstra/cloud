@@ -546,7 +546,7 @@ mod a_wire_nobody_will_ever_come_back_for {
 
     use velstra_cloud_model::{
         meta::{Meta, Placement, ResourceName},
-        resources::{Resource, MINTED_FOR},
+        resources::{MINTED_FOR, Resource},
     };
     use velstra_cloud_store::{MemoryStore, Store};
 
@@ -561,7 +561,8 @@ mod a_wire_nobody_will_ever_come_back_for {
             Placement::new("eu-central", "cell-1"),
         );
         if let Some(guest) = guest {
-            meta.labels.insert(MINTED_FOR.to_string(), guest.to_string());
+            meta.labels
+                .insert(MINTED_FOR.to_string(), guest.to_string());
         }
         meta
     }
@@ -606,7 +607,10 @@ mod a_wire_nobody_will_ever_come_back_for {
         // With its guard on, as the first pass puts it.
         let mut next = ports.get(PORT).await.unwrap().unwrap();
         next.meta.add_finalizer(NODE_RELEASE_FINALIZER);
-        ports.update(&next, &Writer::controller("test")).await.unwrap();
+        ports
+            .update(&next, &Writer::controller("test"))
+            .await
+            .unwrap();
         ports.get(PORT).await.unwrap().unwrap()
     }
 
@@ -652,7 +656,11 @@ mod a_wire_nobody_will_ever_come_back_for {
 
         controller.reconcile(PORT, Some(&port)).await.unwrap();
 
-        let after = ports.get(PORT).await.unwrap().expect("the port was removed");
+        let after = ports
+            .get(PORT)
+            .await
+            .unwrap()
+            .expect("the port was removed");
         assert!(!after.meta.is_deleting());
     }
 
@@ -667,7 +675,11 @@ mod a_wire_nobody_will_ever_come_back_for {
 
         controller.reconcile(PORT, Some(&port)).await.unwrap();
 
-        let after = ports.get(PORT).await.unwrap().expect("somebody's port was removed");
+        let after = ports
+            .get(PORT)
+            .await
+            .unwrap()
+            .expect("somebody's port was removed");
         assert!(!after.meta.is_deleting());
     }
 }

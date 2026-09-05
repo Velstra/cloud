@@ -762,7 +762,7 @@ mod tests {
                 meta(FIP),
                 FloatingIpSpec {
                     instance: String::new(),
-            subnet: SUBNET.into(),
+                    subnet: SUBNET.into(),
                     address: address.map(str::to_string),
                     port: String::new(),
                     delivery: Default::default(),

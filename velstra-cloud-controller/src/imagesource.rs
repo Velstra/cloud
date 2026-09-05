@@ -13,13 +13,13 @@
 
 use std::sync::Arc;
 
+use tracing::info;
 use velstra_cloud_model::{
     ConditionStatus,
     images::{ImageSourceSpec, ImageSourceStatus},
     meta::{Condition, Meta, Placement, ResourceName, Timestamp, set_condition},
     resources::{ImageFormat, ImageSpec, ImageStatus, Resource},
 };
-use tracing::info;
 use velstra_cloud_store::TypedStore;
 
 use crate::{Result, runner::Reconciler, status::StatusWriter};
@@ -101,7 +101,12 @@ impl<F: Fetch> ImageSourceController<F> {
     /// The id is the digest, as every image's is, so publishing the same digest
     /// twice is not two images — it is the same object, and the create is
     /// refused as already existing, which is the answer and not an error.
-    async fn publish(&self, spec: &ImageSourceSpec, digest: &str, now: Timestamp) -> Result<String> {
+    async fn publish(
+        &self,
+        spec: &ImageSourceSpec,
+        digest: &str,
+        now: Timestamp,
+    ) -> Result<String> {
         let id = format!("sha256-{digest}");
         let name = ResourceName::parse(&format!("images/{id}"))
             .map_err(|e| crate::Error::Refused(e.to_string()))?;
@@ -426,8 +431,7 @@ mod tests {
         fn text(
             &self,
             url: &str,
-        ) -> impl std::future::Future<Output = std::result::Result<String, String>> + Send
-        {
+        ) -> impl std::future::Future<Output = std::result::Result<String, String>> + Send {
             self.asked.lock().unwrap().push(url.to_string());
             let answer = self.body.lock().unwrap().clone();
             async move { answer }
@@ -506,9 +510,10 @@ mod tests {
 
         // It asked the checksums file, not the image: the digest is the thing
         // being learned, and the bytes are the node's business.
-        assert_eq!(says.asked.lock().unwrap().as_slice(), &[
-            "https://cloud.example/SHA256SUMS".to_string()
-        ]);
+        assert_eq!(
+            says.asked.lock().unwrap().as_slice(),
+            &["https://cloud.example/SHA256SUMS".to_string()]
+        );
 
         let stored = sources
             .get("image-sources/debian")
@@ -581,7 +586,11 @@ mod tests {
         let checked = condition(&stored.status.conditions, CHECKED).unwrap();
         assert_eq!(checked.status, ConditionStatus::False);
         assert_eq!(checked.reason, "Unreachable");
-        assert!(checked.message.contains("connection refused"), "{}", checked.message);
+        assert!(
+            checked.message.contains("connection refused"),
+            "{}",
+            checked.message
+        );
     }
 
     #[tokio::test]
@@ -590,8 +599,11 @@ mod tests {
         // an operator will paste the wrong one. Taking a sha512 for a sha256
         // would publish an image whose digest no bytes ever match — a source
         // that looks healthy and hands out something that cannot boot.
-        let (_raw, _says, c, sources) =
-            fixture(Ok(format!("{}  debian-13-genericcloud-amd64.qcow2\n", "a".repeat(128)))).await;
+        let (_raw, _says, c, sources) = fixture(Ok(format!(
+            "{}  debian-13-genericcloud-amd64.qcow2\n",
+            "a".repeat(128)
+        )))
+        .await;
         let source = a_source();
         sources
             .create(&source, &velstra_cloud_model::Writer::controller("test"))
@@ -627,10 +639,15 @@ mod tests {
         c.reconcile("image-sources/debian", Some(&source))
             .await
             .unwrap();
-        assert!(says.asked.lock().unwrap().is_empty(), "a paused source was fetched");
+        assert!(
+            says.asked.lock().unwrap().is_empty(),
+            "a paused source was fetched"
+        );
         let stored = sources.get("image-sources/debian").await.unwrap().unwrap();
         assert_eq!(
-            condition(&stored.status.conditions, CHECKED).unwrap().reason,
+            condition(&stored.status.conditions, CHECKED)
+                .unwrap()
+                .reason,
             "Paused"
         );
     }
@@ -674,10 +691,20 @@ mod tests {
     async fn the_versions_past_keep_are_taken_away_newest_first() {
         let (raw, _says, c, sources) = fixture(Ok(sums(DIGEST))).await;
         let store: Arc<dyn Store> = raw.clone();
-        let images: TypedStore<ImageSpec, ImageStatus> =
-            TypedStore::new(store, "cell-1", "images");
+        let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store, "cell-1", "images");
         let url = "http://cloud.example/debian-13-genericcloud-amd64.qcow2";
-        versions(&images, url, "debian-13", &["a".repeat(64).as_str(), &"b".repeat(64), &"c".repeat(64), &"d".repeat(64)]).await;
+        versions(
+            &images,
+            url,
+            "debian-13",
+            &[
+                "a".repeat(64).as_str(),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &"d".repeat(64),
+            ],
+        )
+        .await;
 
         let mut source = a_source();
         source.spec.keep = 2;
@@ -725,7 +752,13 @@ mod tests {
         > = TypedStore::new(store, "cell-1", "instances");
         let url = "http://cloud.example/debian-13-genericcloud-amd64.qcow2";
         let old = "a".repeat(64);
-        versions(&images, url, "debian-13", &[&old, &"b".repeat(64), &"c".repeat(64)]).await;
+        versions(
+            &images,
+            url,
+            "debian-13",
+            &[&old, &"b".repeat(64), &"c".repeat(64)],
+        )
+        .await;
 
         let mut guest = Resource::new(
             Meta::new(
@@ -784,11 +817,22 @@ mod tests {
         // somebody else's work just because it shares a name.
         let (raw, _says, c, sources) = fixture(Ok(sums(DIGEST))).await;
         let store: Arc<dyn Store> = raw.clone();
-        let images: TypedStore<ImageSpec, ImageStatus> =
-            TypedStore::new(store, "cell-1", "images");
+        let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store, "cell-1", "images");
         let url = "http://cloud.example/debian-13-genericcloud-amd64.qcow2";
-        versions(&images, url, "debian-13", &[&"b".repeat(64), &"c".repeat(64)]).await;
-        versions(&images, "http://elsewhere.example/patched.qcow2", "debian-13", &[&"e".repeat(64)]).await;
+        versions(
+            &images,
+            url,
+            "debian-13",
+            &[&"b".repeat(64), &"c".repeat(64)],
+        )
+        .await;
+        versions(
+            &images,
+            "http://elsewhere.example/patched.qcow2",
+            "debian-13",
+            &[&"e".repeat(64)],
+        )
+        .await;
 
         let mut source = a_source();
         source.spec.keep = 1;
@@ -813,5 +857,4 @@ mod tests {
             "a hand-made image was taken away by a source's retention: {left:?}"
         );
     }
-
 }

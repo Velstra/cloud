@@ -570,7 +570,15 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.volumes, self.sink.as_ref(), stored, next, &self.writer, pass).await;
+        reporting::report(
+            &self.volumes,
+            self.sink.as_ref(),
+            stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
     }
 
     /// Every copy this pool owes a target.
@@ -681,7 +689,15 @@ impl PoolAgent {
                     ),
                 },
             );
-            reporting::report(&self.targets, self.sink.as_ref(), target, next.clone(), &self.writer, pass).await;
+            reporting::report(
+                &self.targets,
+                self.sink.as_ref(),
+                target,
+                next.clone(),
+                &self.writer,
+                pass,
+            )
+            .await;
             next
         }
     }
@@ -791,7 +807,15 @@ impl PoolAgent {
                     stored.meta.generation,
                 ),
             );
-            reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
+            reporting::report(
+                &self.backups,
+                self.sink.as_ref(),
+                stored,
+                next,
+                &self.writer,
+                pass,
+            )
+            .await;
             return;
         };
 
@@ -845,7 +869,15 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
+        reporting::report(
+            &self.backups,
+            self.sink.as_ref(),
+            stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
     }
 
     /// Say on the backup that reading it back did not work out.
@@ -876,7 +908,15 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
+        reporting::report(
+            &self.backups,
+            self.sink.as_ref(),
+            stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
     }
 
     /// One backup: claim it, copy the bytes out, report what is on the target.
@@ -1015,7 +1055,15 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
+        reporting::report(
+            &self.backups,
+            self.sink.as_ref(),
+            stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
     }
 
     /// Say on the object why a copy has not been made.
@@ -1042,7 +1090,15 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.backups, self.sink.as_ref(), stored, next, &self.writer, pass).await;
+        reporting::report(
+            &self.backups,
+            self.sink.as_ref(),
+            stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
     }
 
     /// One snapshot: claim it, do what the model says, report what is there.
@@ -1142,7 +1198,15 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.snapshots, self.sink.as_ref(), stored, next, &self.writer, pass).await;
+        reporting::report(
+            &self.snapshots,
+            self.sink.as_ref(),
+            stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
     }
 
     async fn perform(&self, action: &VolumeAction, copies: &Copies) -> Result<()> {
@@ -1242,7 +1306,15 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.pools, self.sink.as_ref(), &stored, next, &self.writer, pass).await;
+        reporting::report(
+            &self.pools,
+            self.sink.as_ref(),
+            &stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
     }
 
     /// Say on the pool that its backend could not be read.
@@ -1282,7 +1354,15 @@ impl PoolAgent {
                 stored.meta.generation,
             ),
         );
-        reporting::report(&self.pools, self.sink.as_ref(), &stored, next, &self.writer, pass).await;
+        reporting::report(
+            &self.pools,
+            self.sink.as_ref(),
+            &stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
     }
 }
 
@@ -1669,7 +1749,9 @@ mod tests {
         };
         let mut next = stored.clone();
         let Ok(status) = serde_json::from_value(object["status"].clone()) else {
-            return crate::sink::SinkOutcome::Failed(format!("{name} reported a status this could not read"));
+            return crate::sink::SinkOutcome::Failed(format!(
+                "{name} reported a status this could not read"
+            ));
         };
         next.status = status;
         match typed.update(&next, writer).await {
@@ -1707,16 +1789,37 @@ mod tests {
                 "snapshots" => "snapshots",
                 "backups" => "backups",
                 "backup-targets" => "backup-targets",
-                other => return crate::sink::SinkOutcome::Failed(
-                    format!("nothing here reports on {other}")),
+                other => {
+                    return crate::sink::SinkOutcome::Failed(format!(
+                        "nothing here reports on {other}"
+                    ));
+                }
             };
             match kind {
-                "pools" => write_one::<rs::PoolSpec, rs::PoolStatus>(&self.0, kind, object, writer).await,
-                "volumes" => write_one::<rs::VolumeSpec, rs::VolumeStatus>(&self.0, kind, object, writer).await,
-                "snapshots" => write_one::<rs::SnapshotSpec, rs::SnapshotStatus>(&self.0, kind, object, writer).await,
-                "backups" => write_one::<bk::BackupSpec, bk::BackupStatus>(&self.0, kind, object, writer).await,
-                "backup-targets" => write_one::<bk::BackupTargetSpec, bk::BackupTargetStatus>(&self.0, kind, object, writer).await,
-                other => crate::sink::SinkOutcome::Failed(format!("nothing here reports on {other}")),
+                "pools" => {
+                    write_one::<rs::PoolSpec, rs::PoolStatus>(&self.0, kind, object, writer).await
+                }
+                "volumes" => {
+                    write_one::<rs::VolumeSpec, rs::VolumeStatus>(&self.0, kind, object, writer)
+                        .await
+                }
+                "snapshots" => {
+                    write_one::<rs::SnapshotSpec, rs::SnapshotStatus>(&self.0, kind, object, writer)
+                        .await
+                }
+                "backups" => {
+                    write_one::<bk::BackupSpec, bk::BackupStatus>(&self.0, kind, object, writer)
+                        .await
+                }
+                "backup-targets" => {
+                    write_one::<bk::BackupTargetSpec, bk::BackupTargetStatus>(
+                        &self.0, kind, object, writer,
+                    )
+                    .await
+                }
+                other => {
+                    crate::sink::SinkOutcome::Failed(format!("nothing here reports on {other}"))
+                }
             }
         }
         fn describe(&self) -> String {

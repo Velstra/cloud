@@ -610,14 +610,17 @@ async fn a_tenant_listing_their_own_project_does_not_pay_for_the_cell() {
                 "ports",
                 &velstra_cloud_api::Filter::none(),
                 // Not the operator this harness builds the cell as: an operator's
-            // list is served whole, and what is being measured is the gate a
-            // tenant goes through — one authorisation question per object.
-            &Identity::new("a-tenant"),
+                // list is served whole, and what is being measured is the gate a
+                // tenant goes through — one authorisation question per object.
+                &Identity::new("a-tenant"),
             )
             .await
             .expect("a tenant lists their own project");
         let reads = counting.read();
-        println!("  cell of {n:>4}: {:>4} ports / {reads:>5} reads", listed.items.len());
+        println!(
+            "  cell of {n:>4}: {:>4} ports / {reads:>5} reads",
+            listed.items.len()
+        );
         costs.push((n, reads));
     }
 
@@ -634,4 +637,3 @@ async fn a_tenant_listing_their_own_project_does_not_pay_for_the_cell() {
          shape, not the linear one: {costs:?}"
     );
 }
-

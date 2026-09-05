@@ -423,8 +423,7 @@ pub fn run_with(
     // mounts it next. On the appliance it goes to [`SEED_DIR`]: `/etc` is on a
     // read-only verity store there, and a machine whose state directory is
     // its own alone has nobody to be renamed by.
-    let dir =
-        dir.unwrap_or_else(|| PathBuf::from(if nixos { SEED_DIR } else { IDENTITY_DIR }));
+    let dir = dir.unwrap_or_else(|| PathBuf::from(if nixos { SEED_DIR } else { IDENTITY_DIR }));
     let machine = match &config {
         Some(path) => {
             let text =
@@ -507,10 +506,7 @@ fn enable_now(unit: &str) -> Result<()> {
     if out.status.success() {
         return Ok(());
     }
-    Err(std::io::Error::other(
-        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-    )
-    .into())
+    Err(std::io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()).into())
 }
 
 /// The NixOS module snippet for these answers.
@@ -641,7 +637,7 @@ fn collect() -> Result<Option<Machine>> {
 
     let mut m = Machine {
         api_ca: String::new(),
-            tls_cert: String::new(),
+        tls_cert: String::new(),
         tls_key: String::new(),
         lvm_group: String::new(),
         lvm_thin_pool: String::new(),
@@ -727,7 +723,9 @@ fn collect() -> Result<Option<Machine>> {
             println!("\nA thin pool changes what a snapshot costs and how it fails: a thick");
             println!("snapshot reserves its space up front and is dropped by the kernel when");
             println!("it fills; a thin one costs nothing until something is written.");
-            m.lvm_thin_pool = prompt("Thin pool inside it, if any []: ")?.trim().to_string();
+            m.lvm_thin_pool = prompt("Thin pool inside it, if any []: ")?
+                .trim()
+                .to_string();
         }
         if m.pool_backend == "ceph" {
             println!("\nAn existing cluster, or one this machine will deploy. For an existing");
@@ -742,13 +740,17 @@ fn collect() -> Result<Option<Machine>> {
             } else {
                 user
             };
-            let pool = prompt("RBD pool for volumes [velstra-volumes]: ")?.trim().to_string();
+            let pool = prompt("RBD pool for volumes [velstra-volumes]: ")?
+                .trim()
+                .to_string();
             m.ceph_pool = if pool.is_empty() {
                 "velstra-volumes".to_string()
             } else {
                 pool
             };
-            let images = prompt("RBD pool for images [velstra-images]: ")?.trim().to_string();
+            let images = prompt("RBD pool for images [velstra-images]: ")?
+                .trim()
+                .to_string();
             m.ceph_image_pool = if images.is_empty() {
                 "velstra-images".to_string()
             } else {
@@ -757,8 +759,14 @@ fn collect() -> Result<Option<Machine>> {
             // The cell's own name for this storage, which is a different
             // namespace from the RBD pools above: a volume asks for
             // `pool: ceph`, and the cluster is where `velstra-volumes` lives.
-            let id = prompt("Pool object id in this cell [ceph]: ")?.trim().to_string();
-            m.ceph_pool_id = if id.is_empty() { "ceph".to_string() } else { id };
+            let id = prompt("Pool object id in this cell [ceph]: ")?
+                .trim()
+                .to_string();
+            m.ceph_pool_id = if id.is_empty() {
+                "ceph".to_string()
+            } else {
+                id
+            };
         }
     }
 
@@ -1245,7 +1253,10 @@ mod tests {
             ..Default::default()
         };
         let seed = render(&m);
-        assert!(seed.contains("VELSTRA_CEPH_CONF=/etc/ceph/ceph.conf"), "{seed}");
+        assert!(
+            seed.contains("VELSTRA_CEPH_CONF=/etc/ceph/ceph.conf"),
+            "{seed}"
+        );
         assert!(seed.contains("VELSTRA_CEPH_USER=client.velstra"), "{seed}");
         assert!(seed.contains("VELSTRA_CEPH_POOL=cloud-volumes"), "{seed}");
         // Nothing that was not answered: an empty line would override the
@@ -1265,7 +1276,6 @@ mod tests {
         assert!(seed.contains("VELSTRA_LVM_THIN_POOL=thin"), "{seed}");
         assert!(!seed.contains("VELSTRA_CEPH"), "{seed}");
     }
-
 }
 
 /// Bring an existing seed up to what this package needs, and change nothing else.
@@ -1318,7 +1328,9 @@ pub fn migrate_seed(dir: &std::path::Path, identity: &std::path::Path) -> Result
                 *line = format!("VELSTRA_API_URL={now}");
             }
         }
-        changed.push(format!("VELSTRA_API_URL is now {now}: this machine serves TLS"));
+        changed.push(format!(
+            "VELSTRA_API_URL is now {now}: this machine serves TLS"
+        ));
     }
 
     if value(&lines, "VELSTRA_API_CA").is_none()
@@ -1351,7 +1363,11 @@ pub fn migrate_seed(dir: &std::path::Path, identity: &std::path::Path) -> Result
 /// answers, or the other does.
 pub fn seed_path(state: &std::path::Path, identity: &std::path::Path) -> std::path::PathBuf {
     let mine = identity.join("node.env");
-    if mine.exists() { mine } else { state.join("node.env") }
+    if mine.exists() {
+        mine
+    } else {
+        state.join("node.env")
+    }
 }
 
 /// Move a seed out of the shared state directory and into the machine's own.
@@ -1363,17 +1379,14 @@ pub fn seed_path(state: &std::path::Path, identity: &std::path::Path) -> std::pa
 ///
 /// Does nothing when the machine already has its own, and nothing when there is
 /// no seed at all, which is what a freshly unpacked package looks like.
-fn settle_identity(
-    state: &std::path::Path,
-    identity: &std::path::Path,
-) -> Result<Vec<String>> {
+fn settle_identity(state: &std::path::Path, identity: &std::path::Path) -> Result<Vec<String>> {
     let from = state.join("node.env");
     let to = identity.join("node.env");
     if to.exists() || !from.exists() {
         return Ok(Vec::new());
     }
-    let text = std::fs::read_to_string(&from)
-        .with_context(|| format!("reading {}", from.display()))?;
+    let text =
+        std::fs::read_to_string(&from).with_context(|| format!("reading {}", from.display()))?;
     std::fs::create_dir_all(identity)
         .with_context(|| format!("creating {}", identity.display()))?;
     std::fs::write(&to, &text).with_context(|| format!("writing {}", to.display()))?;
@@ -1393,7 +1406,11 @@ mod migrating_a_seed {
 
     /// A machine as an upgrade finds it: a state directory holding the seed,
     /// and an `/etc` that does not have one yet.
-    fn scratch(name: &str, seed: &str, with_cert: bool) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn scratch(
+        name: &str,
+        seed: &str,
+        with_cert: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("velstra-seed-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (state, identity) = (root.join("var"), root.join("etc"));
@@ -1417,7 +1434,10 @@ mod migrating_a_seed {
         // Three now: the move, and the two the TLS migration makes.
         assert_eq!(said.len(), 3, "{said:?}");
         let seed = std::fs::read_to_string(identity.join("node.env")).unwrap();
-        assert!(seed.contains("VELSTRA_API_URL=https://localhost:8443"), "{seed}");
+        assert!(
+            seed.contains("VELSTRA_API_URL=https://localhost:8443"),
+            "{seed}"
+        );
         assert!(seed.contains("VELSTRA_API_CA="), "{seed}");
         // Idempotent: a second upgrade says nothing and changes nothing.
         assert!(migrate_seed(&state, &identity).unwrap().is_empty());
@@ -1440,7 +1460,8 @@ mod migrating_a_seed {
     fn somebody_elses_control_plane_is_not_guessed_at() {
         // This machine's certificate says nothing about whether the cell it
         // joined serves TLS, so the seed is not touched.
-        let (state, identity) = scratch("remote", "VELSTRA_API_URL=http://cell.example:8443\n", true);
+        let (state, identity) =
+            scratch("remote", "VELSTRA_API_URL=http://cell.example:8443\n", true);
         assert_eq!(migrate_seed(&state, &identity).unwrap().len(), 1);
         let seed = std::fs::read_to_string(identity.join("node.env")).unwrap();
         assert!(seed.contains("http://cell.example:8443"), "{seed}");
@@ -1482,7 +1503,6 @@ mod migrating_a_seed {
         let _ = std::fs::remove_dir_all(state.parent().unwrap());
     }
 }
-
 
 /// The etcd this cell was going to run into.
 ///
@@ -1621,7 +1641,10 @@ mod giving_the_store_room {
             "a second value was appended, so which one wins is a coin toss"
         );
         assert!(text.contains("ETCD_AUTO_COMPACTION_RETENTION=1h"));
-        assert!(text.contains("ETCD_NAME=cell-1"), "their other settings went");
+        assert!(
+            text.contains("ETCD_NAME=cell-1"),
+            "their other settings went"
+        );
     }
 
     #[test]

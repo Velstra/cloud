@@ -1289,7 +1289,10 @@ impl FakeBgp {
     pub fn answer(&self, peer: &str, state: &str, announced: u32) {
         self.inner.lock().unwrap().peers.insert(
             peer.to_string(),
-            crate::bgp::PeerObservation { state: state.to_string(), announced },
+            crate::bgp::PeerObservation {
+                state: state.to_string(),
+                announced,
+            },
         );
     }
 }

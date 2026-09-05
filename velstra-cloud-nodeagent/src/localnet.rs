@@ -193,7 +193,10 @@ impl LocalNet {
     /// interfaces it did not make would be a plan that takes a machine's own
     /// networking away.
     pub async fn observed(&self) -> Vec<Bridge> {
-        let Ok(out) = self.ip_output(&["-j", "addr", "show", "type", "bridge"]).await else {
+        let Ok(out) = self
+            .ip_output(&["-j", "addr", "show", "type", "bridge"])
+            .await
+        else {
             return Vec::new();
         };
         let Ok(links) = serde_json::from_slice::<serde_json::Value>(&out) else {
@@ -261,7 +264,9 @@ impl LocalNet {
             if !bridge.name.starts_with(&self.prefix) {
                 continue;
             }
-            let wanted = segments.iter().find(|s| self.bridge_for(&s.subnet) == bridge.name);
+            let wanted = segments
+                .iter()
+                .find(|s| self.bridge_for(&s.subnet) == bridge.name);
             match wanted {
                 Some(segment) => {
                     let keep = format!("{}/{}", segment.gateway, segment.prefix_len);
@@ -771,7 +776,10 @@ mod the_datapath_has_to_take_things_away_too {
             subnet: subnet.to_string(),
             gateway: gateway.parse().unwrap(),
             prefix_len: 24,
-            network: format!("{}/24", gateway.rsplit_once('.').unwrap().0.to_string() + ".0"),
+            network: format!(
+                "{}/24",
+                gateway.rsplit_once('.').unwrap().0.to_string() + ".0"
+            ),
             taps: Vec::new(),
         }
     }

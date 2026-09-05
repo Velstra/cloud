@@ -346,7 +346,11 @@ async fn a_node_may_read_the_machine_room_it_is_a_machine_in() {
     let ids: Vec<String> = listed
         .items
         .iter()
-        .filter_map(|n| n["meta"]["name"]["segments"][1].as_str().map(str::to_string))
+        .filter_map(|n| {
+            n["meta"]["name"]["segments"][1]
+                .as_str()
+                .map(str::to_string)
+        })
         .collect();
     assert_eq!(
         ids,
@@ -356,7 +360,12 @@ async fn a_node_may_read_the_machine_room_it_is_a_machine_in() {
 
     // The customer's seat is unchanged — this is not a hole, it is a seat.
     let refusal = api
-        .list_for("", "nodes", &velstra_cloud_api::Filter::none(), &who("a-tenant"))
+        .list_for(
+            "",
+            "nodes",
+            &velstra_cloud_api::Filter::none(),
+            &who("a-tenant"),
+        )
         .await
         .expect_err("a tenant still may not read the machine room");
     assert_eq!(refusal.code, Code::PermissionDenied);
@@ -456,7 +465,9 @@ async fn a_pool_that_already_exists_can_still_be_given_a_credential() {
         .issue_credential(&name("pools/local-2"), &who(OPERATOR))
         .await
         .expect("an operator issues a pool a new credential");
-    let token = issued["poolToken"].as_str().expect("a pool gets a poolToken");
+    let token = issued["poolToken"]
+        .as_str()
+        .expect("a pool gets a poolToken");
     assert_eq!(token.len(), 64);
     // No `operation`: nothing converges, so there is nothing to wait on.
     assert!(issued.get("operation").is_none(), "{issued}");
@@ -481,7 +492,11 @@ async fn a_new_credential_does_not_close_the_door_on_the_old_one() {
 
     assert_ne!(first, second);
     for token in [first.as_str(), second] {
-        let id = api.verifier().verify(token).await.expect("both open the door");
+        let id = api
+            .verifier()
+            .verify(token)
+            .await
+            .expect("both open the door");
         assert_eq!(velstra_cloud_api::sessions::agent_node(&id), Some("node-a"));
     }
 }
@@ -509,10 +524,7 @@ async fn a_credential_is_only_issued_for_a_machine_the_cell_knows() {
         .issue_credential(&name("projects/p1"), &who(OPERATOR))
         .await
         .expect_err("a project has no agent");
-    assert!(
-        refused.to_string().contains("node or a pool"),
-        "{refused}"
-    );
+    assert!(refused.to_string().contains("node or a pool"), "{refused}");
 }
 
 /// A curtain over an open door.

@@ -191,7 +191,9 @@ async fn main() {
             use velstra_cloud_nodeagent::host::Vmm as _;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                let Ok(host) = vmm.observe().await else { continue };
+                let Ok(host) = vmm.observe().await else {
+                    continue;
+                };
                 for instance in host.sending {
                     if let Err(e) = vmm.finish_transfer(&instance) {
                         tracing::debug!(instance, error = %e, "a fake transfer did not finish");
