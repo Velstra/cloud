@@ -320,7 +320,7 @@ mod tests {
                     // and what happens when it cannot has its own test below.
                     shared_state: true,
                     vmm: "qemu".into(),
-            fetching: Vec::new(),
+                    fetching: Vec::new(),
                     capacity: Capacity {
                         vcpus: 32,
                         memory_mib: 65536,
@@ -332,7 +332,10 @@ mod tests {
                     last_heartbeat: Timestamp::now(),
                     // Both hold the image, so the move is not refused for a
                     // reason this check is not about.
-                    images: vec!["sha256-392d11b010cde76dc82ebe107aa399feff105625fd332b1ba58624426fcba7ca".into()],
+                    images: vec![
+                        "sha256-392d11b010cde76dc82ebe107aa399feff105625fd332b1ba58624426fcba7ca"
+                            .into(),
+                    ],
                     cpu: Some(velstra_cloud_model::cpu::NodeCpu {
                         arch: "x86_64".into(),
                         flags: ["sse4_2"].iter().map(|s| s.to_string()).collect(),
@@ -567,10 +570,7 @@ mod tests {
         for id in ["node-a", "node-b"] {
             let mut node = f.nodes.get(&format!("nodes/{id}")).await.unwrap().unwrap();
             node.status.shared_state = false;
-            f.nodes
-                .update(&node, &Writer::agent(id))
-                .await
-                .unwrap();
+            f.nodes.update(&node, &Writer::agent(id)).await.unwrap();
         }
         declare(&f, true).await;
 

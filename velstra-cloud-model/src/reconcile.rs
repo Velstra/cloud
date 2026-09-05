@@ -1357,7 +1357,7 @@ mod tests {
             NodeStatus {
                 shared_state: false,
                 vmm: "qemu".into(),
-            fetching: Vec::new(),
+                fetching: Vec::new(),
                 capacity: Capacity {
                     vcpus,
                     memory_mib: mem,
@@ -2545,9 +2545,7 @@ mod teardown_and_stopping {
 
         let actions = reconcile_instance(&i, false, &[false], false, StartGate::Go, Timestamp(2));
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::DeleteVm { .. })),
+            actions.iter().any(|a| matches!(a, Action::DeleteVm { .. })),
             "a guest nobody has reported on was left running: {actions:?}"
         );
         // And in the order that makes it work: the machine goes before the wire
@@ -2560,7 +2558,9 @@ mod teardown_and_stopping {
             .iter()
             .position(|a| matches!(a, Action::UnprogramPort { .. }))
             .unwrap();
-        assert!(vm < port, "the tap was removed before the guest let go of it");
+        assert!(
+            vm < port,
+            "the tap was removed before the guest let go of it"
+        );
     }
-
 }

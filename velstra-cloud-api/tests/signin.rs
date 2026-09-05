@@ -141,7 +141,12 @@ async fn whoami_names_the_projects_and_the_rung_held_in_each() {
     let root = root["token"].as_str().unwrap().to_string();
     for user in ["ada", "bob"] {
         let (status, _) = cell
-            .send("POST", "/api/v1/users", Some(&root), Some(json!({"id": user, "spec": {}})))
+            .send(
+                "POST",
+                "/api/v1/users",
+                Some(&root),
+                Some(json!({"id": user, "spec": {}})),
+            )
             .await;
         assert_eq!(status, StatusCode::ACCEPTED, "creating {user}");
         let (status, _) = cell
@@ -155,30 +160,47 @@ async fn whoami_names_the_projects_and_the_rung_held_in_each() {
         assert_eq!(status, StatusCode::NO_CONTENT, "setting {user}'s password");
     }
     for (id, bindings) in [
-        ("p1", json!([{"role": "admin", "members": ["ada"]}, {"role": "viewer", "members": ["ada", "bob"]}])),
+        (
+            "p1",
+            json!([{"role": "admin", "members": ["ada"]}, {"role": "viewer", "members": ["ada", "bob"]}]),
+        ),
         ("p2", json!([{"role": "editor", "members": ["bob"]}])),
     ] {
         let (status, _) = cell
-            .send("POST", "/api/v1/projects", Some(&root),
-                  Some(json!({"id": id, "spec": {"bindings": bindings}})))
+            .send(
+                "POST",
+                "/api/v1/projects",
+                Some(&root),
+                Some(json!({"id": id, "spec": {"bindings": bindings}})),
+            )
             .await;
         assert_eq!(status, StatusCode::ACCEPTED, "creating {id}");
     }
 
     let (_, ada) = cell.sign_in("ada", ADA).await;
     let ada = ada["token"].as_str().unwrap().to_string();
-    let (status, who) = cell.send("GET", "/api/v1/sessions/current", Some(&ada), None).await;
+    let (status, who) = cell
+        .send("GET", "/api/v1/sessions/current", Some(&ada), None)
+        .await;
     assert_eq!(status, StatusCode::OK);
     // The strongest rung, not the first binding that names her.
     assert_eq!(who["projects"], json!({"p1": "admin"}), "{who}");
 
     let (_, bob) = cell.sign_in("bob", ADA).await;
     let bob = bob["token"].as_str().unwrap().to_string();
-    let (_, who) = cell.send("GET", "/api/v1/sessions/current", Some(&bob), None).await;
-    assert_eq!(who["projects"], json!({"p1": "viewer", "p2": "editor"}), "{who}");
+    let (_, who) = cell
+        .send("GET", "/api/v1/sessions/current", Some(&bob), None)
+        .await;
+    assert_eq!(
+        who["projects"],
+        json!({"p1": "viewer", "p2": "editor"}),
+        "{who}"
+    );
 
     // An operator is not measured in rungs; the map is what they are named in.
-    let (_, who) = cell.send("GET", "/api/v1/sessions/current", Some(&root), None).await;
+    let (_, who) = cell
+        .send("GET", "/api/v1/sessions/current", Some(&root), None)
+        .await;
     assert_eq!(who["cellAdmin"], json!(true));
     assert_eq!(who["projects"], json!({}), "{who}");
 }

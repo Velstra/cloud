@@ -24,33 +24,20 @@ use velstra_cloud_model::{
     resources::{
         AttachmentSpec, AttachmentStatus, FloatingIpSpec, FloatingIpStatus, InstanceSpec,
         InstanceStatus, NetworkSpec, NetworkStatus, NodeSpec, NodeStatus, OperationSpec,
-        OperationStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus, RouterSpec,
-        PoolSpec, PoolStatus, RouterStatus, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus,
+        OperationStatus, PoolSpec, PoolStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus,
+        RouterSpec, RouterStatus, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus,
         VolumeSpec, VolumeStatus,
     },
 };
 use velstra_cloud_store::{Cached, Store, TypedStore, prefix_for};
 
 use crate::{
-    LoopConfig, Metrics,
-    address::AddressController,
-    attachment::AttachmentController,
-    ceph::CephController,
-    disk::DiskController,
-    drift,
-    floating_ip::FloatingIpController,
-    instance::InstanceController,
-    load_balancer::LoadBalancerController,
-    migration::MigrationController,
-    network::NetworkController,
-    operations::OperationsController,
-    port::PortController,
-    quota::QuotaController,
-    router::RouterController,
-    run_when_leading,
-    scheduler::Scheduler,
-    snapshot::SnapshotController,
-    status::StatusWriter,
+    LoopConfig, Metrics, address::AddressController, attachment::AttachmentController,
+    ceph::CephController, disk::DiskController, drift, floating_ip::FloatingIpController,
+    instance::InstanceController, load_balancer::LoadBalancerController,
+    migration::MigrationController, network::NetworkController, operations::OperationsController,
+    port::PortController, quota::QuotaController, router::RouterController, run_when_leading,
+    scheduler::Scheduler, snapshot::SnapshotController, status::StatusWriter,
     volume::VolumeController,
 };
 
@@ -79,7 +66,11 @@ pub struct Loops {
 impl Loops {
     /// Loops for a process with no election in front of it: it leads
     /// unconditionally, which is what a single-process cell wants.
-    pub fn unelected(config: LoopConfig, metrics: Metrics, shutdown: watch::Receiver<bool>) -> Self {
+    pub fn unelected(
+        config: LoopConfig,
+        metrics: Metrics,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
         let (always, leader) = watch::channel(true);
         // The sender is kept alive for the life of the process; dropping it
         // would close the channel and every loop would read "not leading".
@@ -112,7 +103,8 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
     let nodes: TypedStore<NodeSpec, NodeStatus> = TypedStore::new(store.clone(), id, "nodes");
     let ceph_clusters: TypedStore<CephClusterSpec, CephClusterStatus> =
         TypedStore::new(store.clone(), id, "ceph-clusters");
-    let volumes: TypedStore<VolumeSpec, VolumeStatus> = TypedStore::new(store.clone(), id, "volumes");
+    let volumes: TypedStore<VolumeSpec, VolumeStatus> =
+        TypedStore::new(store.clone(), id, "volumes");
     let attachments: TypedStore<AttachmentSpec, AttachmentStatus> =
         TypedStore::new(store.clone(), id, "attachments");
     let projects: TypedStore<ProjectSpec, ProjectStatus> =
@@ -140,10 +132,12 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
         velstra_cloud_model::backup::BackupScheduleStatus,
     > = TypedStore::new(store.clone(), id, "backup-schedules");
     let ports: TypedStore<PortSpec, PortStatus> = TypedStore::new(store.clone(), id, "ports");
-    let subnets: TypedStore<SubnetSpec, SubnetStatus> = TypedStore::new(store.clone(), id, "subnets");
+    let subnets: TypedStore<SubnetSpec, SubnetStatus> =
+        TypedStore::new(store.clone(), id, "subnets");
     let networks: TypedStore<NetworkSpec, NetworkStatus> =
         TypedStore::new(store.clone(), id, "networks");
-    let routers: TypedStore<RouterSpec, RouterStatus> = TypedStore::new(store.clone(), id, "routers");
+    let routers: TypedStore<RouterSpec, RouterStatus> =
+        TypedStore::new(store.clone(), id, "routers");
     let floating_ips: TypedStore<FloatingIpSpec, FloatingIpStatus> =
         TypedStore::new(store.clone(), id, "floatingips");
     let load_balancers: TypedStore<LoadBalancerSpec, LoadBalancerStatus> =
@@ -197,12 +191,20 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
         "port",
         PortController::new(
             ports.clone(),
-            Cached::start(instances.clone(), store.clone(), prefix_for(id, "instances")),
+            Cached::start(
+                instances.clone(),
+                store.clone(),
+                prefix_for(id, "instances")
+            ),
             id,
         ),
         ports.clone()
     );
-    spawn!("instance", InstanceController::new(instances.clone()), instances.clone());
+    spawn!(
+        "instance",
+        InstanceController::new(instances.clone()),
+        instances.clone()
+    );
     spawn!(
         "disk",
         DiskController::new(attachments.clone(), instances.clone()),
@@ -216,7 +218,11 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
     spawn!(
         "quota",
         QuotaController::new(
-            Cached::start(instances.clone(), store.clone(), prefix_for(id, "instances")),
+            Cached::start(
+                instances.clone(),
+                store.clone(),
+                prefix_for(id, "instances")
+            ),
             Cached::start(volumes.clone(), store.clone(), prefix_for(id, "volumes")),
             Cached::start(
                 floating_ips.clone(),

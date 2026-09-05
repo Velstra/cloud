@@ -1565,11 +1565,11 @@ pub fn destination_of(node: &str, refusal: Option<&migration::Refusal>) -> v1::D
         Refusal::DestinationCpuIncompatible { .. } => "DestinationCpuIncompatible",
         Refusal::GuestCpuUnknown { .. } => "GuestCpuUnknown",
         Refusal::HoldsDevices { .. } => "HoldsDevices",
-            // Its own name, and not folded into anything: it is the only
-            // refusal whose remedy is a decision about *storage*, taken above
-            // the platform, and a console showing it as a capacity or a CPU
-            // problem would send somebody to the wrong place entirely.
-            Refusal::RootDiskIsNotShared { .. } => "RootDiskIsNotShared",
+        // Its own name, and not folded into anything: it is the only
+        // refusal whose remedy is a decision about *storage*, taken above
+        // the platform, and a console showing it as a capacity or a CPU
+        // problem would send somebody to the wrong place entirely.
+        Refusal::RootDiskIsNotShared { .. } => "RootDiskIsNotShared",
     };
     v1::Destination {
         node: node.to_string(),
@@ -1732,7 +1732,7 @@ mod tests {
         let original = Resource::new(
             meta,
             InstanceSpec {
-            flavor: None,
+                flavor: None,
                 volumes: Vec::new(),
                 start_order: 0,
                 start_delay_s: 0,

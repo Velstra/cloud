@@ -24,12 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Observed, Resource,
-    resources::Assigned,
-    authz::Binding,
-    meta::Condition,
-};
+use crate::{Observed, Resource, authz::Binding, meta::Condition, resources::Assigned};
 
 /// How far up a walk goes before it stops looking.
 ///

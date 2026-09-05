@@ -753,9 +753,15 @@ async fn an_instance_keeps_the_image_it_was_built_from() {
         .expect_err("the guest was moved onto another build by name");
     assert_eq!(refused.code, Code::FailedPrecondition, "{refused}");
 
-    let stored = api.get(&web, &who(ADA)).await.expect("the guest is still there");
+    let stored = api
+        .get(&web, &who(ADA))
+        .await
+        .expect("the guest is still there");
     assert_eq!(stored["spec"]["image"], "projects/p1/images/sha256-old");
-    assert_eq!(stored["spec"]["vcpus"], 4, "the size change beside the repeated image was lost");
+    assert_eq!(
+        stored["spec"]["vcpus"], 4,
+        "the size change beside the repeated image was lost"
+    );
 }
 
 /// The same hole, on the field a machine boots from.
@@ -1430,7 +1436,11 @@ async fn a_console_is_granted_to_a_reader_and_a_keyboard_only_to_a_writer() {
 
     // Ada admins p1: a keyboard.
     let opened = api
-        .open_console(&name("projects/p1/instances/i1"), velstra_cloud_model::console::ConsoleKind::Serial, &who(ADA))
+        .open_console(
+            &name("projects/p1/instances/i1"),
+            velstra_cloud_model::console::ConsoleKind::Serial,
+            &who(ADA),
+        )
         .await
         .map_err(|e| e.to_string())
         .expect("an admin of the project may open a console");
@@ -1476,7 +1486,11 @@ async fn a_console_is_granted_to_a_reader_and_a_keyboard_only_to_a_writer() {
     .expect("an operator changes the bindings");
 
     let watching = api
-        .open_console(&name("projects/p1/instances/i1"), velstra_cloud_model::console::ConsoleKind::Serial, &who("cleo"))
+        .open_console(
+            &name("projects/p1/instances/i1"),
+            velstra_cloud_model::console::ConsoleKind::Serial,
+            &who("cleo"),
+        )
         .await
         .map_err(|e| e.to_string())
         .expect("a viewer may watch");
@@ -1492,7 +1506,11 @@ async fn a_console_is_granted_to_a_reader_and_a_keyboard_only_to_a_writer() {
 
     // Bob has nothing in p1 at all: no window either.
     let refused = api
-        .open_console(&name("projects/p1/instances/i1"), velstra_cloud_model::console::ConsoleKind::Serial, &who(BOB))
+        .open_console(
+            &name("projects/p1/instances/i1"),
+            velstra_cloud_model::console::ConsoleKind::Serial,
+            &who(BOB),
+        )
         .await
         .expect_err("a stranger opened a console");
     assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
@@ -1900,7 +1918,6 @@ async fn a_tenant_boots_the_newest_of_a_family_like_anybody_else() {
     );
 }
 
-
 #[tokio::test]
 async fn the_catalogue_can_be_listed_and_not_only_guessed() {
     // `families/debian-13` is the reference somebody is supposed to write, and
@@ -1946,15 +1963,17 @@ async fn the_catalogue_can_be_listed_and_not_only_guessed() {
         "the catalogue did not list what a create can resolve"
     );
     assert!(
-        listed.items.iter().all(|i| i["spec"]["public"] == json!(true)),
+        listed
+            .items
+            .iter()
+            .all(|i| i["spec"]["public"] == json!(true)),
         "a cell image is the catalogue's and everybody may boot it"
     );
     // Every entry names bytes that exist — a picker offering a family that
     // resolves to nothing is worse than no picker.
     for entry in &listed.items {
         let image = entry["spec"]["image"].as_str().unwrap();
-        let found: Result<velstra_cloud_model::resources::Image, _> =
-            api.typed(&name(image)).await;
+        let found: Result<velstra_cloud_model::resources::Image, _> = api.typed(&name(image)).await;
         assert!(
             found.is_ok(),
             "the catalogue offered {image}, which is not there"
@@ -1967,10 +1986,7 @@ async fn a_projects_own_family_shadows_the_catalogues_in_the_listing_too() {
     // Resolution already prefers the project's own, so a listing that showed the
     // cell's would be a picker whose entries lie about what they boot.
     let api = cell().await;
-    for (parent, digest, version) in [
-        ("", "aa", "20260101"),
-        ("projects/p1", "bb", "our-build"),
-    ] {
+    for (parent, digest, version) in [("", "aa", "20260101"), ("projects/p1", "bb", "our-build")] {
         api.create(
             parent,
             "images",
@@ -2436,7 +2452,10 @@ async fn an_operator_publishes_a_tenants_image_without_retyping_it() {
 
     let published: velstra_cloud_model::resources::Image =
         api.typed(&name("images/veroeffentlicht")).await.unwrap();
-    assert_eq!(published.spec.digest, digest, "the bytes are not the same bytes");
+    assert_eq!(
+        published.spec.digest, digest,
+        "the bytes are not the same bytes"
+    );
     assert_eq!(published.spec.family, "our-base");
     assert_eq!(published.spec.version, "20260829");
     assert_eq!(published.spec.size_bytes, 4_294_967_296);
@@ -2448,7 +2467,12 @@ async fn an_operator_publishes_a_tenants_image_without_retyping_it() {
 
     // And it is the catalogue's now: everybody may boot it.
     let listed = api
-        .list_for("", "families", &velstra_cloud_api::Filter::none(), &who(ADA))
+        .list_for(
+            "",
+            "families",
+            &velstra_cloud_api::Filter::none(),
+            &who(ADA),
+        )
         .await
         .unwrap();
     assert!(
@@ -2661,7 +2685,12 @@ async fn a_role_that_grants_nothing_in_particular_is_refused() {
         ),
     ] {
         let refused = api
-            .create("", "roles", &json!({ "id": "leer", "spec": spec }), &who(OPERATOR))
+            .create(
+                "",
+                "roles",
+                &json!({ "id": "leer", "spec": spec }),
+                &who(OPERATOR),
+            )
             .await;
         assert!(refused.is_err(), "{what} was accepted");
     }
@@ -2764,7 +2793,11 @@ async fn the_fleet_reports_are_refused_to_whoever_may_not_list_the_fleet() {
         ("cpu", api.explain_cpu(&who(ADA)).await.err()),
     ] {
         let refused = verdict.unwrap_or_else(|| panic!("a tenant read the fleet's {what}"));
-        assert_eq!(refused.code, velstra_cloud_api::Code::PermissionDenied, "{refused}");
+        assert_eq!(
+            refused.code,
+            velstra_cloud_api::Code::PermissionDenied,
+            "{refused}"
+        );
     }
 }
 
@@ -2792,7 +2825,10 @@ async fn a_tenant_sees_no_machines_through_any_window() {
     // Reading it as the tenant: the machine's name is not in the answer —
     // through the read, and through the project list the boards are built
     // from, which was the door the console actually used.
-    let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
+    let seen = api
+        .get(&name("projects/p1/instances/web"), &who(ADA))
+        .await
+        .unwrap();
     assert!(seen["spec"].get("node").is_none(), "{:?}", seen["spec"]);
     assert!(seen["status"].get("node").is_none(), "{:?}", seen["status"]);
     let listed = api
@@ -2800,10 +2836,17 @@ async fn a_tenant_sees_no_machines_through_any_window() {
         .await
         .unwrap();
     for item in &listed.items {
-        assert!(item["spec"].get("node").is_none(), "the project list leaks: {:?}", item["spec"]);
+        assert!(
+            item["spec"].get("node").is_none(),
+            "the project list leaks: {:?}",
+            item["spec"]
+        );
     }
     // And the operator still sees it whole: redaction is a view, not a change.
-    let whole = api.get(&name("projects/p1/instances/web"), &who(OPERATOR)).await.unwrap();
+    let whole = api
+        .get(&name("projects/p1/instances/web"), &who(OPERATOR))
+        .await
+        .unwrap();
     assert_eq!(whole["spec"]["node"], "hv-1");
 
     // Ports: the fifth door, found live in a tenant's own list after the
@@ -2840,27 +2883,51 @@ async fn a_tenant_sees_no_machines_through_any_window() {
     .await
     .unwrap();
     {
-        use velstra_cloud_model::access::Writer;
-        use velstra_cloud_model::resources::{PortSpec, PortStatus};
+        use velstra_cloud_model::{
+            access::Writer,
+            resources::{PortSpec, PortStatus},
+        };
         let ports: velstra_cloud_store::TypedStore<PortSpec, PortStatus> =
             velstra_cloud_store::TypedStore::new(store.clone(), "cell-1", "ports");
         let mut port = ports.get("projects/p1/ports/wire").await.unwrap().unwrap();
         port.spec.node = Some("hv-1".to_string());
         port.meta.generation += 1;
-        ports.update(&port, &Writer::controller("test")).await.unwrap();
+        ports
+            .update(&port, &Writer::controller("test"))
+            .await
+            .unwrap();
         let mut port = ports.get("projects/p1/ports/wire").await.unwrap().unwrap();
         port.status.node = Some("hv-1".to_string());
         port.status.programmed = true;
         ports.update(&port, &Writer::agent("hv-1")).await.unwrap();
     }
-    let port_seen = api.get(&name("projects/p1/ports/wire"), &who(ADA)).await.unwrap();
-    assert!(port_seen["spec"].get("node").is_none(), "{:?}", port_seen["spec"]);
-    assert!(port_seen["status"].get("node").is_none(), "{:?}", port_seen["status"]);
+    let port_seen = api
+        .get(&name("projects/p1/ports/wire"), &who(ADA))
+        .await
+        .unwrap();
+    assert!(
+        port_seen["spec"].get("node").is_none(),
+        "{:?}",
+        port_seen["spec"]
+    );
+    assert!(
+        port_seen["status"].get("node").is_none(),
+        "{:?}",
+        port_seen["status"]
+    );
     let ready = port_seen["status"]["conditions"]
-        .as_array().unwrap().iter().find(|c| c["kind"] == "Ready").cloned().unwrap();
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "Ready")
+        .cloned()
+        .unwrap();
     assert_eq!(ready["reason"], "Programmed");
     assert!(
-        !ready["message"].as_str().unwrap_or_default().contains("hv-1"),
+        !ready["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hv-1"),
         "the condition's words leak the machine: {ready}"
     );
     let port_listed = api
@@ -2868,10 +2935,17 @@ async fn a_tenant_sees_no_machines_through_any_window() {
         .await
         .unwrap();
     for item in &port_listed.items {
-        assert!(item["status"].get("node").is_none(), "the port list leaks: {:?}", item["status"]);
+        assert!(
+            item["status"].get("node").is_none(),
+            "the port list leaks: {:?}",
+            item["status"]
+        );
     }
     // The operator's view keeps the machine, words and all.
-    let port_whole = api.get(&name("projects/p1/ports/wire"), &who(OPERATOR)).await.unwrap();
+    let port_whole = api
+        .get(&name("projects/p1/ports/wire"), &who(OPERATOR))
+        .await
+        .unwrap();
     assert_eq!(port_whole["status"]["node"], "hv-1");
 
     // Migrations: refused whole — create and read alike.
@@ -2894,13 +2968,25 @@ async fn a_tenant_sees_no_machines_through_any_window() {
 
     // Pinning: a name they cannot see is not a name they may write.
     for (kind, spec) in [
-        ("instances", json!({ "vcpus": 1, "memory_mib": 512, "node": "hv-1" })),
-        ("attachments", json!({ "volume": "projects/p1/volumes/v", "instance": "projects/p1/instances/web", "node": "hv-1" })),
+        (
+            "instances",
+            json!({ "vcpus": 1, "memory_mib": 512, "node": "hv-1" }),
+        ),
+        (
+            "attachments",
+            json!({ "volume": "projects/p1/volumes/v", "instance": "projects/p1/instances/web", "node": "hv-1" }),
+        ),
     ] {
         let refused = api
-            .create("projects/p1", kind, &json!({ "id": "pinned", "spec": spec }), &who(ADA))
+            .create(
+                "projects/p1",
+                kind,
+                &json!({ "id": "pinned", "spec": spec }),
+                &who(ADA),
+            )
             .await
-            .map(|_| ()).expect_err(&format!("a tenant pinned a {kind} to a machine"));
+            .map(|_| ())
+            .expect_err(&format!("a tenant pinned a {kind} to a machine"));
         assert!(refused.to_string().contains("cannot pin"), "{refused}");
     }
     let refused = api
@@ -2950,7 +3036,10 @@ async fn a_tenant_sees_no_machines_through_any_window() {
     )
     .await
     .unwrap();
-    let reach = api.explain_reach(&name("projects/p1/floatingips/ip"), &who(ADA)).await.unwrap();
+    let reach = api
+        .explain_reach(&name("projects/p1/floatingips/ip"), &who(ADA))
+        .await
+        .unwrap();
     assert!(reach.get("on").is_none(), "{reach}");
     assert!(reach["announced"].get("nodes").is_none(), "{reach}");
     let whole = api
@@ -2988,9 +3077,11 @@ async fn a_tenant_sees_no_machines_through_any_window() {
     // assignee), and the agent that copies the disk claims the status. A
     // tenant asking for their own template got both names back.
     {
-        use velstra_cloud_model::access::Writer;
-        use velstra_cloud_model::capture::{CaptureSpec, CaptureStatus};
-        use velstra_cloud_model::meta::{Meta, Placement, ResourceName};
+        use velstra_cloud_model::{
+            access::Writer,
+            capture::{CaptureSpec, CaptureStatus},
+            meta::{Meta, Placement, ResourceName},
+        };
         let captures: velstra_cloud_store::TypedStore<CaptureSpec, CaptureStatus> =
             velstra_cloud_store::TypedStore::new(store.clone(), "cell-1", "captures");
         let mut capture = velstra_cloud_model::resources::Resource::new(
@@ -3006,22 +3097,50 @@ async fn a_tenant_sees_no_machines_through_any_window() {
             },
             CaptureStatus::default(),
         );
-        captures.create(&capture, &Writer::controller("test")).await.unwrap();
-        capture = captures.get("projects/p1/captures/golden").await.unwrap().unwrap();
+        captures
+            .create(&capture, &Writer::controller("test"))
+            .await
+            .unwrap();
+        capture = captures
+            .get("projects/p1/captures/golden")
+            .await
+            .unwrap()
+            .unwrap();
         capture.status.node = Some("hv-1".into());
-        captures.update(&capture, &Writer::agent("hv-1")).await.unwrap();
+        captures
+            .update(&capture, &Writer::agent("hv-1"))
+            .await
+            .unwrap();
     }
-    let seen = api.get(&name("projects/p1/captures/golden"), &who(ADA)).await.unwrap();
-    assert!(seen["spec"].get("node").is_none(), "a capture's spec leaks: {:?}", seen["spec"]);
-    assert!(seen["status"].get("node").is_none(), "a capture's status leaks: {:?}", seen["status"]);
+    let seen = api
+        .get(&name("projects/p1/captures/golden"), &who(ADA))
+        .await
+        .unwrap();
+    assert!(
+        seen["spec"].get("node").is_none(),
+        "a capture's spec leaks: {:?}",
+        seen["spec"]
+    );
+    assert!(
+        seen["status"].get("node").is_none(),
+        "a capture's status leaks: {:?}",
+        seen["status"]
+    );
     let listed = api
         .list_for("projects/p1", "captures", &Default::default(), &who(ADA))
         .await
         .unwrap();
     for item in &listed.items {
-        assert!(item["spec"].get("node").is_none(), "the capture list leaks: {:?}", item["spec"]);
+        assert!(
+            item["spec"].get("node").is_none(),
+            "the capture list leaks: {:?}",
+            item["spec"]
+        );
     }
-    let whole = api.get(&name("projects/p1/captures/golden"), &who(OPERATOR)).await.unwrap();
+    let whole = api
+        .get(&name("projects/p1/captures/golden"), &who(OPERATOR))
+        .await
+        .unwrap();
     assert_eq!(whole["spec"]["node"], "hv-1");
 }
 
@@ -3055,20 +3174,30 @@ async fn the_cells_public_networks_are_readable_and_only_readable_by_tenants() {
     // A tenant reads the offer…
     let net = api.get(&name("networks/public"), &who(ADA)).await.unwrap();
     assert_eq!(net["spec"]["external"], true);
-    let listed = api.list_for("", "subnets", &Default::default(), &who(ADA)).await.unwrap();
+    let listed = api
+        .list_for("", "subnets", &Default::default(), &who(ADA))
+        .await
+        .unwrap();
     assert!(
         listed
             .items
             .iter()
-            .any(|s| serde_json::to_string(&s["meta"]["name"]).unwrap().contains("public-v4")),
+            .any(|s| serde_json::to_string(&s["meta"]["name"])
+                .unwrap()
+                .contains("public-v4")),
         "the public subnet is not in a tenant's list ({} items)",
         listed.items.len()
     );
     // …and may not touch it.
     assert!(
-        api.patch(&name("networks/public"), &json!({ "spec": { "mtu": 1400 } }), None, &who(ADA))
-            .await
-            .is_err(),
+        api.patch(
+            &name("networks/public"),
+            &json!({ "spec": { "mtu": 1400 } }),
+            None,
+            &who(ADA)
+        )
+        .await
+        .is_err(),
         "a tenant edited the cell's pool"
     );
 }
@@ -3091,12 +3220,15 @@ async fn a_public_address_is_assigned_by_instance_out_of_the_cells_pool() {
     )
     .await
     .unwrap();
-    for (id, spec) in [
-        ("public", json!({ "external": true, "mtu": 1500 })),
-    ] {
-        api.create("", "networks", &json!({ "id": id, "spec": spec }), &who(OPERATOR))
-            .await
-            .unwrap();
+    for (id, spec) in [("public", json!({ "external": true, "mtu": 1500 }))] {
+        api.create(
+            "",
+            "networks",
+            &json!({ "id": id, "spec": spec }),
+            &who(OPERATOR),
+        )
+        .await
+        .unwrap();
     }
     for (id, cidr, gw) in [
         ("public-v6", "2001:db8::/64", "2001:db8::1"),
@@ -3130,19 +3262,23 @@ async fn a_public_address_is_assigned_by_instance_out_of_the_cells_pool() {
     )
     .await
     .expect("a tenant gives their VM a public address");
-    let stored = api.get(&name("projects/p1/floatingips/web-ip"), &who(ADA)).await.unwrap();
+    let stored = api
+        .get(&name("projects/p1/floatingips/web-ip"), &who(ADA))
+        .await
+        .unwrap();
     // The port was derived from the guest's one interface, and the pool chosen
     // v4-first; `instance` was consumed.
     let port = stored["spec"]["port"].as_str().unwrap_or_default();
     assert!(port.contains("/ports/"), "{stored}");
     assert!(
-        serde_json::to_string(&stored["spec"]["subnet"]).unwrap().contains("public-v4"),
+        serde_json::to_string(&stored["spec"]["subnet"])
+            .unwrap()
+            .contains("public-v4"),
         "{:?}",
         stored["spec"]["subnet"]
     );
     assert!(
-        stored["spec"].get("instance").is_none()
-            || stored["spec"]["instance"].as_str() == Some(""),
+        stored["spec"].get("instance").is_none() || stored["spec"]["instance"].as_str() == Some(""),
         "{:?}",
         stored["spec"]
     );
@@ -3185,8 +3321,12 @@ async fn a_public_address_is_assigned_by_instance_out_of_the_cells_pool() {
             &who(ADA),
         )
         .await
-        .map(|_| ()).expect_err("an address out of no pool");
-    assert!(refused.to_string().contains("no public addresses"), "{refused}");
+        .map(|_| ())
+        .expect_err("an address out of no pool");
+    assert!(
+        refused.to_string().contains("no public addresses"),
+        "{refused}"
+    );
 }
 
 /// The month added up, for whoever may read the project — and nobody else.
@@ -3206,9 +3346,12 @@ async fn a_tenant_sums_their_own_bill_and_not_a_neighbours() {
         );
         let record = velstra_cloud_model::resources::Resource::new(
             velstra_cloud_model::meta::Meta::new(
-                format!("projects/p1/usage/{}", velstra_cloud_model::usage::id_for(at))
-                    .parse()
-                    .unwrap(),
+                format!(
+                    "projects/p1/usage/{}",
+                    velstra_cloud_model::usage::id_for(at)
+                )
+                .parse()
+                .unwrap(),
                 velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
             ),
             velstra_cloud_model::usage::UsageRecordSpec {
@@ -3225,7 +3368,10 @@ async fn a_tenant_sums_their_own_bill_and_not_a_neighbours() {
             Default::default(),
         );
         usage
-            .create(&record, &velstra_cloud_model::access::Writer::controller("usage"))
+            .create(
+                &record,
+                &velstra_cloud_model::access::Writer::controller("usage"),
+            )
             .await
             .unwrap();
     }
@@ -3246,7 +3392,9 @@ async fn a_tenant_sums_their_own_bill_and_not_a_neighbours() {
 
     // Somebody else's bill is somebody else's.
     assert!(
-        api2.explain_usage(&name("projects/p1"), None, &who(BOB)).await.is_err(),
+        api2.explain_usage(&name("projects/p1"), None, &who(BOB))
+            .await
+            .is_err(),
         "a tenant summed a neighbour's project"
     );
     // And a spelling that is not a month is refused, not read as now.
@@ -3282,7 +3430,10 @@ async fn metrics_are_the_operators_and_carry_what_an_alert_needs() {
     .await
     .unwrap();
 
-    let text = api.metrics(&who(OPERATOR)).await.expect("an operator scrapes");
+    let text = api
+        .metrics(&who(OPERATOR))
+        .await
+        .expect("an operator scrapes");
     for needle in [
         "velstra_node_heartbeat_age_seconds{node=\"hv-1\"}",
         "# TYPE velstra_pool_gib gauge",
@@ -3292,9 +3443,15 @@ async fn metrics_are_the_operators_and_carry_what_an_alert_needs() {
         assert!(text.contains(needle), "missing {needle} in:\n{text}");
     }
     // A guest asked to run and not yet running is the alertable number.
-    assert!(text.contains("velstra_instances_off_desired_state 1"), "{text}");
+    assert!(
+        text.contains("velstra_instances_off_desired_state 1"),
+        "{text}"
+    );
 
-    assert!(api.metrics(&who(ADA)).await.is_err(), "a tenant scraped the cell");
+    assert!(
+        api.metrics(&who(ADA)).await.is_err(),
+        "a tenant scraped the cell"
+    );
 }
 
 #[tokio::test]
@@ -3427,8 +3584,15 @@ async fn a_flavor_is_a_menu_the_cell_writes_and_a_tenant_orders_from() {
     )
     .await
     .expect("a guest ordered by name");
-    let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
-    assert_eq!(seen["spec"]["flavor"], "flavors/m1-small", "{:?}", seen["spec"]);
+    let seen = api
+        .get(&name("projects/p1/instances/web"), &who(ADA))
+        .await
+        .unwrap();
+    assert_eq!(
+        seen["spec"]["flavor"], "flavors/m1-small",
+        "{:?}",
+        seen["spec"]
+    );
     assert_eq!(seen["spec"]["vcpus"], 2);
     assert_eq!(seen["spec"]["memory_mib"], 2048);
     assert_eq!(seen["spec"]["root_disk_gib"], 10);
@@ -3442,7 +3606,10 @@ async fn a_flavor_is_a_menu_the_cell_writes_and_a_tenant_orders_from() {
     )
     .await
     .expect("the next size up");
-    let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
+    let seen = api
+        .get(&name("projects/p1/instances/web"), &who(ADA))
+        .await
+        .unwrap();
     assert_eq!(seen["spec"]["vcpus"], 8);
     assert_eq!(seen["spec"]["memory_mib"], 16384);
     assert_eq!(seen["spec"]["root_disk_gib"], 40);
@@ -3462,8 +3629,14 @@ async fn a_flavor_is_a_menu_the_cell_writes_and_a_tenant_orders_from() {
         .expect_err("a flavor with a smaller disk shrank the root disk");
     assert_eq!(refused.field.as_deref(), Some("spec.flavor"), "{refused}");
     assert!(refused.to_string().contains("shrunk"), "{refused}");
-    let seen = api.get(&name("projects/p1/instances/web"), &who(ADA)).await.unwrap();
-    assert_eq!(seen["spec"]["root_disk_gib"], 40, "the refusal still shrank it");
+    let seen = api
+        .get(&name("projects/p1/instances/web"), &who(ADA))
+        .await
+        .unwrap();
+    assert_eq!(
+        seen["spec"]["root_disk_gib"], 40,
+        "the refusal still shrank it"
+    );
     assert_eq!(seen["spec"]["flavor"], "flavors/m1-big");
 
     // Typing a size instead is what the policy closed.
@@ -3489,10 +3662,15 @@ async fn a_flavor_is_a_menu_the_cell_writes_and_a_tenant_orders_from() {
     )
     .await
     .expect("the provider hand-sizes");
-    let seen = api.get(&name("projects/p1/instances/web"), &who(OPERATOR)).await.unwrap();
+    let seen = api
+        .get(&name("projects/p1/instances/web"), &who(OPERATOR))
+        .await
+        .unwrap();
     assert_eq!(seen["spec"]["vcpus"], 5);
     assert!(
-        seen["spec"].get("flavor").is_none_or(serde_json::Value::is_null),
+        seen["spec"]
+            .get("flavor")
+            .is_none_or(serde_json::Value::is_null),
         "a hand-sized guest still wears the flavor's name: {:?}",
         seen["spec"]
     );

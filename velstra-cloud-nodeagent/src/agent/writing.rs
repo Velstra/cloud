@@ -87,8 +87,10 @@ impl Agent {
         // are minutes, the console prints ages in seconds. When anything
         // *else* in the status changed, the report carries a fresh heartbeat
         // with it for free.
-        let heartbeat_due =
-            Timestamp::now().0.saturating_sub(stored.status.last_heartbeat.0) >= 10_000;
+        let heartbeat_due = Timestamp::now()
+            .0
+            .saturating_sub(stored.status.last_heartbeat.0)
+            >= 10_000;
 
         let mut next = stored.clone();
         next.status.observed_generation = stored.meta.generation;
@@ -103,7 +105,10 @@ impl Agent {
         const MIB_WORTH_REPORTING: u64 = 256;
         if !heartbeat_due {
             let close = |a: u64, b: u64| a.abs_diff(b) < MIB_WORTH_REPORTING;
-            if close(next.status.capacity.memory_mib, stored.status.capacity.memory_mib) {
+            if close(
+                next.status.capacity.memory_mib,
+                stored.status.capacity.memory_mib,
+            ) {
                 next.status.capacity.memory_mib = stored.status.capacity.memory_mib;
             }
             if next.status.capacity.numa_free_mib.len()

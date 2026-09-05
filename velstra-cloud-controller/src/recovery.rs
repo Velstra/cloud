@@ -223,7 +223,7 @@ mod tests {
             NodeStatus {
                 shared_state: false,
                 vmm: "qemu".into(),
-            fetching: Vec::new(),
+                fetching: Vec::new(),
                 last_heartbeat: Timestamp(heard),
                 ..Default::default()
             },

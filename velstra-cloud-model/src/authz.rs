@@ -342,7 +342,10 @@ mod tests {
     fn somebody_with_no_binding_may_do_nothing() {
         let b = bindings(Role::Admin, "ada");
         for verb in [Verb::Read, Verb::Write, Verb::Administer] {
-            assert!(may("bob", &[], &b, verb, "instances", &[]).is_err(), "{verb:?}");
+            assert!(
+                may("bob", &[], &b, verb, "instances", &[]).is_err(),
+                "{verb:?}"
+            );
         }
     }
 
@@ -352,7 +355,15 @@ mod tests {
         // for enumerating other tenants' resources.
         let denied = may("bob", &[], &[], Verb::Read, "instances", &[]).unwrap_err();
         assert!(denied.0.contains("does not exist"), "{denied}");
-        let also = may("bob", &[], &bindings(Role::Admin, "ada"), Verb::Read, "instances", &[]).unwrap_err();
+        let also = may(
+            "bob",
+            &[],
+            &bindings(Role::Admin, "ada"),
+            Verb::Read,
+            "instances",
+            &[],
+        )
+        .unwrap_err();
         assert_eq!(denied, also, "the two refusals can be told apart");
     }
 
@@ -361,7 +372,17 @@ mod tests {
         // Anything else is a cell nobody can repair.
         let admins = vec!["ops".to_string()];
         assert!(may("ops", &admins, &[], Verb::Administer, "instances", &[]).is_ok());
-        assert!(may("ops", &admins, &bindings(Role::Viewer, "ada"), Verb::Write, "instances", &[]).is_ok());
+        assert!(
+            may(
+                "ops",
+                &admins,
+                &bindings(Role::Viewer, "ada"),
+                Verb::Write,
+                "instances",
+                &[]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -560,7 +581,14 @@ mod what_the_cell_keeps {
     fn a_tenants_own_collections_are_not_on_it() {
         // Filtering is right for these: an empty answer means "none of yours",
         // which is true and useful.
-        for kind in ["projects", "images", "instances", "volumes", "audit", "usage"] {
+        for kind in [
+            "projects",
+            "images",
+            "instances",
+            "volumes",
+            "audit",
+            "usage",
+        ] {
             assert!(!belongs_to_the_cell(kind), "{kind}");
         }
     }
@@ -590,7 +618,12 @@ mod what_the_cell_keeps {
         for kind in ["nodes", "pools", "backup-targets", "ceph-clusters"] {
             assert!(a_machine_may_read(kind), "{kind}");
         }
-        for kind in ["users", "image-sources", "device-classes", "maintenance-windows"] {
+        for kind in [
+            "users",
+            "image-sources",
+            "device-classes",
+            "maintenance-windows",
+        ] {
             assert!(!a_machine_may_read(kind), "{kind}");
         }
         // A tenant's own collections are not the cell's, and an agent reads
@@ -607,7 +640,6 @@ mod what_the_cell_keeps {
         }
     }
 }
-
 
 #[cfg(test)]
 mod a_role_the_cell_wrote_down {
@@ -657,7 +689,10 @@ mod a_role_the_cell_wrote_down {
         // Not convenience. A person who may start a guest and may not read it is
         // looking at a console that shows nothing and a button that works, which
         // is worse than either half on its own.
-        let defined = [role("roles/db-operator", &[(Verb::Operate, &["instances"])])];
+        let defined = [role(
+            "roles/db-operator",
+            &[(Verb::Operate, &["instances"])],
+        )];
         let bindings = held(Role::Custom("roles/db-operator".into()), "ada");
         assert!(may("ada", &[], &bindings, Verb::Read, "instances", &defined).is_ok());
         // Only where it may act, though. Read on everything is `viewer`.
@@ -671,7 +706,17 @@ mod a_role_the_cell_wrote_down {
         // change bindings quietly a role that can also read the estate.
         let defined = [role("roles/granter", &[(Verb::Administer, &["projects"])])];
         let bindings = held(Role::Custom("roles/granter".into()), "ada");
-        assert!(may("ada", &[], &bindings, Verb::Administer, "projects", &defined).is_ok());
+        assert!(
+            may(
+                "ada",
+                &[],
+                &bindings,
+                Verb::Administer,
+                "projects",
+                &defined
+            )
+            .is_ok()
+        );
         assert!(may("ada", &[], &bindings, Verb::Read, "projects", &defined).is_err());
     }
 

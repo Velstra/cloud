@@ -1181,7 +1181,7 @@ async fn two_nodes(h: &Harness) {
                 // that; the disk rule itself is tested in the model, where the
                 // node objects are built by hand.
                 shared_state: true,
-            fetching: Vec::new(),
+                fetching: Vec::new(),
                 pci_devices: Vec::new(),
                 cpu: Some(a_cpu()),
                 capacity: Capacity {
@@ -1195,7 +1195,10 @@ async fn two_nodes(h: &Harness) {
                 // Which nodes hold an image is worked out from these reports, so
                 // a node that has it says so itself.
                 images: if cached {
-                    vec!["sha256-9df3b1ed942629573eb17b71a0b34f560a183be8811bf770586815c6138da5f5".into()]
+                    vec![
+                        "sha256-9df3b1ed942629573eb17b71a0b34f560a183be8811bf770586815c6138da5f5"
+                            .into(),
+                    ]
                 } else {
                     vec![]
                 },
@@ -1274,7 +1277,9 @@ async fn running_guest(h: &Harness) -> String {
                     family: "debian-13".into(),
                     version: "20260815".into(),
                     source_instance: None,
-                    digest: "sha256:9df3b1ed942629573eb17b71a0b34f560a183be8811bf770586815c6138da5f5".into(),
+                    digest:
+                        "sha256:9df3b1ed942629573eb17b71a0b34f560a183be8811bf770586815c6138da5f5"
+                            .into(),
                     ..Default::default()
                 },
                 velstra_cloud_model::resources::ImageStatus::default(),
@@ -2095,8 +2100,15 @@ async fn a_volume_a_pool_cannot_hold_is_refused_at_the_door() {
             json!({ "id": "zu-gross", "spec": { "pool": "tight", "sizeGib": 5 } }),
         )
         .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
-    let why = refused.body["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let why = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
     assert!(why.contains("2 GiB left") && why.contains("5 GiB"), "{why}");
     assert_eq!(refused.body["error"]["field"], "spec.sizeGib");
 
@@ -4227,7 +4239,12 @@ async fn a_console_stream_is_opened_with_the_ticket_because_a_browser_has_no_hea
     // It gets as far as the handler and is turned away there for the one reason
     // a test client cannot avoid: this is not a real upgrade. That is the proof
     // it passed the door.
-    assert_eq!(answered.status, StatusCode::BAD_REQUEST, "{:?}", answered.body);
+    assert_eq!(
+        answered.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        answered.body
+    );
     assert!(
         answered.body["error"]["message"]
             .as_str()
@@ -4265,7 +4282,11 @@ async fn a_console_stream_is_opened_with_the_ticket_because_a_browser_has_no_hea
 
     // And the exemption is exactly this one verb: nothing else opens without a
     // header just because it carries a ticket in its query.
-    let elsewhere = format!("{name}?session={}&ticket={}", urlencode(session), urlencode(ticket));
+    let elsewhere = format!(
+        "{name}?session={}&ticket={}",
+        urlencode(session),
+        urlencode(ticket)
+    );
     assert_eq!(
         h.send_bare(&elsewhere).await.status,
         StatusCode::UNAUTHORIZED,
@@ -4385,8 +4406,7 @@ async fn a_port_no_guest_uses_is_not_waiting_for_anybody() {
     // And it has been seen by everybody who is ever going to see it, which is
     // what stops the console reading it as "nothing has looked at this".
     assert_eq!(
-        port.body["status"]["observedGeneration"],
-        port.body["meta"]["generation"],
+        port.body["status"]["observedGeneration"], port.body["meta"]["generation"],
         "{:?}",
         port.body["status"]
     );
@@ -4404,7 +4424,11 @@ async fn a_volume_with_no_pool_named_is_put_somewhere_rather_than_nowhere() {
     let h = Harness::new();
     let writer = writer();
     // Two accepting pools with different room, and one that is not accepting.
-    for (id, free, accepting) in [("small", 50u64, true), ("roomy", 500, true), ("closed", 900, false)] {
+    for (id, free, accepting) in [
+        ("small", 50u64, true),
+        ("roomy", 500, true),
+        ("closed", 900, false),
+    ] {
         let mut pool = velstra_cloud_model::resources::Pool::new(
             velstra_cloud_model::meta::Meta::new(
                 format!("pools/{id}").parse().unwrap(),
@@ -4425,14 +4449,22 @@ async fn a_volume_with_no_pool_named_is_put_somewhere_rather_than_nowhere() {
     }
 
     let made = h
-        .post("projects/p1/volumes", json!({ "id": "auto", "spec": { "sizeGib": 5 } }))
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "auto", "spec": { "sizeGib": 5 } }),
+        )
         .await;
     assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
 
     let stored = h.get("projects/p1/volumes/auto").await;
     // The accepting pool with the most room, written down — never the closed
     // one, however large, and never the empty string that provisions nothing.
-    assert_eq!(stored.body["spec"]["pool"], json!("roomy"), "{:?}", stored.body["spec"]);
+    assert_eq!(
+        stored.body["spec"]["pool"],
+        json!("roomy"),
+        "{:?}",
+        stored.body["spec"]
+    );
 }
 
 #[tokio::test]
@@ -4454,7 +4486,10 @@ async fn a_network_needs_no_number_from_the_person_asking_for_one() {
 
     let a = h.get("projects/p1/networks/a").await;
     let b = h.get("projects/p1/networks/b").await;
-    let (va, vb) = (a.body["spec"]["vni"].as_u64().unwrap(), b.body["spec"]["vni"].as_u64().unwrap());
+    let (va, vb) = (
+        a.body["spec"]["vni"].as_u64().unwrap(),
+        b.body["spec"]["vni"].as_u64().unwrap(),
+    );
     assert!(va >= 5000 && vb >= 5000, "{va} {vb}");
     assert_ne!(va, vb, "two networks were given the same VNI");
     // And an MTU that fits inside a VXLAN header rather than the wire's own,
@@ -4464,7 +4499,10 @@ async fn a_network_needs_no_number_from_the_person_asking_for_one() {
 
     // An operator who does want a specific number still gets it.
     let pinned = h
-        .post("projects/p1/networks", json!({ "id": "c", "spec": { "vni": 9001, "mtu": 9000 } }))
+        .post(
+            "projects/p1/networks",
+            json!({ "id": "c", "spec": { "vni": 9001, "mtu": 9000 } }),
+        )
         .await;
     assert_eq!(pinned.status, StatusCode::ACCEPTED, "{:?}", pinned.body);
     let c = h.get("projects/p1/networks/c").await;
@@ -4492,8 +4530,16 @@ async fn one_machine_is_one_request() {
     assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
 
     let guest = h.get("projects/p2/instances/erste").await;
-    let ports = guest.body["spec"]["ports"].as_array().cloned().unwrap_or_default();
-    assert_eq!(ports.len(), 1, "a guest was created with no wire: {:?}", guest.body["spec"]);
+    let ports = guest.body["spec"]["ports"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        ports.len(),
+        1,
+        "a guest was created with no wire: {:?}",
+        guest.body["spec"]
+    );
 
     // On this project's own default network, made for it — with an address
     // range nobody typed.
@@ -4502,8 +4548,12 @@ async fn one_machine_is_one_request() {
     let subnet = h.get("projects/p2/subnets/default").await;
     assert_eq!(subnet.status, StatusCode::OK, "{:?}", subnet.body);
     assert!(
-        subnet.body["spec"]["cidr"].as_str().unwrap_or_default().starts_with("10."),
-        "{:?}", subnet.body["spec"]
+        subnet.body["spec"]["cidr"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("10."),
+        "{:?}",
+        subnet.body["spec"]
     );
 
     // A second guest joins the first one's network rather than getting another,
@@ -4541,11 +4591,13 @@ async fn one_machine_is_one_request() {
     assert_eq!(alone.status, StatusCode::ACCEPTED, "{:?}", alone.body);
     let g = h.get("projects/p2/instances/allein").await;
     assert!(
-        g.body["spec"]["ports"].as_array().is_none_or(|p| p.is_empty()),
-        "{:?}", g.body["spec"]
+        g.body["spec"]["ports"]
+            .as_array()
+            .is_none_or(|p| p.is_empty()),
+        "{:?}",
+        g.body["spec"]
     );
 }
-
 
 /// Naming a subnet is naming a network more precisely, and with two subnets it
 /// is the only complete answer.
@@ -4593,7 +4645,10 @@ async fn a_guest_is_put_on_a_network_or_on_one_of_its_subnets() {
     let why = vague.body["error"]["message"].as_str().unwrap_or_default();
     assert!(why.contains("more than one subnet"), "{why}");
     assert!(why.contains("front") && why.contains("back"), "{why}");
-    assert!(why.contains("10.60.0.0/24"), "the ranges are not named: {why}");
+    assert!(
+        why.contains("10.60.0.0/24"),
+        "the ranges are not named: {why}"
+    );
     assert_eq!(vague.body["error"]["field"], "spec.networks");
 
     // The subnet is. Its network is the subnet's own — nobody names both.
@@ -4609,7 +4664,10 @@ async fn a_guest_is_put_on_a_network_or_on_one_of_its_subnets() {
         .await;
     assert_eq!(precise.status, StatusCode::ACCEPTED, "{:?}", precise.body);
     let guest = h.get("projects/p2/instances/genau").await;
-    let port = guest.body["spec"]["ports"][0].as_str().unwrap_or_default().to_string();
+    let port = guest.body["spec"]["ports"][0]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(!port.is_empty(), "{:?}", guest.body["spec"]);
     let p = h.get(&port).await;
     assert_eq!(p.body["spec"]["subnet"], "projects/p2/subnets/back");
@@ -4632,7 +4690,8 @@ async fn a_guest_is_put_on_a_network_or_on_one_of_its_subnets() {
             .as_str()
             .unwrap_or_default()
             .contains("no subnet called"),
-        "{:?}", ghost.body
+        "{:?}",
+        ghost.body
     );
 }
 
@@ -4653,7 +4712,12 @@ async fn a_backup_without_a_target_goes_to_the_cells_most_roomy_one() {
             json!({ "id": id, "spec": { "kind": "directory", "path": format!("/srv/{id}"), "accepting": true, "agent": "nvme" } }),
         )
         .await;
-        let mut t = h.backup_targets().get(&format!("backup-targets/{id}")).await.unwrap().unwrap();
+        let mut t = h
+            .backup_targets()
+            .get(&format!("backup-targets/{id}"))
+            .await
+            .unwrap()
+            .unwrap();
         t.status.writable = Some(true);
         t.status.free_gib = free;
         h.backup_targets()
@@ -4662,28 +4726,54 @@ async fn a_backup_without_a_target_goes_to_the_cells_most_roomy_one() {
             .unwrap();
     }
     let vol = h
-        .post("projects/p1/volumes", json!({ "id": "data", "spec": { "pool": "nvme", "sizeGib": 1 } }))
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data", "spec": { "pool": "nvme", "sizeGib": 1 } }),
+        )
         .await;
     assert_eq!(vol.status, StatusCode::ACCEPTED, "{:?}", vol.body);
 
     let made = h
-        .post("projects/p1/backups", json!({ "id": "b1", "spec": { "volume": "projects/p1/volumes/data" } }))
+        .post(
+            "projects/p1/backups",
+            json!({ "id": "b1", "spec": { "volume": "projects/p1/volumes/data" } }),
+        )
         .await;
     assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
     let stored = h.get("projects/p1/backups/b1").await;
-    assert_eq!(stored.body["spec"]["target"], "backup-targets/big", "{:?}", stored.body["spec"]);
+    assert_eq!(
+        stored.body["spec"]["target"], "backup-targets/big",
+        "{:?}",
+        stored.body["spec"]
+    );
 
     // A cell with nowhere to put a copy says so, with what an operator must do.
     let h2 = Harness::new();
     h2.pool("nvme").await;
-    h2.post("projects/p1/volumes", json!({ "id": "data", "spec": { "pool": "nvme", "sizeGib": 1 } })).await;
+    h2.post(
+        "projects/p1/volumes",
+        json!({ "id": "data", "spec": { "pool": "nvme", "sizeGib": 1 } }),
+    )
+    .await;
     let refused = h2
-        .post("projects/p1/backups", json!({ "id": "b1", "spec": { "volume": "projects/p1/volumes/data" } }))
+        .post(
+            "projects/p1/backups",
+            json!({ "id": "b1", "spec": { "volume": "projects/p1/volumes/data" } }),
+        )
         .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
     assert!(
-        refused.body["error"]["message"].as_str().unwrap_or_default().contains("nowhere in this cell takes backups"),
-        "{:?}", refused.body
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nowhere in this cell takes backups"),
+        "{:?}",
+        refused.body
     );
 }
 
@@ -4737,8 +4827,15 @@ async fn a_value_the_field_does_not_take_says_so_about_the_value() {
     let refused = h
         .patch("nodes/node-a", json!({ "spec": { "cpuBaseline": "V1" }}))
         .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
-    let message = refused.body["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
         message.contains("does not take that value"),
         "the refusal still blames the field: {message}"
@@ -4751,7 +4848,10 @@ async fn a_value_the_field_does_not_take_says_so_about_the_value() {
 
     // The spelling the platform itself uses is accepted.
     let ok = h
-        .patch("nodes/node-a", json!({ "spec": { "cpuBaseline": "x86-64-v2" }}))
+        .patch(
+            "nodes/node-a",
+            json!({ "spec": { "cpuBaseline": "x86-64-v2" }}),
+        )
         .await;
     assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
 
@@ -4760,7 +4860,9 @@ async fn a_value_the_field_does_not_take_says_so_about_the_value() {
     let missing = h
         .patch("nodes/node-a", json!({ "spec": { "gibtEsNicht": 3 }}))
         .await;
-    let message = missing.body["error"]["message"].as_str().unwrap_or_default();
+    let message = missing.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
         message.contains("no field called"),
         "an unknown field stopped saying so: {message}"

@@ -923,7 +923,11 @@ impl Api {
     /// the target, and the second is their own refusal. Everything else about
     /// the cell — who else was refused what — stays an operator's.
     async fn may_read(&self, who: &Identity, name: &ResourceName, document: &Value) -> bool {
-        if self.judge(who, Verb::Read, name, name.collection()).await.is_ok() {
+        if self
+            .judge(who, Verb::Read, name, name.collection())
+            .await
+            .is_ok()
+        {
             return true;
         }
         if name.collection() != "audit" {
@@ -958,7 +962,9 @@ impl Api {
     /// is everything and is said by `cellAdmin`.
     pub async fn project_roles(&self, who: &Identity) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
-        let Ok(projects) = self.typed_list::<ProjectSpec, ProjectStatus>("", "projects").await
+        let Ok(projects) = self
+            .typed_list::<ProjectSpec, ProjectStatus>("", "projects")
+            .await
         else {
             return out;
         };
@@ -1261,14 +1267,22 @@ impl Api {
     /// name would be a label, not a size. Stored with the name kept, so a
     /// person can see what was picked.
     async fn settle_flavor(&self, spec: &mut Value) -> ApiResult<()> {
-        let Some(named) = spec.get("flavor").and_then(Value::as_str).map(str::to_string) else {
+        let Some(named) = spec
+            .get("flavor")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
             return Ok(());
         };
         if named.is_empty() {
             spec.as_object_mut().map(|m| m.remove("flavor"));
             return Ok(());
         }
-        let full = if named.starts_with("flavors/") { named.clone() } else { format!("flavors/{named}") };
+        let full = if named.starts_with("flavors/") {
+            named.clone()
+        } else {
+            format!("flavors/{named}")
+        };
         let flavor: velstra_cloud_model::resources::Flavor = self
             .typed(&ResourceName::parse(&full).map_err(ApiError::from)?)
             .await
@@ -1301,7 +1315,11 @@ impl Api {
         if self.is_operator(who) {
             return Ok(());
         }
-        if spec.get("flavor").and_then(Value::as_str).is_some_and(|f| !f.is_empty()) {
+        if spec
+            .get("flavor")
+            .and_then(Value::as_str)
+            .is_some_and(|f| !f.is_empty())
+        {
             return Ok(());
         }
         if self.policy_of(project).await.custom_sizes {
@@ -1759,8 +1777,8 @@ impl Api {
                     .filter(|i| i.meta.name.to_string().starts_with(&format!("{parent}/")))
                     .collect()
             };
-            let chosen = velstra_cloud_model::resources::newest_of_family(mine, &family)
-                .or_else(|| {
+            let chosen =
+                velstra_cloud_model::resources::newest_of_family(mine, &family).or_else(|| {
                     let theirs: Vec<_> = images
                         .iter()
                         .filter(|i| !i.meta.name.to_string().starts_with("projects/"))
@@ -1792,7 +1810,10 @@ impl Api {
         }
         // The revision the underlying images were read at: a family is a view
         // of them, so a watcher resuming from here resumes from the right place.
-        let at = self.list_filtered("", "images", &Filter::none()).await?.revision;
+        let at = self
+            .list_filtered("", "images", &Filter::none())
+            .await?
+            .revision;
         Ok(Listing {
             items,
             revision: at,
@@ -2075,8 +2096,12 @@ impl Api {
             // quota counts vCPUs, the scheduler reads memory — and the
             // hand-sizing rule runs on the settled spec.
             self.settle_flavor(&mut spec).await?;
-            self.refuse_a_hand_sized_guest_without_leave(&spec, governing_project(&ResourceName::parse(parent).map_err(ApiError::from)?).as_deref(), who)
-                .await?;
+            self.refuse_a_hand_sized_guest_without_leave(
+                &spec,
+                governing_project(&ResourceName::parse(parent).map_err(ApiError::from)?).as_deref(),
+                who,
+            )
+            .await?;
         }
         // Before the shape check, not after: the bare spelling is a *spelling*
         // and not a malformed name, and `refs::check` cannot know that without
@@ -2116,7 +2141,10 @@ impl Api {
             self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
         }
         if matches!(kind, "instances" | "attachments")
-            && spec.get("node").and_then(Value::as_str).is_some_and(|n| !n.is_empty())
+            && spec
+                .get("node")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty())
             && !self.is_operator(who)
         {
             // The same rule the patch enforces, at birth: see there.
@@ -2269,11 +2297,7 @@ impl Api {
     /// into a file would otherwise take the agent down while fixing it — and it
     /// is why this is `issueCredential` rather than `rotateCredential`, which
     /// would be a name promising the other thing.
-    pub async fn issue_credential(
-        &self,
-        name: &ResourceName,
-        who: &Identity,
-    ) -> ApiResult<Value> {
+    pub async fn issue_credential(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
         let kind = name.collection();
         if kind != "nodes" && kind != "pools" {
             return Err(ApiError::invalid(format!(
@@ -2292,9 +2316,15 @@ impl Api {
         let mut body = Map::new();
         body.insert("target".into(), Value::String(name.to_string()));
         let (field, token) = if kind == "nodes" {
-            ("nodeToken", self.inner.identity.mint_node_credential(name.id()).await?)
+            (
+                "nodeToken",
+                self.inner.identity.mint_node_credential(name.id()).await?,
+            )
         } else {
-            ("poolToken", self.inner.identity.mint_pool_credential(name.id()).await?)
+            (
+                "poolToken",
+                self.inner.identity.mint_pool_credential(name.id()).await?,
+            )
         };
         body.insert(field.into(), Value::String(token));
         // No `operation`: nothing converges here. A create answers with one
@@ -2422,22 +2452,24 @@ impl Api {
                     // root disk that a typed number would have been refused
                     // for — the menu was a way round the one rule that
                     // protects bytes.
-                    self.refuse_a_smaller_disk(name, spec, who).await.map_err(|e| {
-                        let picked = spec
-                            .get("flavor")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        ApiError::new(
-                            e.code,
-                            format!(
-                                "{picked} comes with a smaller root disk than this guest has, \
+                    self.refuse_a_smaller_disk(name, spec, who)
+                        .await
+                        .map_err(|e| {
+                            let picked = spec
+                                .get("flavor")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            ApiError::new(
+                                e.code,
+                                format!(
+                                    "{picked} comes with a smaller root disk than this guest has, \
                                  and a disk is not shrunk: {}",
-                                e.message
-                            ),
-                        )
-                        .at("spec.flavor")
-                    })?;
+                                    e.message
+                                ),
+                            )
+                            .at("spec.flavor")
+                        })?;
                 } else if spec.get("vcpus").is_some()
                     || spec.get("memory_mib").is_some()
                     || spec.get("root_disk_gib").is_some()
@@ -2725,9 +2757,7 @@ impl Api {
                 // is a step the customer was deliberately spared at the other
                 // end. Found live, on the first machine created with a disk that
                 // somebody then tried to delete.
-                if document["meta"]["labels"]
-                    [velstra_cloud_model::resources::MINTED_FOR]
-                    .as_str()
+                if document["meta"]["labels"][velstra_cloud_model::resources::MINTED_FOR].as_str()
                     == Some(wanted.as_str())
                 {
                     continue;
@@ -2804,7 +2834,11 @@ impl Api {
         } else {
             let name = ResourceName::parse(parent).map_err(ApiError::from)?;
             self.authorize(who, Verb::Read, &name).await?;
-            if a_machine { Gate::Machine } else { Gate::Everything }
+            if a_machine {
+                Gate::Machine
+            } else {
+                Gate::Everything
+            }
         };
         let stream = self.watch_gated(parent, kind, from, filter, gate)?;
         // The same trimming a read gets, or the watch is the hole: the list
@@ -3126,18 +3160,18 @@ impl Api {
             .get("status")
             .and_then(|s| s.get("programmed"))
             .is_none()
-            || document.get("spec").and_then(|s| s.get("network")).is_none()
+            || document
+                .get("spec")
+                .and_then(|s| s.get("network"))
+                .is_none()
         {
             return Ok(());
         }
         let generation = document["meta"]["generation"].as_u64().unwrap_or(0);
         let node = document["status"]["node"].as_str().map(str::to_string);
         let programmed = document["status"]["programmed"].as_bool().unwrap_or(false);
-        let condition = velstra_cloud_model::resources::port_condition(
-            generation,
-            node.as_deref(),
-            programmed,
-        );
+        let condition =
+            velstra_cloud_model::resources::port_condition(generation, node.as_deref(), programmed);
         let mut conditions: Vec<velstra_cloud_model::Condition> =
             serde_json::from_value(document["status"]["conditions"].clone()).unwrap_or_default();
         set_condition(&mut conditions, condition);
@@ -3257,13 +3291,15 @@ impl Api {
             .and_then(velstra_cloud_model::images::stored_name)
             .unwrap_or_default();
         let nodes = scratch.nodes(self).await?;
-        document["status"]["cached_on"] =
-            json!(velstra_cloud_model::resources::nodes_holding(&stored, &nodes));
+        document["status"]["cached_on"] = json!(velstra_cloud_model::resources::nodes_holding(
+            &stored, &nodes
+        ));
         // And what is on its way. An image had two visible states — here or not
         // — while a gigabyte takes minutes to arrive, so "downloading" and
         // "stuck" looked identical to the person waiting.
-        document["status"]["fetching_on"] =
-            json!(velstra_cloud_model::resources::nodes_fetching(&stored, &nodes));
+        document["status"]["fetching_on"] = json!(velstra_cloud_model::resources::nodes_fetching(
+            &stored, &nodes
+        ));
         Ok(())
     }
 
@@ -3557,11 +3593,7 @@ impl Api {
     /// reference check downstream never sees `families/…` — which it would
     /// otherwise judge as a cell-wide resource and refuse with the wrong
     /// sentence.
-    async fn refuse_an_image_change(
-        &self,
-        name: &ResourceName,
-        spec: &mut Value,
-    ) -> ApiResult<()> {
+    async fn refuse_an_image_change(&self, name: &ResourceName, spec: &mut Value) -> ApiResult<()> {
         let Some(asked) = spec.get("image").and_then(Value::as_str) else {
             return Ok(());
         };
@@ -4494,7 +4526,11 @@ impl Api {
             era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
         };
         let start = Timestamp(days_from(year, month_no) as u64 * 86_400_000);
-        let (next_y, next_m) = if month_no == 12 { (year + 1, 1) } else { (year, month_no + 1) };
+        let (next_y, next_m) = if month_no == 12 {
+            (year + 1, 1)
+        } else {
+            (year, month_no + 1)
+        };
         let end = Timestamp(days_from(next_y, next_m) as u64 * 86_400_000);
 
         let records: Vec<velstra_cloud_model::resources::UsageRecord> =
@@ -4574,7 +4610,10 @@ impl Api {
         let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
         let _ = writeln!(out, "# TYPE velstra_pool_gib gauge");
         for p in &pools {
-            for (kind, v) in [("capacity", p.status.capacity_gib), ("allocated", p.status.allocated_gib)] {
+            for (kind, v) in [
+                ("capacity", p.status.capacity_gib),
+                ("allocated", p.status.allocated_gib),
+            ] {
                 let _ = writeln!(
                     out,
                     "velstra_pool_gib{{pool=\"{}\",kind=\"{kind}\"}} {v}",
@@ -4985,7 +5024,9 @@ impl Api {
                     )
                     .at("spec.networks"));
                 };
-                minted.push(Value::String(self.mint_a_port_on(guest, parent, network).await?));
+                minted.push(Value::String(
+                    self.mint_a_port_on(guest, parent, network).await?,
+                ));
             }
             spec["ports"] = Value::Array(minted);
             // Consumed: what gets stored is `ports`. Two fields describing one
@@ -5075,7 +5116,11 @@ impl Api {
         // both would be asking the same question twice and inviting them to
         // disagree.
         if asked.starts_with(&format!("{parent}/subnets/")) {
-            let Some(subnet) = subnets.iter().filter(alive).find(|s| s.meta.name.to_string() == asked) else {
+            let Some(subnet) = subnets
+                .iter()
+                .filter(alive)
+                .find(|s| s.meta.name.to_string() == asked)
+            else {
                 return Err(ApiError::new(
                     Code::FailedPrecondition,
                     format!("there is no subnet called `{asked}`"),
@@ -5083,7 +5128,12 @@ impl Api {
                 .at("spec.networks"));
             };
             return self
-                .port_on(guest, parent, &subnet.spec.network, &subnet.meta.name.to_string())
+                .port_on(
+                    guest,
+                    parent,
+                    &subnet.spec.network,
+                    &subnet.meta.name.to_string(),
+                )
                 .await;
         }
 
@@ -5159,7 +5209,6 @@ impl Api {
         network: &str,
         subnet: &str,
     ) -> ApiResult<String> {
-
         let port = format!("{parent}/ports/{}", minted("ports"));
         self.make_for(
             guest,
@@ -5192,15 +5241,14 @@ impl Api {
             return Ok(());
         };
         for (i, binding) in bindings.iter().enumerate() {
-            let named = binding.get("role").and_then(Value::as_str).unwrap_or_default();
+            let named = binding
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if !named.starts_with(CUSTOM_ROLE_PREFIX) {
                 continue;
             }
-            let known = self
-                .collection("roles")?
-                .get(named)
-                .await?
-                .is_some();
+            let known = self.collection("roles")?.get(named).await?.is_some();
             if !known {
                 return Err(ApiError::new(
                     Code::FailedPrecondition,
@@ -5269,9 +5317,7 @@ impl Api {
                     )
                     .at("spec.parent"));
                 }
-                if seen.contains(&step)
-                    || seen.len() >= velstra_cloud_model::hierarchy::MAX_DEPTH
-                {
+                if seen.contains(&step) || seen.len() >= velstra_cloud_model::hierarchy::MAX_DEPTH {
                     break;
                 }
                 seen.push(step.clone());
@@ -5320,24 +5366,22 @@ impl Api {
         };
         let name = ResourceName::parse(&from).map_err(ApiError::from)?;
         if name.collection() != "images" {
-            return Err(
-                ApiError::invalid("`from` names an image to publish, as in \
-                                   `projects/p1/images/sha256-3f9a2b`")
-                .at("spec.from"),
-            );
+            return Err(ApiError::invalid(
+                "`from` names an image to publish, as in \
+                                   `projects/p1/images/sha256-3f9a2b`",
+            )
+            .at("spec.from"));
         }
-        let Some(source) = self
-            .collection("images")?
-            .get(&from)
-            .await?
-            .and_then(|d| {
+        let Some(source) =
+            self.collection("images")?.get(&from).await?.and_then(|d| {
                 serde_json::from_value::<velstra_cloud_model::resources::Image>(d).ok()
             })
         else {
-            return Err(
-                ApiError::new(Code::FailedPrecondition, format!("there is no image called `{from}`"))
-                    .at("spec.from"),
-            );
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!("there is no image called `{from}`"),
+            )
+            .at("spec.from"));
         };
 
         // The model's spelling, not the wire's: by the time a spec reaches a
@@ -5386,7 +5430,9 @@ impl Api {
             .iter()
             .map(|n| n.spec.vni)
             .collect();
-        let vni = (FIRST_VNI..).find(|v| !taken.contains(v)).unwrap_or(FIRST_VNI);
+        let vni = (FIRST_VNI..)
+            .find(|v| !taken.contains(v))
+            .unwrap_or(FIRST_VNI);
         spec["vni"] = json!(vni);
         Ok(())
     }
@@ -5411,7 +5457,11 @@ impl Api {
             .unwrap_or_default()
             .to_string();
         if !named_instance.is_empty() {
-            if spec.get("port").and_then(Value::as_str).is_some_and(|p| !p.is_empty()) {
+            if spec
+                .get("port")
+                .and_then(Value::as_str)
+                .is_some_and(|p| !p.is_empty())
+            {
                 return Err(ApiError::invalid(
                     "name instance or name port, not both: they are two answers to one \
                      question, and picking one silently is how an address ends up in front \
@@ -5515,11 +5565,7 @@ impl Api {
         let chosen = pools
             .iter()
             .filter(|p| p.spec.accepting && p.meta.deleted_at.is_none())
-            .max_by_key(|p| {
-                p.status
-                    .capacity_gib
-                    .saturating_sub(p.status.allocated_gib)
-            });
+            .max_by_key(|p| p.status.capacity_gib.saturating_sub(p.status.allocated_gib));
         let Some(pool) = chosen else {
             return Err(ApiError::new(
                 Code::FailedPrecondition,
@@ -5648,8 +5694,7 @@ impl Api {
                         .iter()
                         .filter(|i| !i.meta.name.to_string().starts_with("projects/"))
                         .collect();
-                    velstra_cloud_model::resources::newest_of_family(theirs, &family)
-                        .cloned()
+                    velstra_cloud_model::resources::newest_of_family(theirs, &family).cloned()
                 })
         };
 

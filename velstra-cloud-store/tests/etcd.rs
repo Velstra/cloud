@@ -458,14 +458,25 @@ async fn compacting_keeps_the_objects_and_drops_the_history() {
     // An object with history: written, then rewritten.
     let before = store.revision().await.unwrap();
     let rev1 = store
-        .put(&key_for(cell, "instances", "i1"), b"v1".to_vec(), Expect::Absent)
+        .put(
+            &key_for(cell, "instances", "i1"),
+            b"v1".to_vec(),
+            Expect::Absent,
+        )
         .await
         .unwrap();
     store
         .put(
             &key_for(cell, "instances", "i1"),
             b"v2".to_vec(),
-            Expect::Revision(store.get(&key_for(cell, "instances", "i1")).await.unwrap().unwrap().revision),
+            Expect::Revision(
+                store
+                    .get(&key_for(cell, "instances", "i1"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+            ),
         )
         .await
         .unwrap();
@@ -474,7 +485,11 @@ async fn compacting_keeps_the_objects_and_drops_the_history() {
     store.compact(now).await.unwrap();
 
     // The object is whole; only the past is gone.
-    let read = store.get(&key_for(cell, "instances", "i1")).await.unwrap().unwrap();
+    let read = store
+        .get(&key_for(cell, "instances", "i1"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(read.value, b"v2");
 
     // Compacting a second time to the same point is not an error — another
@@ -488,13 +503,18 @@ async fn compacting_keeps_the_objects_and_drops_the_history() {
     // From *before* the first write: `rev1 + 1` is exactly the compaction
     // point and survives, so a watch from `rev1` is valid and rightly stays
     // open — which is what this test first asserted the opposite of.
-    let mut watch =
-        store.watch(&velstra_cloud_store::prefix_for(cell, "instances"), Some(before));
+    let mut watch = store.watch(
+        &velstra_cloud_store::prefix_for(cell, "instances"),
+        Some(before),
+    );
     let ended = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(_event) = watch.recv().await {}
     })
     .await;
-    assert!(ended.is_ok(), "a watch across the compaction neither ended nor erred");
+    assert!(
+        ended.is_ok(),
+        "a watch across the compaction neither ended nor erred"
+    );
 }
 
 /// A snapshot is written whole or not at all, and is a real etcd snapshot.
@@ -503,7 +523,11 @@ async fn a_snapshot_is_written_whole_and_restorable_in_shape() {
     let etcd = etcd_or_skip!();
     let store = etcd.store().await;
     store
-        .put(&key_for("cell-snap", "instances", "i1"), b"spec".to_vec(), Expect::Absent)
+        .put(
+            &key_for("cell-snap", "instances", "i1"),
+            b"spec".to_vec(),
+            Expect::Absent,
+        )
         .await
         .unwrap();
 
@@ -519,7 +543,11 @@ async fn a_snapshot_is_written_whole_and_restorable_in_shape() {
     // 16 (little-endian). Checking it is what tells "a snapshot" from "an
     // empty file the stream never filled".
     assert!(bytes.len() > 4096, "the snapshot is {} bytes", bytes.len());
-    assert_eq!(&bytes[16..20], &[0xED, 0xDA, 0x0C, 0xED], "not a bbolt database");
+    assert_eq!(
+        &bytes[16..20],
+        &[0xED, 0xDA, 0x0C, 0xED],
+        "not a bbolt database"
+    );
     // Nothing partial is left beside it.
     for entry in std::fs::read_dir(&dir).unwrap() {
         let name = entry.unwrap().file_name();

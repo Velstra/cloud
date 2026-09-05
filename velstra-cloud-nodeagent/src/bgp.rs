@@ -315,12 +315,14 @@ impl BgpSpeaker for FrrSpeaker {
         if current == rendered {
             return Ok(());
         }
-        tokio::fs::write(&self.config, rendered).await.map_err(|e| {
-            crate::host::HostError::failed(format!(
-                "could not write {}: {e}",
-                self.config.display()
-            ))
-        })?;
+        tokio::fs::write(&self.config, rendered)
+            .await
+            .map_err(|e| {
+                crate::host::HostError::failed(format!(
+                    "could not write {}: {e}",
+                    self.config.display()
+                ))
+            })?;
         // `reload`, not `restart`: FRR diffs the file against its running
         // state, so an unchanged neighbour keeps its session — a restart on
         // every prefix change would flap the very announcements this exists
@@ -341,9 +343,7 @@ impl BgpSpeaker for FrrSpeaker {
 
     async fn is_speaking(&self) -> bool {
         match tokio::fs::read_to_string(&self.config).await {
-            Ok(current) => {
-                current.starts_with(WRITTEN_BY_US) && current.contains("\nrouter bgp ")
-            }
+            Ok(current) => current.starts_with(WRITTEN_BY_US) && current.contains("\nrouter bgp "),
             Err(_) => false,
         }
     }
@@ -360,8 +360,9 @@ impl BgpSpeaker for FrrSpeaker {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|e| crate::host::HostError::failed(format!("bgp summary was not json: {e}")))?;
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+            crate::host::HostError::failed(format!("bgp summary was not json: {e}"))
+        })?;
         let mut peers = BTreeMap::new();
         // Both families: a v4 neighbour carrying the v6 family appears twice,
         // and `Established` on either is the session being up.
@@ -369,14 +370,19 @@ impl BgpSpeaker for FrrSpeaker {
             let Some(list) = parsed.get(family).and_then(|f| f.get("peers")) else {
                 continue;
             };
-            let Some(map) = list.as_object() else { continue };
+            let Some(map) = list.as_object() else {
+                continue;
+            };
             for (peer, p) in map {
                 let state = p
                     .get("state")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown")
                     .to_string();
-                let announced = p.get("pfxSnt").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let announced = p
+                    .get("pfxSnt")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 let entry: &mut PeerObservation = peers.entry(peer.clone()).or_default();
                 if entry.state != "Established" {
                     entry.state = state;
@@ -390,7 +396,6 @@ impl BgpSpeaker for FrrSpeaker {
 
 #[cfg(test)]
 mod what_the_cell_announces {
-    use super::*;
     use velstra_cloud_model::{
         meta::{Meta, Placement, ResourceName},
         resources::{
@@ -398,6 +403,8 @@ mod what_the_cell_announces {
             NetworkStatus, Resource, SubnetSpec, SubnetStatus,
         },
     };
+
+    use super::*;
 
     fn meta(name: &str) -> Meta {
         Meta::new(
@@ -421,7 +428,10 @@ mod what_the_cell_announces {
     }
 
     fn network(name: &str, external: bool) -> Network {
-        let spec = NetworkSpec { external, ..Default::default() };
+        let spec = NetworkSpec {
+            external,
+            ..Default::default()
+        };
         Resource::new(meta(name), spec, NetworkStatus::default())
     }
 
@@ -452,15 +462,25 @@ mod what_the_cell_announces {
     fn announcements_are_derived_not_listed() {
         let desired = desired_for(
             "gw-1",
-            &[peer("bgp-peers/edge", "gw-1"), peer("bgp-peers/other", "gw-2")],
-            &[network("networks/public", true), network("networks/lan", false)],
+            &[
+                peer("bgp-peers/edge", "gw-1"),
+                peer("bgp-peers/other", "gw-2"),
+            ],
+            &[
+                network("networks/public", true),
+                network("networks/lan", false),
+            ],
             &[
                 subnet("subnets/public-v4", "networks/public", "203.0.113.0/24"),
                 subnet("subnets/public-v6", "networks/public", "2001:db8:77::/64"),
                 subnet("subnets/lan", "networks/lan", "10.0.0.0/24"),
             ],
             &[
-                floating("projects/p1/floatingips/a", "203.0.113.7", "projects/p1/ports/x"),
+                floating(
+                    "projects/p1/floatingips/a",
+                    "203.0.113.7",
+                    "projects/p1/ports/x",
+                ),
                 // In front of nothing: a reservation, not a reachable address.
                 floating("projects/p1/floatingips/b", "203.0.113.8", ""),
             ],
@@ -481,7 +501,11 @@ mod what_the_cell_announces {
             "gw-1",
             &[peer("bgp-peers/edge", "gw-2")],
             &[network("networks/public", true)],
-            &[subnet("subnets/public-v4", "networks/public", "203.0.113.0/24")],
+            &[subnet(
+                "subnets/public-v4",
+                "networks/public",
+                "203.0.113.0/24",
+            )],
             &[],
         );
         assert!(desired.sessions.is_empty());
@@ -502,7 +526,11 @@ mod what_the_cell_announces {
             "horst",
             &[peer("bgp-peers/edge", "horst")],
             &[network("networks/public", true)],
-            &[subnet("subnets/public-v4", "networks/public", "203.0.113.0/24")],
+            &[subnet(
+                "subnets/public-v4",
+                "networks/public",
+                "203.0.113.0/24",
+            )],
             &[],
         ));
         assert!(conf.contains(&format!(" bgp router-id {a}")), "{conf}");
@@ -514,14 +542,23 @@ mod what_the_cell_announces {
         p.spec.password = Some("s3cret".into());
         p.spec.multihop = Some(3);
         let conf = render_frr(&desired_for("gw-1", &[p.clone()], &[], &[], &[]));
-        assert!(conf.contains(" neighbor 10.10.10.1 password s3cret"), "{conf}");
-        assert!(conf.contains(" neighbor 10.10.10.1 ebgp-multihop 3"), "{conf}");
+        assert!(
+            conf.contains(" neighbor 10.10.10.1 password s3cret"),
+            "{conf}"
+        );
+        assert!(
+            conf.contains(" neighbor 10.10.10.1 ebgp-multihop 3"),
+            "{conf}"
+        );
         // An empty password and a distance of one are the defaults spelled
         // out, and the defaults render as nothing.
         p.spec.password = Some(String::new());
         p.spec.multihop = Some(1);
         let conf = render_frr(&desired_for("gw-1", &[p], &[], &[], &[]));
-        assert!(!conf.contains("password") && !conf.contains("multihop"), "{conf}");
+        assert!(
+            !conf.contains("password") && !conf.contains("multihop"),
+            "{conf}"
+        );
     }
 
     #[test]
@@ -534,14 +571,24 @@ mod what_the_cell_announces {
                 subnet("subnets/public-v4", "networks/public", "203.0.113.0/24"),
                 subnet("subnets/public-v6", "networks/public", "2001:db8:77::/64"),
             ],
-            &[floating("projects/p1/floatingips/a", "203.0.113.7", "projects/p1/ports/x")],
+            &[floating(
+                "projects/p1/floatingips/a",
+                "203.0.113.7",
+                "projects/p1/ports/x",
+            )],
         );
         let conf = render_frr(&desired);
         assert!(conf.contains("router bgp 65010"), "{conf}");
         assert!(conf.contains(" no bgp ebgp-requires-policy"), "{conf}");
         assert!(conf.contains("ip route 203.0.113.0/24 blackhole"), "{conf}");
-        assert!(conf.contains("ipv6 route 2001:db8:77::/64 blackhole"), "{conf}");
-        assert!(conf.contains("neighbor 10.10.10.1 remote-as 65000"), "{conf}");
+        assert!(
+            conf.contains("ipv6 route 2001:db8:77::/64 blackhole"),
+            "{conf}"
+        );
+        assert!(
+            conf.contains("neighbor 10.10.10.1 remote-as 65000"),
+            "{conf}"
+        );
         assert!(conf.contains("  network 203.0.113.0/24"), "{conf}");
         assert!(conf.contains("  network 203.0.113.7/32"), "{conf}");
         assert!(conf.contains("  network 2001:db8:77::/64"), "{conf}");

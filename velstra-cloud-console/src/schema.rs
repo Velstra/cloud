@@ -1127,7 +1127,13 @@ const FLAVOR_FIELDS: &[Field] = &[
     Field {
         key: "vcpus",
         label: "vCPUs",
-        kind: Kind::Number { unit: "", min: 1, max: 256, step: 1, scale: Scale::None },
+        kind: Kind::Number {
+            unit: "",
+            min: 1,
+            max: 256,
+            step: 1,
+            scale: Scale::None,
+        },
         required: true,
         advanced: false,
         help: "",
@@ -1138,7 +1144,13 @@ const FLAVOR_FIELDS: &[Field] = &[
     Field {
         key: "memoryMib",
         label: "Memory",
-        kind: Kind::Number { unit: "MiB", min: 256, max: 4_194_304, step: 256, scale: Scale::Mib },
+        kind: Kind::Number {
+            unit: "MiB",
+            min: 256,
+            max: 4_194_304,
+            step: 256,
+            scale: Scale::Mib,
+        },
         required: true,
         advanced: false,
         help: "",
@@ -1149,7 +1161,13 @@ const FLAVOR_FIELDS: &[Field] = &[
     Field {
         key: "rootDiskGib",
         label: "Root disk",
-        kind: Kind::Number { unit: "GiB", min: 1, max: 65_536, step: 1, scale: Scale::None },
+        kind: Kind::Number {
+            unit: "GiB",
+            min: 1,
+            max: 65_536,
+            step: 1,
+            scale: Scale::None,
+        },
         required: true,
         advanced: false,
         help: "",
@@ -1160,7 +1178,10 @@ const FLAVOR_FIELDS: &[Field] = &[
     Field {
         key: "description",
         label: "Description",
-        kind: Kind::Text { placeholder: "burstable, for dev boxes", check: Check::None },
+        kind: Kind::Text {
+            placeholder: "burstable, for dev boxes",
+            check: Check::None,
+        },
         required: false,
         advanced: false,
         help: "One sentence for the picker. The numbers already say most of it.",
@@ -1174,7 +1195,10 @@ const BGP_PEER_FIELDS: &[Field] = &[
     Field {
         key: "peer",
         label: "Peer address",
-        kind: Kind::Text { placeholder: "10.10.10.1", check: Check::None },
+        kind: Kind::Text {
+            placeholder: "10.10.10.1",
+            check: Check::None,
+        },
         required: true,
         advanced: false,
         help: "The router or firewall in front of the cell.",
@@ -1185,7 +1209,13 @@ const BGP_PEER_FIELDS: &[Field] = &[
     Field {
         key: "peerAs",
         label: "Peer AS",
-        kind: Kind::Number { unit: "", min: 1, max: 4_294_967_295, step: 1, scale: Scale::None },
+        kind: Kind::Number {
+            unit: "",
+            min: 1,
+            max: 4_294_967_295,
+            step: 1,
+            scale: Scale::None,
+        },
         required: true,
         advanced: false,
         help: "",
@@ -1196,7 +1226,13 @@ const BGP_PEER_FIELDS: &[Field] = &[
     Field {
         key: "localAs",
         label: "Local AS",
-        kind: Kind::Number { unit: "", min: 1, max: 4_294_967_295, step: 1, scale: Scale::None },
+        kind: Kind::Number {
+            unit: "",
+            min: 1,
+            max: 4_294_967_295,
+            step: 1,
+            scale: Scale::None,
+        },
         required: true,
         advanced: false,
         help: "",
@@ -1207,7 +1243,11 @@ const BGP_PEER_FIELDS: &[Field] = &[
     Field {
         key: "node",
         label: "Speaks from",
-        kind: Kind::Ref { collection: "nodes", filter_by: None, spelling: Spelling::Id },
+        kind: Kind::Ref {
+            collection: "nodes",
+            filter_by: None,
+            spelling: Spelling::Id,
+        },
         required: true,
         advanced: false,
         help: "The machine that holds the session — a gateway, with FRR \
@@ -1219,7 +1259,10 @@ const BGP_PEER_FIELDS: &[Field] = &[
     Field {
         key: "password",
         label: "TCP-MD5 password",
-        kind: Kind::Text { placeholder: "", check: Check::None },
+        kind: Kind::Text {
+            placeholder: "",
+            check: Check::None,
+        },
         required: false,
         advanced: true,
         help: "The same string the router has for this session (RFC 2385). Most \
@@ -1231,7 +1274,13 @@ const BGP_PEER_FIELDS: &[Field] = &[
     Field {
         key: "multihop",
         label: "Hops to the peer",
-        kind: Kind::Number { unit: "", min: 1, max: 255, step: 1, scale: Scale::None },
+        kind: Kind::Number {
+            unit: "",
+            min: 1,
+            max: 255,
+            step: 1,
+            scale: Scale::None,
+        },
         required: false,
         advanced: true,
         help: "Only when the router is not on the same wire: eBGP refuses a \
@@ -1243,7 +1292,10 @@ const BGP_PEER_FIELDS: &[Field] = &[
     Field {
         key: "description",
         label: "Description",
-        kind: Kind::Text { placeholder: "edge firewall, rack 3", check: Check::None },
+        kind: Kind::Text {
+            placeholder: "edge firewall, rack 3",
+            check: Check::None,
+        },
         required: false,
         advanced: true,
         help: "",

@@ -845,4 +845,3 @@ mod reading_an_answer {
         assert_eq!(strip_terminator("  padded  \n"), "  padded  ");
     }
 }
-

@@ -210,10 +210,8 @@ impl velstra_cloud_nodeagent::CellReader for CountingCell {
     async fn instance(
         &self,
         name: &str,
-    ) -> Result<
-        Option<velstra_cloud_model::resources::Instance>,
-        velstra_cloud_nodeagent::HostError,
-    > {
+    ) -> Result<Option<velstra_cloud_model::resources::Instance>, velstra_cloud_nodeagent::HostError>
+    {
         Ok(self
             .instances()
             .await?
