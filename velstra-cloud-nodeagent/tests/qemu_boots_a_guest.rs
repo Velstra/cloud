@@ -18,7 +18,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use velstra_cloud_model::resources::InstanceState;
-use velstra_cloud_nodeagent::{Boot, Layout, QemuVmm, Scope, VmRequest, Vmm};
+use velstra_cloud_nodeagent::{Boot, Layout, QemuVmm, Scope, VmRequest, Vmm, hostfs};
 
 /// A raw disk image with a bootable guest on it, if this machine has one.
 ///
@@ -107,24 +107,36 @@ async fn a_stock_cloud_image_boots_and_says_so() {
     let vmm = QemuVmm::new(layout.clone());
 
     let instance = "projects/p1/instances/boot-1";
+    // Named by its digest, because that is the only name the platform can
+    // resolve: `hostfs::stored_as` turns the `sha256:` in an image's name into
+    // the file it was published as, and anything else — `…/images/alpine`, say
+    // — resolves to nothing at all. When it does, `create_disk` is handed no
+    // image and makes a blank one, the guest finds no bootloader, and the only
+    // evidence is a console that stays empty for sixty seconds. That is exactly
+    // what this test spent a week doing after images moved to digest naming.
+    let digest = hostfs::sha256_file(&image)
+        .await
+        .expect("the image can be hashed");
     let request = VmRequest {
         devices: Vec::new(),
         instance: instance.to_string(),
         vcpus: 1,
         memory_mib: 512,
-        image: "projects/p1/images/alpine".into(),
+        image: format!("projects/p1/images/sha256-{digest}"),
         root_disk_gib: 1,
         nics: vec![],
         cpu_baseline: None,
     };
 
-    // The image, published the way a pulled one is: under its slug in the
-    // image directory. From here on the platform does the work — the test does
-    // not put an operating system anywhere the guest can reach it.
+    // The image, published the way a pulled one is: under the name
+    // `hostfs::stored_as` gives it. From here on the platform does the work —
+    // the test does not put an operating system anywhere the guest can reach it.
     std::fs::create_dir_all(&layout.image_dir).expect("an image directory");
     std::fs::copy(
         &image,
-        layout.image_dir.join(request.image.replace('/', "~")),
+        layout
+            .image_dir
+            .join(hostfs::stored_as(&request.image).expect("the image is named by its digest")),
     )
     .expect("the published image");
 
@@ -146,6 +158,25 @@ async fn a_stock_cloud_image_boots_and_says_so() {
             .len()
             >= std::fs::metadata(&image).expect("the image").len(),
         "the disk is smaller than the image it is supposed to be a copy of"
+    );
+    // Size is not enough, and that is not a hypothetical: a disk created with
+    // no image is a full-sized hole of zeroes, larger than the image and
+    // bootable by nothing. Comparing the first sector says whether an operating
+    // system is on it here, where the answer is one line, instead of sixty
+    // seconds later as an empty console.
+    let head = |path: &std::path::Path| -> Vec<u8> {
+        use std::io::Read;
+        let mut buffer = vec![0u8; 512];
+        std::fs::File::open(path)
+            .expect("the file is there")
+            .read_exact(&mut buffer)
+            .expect("512 bytes");
+        buffer
+    };
+    assert_eq!(
+        head(&layout.disk(instance)),
+        head(&image),
+        "the disk does not start with the image's boot sector, so nothing on it will boot"
     );
 
     vmm.start(&request).await.expect("qemu starts");
