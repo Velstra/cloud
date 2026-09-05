@@ -1602,7 +1602,10 @@ mod tests {
         let a = node("node-a", 16384, "0.1.0");
         let b = node("node-b", 16384, "0.1.0");
         assert!(a.status.shared_state && b.status.shared_state);
-        assert_eq!(may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live), Ok(()));
+        assert_eq!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live),
+            Ok(())
+        );
     }
     #[test]
     fn two_machines_with_different_processors_may_hand_a_guest_back_and_forth() {

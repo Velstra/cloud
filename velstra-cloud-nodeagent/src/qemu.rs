@@ -919,7 +919,7 @@ fn cpu_arg(request: &VmRequest) -> String {
 /// Missing `qemu-system-*` answers `false`, which is the closed direction: a
 /// node that cannot be asked cannot be shown able.
 async fn presents_levels(binary: &str) -> bool {
-        let Ok(out) = tokio::process::Command::new(binary)
+    let Ok(out) = tokio::process::Command::new(binary)
         .args(["-cpu", "help"])
         .output()
         .await

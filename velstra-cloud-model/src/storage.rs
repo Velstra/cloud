@@ -477,8 +477,7 @@ pub fn may_create_volume(
         // instance's root disk crosses this line on every create already; a
         // volume asked for by hand was refused the same bytes for no reason a
         // sentence could defend. Snapshots and project images keep the rule.
-        let published_catalogue =
-            named.collection() == "images" && named.project().is_none();
+        let published_catalogue = named.collection() == "images" && named.project().is_none();
         if named.project() != project && !published_catalogue {
             return Err(Refusal::AnotherProject {
                 origin: source.to_string(),

@@ -507,9 +507,15 @@ mod tests {
 
         // A dedicated group with room to spare: free plus mine.
         let free = 100u64 << 30;
-        assert_eq!(usable_capacity_gib(free, [20, 5].into_iter(), [2].into_iter()), 127);
+        assert_eq!(
+            usable_capacity_gib(free, [20, 5].into_iter(), [2].into_iter()),
+            127
+        );
 
         // A group full of foreign volumes and none of ours holds nothing for us.
-        assert_eq!(usable_capacity_gib(0, std::iter::empty(), std::iter::empty()), 0);
+        assert_eq!(
+            usable_capacity_gib(0, std::iter::empty(), std::iter::empty()),
+            0
+        );
     }
 }

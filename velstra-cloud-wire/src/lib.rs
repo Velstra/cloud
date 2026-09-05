@@ -236,7 +236,7 @@ mod tests {
             NodeStatus {
                 shared_state: false,
                 vmm: "qemu".into(),
-            fetching: Vec::new(),
+                fetching: Vec::new(),
                 pci_devices: Vec::new(),
                 cpu: None,
                 observed_generation: 3,

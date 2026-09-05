@@ -105,8 +105,7 @@ impl OperationsController {
         // time because for a port it depends on whether it is in use. Left out,
         // an operation that created a spare port never finished: found on a real
         // cell, on the first two entries of its attention list.
-        if name.collection() == "ports"
-            && peek.spec.node.as_deref().unwrap_or_default().is_empty()
+        if name.collection() == "ports" && peek.spec.node.as_deref().unwrap_or_default().is_empty()
         {
             return Ok(TargetView::Unwatched);
         }

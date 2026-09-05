@@ -715,9 +715,7 @@ pub fn next_step(spec: &CephClusterSpec, observed: &CephObserved) -> CephStep {
             // the platform's taste may be taken when the spec says so for it.
             // `waivable` never contains a mounted disk or one with data, so
             // the flag cannot reach those.
-            Some(state)
-                if osd.even_if_unsuitable && state.waivable.contains(&osd.device) =>
-            {
+            Some(state) if osd.even_if_unsuitable && state.waivable.contains(&osd.device) => {
                 return CephStep::AddOsd {
                     node: osd.node.clone(),
                     device: osd.device.clone(),
@@ -852,8 +850,7 @@ pub fn observe_at(nodes: &[crate::resources::Node], now: crate::meta::Timestamp)
                     .devices
                     .iter()
                     .filter(|d| {
-                        matches!(d.state, DeviceUse::Unsuitable { .. })
-                            && d.size_gib >= MIN_OSD_GIB
+                        matches!(d.state, DeviceUse::Unsuitable { .. }) && d.size_gib >= MIN_OSD_GIB
                     })
                     .map(|d| d.path.clone())
                     .collect(),
@@ -1324,7 +1321,7 @@ mod tests {
                 NodeStatus {
                     shared_state: false,
                     vmm: "qemu".into(),
-            fetching: Vec::new(),
+                    fetching: Vec::new(),
                     last_heartbeat: Timestamp(beat),
                     ..NodeStatus::default()
                 },
@@ -1444,7 +1441,9 @@ mod tests {
         // The disk stopped being consumable because the platform dislikes it —
         // removable — which is exactly what the flag waives.
         observed.nodes[0].consumable.clear();
-        observed.nodes[0].waivable.push("/dev/disk/by-id/one".into());
+        observed.nodes[0]
+            .waivable
+            .push("/dev/disk/by-id/one".into());
         assert_eq!(
             next_step(&spec, &observed),
             CephStep::AddOsd {
