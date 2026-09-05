@@ -24,7 +24,7 @@
 //! fails when the two drift, so a change to the surface is a change to the
 //! document in the same commit.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use velstra_cloud_console::{Check, Collection, Field, Kind, Scope};
 
 /// The document, as JSON.
@@ -452,8 +452,7 @@ const VERBS: &[Verb] = &[
         verb: "console",
         method: "post",
         on_collection: false,
-        summary:
-            "Open a console session to the guest; the answer names the session and its ticket.",
+        summary: "Open a console session to the guest; the answer names the session and its ticket.",
         query: &[],
     },
     Verb {
@@ -542,8 +541,7 @@ const VERBS: &[Verb] = &[
         verb: "reportStatus",
         method: "post",
         on_collection: false,
-        summary:
-            "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
+        summary: "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
         query: &[],
     },
     Verb {
@@ -551,8 +549,7 @@ const VERBS: &[Verb] = &[
         verb: "reportStatus",
         method: "post",
         on_collection: false,
-        summary:
-            "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
+        summary: "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
         query: &[],
     },
     Verb {
@@ -560,8 +557,7 @@ const VERBS: &[Verb] = &[
         verb: "reportStatus",
         method: "post",
         on_collection: false,
-        summary:
-            "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
+        summary: "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
         query: &[],
     },
     Verb {
@@ -569,8 +565,7 @@ const VERBS: &[Verb] = &[
         verb: "reportStatus",
         method: "post",
         on_collection: false,
-        summary:
-            "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
+        summary: "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
         query: &[],
     },
     Verb {
@@ -578,8 +573,7 @@ const VERBS: &[Verb] = &[
         verb: "reportStatus",
         method: "post",
         on_collection: false,
-        summary:
-            "The machine's own report. A node identity only; `If-Match` carries the revision read.",
+        summary: "The machine's own report. A node identity only; `If-Match` carries the revision read.",
         query: &[],
     },
 ];
@@ -795,9 +789,11 @@ mod tests {
     #[test]
     fn a_project_scoped_collection_sits_under_its_project() {
         let doc = document();
-        assert!(doc["paths"]
-            .get("/api/v1/projects/{project}/instances/{name}")
-            .is_some());
+        assert!(
+            doc["paths"]
+                .get("/api/v1/projects/{project}/instances/{name}")
+                .is_some()
+        );
         assert!(doc["paths"].get("/api/v1/nodes/{name}").is_some());
         assert!(doc["paths"].get("/api/v1/projects/{name}").is_some());
     }
@@ -838,9 +834,11 @@ mod tests {
             doc["paths"]["/api/v1/sessions"]["post"]["security"],
             json!([])
         );
-        assert!(doc["paths"]["/api/v1/nodes"]["get"]
-            .get("security")
-            .is_none());
+        assert!(
+            doc["paths"]["/api/v1/nodes"]["get"]
+                .get("security")
+                .is_none()
+        );
         assert_eq!(doc["security"], json!([{ "bearer": [] }]));
     }
 

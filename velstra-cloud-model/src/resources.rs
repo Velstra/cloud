@@ -128,8 +128,7 @@ pub type Capture = Resource<crate::capture::CaptureSpec, crate::capture::Capture
 pub type UsageRecord = Resource<crate::usage::UsageRecordSpec, crate::usage::UsageRecordStatus>;
 pub type ConsoleSession =
     Resource<crate::console::ConsoleSessionSpec, crate::console::ConsoleSessionStatus>;
-pub type ImageSource =
-    Resource<crate::images::ImageSourceSpec, crate::images::ImageSourceStatus>;
+pub type ImageSource = Resource<crate::images::ImageSourceSpec, crate::images::ImageSourceStatus>;
 
 impl Observed for crate::capture::CaptureStatus {
     fn observed_generation(&self) -> u64 {

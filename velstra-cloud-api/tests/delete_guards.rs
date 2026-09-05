@@ -229,13 +229,8 @@ async fn a_project_is_not_held_by_the_readings_taken_of_it() {
     // its own retention rather than with this.
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
-    let api = Api::new(
-        store.clone(),
-        "eu-central",
-        "cell-1",
-        verifier,
-    )
-    .with_cell_admins(vec![OPS.to_string()]);
+    let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+        .with_cell_admins(vec![OPS.to_string()]);
 
     api.create(
         "",
@@ -339,13 +334,9 @@ async fn a_machine_with_a_disk_can_be_deleted() {
     .await
     .expect("the platform attaches the disk");
 
-    api.delete(
-        &name("projects/p1/instances/db"),
-        None,
-        &who(),
-    )
-    .await
-    .expect("a machine with a disk the platform attached can be deleted");
+    api.delete(&name("projects/p1/instances/db"), None, &who())
+        .await
+        .expect("a machine with a disk the platform attached can be deleted");
 }
 
 #[tokio::test]

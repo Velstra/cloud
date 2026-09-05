@@ -373,7 +373,7 @@ mod tests {
                 ticket_sha256: sha256_hex(ticket),
                 expires_at: Timestamp(Timestamp::now().0 + TICKET_LIFETIME_MS),
                 kind: velstra_cloud_model::console::ConsoleKind::Serial,
-            read_only,
+                read_only,
             },
             ConsoleSessionStatus::default(),
         )

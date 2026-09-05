@@ -597,7 +597,10 @@ async fn a_cold_move_stops_the_guest_here_and_starts_it_there() {
 
     // The source stops it, and lets go by the same path every mode uses.
     cell.source.resync().await;
-    assert!(!cell.source_vmm.is_running(I1), "the guest is still running on the source");
+    assert!(
+        !cell.source_vmm.is_running(I1),
+        "the guest is still running on the source"
+    );
     let instance = read_instance(&cell.store, I1).await;
     assert_eq!(
         instance.status.node, None,
@@ -612,7 +615,10 @@ async fn a_cold_move_stops_the_guest_here_and_starts_it_there() {
     next.spec.node = Some(DESTINATION.to_string());
     next.meta.generation += 1;
     instances(&cell.store)
-        .update(&next, &velstra_cloud_model::access::Writer::controller("test"))
+        .update(
+            &next,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 
@@ -642,7 +648,10 @@ async fn a_cold_move_does_not_start_a_second_copy_while_the_source_still_has_one
     for _ in 0..4 {
         cell.destination.resync().await;
     }
-    assert!(cell.source_vmm.is_running(I1), "the source lost the guest to nobody");
+    assert!(
+        cell.source_vmm.is_running(I1),
+        "the source lost the guest to nobody"
+    );
     assert!(
         !cell.destination_vmm.is_running(I1),
         "the destination started a second copy of a guest that is still running on the source"
@@ -686,11 +695,7 @@ async fn a_cold_move_that_is_abandoned_leaves_the_guest_to_the_source() {
 /// never drains.
 #[tokio::test]
 async fn a_guest_that_ignores_the_power_button_is_asked_once_and_then_taken_down() {
-    let cell = two_nodes_in(
-        MigrationMode::Reboot,
-        MigrationStatus::default(),
-    )
-    .await;
+    let cell = two_nodes_in(MigrationMode::Reboot, MigrationStatus::default()).await;
     cell.source_vmm.deafen(I1);
 
     // Several passes, and the guest goes on running: it was asked and it is
@@ -698,7 +703,10 @@ async fn a_guest_that_ignores_the_power_button_is_asked_once_and_then_taken_down
     for _ in 0..5 {
         cell.source.resync().await;
     }
-    assert!(cell.source_vmm.is_running(I1), "the deaf guest went down by itself");
+    assert!(
+        cell.source_vmm.is_running(I1),
+        "the deaf guest went down by itself"
+    );
     assert!(
         !cell.source_vmm.was_killed(I1),
         "the wait was never given: the guest's plug was pulled straight away"
@@ -741,7 +749,10 @@ async fn a_cold_move_takes_the_sources_tap_and_hands_the_port_over() {
     next.spec.node = Some(DESTINATION.to_string());
     next.meta.generation += 1;
     instances(&cell.store)
-        .update(&next, &velstra_cloud_model::access::Writer::controller("test"))
+        .update(
+            &next,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
     cell.destination.resync().await;
@@ -779,7 +790,10 @@ async fn a_cold_move_takes_the_sources_tap_and_hands_the_port_over() {
     reassigned.spec.node = Some(DESTINATION.to_string());
     reassigned.meta.generation += 1;
     ports(&cell.store)
-        .update(&reassigned, &velstra_cloud_model::access::Writer::controller("test"))
+        .update(
+            &reassigned,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
         .await
         .unwrap();
 
@@ -787,6 +801,11 @@ async fn a_cold_move_takes_the_sources_tap_and_hands_the_port_over() {
     cell.destination.resync().await;
     cell.destination.resync().await;
     let port = read_port(&cell.store, PORT_A).await;
-    assert_eq!(port.status.node.as_deref(), Some(DESTINATION), "{:?}", port.status);
+    assert_eq!(
+        port.status.node.as_deref(),
+        Some(DESTINATION),
+        "{:?}",
+        port.status
+    );
     assert!(port.status.programmed, "{:?}", port.status);
 }

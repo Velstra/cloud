@@ -163,7 +163,10 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         cell: "cell-1".into(),
         roles: vec![Role::ControlPlane, Role::Hypervisor, Role::Pool],
         api_url: if tls.is_some() {
-            format!("https://localhost:{}", listen.rsplit(':').next().unwrap_or("8443"))
+            format!(
+                "https://localhost:{}",
+                listen.rsplit(':').next().unwrap_or("8443")
+            )
         } else {
             "http://127.0.0.1:8443".into()
         },
@@ -211,7 +214,9 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     match crate::setup::settle_etcd() {
         Ok(true) => say("gave etcd room to keep working"),
         Ok(false) => {}
-        Err(e) => say(&format!("could not configure etcd ({e}); its defaults will do for now")),
+        Err(e) => say(&format!(
+            "could not configure etcd ({e}); its defaults will do for now"
+        )),
     }
     enable(&["etcd", "velstra-cloud-api", "velstra-cloud-controller"])?;
     say("brought up etcd and the control plane");
@@ -232,7 +237,10 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     enable(&["velstra-cloud-nodeagent", "velstra-cloud-poolagent"])?;
     say("brought up the node and pool agents");
 
-    println!("\nDone. The console is at {}", browsable(&listen, tls.is_some()));
+    println!(
+        "\nDone. The console is at {}",
+        browsable(&listen, tls.is_some())
+    );
     if let Some(cert) = &tls {
         // Printed once, here, on the machine's own console. A browser will warn
         // about this certificate — correctly, because nobody it trusts signed it
@@ -245,8 +253,14 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         println!();
         println!("  {}", cert.fingerprint);
         println!();
-        println!("To use a real certificate instead, put it at {} and its", cert.cert.display());
-        println!("key at {}, then restart velstra-cloud-api.", cert.key.display());
+        println!(
+            "To use a real certificate instead, put it at {} and its",
+            cert.cert.display()
+        );
+        println!(
+            "key at {}, then restart velstra-cloud-api.",
+            cert.key.display()
+        );
     }
     // Not "the password you just chose": on an unattended run nobody chose
     // anything here, and a closing line that describes a conversation that did

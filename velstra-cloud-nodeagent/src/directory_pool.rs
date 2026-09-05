@@ -295,8 +295,8 @@ impl Storage for DirectoryPool {
         // scheduler subtracts an allocation from lands back on the free space —
         // the same accounting the LVM pool does, for the same reason: the
         // filesystem may not be this pool's alone.
-        let mine_gib: u64 = volumes.values().sum::<u64>()
-            + snapshots.values().map(|s| s.gib).sum::<u64>();
+        let mine_gib: u64 =
+            volumes.values().sum::<u64>() + snapshots.values().map(|s| s.gib).sum::<u64>();
         Ok(PoolState {
             volumes,
             capacity_gib: self.available_gib().await? + mine_gib,

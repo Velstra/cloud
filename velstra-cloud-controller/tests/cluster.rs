@@ -109,10 +109,7 @@ impl Cell {
     }
 
     fn attachment(&self) -> AttachmentController {
-        AttachmentController::new(
-            self.attachments.clone(),
-            self.volumes.clone(),
-        )
+        AttachmentController::new(self.attachments.clone(), self.volumes.clone())
     }
 
     /// Every controller, once, in the order a process would start them.
@@ -452,11 +449,24 @@ impl Store for DiesAfter {
         value: Vec<u8>,
         expect: Expect,
     ) -> velstra_cloud_store::Result<Revision> {
-        if self
-            .left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_err()
-        {
+        // One write fewer, and refuse when there are none left. Spelled as the
+        // compare-and-swap it is rather than `fetch_update`, which rustc 1.98
+        // deprecated in favour of `try_update` — a name that does not exist in
+        // the 1.85 this workspace says it builds on.
+        let mut left = self.left.load(Ordering::SeqCst);
+        let taken = loop {
+            let Some(next) = left.checked_sub(1) else {
+                break false;
+            };
+            match self
+                .left
+                .compare_exchange_weak(left, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break true,
+                Err(seen) => left = seen,
+            }
+        };
+        if !taken {
             return Err(velstra_cloud_store::StoreError::Backend(
                 "the controller died here".into(),
             ));

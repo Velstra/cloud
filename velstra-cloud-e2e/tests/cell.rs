@@ -50,7 +50,8 @@ const CELL: &str = "cell-1";
 /// The image every instance in this file boots from.
 const IMAGE: &str = "projects/p1/images/sha256-abc";
 /// What the bytes behind it are filed under, which is a different question.
-const IMAGE_DIGEST: &str = "sha256:17bfebfb2d61335a30fb1119cc9894ed15605293c627cf8428f28864a832bf5a";
+const IMAGE_DIGEST: &str =
+    "sha256:17bfebfb2d61335a30fb1119cc9894ed15605293c627cf8428f28864a832bf5a";
 const TOKEN: &str = "e2e-token";
 
 /// Everything a cell is made of, sharing one store — which is the point: there

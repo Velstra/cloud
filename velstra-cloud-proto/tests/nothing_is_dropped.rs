@@ -854,7 +854,7 @@ whole_object_survives!(
     resources::NodeStatus {
         shared_state: false,
         vmm: "qemu".into(),
-            fetching: Vec::new(),
+        fetching: Vec::new(),
         pci_devices: Vec::new(),
         cpu: None,
         console_endpoint: "10.0.0.7:8447".into(),
@@ -1007,7 +1007,7 @@ whole_object_survives!(
     v1::FloatingIp,
     resources::FloatingIpSpec {
         instance: String::new(),
-            subnet: "projects/p1/subnets/s1".into(),
+        subnet: "projects/p1/subnets/s1".into(),
         // Present, not `None`: an absent address is the *default*, and a
         // round-trip of the default proves only that nothing was written.
         address: Some("203.0.113.7".into()),
@@ -1101,7 +1101,7 @@ whole_object_survives!(
         desired_state: resources::DesiredState::Stopped,
         ports: vec!["projects/p1/ports/port-a".into()],
         networks: vec!["projects/p1/networks/prod".to_string()],
-    volumes: vec!["projects/p1/volumes/data".to_string()],
+        volumes: vec!["projects/p1/volumes/data".to_string()],
         ssh_keys: vec!["ssh-ed25519 AAAA".into()],
         user_data: Some("#cloud-config".into()),
         node: Some("node-a".into()),

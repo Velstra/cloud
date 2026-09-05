@@ -228,7 +228,10 @@ async fn mint_service_token(
         .at("id"));
     }
     let purpose = body.map(|Json(b)| b.purpose).unwrap_or_default();
-    let token = api.identity().mint_service_credential(&id, &purpose).await?;
+    let token = api
+        .identity()
+        .mint_service_credential(&id, &purpose)
+        .await?;
     // Once. The platform keeps a digest and cannot show it again — which is
     // said here rather than left to be discovered.
     Ok(Json(serde_json::json!({
@@ -246,7 +249,10 @@ async fn metrics(
     let body = api.metrics(&who).await?;
     Ok((
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         body,
     )
         .into_response())

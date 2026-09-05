@@ -27,8 +27,8 @@
 
 use tracing::info;
 use velstra_cloud_model::{
-    access::Writer,
     Resource,
+    access::Writer,
     meta::{Meta, ResourceName},
     resources::{
         Attachment, AttachmentSpec, AttachmentStatus, Instance, InstanceSpec, InstanceStatus,
@@ -70,12 +70,7 @@ impl DiskController {
 pub fn attachment_name(instance: &str, volume: &str) -> Option<String> {
     let i = ResourceName::parse(instance).ok()?;
     let v = ResourceName::parse(volume).ok()?;
-    Some(format!(
-        "{}/attachments/{}-{}",
-        i.parent()?,
-        i.id(),
-        v.id()
-    ))
+    Some(format!("{}/attachments/{}-{}", i.parent()?, i.id(), v.id()))
 }
 
 impl DiskController {
@@ -226,7 +221,11 @@ impl Reconciler for DiskController {
                 },
                 AttachmentStatus::default(),
             );
-            match self.attachments.create(&asked, &Writer::controller(WHO)).await {
+            match self
+                .attachments
+                .create(&asked, &Writer::controller(WHO))
+                .await
+            {
                 Ok(_) => info!(
                     instance = name,
                     volume = %volume,
@@ -467,15 +466,16 @@ pub mod tests {
         assert!(
             live.is_empty(),
             "a guest being torn down kept its disks, which is the deadlock: {:?}",
-            live.iter().map(|a| a.meta.name.to_string()).collect::<Vec<_>>()
+            live.iter()
+                .map(|a| a.meta.name.to_string())
+                .collect::<Vec<_>>()
         );
     }
 }
 
 #[cfg(test)]
 mod when_the_guest_is_gone {
-    use super::tests::*;
-    use super::*;
+    use super::{tests::*, *};
 
     #[tokio::test]
     async fn its_disks_go_with_it() {
@@ -501,7 +501,9 @@ mod when_the_guest_is_gone {
         assert!(
             live.is_empty(),
             "a deleted guest left its disks attached: {:?}",
-            live.iter().map(|a| a.meta.name.to_string()).collect::<Vec<_>>()
+            live.iter()
+                .map(|a| a.meta.name.to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -537,8 +539,7 @@ mod when_the_guest_is_gone {
 
 #[cfg(test)]
 mod the_ones_nobody_witnessed {
-    use super::tests::*;
-    use super::*;
+    use super::{tests::*, *};
 
     #[tokio::test]
     async fn an_attachment_whose_guest_vanished_unnoticed_is_still_collected() {
@@ -572,7 +573,9 @@ mod the_ones_nobody_witnessed {
         assert!(
             live.is_empty(),
             "an abandoned attachment survived a sweep: {:?}",
-            live.iter().map(|a| a.meta.name.to_string()).collect::<Vec<_>>()
+            live.iter()
+                .map(|a| a.meta.name.to_string())
+                .collect::<Vec<_>>()
         );
     }
 }

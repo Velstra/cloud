@@ -274,7 +274,7 @@ mod tests {
             status: NodeStatus {
                 shared_state: false,
                 vmm: "qemu".into(),
-            fetching: Vec::new(),
+                fetching: Vec::new(),
                 ceph,
                 // Reporting now: these tests are about what a cluster's status
                 // says, not about who is up, and the liveness rule has its own

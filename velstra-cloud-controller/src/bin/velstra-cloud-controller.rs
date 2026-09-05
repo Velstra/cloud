@@ -100,12 +100,20 @@ struct Args {
     alert_mail_to: Vec<String>,
 
     /// The sender an alert mail carries.
-    #[arg(long, env = "VELSTRA_ALERT_MAIL_FROM", default_value = "velstra-cloud@localhost")]
+    #[arg(
+        long,
+        env = "VELSTRA_ALERT_MAIL_FROM",
+        default_value = "velstra-cloud@localhost"
+    )]
     alert_mail_from: String,
 
     /// A sendmail-compatible binary; it is given the message on stdin with
     /// `-t`, so any MTA or msmtp will do.
-    #[arg(long, env = "VELSTRA_ALERT_SENDMAIL", default_value = "/usr/sbin/sendmail")]
+    #[arg(
+        long,
+        env = "VELSTRA_ALERT_SENDMAIL",
+        default_value = "/usr/sbin/sendmail"
+    )]
     alert_sendmail: std::path::PathBuf,
 
     /// A pool is "nearly full" at this share of its capacity, in percent.
@@ -191,7 +199,12 @@ async fn main() {
     let alerts = velstra_cloud_controller::alerts::Config {
         targets: velstra_cloud_controller::alerts::Targets {
             webhook: args.alert_webhook.clone(),
-            mail_to: args.alert_mail_to.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
+            mail_to: args
+                .alert_mail_to
+                .iter()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect(),
             mail_from: args.alert_mail_from.clone(),
             sendmail: args.alert_sendmail.clone(),
         },

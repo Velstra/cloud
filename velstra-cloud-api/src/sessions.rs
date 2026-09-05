@@ -36,10 +36,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use velstra_cloud_model::{
     identity::{
-        AgentKind, Credential, CredentialSpec, CredentialStatus, NodeCredential, NodeCredentialSpec,
-        NodeCredentialStatus, SESSION_LIFETIME_MS, SessionSpec, SessionStatus, User, UserSpec,
-        UserStatus, check_password_strength, hash_password, new_node_token, new_session_token,
-        session_is_live, token_digest, verify_password,
+        AgentKind, Credential, CredentialSpec, CredentialStatus, NodeCredential,
+        NodeCredentialSpec, NodeCredentialStatus, SESSION_LIFETIME_MS, SessionSpec, SessionStatus,
+        User, UserSpec, UserStatus, check_password_strength, hash_password, new_node_token,
+        new_session_token, session_is_live, token_digest, verify_password,
     },
     meta::{Meta, Placement, Timestamp},
     resources::Resource,
@@ -335,7 +335,11 @@ impl IdentityStore {
             )
             .await
             .map_err(store_error)?;
-        tracing::info!(agent = node, kind = kind.subject_prefix(), "minted a per-agent token");
+        tracing::info!(
+            agent = node,
+            kind = kind.subject_prefix(),
+            "minted a per-agent token"
+        );
         Ok(token)
     }
 
@@ -359,7 +363,10 @@ impl IdentityStore {
             status: Default::default(),
         };
         self.service_credentials
-            .create(&credential, &velstra_cloud_model::Writer::controller("sessions"))
+            .create(
+                &credential,
+                &velstra_cloud_model::Writer::controller("sessions"),
+            )
             .await
             .map_err(store_error)?;
         tracing::info!(user, purpose, "minted a service account token");
@@ -421,7 +428,8 @@ impl IdentityStore {
         // `node:` or `pool:` — the same machinery either way (an agent writes
         // what it owns, and ownership is by name), but a refusal in a log should
         // say which kind was refused.
-        let mut identity = Identity::new(format!("{}:{node}", credential.spec.kind.subject_prefix()));
+        let mut identity =
+            Identity::new(format!("{}:{node}", credential.spec.kind.subject_prefix()));
         identity.scopes.push(format!("{AGENT_SCOPE_PREFIX}{node}"));
         Ok(identity)
     }
