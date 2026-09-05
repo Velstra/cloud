@@ -2676,8 +2676,10 @@ async fn an_image_carrying_a_signature_nothing_verifies_is_refused() {
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{:?}", answer.body);
     assert_eq!(answer.field(), "spec.signature");
     let message = answer.body["error"]["message"].as_str().unwrap_or_default();
+    // This harness names no signing key, so the refusal is the "cannot be
+    // checked here" one; `tests/signatures.rs` covers a cell that has keys.
     assert!(
-        message.contains("verifies"),
+        message.contains("--image-signing-key"),
         "the refusal did not say why: {message}"
     );
 

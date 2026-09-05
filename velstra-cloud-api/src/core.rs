@@ -403,6 +403,10 @@ struct Inner {
     /// operator**, which is the safe direction — a cell started without one can
     /// be read and written only where a project grants it.
     cell_admins: Vec<String>,
+    /// The keys an image's `spec.signature` may verify under. Empty means every
+    /// signature is refused, which is what the cell did before verification
+    /// existed and what a cell that has named no key should keep doing.
+    image_signing_keys: Vec<velstra_cloud_model::images::SigningKey>,
     /// One watch on the store per assigned collection, however many node agents.
     ///
     /// Only the four that grow with the cell, and only reached through a
@@ -585,6 +589,7 @@ impl Api {
                 store_backup_dir: None,
                 collections,
                 cell_admins: Vec::new(),
+                image_signing_keys: Vec::new(),
                 served: RwLock::new(BTreeMap::new()),
                 placement: Placement::new(region, cell),
                 verifier: verifier.clone(),
@@ -739,6 +744,22 @@ impl Api {
     }
 
     /// Name where the store's snapshots go. See `Inner::store_backup_dir`.
+    /// Name the keys an image signature may verify under.
+    ///
+    /// Without any, `spec.signature` is refused at admission, as it always was.
+    /// With them, a signature that verifies is stored and one that does not is
+    /// refused with the reason — so a stored signature is a verified one, which
+    /// is what lets the console show *verified* honestly.
+    pub fn with_image_signing_keys(
+        mut self,
+        keys: Vec<velstra_cloud_model::images::SigningKey>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("signing keys are named before the API is shared");
+        inner.image_signing_keys = keys;
+        self
+    }
+
     pub fn with_store_backups(mut self, dir: std::path::PathBuf) -> Self {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("the backup dir is named before the API is shared");
@@ -2212,7 +2233,8 @@ impl Api {
             self.refuse_a_disk_that_is_not_free(&spec).await?;
         }
         if kind == "images" {
-            refuse_an_unverified_signature(&spec)?;
+            let digest = spec.get("digest").and_then(Value::as_str).map(str::to_string);
+            self.judge_image_signature(&spec, digest.as_deref())?;
         }
         if kind == "image-sources" {
             refuse_an_unusable_image_source(&spec)?;
@@ -2435,7 +2457,11 @@ impl Api {
                 self.refuse_a_disk_that_is_not_free(spec).await?;
             }
             if name.collection() == "images" {
-                refuse_an_unverified_signature(spec)?;
+                // Every image patch restates the digest — `check_rules` refuses
+                // one that does not, because an image is what its bytes are —
+                // so the signature is judged over the digest the patch carries.
+                let digest = spec.get("digest").and_then(Value::as_str).map(str::to_string);
+                self.judge_image_signature(spec, digest.as_deref())?;
             }
             if name.collection() == "instances" {
                 // A resize is either the next size on the menu or a hand-typed
@@ -6776,18 +6802,32 @@ fn refuse_an_unusable_overcommit(spec: &Value) -> ApiResult<()> {
 /// An explicitly *empty* signature is not a claim and is not refused: a client
 /// echoing back an object it read, or clearing the field, must not be told off
 /// for it.
-fn refuse_an_unverified_signature(spec: &Value) -> ApiResult<()> {
-    let carried = spec
-        .get("signature")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.trim().is_empty());
-    if carried {
-        return Err(
-            ApiError::invalid(velstra_cloud_model::resources::UNVERIFIED_SIGNATURE)
-                .at("spec.signature"),
-        );
+impl Api {
+    /// Judge `spec.signature` before an image is stored.
+    ///
+    /// Three answers, and only two of them store anything: no signature is an
+    /// unsigned image and is fine; one that verifies under a configured key is
+    /// kept; one that does not — or one offered to a cell with no keys — is
+    /// refused at the field with the reason. Nothing that failed is ever
+    /// stored, which is what makes a stored signature mean *verified*.
+    fn judge_image_signature(&self, spec: &Value, digest: Option<&str>) -> ApiResult<()> {
+        use velstra_cloud_model::images::{SignatureVerdict, judge_signature};
+        let signature = spec.get("signature").and_then(Value::as_str);
+        if signature.is_none_or(|s| s.trim().is_empty()) {
+            return Ok(());
+        }
+        let Some(digest) = digest else {
+            return Err(ApiError::invalid(
+                "spec.signature is over the digest, and this image has none yet; publish the \
+                 image with its digest (or from one that has it) and sign that",
+            )
+            .at("spec.signature"));
+        };
+        match judge_signature(digest, signature, &self.inner.image_signing_keys) {
+            SignatureVerdict::Unsigned | SignatureVerdict::Verified { .. } => Ok(()),
+            SignatureVerdict::Refused(why) => Err(ApiError::invalid(why).at("spec.signature")),
+        }
     }
-    Ok(())
 }
 
 fn refuse_unwritable(body: &Value) -> ApiResult<()> {

@@ -38,6 +38,12 @@ struct Args {
     #[arg(long, env = "VELSTRA_STORE_BACKUP_DIR", default_value = "")]
     store_backup_dir: String,
 
+    /// A public key an image's `spec.signature` may verify under: Ed25519, the
+    /// raw 32 bytes as base64. Repeat the flag, or separate keys with commas in
+    /// the variable. Without any, every signature is refused at admission.
+    #[arg(long, env = "VELSTRA_IMAGE_SIGNING_KEYS", value_delimiter = ',')]
+    image_signing_key: Vec<String>,
+
     /// Print the REST surface as OpenAPI 3.1 and exit, serving nothing.
     ///
     /// The same document `GET /api/v1/openapi.json` answers with, for a client
@@ -235,8 +241,27 @@ async fn main() -> anyhow::Result<()> {
         (None, None) => {}
     }
 
+    // Parsed before anything is served: a key that does not parse is a cell that
+    // would refuse every signature while claiming to check them.
+    let signing_keys = args
+        .image_signing_key
+        .iter()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .map(|k| {
+            velstra_cloud_model::images::SigningKey::parse(k)
+                .map_err(|e| anyhow::anyhow!("--image-signing-key {k:?}: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if signing_keys.is_empty() {
+        tracing::info!("no --image-signing-key: an image signature is refused at admission");
+    } else {
+        let fingerprints: Vec<String> = signing_keys.iter().map(|k| k.fingerprint()).collect();
+        tracing::info!(keys = ?fingerprints, "image signatures verify under these keys");
+    }
     let mut api = velstra_cloud_api::Api::new(store, &args.region, &args.cell, verifier)
-        .with_cell_admins(args.cell_admin.clone());
+        .with_cell_admins(args.cell_admin.clone())
+        .with_image_signing_keys(signing_keys);
     if !args.store_backup_dir.is_empty() {
         api = api.with_store_backups(std::path::PathBuf::from(&args.store_backup_dir));
     }
