@@ -88,6 +88,34 @@ struct Args {
     /// exists for.
     #[arg(long)]
     no_leader_election: bool,
+
+    /// Where to POST an alert — one JSON object per transition, `firing` or
+    /// `resolved`. Nothing is posted without it.
+    #[arg(long, env = "VELSTRA_ALERT_WEBHOOK")]
+    alert_webhook: Option<String>,
+
+    /// Who to mail an alert, through the sendmail binary below. Repeat the
+    /// flag, or separate addresses with commas in the variable.
+    #[arg(long, env = "VELSTRA_ALERT_MAIL_TO", value_delimiter = ',')]
+    alert_mail_to: Vec<String>,
+
+    /// The sender an alert mail carries.
+    #[arg(long, env = "VELSTRA_ALERT_MAIL_FROM", default_value = "velstra-cloud@localhost")]
+    alert_mail_from: String,
+
+    /// A sendmail-compatible binary; it is given the message on stdin with
+    /// `-t`, so any MTA or msmtp will do.
+    #[arg(long, env = "VELSTRA_ALERT_SENDMAIL", default_value = "/usr/sbin/sendmail")]
+    alert_sendmail: std::path::PathBuf,
+
+    /// A pool is "nearly full" at this share of its capacity, in percent.
+    #[arg(long, default_value_t = 80)]
+    alert_pool_full_percent: u8,
+
+    /// An object that has disagreed with itself for this many seconds is
+    /// "stuck".
+    #[arg(long, default_value_t = 900)]
+    alert_stuck_after: u64,
 }
 
 #[tokio::main]
@@ -160,11 +188,28 @@ async fn main() {
         cell: args.cell.clone(),
         fabric: args.fabric.clone(),
     };
+    let alerts = velstra_cloud_controller::alerts::Config {
+        targets: velstra_cloud_controller::alerts::Targets {
+            webhook: args.alert_webhook.clone(),
+            mail_to: args.alert_mail_to.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
+            mail_from: args.alert_mail_from.clone(),
+            sendmail: args.alert_sendmail.clone(),
+        },
+        rules: velstra_cloud_controller::alerts::Rules {
+            pool_full_percent: args.alert_pool_full_percent,
+            stuck_after: std::time::Duration::from_secs(args.alert_stuck_after),
+            ..Default::default()
+        },
+    };
+    if alerts.targets.is_empty() {
+        info!("alerts are judged but nobody is told: no --alert-webhook or --alert-mail-to");
+    }
     let loops = velstra_cloud_controller::wiring::Loops {
         config,
         metrics: metrics.clone(),
         shutdown: shutdown.clone(),
         leader: leader.clone(),
+        alerts,
     };
     for (name, task) in velstra_cloud_controller::wiring::every_controller(&wiring, &loops) {
         tracing::debug!(controller = name, "starting");

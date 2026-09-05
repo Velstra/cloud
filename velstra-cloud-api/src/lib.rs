@@ -21,6 +21,7 @@ pub mod grpc;
 /// linking an API server: the shaping is pure, and the two ends of a contract
 /// should not have two implementations of it.
 pub use velstra_cloud_wire as json;
+pub mod openapi;
 pub mod paging;
 pub mod proxy;
 pub mod refs;

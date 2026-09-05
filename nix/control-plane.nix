@@ -176,6 +176,41 @@ in
         reconcile of a settled object writes nothing.
       '';
     };
+
+    alerts = {
+      webhook = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Where the controller POSTs an alert: one JSON object per transition,
+          `firing` when a condition appears and `resolved` when it goes. The
+          rules are fixed — a machine silent past its fencing deadline, a pool
+          nearly full, a project out of quota, an object stuck — and nothing is
+          posted without this.
+        '';
+      };
+
+      mailTo = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Addresses to mail the same alerts to, through `alerts.sendmail`.";
+      };
+
+      mailFrom = lib.mkOption {
+        type = lib.types.str;
+        default = "velstra-cloud@localhost";
+        description = "The sender an alert mail carries.";
+      };
+
+      sendmail = lib.mkOption {
+        type = lib.types.str;
+        default = "/run/wrappers/bin/sendmail";
+        description = ''
+          A sendmail-compatible binary, given the message on stdin with `-t`.
+          The system MTA's wrapper by default; msmtp's `sendmail` works too.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -256,6 +291,10 @@ in
             cfg.resyncSeconds != null
           ) "--resync-interval ${toString cfg.resyncSeconds}"
           ++ lib.optional (cfg.fabric != null) "--fabric ${cfg.fabric}"
+          ++ lib.optional (cfg.alerts.webhook != null) "--alert-webhook ${lib.escapeShellArg cfg.alerts.webhook}"
+          ++ lib.optional (cfg.alerts.mailTo != [ ]) "--alert-mail-to ${lib.escapeShellArg (lib.concatStringsSep "," cfg.alerts.mailTo)}"
+          ++ lib.optional (cfg.alerts.mailTo != [ ]) "--alert-mail-from ${lib.escapeShellArg cfg.alerts.mailFrom}"
+          ++ lib.optional (cfg.alerts.mailTo != [ ]) "--alert-sendmail ${lib.escapeShellArg cfg.alerts.sendmail}"
         );
       };
     };

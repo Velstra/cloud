@@ -72,6 +72,11 @@ const REQUESTS: &[&str] = &[
     // One object, whole.
     "projects/p1/instances/web-1",
     "nodes/node-a",
+    // An image, listed and whole: the console reads `spec.family` off one
+    // (the catalogue is derived from it), and a recording without any image
+    // said nothing about that field.
+    "projects/p1/images",
+    "projects/p1/images/debian-13",
     // Every custom method. These are the ones with two implementations and no
     // compiler between them.
     "nodes:explainCapacity",
@@ -257,6 +262,18 @@ async fn seed(h: &Harness) {
         "POST",
         "projects",
         Some(json!({ "id": "p1", "spec": { "quota": { "instances": 20, "vcpus": 200 } } })),
+    )
+    .await;
+    // The same image `fake-api.mjs` seeds, so both sides answer the same path.
+    h.send(
+        "POST",
+        "projects/p1/images",
+        Some(json!({ "id": "debian-13", "spec": {
+            "family": "debian-13", "version": "20260815",
+            "digest": format!("sha256:{}", "a".repeat(64)), "format": "Qcow2",
+            "sizeBytes": 1_181_116_006_u64,
+            "sourceUrl": "https://images.invalid/debian-13.qcow2",
+        }})),
     )
     .await;
     h.send(

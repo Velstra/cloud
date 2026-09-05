@@ -117,10 +117,15 @@ jobs:
       #                      colocated (skips loudly otherwise).
       #   - contract_routes: every collection, route and verb the API serves is
       #                      named in docs/rest-contract.md.
+      #   - openapi:         docs/openapi.json is byte-for-byte what the API
+      #                      generates, and every verb the router dispatches is
+      #                      in it. Regenerate with
+      #                      VELSTRA_WRITE_OPENAPI=1 cargo test -p velstra-cloud-api --test openapi
       - name: contract drift
         run: |
           cargo test -p velstra-cloud-fabric --test fabric_proto --locked -- --nocapture
           cargo test -p velstra-cloud-api --test contract_routes --locked
+          cargo test -p velstra-cloud-api --test openapi --locked
 
       # `--locked` on purpose: a Cargo.lock that no longer matches the manifests
       # is a change nobody made on purpose, and it is better found here than in

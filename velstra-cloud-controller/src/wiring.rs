@@ -25,8 +25,8 @@ use velstra_cloud_model::{
         AttachmentSpec, AttachmentStatus, FloatingIpSpec, FloatingIpStatus, InstanceSpec,
         InstanceStatus, NetworkSpec, NetworkStatus, NodeSpec, NodeStatus, OperationSpec,
         OperationStatus, PortSpec, PortStatus, ProjectSpec, ProjectStatus, RouterSpec,
-        RouterStatus, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus, VolumeSpec,
-        VolumeStatus,
+        PoolSpec, PoolStatus, RouterStatus, SnapshotSpec, SnapshotStatus, SubnetSpec, SubnetStatus,
+        VolumeSpec, VolumeStatus,
     },
 };
 use velstra_cloud_store::{Cached, Store, TypedStore, prefix_for};
@@ -71,6 +71,9 @@ pub struct Loops {
     pub metrics: Metrics,
     pub shutdown: watch::Receiver<bool>,
     pub leader: watch::Receiver<bool>,
+    /// Who is told when the cell is not doing its job, and at what thresholds.
+    /// The default tells nobody and still moves the gauge.
+    pub alerts: crate::alerts::Config,
 }
 
 impl Loops {
@@ -86,6 +89,7 @@ impl Loops {
             metrics,
             shutdown,
             leader,
+            alerts: crate::alerts::Config::default(),
         }
     }
 }
@@ -360,9 +364,17 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
     );
 
     // Not a reconciler: the drift scan reads every collection on a timer and
-    // publishes how far behind each one is.
+    // publishes how far behind each one is — and, on the same pass, the alerts
+    // are judged over what it found plus the machines, pools and projects.
+    // One pass, because "what is stuck" is a question the scan has just
+    // answered and asking the store twice would be two answers.
     let scan_metrics = metrics.clone();
     let mut scan_shutdown = loops.shutdown.clone();
+    let leading = loops.leader.clone();
+    let mut notifier = crate::alerts::Notifier::new(loops.alerts.clone(), id, metrics.clone());
+    let pools: TypedStore<PoolSpec, PoolStatus> = TypedStore::new(store.clone(), id, "pools");
+    let scanned_nodes = nodes.clone();
+    let scanned_projects = projects.clone();
     out.push((
         "drift",
         Box::pin(async move {
@@ -373,16 +385,36 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
                     _ = every.tick() => {
                         let now = Timestamp::now();
                         let scans = [
-                            drift::scan("instances", &instances, &scan_metrics, now).await.err(),
-                            drift::scan("attachments", &attachments, &scan_metrics, now).await.err(),
-                            drift::scan("projects", &projects, &scan_metrics, now).await.err(),
-                            drift::scan("operations", &operations, &scan_metrics, now).await.err(),
-                            drift::scan("migrations", &migrations, &scan_metrics, now).await.err(),
-                            drift::scan("volumes", &volumes, &scan_metrics, now).await.err(),
-                            drift::scan("snapshots", &snapshots, &scan_metrics, now).await.err(),
+                            drift::scan("instances", &instances, &scan_metrics, now).await,
+                            drift::scan("attachments", &attachments, &scan_metrics, now).await,
+                            drift::scan("projects", &projects, &scan_metrics, now).await,
+                            drift::scan("operations", &operations, &scan_metrics, now).await,
+                            drift::scan("migrations", &migrations, &scan_metrics, now).await,
+                            drift::scan("volumes", &volumes, &scan_metrics, now).await,
+                            drift::scan("snapshots", &snapshots, &scan_metrics, now).await,
                         ];
-                        for error in scans.into_iter().flatten() {
-                            error!(%error, "drift scan failed");
+                        let mut divergent = Vec::new();
+                        for scan in scans {
+                            match scan {
+                                Ok(found) => divergent.extend(found),
+                                Err(error) => error!(%error, "drift scan failed"),
+                            }
+                        }
+                        let listed = tokio::try_join!(
+                            scanned_nodes.list(),
+                            pools.list(),
+                            scanned_projects.list(),
+                        );
+                        match listed {
+                            Ok((nodes, pools, projects)) => {
+                                let alerts = crate::alerts::evaluate(
+                                    &nodes, &pools, &projects, &divergent, notifier.rules(), now,
+                                );
+                                // Every process judges; only the leader tells anybody.
+                                let deliver = *leading.borrow();
+                                notifier.observe(alerts, deliver).await;
+                            }
+                            Err(error) => error!(%error, "alert pass could not list the cell"),
                         }
                     }
                 }

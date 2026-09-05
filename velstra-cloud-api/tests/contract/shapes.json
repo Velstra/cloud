@@ -357,6 +357,73 @@
     "pendingAdoption": [],
     "unreported": []
   },
+  "projects/p1/images": {
+    "items": [
+      {
+        "meta": {
+          "createdAt": "number",
+          "deletedAt": "null",
+          "finalizers": [],
+          "generation": "number",
+          "labels": {},
+          "name": "string",
+          "placement": {
+            "cell": "string",
+            "region": "string"
+          },
+          "revision": "string",
+          "uid": "string"
+        },
+        "spec": {
+          "digest": "string",
+          "family": "string",
+          "format": "string",
+          "signature": "null",
+          "sizeBytes": "number",
+          "sourceUrl": "string",
+          "version": "string"
+        },
+        "status": {
+          "cachedOn": [],
+          "conditions": [],
+          "fetchingOn": [],
+          "observedGeneration": "number"
+        }
+      }
+    ],
+    "revision": "string"
+  },
+  "projects/p1/images/debian-13": {
+    "meta": {
+      "createdAt": "number",
+      "deletedAt": "null",
+      "finalizers": [],
+      "generation": "number",
+      "labels": {},
+      "name": "string",
+      "placement": {
+        "cell": "string",
+        "region": "string"
+      },
+      "revision": "string",
+      "uid": "string"
+    },
+    "spec": {
+      "digest": "string",
+      "family": "string",
+      "format": "string",
+      "signature": "null",
+      "sizeBytes": "number",
+      "sourceUrl": "string",
+      "version": "string"
+    },
+    "status": {
+      "cachedOn": [],
+      "conditions": [],
+      "fetchingOn": [],
+      "observedGeneration": "number"
+    }
+  },
   "projects/p1/instances": {
     "items": [
       {
