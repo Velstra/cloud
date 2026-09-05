@@ -101,6 +101,18 @@ struct Args {
     #[arg(long, default_value = "3600")]
     dhcp_lease_secs: u64,
 
+    /// A public key an image's signature must verify under before this node
+    /// fetches it: Ed25519, the raw 32 bytes as base64. Repeat the flag, or
+    /// separate keys with commas in the variable. The same keys the API was
+    /// started with, normally.
+    #[arg(long, env = "VELSTRA_IMAGE_SIGNING_KEYS", value_delimiter = ',')]
+    image_signing_key: Vec<String>,
+
+    /// Fetch signed images only: an image with no signature is refused with
+    /// the reason on the guest that needed it. Needs at least one key.
+    #[arg(long, env = "VELSTRA_REQUIRE_SIGNED_IMAGES")]
+    require_signed_images: bool,
+
     /// How often the responder looks for taps that have appeared or gone.
     #[arg(long, default_value = "2")]
     dhcp_scan_secs: u64,
@@ -461,6 +473,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig::new(&args.node, &args.region, &args.cell);
     config.resync = Duration::from_secs(args.resync_secs);
     config.shared_state = args.shared_state;
+    config.image_signing_keys = args
+        .image_signing_key
+        .iter()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .map(|k| {
+            velstra_cloud_model::images::SigningKey::parse(k)
+                .map_err(|e| format!("--image-signing-key {k:?}: {e}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    config.require_signed_images = args.require_signed_images;
+    if args.require_signed_images && config.image_signing_keys.is_empty() {
+        return Err("--require-signed-images without an --image-signing-key would refuse every \
+                    image; name the key the signatures are made under"
+            .into());
+    }
     let agent = match &args.api {
         Some(url) => {
             let token = match &args.api_token_file {

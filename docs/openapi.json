@@ -792,6 +792,10 @@
             "type": "string",
             "x-at-creation": true
           },
+          "signature": {
+            "description": "An Ed25519 signature over `sha256:<digest>`, base64. Accepted only when it verifies under a key the cell was started with; refused otherwise, so a stored signature is a verified one.",
+            "type": "string"
+          },
           "sizeBytes": {
             "maximum": 9223372036854775807,
             "minimum": 0,

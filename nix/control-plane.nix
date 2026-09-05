@@ -148,6 +148,17 @@ in
       '';
     };
 
+    imageSigningKeys = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Ed25519 public keys (the raw 32 bytes, base64) an image's
+        `spec.signature` may verify under. Empty — the default — refuses every
+        signature at admission, because a claim nobody can check is worse than
+        no claim. See docs/operating.md, "Signed images".
+      '';
+    };
+
     writesPerSecond = lib.mkOption {
       type = lib.types.nullOr lib.types.ints.unsigned;
       default = null;
@@ -259,6 +270,7 @@ in
           ${lib.optionalString (
             cfg.writesPerSecond != null
           ) "--writes-per-second ${toString cfg.writesPerSecond}"} \
+          ${lib.concatStringsSep " " (map (k: "--image-signing-key ${lib.escapeShellArg k}") cfg.imageSigningKeys)} \
           ${lib.concatStringsSep " " (
             lib.mapAttrsToList (cell: endpoint: "--cell-endpoint ${cell}=${endpoint}") cfg.cells
           )} \

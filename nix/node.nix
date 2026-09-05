@@ -254,6 +254,9 @@ in
         # splitting a flag list, and the empty case has to disappear entirely.
         # Every value in it went through the wizard's seed-safety check, which
         # refuses anything that would need quoting.
+        # Image signing is read from the seed as well: VELSTRA_IMAGE_SIGNING_KEYS
+        # (base64 keys, comma-separated) and VELSTRA_REQUIRE_SIGNED_IMAGES=true
+        # are the agent's own variables, so they need no flag here.
         exec ${cfg.package}/bin/velstra-cloud-nodeagent \
           --node "$VELSTRA_NODE" \
           --cell "$VELSTRA_CELL" \

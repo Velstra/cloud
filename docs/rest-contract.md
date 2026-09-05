@@ -528,6 +528,28 @@ booted before.
 Creating outside a project is a cell operator's, so publishing is too. Anybody
 may boot from the catalogue; only the cell may put something in it.
 
+### Signed images
+
+`spec.signature` is an Ed25519 signature over the **digest line** — the string
+`spec.digest` carries, `sha256:<64 hex>`, no newline — written as base64. The
+API judges it at admission under the keys it was started with
+(`--image-signing-key`, repeatable; `VELSTRA_IMAGE_SIGNING_KEYS`, comma-separated):
+
+- no signature: the image is stored unsigned; whether a node boots it is the
+  node's policy;
+- a signature that verifies: stored;
+- a signature that does not verify, or any signature offered to a cell with no
+  keys: `400 INVALID_ARGUMENT` at `spec.signature`, with the reason.
+
+So a stored signature **is** a verified one, and the console's *Signature*
+column reads `verified` or `unsigned` and nothing else. A patch that adds a
+signature restates the digest, as every image patch does, and is judged over it.
+
+The node agent judges again under its own keys before it fetches, and refuses
+an image whose signature fails — or, with `--require-signed-images`, one that
+has none — with the sentence on the guest that needed it. Making a key and a
+signature is in `docs/operating.md`.
+
 ### Roles the cell writes down
 
 The four rungs say **how much** somebody may do, over a whole project. That is

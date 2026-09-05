@@ -120,6 +120,13 @@ pub struct AgentConfig {
     /// Whether this machine's state directory is storage every node reaches.
     /// Told, never worked out — see the flag's own documentation.
     pub shared_state: bool,
+    /// The keys an image's signature must verify under before this node fetches
+    /// it. Judged here as well as at the API, because a node's copy of the
+    /// cell is what it acts on, and a store written around the API is still a
+    /// store this node reads.
+    pub image_signing_keys: Vec<velstra_cloud_model::images::SigningKey>,
+    /// Refuse to fetch an image that carries no signature at all.
+    pub require_signed_images: bool,
 }
 
 impl AgentConfig {
@@ -131,6 +138,8 @@ impl AgentConfig {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             console_endpoint: String::new(),
             shared_state: false,
+            image_signing_keys: Vec::new(),
+            require_signed_images: false,
         }
     }
 }
@@ -1530,11 +1539,14 @@ impl Agent {
                 // is passed separately: the two used to be the same string, and
                 // that forced every image to be called `sha256-<64 hex>` in
                 // every list an operator reads.
-                Some(image) => self
-                    .vmm
-                    .pull_image(digest, &image.digest, &image.source_url)
-                    .await
-                    .map(|_| ()),
+                Some(image) => match self.image_may_be_fetched(digest, image) {
+                    Ok(()) => self
+                        .vmm
+                        .pull_image(digest, &image.digest, &image.source_url)
+                        .await
+                        .map(|_| ()),
+                    Err(why) => Err(crate::host::HostError::failed(why)),
+                },
                 None => Err(crate::host::HostError::failed(format!(
                     "{digest} is not a registered image in this cell, so this \
                      node has nowhere to fetch it from"
@@ -2259,3 +2271,36 @@ fn is_release(action: &Action) -> bool {
 /// The finalizer this node holds, exposed so a controller and the agent name
 /// the same string.
 pub const RELEASE_FINALIZER: &str = NODE_RELEASE_FINALIZER;
+
+impl Agent {
+    /// Whether this node may fetch `image` at all: its signature, if it has
+    /// one, verifies under this node's keys; and if the node was told to insist
+    /// on signatures, it has one. The sentence names what stopped it, because
+    /// "the image never arrived" is how this would otherwise read.
+    fn image_may_be_fetched(
+        &self,
+        name: &str,
+        image: &velstra_cloud_model::resources::ImageSpec,
+    ) -> Result<(), String> {
+        use velstra_cloud_model::images::{SignatureVerdict, judge_signature};
+        match judge_signature(
+            &image.digest,
+            image.signature.as_deref(),
+            &self.config.image_signing_keys,
+        ) {
+            SignatureVerdict::Verified { .. } => Ok(()),
+            SignatureVerdict::Unsigned if self.config.require_signed_images => Err(format!(
+                "{name} carries no signature and this node fetches signed images only \
+                 (--require-signed-images)"
+            )),
+            SignatureVerdict::Unsigned => Ok(()),
+            SignatureVerdict::Refused(why) if self.config.image_signing_keys.is_empty() => {
+                Err(format!(
+                    "{name} carries a signature and this node has no key to check it under \
+                     (--image-signing-key); refusing to fetch what it cannot judge: {why}"
+                ))
+            }
+            SignatureVerdict::Refused(why) => Err(format!("{name} is not fetched: {why}")),
+        }
+    }
+}

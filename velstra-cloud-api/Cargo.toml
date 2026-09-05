@@ -53,4 +53,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# For the signature tests: making a key pair to sign with.
+ring = { workspace = true }
 tower = { workspace = true }

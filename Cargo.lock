@@ -2499,6 +2499,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "prost 0.13.5",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -2581,7 +2582,9 @@ name = "velstra-cloud-model"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64",
  "rand 0.8.7",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

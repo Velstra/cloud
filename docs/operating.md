@@ -328,6 +328,38 @@ out before retention does.
 
 ---
 
+## 6b. Signed images
+
+An image's digest proves the bytes are the bytes. A signature proves whose
+bytes they are, under a key you chose. One key for the cell, kept off the
+machines, is enough:
+
+```
+openssl genpkey -algorithm ed25519 -out image-signing.pem
+openssl pkey -in image-signing.pem -pubout -outform DER | tail -c 32 | base64 -w0
+```
+
+The second line is the public key as the API and the node agent take it —
+`--image-signing-key <that>` on `velstra-cloud-api` and on
+`velstra-cloud-nodeagent` (or `VELSTRA_IMAGE_SIGNING_KEYS`, comma-separated,
+for several). On NixOS: `velstra.cloud.controlPlane.imageSigningKeys`, and the
+same variable in a node's seed.
+
+Signing is over the digest line, exactly as `spec.digest` carries it:
+
+```
+printf '%s' 'sha256:<64 hex>' | openssl pkeyutl -sign -inkey image-signing.pem -rawin | base64 -w0
+```
+
+Put the result in `spec.signature` when publishing the image (the console's
+image form has it behind *Advanced*). The API stores it only if it verifies,
+refuses it at the field with the reason if it does not, and refuses every
+signature when it was started without a key — a claim nobody can check is
+worse than no claim. A node with `--require-signed-images` fetches nothing
+unsigned, and says so on the guest that asked.
+
+---
+
 ## 7. When somebody says "I clicked it and nothing happened"
 
 Open the object and read its **History**. It carries two things:
