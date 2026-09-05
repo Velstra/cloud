@@ -2471,12 +2471,27 @@ const IMAGE_FIELDS: &[Field] = &[
         derived: false,
         at_creation: false,
     },
-    // There is deliberately no `signature` field. It used to be here, with the
-    // help text "Verified before a node will boot it" — and nothing in the
-    // platform has ever verified it. A box that records a security claim
-    // nothing checks is not a neutral convenience: it is where the claim comes
-    // from. The API now refuses one, so a box here could only produce an error.
-    // See `ImageSpec::signature`.
+    // Behind the disclosure, and honest about what accepting it means: the
+    // API checks it against the cell's keys and stores nothing that failed,
+    // so what this box produces is either a verified signature or a refusal
+    // at the field. It was absent while nothing verified it — a box that
+    // records a security claim nothing checks is where the claim comes from.
+    Field {
+        key: "signature",
+        label: "Signature",
+        kind: Kind::Text {
+            placeholder: "base64 Ed25519 signature over the digest line",
+            check: Check::None,
+        },
+        required: false,
+        advanced: true,
+        help: "An Ed25519 signature over `sha256:<digest>`, base64. Accepted only when it \
+               verifies under a key the cell was started with; refused otherwise, so a \
+               stored signature is a verified one.",
+        when_empty: "unsigned",
+        derived: false,
+        at_creation: false,
+    },
 ];
 
 const NODE_FIELDS: &[Field] = &[
@@ -4011,10 +4026,20 @@ pub const COLLECTIONS: &[Collection] = &[
                 cell: Cell::Count,
                 width: 112,
             },
-            // And deliberately no `Signed` column. It read yes or no off a
-            // string nothing had checked, at a glance, in a list — which is the
-            // worst possible place for an unverified claim to appear, because
-            // that is exactly how somebody decides an image is safe.
+            // `verified` or `unsigned`, and nothing else — because the API
+            // stores a signature only after it verified under a configured key
+            // and refuses one that did not, a stored signature *is* a verified
+            // one. The column that used to read yes/no off an unchecked field
+            // is what made the field be refused in the first place.
+            Column {
+                path: "spec.signature",
+                label: "Signature",
+                cell: Cell::Yes {
+                    yes: "verified",
+                    no: "unsigned",
+                },
+                width: 9,
+            },
         ],
         agreements: &[],
         creatable: true,

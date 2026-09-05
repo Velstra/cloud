@@ -1243,9 +1243,14 @@ pub struct ImageSpec {
     /// ([`crate::resources::UNVERIFIED_SIGNATURE`]) rather than stored and
     /// ignored: the platform will not hold a claim it cannot check.
     ///
-    /// The field stays on the type and on the wire so that implementing
-    /// verification is a change in one direction rather than a schema
-    /// migration. When it lands, the refusal goes with it, in the same commit.
+    /// Verification exists now: an Ed25519 signature over the digest line,
+    /// base64, judged by [`crate::images::judge_signature`] under the keys the
+    /// API was started with (`--image-signing-key`). A signature that verifies
+    /// is stored; one that does not, or one offered to a cell with no keys, is
+    /// refused at the field — so a stored signature is a verified one, and the
+    /// console may say *verified* honestly. The node agent judges it again
+    /// under its own keys before it fetches, and can be told to refuse
+    /// unsigned images altogether (`--require-signed-images`).
     pub signature: Option<String>,
 }
 
@@ -1254,11 +1259,10 @@ pub struct ImageSpec {
 /// Here rather than in the API crate because it is a statement about the model:
 /// the reason is a property of the field, and a caller reading this type should
 /// find out why without going looking.
-pub const UNVERIFIED_SIGNATURE: &str = "spec.signature is not stored, because nothing in this platform verifies it. It was \
-     declared as a cosign-style signature checked before boot, and no code has ever read it — \
-     while the console showed a `Signed` column derived from it. An unchecked claim that is \
-     displayed as a checked one is worse than no field at all, so it is refused rather than \
-     kept. Publish the image without it; when verification exists this will accept it again.";
+pub const UNVERIFIED_SIGNATURE: &str = "spec.signature cannot be checked here: this cell was started \
+     without an image signing key. A claim nobody can check is worse than no claim, so it is \
+     refused rather than stored. Publish the image without it, or start the API with \
+     --image-signing-key.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImageFormat {

@@ -36,6 +36,9 @@ argon2 = "0.5"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
+# Ed25519 for image signatures. Already in the tree under rustls; naming it here
+# adds a verifier, not a dependency.
+ring = "0.17"
 clap = { version = "4", features = ["derive", "env"] }
 etcd-client = "0.19"
 futures = "0.3"
