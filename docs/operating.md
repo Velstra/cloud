@@ -89,6 +89,42 @@ restart *into* — an empty machine wearing a familiar name.
 
 ---
 
+## 3a. Being told
+
+The metrics say everything (`/metrics` on the API and the controller). An
+alert is for the handful of conditions where waiting until somebody reads a
+dashboard is already too late. The controller judges four, on every resync
+pass, and tells somebody only when one **appears** or **goes away** — a pool at
+85 % is at 85 % on every pass, and what a person wants to hear is that it
+became so:
+
+| rule | fires when |
+|---|---|
+| `node-silent` | a machine has not reported for longer than its own `fenceAfterS` plus a minute — the moment its guests are certainly stopped and recovery may move them |
+| `pool-nearly-full` | a pool has allocated 80 % of its capacity (`--alert-pool-full-percent`) |
+| `quota-exhausted` | a project has used every unit of some dimension, so its next create is refused |
+| `stuck` | an object has disagreed with itself — unconverged, unreported, not ready, deletion blocked — for 15 minutes (`--alert-stuck-after`) |
+
+Two targets, both optional, both tried, one failing never stopping the other:
+
+```
+velstra-cloud-controller …   --alert-webhook https://hooks.example.org/velstra   --alert-mail-to noc@example.org --alert-mail-from velstra@example.org
+```
+
+The webhook receives one JSON object per transition —
+`{"kind":"firing"|"resolved","rule":…,"subject":…,"message":…,"cell":…,"at":…}`
+— and the mail goes through a sendmail-compatible binary
+(`--alert-sendmail`, `/usr/sbin/sendmail` by default; msmtp works). On NixOS the
+same knobs are `velstra.cloud.controlPlane.alerts.{webhook,mailTo,mailFrom}`.
+
+Only the leader delivers, so a cell with three controllers says each thing
+once. A restarted controller repeats every open alert once, deliberately: for
+something that exists to be noticed, that is the right side to err on. What is
+firing right now is `alerts_firing{rule}` on the controller's metrics, and
+whether deliveries are getting through is `alert_deliveries_total{target,outcome}`.
+
+---
+
 ## 4. Sharing a processor
 
 ```

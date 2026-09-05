@@ -369,7 +369,7 @@ function seed() {
   // in this cell reaches out — a fact that lives on a node and shows up on a
   // tenant's map, which is why the map asks for it.
   put("nodes/node-a", { schedulable: true, labels: ["nvme", "gen4"], gateway: true },
-    { observedGeneration: 1, conditions: ready(1),
+    { observedGeneration: 1, conditions: ready(1), sharedState: true, vmm: "qemu",
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
       allocated: { vcpus: 10, memoryMib: 20480, diskGib: 200, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 4000,
@@ -399,7 +399,7 @@ function seed() {
           state: { kind: "Free" } },
       ] });
   put("nodes/node-b", { schedulable: false, labels: ["nvme"] },
-    { observedGeneration: 1, conditions: ready(1),
+    { observedGeneration: 1, conditions: ready(1), sharedState: false, vmm: "qemu",
       capacity: { vcpus: 32, memoryMib: 65536, diskGib: 2048, numaFreeMib: [16384, 16384], hugepages1gi: 0 },
       allocated: { vcpus: 30, memoryMib: 61440, diskGib: 1900, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 900_000,
@@ -412,7 +412,7 @@ function seed() {
   // "no", and a console checked only against that is a console whose picker was
   // never seen with anything in it.
   put("nodes/node-c", { schedulable: true, labels: ["nvme", "gen4"], vcpuOvercommit: 4 },
-    { observedGeneration: 1, conditions: ready(1),
+    { observedGeneration: 1, conditions: ready(1), sharedState: true, vmm: "qemu",
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
       allocated: { vcpus: 4, memoryMib: 8192, diskGib: 80, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 3000,
@@ -431,7 +431,7 @@ function seed() {
   // machines whose CPUs differed by a handful of flags: every destination was
   // greyed out, and every one of them could have taken the guest with a restart.
   put("nodes/node-d", { schedulable: true, labels: ["sata"] },
-    { observedGeneration: 1, conditions: ready(1),
+    { observedGeneration: 1, conditions: ready(1), sharedState: false, vmm: "qemu",
       capacity: { vcpus: 32, memoryMib: 131072, diskGib: 2048, numaFreeMib: [65536, 65536], hugepages1gi: 0 },
       allocated: { vcpus: 2, memoryMib: 4096, diskGib: 40, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 2000,
@@ -452,10 +452,10 @@ function seed() {
     note: "moving it to rack 4" },
     { observedGeneration: 1, conditions: [] });
 
-  // No `signature` on either: the API refuses one, because nothing in the
-  // platform verifies it. A fixture carrying a field the real API would reject
-  // is the drift this file exists to prevent — the console would be built
-  // against a shape that cannot exist.
+  // `signature` is answered `null` on both: the API refuses a *value*, because
+  // nothing in the platform verifies one, but the field is on the wire. A
+  // fixture carrying a signature would be the drift this file exists to
+  // prevent — the console would be built against a shape that cannot exist.
   // A `family` on both, because the catalogue is derived from it. An image
   // without one is invisible in `families` — and the instance form picks from
   // *there*, not from the images, so a fixture without families is a create form
@@ -463,15 +463,15 @@ function seed() {
   put("projects/p1/images/debian-13", {
     digest: "sha256:" + "a".repeat(64), format: "Qcow2", sizeBytes: 1_181_116_006,
     family: "debian-13", version: "20260815",
-    sourceUrl: "https://images.invalid/debian-13.qcow2" },
+    sourceUrl: "https://images.invalid/debian-13.qcow2", signature: null },
     // node-d too, so nothing but the processor stands between this guest and
     // that machine — which is the one thing the mode changes.
-    { observedGeneration: 1, conditions: ready(1), cachedOn: ["node-a", "node-c", "node-d"] });
+    { observedGeneration: 1, conditions: ready(1), cachedOn: ["node-a", "node-c", "node-d"], fetchingOn: [] });
   put("projects/p1/images/alpine-3", {
     digest: "sha256:" + "b".repeat(64), format: "Raw", sizeBytes: 62_914_560,
     family: "alpine-3", version: "3.20",
-    sourceUrl: "https://images.invalid/alpine-3.raw" },
-    { observedGeneration: 1, conditions: ready(1), cachedOn: [] });
+    sourceUrl: "https://images.invalid/alpine-3.raw", signature: null },
+    { observedGeneration: 1, conditions: ready(1), cachedOn: [], fetchingOn: ["node-b"] });
 
   // The catalogue, as the real API derives it: one entry per family, naming the
   // image a create would resolve to. Written out rather than computed, because

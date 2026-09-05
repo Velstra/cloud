@@ -38,6 +38,13 @@ struct Args {
     #[arg(long, env = "VELSTRA_STORE_BACKUP_DIR", default_value = "")]
     store_backup_dir: String,
 
+    /// Print the REST surface as OpenAPI 3.1 and exit, serving nothing.
+    ///
+    /// The same document `GET /api/v1/openapi.json` answers with, for a client
+    /// generator that runs before there is a cell to ask.
+    #[arg(long)]
+    openapi: bool,
+
     /// The certificate and key to serve TLS with, as PEM files.
     ///
     /// Both or neither. Without them this port is plaintext and says so in the
@@ -150,6 +157,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if args.openapi {
+        print!("{}", velstra_cloud_api::openapi::pretty());
+        return Ok(());
+    }
 
     let static_tokens: Option<Arc<dyn TokenVerifier>> = match &args.token_file {
         Some(path) => {

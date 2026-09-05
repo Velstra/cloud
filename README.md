@@ -40,13 +40,17 @@ below are enforced, not documented). Built on top of them today:
   (never incremented) thereafter, and an hourly **session sweeper**;
 - a **controller set** over the pure reconcile functions — instances, volumes,
   snapshots, attachments, networks, routers, floating IPs, subnets, ports,
-  security groups, images, Ceph clusters, migrations, operations;
+  security groups, images, Ceph clusters, migrations, operations — plus a
+  drift scan that publishes how far each collection is behind and **alerts**
+  on the four conditions worth a pager (a silent machine, a pool nearly
+  full, a project out of quota, an object stuck), by webhook and mail;
 - a **node agent** with a `Vmm` trait and **QEMU + Cloud Hypervisor** backends,
   **Ceph/RBD** storage, and **live migration** (QMP pre-copy);
 - a self-contained **web console**.
 
 CI runs fmt/clippy/`cargo test`, a **contract-drift gate** (every served
-collection must appear in `docs/rest-contract.md`), the console in a real
+collection must appear in `docs/rest-contract.md`, and `docs/openapi.json`
+must be what the API generates), the console in a real
 headless browser against the contract, and **two real-VM boot tests**, one per
 VMM backend, on a runner with `/dev/kvm`.
 
@@ -166,6 +170,9 @@ Start with the first one if you have never run this.
   with pictures of the console it is describing.
 - `docs/rest-contract.md` — the HTTP surface, fixed. The API serves it and the
   console consumes it; neither changes it alone.
+- `docs/openapi.json` — the same surface as OpenAPI 3.1, generated from the
+  router and the console's schema (never edited), served at
+  `/api/v1/openapi.json` and printed by `velstra-cloud-api --openapi`.
 - `docs/deployment-and-devices.md` — how a node is installed and what hardware
   it can hand a guest: the decision record behind the flake.
 - `docs/setup-guide.md` — from nothing to a machine running guests, twice: by

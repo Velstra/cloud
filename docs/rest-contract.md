@@ -6,6 +6,17 @@ serves it, the console consumes it. Neither may change it alone.
 gRPC is the native surface; this is the JSON gateway over the same handlers, so
 a field that is not here is not in the proto either.
 
+**The same surface as a document a program can read** is `docs/openapi.json`
+(OpenAPI 3.1), served by a running cell at `GET /api/v1/openapi.json` without a
+token and printed by `velstra-cloud-api --openapi`. It is generated, never
+edited: the collections are the router's own list, the field shapes are the
+console's form schema, the custom methods are the ones the router dispatches —
+and a test fails when the checked-in file is not what the code generates
+(`VELSTRA_WRITE_OPENAPI=1 cargo test -p velstra-cloud-api --test openapi`
+rewrites it). Feed it to a client generator or a Terraform provider framework;
+this document stays the place the *meaning* is written down, because a schema
+says what a field is called and not why it is derived or what refuses it.
+
 ## Names and shapes
 
 A resource is addressed the way AIP addresses one:

@@ -22,6 +22,7 @@
 //!   slot in a rate-limited queue, not a core and not its neighbours' latency.
 
 pub mod address;
+pub mod alerts;
 pub mod attachment;
 pub mod backoff;
 pub mod backup_schedule;

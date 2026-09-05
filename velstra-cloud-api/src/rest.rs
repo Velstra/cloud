@@ -75,6 +75,9 @@ pub fn router(api: Api) -> Router {
         // the token every other route demands. Behind the layer it would be a
         // door whose key is on the other side of it.
         .route("/api/v1/sessions", post(sign_in))
+        // Documentation, not data: the same schema the console page below
+        // embeds, so it is served the way the page is — without a token.
+        .route("/api/v1/openapi.json", get(openapi))
         .route("/", get(console))
         .route("/favicon.ico", get(favicon))
         // A deep link into the console is a path this API does not serve and
@@ -305,6 +308,17 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 
 /// The operator's console, held for the lifetime of the process rather than
 /// rebuilt per request — it is one document and it never changes.
+/// `GET /api/v1/openapi.json` — the surface as OpenAPI 3.1, derived from the
+/// router and the console's schema. See [`crate::openapi`].
+async fn openapi() -> Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        crate::openapi::pretty(),
+    )
+        .into_response()
+}
+
 async fn console() -> Response {
     axum::response::Html(velstra_cloud_console::page_ref()).into_response()
 }
