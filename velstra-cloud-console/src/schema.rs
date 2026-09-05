@@ -4038,7 +4038,7 @@ pub const COLLECTIONS: &[Collection] = &[
                     yes: "verified",
                     no: "unsigned",
                 },
-                width: 9,
+                width: 88,
             },
         ],
         agreements: &[],
