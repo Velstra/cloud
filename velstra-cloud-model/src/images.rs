@@ -281,9 +281,9 @@ impl SigningKey {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(text.trim())
             .map_err(|e| format!("not base64: {e}"))?;
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|b: Vec<u8>| format!("an Ed25519 public key is 32 bytes, this is {}", b.len()))?;
+        let key: [u8; 32] = bytes.try_into().map_err(|b: Vec<u8>| {
+            format!("an Ed25519 public key is 32 bytes, this is {}", b.len())
+        })?;
         Ok(Self(key))
     }
 
@@ -348,7 +348,12 @@ pub fn judge_signature(
                 .into(),
         );
     }
-    if !digest.starts_with("sha256:") || digest.len() != 7 + 64 {
+    // The hex is checked, not just the shape. A signature is a claim *about a
+    // digest*, so a digest that is not one makes the claim meaningless — and
+    // `sha256:` followed by sixty-four arbitrary characters would otherwise
+    // verify happily and be shown as `verified` in the console.
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return SignatureVerdict::Refused(format!(
             "a signature is over the digest line, and {digest:?} is not one (`sha256:<64 hex>`)"
         ));
@@ -380,9 +385,10 @@ pub fn judge_signature(
 
 #[cfg(test)]
 mod signature_tests {
-    use super::*;
     use base64::Engine;
     use ring::signature::KeyPair;
+
+    use super::*;
 
     fn keypair() -> (ring::signature::Ed25519KeyPair, SigningKey) {
         let rng = ring::rand::SystemRandom::new();
@@ -401,7 +407,11 @@ mod signature_tests {
     #[test]
     fn a_signature_under_a_configured_key_verifies_and_names_the_key() {
         let (pair, key) = keypair();
-        let verdict = judge_signature(DIGEST, Some(&sign(&pair, DIGEST)), std::slice::from_ref(&key));
+        let verdict = judge_signature(
+            DIGEST,
+            Some(&sign(&pair, DIGEST)),
+            std::slice::from_ref(&key),
+        );
         assert_eq!(
             verdict,
             SignatureVerdict::Verified {
@@ -428,17 +438,34 @@ mod signature_tests {
             SignatureVerdict::Refused(why) => assert!(why.contains("--image-signing-key"), "{why}"),
             v => panic!("{v:?}"),
         }
-        match judge_signature("sha256-abc", Some(&good), &[key]) {
+        match judge_signature("sha256-abc", Some(&good), std::slice::from_ref(&key)) {
             SignatureVerdict::Refused(why) => assert!(why.contains("digest line"), "{why}"),
             v => panic!("{v:?}"),
+        }
+        // Sixty-four characters that are not hex is not a digest, however
+        // convincingly it is signed: the shape alone would have passed.
+        let not_hex = format!("sha256:{}", "z".repeat(64));
+        match judge_signature(
+            &not_hex,
+            Some(&sign(&pair, &not_hex)),
+            std::slice::from_ref(&key),
+        ) {
+            SignatureVerdict::Refused(why) => assert!(why.contains("64 hex"), "{why}"),
+            v => panic!("a signature over a digest that is not one was accepted: {v:?}"),
         }
     }
 
     #[test]
     fn no_signature_is_unsigned_not_refused_and_garbage_is_refused_before_any_key() {
         let (_, key) = keypair();
-        assert_eq!(judge_signature(DIGEST, None, std::slice::from_ref(&key)), SignatureVerdict::Unsigned);
-        assert_eq!(judge_signature(DIGEST, Some("  "), &[]), SignatureVerdict::Unsigned);
+        assert_eq!(
+            judge_signature(DIGEST, None, std::slice::from_ref(&key)),
+            SignatureVerdict::Unsigned
+        );
+        assert_eq!(
+            judge_signature(DIGEST, Some("  "), &[]),
+            SignatureVerdict::Unsigned
+        );
         assert!(matches!(
             judge_signature(DIGEST, Some("not base64!"), std::slice::from_ref(&key)),
             SignatureVerdict::Refused(_)
@@ -456,7 +483,10 @@ mod signature_tests {
         assert_eq!(SigningKey::parse(&format!(" {text}\n")).unwrap(), key);
         assert!(SigningKey::parse("AAAA").unwrap_err().contains("32 bytes"));
         assert!(SigningKey::parse("*").unwrap_err().contains("base64"));
-        assert_eq!(format!("{key:?}"), format!("SigningKey({})", key.fingerprint()));
+        assert_eq!(
+            format!("{key:?}"),
+            format!("SigningKey({})", key.fingerprint())
+        );
         assert_eq!(key.fingerprint().len(), 8);
     }
 }

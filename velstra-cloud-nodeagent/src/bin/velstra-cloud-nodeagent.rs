@@ -485,9 +485,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, String>>()?;
     config.require_signed_images = args.require_signed_images;
     if args.require_signed_images && config.image_signing_keys.is_empty() {
-        return Err("--require-signed-images without an --image-signing-key would refuse every \
+        return Err(
+            "--require-signed-images without an --image-signing-key would refuse every \
                     image; name the key the signatures are made under"
-            .into());
+                .into(),
+        );
     }
     let agent = match &args.api {
         Some(url) => {

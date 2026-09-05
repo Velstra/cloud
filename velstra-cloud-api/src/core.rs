@@ -754,8 +754,8 @@ impl Api {
         mut self,
         keys: Vec<velstra_cloud_model::images::SigningKey>,
     ) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("signing keys are named before the API is shared");
+        let inner =
+            Arc::get_mut(&mut self.inner).expect("signing keys are named before the API is shared");
         inner.image_signing_keys = keys;
         self
     }
@@ -2233,7 +2233,10 @@ impl Api {
             self.refuse_a_disk_that_is_not_free(&spec).await?;
         }
         if kind == "images" {
-            let digest = spec.get("digest").and_then(Value::as_str).map(str::to_string);
+            let digest = spec
+                .get("digest")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             self.judge_image_signature(&spec, digest.as_deref())?;
         }
         if kind == "image-sources" {
@@ -2460,7 +2463,10 @@ impl Api {
                 // Every image patch restates the digest — `check_rules` refuses
                 // one that does not, because an image is what its bytes are —
                 // so the signature is judged over the digest the patch carries.
-                let digest = spec.get("digest").and_then(Value::as_str).map(str::to_string);
+                let digest = spec
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 self.judge_image_signature(spec, digest.as_deref())?;
             }
             if name.collection() == "instances" {
