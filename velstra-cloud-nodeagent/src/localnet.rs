@@ -1185,6 +1185,8 @@ mod balancer_addresses {
                 vip: Some(vip.to_string()),
                 listeners: Vec::new(),
                 members: Vec::new(),
+                session_affinity: false,
+                draining: Default::default(),
             },
             Default::default(),
         )

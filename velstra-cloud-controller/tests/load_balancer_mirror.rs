@@ -268,6 +268,8 @@ async fn a_load_balancer_is_programmed_follows_its_spec_and_is_torn_down() {
                         "projects/p1/ports/web".into(),
                         "projects/p1/ports/web2".into(),
                     ],
+                    session_affinity: false,
+                    draining: Default::default(),
                 },
                 LoadBalancerStatus::default(),
             ),

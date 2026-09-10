@@ -1493,10 +1493,14 @@ object — its status is written by the controller, like a router's.
     "subnet":  "projects/p1/subnets/prod-a",
     "vip": "10.20.0.20",
     "listeners": [ { "protocol": "Tcp", "port": 443, "memberPort": 8080 } ],
-    "members":   [ "projects/p1/ports/web-1-eth0" ] },
+    "members":   [ "projects/p1/ports/web-1-eth0",
+                   "projects/p1/ports/web-2-eth0" ],
+    "sessionAffinity": false,
+    "draining":  [ "projects/p1/ports/web-2-eth0" ] },
   "status": {
     "vip": "10.20.0.20",
-    "listeners": [ { "protocol": "Tcp", "port": 443, "members": 1 } ], … } }
+    "listeners": [ { "protocol": "Tcp", "port": 443,
+                     "members": 2, "draining": 1 } ], … } }
 ```
 
 What a client may rely on:
@@ -1521,14 +1525,35 @@ What a client may rely on:
   pool back with `Ready=False` reason `MembersNotReady` naming it; the fabric
   is never programmed with part of a pool, because a pool serving three of its
   four members looks balanced and silently leaves one out.
-- **There are no weights, no algorithm and no health checks — deliberately.**
-  The fabric spreads flows uniformly by connection hash and reports nothing
-  about a member's health, and this API does not carry a field nothing reads:
-  a weight the console displayed as if it biased traffic, or a health-check
-  policy nothing runs, would be the unverified-signature defect over again.
+- **`draining` names members being taken out of service.** They take no new
+  connections and keep the ones they have until the clients finish — which is
+  the difference between draining a member and removing it, because removing it
+  cuts its connections mid-request. Every name in `draining` has to be one of
+  `members`; one that is not is refused on write, because a name sitting there
+  matching nothing looks exactly like a member that has finished draining.
+  Draining *can* empty the pool, unlike a failed health check: it is an
+  instruction rather than an observation, and an operator draining everything
+  is asking the service to stop. `status.listeners[].draining` counts them, so
+  a drain that took can be told from one the platform ignored.
+- **`sessionAffinity` sends every connection from one client address to one
+  member**, instead of spreading each connection on its own — for a service
+  keeping something per client between connections. The cost is stated because
+  it is easy to ask for by accident: one client is one member, so a pool
+  fronting few busy clients spreads worse, and everyone behind one NAT is one
+  address and so one client. Turning it on or off moves clients exactly once.
+- **There are still no weights and no health-check policy — deliberately.**
+  This API does not carry a field nothing reads: a weight the console displayed
+  as if it biased traffic would be the unverified-signature defect over again.
   `status.listeners[].members` is a count of what is programmed, emphatically
-  not a health verdict. When the fabric grows any of these, the field arrives
-  with the code that honours it.
+  not a health verdict. Affinity and draining arrived under the same rule and
+  the other way round — with the datapath code that honours them, in both
+  datapaths, or they would not be here.
+- **An older fabric says so.** A cell whose fabric predates these two fields
+  accepts the service and ignores them, and answers a list with nothing where
+  they belong — which is how the controller can tell "off" from "not
+  understood". It programs the listeners and says in the condition's message
+  that connections are spread over the whole pool as if neither had been asked
+  for, rather than reporting a binding no packet obeys.
 - **Deleting waits for the fabric.** `DELETE` returns 202 and the object stays
   listable, carrying `fabric.velstra.io/release`, until every fabric service
   has been retired — an address that kept answering after its object vanished
@@ -1536,6 +1561,38 @@ What a client may rely on:
 - **Quota**: a project's `quota.loadBalancers` caps how many a project may
   hold, counted from what exists like every other dimension, and refused at
   create with `RESOURCE_EXHAUSTED`.
+
+### The address is the cell's, not the world's
+
+**A balancer's VIP is reachable from inside the cell.** A public address in
+front of a *service* is not yet a thing this platform does, and the shape of
+the gap is worth stating exactly, because two of the three pieces are already
+there and it is easy to conclude from that it works.
+
+What does work: a load balancer may name an **external** network and take its
+VIP from one of its subnets, and it is given one — counted against the same
+pool the ports and the floating IPs draw from, so it is a real address nothing
+else holds, inside a prefix a gateway node is already announcing. What does not
+work is the last hop. Neither datapath will hold that address:
+
+* **The node's own balancer** puts a VIP on the bridge for the VIP's subnet,
+  and builds that bridge only for a subnet one of its guests is on — holding
+  the *gateway* address of the segment while it does. For an external subnet
+  that would be this node claiming to be the upstream router of somebody else's
+  network, which is the same thing it refuses to do for a network on a host
+  bridge. It declines, and the balancer reads `Ready=False` with reason
+  `NoDataPlane` saying no node is answering — which is true, and is the whole
+  of what it can say.
+* **The fabric** associates a floating IP to a `port_id` and a fixed address —
+  one guest interface. A service has no port; its VIP is not an interface
+  anything holds. Translating a public address onto a VIP means a second NAT
+  in front of the balancer's own, and that is fabric work.
+
+So today a public service is a guest with a **routed** floating IP — the guest
+holds the public address itself and answers for it — and a balancer in front of
+several guests serves the cell. Do not read the accepted external VIP as more
+than it is: the object is honest about it in its condition, and this paragraph
+exists so the plan is not mistaken for the feature.
 
 Like `security-groups`, this collection is served on the JSON surface only;
 there is no gRPC service for it yet.
@@ -1568,6 +1625,13 @@ listener on 443 and a guest that speaks TLS:
 { "spec": { "listeners": [ { "protocol": "Tcp", "port": 443, "memberPort": 443 } ],
             "members": [ "projects/p1/ports/web-a", "projects/p1/ports/web-b" ] } }
 ```
+
+`sessionAffinity` and `draining` mean the same thing here as on a fabric, and
+are honoured the same way: a draining member is left out of the rotation while
+its open connections keep being spliced, and affinity picks the member from a
+hash of the client's address instead of a counter — the same bytes hashed the
+same way the fabric hashes them, so a service that moves between datapaths moves
+its clients once rather than reshuffling them.
 
 Two more things it does not do, stated so nobody looks for them: it balances
 **only across members on the node holding the address** — without a fabric there

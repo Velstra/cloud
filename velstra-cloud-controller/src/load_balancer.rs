@@ -248,8 +248,15 @@ impl LoadBalancerController {
                     .map(|m| FabricMember {
                         port_id: m.port_id,
                         port: m.port as u16,
+                        // Exactly what the fabric said, absence included: a
+                        // fabric older than the field says nothing, and
+                        // `same_service` leaves it out of the comparison rather
+                        // than reading it as "not draining" and rebuilding this
+                        // service on every pass.
+                        draining: m.draining,
                     })
                     .collect(),
+                client_affinity: s.client_affinity,
             });
         }
         Ok((held, alien))
@@ -296,8 +303,10 @@ impl LoadBalancerController {
                 .map(|m| pb::LbMember {
                     port_id: m.port_id.clone(),
                     port: m.port as u32,
+                    draining: Some(m.draining.unwrap_or(false)),
                 })
                 .collect(),
+            client_affinity: Some(service.client_affinity.unwrap_or(false)),
         }
     }
 }
@@ -367,6 +376,14 @@ impl Reconciler for LoadBalancerController {
             vip: _,       // the address itself — decided by `address`
             listeners: _, // one fabric service each, below
             members: _,   // resolved to fabric port ids below
+            // Resolved to fabric port ids alongside the members, and handed to
+            // `desired_services`, which marks those members rather than
+            // dropping them — a draining member the fabric stopped knowing
+            // about is one whose connections have nothing holding them.
+            draining: _,
+            // Carried onto each fabric service; the data plane hashes the
+            // client's address alone when it is set.
+            session_affinity: _,
         } = &lb.spec;
 
         // The address first, and always: a cell with no fabric still decides
@@ -480,7 +497,29 @@ impl Reconciler for LoadBalancerController {
             }
         };
 
-        let desired = desired_services(name, &lb.spec, network.spec.vni, &vip, &member_ids);
+        // The same resolution the members get: a name here is a *member*, so
+        // it resolves through the same ports and the same fabric lookup, and a
+        // member not ready yet has already stopped the pass above.
+        let draining_ids = match self
+            .resolve_members(&fabric_ports, &lb.spec.draining)
+            .await?
+        {
+            Ok(ids) => ids.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            Err(why) => {
+                return self
+                    .settle(lb, ConditionStatus::False, "MembersNotReady", &why, None)
+                    .await;
+            }
+        };
+
+        let desired = desired_services(
+            name,
+            &lb.spec,
+            network.spec.vni,
+            &vip,
+            &member_ids,
+            &draining_ids,
+        );
         let (held, alien) = match self.held(&mut client, name).await {
             Ok(answer) => answer,
             Err(status) => {
@@ -538,8 +577,20 @@ impl Reconciler for LoadBalancerController {
             }
         }
 
+        // What this fabric can actually do. A fabric older than these fields
+        // accepts the service and ignores them, and it says so by answering a
+        // list with nothing where they belong. Saying `Programmed` over that
+        // would be the platform claiming a binding no packet obeys.
+        let asked_for_more = lb.spec.session_affinity || !lb.spec.draining.is_empty();
+        let fabric_is_silent = held
+            .iter()
+            .any(|s| s.client_affinity.is_none() || s.members.iter().any(|m| m.draining.is_none()));
         let message = if member_ids.is_empty() {
             "the pool is empty; the address answers and forwards to nothing"
+        } else if asked_for_more && fabric_is_silent {
+            "the fabric on this cell is older than sessionAffinity and draining and does not \
+             answer for them: every listener is programmed, and connections are spread over the \
+             whole pool as if neither had been asked for. Upgrade the fabric to have them apply"
         } else {
             ""
         };
@@ -703,6 +754,8 @@ mod tests {
                         member_port: 0,
                     }],
                     members: vec![],
+                    session_affinity: false,
+                    draining: Default::default(),
                 },
                 LoadBalancerStatus::default(),
             );

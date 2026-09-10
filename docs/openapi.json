@@ -1039,6 +1039,14 @@
         "additionalProperties": true,
         "description": "One address in front of many ports. The fabric balances by connection on whichever host traffic arrives at — there is no appliance to place and nothing to fail over. Nothing here probes a member's health: the pool is what was declared, not a judgement about it.",
         "properties": {
+          "draining": {
+            "description": "Members being taken out of service: they take no new connections and keep the ones they have until the clients are done. Every name here has to be one of the members. Removing a member outright cuts its connections instead.",
+            "items": {
+              "description": "The name of a `ports` object.",
+              "type": "string"
+            },
+            "type": "array"
+          },
           "listeners": {
             "description": "The ports the address answers on. Traffic is spread across the pool by connection, so one client's connection stays on one member.",
             "items": {
@@ -1058,6 +1066,10 @@
           "network": {
             "description": "The name of a `networks` object. The network the address lives on. It scopes the service, so two projects may front the same address on different networks.",
             "type": "string"
+          },
+          "sessionAffinity": {
+            "description": "For a service that keeps something per client between connections — a session in memory, an upload in pieces. The cost: one client is one member, so a pool fronting few busy clients spreads worse, and everyone behind one NAT counts as one client.",
+            "type": "boolean"
           },
           "subnet": {
             "description": "The name of a `subnets` object. Where the address comes from. The same counting as a port's address and a floating IP's, so no two of them are ever the same address.",
