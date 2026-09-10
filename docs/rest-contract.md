@@ -888,7 +888,10 @@ API judges it at admission under the keys it was started with
 (`--image-signing-key`, repeatable; `VELSTRA_IMAGE_SIGNING_KEYS`, comma-separated):
 
 - no signature: the image is stored unsigned; whether a node boots it is the
-  node's policy;
+  node's policy — `--require-signed-images` refuses it **before a disk is made
+  from it**, not only before the bytes are fetched. Those are not the same
+  door: an image already in a node's cache is never fetched again, so a gate on
+  the fetch alone stopped nothing on a cell that had been running;
 - a signature that verifies: stored;
 - a signature that does not verify, or any signature offered to a cell with no
   keys: `400 INVALID_ARGUMENT` at `spec.signature`, with the reason.

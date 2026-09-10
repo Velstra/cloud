@@ -1906,7 +1906,7 @@ impl Agent {
                 // is passed separately: the two used to be the same string, and
                 // that forced every image to be called `sha256-<64 hex>` in
                 // every list an operator reads.
-                Some(image) => match self.image_may_be_fetched(digest, image) {
+                Some(image) => match self.image_may_be_used(digest, image) {
                     Ok(()) => self
                         .vmm
                         .pull_image(digest, &image.digest, &image.source_url)
@@ -1933,6 +1933,15 @@ impl Agent {
                 // reason — but the default is the safe one either way, since a
                 // raw copy of a raw image is what it always was.
                 let known = cell.images.get(image.as_str());
+                // The same judgement the fetch makes, here too. A cached image
+                // is one no `PullImage` is ever emitted for, so this is the
+                // only door left: without it, turning signature enforcement on
+                // stopped nothing that was already on the disk.
+                if let Some(spec) = known
+                    && let Err(why) = self.image_may_be_used(image, spec)
+                {
+                    return Err(why);
+                }
                 let format = known.map(|i| i.format).unwrap_or_default();
                 // The bytes are on disk under their digest, so that is what
                 // finds them. An image the cell does not have leaves this empty,
@@ -2830,11 +2839,20 @@ fn is_release(action: &Action) -> bool {
 pub const RELEASE_FINALIZER: &str = NODE_RELEASE_FINALIZER;
 
 impl Agent {
-    /// Whether this node may fetch `image` at all: its signature, if it has
+    /// Whether this node may **use** `image` at all: its signature, if it has
     /// one, verifies under this node's keys; and if the node was told to insist
     /// on signatures, it has one. The sentence names what stopped it, because
     /// "the image never arrived" is how this would otherwise read.
-    fn image_may_be_fetched(
+    ///
+    /// Asked before a fetch *and* before a disk is made from one, which is not
+    /// the same question twice. It used to be asked only where the bytes were
+    /// fetched, and `PullImage` is emitted only when the bytes are **absent**
+    /// — so every image already in a node's cache went on booting after
+    /// `--require-signed-images` was turned on, including through new unsigned
+    /// image objects any tenant could register on a cached digest. The
+    /// contract says the node "judges again before it fetches"; that was true
+    /// and it was not the whole rule.
+    fn image_may_be_used(
         &self,
         name: &str,
         image: &velstra_cloud_model::resources::ImageSpec,

@@ -119,17 +119,28 @@ struct Args {
 
     /// Publish an image into the cluster and exit, instead of running the agent.
     ///
-    /// The image service, such as it is. Takes the resource name — which carries
-    /// the digest — and the file, verifies the second against the first, and
-    /// leaves a protected `@base` snapshot every volume can clone from.
+    /// The image service, such as it is. Takes the resource name and the file,
+    /// verifies the file against the digest the image carries, and leaves a
+    /// protected `@base` snapshot every volume can clone from.
     ///
-    ///   --import-image projects/p1/images/sha256-… --from ./noble.raw
+    /// The digest comes from `--digest` when the name does not carry one, which
+    /// is the ordinary case: an image the API minted is called
+    /// `debian-13-cbf3e1f5` and a capture is `<label>-sha256-<hex>`.
+    ///
+    ///   --import-image projects/p1/images/debian-13-cbf3e1f5 \
+    ///     --digest sha256:cbf3e1f5… --from ./noble.raw
     #[arg(long, requires = "import_from")]
     import_image: Option<String>,
 
     /// The file `--import-image` publishes.
     #[arg(long = "from")]
     import_from: Option<PathBuf>,
+
+    /// The digest the file must hash to — `sha256:<hex>` or `sha512:<hex>`,
+    /// the image's own `spec.digest`. Taken from the image's name when it is
+    /// one, which most names are not.
+    #[arg(long)]
+    digest: Option<String>,
 
     /// What the fake backend claims to hold. Ignored by every real one, which
     /// measures the filesystem instead.
@@ -183,7 +194,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exits rather than being a mode the agent runs in.
     if let (Some(image), Some(file)) = (&args.import_image, &args.import_from) {
         let ceph = CephPool::new(ceph_config(&args));
-        return match ceph.import_image(image, file).await {
+        // The name is a fallback, not the source: it is one only for an image
+        // an image-source published.
+        let digest = args.digest.clone().unwrap_or_else(|| image.clone());
+        return match ceph.import_image(image, &digest, file).await {
             Ok(true) => {
                 tracing::info!(image, pool = %args.ceph_image_pool, "published");
                 Ok(())
