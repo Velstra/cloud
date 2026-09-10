@@ -40,7 +40,7 @@ use std::{
 };
 
 use velstra_cloud_model::{
-    loadbalancer::{LoadBalancer, serving},
+    loadbalancer::{LoadBalancer, Protocol, serving},
     resources::Port,
 };
 
@@ -124,6 +124,18 @@ pub fn plan(
             continue;
         }
         for listener in &balancer.spec.listeners {
+            // **TCP only, and said out loud.** This balancer accepts a
+            // connection and splices it; there is no such thing for UDP, which
+            // has no connection to accept. The protocol was not read at all, so
+            // a `Udp` listener quietly became a TCP one — and a balancer with
+            // both TCP/53 and UDP/53 produced two identical services that the
+            // `dedup` below folded into one, so half the ask vanished without a
+            // word. A listener this datapath cannot serve is left out; the
+            // balancer's condition then names the nodes serving it and does not
+            // claim this one.
+            if listener.protocol != Protocol::Tcp {
+                continue;
+            }
             // Zero means "the port the client asked for", which for a
             // passthrough balancer is the listener's own.
             let member_port = if listener.member_port == 0 {
@@ -358,6 +370,40 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             vec!["10.19.136.2:8080", "10.19.136.3:8080"]
+        );
+    }
+
+    /// A listener this datapath cannot serve is left out, not served wrongly.
+    ///
+    /// The protocol was never read. `start` binds a `TcpListener`, so a `Udp`
+    /// listener quietly became a TCP one — and TCP/53 beside UDP/53 produced
+    /// two identical `Service` values that `dedup` folded into one, so half of
+    /// what was asked for disappeared without a word.
+    #[test]
+    fn a_udp_listener_is_left_out_rather_than_bound_as_tcp() {
+        let ports = BTreeMap::from([port("projects/p1/ports/a", "10.19.136.2")]);
+        let answering = BTreeMap::from([("projects/p1/ports/a".to_string(), vec![53u32])]);
+        let mut both = balancer(
+            vec![listener(53, 53), listener(53, 53)],
+            vec!["projects/p1/ports/a"],
+        );
+        both.spec.listeners[1].protocol = Protocol::Udp;
+
+        let served = plan(&[both], &ports, &everything, &answering);
+        assert_eq!(
+            served.len(),
+            1,
+            "the UDP listener was either bound as TCP or folded into it: {served:?}"
+        );
+        assert_eq!(served[0].at.to_string(), "10.19.136.9:53");
+
+        // A balancer that is *only* UDP serves nothing here, rather than
+        // serving TCP and reporting itself as done.
+        let mut udp_only = balancer(vec![listener(53, 53)], vec!["projects/p1/ports/a"]);
+        udp_only.spec.listeners[0].protocol = Protocol::Udp;
+        assert!(
+            plan(&[udp_only], &ports, &everything, &answering).is_empty(),
+            "a UDP-only balancer was served over TCP"
         );
     }
 

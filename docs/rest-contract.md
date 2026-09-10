@@ -1657,6 +1657,11 @@ hash of the client's address instead of a counter — the same bytes hashed the
 same way the fabric hashes them, so a service that moves between datapaths moves
 its clients once rather than reshuffling them.
 
+**TCP only.** This balancer accepts a connection and splices it, and there is
+no such thing for UDP — so a `Udp` listener is left out of what this node
+serves rather than bound as TCP, and the balancer's condition names the nodes
+that do serve it. On a fabric cell both protocols are programmed.
+
 Two more things it does not do, stated so nobody looks for them: it balances
 **only across members on the node holding the address** — without a fabric there
 is no path from one machine to a guest on another, so a member elsewhere is one

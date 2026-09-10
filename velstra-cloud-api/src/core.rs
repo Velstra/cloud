@@ -8509,6 +8509,74 @@ fn check_image(spec: &Value, document: Document) -> ApiResult<()> {
     Ok(())
 }
 
+/// Refuse a subnet that describes a segment the node cannot build.
+///
+/// **Where this was missing.** Nothing validated a subnet at all, and a node
+/// takes its two fields almost verbatim: `plan` runs
+/// `ip addr replace <gateway>/<prefix> dev <bridge>`, and the NAT rule is
+/// written from the CIDR. The only check anywhere was that the gateway's
+/// *family* matched the range — so a tenant could write `10.0.0.0/24` with a
+/// gateway of `192.168.1.1` and put a route on the node that competes with its
+/// own management address, or a CIDR of `0.0.0.0/0` and have the node
+/// masquerade the world.
+///
+/// A subnet is one of the few things a tenant writes that a node acts on
+/// directly, so this is where it is judged: a refusal here is a sentence
+/// somebody reads, and the same mistake found on the node is a warning in a
+/// journal on a machine they do not have.
+fn check_subnet(spec: &Value, document: Document) -> ApiResult<()> {
+    use velstra_cloud_model::network::Cidr;
+
+    let text = |key: &str| spec.get(key).and_then(Value::as_str).unwrap_or_default();
+    let (cidr, gateway) = (text("cidr"), text("gateway"));
+    // A change carries what it changes, so a patch that names neither is not
+    // about the shape of the segment.
+    if document == Document::Part && cidr.is_empty() && gateway.is_empty() {
+        return Ok(());
+    }
+    let Ok(range) = Cidr::parse(cidr) else {
+        return Err(ApiError::invalid(format!(
+            "`{cidr}` is not a range — a subnet is written `10.0.0.0/24` or `fd00:1::/64`, and \
+             the node builds its segment out of exactly this"
+        ))
+        .at("spec.cidr"));
+    };
+    // A range this wide is not a subnet, it is every address there is: the
+    // node would masquerade out of it and route into it, and nothing else on
+    // the machine would be reachable.
+    let too_wide = if range.address.is_ipv4() { 8 } else { 16 };
+    if range.prefix_len < too_wide {
+        return Err(ApiError::invalid(format!(
+            "/{} is wider than a segment can be (/{too_wide} at most): the node holds this \
+             range on a bridge and translates out of it, so a range that covers the machine's \
+             own addresses takes the machine off its network",
+            range.prefix_len
+        ))
+        .at("spec.cidr"));
+    }
+    if gateway.is_empty() {
+        return Ok(());
+    }
+    let Ok(address) = gateway.parse::<std::net::IpAddr>() else {
+        return Err(ApiError::invalid(format!(
+            "`{gateway}` is not an address, and the node puts this one on a bridge as the \
+             segment's way out"
+        ))
+        .at("spec.gateway"));
+    };
+    // The check that was actually missing. A gateway outside its own range is
+    // a route the node installs on itself for somebody else's network.
+    if !range.contains(address) {
+        return Err(ApiError::invalid(format!(
+            "the gateway {gateway} is not inside {cidr}, so no guest on this segment could \
+             reach it — and the node would hold that address on its bridge, competing with \
+             whatever else on this machine is on {gateway}"
+        ))
+        .at("spec.gateway"));
+    }
+    Ok(())
+}
+
 fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     if kind == "load-balancers" {
         check_listeners(spec)?;
@@ -8525,6 +8593,9 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     }
     if kind == "roles" {
         return check_role(spec);
+    }
+    if kind == "subnets" {
+        return check_subnet(spec, document);
     }
     if kind != "security-groups" {
         return Ok(());

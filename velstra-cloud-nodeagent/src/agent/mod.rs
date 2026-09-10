@@ -1879,6 +1879,7 @@ impl Agent {
                     // A dual-stack guest gets a second port, so both are
                     // guarded, each by its own chain.
                     addresses: port.spec.address.iter().cloned().collect(),
+                    mac: port.spec.mac.clone(),
                     rules: self.rules_for(&port.spec, groups, ports),
                 })
             })
