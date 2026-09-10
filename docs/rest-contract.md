@@ -1562,6 +1562,38 @@ What a client may rely on:
   hold, counted from what exists like every other dimension, and refused at
   create with `RESOURCE_EXHAUSTED`.
 
+### The address is the cell's, not the world's
+
+**A balancer's VIP is reachable from inside the cell.** A public address in
+front of a *service* is not yet a thing this platform does, and the shape of
+the gap is worth stating exactly, because two of the three pieces are already
+there and it is easy to conclude from that it works.
+
+What does work: a load balancer may name an **external** network and take its
+VIP from one of its subnets, and it is given one — counted against the same
+pool the ports and the floating IPs draw from, so it is a real address nothing
+else holds, inside a prefix a gateway node is already announcing. What does not
+work is the last hop. Neither datapath will hold that address:
+
+* **The node's own balancer** puts a VIP on the bridge for the VIP's subnet,
+  and builds that bridge only for a subnet one of its guests is on — holding
+  the *gateway* address of the segment while it does. For an external subnet
+  that would be this node claiming to be the upstream router of somebody else's
+  network, which is the same thing it refuses to do for a network on a host
+  bridge. It declines, and the balancer reads `Ready=False` with reason
+  `NoDataPlane` saying no node is answering — which is true, and is the whole
+  of what it can say.
+* **The fabric** associates a floating IP to a `port_id` and a fixed address —
+  one guest interface. A service has no port; its VIP is not an interface
+  anything holds. Translating a public address onto a VIP means a second NAT
+  in front of the balancer's own, and that is fabric work.
+
+So today a public service is a guest with a **routed** floating IP — the guest
+holds the public address itself and answers for it — and a balancer in front of
+several guests serves the cell. Do not read the accepted external VIP as more
+than it is: the object is honest about it in its condition, and this paragraph
+exists so the plan is not mistaken for the feature.
+
 Like `security-groups`, this collection is served on the JSON surface only;
 there is no gRPC service for it yet.
 
