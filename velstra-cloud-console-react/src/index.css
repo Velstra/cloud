@@ -1,0 +1,194 @@
+@import "tailwindcss";
+
+/* The Velstra Cloud tokens, carried over unchanged from
+   velstra-cloud-console/src/assets/tokens.css and light.css — including
+   today's corrections. The point of this spike is to compare the stack, not
+   the palette: both consoles must look like the same product. */
+@theme {
+  --color-ink-950: #080c11;
+  --color-ink-900: #0b0f14;
+  --color-ink-850: #10161d;
+  --color-ink-800: #141a22;
+  --color-ink-700: #19212b;
+  --color-ink-600: #1d2630;
+  --color-ink-500: #2a3441;
+  --color-ink-400: #3a4658;
+  --color-slate-400: #8b9bb0;
+  --color-slate-300: #7b8a9e;
+  --color-slate-100: #e8edf2;
+  --color-signal-400: #4fb2dc;
+  --color-signal-500: #2e96c4;
+  --color-signal-600: #2179a1;
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-lg: 6px;
+
+  --ease-settle: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+:root {
+  color-scheme: dark;
+  --bg-app: #0b0f14;
+  --surface: #141a22;
+  --surface-raised: #19212b;
+  --surface-sunken: #10161d;
+  --surface-hover: #1d2630;
+  --sidebar-bg: #080c11;
+  --text-strong: #f4f8fb;
+  --text-body: #e8edf2;
+  --text-muted: #8b9bb0;
+  --text-faint: #7b8a9e;
+  --border: #2a3441;
+  --border-strong: #3a4658;
+  --border-subtle: #1d2630;
+  --brand: #2e96c4;
+  --brand-hover: #4fb2dc;
+  --on-brand: #080c11;
+  --focus-ring: #2e96c4;
+  --glow-focus: 0 0 0 3px rgba(46, 150, 196, 0.32);
+  --settled: #34d399;
+  --drifting: #fbbf24;
+  --failing: #f87171;
+  --dot-settled: #10b981;
+  --dot-drifting: #f59e0b;
+  --dot-failing: #ef4444;
+  --wash-signal: rgba(46, 150, 196, 0.1);
+  --product: #2e96c4;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg-app: #f4f6fa;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-sunken: #f2f5fa;
+  --surface-hover: #e9eef7;
+  --sidebar-bg: #edf1f8;
+  --text-strong: #0b0e14;
+  --text-body: #1d2431;
+  --text-muted: #535f70;
+  --text-faint: #5f6c7e;
+  --border: #dde3ec;
+  --border-strong: #c6cfdc;
+  --border-subtle: #e8edf4;
+  --brand: #2179a1;
+  --brand-hover: #2e96c4;
+  --on-brand: #ffffff;
+  --focus-ring: #2179a1;
+  --glow-focus: 0 0 0 3px rgba(33, 121, 161, 0.22);
+  --settled: #146c2e;
+  --drifting: #805500;
+  --failing: #b3202b;
+  --dot-settled: #1a7f37;
+  --dot-drifting: #9a6700;
+  --dot-failing: #cf222e;
+  --wash-signal: rgba(33, 121, 161, 0.09);
+  --product: #1b6c8e;
+}
+
+
+/* shadcn's primitives are written against its own variable names. Pointing
+   those at the Velstra tokens is what keeps the spike a comparison of stacks
+   rather than of palettes: the same button, drawn in the same colours. */
+@theme inline {
+  --color-background: var(--bg-app);
+  --color-foreground: var(--text-body);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--text-body);
+  --color-popover: var(--surface-raised);
+  --color-popover-foreground: var(--text-body);
+  --color-primary: var(--brand);
+  --color-primary-foreground: var(--on-brand);
+  --color-secondary: var(--surface-raised);
+  --color-secondary-foreground: var(--text-body);
+  --color-muted: var(--surface-sunken);
+  --color-muted-foreground: var(--text-muted);
+  --color-accent: var(--surface-hover);
+  --color-accent-foreground: var(--text-strong);
+  --color-destructive: var(--failing);
+  --color-border: var(--border);
+  --color-input: var(--border-strong);
+  --color-ring: var(--focus-ring);
+  --radius: 4px;
+}
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg-app);
+  color: var(--text-body);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- motion ---------------------------------------------------------------
+   Every movement here answers one of three questions: where did this come
+   from, what just changed, or is it still working. Nothing moves to look
+   alive. Durations and the settle curve are the console's own tokens; every
+   animation has a still equivalent that carries the same fact, chosen by the
+   system (`prefers-reduced-motion`) or by the person (`data-motion="reduced"`
+   on the root, from the palette). */
+:root {
+  --dur-press: 100ms; --dur-fast: 140ms; --dur-base: 220ms; --dur-slow: 320ms;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+}
+@keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes slide-in-right { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: none; } }
+@keyframes pop { 0% { transform: scale(1); } 35% { transform: scale(1.28); } 100% { transform: scale(1); } }
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* Arrivals: a pane that slides in says which edge it belongs to; a screen
+   that fades up says it is new rather than the old one re-drawn. Once, on
+   mount — never on every re-render. */
+.arrive-up   { animation: fade-up var(--dur-base) var(--ease-settle) 1 both; }
+.arrive-right { animation: slide-in-right var(--dur-base) var(--ease-settle) 1 both; }
+/* A count that changed says so with a tick, not a colour. */
+.ticked { animation: pop var(--dur-slow) var(--ease-settle) 1; }
+/* Something is being worked on: the dot breathes. */
+.breathing { animation: breathe 1.2s var(--ease-out) infinite; }
+/* Still reading: a sheen moves across the placeholder, so a page that is
+   waiting is told apart from a page that is empty. */
+.shimmer {
+  background: linear-gradient(90deg, var(--surface-sunken) 0%, var(--surface-hover) 40%, var(--surface-sunken) 80%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+/* The press: a squash under the finger, on the press and not the release. */
+.press { transition: transform var(--dur-press) var(--ease-out), background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out); }
+.press:active { transform: scale(.97); }
+/* A rail group folds: height, not display, so the list is seen to go. */
+.fold { display: grid; grid-template-rows: 1fr; transition: grid-template-rows var(--dur-base) var(--ease-settle); }
+.fold[data-closed="true"] { grid-template-rows: 0fr; }
+.fold > * { overflow: hidden; min-height: 0; }
+/* Route changes cross-fade through the View Transitions API, when the
+   browser has it; the old screen is not yanked out from under the pointer. */
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: var(--dur-base); animation-timing-function: var(--ease-settle); }
+
+/* The still equivalents. */
+@media (prefers-reduced-motion: reduce) {
+  .arrive-up, .arrive-right, .ticked, .shimmer { animation: none; }
+  .breathing { animation: none; outline: 1px solid currentColor; outline-offset: 1px; }
+  .press, .fold { transition: none; }
+  ::view-transition-old(root), ::view-transition-new(root) { animation: none; }
+}
+:root[data-motion="reduced"] .arrive-up, :root[data-motion="reduced"] .arrive-right,
+:root[data-motion="reduced"] .ticked, :root[data-motion="reduced"] .shimmer { animation: none; }
+:root[data-motion="reduced"] .breathing { animation: none; outline: 1px solid currentColor; outline-offset: 1px; }
+:root[data-motion="reduced"] .press, :root[data-motion="reduced"] .fold { transition: none; }
+:root[data-motion="reduced"] tr[data-changed="true"] > td { animation: none; }
+:root[data-motion="reduced"] tr[data-changed="true"] > td:first-child { box-shadow: inset 2px 0 0 var(--brand); }
+
+/* A row whose verdict changed on the last refresh, said once. Same rule as the
+   console it is being compared with, including the still equivalent. */
+@keyframes noticed { from { background: var(--wash-signal); } to { background: transparent; } }
+tr[data-changed="true"] > td { animation: noticed 900ms var(--ease-settle) 1; }
+@media (prefers-reduced-motion: reduce) {
+  tr[data-changed="true"] > td { animation: none; }
+  tr[data-changed="true"] > td:first-child { box-shadow: inset 2px 0 0 var(--brand); }
+}

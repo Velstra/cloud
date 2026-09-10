@@ -1,0 +1,147 @@
+{
+  "version": 1,
+  "note": "Filled in by hand. `21st init --design-context` detects nothing here: it looks for a JS framework and a token file it recognises, and this console is a Rust crate that inlines its own CSS and JS. Everything below was read out of those files or measured in a browser against the running console. `21st init --design-context --refresh` would overwrite it.",
+  "project": {
+    "name": "velstra-cloud-console",
+    "productType": "operator console for an IaaS control plane",
+    "stack": ["rust", "vanilla-js", "vanilla-css", "no-framework", "no-build-step"]
+  },
+  "sources": {
+    "tokens": [
+      "velstra-cloud-console/src/assets/tokens.css",
+      "velstra-cloud-console/src/assets/light.css"
+    ],
+    "components": [
+      "velstra-cloud-console/src/assets/console.css",
+      "velstra-cloud-console/src/assets/board.js",
+      "velstra-cloud-console/src/assets/detail.js",
+      "velstra-cloud-console/src/assets/form.js",
+      "velstra-cloud-console/src/assets/model.js",
+      "velstra-cloud-console/src/assets/shell.html"
+    ],
+    "assets": [],
+    "instructions": [
+      "velstra-cloud-console/src/lib.rs (module doc: what the console is for)",
+      "velstra-cloud-console/src/assets/tokens.css (the reasoning is in the comments)"
+    ]
+  },
+  "design": {
+    "colorMode": "dark-first, both appearances re-pointed from one token set",
+    "colors": {
+      "ground": "--bg-app #0b0f14 dark / #f4f6fa light",
+      "surface": "--surface, --surface-raised, --surface-sunken, --surface-hover",
+      "text": "--text-strong, --text-body, --text-muted, --text-faint (four levels, every one at or above 4.5:1 on every ground it is painted on)",
+      "interaction": "--brand / signal blue #2e96c4 dark, #2179a1 light — links, focus, selection, active navigation, the one primary action",
+      "status-dot": "--green-500 / --amber-500 / --red-500",
+      "status-text": "--green-300 / --amber-300 / --red-300 — the same three at text weight, lighter on dark and darker on light",
+      "verdicts": "--settled, --drifting, --failing (a fourth, unreported, is --text-muted)",
+      "product": "--product, the platform's own mark; never the interaction colour"
+    },
+    "typography": {
+      "families": "--font-sans: system-ui stack only; --font-mono: ui-monospace stack. No webfont, ever.",
+      "scale": "--text-2xs .6875rem, --text-xs .75rem, --text-sm .8125rem, --text-base .875rem, --text-lg 1.0625rem, --text-xl 1.375rem, --text-display 2rem, --text-hero 2.5rem",
+      "weights": "--fw-regular 400, --fw-medium 500, --fw-semibold 600, --fw-bold 700",
+      "tracking": "a function of size: --tracking-hero -.032em through --tracking-caps .07em",
+      "mono-is-for": "object names, paths, identifiers, log lines, wire addresses"
+    },
+    "spacing": {
+      "scale": "--space-1 .25rem through --space-9 3rem",
+      "reading-layout": "--gutter 180px + --gutter-gap 28px — labels have one left edge, content the other",
+      "rail": "--rail-w 232px"
+    },
+    "radius": {
+      "scale": "--radius-xs 3px, --radius-sm 4px, --radius-md 4px, --radius-lg 6px, --radius-pill 999px",
+      "rule": "4px default, 6px the largest ordinary surface, pill for status dots only"
+    },
+    "shadows": {
+      "scale": "--shadow-sm, --shadow-md, --shadow-lg, --edge-top",
+      "rule": "elevation and a 1px border say 'this is over that'; no tint, no blur"
+    },
+    "motion": {
+      "durations": "--dur-press 100ms, --dur-fast 140ms, --dur-base 220ms, --dur-slow 320ms",
+      "easing": "--ease-out, --ease-in-out, --ease-settle (critically damped: arrives and stops, no overshoot)",
+      "rule": "almost nothing moves; what does, moves because it carries information",
+      "reduced-motion": "every animation has a still equivalent that says the same thing"
+    },
+    "density": "compact — dense tables, 13px body, 44px row pitch"
+  },
+  "components": {
+    "installed": [],
+    "preferredPrimitives": [
+      ".btn / .btn.primary / .btn.quiet — the quiet one takes its colour when the pointer arrives",
+      ".btn.busy — a press that waits on the API says so; use it, do not invent a spinner",
+      ".state.<verdict> + mark() — the verdict word and its dot, the one way status is shown",
+      ".overpanel / .overrow / .linky — the overview's panel, row and way-through",
+      ".tally / .tallybtn — a count broken into parts that narrow the list under them",
+      ".tblwrap > table — every wide thing scrolls in its own container",
+      ".railitem / .railhome — navigation; .on is the active one",
+      "el() in dom.js — the only element factory; there is no template language"
+    ],
+    "patterns": [
+      "spec vs status, and a verdict derived from generation against observed_generation in one function so no two screens disagree",
+      "board (list) → sheet (one object, modal drawer with a scrim) → form",
+      "the margin column carries the label, the content column carries the answer"
+    ]
+  },
+  "constraints": {
+    "must": [
+      "Fetch nothing. No CDN, no webfont, no icon set, no framework: an operator opens this during an incident, sometimes from a network that reaches only the API.",
+      "Define every custom property you reference. A var() with no definition and no fallback is an invalid declaration that silently does nothing — 25 of them were found this way on 2026-09-06.",
+      "Keep both appearances resolving from one token set; never write a colour literal in a component rule.",
+      "Every text colour clears 4.5:1 on every ground it is actually painted on, measured by compositing, not read off the token table.",
+      "Colour is never the only carrier: a verdict is a word and a dot, not a hue.",
+      "Every animation has a reduced-motion equivalent that carries the same fact without moving."
+    ],
+    "avoid": [
+      "Glass, blur and translucent materials: 'on a page of dense tables it costs twice'.",
+      "Radii above 6px: 'a rounded card invites you to swipe it'; infrastructure surfaces are regions of a page, not objects to pick up.",
+      "Spring and bounce: 'a panel that bounces on open is a panel an operator sees bounce forty times a day'.",
+      "Numbers that count up: a figure that animates is a figure you cannot read while it moves.",
+      "The interaction colour as a status or a progress fill: signal blue 'never means healthy, and it never fills a progress bar'.",
+      "Decorative gradients, hero headlines, icon-only controls."
+    ]
+  },
+  "decisions": [
+    {
+      "date": "2026-09-06",
+      "what": "The light ramp re-points the -300 status colours as well as the -500 ones.",
+      "why": "`.state` writes every object's verdict in the -300 ramp, which light.css never re-pointed: 'not settled' read 1.47:1 and 'Settled' 1.78:1 on a white page. On a light ground 'text weight' means darker than the dot, not lighter.",
+      "where": "light.css"
+    },
+    {
+      "date": "2026-09-06",
+      "what": "--slate-300 added; --text-faint points at it instead of --ink-300.",
+      "why": "--ink-300 as faint text read 2.99:1 on a raised card. --slate-300 clears 4.5:1 on every dark ground and stays a step under --slate-400, so the four text levels keep their order.",
+      "where": "tokens.css"
+    },
+    {
+      "date": "2026-09-06",
+      "what": "Six token names that resolve to nothing were mapped onto the real vocabulary: --text→--text-body, --text-dim→--text-muted, --mono→--font-mono, --accent→--brand, --radius→--radius-lg, --border-faint→--border-subtle.",
+      "why": "25 declarations across the overview, the map, the label filter, the log block, the CPU advisory and the VNC screen were invalid and silently did nothing — including three focus and active-state indicators.",
+      "where": "console.css"
+    },
+    {
+      "date": "2026-09-06",
+      "what": "The attention list is ordered by verdict, not by collection.",
+      "why": "unsettledEverywhere() walked the rail in order, so a failing guest could sit below three networks that had merely not reported. Its own doc comment already claimed an order it did not produce.",
+      "where": "board.js"
+    },
+    {
+      "date": "2026-09-06",
+      "what": "One animation was added to the boards and no others: a row whose verdict changed on the last refresh is washed once, 900ms on --ease-settle, with a 2px edge instead under reduced motion.",
+      "why": "It carries what the table cannot — which of forty rows is not what it was a moment ago. Motion that only decorates was declined; see `avoid`.",
+      "where": "board.js, console.css"
+    },
+    {
+      "date": "2026-09-06",
+      "what": "Rows in the attention list were left as they are: the name is the way through, the row is not a target.",
+      "why": "Proposed and withdrawn after reading the code. `.linky` is already a focusable button and its comment is deliberate: 'it is a way through, not an action'. What was actually missing was its hover colour, which was one of the dead tokens."
+    }
+  ],
+  "evidence": [
+    "Every text node on 33 boards and their sheets, in both appearances at 1600px and 430px, composited over its real background: 5878 findings before the light-ramp fix, 398 after, all four remaining ones measured as conforming.",
+    "Target sizes checked by hit test rather than by rectangle: the 13x13 row checkboxes have 44px between them, so WCAG 2.5.8's spacing exception applies.",
+    "Computed styles on the overview before the token migration: panel border-radius 0px, ATTENTION heading at body strength, object paths in the sans stack."
+  ],
+  "generatedAt": "2026-09-06T11:04:29.998Z"
+}
