@@ -40,6 +40,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use rustls_pki_types::pem::PemObject;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use velstra_cloud_model::{
@@ -115,12 +116,11 @@ impl ConsoleTls {
             .map_err(|e| format!("reading {}: {e}", self.cert.display()))?;
         let key =
             std::fs::read(&self.key).map_err(|e| format!("reading {}: {e}", self.key.display()))?;
-        let chain: Vec<_> = rustls_pemfile::certs(&mut certs.as_slice())
+        let chain: Vec<_> = rustls_pki_types::CertificateDer::pem_slice_iter(&certs)
             .collect::<Result<_, _>>()
             .map_err(|e| format!("{} is not a certificate: {e}", self.cert.display()))?;
-        let private = rustls_pemfile::private_key(&mut key.as_slice())
-            .map_err(|e| format!("{} is not a key: {e}", self.key.display()))?
-            .ok_or_else(|| format!("{} holds no private key", self.key.display()))?;
+        let private = rustls_pki_types::PrivateKeyDer::from_pem_slice(&key)
+            .map_err(|e| format!("{} is not a key: {e}", self.key.display()))?;
         tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(chain, private)

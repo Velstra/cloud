@@ -49,6 +49,10 @@ futures = "0.3"
 # `velstra-cloud-api/src/console_proxy.rs` — and this feature is what makes
 # `connect_async_tls_with_config` exist to hand it to.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# PEM parsing. `rustls-pemfile` did this and is unmaintained with no safe
+# upgrade (RUSTSEC-2026-0257): its own announcement points here, to the
+# `PemObject` trait, and rustls already brings the crate into the tree.
+rustls-pki-types = { version = "1", features = ["std"] }
 hex = "0.4"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
