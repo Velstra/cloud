@@ -1,0 +1,23 @@
+{
+  "agent_version": "",
+  "allocated": {
+    "disk_gib": 0,
+    "hugepages_1gi": 0,
+    "memory_mib": 0,
+    "numa_free_mib": [],
+    "vcpus": 0
+  },
+  "capacity": {
+    "disk_gib": 0,
+    "hugepages_1gi": 0,
+    "memory_mib": 0,
+    "numa_free_mib": [],
+    "vcpus": 0
+  },
+  "conditions": [],
+  "console_tls": false,
+  "images": [],
+  "last_heartbeat": 0,
+  "observed_generation": 0,
+  "shared_state": false
+}

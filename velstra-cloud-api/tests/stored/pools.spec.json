@@ -1,0 +1,9 @@
+{
+  "accepting": false,
+  "labels": [],
+  "volume_ceiling": {
+    "iops": 0,
+    "read_mibps": 0,
+    "write_mibps": 0
+  }
+}

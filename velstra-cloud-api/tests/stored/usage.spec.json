@@ -1,0 +1,24 @@
+{
+  "at": 0,
+  "project": "",
+  "traffic": {
+    "carried_rx": 0,
+    "carried_tx": 0,
+    "rx_bytes": 0,
+    "tx_bytes": 0
+  },
+  "used": {
+    "backup_gib": 0,
+    "backups": 0,
+    "devices": 0,
+    "floating_ips": 0,
+    "instances": 0,
+    "load_balancers": 0,
+    "memory_mib": 0,
+    "snapshot_gib": 0,
+    "snapshots": 0,
+    "vcpus": 0,
+    "volume_gib": 0,
+    "volumes": 0
+  }
+}

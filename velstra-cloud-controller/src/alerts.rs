@@ -18,6 +18,7 @@
 //! | `node-wires-nowhere` | a machine carries guest traffic with a bare tap, so its guests have a wire with nothing at the other end |
 //! | `node-silent` | a machine has not reported for longer than its own fencing deadline plus a margin — the point at which its guests are certainly stopped ([`velstra_cloud_model::ha::is_fenced`]) |
 //! | `pool-nearly-full` | a pool has allocated more than a share of its capacity (80 % unless told otherwise) |
+//! | `pool-unwatched` | no agent has reported on a pool, ever or lately — so nothing is provisioned into it and nothing is released from it |
 //! | `quota-exhausted` | a project has used every unit of some quota dimension, so its next create is refused |
 //! | `ceph-error` / `ceph-warning` | the Ceph cluster says `HEALTH_ERR` or `HEALTH_WARN`, with the checks it named |
 //! | `ceph-osd-down` | a disk is not up, or is up and out, so the cluster is carrying data on fewer disks than it has |
@@ -111,6 +112,14 @@ pub struct Rules {
     /// same margin recovery uses, so the two agree about when a machine is
     /// gone.
     pub silence_margin: Duration,
+    /// A pool whose agent has not reported for this long is unwatched.
+    ///
+    /// Generous on purpose. A pool agent reports on its own resync and there
+    /// is no fencing deadline to hang this off, so the number only has to be
+    /// long enough that a restart or a slow pass is not an alert — what it is
+    /// really there to catch is a pool that has *no* agent at all, which is
+    /// the same silence going on for ever.
+    pub pool_silent_after: Duration,
 }
 
 impl Default for Rules {
@@ -120,6 +129,7 @@ impl Default for Rules {
             backup_target_free_gib: 32,
             stuck_after: Duration::from_secs(15 * 60),
             silence_margin: Duration::from_secs(60),
+            pool_silent_after: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -176,6 +186,11 @@ pub const RULES: &[(&str, Severity)] = &[
     ("ceph-warning", Severity::Warning),
     ("ceph-nearly-full", Severity::Warning),
     ("pool-nearly-full", Severity::Warning),
+    // Nobody is provisioning into this pool or letting anything out of it. The
+    // reason it is a rule of its own rather than a corner of `stuck`: an
+    // operator learns of it today by deleting a volume and watching the
+    // deletion never finish, with the cause on no screen anywhere.
+    ("pool-unwatched", Severity::Warning),
     // The place the copies go is filling up. A leading indicator on purpose:
     // by the time a backup *fails* for want of room, the target is already
     // full for everybody else on it — including for the delete that would
@@ -382,6 +397,41 @@ pub fn evaluate(
     }
 
     for pool in pools {
+        if pool.meta.is_deleting() {
+            continue;
+        }
+        // Before the fullness check, and not inside it: that one skips a pool
+        // whose capacity is zero, and a pool nobody reports on has a capacity
+        // of zero — so the one pool worth complaining about was the one pool
+        // that produced no alert at all.
+        let quiet = pool.status.last_heartbeat;
+        if quiet == Timestamp(0) {
+            out.push(Alert {
+                rule: "pool-unwatched",
+                subject: pool.meta.name.to_string(),
+                message: format!(
+                    "no agent has ever reported on {}. Nothing is provisioned into it and \
+                     nothing is let out of it: a volume created here waits for ever, and a \
+                     volume deleted here keeps its `pool.velstra.io/release` finalizer for \
+                     ever, because the agent that would release it does not exist. Start the \
+                     agent that serves this pool, or delete the pool object.",
+                    pool.meta.name
+                ),
+            });
+        } else if quiet.age(now) > rules.pool_silent_after {
+            out.push(Alert {
+                rule: "pool-unwatched",
+                subject: pool.meta.name.to_string(),
+                message: format!(
+                    "{} has not been reported on for {} s. Its volumes are still there and \
+                     still readable by the guests using them; what has stopped is creating, \
+                     growing and releasing them — a deletion now waits on a finalizer nothing \
+                     will remove.",
+                    pool.meta.name,
+                    quiet.age(now).as_secs()
+                ),
+            });
+        }
         let (capacity, allocated) = (pool.status.capacity_gib, pool.status.allocated_gib);
         if capacity == 0 {
             continue;
@@ -828,7 +878,18 @@ mod tests {
         )
     }
 
+    /// A pool with an agent that reported a moment ago — the ordinary case, so
+    /// a test about fullness is not also a test about silence.
     fn pool(name: &str, capacity: u64, allocated: u64) -> Resource<PoolSpec, PoolStatus> {
+        let mut p = unwatched_pool(name, capacity, allocated);
+        p.status.last_heartbeat = Timestamp(NOW.0 - 1_000);
+        p
+    }
+
+    /// One nothing has ever reported on: `last_heartbeat` is zero, which is
+    /// what a pool object created for an agent that was never started looks
+    /// like for ever.
+    fn unwatched_pool(name: &str, capacity: u64, allocated: u64) -> Resource<PoolSpec, PoolStatus> {
         Resource::new(
             meta(&format!("pools/{name}")),
             PoolSpec::default(),
@@ -1306,6 +1367,71 @@ mod tests {
         assert!(
             quiet.is_empty(),
             "a healthy cluster woke somebody up: {quiet:?}"
+        );
+    }
+
+    /// A pool object whose agent was never started is a black hole: volumes
+    /// created on it wait for ever and volumes deleted from it keep their
+    /// release finalizer for ever, because the thing that would remove it does
+    /// not exist. Before this rule the only way to learn that was to delete a
+    /// volume and watch nothing happen.
+    #[test]
+    fn a_pool_nobody_reports_on_says_so_rather_than_swallowing_volumes() {
+        // Capacity zero, which is what an unserviced pool reports — and which
+        // the fullness rule skips, so this pool used to produce no alert at
+        // all.
+        let never = [unwatched_pool("ceph", 0, 0)];
+        let alerts = evaluate(&[], &never, &[], &[], &[], &[], &[], &Rules::default(), NOW);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].rule, "pool-unwatched");
+        assert_eq!(alerts[0].subject, "pools/ceph");
+        assert!(
+            alerts[0].message.contains("finalizer"),
+            "it did not say what actually goes wrong: {}",
+            alerts[0].message
+        );
+
+        // An agent that reported and stopped is the other half, and reads
+        // differently on purpose: the volumes are still there and still
+        // readable, and what stopped is managing them.
+        let mut stopped = unwatched_pool("local", 100, 10);
+        stopped.status.last_heartbeat = Timestamp(NOW.0 - 900_000);
+        let alerts = evaluate(
+            &[],
+            std::slice::from_ref(&stopped),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &Rules::default(),
+            NOW,
+        );
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].rule, "pool-unwatched");
+        assert!(
+            alerts[0].message.contains("still readable"),
+            "{}",
+            alerts[0].message
+        );
+
+        // A pool being deleted is not a pool to complain about: its agent
+        // going away is the expected end of it.
+        let mut going = unwatched_pool("old", 0, 0);
+        going.meta.deleted_at = Some(NOW);
+        assert!(
+            evaluate(
+                &[],
+                std::slice::from_ref(&going),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &Rules::default(),
+                NOW
+            )
+            .is_empty()
         );
     }
 

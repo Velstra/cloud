@@ -45,6 +45,52 @@ Two things restore does **not** bring back, by design:
 * **The store's own history** — watches resume by re-listing, which every
   agent does on its resync anyway.
 
+### Rehearsing it without touching the cell
+
+A restore procedure nobody has run is a procedure, not a capability. This one
+can be exercised on a live control plane without going near it, because a
+restored store is just a second etcd on other ports:
+
+```
+SNAP=$(ls -t /var/lib/velstra/store-backups/etcd-*.snap | head -1)
+etcdutl snapshot restore "$SNAP" --data-dir /var/lib/etcd.rehearsal \
+  --name rehearsal \
+  --initial-cluster rehearsal=http://127.0.0.1:23800 \
+  --initial-advertise-peer-urls http://127.0.0.1:23800
+etcd --data-dir /var/lib/etcd.rehearsal --name rehearsal \
+  --listen-client-urls http://127.0.0.1:23790 \
+  --advertise-client-urls http://127.0.0.1:23790 \
+  --listen-peer-urls http://127.0.0.1:23800 \
+  --initial-advertise-peer-urls http://127.0.0.1:23800 \
+  --initial-cluster rehearsal=http://127.0.0.1:23800 \
+  --initial-cluster-state existing &
+```
+
+The `--name` and the peer URL have to be given to **both** commands and have to
+match: `etcdutl` writes the member into the restored data directory, and etcd
+refuses to start against a directory that names a different member. Leaving
+them at the defaults puts the rehearsal on 2380, which is the live store's peer
+port.
+
+Then compare, and read something real out of it:
+
+```
+etcdctl --endpoints=127.0.0.1:23790 endpoint health
+etcdctl --endpoints=127.0.0.1:23790 get --prefix --keys-only "" | grep -c .
+etcdctl --endpoints=127.0.0.1:2379  get --prefix --keys-only "" | grep -c .
+etcdctl --endpoints=127.0.0.1:23790 get /<cell>/instances/ --prefix --keys-only
+```
+
+A key count one or two short of the live one is the writes since the snapshot,
+not a fault. Afterwards, stop it by port rather than by name — `kill $(ss -lptn
+'sport = :23790' | grep -oP 'pid=\K[0-9]+')` — and remove the directory. A
+restore of a 225 MiB snapshot takes about a second and lands in roughly 280 MiB
+on disk, so check `df` first.
+
+Done on this cell on 10 September 2026: 234 930 keys against 234 931 live, the
+guests and their specs readable out of the restored store, and the live control
+plane untouched throughout.
+
 ## When the store filled up anyway
 
 `mvcc: database space exceeded` means history outgrew etcd's quota. The API
@@ -127,6 +173,18 @@ Bringing one up, in the order the platform expects:
    --backend ceph`. The image lands in the image pool with a protected
    `@base` snapshot, and every volume made from it is an `rbd clone` — no
    bytes move, and "which nodes hold this image" stops being a question.
+
+**A pool object with no agent is a black hole, and the cell now says so.**
+Steps 3 and 4 are easy to leave half-done — the `pools` object exists, the
+agent was never started — and the result is a pool that swallows work
+silently: a volume created on it waits for ever, and a volume *deleted* from it
+keeps its `pool.velstra.io/release` finalizer for ever, because the agent that
+would remove it does not exist. The `pool-unwatched` alert fires for a pool
+nothing has ever reported on, and again for one whose agent has stopped (ten
+minutes by default, `--alert-pool-silent-after`). If you find such a pool with
+volumes already stuck on it, the way out is to start its agent — nothing else
+removes that finalizer, by design: a platform that dropped it would be
+declaring bytes released that nobody has released.
 
 Two things Ceph itself insists on, both handled by the platform and both worth
 knowing when reading a cluster by hand: a pool with `size: 1` needs
