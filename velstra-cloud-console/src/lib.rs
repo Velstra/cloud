@@ -38,7 +38,7 @@ use std::sync::OnceLock;
 
 pub use schema::{
     Agreement, COLLECTIONS, Cell, Check, Choice, Collection, Column, Field, Kind, Refusal, Scale,
-    Scope,
+    Scope, as_pretty_json,
 };
 
 const SHELL: &str = include_str!("assets/shell.html");
