@@ -41,8 +41,8 @@ use std::sync::Arc;
 use tracing::info;
 use velstra_cloud_model::{
     ceph::{
-        CephCluster, CephClusterSpec, CephClusterStatus, CephObserved, CephPhase, CephStep,
-        OsdSpec, next_step, observe, phase_of,
+        CephCluster, CephClusterSpec, CephClusterStatus, CephObserved, CephPhase, CephSeen,
+        CephStep, OsdSpec, next_step, observe, phase_of,
     },
     meta::{Condition, ConditionStatus, set_condition},
     resources::{Node, NodeSpec, NodeStatus},
@@ -90,13 +90,42 @@ impl CephController {
     /// — and a controller that computed "the cluster is finished" differently
     /// from the nodes computing "there is nothing left to do" would disagree
     /// exactly when somebody was watching.
-    async fn observe(&self, cluster: &CephCluster) -> Result<CephObserved> {
+    async fn observe(&self, cluster: &CephCluster) -> Result<(CephObserved, Vec<Node>)> {
         let nodes: Vec<Node> = self.nodes.list().await?;
         // The published key is a monotonic witness that a cluster exists, where
         // "a monitor is running" is a daemon reading that can go false. See
         // [`CephObserved::with_published_key`].
-        Ok(observe(&nodes).with_published_key(&cluster.status.ssh_pubkey))
+        let observed = observe(&nodes).with_published_key(&cluster.status.ssh_pubkey);
+        Ok((observed, nodes))
     }
+}
+
+/// The freshest thing any node saw of the cluster, and who saw it.
+///
+/// Freshest by the node's own heartbeat, not by the reading's `at`: a node
+/// whose clock is ahead would otherwise win for ever with a reading nobody
+/// has refreshed. OSD rows come back with the disk named the way the node
+/// names it — Ceph knows `sda`, the node reports `/dev/disk/by-id/…`, and
+/// `spec.osds` is written in the node's spelling — so a reader can tell which
+/// row is which disk without a second table.
+fn freshest_seen(nodes: &[Node]) -> Option<(String, CephSeen)> {
+    let node = nodes
+        .iter()
+        .filter(|n| n.status.ceph.as_ref().is_some_and(|c| c.seen.is_some()))
+        .max_by_key(|n| n.status.last_heartbeat)?;
+    let mut seen = node.status.ceph.as_ref()?.seen.clone()?;
+    for osd in &mut seen.osds {
+        let Some(kernel) = osd.device.strip_prefix("/dev/") else {
+            continue;
+        };
+        let owner = nodes.iter().find(|n| n.meta.name.id() == osd.host);
+        if let Some(d) =
+            owner.and_then(|n| n.status.devices.iter().find(|d| d.kernel_name == kernel))
+        {
+            osd.device = d.path.clone();
+        }
+    }
+    Some((node.meta.name.id().to_string(), seen))
 }
 
 /// What the OSDs that exist are, as `(node, device)` pairs.
@@ -149,7 +178,7 @@ impl Reconciler for CephController {
             return Ok(());
         };
 
-        let observed = self.observe(cluster).await?;
+        let (observed, nodes) = self.observe(cluster).await?;
         let phase = phase_of(&cluster.spec, &observed);
         let step = next_step(&cluster.spec, &observed);
 
@@ -175,6 +204,13 @@ impl Reconciler for CephController {
         // then read an empty key would forget how to be reached.
         if !observed.ssh_pubkey.is_empty() {
             next.status.ssh_pubkey = observed.ssh_pubkey.clone();
+        }
+        // Likewise never cleared: the reading carries its own `at`, and a
+        // stale one that says when it was taken beats a blank that says
+        // nothing.
+        if let Some((by, seen)) = freshest_seen(&nodes) {
+            next.status.seen = seen;
+            next.status.seen_by = by;
         }
 
         // What the condition says, and it says the *step* rather than a

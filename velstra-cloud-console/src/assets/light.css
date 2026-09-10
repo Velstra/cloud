@@ -15,7 +15,10 @@ color-scheme: light;
    one sheet. */
 --sidebar-bg: #edf1f8;
 --text-strong: #0b0e14; --text-body: #1d2431;
---text-muted: #5b6779; --text-faint: #7a8699;
+/* Measured on every light ground this console paints — the page, a card, a
+   sunken panel, a hovered row and the rail: faint read 3.17:1 at its worst,
+   under AA. These clear 4.5:1 on all five and keep the two levels apart. */
+--text-muted: #535f70; --text-faint: #5f6c7e;
 --border: #dde3ec; --border-strong: #c6cfdc;
 --border-subtle: #e8edf4;
 --brand: var(--signal-600); --brand-hover: var(--signal-500);
@@ -24,7 +27,18 @@ color-scheme: light;
 --on-brand: #ffffff;
 
 --green-500: #1a7f37; --amber-500: #9a6700; --red-500: #cf222e;
+/* The text-weight ramp has to be re-pointed too, and forgetting it is not a
+   cosmetic miss: `.state` writes the verdict of every object in these three
+   colours, and the dark ramp's amber on a white page reads 1.47:1 — a word
+   saying something is not settled, in a colour nobody can read. On a light
+   ground "text weight" means darker than the dot, not lighter. The amber is a
+   shade darker than the others because the rail's active row tints itself with
+   the brand at 16%, and that ground is where it was thinnest. */
+--green-300: #146c2e; --amber-300: #805500; --red-300: #b3202b;
 --cyan-500: #1b7f9e; --cyan-600: #14657e; --cyan-900: #e2f2f7;
+/* The wordmark is the product colour at 14px, which is not large text: the
+   dark ramp's cyan reads 4.24:1 here. */
+--product: #1b6c8e;
 
 /* The same two materials, re-pointed. Light chrome is more opaque than dark:
    dark text over a blurred light background loses contrast far faster than
@@ -39,4 +53,5 @@ color-scheme: light;
 --shadow-lg: 0 18px 44px rgba(16,24,40,.14);
 --edge-top: inset 0 1px 0 rgba(255,255,255,.9);
 --glow-focus: 0 0 0 3px rgba(58,114,230,.22);
+--wash-signal: rgba(33,121,161,.09);
 --wash: radial-gradient(1100px 460px at 78% -12%, rgba(27,127,158,.10), transparent 62%);

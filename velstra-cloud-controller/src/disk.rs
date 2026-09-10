@@ -218,6 +218,7 @@ impl Reconciler for DiskController {
                     // this moment nobody knows, and guessing is the defect.
                     at: String::new(),
                     read_only: false,
+                    limits: Default::default(),
                 },
                 AttachmentStatus::default(),
             );
@@ -427,6 +428,7 @@ pub mod tests {
                         node: "nodes/n1".into(),
                         at: String::new(),
                         read_only: false,
+                        limits: Default::default(),
                     },
                     AttachmentStatus::default(),
                 ),
@@ -521,6 +523,7 @@ mod when_the_guest_is_gone {
                         node: "nodes/n1".into(),
                         at: String::new(),
                         read_only: false,
+                        limits: Default::default(),
                     },
                     AttachmentStatus::default(),
                 ),

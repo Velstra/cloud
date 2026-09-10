@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use http_body_util::BodyExt;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
+use rustls_pki_types::pem::PemObject;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use velstra_cloud_model::{
@@ -73,7 +74,7 @@ fn tls_config(ca_path: &str) -> Result<std::sync::Arc<tokio_rustls::rustls::Clie
     let pem =
         std::fs::read(ca_path).map_err(|e| HostError::failed(format!("reading {ca_path}: {e}")))?;
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+    for cert in rustls_pki_types::CertificateDer::pem_slice_iter(&pem) {
         let cert = cert.map_err(|e| HostError::failed(format!("{ca_path}: {e}")))?;
         roots
             .add(cert)
@@ -390,8 +391,35 @@ impl CellReader for ApiCell {
     async fn migrations(&self) -> Result<Vec<Migration>> {
         self.list("migrations").await
     }
+
+    async fn directory(&self) -> Result<Vec<crate::dns::Named>> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            hostname: String,
+            subnet: String,
+            address: String,
+        }
+        let body = self.get("/api/v1/directory").await?;
+        let answer: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| crate::host::HostError::failed(format!("the directory: {e}")))?;
+        let rows: Vec<Row> = serde_json::from_value(answer["items"].clone()).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(crate::dns::Named {
+                    hostname: r.hostname,
+                    subnet: r.subnet,
+                    address: r.address.parse().ok()?,
+                })
+            })
+            .collect())
+    }
     async fn security_groups(&self) -> Result<Vec<SecurityGroup>> {
         self.list("security-groups").await
+    }
+
+    async fn load_balancers(&self) -> Result<Vec<velstra_cloud_model::loadbalancer::LoadBalancer>> {
+        self.list("load-balancers").await
     }
     async fn subnets(&self) -> Result<Vec<Subnet>> {
         self.list("subnets").await

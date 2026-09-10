@@ -276,6 +276,61 @@ pub enum Refusal {
     /// Reported by the agent, so this is what it last saw rather than a guess.
     #[error("{target} is not writable: the agent cannot reach {path}")]
     TargetNotWritable { target: String, path: String },
+    /// The target has nothing left.
+    ///
+    /// This is the refusal that keeps one tenant from taking the target down
+    /// for everybody. A copy that runs until the filesystem is full leaves a
+    /// truncated file *and* a target on which nobody else's backup can be
+    /// written — nor deleted, which is what would have made room.
+    #[error(
+        "{target} has {free} GiB free, below the {headroom} GiB this platform keeps clear. A \
+         target run to the last byte fails every tenant's next copy, and the delete that would \
+         make room fails with it. Free space there, or point this backup at another target."
+    )]
+    NoRoom {
+        target: String,
+        free: u64,
+        headroom: u64,
+    },
+}
+
+/// GiB kept clear on a backup target.
+///
+/// A target holds more than one tenant's copies, and a filesystem at a hundred
+/// percent is one where the *next* write fails — including the write that
+/// deletes something to make room. This is the margin that turns "the target
+/// is full" from an outage somebody digs out of into a refused backup with a
+/// sentence on it.
+pub const TARGET_HEADROOM_GIB: u64 = 8;
+
+/// Whether a target has room to be written to at all.
+///
+/// **Deliberately not "does this copy fit".** How many bytes a copy occupies
+/// is not knowable before it is made: a forty-gibibyte volume with two
+/// gibibytes written to it copies two, and refusing that backup because the
+/// target has ten free would refuse a copy that would have worked. Sparse is
+/// the normal case, not the exception, and a check that guesses high refuses
+/// real backups every night while never being wrong out loud.
+///
+/// What *is* knowable is whether the target has anything left, and that is the
+/// state which takes every tenant's backups down at once. A copy that then
+/// runs out of room fails on the write, loudly, on the backup itself — the
+/// same place a target that has been unmounted fails. The leading indicator is
+/// the `backup-target-nearly-full` alert, which fires long before this does.
+///
+/// `free_gib` is what the reporting agent last saw, so it is a moment old and
+/// not a promise — which is the second reason there is headroom. A target
+/// nobody reports on is not asked: unknown is not "full", the same rule
+/// [`may_back_up`] applies to writability.
+pub fn room_on(target: &str, free_gib: u64) -> Result<(), Refusal> {
+    if free_gib < TARGET_HEADROOM_GIB {
+        return Err(Refusal::NoRoom {
+            target: target.to_string(),
+            free: free_gib,
+            headroom: TARGET_HEADROOM_GIB,
+        });
+    }
+    Ok(())
 }
 
 /// One target, as the caller has it. Taken apart rather than as a resource so
@@ -480,6 +535,31 @@ pub fn next_to_verify(every_hours: u32, copies: &[CopyView], now: Timestamp) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_target_with_room_on_it_takes_a_copy() {
+        assert!(room_on("backup-targets/nas", 100).is_ok());
+        assert!(room_on("backup-targets/nas", TARGET_HEADROOM_GIB).is_ok());
+    }
+
+    /// A filesystem with nothing left is one where the delete that would make
+    /// room also fails, so the refusal says so before a byte is read.
+    #[test]
+    fn a_target_with_nothing_left_is_refused_before_the_copy_starts() {
+        let refusal = room_on("backup-targets/nas", 2).expect_err("nothing fits here");
+        assert!(matches!(refusal, Refusal::NoRoom { free: 2, .. }));
+        let said = refusal.to_string();
+        assert!(said.contains("2 GiB free"), "{said}");
+        assert!(said.contains("delete"), "{said}");
+    }
+
+    /// The check is about the target, not about the copy: a thinly-written
+    /// forty-gibibyte volume copies whatever was actually written to it, and a
+    /// check that guessed high would refuse backups that work.
+    #[test]
+    fn a_roomy_target_is_not_refused_for_a_large_sparse_volume() {
+        assert!(room_on("backup-targets/nas", 10).is_ok());
+    }
+
     use super::*;
 
     const HOUR: u64 = 3_600_000;

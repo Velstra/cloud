@@ -86,18 +86,18 @@ function grantsInto(host, coll, project, onSaved) {
       const who = el("input.input", { type: "text", value: g.member, placeholder: "ada@example.com" });
       who.oninput = () => { grants[i].member = who.value.trim(); };
 
-      const drop = el("button.btn.quiet", { type: "button", title: "Remove this grant" }, "Remove");
+      const drop = btn("Remove", { quiet: true, title: "Remove this grant" });
       drop.onclick = () => { grants.splice(i, 1); draw(); };
 
       rows.appendChild(el("div.grantrow", who, pick, drop));
     }
 
-    const add = el("button.btn.quiet", { type: "button" }, "Add someone");
+    const add = btn("Add someone", { quiet: true });
     add.onclick = () => { grants.push({ role: "viewer", member: "" }); draw(); };
 
-    const save = el("button.btn", { type: "button" }, "Save grants");
+    const save = btn("Save grants");
     save.onclick = async () => {
-      save.disabled = true;
+      working(save);
       try {
         // The revision of what this panel last read. A colleague's change made
         // in between is refused here rather than replaced — which is the whole
@@ -129,7 +129,7 @@ function grantsInto(host, coll, project, onSaved) {
         grants = grantsOf(stored);
         note = el("span.bad", String(e.message || e));
       }
-      save.disabled = false;
+      settled(save);
       draw();
     };
 

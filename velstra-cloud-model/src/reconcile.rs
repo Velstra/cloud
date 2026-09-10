@@ -46,6 +46,21 @@ pub enum Action {
         /// like a guest that is simply slow.
         image: String,
     },
+    /// Make an existing root disk bigger, because the spec now asks for more.
+    ///
+    /// Only emitted while the guest is stopped. Growing under a running guest
+    /// needs the VMM told about it, and until that exists the platform's
+    /// answer to a bigger root disk is the same as to more vCPUs: it takes
+    /// effect on the next start, and the object says so.
+    ///
+    /// Its absence was a lie the whole way down: the API accepted the change,
+    /// the quota charged the larger number immediately, the console showed it
+    /// pending a restart — and no restart ever applied it, because nothing
+    /// asked how big the disk was.
+    GrowDisk {
+        instance: String,
+        gib: u64,
+    },
     StartVm {
         instance: String,
     },
@@ -114,6 +129,10 @@ pub fn reconcile_instance(
     image_cached: bool,
     ports_programmed: &[bool],
     disk_present: bool,
+    // How big that disk actually is, when the node could tell. `None` means
+    // the question was not answered — an older agent, or a backend that keeps
+    // the disk somewhere it cannot measure — and nothing is grown on a guess.
+    disk_gib: Option<u64>,
     // Whether anything ahead of this guest in the node's start order is still
     // coming up. `Go` for everything a caller has no ordering opinion about,
     // which is most callers and every cell that has not asked for one.
@@ -188,6 +207,14 @@ pub fn reconcile_instance(
             instance: name.clone(),
             gib: instance.spec.root_disk_gib,
             image: instance.spec.image.clone(),
+        });
+    } else if let Some(actual) = disk_gib
+        && actual < instance.spec.root_disk_gib
+        && instance.status.state != InstanceState::Running
+    {
+        actions.push(Action::GrowDisk {
+            instance: name.clone(),
+            gib: instance.spec.root_disk_gib,
         });
     }
     for (i, port) in instance.spec.ports.iter().enumerate() {
@@ -385,6 +412,17 @@ pub fn start_gate(order: u32, delay_s: u32, peers: &[StartPeer], now: Timestamp)
     }
 }
 
+/// How long a node may go without reporting before it stops being given work.
+///
+/// The same number that decides whether a node may be handed Ceph work, and
+/// deliberately the same: "has this machine reported recently enough to be
+/// trusted with something" is one question, and two windows would disagree
+/// exactly when somebody was reading both screens. It is enforced against the
+/// agent's own resync interval at startup — see
+/// [`crate::ceph::MIN_HEARTBEATS_PER_WINDOW`] — so a healthy node cannot fall
+/// out of it.
+pub const NODE_SILENT_AFTER_MS: u64 = crate::ceph::NODE_STALE_AFTER_MS;
+
 /// Why a node was not chosen. The chain of these *is* the explain API: an
 /// operator asking "why did this not schedule" gets the filter that removed
 /// each candidate, not a log to grep.
@@ -392,6 +430,14 @@ pub fn start_gate(order: u32, delay_s: u32, peers: &[StartPeer], now: Timestamp)
 pub enum Rejected {
     Unschedulable,
     NotReady,
+    /// The machine has not reported for longer than the window a healthy one
+    /// cannot miss. Told apart from `NotReady` on purpose: a node that says it
+    /// is not ready has answered, and a node that has gone quiet has not —
+    /// they are different failures and lead to different next steps.
+    Silent {
+        /// How long since it last said anything, in milliseconds.
+        quiet_ms: u64,
+    },
     InsufficientVcpus {
         free: u32,
         want: u32,
@@ -485,6 +531,12 @@ pub fn place(
     // computed a different answer on a second call with the same arguments
     // would be untestable and unexplainable.
     closed: &[crate::maintenance::Closed],
+    // Now, for the one judgement that needs a clock: whether a machine has
+    // reported recently enough to be given work. Passed in for the same reason
+    // `closed` is — this function is pure, and a scheduler that answered
+    // differently on a second call with the same arguments would be
+    // untestable and unexplainable.
+    now: crate::meta::Timestamp,
 ) -> Result<String, Vec<Explanation>> {
     let mut rejected = Vec::new();
     let mut best: Option<(&Node, (u8, u8, u64))> = None;
@@ -515,6 +567,21 @@ pub fn place(
             rejected.push(Explanation {
                 node: id,
                 why: Rejected::NotReady,
+            });
+            continue;
+        }
+        // A machine that has stopped reporting is not a candidate, however
+        // ready it last claimed to be. The agent writes `Ready: True` on every
+        // report and has no branch that writes `False` — it cannot, because a
+        // dead process writes nothing — so without this the last thing a
+        // failing machine ever said keeps it in the rotation for ever. Worse,
+        // its `allocated` freezes too, so it looks like the emptiest node in
+        // the cell and is *preferred*.
+        let quiet_ms = node.status.last_heartbeat.age(now).as_millis() as u64;
+        if quiet_ms > NODE_SILENT_AFTER_MS {
+            rejected.push(Explanation {
+                node: id,
+                why: Rejected::Silent { quiet_ms },
             });
             continue;
         }
@@ -749,7 +816,11 @@ pub struct Headroom {
 /// * Free memory does not add up into a guest. Sixty-four gibibytes spread
 ///   over eight nodes fits no sixteen-gibibyte guest, and `largest_fit` is the
 ///   only honest answer to "will another one go in".
-pub fn headroom(nodes: &[Node], closed: &[crate::maintenance::Closed]) -> Headroom {
+pub fn headroom(
+    nodes: &[Node],
+    closed: &[crate::maintenance::Closed],
+    now: crate::meta::Timestamp,
+) -> Headroom {
     let mut out = Headroom::default();
     for node in nodes {
         if node.meta.is_deleting() {
@@ -766,7 +837,8 @@ pub fn headroom(nodes: &[Node], closed: &[crate::maintenance::Closed]) -> Headro
         out.allocated.disk_gib = out.allocated.disk_gib.saturating_add(a.disk_gib);
 
         let ready = crate::meta::condition(&node.status.conditions, "Ready")
-            .is_some_and(|c| c.status == ConditionStatus::True);
+            .is_some_and(|c| c.status == ConditionStatus::True)
+            && node.status.last_heartbeat.age(now).as_millis() as u64 <= NODE_SILENT_AFTER_MS;
         // A machine inside an open maintenance window is unusable in exactly
         // the way a draining one is. Counting it would put its free memory into
         // `largestFit`, and `largestFit` is the number a tenant is told they
@@ -902,6 +974,7 @@ fn describe(why: &Rejected) -> String {
     match why {
         Rejected::Unschedulable => "draining".to_string(),
         Rejected::NotReady => "not ready".to_string(),
+        Rejected::Silent { quiet_ms } => format!("silent for {}s", quiet_ms / 1000),
         Rejected::InsufficientVcpus { free, want } => format!("{free} vcpus free, {want} wanted"),
         Rejected::InsufficientMemory { free_mib, want_mib } => {
             format!("{free_mib} MiB free, {want_mib} MiB wanted")
@@ -995,6 +1068,8 @@ pub fn count_quota(
     volumes: &[Volume],
     floating_ips: &[crate::resources::FloatingIp],
     load_balancers: &[crate::loadbalancer::LoadBalancer],
+    snapshots: &[crate::resources::Snapshot],
+    backups: &[crate::resources::Backup],
 ) -> Quota {
     let mut used = Quota::default();
     for instance in instances.iter().filter(|i| i.meta.name.is_under(project)) {
@@ -1022,6 +1097,17 @@ pub fn count_quota(
         .iter()
         .filter(|l| l.meta.name.is_under(project))
         .count() as u32;
+    for snapshot in snapshots.iter().filter(|s| s.meta.name.is_under(project)) {
+        used.snapshots = used.snapshots.saturating_add(1);
+        // From the status: how much a snapshot occupies is the pool's answer,
+        // and the asker never states one. A snapshot not yet taken counts as
+        // nothing, which is what it is.
+        used.snapshot_gib = used.snapshot_gib.saturating_add(snapshot.status.size_gib);
+    }
+    for backup in backups.iter().filter(|b| b.meta.name.is_under(project)) {
+        used.backups = used.backups.saturating_add(1);
+        used.backup_gib = used.backup_gib.saturating_add(backup.status.size_gib);
+    }
     used
 }
 
@@ -1339,6 +1425,12 @@ mod tests {
         )
     }
 
+    /// Now, for the pure functions that take a clock. Read once per call so a
+    /// test reads the same way the scheduler does.
+    fn now() -> crate::meta::Timestamp {
+        crate::meta::Timestamp::now()
+    }
+
     fn node(id: &str, vcpus: u32, mem: u64) -> Node {
         let mut n = Resource::new(
             Meta::new(
@@ -1369,7 +1461,81 @@ mod tests {
             },
         );
         set_condition(&mut n.status.conditions, Condition::ready(1));
+        // A live machine, because that is what these tests are about. The one
+        // test that is about a dead one sets this back by hand.
+        n.status.last_heartbeat = crate::meta::Timestamp::now();
         n
+    }
+
+    /// A machine that has stopped reporting is not a candidate, however
+    /// ready the last thing it said was. The agent writes `Ready: True` on
+    /// every report and can write nothing at all once it is dead, so without
+    /// this the last word of a failing machine keeps it in the rotation — and
+    /// its frozen `allocated` makes it look like the emptiest node in the
+    /// cell, so it is *preferred*.
+    /// A bigger root disk in the spec used to be accepted, charged for by the
+    /// quota, shown in the console as pending — and never applied, because the
+    /// only question anybody asked about a disk was whether it existed.
+    #[test]
+    fn a_root_disk_that_was_asked_to_grow_grows_when_the_guest_is_stopped() {
+        let mut i = inst("projects/p1/instances/i1");
+        i.spec.root_disk_gib = 40;
+        i.spec.desired_state = DesiredState::Stopped;
+        i.status.state = InstanceState::Stopped;
+        let actions = reconcile_instance(&i, true, &[true], true, Some(20), StartGate::Go, now());
+        assert!(
+            actions.contains(&Action::GrowDisk {
+                instance: "projects/p1/instances/i1".into(),
+                gib: 40
+            }),
+            "a disk that was asked to grow did not: {actions:?}"
+        );
+
+        // Not under a running guest: the VMM would have to be told, and until
+        // it is, this takes effect on the next start like vCPUs and memory.
+        i.status.state = InstanceState::Running;
+        let actions = reconcile_instance(&i, true, &[true], true, Some(20), StartGate::Go, now());
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::GrowDisk { .. })),
+            "a disk was grown under a running guest: {actions:?}"
+        );
+
+        // And never smaller. A shrink is a mistake, and acting on one destroys
+        // the filesystem living there.
+        i.status.state = InstanceState::Stopped;
+        i.spec.root_disk_gib = 10;
+        let actions = reconcile_instance(&i, true, &[true], true, Some(20), StartGate::Go, now());
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::GrowDisk { .. })),
+            "a disk was shrunk: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_machine_that_has_gone_quiet_is_given_no_work() {
+        let i = inst("projects/p1/instances/i1");
+        let mut dead = node("a", 8, 16384);
+        dead.status.last_heartbeat = crate::meta::Timestamp(now().0 - NODE_SILENT_AFTER_MS - 1_000);
+        let why = place(&i, &[dead], &[], &[], &Default::default(), &[], now()).unwrap_err();
+        assert!(
+            matches!(why.first().map(|e| &e.why), Some(Rejected::Silent { .. })),
+            "a silent node was not refused as silent: {why:?}"
+        );
+        // And it is told apart from a machine that answered and said no.
+        let mut refusing = node("b", 8, 16384);
+        refusing.status.conditions.clear();
+        let why = place(&i, &[refusing], &[], &[], &Default::default(), &[], now()).unwrap_err();
+        assert_eq!(why.first().map(|e| &e.why), Some(&Rejected::NotReady));
+    }
+
+    /// The same machine is not counted as room a tenant can be promised.
+    #[test]
+    fn a_quiet_machine_is_not_headroom() {
+        let mut dead = node("a", 8, 16384);
+        dead.status.last_heartbeat = crate::meta::Timestamp(now().0 - NODE_SILENT_AFTER_MS - 1_000);
+        let h = headroom(&[dead], &[], now());
+        assert_eq!(h.usable_nodes, 0, "a silent machine was offered as room");
+        assert_eq!(h.unusable_nodes, 1);
     }
 
     #[test]
@@ -1380,6 +1546,8 @@ mod tests {
             false,
             &[false],
             false,
+            // How big that disk is. These tests are not about growing one.
+            None,
             StartGate::Go,
             crate::meta::Timestamp::now(),
         );
@@ -1403,6 +1571,8 @@ mod tests {
             true,
             &[true],
             true,
+            // How big that disk is. These tests are not about growing one.
+            None,
             StartGate::Go,
             crate::meta::Timestamp::now(),
         );
@@ -1426,6 +1596,8 @@ mod tests {
                 true,
                 &[true],
                 true,
+                // How big that disk is. These tests are not about growing one.
+                None,
                 StartGate::Go,
                 crate::meta::Timestamp::now()
             )
@@ -1442,6 +1614,8 @@ mod tests {
             true,
             &[true],
             true,
+            // How big that disk is. These tests are not about growing one.
+            None,
             StartGate::Go,
             crate::meta::Timestamp::now(),
         );
@@ -1464,6 +1638,8 @@ mod tests {
             true,
             &[true],
             true,
+            // How big that disk is. These tests are not about growing one.
+            None,
             StartGate::Go,
             crate::meta::Timestamp::now(),
         );
@@ -1489,6 +1665,7 @@ mod tests {
                 node: "node-a".into(),
                 at: String::new(),
                 read_only: false,
+                limits: Default::default(),
             },
             AttachmentStatus {
                 attached: true,
@@ -1579,14 +1756,15 @@ mod tests {
                 &[],
                 &[],
                 &classes,
-                &[]
+                &[],
+                now()
             )
             .unwrap(),
             "has"
         );
 
         // With only the two that cannot, both rejections say why.
-        let why = place(&i, &[bare, busy], &[], &[], &classes, &[]).unwrap_err();
+        let why = place(&i, &[bare, busy], &[], &[], &classes, &[], now()).unwrap_err();
         let all: String = why
             .iter()
             .map(|e| format!("{}: {}\n", e.node, describe(&e.why)))
@@ -1610,6 +1788,7 @@ mod tests {
             &[],
             &Default::default(),
             &[],
+            now(),
         )
         .unwrap_err();
         assert!(
@@ -1731,7 +1910,7 @@ mod tests {
         let cell: Vec<Node> = (1..=4)
             .map(|i| sized(&format!("n{i}"), 8, 32_768, 16_384))
             .collect();
-        let h = headroom(&cell, &[]);
+        let h = headroom(&cell, &[], now());
 
         assert_eq!(
             h.free.memory_mib,
@@ -1752,7 +1931,7 @@ mod tests {
         draining.spec.schedulable = false;
         let cell = vec![sized("n1", 8, 32_768, 8_192), draining];
 
-        let h = headroom(&cell, &[]);
+        let h = headroom(&cell, &[], now());
         assert_eq!(h.usable_nodes, 1);
         assert_eq!(h.unusable_nodes, 1);
         assert_eq!(h.total.memory_mib, 2 * 32_768, "the machine still exists");
@@ -1769,7 +1948,7 @@ mod tests {
     fn a_node_being_emptied_offers_no_room() {
         let mut leaving = sized("n1", 8, 32_768, 0);
         leaving.spec.evacuate = true;
-        let h = headroom(&[leaving], &[]);
+        let h = headroom(&[leaving], &[], now());
         assert_eq!(h.usable_nodes, 0);
         assert_eq!(h.free.memory_mib, 0);
     }
@@ -1779,7 +1958,7 @@ mod tests {
     fn a_node_that_is_not_ready_offers_no_room() {
         let mut quiet = sized("n1", 8, 32_768, 0);
         quiet.status.conditions.clear();
-        let h = headroom(&[quiet], &[]);
+        let h = headroom(&[quiet], &[], now());
         assert_eq!(h.usable_nodes, 0);
         assert_eq!(h.free.memory_mib, 0);
         assert_eq!(h.total.memory_mib, 32_768);
@@ -1801,7 +1980,7 @@ mod tests {
         shared.spec.vcpu_overcommit = 4;
         assert_eq!(offered_vcpus(&shared), 32);
 
-        let h = headroom(&[shared.clone()], &[]);
+        let h = headroom(&[shared.clone()], &[], now());
         assert_eq!(
             h.free.vcpus, 32,
             "the ratio did not reach what can be placed"
@@ -1820,9 +1999,9 @@ mod tests {
         let mut big = inst("projects/p1/instances/i1");
         big.spec.vcpus = 16;
         big.spec.memory_mib = 1024;
-        assert!(place(&big, &[plain], &[], &[], &Default::default(), &[]).is_err());
+        assert!(place(&big, &[plain], &[], &[], &Default::default(), &[], now()).is_err());
         assert_eq!(
-            place(&big, &[shared], &[], &[], &Default::default(), &[]).unwrap(),
+            place(&big, &[shared], &[], &[], &Default::default(), &[], now()).unwrap(),
             "n1"
         );
     }
@@ -1833,7 +2012,7 @@ mod tests {
     #[test]
     fn a_node_out_of_service_lends_nothing_to_what_can_be_started() {
         let cell = vec![sized("n1", 8, 32_768, 0), sized("n2", 64, 262_144, 0)];
-        let open = headroom(&cell, &[]);
+        let open = headroom(&cell, &[], now());
         assert_eq!(open.largest_fit.memory_mib, 262_144);
 
         let closed = vec![crate::maintenance::Closed {
@@ -1843,7 +2022,7 @@ mod tests {
             note: String::new(),
             window: "maintenance-windows/w".into(),
         }];
-        let h = headroom(&cell, &closed);
+        let h = headroom(&cell, &closed, now());
         assert_eq!(
             h.largest_fit.memory_mib, 32_768,
             "a machine out of service was still offered as room for a guest"
@@ -1861,7 +2040,7 @@ mod tests {
     fn a_node_being_removed_is_in_neither_count() {
         let mut going = sized("n1", 8, 32_768, 0);
         going.meta.deleted_at = Some(Timestamp(1));
-        let h = headroom(&[going], &[]);
+        let h = headroom(&[going], &[], now());
         assert_eq!(h.usable_nodes, 0);
         assert_eq!(h.unusable_nodes, 0);
         assert_eq!(
@@ -1875,7 +2054,7 @@ mod tests {
         let i = inst("projects/p1/instances/i1");
         let nodes = vec![node("a", 8, 4096), node("b", 8, 16384)];
         assert_eq!(
-            place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap(),
+            place(&i, &nodes, &[], &[], &Default::default(), &[], now()).unwrap(),
             "b"
         );
     }
@@ -1897,13 +2076,13 @@ mod tests {
         }];
         // The emptiest node would have won on every other pass.
         assert_eq!(
-            place(&i, &nodes, &[], &[], &Default::default(), &closed).unwrap(),
+            place(&i, &nodes, &[], &[], &Default::default(), &closed, now()).unwrap(),
             "a"
         );
 
         let mut alone = nodes;
         alone.remove(0);
-        let why = place(&i, &alone, &[], &[], &Default::default(), &closed).unwrap_err();
+        let why = place(&i, &alone, &[], &[], &Default::default(), &closed, now()).unwrap_err();
         assert!(matches!(
             why[0].why,
             Rejected::InMaintenance {
@@ -1931,14 +2110,14 @@ mod tests {
         let nodes = vec![node("a", 8, 65_536), node("b", 8, 16_384)];
         let with = vec![("web".to_string(), "b".to_string())];
         assert_eq!(
-            place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap(),
+            place(&i, &nodes, &[], &with, &Default::default(), &[], now()).unwrap(),
             "b"
         );
 
         // With nobody placed yet there is nothing to be near, and refusing
         // every node would mean a group whose first member could never start.
         assert_eq!(
-            place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap(),
+            place(&i, &nodes, &[], &[], &Default::default(), &[], now()).unwrap(),
             "a"
         );
     }
@@ -1954,7 +2133,7 @@ mod tests {
         let nodes = vec![node("a", 8, 65_536), node("b", 8, 16_384)];
         let with = vec![("web".to_string(), "b".to_string())];
 
-        let why = place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap_err();
+        let why = place(&i, &nodes, &[], &with, &Default::default(), &[], now()).unwrap_err();
         let about_a = why.iter().find(|e| e.node == "a").unwrap();
         assert!(matches!(about_a.why, Rejected::NotWithGroup { .. }));
         assert!(
@@ -1968,7 +2147,7 @@ mod tests {
         // too small.
         i.spec.placement_policy.affinity = crate::resources::Strength::Preferred;
         assert_eq!(
-            place(&i, &nodes, &[], &with, &Default::default(), &[]).unwrap(),
+            place(&i, &nodes, &[], &with, &Default::default(), &[], now()).unwrap(),
             "a"
         );
     }
@@ -1986,12 +2165,12 @@ mod tests {
 
         // Required — the default, and what this platform did before the field
         // existed.
-        let why = place(&i, &only, &taken, &[], &Default::default(), &[]).unwrap_err();
+        let why = place(&i, &only, &taken, &[], &Default::default(), &[], now()).unwrap_err();
         assert!(matches!(why[0].why, Rejected::AntiAffinity { .. }));
 
         i.spec.placement_policy.spread = crate::resources::Strength::Preferred;
         assert_eq!(
-            place(&i, &only, &taken, &[], &Default::default(), &[]).unwrap(),
+            place(&i, &only, &taken, &[], &Default::default(), &[], now()).unwrap(),
             "a"
         );
 
@@ -1999,7 +2178,7 @@ mod tests {
         // even though it has less room than the crowded one.
         let both = vec![node("a", 8, 65_536), node("b", 8, 16_384)];
         assert_eq!(
-            place(&i, &both, &taken, &[], &Default::default(), &[]).unwrap(),
+            place(&i, &both, &taken, &[], &Default::default(), &[], now()).unwrap(),
             "b",
             "a preference for spreading lost to free memory"
         );
@@ -2010,7 +2189,7 @@ mod tests {
         let mut i = super::tests::inst("projects/p1/instances/i1");
         i.spec.memory_mib = 99999;
         let nodes = vec![node("a", 8, 4096), node("b", 8, 16384)];
-        let why = place(&i, &nodes, &[], &[], &Default::default(), &[]).unwrap_err();
+        let why = place(&i, &nodes, &[], &[], &Default::default(), &[], now()).unwrap_err();
         assert_eq!(why.len(), 2, "an operator must learn about every candidate");
         assert!(matches!(why[0].why, Rejected::InsufficientMemory { .. }));
     }
@@ -2023,7 +2202,7 @@ mod tests {
         i.spec.memory_mib = 8192;
         let mut n = node("a", 8, 16384);
         n.status.capacity.numa_free_mib = vec![4096, 4096];
-        let why = place(&i, &[n], &[], &[], &Default::default(), &[]).unwrap_err();
+        let why = place(&i, &[n], &[], &[], &Default::default(), &[], now()).unwrap_err();
         assert_eq!(why[0].why, Rejected::NoNumaNodeFits { want_mib: 8192 });
     }
 
@@ -2033,7 +2212,7 @@ mod tests {
         i.spec.placement_policy.anti_affinity_group = Some("web".into());
         let nodes = vec![node("a", 8, 16384)];
         let occupied = vec![("web".to_string(), "a".to_string())];
-        assert!(place(&i, &nodes, &occupied, &[], &Default::default(), &[]).is_err());
+        assert!(place(&i, &nodes, &occupied, &[], &Default::default(), &[], now()).is_err());
     }
 
     #[test]
@@ -2041,7 +2220,7 @@ mod tests {
         let i = inst("projects/p1/instances/i1");
         let mut n = node("a", 8, 16384);
         n.spec.schedulable = false;
-        let why = place(&i, &[n], &[], &[], &Default::default(), &[]).unwrap_err();
+        let why = place(&i, &[n], &[], &[], &Default::default(), &[], now()).unwrap_err();
         assert_eq!(why[0].why, Rejected::Unschedulable);
     }
 
@@ -2158,7 +2337,7 @@ mod tests {
         dying.meta.deleted_at = Some(crate::meta::Timestamp::now());
         let theirs = inst("projects/p2/instances/i1");
 
-        let used = count_quota(&project, &[mine, dying, theirs], &[], &[], &[]);
+        let used = count_quota(&project, &[mine, dying, theirs], &[], &[], &[], &[], &[]);
         assert_eq!(
             used.instances, 2,
             "another project's instance was charged here"
@@ -2180,6 +2359,10 @@ mod tests {
             volume_gib: 100,
             floating_ips: 2,
             load_balancers: 2,
+            snapshots: 0,
+            snapshot_gib: 0,
+            backups: 0,
+            backup_gib: 0,
         };
         let within = Quota {
             devices: 0,
@@ -2190,6 +2373,10 @@ mod tests {
             volume_gib: 20,
             floating_ips: 1,
             load_balancers: 1,
+            snapshots: 0,
+            snapshot_gib: 0,
+            backups: 0,
+            backup_gib: 0,
         };
         assert_eq!(
             quota_condition(&limit, &within, 1).status,
@@ -2461,6 +2648,8 @@ mod teardown_and_stopping {
             true,
             &[],
             true,
+            // How big that disk is. These tests are not about growing one.
+            None,
             StartGate::Go,
             now,
         );
@@ -2481,6 +2670,8 @@ mod teardown_and_stopping {
             true,
             &[],
             true,
+            // How big that disk is. These tests are not about growing one.
+            None,
             StartGate::Go,
             now,
         );
@@ -2501,6 +2692,8 @@ mod teardown_and_stopping {
             true,
             &[],
             true,
+            // How big that disk is. These tests are not about growing one.
+            None,
             StartGate::Go,
             now,
         );
@@ -2519,6 +2712,8 @@ mod teardown_and_stopping {
             true,
             &[],
             true,
+            // How big that disk is. These tests are not about growing one.
+            None,
             StartGate::Go,
             now,
         );
@@ -2543,7 +2738,15 @@ mod teardown_and_stopping {
         i.status.state = InstanceState::Unknown;
         i.spec.ports = vec!["projects/p1/ports/pt1".into()];
 
-        let actions = reconcile_instance(&i, false, &[false], false, StartGate::Go, Timestamp(2));
+        let actions = reconcile_instance(
+            &i,
+            false,
+            &[false],
+            false,
+            None,
+            StartGate::Go,
+            Timestamp(2),
+        );
         assert!(
             actions.iter().any(|a| matches!(a, Action::DeleteVm { .. })),
             "a guest nobody has reported on was left running: {actions:?}"

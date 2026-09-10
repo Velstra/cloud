@@ -175,6 +175,7 @@ async fn ask_for(store: &Arc<dyn Store>, id: &str, gib: u64) -> Volume {
             source_image: None,
             source_snapshot: None,
             source_backup: None,
+            limits: Default::default(),
         },
         VolumeStatus::default(),
     );
@@ -282,6 +283,7 @@ async fn a_cluster_that_cannot_be_reached_is_reported_rather_than_read_as_empty(
         velstra_cloud_model::resources::PoolSpec {
             accepting: true,
             labels: Vec::new(),
+            volume_ceiling: Default::default(),
         },
         velstra_cloud_model::resources::PoolStatus::default(),
     );

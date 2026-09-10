@@ -255,6 +255,7 @@ async fn a_project_is_not_held_by_the_readings_taken_of_it() {
                 project: "projects/spent".into(),
                 at: velstra_cloud_model::meta::Timestamp(at),
                 used: Default::default(),
+                traffic: Default::default(),
             },
             Default::default(),
         );

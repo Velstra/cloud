@@ -142,6 +142,45 @@ pub struct IdentityStore {
         velstra_cloud_model::identity::ServiceCredentialStatus,
     >,
     placement: Placement,
+    /// Failed sign-ins, per username, for the throttle below. Behind an `Arc`
+    /// because this store is cloned per request and the throttle has to be one
+    /// count, not one per clone.
+    attempts: Arc<std::sync::Mutex<std::collections::HashMap<String, Failures>>>,
+}
+
+/// How often one username has been guessed at wrong, and when.
+#[derive(Clone, Copy)]
+struct Failures {
+    count: u32,
+    last: std::time::Instant,
+}
+
+/// Failures older than this are forgotten: a wrong password this morning must
+/// not slow an honest person down this afternoon.
+const FORGET_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How many wrong answers cost nothing. Enough for a person with two passwords
+/// in their head and a caps-lock key.
+const FREE_TRIES: u32 = 5;
+/// The longest anybody waits. Long enough to make guessing hopeless, short
+/// enough that a locked-out operator is not locked out of an incident.
+const LONGEST_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How many usernames the throttle remembers at once. A spray against ten
+/// thousand invented names must not become a memory leak; past this the
+/// oldest entries go, which costs those names their count and nothing else.
+const MOST_TRACKED: usize = 10_000;
+
+/// How long this username must wait, given how often it has been wrong.
+///
+/// Doubling from one second: the sixth wrong answer costs a second, the tenth
+/// sixteen, and it is capped. A person who mistypes twice notices nothing; a
+/// script gets four attempts a minute within a minute of starting, which is
+/// the difference between guessing a password and not.
+fn wait_after(count: u32) -> std::time::Duration {
+    if count <= FREE_TRIES {
+        return std::time::Duration::ZERO;
+    }
+    let doublings = (count - FREE_TRIES - 1).min(16);
+    LONGEST_WAIT.min(std::time::Duration::from_secs(1u64 << doublings))
 }
 
 impl IdentityStore {
@@ -153,7 +192,64 @@ impl IdentityStore {
             node_credentials: TypedStore::new(store.clone(), cell, "node-credentials"),
             service_credentials: TypedStore::new(store, cell, "service-credentials"),
             placement: Placement::new(region, cell),
+            attempts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Whether this username may be tried again yet, and how long if not.
+    ///
+    /// Keyed on the username as submitted, existing or not, so it tells an
+    /// attacker nothing about which accounts are real. It is per username
+    /// rather than per address on purpose: the address is not visible from
+    /// here, and the attack this stops — guessing one account's password — is
+    /// keyed on the account either way.
+    fn too_soon(&self, username: &str) -> Option<std::time::Duration> {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|p| {
+            self.attempts.clear_poison();
+            p.into_inner()
+        });
+        let now = std::time::Instant::now();
+        attempts.retain(|_, f| now.duration_since(f.last) < FORGET_AFTER);
+        let f = attempts.get(username)?;
+        let wait = wait_after(f.count);
+        let waited = now.duration_since(f.last);
+        (waited < wait).then(|| wait - waited)
+    }
+
+    /// Note a wrong answer for this username.
+    fn note_failure(&self, username: &str) {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|p| {
+            self.attempts.clear_poison();
+            p.into_inner()
+        });
+        let now = std::time::Instant::now();
+        if attempts.len() >= MOST_TRACKED && !attempts.contains_key(username) {
+            attempts.retain(|_, f| now.duration_since(f.last) < FORGET_AFTER);
+            if attempts.len() >= MOST_TRACKED {
+                let oldest = attempts
+                    .iter()
+                    .min_by_key(|(_, f)| f.last)
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest {
+                    attempts.remove(&k);
+                }
+            }
+        }
+        let entry = attempts.entry(username.to_string()).or_insert(Failures {
+            count: 0,
+            last: now,
+        });
+        entry.count = entry.count.saturating_add(1);
+        entry.last = now;
+    }
+
+    /// Forget this username's failures. Called on a sign-in that worked.
+    fn note_success(&self, username: &str) {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|p| {
+            self.attempts.clear_poison();
+            p.into_inner()
+        });
+        attempts.remove(username);
     }
 
     fn now() -> Timestamp {
@@ -167,6 +263,31 @@ impl IdentityStore {
     /// them apart tells whoever is asking which usernames exist — so the caller
     /// gets one sentence and the operator gets the detail in the log.
     pub async fn sign_in(&self, username: &str, password: &str) -> ApiResult<SignedIn> {
+        // Before anything is read or hashed. Without this the only cost of a
+        // guess is one Argon2 hash, and a cell reachable on a network can be
+        // sprayed at line rate for as long as somebody cares to.
+        if let Some(wait) = self.too_soon(username) {
+            return Err(ApiError::new(
+                Code::ResourceExhausted,
+                format!(
+                    "too many sign-ins have been refused for this username. Try again in {} seconds.",
+                    wait.as_secs().max(1)
+                ),
+            ));
+        }
+        let verdict = self.sign_in_inner(username, password).await;
+        match &verdict {
+            Ok(_) => self.note_success(username),
+            // Only a rejected password counts. A store that is down is not a
+            // wrong guess, and throttling on it would lock everybody out of a
+            // cell exactly when they need to reach it.
+            Err(e) if e.code == Code::Unauthenticated => self.note_failure(username),
+            Err(_) => {}
+        }
+        verdict
+    }
+
+    async fn sign_in_inner(&self, username: &str, password: &str) -> ApiResult<SignedIn> {
         let rejected = || {
             ApiError::new(
                 Code::Unauthenticated,
@@ -299,7 +420,8 @@ impl IdentityStore {
     /// itself may never write, in a collection with no route — which is what
     /// makes it a credential the node cannot rotate.
     pub async fn mint_node_credential(&self, node: &str) -> ApiResult<String> {
-        self.mint_agent_credential(node, AgentKind::Node).await
+        self.mint_agent_credential(node, AgentKind::Node, None, "")
+            .await
     }
 
     /// The same, for a storage pool.
@@ -310,10 +432,17 @@ impl IdentityStore {
     /// write to. Reading through the API it already did; authenticating is what
     /// was missing.
     pub async fn mint_pool_credential(&self, pool: &str) -> ApiResult<String> {
-        self.mint_agent_credential(pool, AgentKind::Pool).await
+        self.mint_agent_credential(pool, AgentKind::Pool, None, "")
+            .await
     }
 
-    async fn mint_agent_credential(&self, node: &str, kind: AgentKind) -> ApiResult<String> {
+    async fn mint_agent_credential(
+        &self,
+        node: &str,
+        kind: AgentKind,
+        expires_at: Option<Timestamp>,
+        purpose: &str,
+    ) -> ApiResult<String> {
         let token = new_node_token();
         let now = Self::now();
         let credential = NodeCredential {
@@ -325,6 +454,8 @@ impl IdentityStore {
                 node: node.to_string(),
                 kind,
                 issued_at: now,
+                expires_at,
+                purpose: purpose.to_string(),
             },
             status: NodeCredentialStatus::default(),
         };
@@ -341,6 +472,66 @@ impl IdentityStore {
             "minted a per-agent token"
         );
         Ok(token)
+    }
+
+    /// The same, with an expiry and a note about what it is for.
+    ///
+    /// The path `:issueCredential` takes, so an operator issuing a second
+    /// credential in order to rotate can say which is which and, if they want,
+    /// put an end date on the one they are handing to somebody else.
+    pub async fn mint_agent_credential_for(
+        &self,
+        agent: &str,
+        kind: AgentKind,
+        expires_at: Option<Timestamp>,
+        purpose: &str,
+    ) -> ApiResult<String> {
+        self.mint_agent_credential(agent, kind, expires_at, purpose)
+            .await
+    }
+
+    /// Every credential an agent holds, without the tokens.
+    ///
+    /// There was no way to ask this at all, which made rotation impossible to
+    /// do safely: issuing is additive by design, so an operator who had issued
+    /// three had three live ways in and no way to see or remove two of them.
+    pub async fn agent_credentials_for(
+        &self,
+        agent: &str,
+    ) -> ApiResult<Vec<velstra_cloud_model::identity::NodeCredential>> {
+        let all = self.node_credentials.list().await.map_err(store_error)?;
+        let mut mine: Vec<_> = all.into_iter().filter(|c| c.spec.node == agent).collect();
+        mine.sort_by_key(|c| c.spec.issued_at.0);
+        Ok(mine)
+    }
+
+    /// Take one agent credential out of use.
+    ///
+    /// By id — the token's digest, which is what the store keys it by — and
+    /// only for the agent it belongs to, so an operator revoking one machine's
+    /// credential cannot name another's by accident. Already gone is not an
+    /// error: a revocation whose answer was lost has to be safe to repeat.
+    pub async fn revoke_agent_credential(&self, agent: &str, id: &str) -> ApiResult<()> {
+        let key = stored("node-credentials", id);
+        let Some(credential) = self.node_credentials.get(&key).await.map_err(store_error)? else {
+            return Ok(());
+        };
+        if credential.spec.node != agent {
+            return Err(ApiError::new(
+                Code::NotFound,
+                "there is no such credential for this machine",
+            ));
+        }
+        self.node_credentials
+            .delete(
+                &key,
+                credential.meta.revision,
+                &velstra_cloud_model::Writer::controller("sessions"),
+            )
+            .await
+            .map_err(store_error)?;
+        tracing::info!(agent, "revoked an agent credential");
+        Ok(())
     }
 
     /// Mint a token for a service account.
@@ -371,6 +562,56 @@ impl IdentityStore {
             .map_err(store_error)?;
         tracing::info!(user, purpose, "minted a service account token");
         Ok(token)
+    }
+
+    /// Every token minted for this account, without the tokens.
+    ///
+    /// The id is the credential's own name — the token's digest. A digest is
+    /// not the token and cannot be turned back into one; it is here because
+    /// revoking needs something to name, and inventing a second identifier for
+    /// a thing the store already keys would be two names for one row.
+    pub async fn service_credentials_for(
+        &self,
+        user: &str,
+    ) -> ApiResult<Vec<velstra_cloud_model::identity::ServiceCredential>> {
+        let all = self.service_credentials.list().await.map_err(store_error)?;
+        let mut mine: Vec<_> = all.into_iter().filter(|c| c.spec.user == user).collect();
+        mine.sort_by_key(|c| c.spec.issued_at.0);
+        Ok(mine)
+    }
+
+    /// Take one token out of use.
+    ///
+    /// By id, and only for the account it belongs to: an operator revoking a
+    /// leaked CI token must not be able to name somebody else's row by
+    /// accident. A token that is already gone is not an error — a revocation
+    /// whose answer was lost has to be safe to ask again.
+    pub async fn revoke_service_credential(&self, user: &str, id: &str) -> ApiResult<()> {
+        let key = stored("service-credentials", id);
+        let Some(credential) = self
+            .service_credentials
+            .get(&key)
+            .await
+            .map_err(store_error)?
+        else {
+            return Ok(());
+        };
+        if credential.spec.user != user {
+            return Err(ApiError::new(
+                Code::NotFound,
+                "there is no such token for this account",
+            ));
+        }
+        self.service_credentials
+            .delete(
+                &key,
+                credential.meta.revision,
+                &velstra_cloud_model::Writer::controller("sessions"),
+            )
+            .await
+            .map_err(store_error)?;
+        tracing::info!(user, purpose = %credential.spec.purpose, "revoked a service account token");
+        Ok(())
     }
 
     /// Who a bearer token speaks for, if it is a service account's.
@@ -424,6 +665,23 @@ impl IdentityStore {
                 "the bearer token was not accepted",
             ));
         };
+        // Past its expiry, if it was given one. Deleted here as well as
+        // refused: a credential nobody can use is a row nothing will ever come
+        // back for, and the sweep that would otherwise be needed is this line.
+        if !credential.spec.live_at(Self::now()) {
+            let _ = self
+                .node_credentials
+                .delete(
+                    &stored("node-credentials", &digest),
+                    credential.meta.revision,
+                    &velstra_cloud_model::Writer::controller("sessions"),
+                )
+                .await;
+            return Err(ApiError::new(
+                Code::Unauthenticated,
+                "the bearer token was not accepted",
+            ));
+        }
         let node = credential.spec.node;
         // `node:` or `pool:` — the same machinery either way (an agent writes
         // what it owns, and ownership is by name), but a refusal in a log should
@@ -875,5 +1133,30 @@ impl TokenVerifier for StoreTokenVerifier {
                 None => Err(e),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use std::time::Duration;
+
+    /// The sixth wrong answer costs a second and the tenth sixteen, and it
+    /// stops climbing. Somebody who mistypes twice notices nothing; a script
+    /// gets a handful of tries a minute, which is the difference between
+    /// guessing a password and not.
+    #[test]
+    fn guessing_gets_slower_and_typing_does_not() {
+        for tried in 0..=super::FREE_TRIES {
+            assert_eq!(
+                super::wait_after(tried),
+                Duration::ZERO,
+                "{tried} tries should still be free"
+            );
+        }
+        assert_eq!(super::wait_after(6), Duration::from_secs(1));
+        assert_eq!(super::wait_after(10), Duration::from_secs(16));
+        // Capped, so an operator locked out by a colleague's script is not
+        // locked out of the incident.
+        assert_eq!(super::wait_after(40), super::LONGEST_WAIT);
     }
 }

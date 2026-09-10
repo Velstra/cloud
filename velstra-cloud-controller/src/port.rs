@@ -66,6 +66,20 @@ pub struct PortController {
     /// every event. Measured at 401 objects in a cell of 400, which is ten
     /// thousand in a cell of ten thousand and a hundred million for one resync.
     instances: Cached<InstanceSpec, InstanceStatus>,
+    /// The same instances, read from the store, for the one question the cache
+    /// must not answer alone: **is this guest really gone?**
+    ///
+    /// A cache is a view that lags, and a lagging view says "absent" about
+    /// something that was created a moment ago. That is harmless for every
+    /// other question here and fatal for this one: the port is deleted, the
+    /// guest is left naming a wire that no longer exists, and it never
+    /// recovers — `HostActions: port … is not in the store yet`, for ever.
+    ///
+    /// Seen on a live cell: a guest created and its own default port collected
+    /// four seconds later, by a pass that had not yet been told the guest
+    /// existed. One store read on the rare pass that would otherwise delete
+    /// something is the whole cost of not doing that.
+    stored_instances: TypedStore<InstanceSpec, InstanceStatus>,
     /// Needed only to watch another collection: keys are `/<cell>/<kind>/…`, and
     /// a watch prefix without the cell in it matches nothing at all.
     cell: String,
@@ -75,11 +89,13 @@ impl PortController {
     pub fn new(
         ports: TypedStore<PortSpec, PortStatus>,
         instances: Cached<InstanceSpec, InstanceStatus>,
+        stored_instances: TypedStore<InstanceSpec, InstanceStatus>,
         cell: &str,
     ) -> Self {
         Self {
             ports,
             instances,
+            stored_instances,
             cell: cell.to_string(),
         }
     }
@@ -110,6 +126,21 @@ impl PortController {
             return Ok(false);
         };
         if port.meta.is_deleting() || self.instances.get(guest).await.is_some() {
+            return Ok(false);
+        }
+        // The cache says the guest is gone. Before acting on that — and this
+        // is the only place a *deletion* hangs on it — ask the store, which
+        // does not lag. A guest created a moment ago is absent from a cache
+        // that has not been told yet, and collecting its port on that basis
+        // leaves it naming a wire that will never exist again.
+        if self
+            .stored_instances
+            .get(guest)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
             return Ok(false);
         }
         self.ports
@@ -287,6 +318,7 @@ mod tests {
                     store.clone(),
                     velstra_cloud_store::prefix_for("cell-1", "instances"),
                 ),
+                instances.clone(),
                 "cell-1",
             ),
             ports,
@@ -583,6 +615,7 @@ mod a_wire_nobody_will_ever_come_back_for {
                     store.clone(),
                     velstra_cloud_store::prefix_for("cell-1", "instances"),
                 ),
+                instances.clone(),
                 "cell-1",
             ),
             ports,
@@ -612,6 +645,46 @@ mod a_wire_nobody_will_ever_come_back_for {
             .await
             .unwrap();
         ports.get(PORT).await.unwrap().unwrap()
+    }
+
+    /// A guest that exists keeps its wire, even when the cache has not been
+    /// told about it yet.
+    ///
+    /// The cache is a view that lags, and a lagging view says "absent" about
+    /// something created a moment ago. Every other question here can live with
+    /// that; this one cannot, because it *deletes*. Seen on a live cell: a
+    /// guest created, and its own default port collected four seconds later by
+    /// a pass that had not yet heard of the guest — leaving the instance naming
+    /// a wire that would never exist again, with `HostActions: port … is not in
+    /// the store yet` for ever.
+    #[tokio::test]
+    async fn a_guest_the_cache_has_not_caught_up_with_keeps_its_port() {
+        let (controller, ports, instances) = cell().await;
+        let port = a_port(&ports, Some(GUEST)).await;
+        // Written to the store *after* the cache in front of the controller
+        // started, which is exactly the race: the guest exists and the cache
+        // has not been told.
+        instances
+            .create(
+                &Resource::new(
+                    velstra_cloud_model::meta::Meta::new(
+                        GUEST.parse().unwrap(),
+                        velstra_cloud_model::meta::Placement::new("eu", "cell-1"),
+                    ),
+                    InstanceSpec::default(),
+                    InstanceStatus::default(),
+                ),
+                &Writer::controller("test"),
+            )
+            .await
+            .unwrap();
+
+        controller.reconcile(PORT, Some(&port)).await.unwrap();
+
+        assert!(
+            ports.get(PORT).await.unwrap().is_some(),
+            "a port was collected out from under a guest the cache had not seen"
+        );
     }
 
     #[tokio::test]

@@ -57,6 +57,13 @@ impl Patch {
 pub struct Deleted {
     pub resource: Value,
     pub gone: bool,
+    /// The operation minted for the removal, when one was.
+    ///
+    /// Set a layer up, by [`crate::core::Api::delete`] — this type is the
+    /// collection's answer, and the collection does not know about operations.
+    /// `None` for a delete that finished on the spot, because there is nothing
+    /// left to follow.
+    pub operation: Option<String>,
 }
 
 /// One collection, with its types erased. Every document in and out is
@@ -264,6 +271,7 @@ where
                     ApiError::internal(format!("{name} could not be taken away either: {e}"))
                 })?;
                 return Ok(Deleted {
+                    operation: None,
                     resource: serde_json::json!({ "meta": { "name": name } }),
                     gone: true,
                 });
@@ -302,6 +310,7 @@ where
                 .await?;
         }
         Ok(Deleted {
+            operation: None,
             resource: Self::document(&resource)?,
             gone,
         })

@@ -261,6 +261,9 @@ pub async fn register_image(store: &Arc<dyn Store>, name: &str) {
             size_bytes: 1024,
             source_url: "file:///var/lib/velstra/images/abc.raw".into(),
             signature: None,
+            state: Default::default(),
+            replacement: String::new(),
+            shared_with: Default::default(),
         },
         ImageStatus::default(),
     );
@@ -432,6 +435,7 @@ pub async fn create_attachment(
                 velstra_cloud_nodeagent::hostfs::slug(volume)
             ),
             read_only: false,
+            limits: Default::default(),
         },
         AttachmentStatus {
             node: Some(node.to_string()),

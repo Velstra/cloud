@@ -23,9 +23,9 @@ function at(obj, path) {
 
 const meta = (r) => r.meta || {};
 const spec = (r) => r.spec || {};
-const status = (r) => r.status || {};
+const statusOf = (r) => r.status || {};
 const generation = (r) => Number(pick(meta(r), "generation") || 0);
-const observed = (r) => Number(pick(status(r), "observedGeneration") || 0);
+const observed = (r) => Number(pick(statusOf(r), "observedGeneration") || 0);
 const revision = (r) => {
   const v = pick(meta(r), "revision");
   return v === undefined || v === null ? null : String(v);
@@ -40,7 +40,7 @@ const idOf = (r) => nameOf(r).split("/").pop();
 const deletedAt = (r) => pick(meta(r), "deletedAt");
 
 function condition(r, kind) {
-  const cs = pick(status(r), "conditions") || [];
+  const cs = pick(statusOf(r), "conditions") || [];
   return cs.find((c) => c.kind === kind) || null;
 }
 
@@ -104,9 +104,9 @@ function verdict(r, kind) {
   // about no longer exists" — which is true, and is a fact about a delete
   // somebody did on purpose. If the target is genuinely broken, the target is
   // on the list; the receipt for the request is not a second copy of it.
-  const finished = pick(status(r), "done");
+  const finished = pick(statusOf(r), "done");
   if (finished === true) {
-    const failed = pick(status(r), "error");
+    const failed = pick(statusOf(r), "error");
     return {
       kind: "settled",
       word: "Finished",
@@ -222,7 +222,7 @@ function verdict(r, kind) {
 /// "Drifting" for somebody who just pressed Stop.
 function underway(r) {
   const asked = pick(spec(r), "desiredState");
-  const is = pick(status(r), "state");
+  const is = pick(statusOf(r), "state");
   if (!asked || !is || asked === is) return "";
   if (asked === "Stopped") return "Stopping…";
   if (asked === "Running") return is === "Stopped" ? "Starting…" : "Restarting…";
@@ -291,7 +291,6 @@ const LABELS = {
   // `hugepages1gi`, all lowercase, because that is what the wire says: the
   // field is `hugepages_1gi` and a digit cannot be capitalised. Spelled
   // `hugepages1Gi` here, this row silently showed nothing.
-  hugepages1gi: "1 GiB hugepages",
   hugepages1gi: "1 GiB hugepages",
   numaFreeMib: "Free per NUMA node",
   vmmPid: "VMM process",

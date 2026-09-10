@@ -52,6 +52,7 @@ const CONSOLE_CSS: &str = include_str!("assets/console.css");
 /// exists.
 const SCRIPT: &[(&str, &str)] = &[
     ("dom", include_str!("assets/dom.js")),
+    ("ui", include_str!("assets/ui.js")),
     ("model", include_str!("assets/model.js")),
     ("api", include_str!("assets/api.js")),
     ("board", include_str!("assets/board.js")),

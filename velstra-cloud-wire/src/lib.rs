@@ -236,6 +236,9 @@ mod tests {
             NodeStatus {
                 shared_state: false,
                 vmm: "qemu".into(),
+                datapath: "local-network".into(),
+                console_tls: true,
+                balancers: vec!["projects/p1/load-balancers/web".into()],
                 fetching: Vec::new(),
                 pci_devices: Vec::new(),
                 cpu: None,

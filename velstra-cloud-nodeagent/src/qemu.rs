@@ -273,6 +273,18 @@ impl QemuVmm {
             .collect()
     }
 
+    /// What every disk this guest holds has moved, added up.
+    ///
+    /// **Untested against a live QEMU;** the reply shape it reads is tested
+    /// against bytes in [`disk_traffic_of`].
+    async fn block_stats(&self, instance: &str) -> Option<crate::host::DiskTraffic> {
+        let answer = self
+            .qmp(instance, "query-blockstats", json!({}))
+            .await
+            .ok()?;
+        Some(disk_traffic_of(&answer))
+    }
+
     /// **Untested:** needs a live QEMU.
     async fn received_mib(&self, instance: &str) -> u64 {
         match self.qmp(instance, "query-migrate", json!({})).await {
@@ -384,8 +396,11 @@ impl Vmm for QemuVmm {
         for entry in hostfs::read_dir_names(&self.layout.run_dir)? {
             let instance = unslug(&entry);
             let dir = self.layout.run_dir.join(&entry);
-            if dir.join("root.raw").exists() {
+            let disk = dir.join("root.raw");
+            if disk.exists() {
                 host.disks.insert(instance.clone());
+                host.disk_gib
+                    .insert(instance.clone(), hostfs::disk_gib(&disk));
             }
             if !self.monitor(&instance).exists() && !self.incoming_monitor(&instance).exists() {
                 // No monitor. Usually that means no VMM was ever asked for here
@@ -560,6 +575,20 @@ impl Vmm for QemuVmm {
         let source = hostfs::image_path(&self.layout, image);
         hostfs::create_disk(&self.layout, instance, gib, source.as_deref(), format).await
     }
+    async fn grow_disk(&self, instance: &str, gib: u64) -> Result<()> {
+        hostfs::grow_disk(&self.layout, instance, gib).await
+    }
+    async fn forget_image(&self, stored_as: &str) -> Result<()> {
+        hostfs::forget_image(&self.layout, stored_as)
+    }
+
+    async fn image_age_seconds(&self, stored_as: &str) -> Option<u64> {
+        hostfs::image_age_seconds(&self.layout, stored_as)
+    }
+
+    async fn disk_traffic(&self, instance: &str) -> Option<crate::host::DiskTraffic> {
+        self.block_stats(instance).await
+    }
 
     /// Covered by `tests/qemu_boots_a_guest.rs`, which starts a real guest and
     /// reads its console: "running" is what a VMM reports for a machine that
@@ -625,6 +654,7 @@ impl Vmm for QemuVmm {
         volume: &str,
         at: &str,
         read_only: bool,
+        limits: velstra_cloud_model::throttle::Limits,
     ) -> Result<String> {
         // Not `slug`: QEMU refuses `~` in a node-name. See `hostfs::qmp_id`.
         let id = crate::hostfs::qmp_id(volume);
@@ -658,6 +688,22 @@ impl Vmm for QemuVmm {
             json!({ "driver": "virtio-blk-pci", "drive": id, "id": id }),
         )
         .await?;
+        // The ceiling, if there is one. `block_set_io_throttle` rather than
+        // arguments on the blockdev, because it is the same call for a disk
+        // being opened now and one already open — so a changed ceiling has one
+        // path to take rather than two.
+        //
+        // Every field must be sent: QMP's own default for an omitted member is
+        // zero, which is "unlimited", so a partial message would quietly clear
+        // whatever it did not mention.
+        if !limits.is_unlimited() {
+            self.qmp(
+                instance,
+                "block_set_io_throttle",
+                throttle_args(&id, limits),
+            )
+            .await?;
+        }
         // The name the guest's kernel gives it depends on the guest; what this
         // node can honestly report is the device it plugged in. The same string
         // comes back from `query-block`, which is what makes the next pass see
@@ -1190,6 +1236,24 @@ fn transferred_mib(answer: &Value) -> u64 {
         .and_then(|bytes| bytes.as_u64())
         .unwrap_or(0)
         / (1024 * 1024)
+}
+
+/// QMP's `block_set_io_throttle`, from what the attachment says.
+///
+/// Mebibytes become bytes per second, because that is the unit QEMU takes and
+/// the platform's is the one a person reads. Zero stays zero, which QEMU also
+/// reads as unlimited — so the two vocabularies agree without a special case.
+fn throttle_args(id: &str, limits: velstra_cloud_model::throttle::Limits) -> serde_json::Value {
+    let mib = |n: u32| u64::from(n) * 1024 * 1024;
+    json!({
+        "id": id,
+        "bps": 0,
+        "bps_rd": mib(limits.read_mibps),
+        "bps_wr": mib(limits.write_mibps),
+        "iops": u64::from(limits.iops),
+        "iops_rd": 0,
+        "iops_wr": 0,
+    })
 }
 
 #[cfg(test)]
@@ -1731,5 +1795,97 @@ Available CPUs:
         // A binary that could not be asked cannot be shown able. The closed
         // direction, like everywhere else a capability is claimed.
         assert!(!levels_listed(""));
+    }
+}
+
+/// `query-blockstats`, added up.
+///
+/// Every entry, including the ones QEMU named for itself: the root disk is a
+/// disk this guest is using, and leaving it out would answer "no disk traffic"
+/// about a guest that does nothing but write to it. The parent-device entries
+/// QEMU nests under `parent` are deliberately *not* walked — they are the same
+/// bytes counted a second time at a lower layer.
+///
+/// A missing field is nothing rather than a refusal: this is a number for a
+/// graph, and a graph with one gap is better than a pass that reported nothing
+/// because one device answered oddly.
+pub fn disk_traffic_of(answer: &Value) -> crate::host::DiskTraffic {
+    let mut out = crate::host::DiskTraffic::default();
+    let Some(devices) = answer.as_array() else {
+        return out;
+    };
+    for device in devices {
+        let Some(stats) = device.get("stats") else {
+            continue;
+        };
+        let number = |key: &str| stats.get(key).and_then(Value::as_u64).unwrap_or(0);
+        out.read_bytes = out.read_bytes.saturating_add(number("rd_bytes"));
+        out.write_bytes = out.write_bytes.saturating_add(number("wr_bytes"));
+        out.read_ops = out.read_ops.saturating_add(number("rd_operations"));
+        out.write_ops = out.write_ops.saturating_add(number("wr_operations"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod block_stats_tests {
+    use super::*;
+
+    /// A real `query-blockstats` answer, trimmed to the fields that are read.
+    /// Two devices — the root disk QEMU named for itself and a volume this
+    /// platform named — and the answer is their sum.
+    #[test]
+    fn every_disk_a_guest_holds_is_counted_once() {
+        let answer = json!([
+            {
+                "device": "",
+                "node-name": "#block156",
+                "stats": {
+                    "rd_bytes": 1_048_576u64,
+                    "wr_bytes": 4_194_304u64,
+                    "rd_operations": 64u64,
+                    "wr_operations": 128u64
+                },
+                // The same bytes again, one layer down. Walking this would
+                // double every number.
+                "parent": {
+                    "stats": {
+                        "rd_bytes": 1_048_576u64,
+                        "wr_bytes": 4_194_304u64,
+                        "rd_operations": 64u64,
+                        "wr_operations": 128u64
+                    }
+                }
+            },
+            {
+                "device": "",
+                "node-name": "projects_p1_volumes_data",
+                "stats": {
+                    "rd_bytes": 2_000u64,
+                    "wr_bytes": 3_000u64,
+                    "rd_operations": 2u64,
+                    "wr_operations": 3u64
+                }
+            }
+        ]);
+        let seen = disk_traffic_of(&answer);
+        assert_eq!(seen.read_bytes, 1_050_576);
+        assert_eq!(seen.write_bytes, 4_197_304);
+        assert_eq!(seen.read_ops, 66);
+        assert_eq!(seen.write_ops, 131);
+    }
+
+    /// An answer that is not a list, or a device with no stats, is nothing
+    /// rather than a panic: this is a number for a graph.
+    #[test]
+    fn an_odd_answer_reads_as_nothing() {
+        assert_eq!(
+            disk_traffic_of(&json!({"error": "no"})),
+            crate::host::DiskTraffic::default()
+        );
+        assert_eq!(
+            disk_traffic_of(&json!([{"device": "x"}])),
+            crate::host::DiskTraffic::default()
+        );
     }
 }

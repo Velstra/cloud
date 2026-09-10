@@ -375,6 +375,50 @@ async fn deleting_tears_down_in_order_and_then_says_it_has_let_go() {
     );
 }
 
+/// What the attachment says this disk may take is what the VMM is told.
+///
+/// The last hop of a chain with three of them — a pool's ceiling, a
+/// controller settling it against the volume's own, and this. The first two
+/// have their own tests; without this one the number could arrive on the
+/// attachment and be dropped on the way into the hypervisor, and nothing
+/// anywhere would say so. The guest would simply be fast.
+#[tokio::test]
+async fn what_a_disk_may_take_reaches_the_hypervisor() {
+    let store = store();
+    let attachment = "projects/p1/attachments/a1";
+    let volume = "projects/p1/volumes/v1";
+    create_attachment(&store, attachment, volume, I1, "node-a").await;
+    let mut stored = read_attachment(&store, attachment).await;
+    stored.spec.limits = velstra_cloud_model::throttle::Limits {
+        iops: 5_000,
+        read_mibps: 200,
+        write_mibps: 100,
+    };
+    stored.meta.generation += 1;
+    common::attachments(&store)
+        .update(
+            &stored,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+    agent.resync().await;
+
+    assert_eq!(
+        vmm.throttle_on(volume),
+        Some(velstra_cloud_model::throttle::Limits {
+            iops: 5_000,
+            read_mibps: 200,
+            write_mibps: 100,
+        }),
+        "the hypervisor was not told what this disk may take"
+    );
+}
+
 #[tokio::test]
 async fn an_attachment_is_opened_and_only_released_once_it_is_closed() {
     // No instance object on purpose: an attachment carries the node it belongs
@@ -1191,6 +1235,35 @@ async fn a_guest_whose_instance_is_gone_is_stopped() {
     );
 }
 
+/// A guest another agent on the same machine made is left alone.
+///
+/// Two node agents on one box is a thing the flags invite — `--tap-prefix` and
+/// `--bridge-prefix` say in as many words that "two agents on one machine need
+/// two". The orphan sweep did not know it: `CellReader::instances` is *this
+/// node's share*, never the cell, so every guest of the other agent looked
+/// like an instance nobody's books mention.
+///
+/// Found live. A second agent started on a working node stopped the first
+/// agent's guest within seconds, and the guest's own agent had to bring it
+/// back.
+#[tokio::test]
+async fn a_guest_another_agent_on_this_machine_made_is_left_alone() {
+    let store = store();
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+    let agent = node_agent(store.clone(), "node-a", &vmm, &datapath);
+
+    // Running on this machine, and not out of this agent's state directory.
+    vmm.start_detached_elsewhere(I1);
+    assert!(vmm.is_running(I1));
+
+    agent.resync().await;
+    assert!(
+        vmm.is_running(I1),
+        "the sweep stopped a guest belonging to another agent on the same machine"
+    );
+}
+
 /// A small wobble in the free-memory reading is not a report.
 ///
 /// /proc never answers the same twice on a busy machine, so "did anything
@@ -1400,5 +1473,88 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
     assert!(
         stale.applied().is_some_and(|d| d.sessions.is_empty()),
         "a restarted agent left a deleted session running"
+    );
+}
+
+/// The pass gives up whenever a control-plane or datapath read fails — and
+/// that is exactly the outage self-fencing exists for. While the fence sat at
+/// the end of the pass, a node cut off from the control plane kept every guest
+/// running, with nothing to stop the recovery controller starting them
+/// somewhere else. Two copies of a guest, writing to one disk.
+#[tokio::test]
+async fn a_node_that_cannot_read_the_world_still_fences_itself() {
+    let (store, vmm, datapath, agent) = one_instance_on("node-a").await;
+
+    // A running guest, and a node that has been told to fence after a minute.
+    assert_eq!(agent.resync().await.failures, 0);
+    assert!(vmm.is_running(I1));
+    create_node(&store, "node-a").await;
+    let nodes: velstra_cloud_store::TypedStore<
+        velstra_cloud_model::resources::NodeSpec,
+        velstra_cloud_model::resources::NodeStatus,
+    > = velstra_cloud_store::TypedStore::new(store.clone(), CELL, "nodes");
+    let mut node = nodes.get("nodes/node-a").await.unwrap().unwrap();
+    node.spec.fence_after_s = 60;
+    // A spec change carries a generation, like every other one.
+    node.meta.generation += 1;
+    nodes
+        .update(
+            &node,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+    // One pass to learn the deadline, then the world goes away.
+    assert_eq!(agent.resync().await.failures, 0);
+    datapath.fail_observe("the datapath is unreachable");
+    agent.pretend_last_report_was(Duration::from_secs(600));
+
+    let pass = agent.resync().await;
+
+    assert!(
+        !vmm.is_running(I1),
+        "the pass gave up early and left the guest running: {pass:?}"
+    );
+
+    // And when the world comes back, the guest comes back with it — fencing is
+    // a pause, not a demolition.
+    datapath.heal_observe();
+    agent.resync().await;
+    assert!(vmm.is_running(I1), "the guest did not come back");
+}
+
+/// A hypervisor's image cache grew with every distinct image ever booted on it
+/// and never shrank — on the filesystem that also holds every guest's root
+/// disk. Nothing removed an image when the object was deleted, when the last
+/// guest using it went away, or when the disk filled.
+#[tokio::test]
+async fn a_cached_image_nothing_needs_any_more_is_removed() {
+    let (store, vmm, _datapath, agent) = one_instance_on("node-a").await;
+
+    // One pass brings the guest up, which pulls and keeps its image.
+    assert_eq!(agent.resync().await.failures, 0);
+    let cached = vmm.cached_images();
+    assert_eq!(
+        cached.len(),
+        1,
+        "the guest's image was not cached: {cached:?}"
+    );
+    let held = cached.iter().next().unwrap().clone();
+
+    // While a guest here is made from it, it stays — however old it is.
+    vmm.image_fetched_secs_ago(&held, 365 * 24 * 60 * 60);
+    agent.resync().await;
+    assert!(
+        vmm.cached_images().contains(&held),
+        "an image a guest here needs was swept"
+    );
+
+    // The guest goes; the image is now old and unreferenced, and goes with it.
+    request_delete_instance(&store, I1).await;
+    agent.resync().await;
+    agent.resync().await;
+    assert!(
+        !vmm.cached_images().contains(&held),
+        "the cache kept an image nothing needs"
     );
 }

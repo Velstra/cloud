@@ -117,6 +117,7 @@
               "status": "string"
             }
           ],
+          "consoleTls": "bool",
           "cpu": {
             "arch": "string",
             "canMask": "bool",
@@ -224,6 +225,7 @@
           "status": "string"
         }
       ],
+      "consoleTls": "bool",
       "cpu": {
         "arch": "string",
         "canMask": "bool",
@@ -381,6 +383,7 @@
           "signature": "null",
           "sizeBytes": "number",
           "sourceUrl": "string",
+          "state": "string",
           "version": "string"
         },
         "status": {
@@ -415,6 +418,7 @@
       "signature": "null",
       "sizeBytes": "number",
       "sourceUrl": "string",
+      "state": "string",
       "version": "string"
     },
     "status": {

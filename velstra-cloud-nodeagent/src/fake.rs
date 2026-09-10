@@ -92,6 +92,10 @@ struct Machine {
     /// working because the fake always obeys.
     deaf: BTreeSet<String>,
     disks: BTreeSet<String>,
+    /// How big each root disk is, as the fake was asked to make it.
+    disk_gib: BTreeMap<String, u64>,
+    /// How old a test says a cached image is, in seconds.
+    image_ages: BTreeMap<String, u64>,
     images: BTreeSet<String>,
     fetching: BTreeSet<String>,
     /// Disks this fake machine claims to have, so a test can drive the console's
@@ -113,6 +117,8 @@ struct Machine {
     /// node was handed the *right* source and not merely that it pulled.
     pulled_from: BTreeMap<String, String>,
     volumes: BTreeMap<String, String>,
+    /// What each open volume was throttled to, as the VMM was told.
+    throttled: BTreeMap<String, velstra_cloud_model::throttle::Limits>,
     receivers: BTreeMap<String, Receiver>,
     /// Transfers this machine has begun and not yet finished, and where each
     /// one is going.
@@ -195,6 +201,20 @@ impl Default for FakeVmm {
 }
 
 impl FakeVmm {
+    /// What one open volume was throttled to, as this VMM was told.
+    ///
+    /// The ceiling travels from a pool, through a controller, onto the
+    /// attachment and into the VMM. Each hop can drop it silently, and this is
+    /// what lets a test say it did not.
+    pub fn throttle_on(&self, volume: &str) -> Option<velstra_cloud_model::throttle::Limits> {
+        self.machine
+            .lock()
+            .expect("the fake machine is never poisoned")
+            .throttled
+            .get(volume)
+            .copied()
+    }
+
     pub fn new() -> Self {
         Self {
             machine: Arc::new(Mutex::new(Machine {
@@ -220,8 +240,26 @@ impl FakeVmm {
 
     /// Put a running guest on the machine with no request behind it — the
     /// state a node is in when a guest outlives its instance record.
+    /// A guest running on this machine that this agent did not make.
+    ///
+    /// What a second node agent on the same box sees: the unit is there, the
+    /// disk is under somebody else's state directory. It is not this agent's
+    /// to stop, and until the sweep learned that, it stopped it.
+    pub fn start_detached_elsewhere(&self, instance: &str) {
+        self.start_detached(instance);
+        self.machine
+            .lock()
+            .expect("the fake machine is never poisoned")
+            .disks
+            .remove(instance);
+    }
+
     pub fn start_detached(&self, instance: &str) {
         let mut m = self.machine.lock().unwrap();
+        // With its disk, because a guest this agent started has one under this
+        // agent's own state directory — and that is what tells its guests from
+        // another agent's on the same machine.
+        m.disks.insert(instance.to_string());
         let pid = m.next_pid;
         m.next_pid += 1;
         m.vms.insert(
@@ -246,6 +284,16 @@ impl FakeVmm {
         for n in &mut m.capacity.numa_free_mib {
             *n = n.saturating_sub(mib / 2);
         }
+    }
+
+    /// Say how long ago an image was fetched, so a cache sweep can be
+    /// exercised without waiting a month for one.
+    pub fn image_fetched_secs_ago(&self, stored_as: &str, seconds: u64) {
+        self.machine
+            .lock()
+            .unwrap()
+            .image_ages
+            .insert(stored_as.to_string(), seconds);
     }
 
     /// Give a guest a real file to be its disk.
@@ -312,6 +360,11 @@ impl FakeVmm {
     /// leaving anything behind.
     pub fn vanish(&self, instance: &str) {
         self.machine.lock().unwrap().vms.remove(instance);
+    }
+
+    /// The images this machine has cached, for a test about the sweep.
+    pub fn cached_images(&self) -> std::collections::BTreeSet<String> {
+        self.machine.lock().unwrap().images.clone()
     }
 
     pub fn is_running(&self, instance: &str) -> bool {
@@ -524,6 +577,7 @@ impl Vmm for FakeVmm {
         Ok(HostState {
             vms: m.vms.clone(),
             disks: m.disks.clone(),
+            disk_gib: m.disk_gib.clone(),
             images: m.images.clone(),
             fetching: m.fetching.clone(),
             volumes: m.volumes.clone(),
@@ -553,13 +607,41 @@ impl Vmm for FakeVmm {
     async fn create_disk(
         &self,
         instance: &str,
-        _gib: u64,
+        gib: u64,
         _image: &str,
         _format: velstra_cloud_model::resources::ImageFormat,
     ) -> Result<()> {
         let mut m = self.machine.lock().unwrap();
         check(&mut m, Fault::Disk, instance)?;
         m.disks.insert(instance.to_string());
+        m.disk_gib.insert(instance.to_string(), gib);
+        Ok(())
+    }
+
+    async fn forget_image(&self, stored_as: &str) -> Result<()> {
+        self.machine.lock().unwrap().images.remove(stored_as);
+        Ok(())
+    }
+
+    /// Just fetched, unless a test says otherwise. The same answer a real node
+    /// gives about an image it pulled a moment ago, so a pass in a test sweeps
+    /// nothing by age — which is what production does too, and a fake that
+    /// aged everything to a month would make every test a cache test.
+    async fn image_age_seconds(&self, stored_as: &str) -> Option<u64> {
+        let m = self.machine.lock().unwrap();
+        if !m.images.contains(stored_as) {
+            return None;
+        }
+        Some(m.image_ages.get(stored_as).copied().unwrap_or(0))
+    }
+
+    async fn grow_disk(&self, instance: &str, gib: u64) -> Result<()> {
+        let mut m = self.machine.lock().unwrap();
+        check(&mut m, Fault::Disk, instance)?;
+        // Never shrinks, like the real one: a smaller number is a mistake, and
+        // acting on it destroys a filesystem.
+        let at = m.disk_gib.entry(instance.to_string()).or_insert(0);
+        *at = (*at).max(gib);
         Ok(())
     }
 
@@ -640,6 +722,7 @@ impl Vmm for FakeVmm {
         check(&mut m, Fault::Delete, instance)?;
         m.vms.remove(instance);
         m.disks.remove(instance);
+        m.disk_gib.remove(instance);
         Ok(())
     }
 
@@ -649,9 +732,15 @@ impl Vmm for FakeVmm {
         volume: &str,
         _at: &str,
         _read_only: bool,
+        limits: velstra_cloud_model::throttle::Limits,
     ) -> Result<String> {
         let mut m = self.machine.lock().unwrap();
         check(&mut m, Fault::OpenVolume, volume)?;
+        // Kept so a test can say what the guest was actually given. The
+        // ceiling travels from a pool through a controller onto the
+        // attachment and into the VMM, and each hop is a place it can be
+        // dropped silently.
+        m.throttled.insert(volume.to_string(), limits);
         // Device names are handed out in open order, which is what a guest
         // sees; re-opening one already open returns the same device rather
         // than a second one.
@@ -667,6 +756,7 @@ impl Vmm for FakeVmm {
         let mut m = self.machine.lock().unwrap();
         check(&mut m, Fault::CloseVolume, volume)?;
         m.volumes.remove(volume);
+        m.throttled.remove(volume);
         Ok(())
     }
 
@@ -814,6 +904,10 @@ struct Fabric {
     /// feature existed in for as long as it did.
     rules: BTreeMap<String, Vec<ResolvedRule>>,
     faults: BTreeMap<String, String>,
+    /// Make reading the datapath fail, the way an unreachable one does. The
+    /// pass gives up when this happens, which is the shape self-fencing exists
+    /// for and the only way a test can reach it.
+    observe_fails: Option<String>,
     /// Make tearing this port down fail — *after* the tap has gone, which is
     /// what a real half-finished teardown looks like. The fabric datapath
     /// removes the device first and then talks to the orchestrator, so the
@@ -844,6 +938,15 @@ pub struct FakeDatapath {
 impl FakeDatapath {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make reading the whole datapath fail, until healed.
+    pub fn fail_observe(&self, why: &str) {
+        self.fabric.lock().unwrap().observe_fails = Some(why.to_string());
+    }
+
+    pub fn heal_observe(&self) {
+        self.fabric.lock().unwrap().observe_fails = None;
     }
 
     /// Make programming this port fail, until healed.
@@ -907,8 +1010,15 @@ impl FakeDatapath {
 
 #[async_trait]
 impl Datapath for FakeDatapath {
+    fn datapath_name(&self) -> &'static str {
+        "fake"
+    }
+
     async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>> {
         let f = self.fabric.lock().unwrap();
+        if let Some(why) = &f.observe_fails {
+            return Err(crate::host::HostError::failed(why.clone()));
+        }
         let hidden = f.holds_rules_elsewhere;
         Ok(f.taps
             .iter()
@@ -1243,6 +1353,7 @@ mod tests {
                 "projects/p1/volumes/v1",
                 "/fake/projects~p1~volumes~v1",
                 false,
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1252,6 +1363,7 @@ mod tests {
                 "projects/p1/volumes/v1",
                 "/fake/projects~p1~volumes~v1",
                 false,
+                Default::default(),
             )
             .await
             .unwrap();

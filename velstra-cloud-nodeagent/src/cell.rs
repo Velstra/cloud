@@ -70,6 +70,21 @@ pub trait PoolReader: Send + Sync + 'static {
     async fn backups(&self) -> Result<Vec<velstra_cloud_model::resources::Backup>>;
     async fn backup_targets(&self) -> Result<Vec<velstra_cloud_model::resources::BackupTarget>>;
 
+    /// The cell's images, for the one thing a storage backend cannot work out
+    /// on its own: what an image is called on this machine's disk.
+    ///
+    /// A node files an image under its **digest** — the bytes have one
+    /// identity and the names for them are many — and the digest lives on the
+    /// object. Without this the backends guessed, each in a different
+    /// spelling, and a volume from an image worked on one backend of three.
+    ///
+    /// The default is empty rather than an error: a pool that provisions
+    /// blank volumes, restores and snapshots needs none of this, and a reader
+    /// that has not been taught it should not stop those working.
+    async fn images(&self) -> Result<Vec<velstra_cloud_model::resources::Image>> {
+        Ok(Vec::new())
+    }
+
     /// This pool's own object, or `None` if nobody registered it.
     ///
     /// Read through here rather than off a store handle for one reason, and it
@@ -106,6 +121,10 @@ pub struct StorePool {
         velstra_cloud_model::backup::BackupTargetSpec,
         velstra_cloud_model::backup::BackupTargetStatus,
     >,
+    images: TypedStore<
+        velstra_cloud_model::resources::ImageSpec,
+        velstra_cloud_model::resources::ImageStatus,
+    >,
 }
 
 impl StorePool {
@@ -115,6 +134,7 @@ impl StorePool {
             snapshots: TypedStore::new(store.clone(), cell, "snapshots"),
             backups: TypedStore::new(store.clone(), cell, "backups"),
             targets: TypedStore::new(store.clone(), cell, "backup-targets"),
+            images: TypedStore::new(store.clone(), cell, "images"),
             pools: TypedStore::new(store, cell, "pools"),
         }
     }
@@ -140,6 +160,9 @@ impl PoolReader for StorePool {
             .await
             .map_err(|e| failed("backup targets", e))
     }
+    async fn images(&self) -> Result<Vec<velstra_cloud_model::resources::Image>> {
+        self.images.list().await.map_err(|e| failed("images", e))
+    }
     async fn pool(&self, id: &str) -> Result<Option<velstra_cloud_model::resources::Pool>> {
         self.pools
             .get(&format!("pools/{id}"))
@@ -163,9 +186,36 @@ pub trait CellReader: Send + Sync + 'static {
     /// Migrations with this node at either end.
     async fn migrations(&self) -> Result<Vec<Migration>>;
 
+    /// Every guest in the cell that has a name and an address, for the
+    /// resolver this node runs.
+    ///
+    /// Separate from `instances`, which is deliberately only what this node
+    /// holds: a name is only useful if the machine next door can use it, and
+    /// widening `instances` to serve DNS would hand every node every tenant's
+    /// specs. Three fields is what a resolver needs.
+    ///
+    /// A cell that cannot answer this is a cell whose guests resolve each
+    /// other on one node and nothing else — so an empty answer is a real
+    /// answer, and an error is a failure of the pass rather than of DNS.
+    async fn directory(&self) -> Result<Vec<crate::dns::Named>> {
+        Ok(Vec::new())
+    }
+
     /// Shared, and read whole: a group is a declaration every node reads and
     /// none of them owns.
     async fn security_groups(&self) -> Result<Vec<SecurityGroup>>;
+
+    /// The cell's load balancers, so a node knows which of its guests' ports
+    /// something is sending traffic to — and therefore which are worth
+    /// probing. A node that scanned its guests would be doing something nobody
+    /// asked for, and slowly.
+    ///
+    /// A cell that cannot answer this is a cell with no health checking, not a
+    /// failed pass: the balancer fails open, so an empty answer means every
+    /// member keeps its share exactly as before.
+    async fn load_balancers(&self) -> Result<Vec<velstra_cloud_model::loadbalancer::LoadBalancer>> {
+        Ok(Vec::new())
+    }
     async fn subnets(&self) -> Result<Vec<Subnet>>;
 
     /// Consoles somebody has been granted into a guest on this node.
@@ -356,6 +406,18 @@ fn failed(what: &str, e: impl std::fmt::Display) -> HostError {
 
 #[async_trait]
 impl CellReader for StoreCell {
+    /// The store has everything, so this reader can answer it directly.
+    async fn directory(&self) -> Result<Vec<crate::dns::Named>> {
+        let instances = self.instances().await?;
+        let ports: std::collections::BTreeMap<String, velstra_cloud_model::resources::Port> = self
+            .ports()
+            .await?
+            .into_iter()
+            .map(|p| (p.meta.name.to_string(), p))
+            .collect();
+        Ok(crate::dns::names_in(&instances, &ports))
+    }
+
     async fn instances(&self) -> Result<Vec<Instance>> {
         self.instances
             .list()

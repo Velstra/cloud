@@ -122,6 +122,10 @@ impl Reconciler for CaptureController {
                 // unused while something reports a security property from it
                 // is worse than not having one.
                 signature: None,
+                // A guest captured now is the current one by definition.
+                state: velstra_cloud_model::resources::ImageState::Active,
+                replacement: String::new(),
+                shared_with: Default::default(),
             },
             ImageStatus::default(),
         );

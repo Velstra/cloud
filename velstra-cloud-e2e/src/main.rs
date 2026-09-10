@@ -240,6 +240,7 @@ async fn register_pool(store: Arc<dyn Store>, id: &str) {
         PoolSpec {
             accepting: true,
             labels: vec!["dev".to_string()],
+            volume_ceiling: Default::default(),
         },
         PoolStatus::default(),
     );
@@ -396,6 +397,9 @@ async fn seed(store: Arc<dyn Store>) {
                 size_bytes: 1_073_741_824,
                 source_url: SEED_IMAGE_URL.into(),
                 signature: None,
+                state: Default::default(),
+                replacement: String::new(),
+                shared_with: Default::default(),
             },
             ImageStatus::default(),
         ),
@@ -419,6 +423,9 @@ async fn seed(store: Arc<dyn Store>) {
                 size_bytes: 1_073_741_824,
                 source_url: SEED_IMAGE_URL.into(),
                 signature: None,
+                state: Default::default(),
+                replacement: String::new(),
+                shared_with: Default::default(),
             },
             ImageStatus::default(),
         ),
@@ -495,6 +502,7 @@ async fn seed(store: Arc<dyn Store>) {
                 encryption_key: None,
                 source_image: None,
                 source_snapshot: None,
+                limits: Default::default(),
             },
             VolumeStatus::default(),
         ),
@@ -619,6 +627,7 @@ async fn attach_once_placed(store: Arc<dyn Store>) {
             node,
             at: String::new(),
             read_only: false,
+            limits: Default::default(),
         },
         AttachmentStatus::default(),
     );

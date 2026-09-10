@@ -35,7 +35,7 @@ use velstra_cloud_model::{
     security::{SecurityGroupSpec, SecurityGroupStatus, group_condition, validate},
     storage::{may_create_volume, may_snapshot},
 };
-use velstra_cloud_store::{Event, Store};
+use velstra_cloud_store::{Event, Expect, Store};
 
 use crate::{
     auth::{Identity, TokenVerifier},
@@ -118,6 +118,26 @@ fn settle_parent(spec: &mut Value) {
 /// A bill that can be written, edited or deleted through the same door the
 /// customer comes in is not a bill. Readings are written by the controller,
 /// straight to the store, and this is the whole of the API's part in it: no.
+/// The header a client puts a key in to make a create safely retryable.
+///
+/// The spelling the IETF draft uses, which is also the one every HTTP client
+/// library's documentation shows. AWS puts the same idea in the body as a
+/// client token and Google as a request id; a header keeps it out of the
+/// document, which matters here because the document is fingerprinted and a
+/// field that changed per attempt would defeat the check.
+pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
+
+/// Set on an answer that was a record rather than a fresh create.
+pub const REPLAYED_HEADER: &str = "x-velstra-idempotent-replay";
+
+/// How many readings one page of the billing scan asks for.
+///
+/// A month is 744 hourly readings at most, so this is two pages for a full
+/// month and one for anything shorter — small enough that a tenant asking
+/// about a quiet month decodes almost nothing, large enough that a busy one
+/// is not a hundred round trips.
+const READINGS_PER_PAGE: usize = 500;
+
 const RECORDS_ARE_NOT_WRITTEN_HERE: &str = "usage records are readings taken by the platform, not documents anybody writes. They cannot \
      be created, changed or deleted here — a record that could be would be a bill nobody can \
      stand behind. They are read with GET, and they go away with their project or with their \
@@ -202,6 +222,14 @@ pub struct Created {
     pub pool_token: Option<String>,
 }
 
+/// The outcome of a change: the object as it now stands, and the operation
+/// minted to follow the work, when there is work.
+#[derive(Clone, Debug)]
+pub struct Changed {
+    pub resource: Value,
+    pub operation: Option<String>,
+}
+
 /// Which objects a caller is asking for.
 ///
 /// There is exactly one thing to filter on and it is the agent asking, because
@@ -237,6 +265,18 @@ pub struct Filter {
     /// would fetch every operation in the cell to show six lines about one
     /// object — which is the cost these filters exist to avoid.
     pub target: Option<String>,
+    /// Only objects created at or after this moment.
+    ///
+    /// On `meta.created_at`, which every object has, rather than on a
+    /// per-collection timestamp — a range that means something different in
+    /// each collection is a range nobody can use across two of them. The
+    /// question this exists for is "the refusals of the last hour", and it was
+    /// unanswerable: the audit is the collection that grows without bound, and
+    /// the only way to read a slice of it was to read all of it.
+    pub since: Option<Timestamp>,
+    /// Only objects created before this moment. Exclusive, so two adjacent
+    /// ranges neither overlap nor skip.
+    pub until: Option<Timestamp>,
 }
 
 impl Filter {
@@ -263,18 +303,47 @@ impl Filter {
 
     pub fn for_node(node: impl Into<String>) -> Self {
         Self {
-            labels: Vec::new(),
-            target: None,
             assignee: Some(Assignee::Node(node.into())),
+            ..Self::default()
         }
     }
 
     pub fn for_pool(pool: impl Into<String>) -> Self {
         Self {
-            labels: Vec::new(),
-            target: None,
             assignee: Some(Assignee::Pool(pool.into())),
+            ..Self::default()
         }
+    }
+
+    /// Whether this object was created inside the range asked for.
+    ///
+    /// Read off the document, like the label check and for the same reason:
+    /// this runs before the expensive half of a listing. An object with no
+    /// `meta.created_at` — which nothing this platform writes lacks — is
+    /// admitted rather than dropped: a range must not swallow a record because
+    /// of a field it could not read.
+    fn time_admits(&self, document: &Value) -> bool {
+        if self.since.is_none() && self.until.is_none() {
+            return true;
+        }
+        let Some(at) = document
+            .get("meta")
+            .and_then(|m| m.get("created_at"))
+            .and_then(Value::as_u64)
+        else {
+            return true;
+        };
+        if let Some(since) = self.since
+            && at < since.0
+        {
+            return false;
+        }
+        if let Some(until) = self.until
+            && at >= until.0
+        {
+            return false;
+        }
+        true
     }
 
     /// Whether this record is about the resource that was asked about.
@@ -383,6 +452,8 @@ impl Scratch {
 }
 
 struct Inner {
+    /// What this instance has been asked to do, for `/metrics`.
+    requests: Requests,
     /// The store itself, beside the typed views over it — for the one job no
     /// collection can carry: compacting the history they all share.
     store: Arc<dyn Store>,
@@ -394,6 +465,9 @@ struct Inner {
     /// gone is a cell nobody will ever manage again. Point it somewhere that
     /// is not this machine's own disk.
     store_backup_dir: Option<std::path::PathBuf>,
+    /// Whose certificates to believe when a node serves its console over TLS.
+    /// See [`Api::with_console_ca`].
+    console_ca: Option<std::path::PathBuf>,
     collections: BTreeMap<&'static str, Arc<dyn Collection>>,
     /// Subjects that may do anything, anywhere in this cell.
     ///
@@ -441,6 +515,83 @@ struct Inner {
 #[derive(Clone)]
 pub struct Api {
     inner: Arc<Inner>,
+}
+
+/// What the API has been asked to do, counted.
+///
+/// Latency as a sum and a count rather than a histogram: the two questions an
+/// operator actually asks of an API are "is it up" and "did it get slower",
+/// and a mean per route answers the second without a bucket layout nobody
+/// will tune. A histogram can come later; nothing at all could not.
+#[derive(Default)]
+pub struct Requests {
+    /// `(method, route, status class)` → how many.
+    answered: std::sync::Mutex<BTreeMap<(String, String, u16), u64>>,
+    /// `(method, route)` → total microseconds, and how many were counted.
+    spent: std::sync::Mutex<BTreeMap<(String, String), (u64, u64)>>,
+}
+
+impl Requests {
+    pub fn record(&self, method: &str, route: &str, status: u16, micros: u64) {
+        let class = status / 100 * 100;
+        {
+            let mut answered = self.answered.lock().unwrap_or_else(|p| {
+                self.answered.clear_poison();
+                p.into_inner()
+            });
+            *answered
+                .entry((method.to_string(), route.to_string(), class))
+                .or_insert(0) += 1;
+        }
+        let mut spent = self.spent.lock().unwrap_or_else(|p| {
+            self.spent.clear_poison();
+            p.into_inner()
+        });
+        let at = spent
+            .entry((method.to_string(), route.to_string()))
+            .or_insert((0, 0));
+        at.0 = at.0.saturating_add(micros);
+        at.1 += 1;
+    }
+
+    /// The counters, in Prometheus' text format.
+    fn text(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let answered = self.answered.lock().unwrap_or_else(|p| {
+            self.answered.clear_poison();
+            p.into_inner()
+        });
+        if !answered.is_empty() {
+            let _ = writeln!(out, "# TYPE velstra_api_requests counter");
+            for ((method, route, class), count) in answered.iter() {
+                let _ = writeln!(
+                    out,
+                    "velstra_api_requests{{method=\"{method}\",route=\"{route}\",status=\"{class}\"}} {count}"
+                );
+            }
+        }
+        let spent = self.spent.lock().unwrap_or_else(|p| {
+            self.spent.clear_poison();
+            p.into_inner()
+        });
+        if !spent.is_empty() {
+            let _ = writeln!(out, "# TYPE velstra_api_request_seconds_total counter");
+            let _ = writeln!(out, "# TYPE velstra_api_requests_timed counter");
+            for ((method, route), (micros, count)) in spent.iter() {
+                let _ = writeln!(
+                    out,
+                    "velstra_api_request_seconds_total{{method=\"{method}\",route=\"{route}\"}} {:.6}",
+                    *micros as f64 / 1_000_000.0
+                );
+                let _ = writeln!(
+                    out,
+                    "velstra_api_requests_timed{{method=\"{method}\",route=\"{route}\"}} {count}"
+                );
+            }
+        }
+        out
+    }
 }
 
 /// The higher of two rungs. A custom role sits between Viewer and Operator:
@@ -585,8 +736,10 @@ impl Api {
         ]);
         Self {
             inner: Arc::new(Inner {
+                requests: Requests::default(),
                 store: store.clone(),
                 store_backup_dir: None,
+                console_ca: None,
                 collections,
                 cell_admins: Vec::new(),
                 image_signing_keys: Vec::new(),
@@ -613,6 +766,60 @@ impl Api {
         &self.inner.identity
     }
 
+    /// Every guest in the cell that has a name and an address.
+    ///
+    /// Three fields per port: the guest's own name, the subnet it is on, and
+    /// the address. Nothing else — not the spec, not the state, not who owns
+    /// it. It is what a resolver needs and no more, and every guest on a
+    /// subnet can already learn all three by scanning it.
+    pub async fn directory(&self) -> ApiResult<Vec<Value>> {
+        let instances: Vec<Instance> = self.typed_list("", "instances").await?;
+        let ports: Vec<velstra_cloud_model::resources::Port> = self.typed_list("", "ports").await?;
+        let by_name: BTreeMap<String, &velstra_cloud_model::resources::Port> =
+            ports.iter().map(|p| (p.meta.name.to_string(), p)).collect();
+        let mut out = Vec::new();
+        for instance in &instances {
+            if instance.meta.is_deleting() {
+                continue;
+            }
+            for port in &instance.spec.ports {
+                let Some(port) = by_name.get(port.as_str()) else {
+                    continue;
+                };
+                let Some(address) = port.spec.address.as_deref() else {
+                    continue;
+                };
+                out.push(serde_json::json!({
+                    "hostname": instance.meta.name.id(),
+                    "subnet": port.spec.subnet,
+                    "address": address.split('/').next().unwrap_or(address),
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether the store answers, for a readiness probe.
+    ///
+    /// A read of one key that is not expected to exist: it costs a round trip
+    /// and no decode, and it distinguishes the two states a load balancer
+    /// cares about — the process is up but cannot reach etcd, versus the
+    /// process is serving. Not "is there a leader" and not "is the cell
+    /// healthy": readiness is about this instance's ability to answer, and an
+    /// API that reported the cell's health would take every replica out of
+    /// rotation for one bad node.
+    pub async fn store_answers(&self) -> bool {
+        self.inner
+            .store
+            .get(&velstra_cloud_store::key_for(
+                &self.inner.placement.cell,
+                "readiness",
+                "probe",
+            ))
+            .await
+            .is_ok()
+    }
+
     /// Whether `who` may administer the cell — either from the started-with
     /// operator list or from their own user record.
     pub fn is_operator(&self, who: &Identity) -> bool {
@@ -632,12 +839,29 @@ impl Api {
 
     /// One object, by name.
     pub async fn get(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
-        // An audit record is judged by what it is about, so the decision needs
-        // the record — see `may_read`. Reading it first is safe: a refusal is
-        // still a refusal, and the object's existence was already implied by
-        // the caller naming it.
+        // A family is derived — grouped out of the images on the way out — so
+        // there is no collection to read it from. It still has a name, the
+        // listing hands that name out, and a name a listing hands out is one a
+        // client will `GET`: found live, where the console linked to
+        // `families/debian-13` and was told there is no such collection.
+        if name.collection() == velstra_cloud_model::resources::FAMILIES {
+            let parent = name.parent().map(|p| p.to_string()).unwrap_or_default();
+            let wanted = name.to_string();
+            return self
+                .list_families(&parent, who)
+                .await?
+                .items
+                .into_iter()
+                .find(|item| item["meta"]["name"].as_str() == Some(wanted.as_str()))
+                .ok_or_else(|| ApiError::not_found(name));
+        }
+        // An audit record is judged by what it is about, and an image by whom
+        // its owner shared it with, so both decisions need the record — see
+        // `may_read`. Reading it first is safe: a refusal is still a refusal,
+        // and the object's existence was already implied by the caller naming
+        // it.
         let collection = self.collection(name.collection())?;
-        if name.collection() == "audit" {
+        if matches!(name.collection(), "audit" | "images") {
             let document = collection
                 .get(&name.to_string())
                 .await?
@@ -646,7 +870,10 @@ impl Api {
                 return Err(self.refuse_a_read(who, name).await);
             }
             let mut document = document;
-            self.answer(&mut document, &mut Scratch::default()).await?;
+            if crate::sessions::agent_node(who).is_none() {
+                self.answer(&mut document, &mut Scratch::default()).await?;
+            }
+            self.redact_for(who, name.collection(), &mut document);
             return Ok(document);
         }
         self.authorize(who, Verb::Read, name).await?;
@@ -767,6 +994,25 @@ impl Api {
         self
     }
 
+    /// Whose certificates to believe when a node serves its console over TLS.
+    ///
+    /// A cell's nodes carry certificates its own authority signed, not ones a
+    /// public root vouches for. Without this the console proxy falls back to
+    /// the public roots, which answer "unknown issuer" to every node in a
+    /// private cell — so a node that went to the trouble of serving TLS would
+    /// be one nobody could attach to.
+    pub fn with_console_ca(mut self, ca: std::path::PathBuf) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("the console CA is named before the API is shared");
+        inner.console_ca = Some(ca);
+        self
+    }
+
+    /// The CA a console stream is verified against, if one was named.
+    pub fn console_ca(&self) -> Option<&std::path::Path> {
+        self.inner.console_ca.as_deref()
+    }
+
     /// Cap how fast one caller may **write**.
     ///
     /// Off unless asked for. What it stops is the ordinary accident — a script
@@ -869,22 +1115,78 @@ impl Api {
     /// [`velstra_cloud_model::audit::record_id`]), which is what stops somebody
     /// filling the store by hammering a forbidden path.
     async fn record_refusal(&self, who: &Identity, verb: Verb, name: &ResourceName, detail: &str) {
-        use velstra_cloud_model::audit::{AuditKind, AuditSpec, AuditStatus, record_id};
-
-        let at = velstra_cloud_model::meta::Timestamp::now();
         let spelled = match verb {
             Verb::Read => "read",
             Verb::Operate => "operate",
             Verb::Write => "write",
             Verb::Administer => "administer",
         };
-        let id = record_id(
-            AuditKind::Refused,
+        self.record(
+            velstra_cloud_model::audit::AuditKind::Refused,
             &who.subject,
             spelled,
             &name.to_string(),
-            at,
-        );
+            detail,
+        )
+        .await;
+    }
+
+    /// Note that somebody changed something.
+    ///
+    /// Called after the change is written, not before: an audit line for a
+    /// change that was then refused would be a lie, and the refusal has its
+    /// own line. Best-effort like the refusal above, and for the same reason —
+    /// a full disk must not turn a working cell into an outage.
+    pub async fn record_change(&self, who: &Identity, verb: &str, name: &ResourceName) {
+        // A sentence, like every other line in this collection carries. It is
+        // not decoration: `detail` is the column a console renders, and a kind
+        // of line that left it empty would be a blank row beside full ones.
+        let said = match verb {
+            "create" => "created it",
+            "update" => "changed it",
+            "delete" => "asked for it to be deleted",
+            other => other,
+        };
+        self.record(
+            velstra_cloud_model::audit::AuditKind::Changed,
+            &who.subject,
+            verb,
+            &name.to_string(),
+            said,
+        )
+        .await;
+    }
+
+    /// Note that a session began or ended.
+    ///
+    /// `subject` rather than an `Identity`, because a failed sign-in has no
+    /// identity — and the failures are the half of this an operator needs when
+    /// they are asked whether an account was under attack.
+    pub async fn record_session(
+        &self,
+        kind: velstra_cloud_model::audit::AuditKind,
+        subject: &str,
+        detail: &str,
+    ) {
+        self.record(kind, subject, "", "", detail).await;
+    }
+
+    /// One line in the audit, whatever kind it is.
+    async fn record(
+        &self,
+        kind: velstra_cloud_model::audit::AuditKind,
+        subject: &str,
+        verb: &str,
+        target: &str,
+        detail: &str,
+    ) {
+        use velstra_cloud_model::audit::{AuditSpec, AuditStatus, record_id};
+
+        let at = velstra_cloud_model::meta::Timestamp::now();
+        let spelled = verb;
+        let who = Identity::new(subject);
+        let name_string = target.to_string();
+        let id = record_id(kind, &who.subject, spelled, &name_string, at);
         let Ok(record_name) = ResourceName::parse(&format!("audit/{id}")) else {
             return;
         };
@@ -892,9 +1194,9 @@ impl Api {
             return;
         };
         let spec = AuditSpec {
-            kind: AuditKind::Refused,
+            kind,
             subject: who.subject.clone(),
-            target: name.to_string(),
+            target: name_string.clone(),
             verb: spelled.to_string(),
             // The same sentence the caller was given. A paraphrase is one an
             // operator has to correlate by hand against what the person
@@ -911,7 +1213,7 @@ impl Api {
         // That is the flood defence working, not a failure.
         if let Err(e) = collection.create(meta, spec).await {
             if e.code != Code::AlreadyExists {
-                tracing::warn!(error = %e.message, "could not record a refusal");
+                tracing::warn!(error = %e.message, "could not record an audit line");
             }
         }
         let _ = AuditStatus::default();
@@ -950,6 +1252,43 @@ impl Api {
             .is_ok()
         {
             return true;
+        }
+        // An image its owner shared. A one-way grant: whoever receives it may
+        // read and boot, and this is a *read* check — editing, retiring and
+        // deleting still go through `authorize`, which knows nothing about
+        // sharing and refuses as it always did.
+        //
+        // Read off the document rather than by fetching the image: the
+        // document is what the caller already has, and a second read here
+        // would be one per row of a listing.
+        //
+        // The question asked of each named project is the ordinary one — "may
+        // this caller read images *there*" — so sharing grants nothing a
+        // person did not already hold somewhere; it only says which image
+        // their existing access now reaches.
+        if name.collection() == "images"
+            && let Some(shared) = document["spec"]["shared_with"].as_array()
+        {
+            for entry in shared.iter().filter_map(Value::as_str) {
+                // Shared with the cell. Any caller who got this far is
+                // authenticated, which is what "every project" means: a golden
+                // image a provider publishes once instead of copying it into
+                // every tenant.
+                if entry == velstra_cloud_model::resources::SHARED_WITH_EVERY_PROJECT {
+                    return true;
+                }
+                let project = entry.strip_prefix("projects/").unwrap_or(entry);
+                // Any well-formed name in that project's images: the question
+                // is about the collection, and `judge` reads the project's
+                // bindings rather than going looking for the object.
+                let Ok(there) = ResourceName::parse(&format!("projects/{project}/images/any"))
+                else {
+                    continue;
+                };
+                if self.judge(who, Verb::Read, &there, "images").await.is_ok() {
+                    return true;
+                }
+            }
         }
         if name.collection() != "audit" {
             return false;
@@ -1607,6 +1946,9 @@ impl Api {
                 if let Err(e) = api.sweep_spent_consoles(Timestamp::now()).await {
                     tracing::warn!(error = %e, "the console sweep could not run this round");
                 }
+                if let Err(e) = api.sweep_spent_idempotency_keys(Timestamp::now()).await {
+                    tracing::warn!(error = %e, "the idempotency sweep could not run this round");
+                }
                 if let Some(dir) = &api.inner.store_backup_dir {
                     match api.inner.store.snapshot(dir).await {
                         Ok(Some(wrote)) => {
@@ -1880,6 +2222,122 @@ impl Api {
             .await
     }
 
+    /// The audit, over a time range, read as one key range per kind.
+    ///
+    /// The shape [`Self::readings_between`] uses, for the same reason and on
+    /// the same evidence: an id that carries the moment is an index, and
+    /// walking past every record written before the range to find the ones
+    /// inside it is a scan of the whole log per question.
+    ///
+    /// Four ranges rather than one, because the kind sorts before the minute —
+    /// `changed-…`, then `refused-…`, then `signin-…`, then `signout-…`, each
+    /// with its own minutes ascending inside it. Walked in that order, so what
+    /// comes back is in the same order the ordinary listing would have given.
+    ///
+    /// The page token it hands back is an ordinary one: it names a key, a key
+    /// names its kind, and a caller resuming with it lands back here only if
+    /// they still ask for a range — which they will, because the console does.
+    async fn audit_between(
+        &self,
+        parent: &str,
+        kind: &str,
+        filter: &Filter,
+        paging: &Paging,
+        gate: &Gate,
+    ) -> ApiResult<Listing> {
+        use velstra_cloud_model::audit::{KINDS, seek_from};
+
+        let since = filter.since.unwrap_or(Timestamp(0));
+        let collection = self.collection(kind)?;
+        let unpaged = !paging.is_paged();
+        let want = paging.resolved_size();
+        let mut items = Vec::new();
+        let mut scratch = Scratch::default();
+        // Read before the first page, like the ordinary walk: it is the
+        // revision this answer is a picture of, and a watch started from it
+        // misses nothing that happened after.
+        let revision = collection.revision().await?;
+        let mut more = false;
+        let mut last: Option<String> = None;
+
+        'kinds: for prefix in KINDS {
+            let mut after = Some(format!("audit/{}", seek_from(prefix, since)));
+            loop {
+                let (documents, has_more) = collection
+                    .list_page(after.as_deref(), READINGS_PER_PAGE)
+                    .await?;
+                let empty = documents.is_empty();
+                for mut document in documents {
+                    let Some(name) = name_of(&document) else {
+                        continue;
+                    };
+                    // Past this kind's range: the next kind's keys sort after
+                    // it, and they are walked by the next turn of the outer
+                    // loop rather than by reading through them here.
+                    if !name.starts_with(&format!("audit/{prefix}-")) {
+                        continue 'kinds;
+                    }
+                    after = Some(name.clone());
+                    if !under(&document, parent) {
+                        continue;
+                    }
+                    if !filter.admits(kind, &document)
+                        || !filter.labels_admit(&document)
+                        || !filter.target_admits(&document)
+                        || !filter.time_admits(&document)
+                    {
+                        continue;
+                    }
+                    if let Gate::Readable(who) = gate {
+                        let Ok(parsed) = ResourceName::parse(&name) else {
+                            continue;
+                        };
+                        if !self.may_read(who, &parsed, &document).await {
+                            continue;
+                        }
+                    }
+                    if !matches!(gate, Gate::Machine) {
+                        self.answer(&mut document, &mut scratch).await?;
+                    }
+                    if let Gate::Readable(who) = gate {
+                        self.redact_for(who, kind, &mut document);
+                    }
+                    last = Some(name);
+                    items.push(document);
+                    if !unpaged && items.len() > want {
+                        // One past the page: there is more, and the cursor is
+                        // the last item actually delivered.
+                        items.truncate(want);
+                        more = true;
+                        last = items.last().and_then(name_of);
+                        break 'kinds;
+                    }
+                }
+                if empty || !has_more {
+                    break;
+                }
+            }
+        }
+        let next_page_token = more
+            .then(|| {
+                last.as_ref().map(|after| {
+                    PageToken {
+                        kind: kind.to_string(),
+                        parent: parent.to_string(),
+                        after: after.clone(),
+                        revision: revision.0,
+                    }
+                    .encode()
+                })
+            })
+            .flatten();
+        Ok(Listing {
+            items,
+            revision,
+            next_page_token,
+        })
+    }
+
     async fn list_gated(
         &self,
         parent: &str,
@@ -1890,6 +2348,20 @@ impl Api {
     ) -> ApiResult<Listing> {
         if let Some(token) = &paging.token {
             token.check(kind, parent)?;
+        }
+        // The audit, asked for by time, is read as a key range rather than
+        // scanned. An audit id is `{kind}-{minute}-{hash}`, so the store holds
+        // the log sorted by kind and then by minute — and "the refusals of the
+        // last hour" is the tail of every kind's range. Scanning from the
+        // front finds nothing for as long as the cell is old: on a cell with
+        // two hundred thousand records that is the difference between an
+        // answer and a timeout, which is the difference between a filter
+        // somebody uses and one they read about.
+        //
+        // Only without a page token: a token is a walk this already shaped,
+        // and it carries a key that names its own kind.
+        if kind == "audit" && filter.since.is_some() && paging.token.is_none() {
+            return self.audit_between(parent, kind, filter, paging, gate).await;
         }
         let collection = self.collection(kind)?;
         let unpaged = !paging.is_paged();
@@ -1910,16 +2382,29 @@ impl Api {
                 // that decides how many nodes a cell can hold.
                 Some(cache) => {
                     let (held, at) = cache.all().await;
-                    let mut documents: Vec<Value> =
-                        held.iter().map(|d| (**d).clone()).collect::<Vec<_>>();
-                    // The cache holds a whole collection, so its page is a slice.
-                    // That still removes the expensive half — the computed fields
-                    // and the serialising — and the cheap half is a memory scan
-                    // the cache exists to make cheap.
-                    if let Some(after) = &after {
-                        documents
-                            .retain(|d| name_of(d).is_some_and(|n| n.as_str() > after.as_str()));
-                    }
+                    // The cache holds a whole collection, so its page is a slice —
+                    // and only the slice is copied out. It used to clone every
+                    // held document and then keep a page of them, which on a
+                    // cell with 234,592 audit records is a copy of the whole log
+                    // for a page of twenty. The cache is sorted by name, so the
+                    // page is the first `want` past the cursor, and one more to
+                    // know if there is another.
+                    let past = |d: &Value| match &after {
+                        Some(after) => name_of(d).is_some_and(|n| n.as_str() > after.as_str()),
+                        None => true,
+                    };
+                    let mut documents: Vec<Value> = if unpaged {
+                        held.iter()
+                            .filter(|d| past(d))
+                            .map(|d| (**d).clone())
+                            .collect()
+                    } else {
+                        held.iter()
+                            .filter(|d| past(d))
+                            .take(want + 1)
+                            .map(|d| (**d).clone())
+                            .collect()
+                    };
                     let has_more = !unpaged && documents.len() > want;
                     if !unpaged {
                         documents.truncate(want);
@@ -1968,6 +2453,12 @@ impl Api {
                 // "What has happened to this guest": a record about something
                 // else costs nothing beyond this line.
                 if !filter.target_admits(&document) {
+                    continue;
+                }
+                // And the range, for the same reason and at the same price:
+                // one integer comparison against a field that is already
+                // parsed.
+                if !filter.time_admits(&document) {
                     continue;
                 }
                 // Before `answer`, for the same reason `admits` is: the derived
@@ -2050,6 +2541,149 @@ impl Api {
     /// an `id`. It may not carry `status` — that half belongs to the agent that
     /// will own the object, and a client that sets it is describing a world it
     /// has not observed.
+    /// A create the caller may safely retry.
+    ///
+    /// Without a key this is [`Api::create`] and nothing more. With one, the
+    /// second attempt of the same create is answered with the first attempt's
+    /// answer instead of making a second object — see
+    /// [`velstra_cloud_model::idempotency`] for why the generated name makes
+    /// that necessary.
+    ///
+    /// The bool is whether this was a replay, so the caller can say so on the
+    /// wire. A client that cannot tell a replay from a fresh create still
+    /// behaves correctly; one that can, can log it.
+    pub async fn create_with_key(
+        &self,
+        parent: &str,
+        kind: &str,
+        body: &Value,
+        who: &Identity,
+        key: Option<&str>,
+    ) -> ApiResult<(Created, bool)> {
+        use velstra_cloud_model::idempotency::{
+            IDEMPOTENCY_KIND, Replay, check_key, fingerprint, record_id,
+        };
+
+        let Some(raw) = key else {
+            return Ok((self.create(parent, kind, body, who).await?, false));
+        };
+        let key = check_key(raw).map_err(|why| ApiError::invalid(why).at(IDEMPOTENCY_HEADER))?;
+        // Registering a machine hands back a credential that is shown once and
+        // stored only as a digest. A replay could not return it — the API no
+        // longer has it — so the honest answer is to refuse the key rather than
+        // to answer a retry with a record that silently lacks the one field the
+        // caller needed.
+        if matches!(kind, "nodes" | "pools") {
+            return Err(ApiError::invalid(format!(
+                "registering a {} hands back a credential that is shown once, so the create                  cannot be replayed; retry it without an idempotency key and delete the object                  if it turns out the first attempt landed",
+                if kind == "nodes" { "node" } else { "pool" }
+            ))
+            .at(IDEMPOTENCY_HEADER));
+        }
+
+        let store_key = velstra_cloud_store::key_for(
+            &self.inner.placement.cell,
+            IDEMPOTENCY_KIND,
+            &record_id(&who.subject, parent, kind, key),
+        );
+        let asked = fingerprint(body);
+        let now = Timestamp::now();
+
+        let held = self
+            .inner
+            .store
+            .get(&store_key)
+            .await
+            .map_err(ApiError::from)?;
+        let fresh = held.as_ref().and_then(|entry| {
+            serde_json::from_slice::<Replay>(&entry.value)
+                .ok()
+                .filter(|r| !r.expired(now))
+        });
+        if let Some(record) = fresh {
+            if record.fingerprint != asked {
+                return Err(ApiError::new(
+                    Code::AlreadyExists,
+                    "this idempotency key was already used for a different request. A key                      stands for one create; use a fresh one, or send the request that key was                      first used for.",
+                )
+                .at(IDEMPOTENCY_HEADER));
+            }
+            let Some(operation) = record.operation else {
+                // Somebody else is inside the create right now. Aborted rather
+                // than AlreadyExists: nothing exists yet, and the right thing
+                // for the client to do is come back.
+                return Err(ApiError::new(
+                    Code::Aborted,
+                    "a create with this idempotency key is still in flight; retry in a moment                      and you will be given its answer",
+                )
+                .at(IDEMPOTENCY_HEADER));
+            };
+            return Ok((
+                Created {
+                    operation,
+                    target: record.target,
+                    node_token: None,
+                    pool_token: None,
+                },
+                true,
+            ));
+        }
+
+        // The claim, before the work: two attempts arriving together must not
+        // both do it. Written against exactly what was read, so the loser of
+        // the race is told to come back rather than making a second object.
+        let claim = Replay {
+            at: now,
+            fingerprint: asked.clone(),
+            operation: None,
+            target: String::new(),
+        };
+        let expect = match &held {
+            Some(entry) => Expect::Revision(entry.revision),
+            None => Expect::Absent,
+        };
+        let claimed = serde_json::to_vec(&claim).expect("a replay record always serialises");
+        if self
+            .inner
+            .store
+            .put(&store_key, claimed, expect)
+            .await
+            .is_err()
+        {
+            return Err(ApiError::new(
+                Code::Aborted,
+                "a create with this idempotency key is still in flight; retry in a moment                  and you will be given its answer",
+            )
+            .at(IDEMPOTENCY_HEADER));
+        }
+
+        let created = match self.create(parent, kind, body, who).await {
+            Ok(created) => created,
+            Err(e) => {
+                // The claim goes back, so a corrected retry may use the same
+                // key. Best effort: the caller already has their error, and a
+                // stuck claim expires within the day either way.
+                let _ = self.inner.store.delete(&store_key, Expect::Any).await;
+                return Err(e);
+            }
+        };
+        let answered = Replay {
+            at: now,
+            fingerprint: asked,
+            operation: Some(created.operation.clone()),
+            target: created.target.clone(),
+        };
+        // Best effort, and deliberately: the object exists. Failing the create
+        // here would tell the caller nothing happened when something did, which
+        // is the one answer worse than a duplicate.
+        if let Ok(value) = serde_json::to_vec(&answered)
+            && let Err(e) = self.inner.store.put(&store_key, value, Expect::Any).await
+        {
+            tracing::warn!(error = %e, "a create was made but its idempotency key was not recorded");
+        }
+        Ok((created, false))
+    }
+
     pub async fn create(
         &self,
         parent: &str,
@@ -2113,6 +2747,12 @@ impl Api {
         // the authorisation that means something: may this caller boot that.
         if kind == "instances" {
             self.settle_image_family(parent, &mut spec).await?;
+            // Straight after the family is resolved to a concrete image, and
+            // before anything is *made*: `settle_default_network` mints a port
+            // for a guest that has none, so a refusal after it left a wire
+            // behind for a guest that was never created. A check that has
+            // everything it needs belongs at the first point it has it.
+            self.refuse_a_retired_image(kind, &spec).await?;
             // The named size becomes numbers before anything reads them —
             // quota counts vCPUs, the scheduler reads memory — and the
             // hand-sizing rule runs on the settled spec.
@@ -2137,7 +2777,7 @@ impl Api {
         // reason and learns nothing about whether it is there.
         self.authorize_references(who, kind, &spec, home.as_deref())
             .await?;
-        check_rules(kind, &spec)?;
+        check_rules(kind, &spec, Document::Whole)?;
         // What this project was given, as against what this caller may do. Two
         // different questions, both asked: a project admin may create a network,
         // and only the cell decides whether one of this project's networks may
@@ -2145,6 +2785,10 @@ impl Api {
         let allowed_in = home.as_deref();
         if kind == "networks" {
             self.refuse_a_bridge_this_project_was_not_given(&spec, allowed_in, who)
+                .await?;
+        }
+        if kind == "subnets" {
+            self.refuse_a_subnet_that_would_unmirror_a_network(&spec)
                 .await?;
         }
         if kind == "instances" {
@@ -2177,6 +2821,30 @@ impl Api {
         }
         if kind == "attachments" {
             self.settle_node(&mut spec, None).await?;
+            self.refuse_a_second_holder(parent, &spec).await?;
+        }
+        if kind == "volumes" {
+            // Refused here rather than by the pool agent, which is where it
+            // used to be discovered: the field is in the model, in the
+            // OpenAPI and on both consoles' forms, and every backend answers
+            // "there is no KMS for this pool to ask". A tenant who filled it
+            // in got a volume that never provisioned and a sentence only
+            // visible in an agent's log. Until there is a KMS, the honest
+            // place to say no is where the request is made.
+            // `encryption_key`, not `encryptionKey`: the wire layer has already
+            // turned the body into the model's spelling by the time it gets
+            // here, and a check against the camelCase name silently matched
+            // nothing.
+            if let Some(key) = spec.get("encryption_key").and_then(Value::as_str)
+                && !key.trim().is_empty()
+            {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    "this cell has no key manager, so a volume cannot be encrypted at rest yet. \
+                     Leave the key empty; the field is here for when one exists.",
+                )
+                .at("spec.encryptionKey"));
+            }
         }
         if kind == "migrations" {
             // Moving a guest between machines is running the *cell*, not the
@@ -2221,6 +2889,7 @@ impl Api {
         }
         if kind == "volumes" {
             self.settle_volume_source(&name, &mut spec).await?;
+            self.refuse_a_retired_image(kind, &spec).await?;
             // After the source, on purpose: a clone inherits the pool holding
             // its snapshot, and a choice made before that would put the copy in
             // a different pool from the bytes it is cloned from. Only a volume
@@ -2238,6 +2907,8 @@ impl Api {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             self.judge_image_signature(&spec, digest.as_deref())?;
+            self.refuse_a_replacement_that_is_not_an_image(&spec)
+                .await?;
         }
         if kind == "image-sources" {
             refuse_an_unusable_image_source(&spec)?;
@@ -2297,12 +2968,263 @@ impl Api {
         } else {
             None
         };
+        self.record_change(who, "create", &name).await;
         Ok(Created {
             operation,
             target: name.to_string(),
             node_token,
             pool_token,
         })
+    }
+
+    /// Refuse a second subnet on a network the fabric is currently carrying.
+    ///
+    /// **The two models disagree and one of them is load-bearing.** A cloud
+    /// network holds subnets as separate objects and may have several; the
+    /// fabric's network holds one range and checks every port's address
+    /// against it. There is no faithful mirror of two into one — widening to a
+    /// supernet stops the check meaning anything, and mirroring the first
+    /// refuses the other's ports with an error naming a subnet nobody asked
+    /// about. So the controller refuses to mirror such a network, and says so
+    /// on it.
+    ///
+    /// What that left was the worst shape available: adding a subnet to a
+    /// *working* network was accepted, and the network then quietly stopped
+    /// being mirrored. Nothing broke that minute — the fabric keeps what it
+    /// has — and everything broke at the next fabric restart, by which time
+    /// the subnet was old news.
+    ///
+    /// Refused only when the network says it is mirrored **right now**. A cell
+    /// with no fabric never mirrors anything and carries several subnets per
+    /// network perfectly well; refusing there would take away something that
+    /// works to prevent something that cannot happen.
+    async fn refuse_a_subnet_that_would_unmirror_a_network(&self, spec: &Value) -> ApiResult<()> {
+        let Some(named) = spec.get("network").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Ok(name) = ResourceName::parse(named) else {
+            return Ok(());
+        };
+        let Ok(network) = self
+            .typed::<velstra_cloud_model::resources::NetworkSpec, velstra_cloud_model::resources::NetworkStatus>(&name)
+            .await
+        else {
+            return Ok(());
+        };
+        let carried = velstra_cloud_model::meta::condition(&network.status.conditions, "Mirrored")
+            .is_some_and(|c| {
+                c.status == velstra_cloud_model::meta::ConditionStatus::True
+                    && c.reason == "Mirrored"
+            });
+        if !carried {
+            return Ok(());
+        }
+        let existing: Vec<velstra_cloud_model::resources::Subnet> = self
+            .typed_list(
+                &network
+                    .meta
+                    .name
+                    .project()
+                    .map(|p| format!("projects/{p}"))
+                    .unwrap_or_default(),
+                "subnets",
+            )
+            .await?;
+        let siblings: Vec<String> = existing
+            .iter()
+            .filter(|s| s.spec.network == named && s.meta.deleted_at.is_none())
+            .map(|s| s.spec.cidr.clone())
+            .collect();
+        if siblings.is_empty() {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            format!(
+                "{named} is carried by the fabric with one range ({}), and the fabric checks \
+                 every port's address against it. A second subnet has no faithful mirror: \
+                 widening to cover both would stop the check meaning anything, and mirroring \
+                 one would refuse the other's ports. Adding this would leave the network \
+                 unmirrored — working until the next fabric restart, and then not. Make \
+                 another network instead.",
+                siblings.join(", ")
+            ),
+        )
+        .at("spec.network"))
+    }
+
+    /// Refuse to build anything new from an image that has been retired.
+    ///
+    /// An image is immutable, so the way one is withdrawn is not by changing
+    /// it but by saying where it is in its life — see
+    /// [`velstra_cloud_model::resources::ImageState`]. `Deprecated` is silent
+    /// here on purpose: it stops a *family* resolving to the image, and
+    /// somebody who pinned the digest keeps working. `Obsolete` is the rung
+    /// where the answer becomes no.
+    ///
+    /// Guests already built from it are untouched. Withdrawing an image must
+    /// not be a way to take a running fleet down.
+    async fn refuse_a_retired_image(&self, kind: &str, spec: &Value) -> ApiResult<()> {
+        let field = if kind == "instances" {
+            "image"
+        } else {
+            "source_image"
+        };
+        let Some(named) = spec
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+        else {
+            return Ok(());
+        };
+        let Ok(name) = ResourceName::parse(named) else {
+            return Ok(());
+        };
+        // Absent is somebody else's problem — the reference machinery and the
+        // node agent both have something to say about an image that is not
+        // there, and inventing a third answer here would only mean two of them
+        // disagree.
+        let Ok(image) = self
+            .typed::<velstra_cloud_model::resources::ImageSpec, velstra_cloud_model::resources::ImageStatus>(&name)
+            .await
+        else {
+            return Ok(());
+        };
+        if image.spec.state.usable() {
+            return Ok(());
+        }
+        let instead = if image.spec.replacement.is_empty() {
+            String::from("Nothing was named to replace it; ask whoever retired it what to use.")
+        } else {
+            format!("Use {} instead.", image.spec.replacement)
+        };
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            format!(
+                "{named} has been retired, so nothing new is built from it. Guests already \
+                 running on it are unaffected. {instead}"
+            ),
+        )
+        .at(if kind == "instances" {
+            "spec.image"
+        } else {
+            "spec.sourceImage"
+        }))
+    }
+
+    /// An image may only be replaced by an image.
+    ///
+    /// Checked because the field exists to be *read out to a tenant* in a
+    /// refusal, and a sentence telling somebody to use a name that is not an
+    /// image is worse than one that names nothing.
+    async fn refuse_a_replacement_that_is_not_an_image(&self, spec: &Value) -> ApiResult<()> {
+        let Some(named) = spec
+            .get("replacement")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+        else {
+            return Ok(());
+        };
+        let refuse = |why: String| Err(ApiError::invalid(why).at("spec.replacement"));
+        let Ok(name) = ResourceName::parse(named) else {
+            return refuse(format!("{named} is not a resource name"));
+        };
+        if name.collection() != "images" {
+            return refuse(format!(
+                "an image is replaced by an image, and {named} is a {}",
+                name.collection()
+            ));
+        }
+        match self
+            .typed::<velstra_cloud_model::resources::ImageSpec, velstra_cloud_model::resources::ImageStatus>(&name)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => refuse(format!("{named} is not an image this cell has")),
+        }
+    }
+
+    /// Take a deleted account out of every project's and folder's bindings.
+    ///
+    /// A binding names a subject as a plain string, so nothing in the
+    /// reference machinery noticed that a user was still named by one — the
+    /// delete guard looks at reference *fields*, and `members` is not one for
+    /// a project. So offboarding by deletion left every grant in place, and
+    /// the next account created with that id, on a system where ids are often
+    /// a person's name, inherited the whole of it.
+    ///
+    /// Best effort and loud: the account is going either way, and refusing the
+    /// delete because one project could not be written would leave the
+    /// operator with half an offboarding and no way to finish it.
+    async fn unbind_everywhere(&self, subject: &str) {
+        for kind in ["projects", "folders"] {
+            let Ok(objects) = self
+                .typed_list::<serde_json::Value, serde_json::Value>("", kind)
+                .await
+            else {
+                tracing::error!(
+                    kind,
+                    subject,
+                    "could not read {kind} to unbind a deleted account"
+                );
+                continue;
+            };
+            for object in objects {
+                let name = object.meta.name.to_string();
+                let Some(bindings) = object.spec.get("bindings").and_then(Value::as_array) else {
+                    continue;
+                };
+                let mut left: Vec<Value> = Vec::new();
+                let mut changed = false;
+                for binding in bindings {
+                    let members: Vec<Value> = binding
+                        .get("members")
+                        .and_then(Value::as_array)
+                        .map(|m| {
+                            m.iter()
+                                .filter(|x| x.as_str() != Some(subject))
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if members.len()
+                        != binding
+                            .get("members")
+                            .and_then(Value::as_array)
+                            .map_or(0, |m| m.len())
+                    {
+                        changed = true;
+                    }
+                    // A binding nobody is left in is a binding with no meaning;
+                    // keeping it would leave an empty grant for somebody to
+                    // wonder about later.
+                    if members.is_empty() {
+                        continue;
+                    }
+                    let mut next = binding.clone();
+                    if let Some(map) = next.as_object_mut() {
+                        map.insert("members".into(), Value::Array(members));
+                    }
+                    left.push(next);
+                }
+                if !changed {
+                    continue;
+                }
+                let patch = crate::collection::Patch {
+                    spec: Some(serde_json::json!({ "bindings": left })),
+                    labels: None,
+                };
+                let Ok(collection) = self.collection(kind) else {
+                    continue;
+                };
+                match collection.patch(&name, &patch, None).await {
+                    Ok(_) => tracing::info!(%name, subject, "unbound a deleted account"),
+                    Err(e) => {
+                        tracing::error!(%name, subject, "could not unbind a deleted account: {}", e.message)
+                    }
+                }
+            }
+        }
     }
 
     /// Issue a fresh agent credential for a machine that already exists.
@@ -2322,7 +3244,12 @@ impl Api {
     /// into a file would otherwise take the agent down while fixing it — and it
     /// is why this is `issueCredential` rather than `rotateCredential`, which
     /// would be a name promising the other thing.
-    pub async fn issue_credential(&self, name: &ResourceName, who: &Identity) -> ApiResult<Value> {
+    pub async fn issue_credential(
+        &self,
+        name: &ResourceName,
+        ask: &Value,
+        who: &Identity,
+    ) -> ApiResult<Value> {
         let kind = name.collection();
         if kind != "nodes" && kind != "pools" {
             return Err(ApiError::invalid(format!(
@@ -2338,18 +3265,49 @@ impl Api {
         // a credential for a machine the cell has never heard of, and it would
         // authenticate.
         self.get(name, who).await?;
+        // Two optional things the caller may say about the credential they are
+        // asking for: what it is for, and when it should stop working. Both
+        // exist because issuing is additive — an operator ends up with several
+        // and has to be able to tell them apart, and the one handed to somebody
+        // outside is the one that should have an end.
+        let purpose = ask
+            .get("purpose")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let expires_at = match ask.get("expiresAt") {
+            None | Some(Value::Null) => None,
+            Some(raw) => Some(velstra_cloud_model::meta::Timestamp(
+                raw.as_u64().ok_or_else(|| {
+                    ApiError::invalid("expiresAt is a time in milliseconds").at("expiresAt")
+                })?,
+            )),
+        };
+        if let Some(end) = expires_at
+            && end.0 <= Timestamp::now().0
+        {
+            return Err(ApiError::invalid(
+                "that end date has already passed, so the credential would be refused the first                  time it was presented",
+            )
+            .at("expiresAt"));
+        }
         let mut body = Map::new();
         body.insert("target".into(), Value::String(name.to_string()));
-        let (field, token) = if kind == "nodes" {
-            (
-                "nodeToken",
-                self.inner.identity.mint_node_credential(name.id()).await?,
-            )
+        let agent_kind = if kind == "nodes" {
+            velstra_cloud_model::identity::AgentKind::Node
         } else {
-            (
-                "poolToken",
-                self.inner.identity.mint_pool_credential(name.id()).await?,
-            )
+            velstra_cloud_model::identity::AgentKind::Pool
+        };
+        let token = self
+            .inner
+            .identity
+            .mint_agent_credential_for(name.id(), agent_kind, expires_at, &purpose)
+            .await?;
+        let field = if kind == "nodes" {
+            "nodeToken"
+        } else {
+            "poolToken"
         };
         body.insert(field.into(), Value::String(token));
         // No `operation`: nothing converges here. A create answers with one
@@ -2366,7 +3324,7 @@ impl Api {
         body: &Value,
         expect: Option<Revision>,
         who: &Identity,
-    ) -> ApiResult<Value> {
+    ) -> ApiResult<Changed> {
         self.may_write_now(who)?;
         // Changing who else may is a different permission from changing
         // anything else, or an editor is an admin one request later.
@@ -2451,7 +3409,7 @@ impl Api {
                     .await?;
             }
             self.refuse_a_role_nobody_defined(spec).await?;
-            check_rules(name.collection(), spec)?;
+            check_rules(name.collection(), spec, Document::Part)?;
             if name.collection() == "volumes" {
                 self.refuse_a_new_source(name, spec).await?;
                 self.refuse_a_moved_pool(name, spec).await?;
@@ -2468,6 +3426,7 @@ impl Api {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 self.judge_image_signature(spec, digest.as_deref())?;
+                self.refuse_a_replacement_that_is_not_an_image(spec).await?;
             }
             if name.collection() == "instances" {
                 // A resize is either the next size on the menu or a hand-typed
@@ -2601,7 +3560,29 @@ impl Api {
         }
         let mut document = collection.patch(&name.to_string(), &patch, expect).await?;
         self.answer(&mut document, &mut Scratch::default()).await?;
-        Ok(document)
+        self.record_change(who, "update", name).await;
+        // A change to the spec is work somebody has asked for and nobody has
+        // done yet — the same thing a create is, and until now only a create
+        // said so. Resizing a guest, moving an attachment, taking a member out
+        // of a pool: each is minutes of reconciling with no handle to follow,
+        // and the only trace was an audit line saying who asked.
+        //
+        // Not for a labels-only change: nothing reconciles a label, so an
+        // operation for one would be an object that is finished before it is
+        // written.
+        let operation = if patch.spec.is_some() {
+            let generation = document["meta"]["generation"].as_u64().unwrap_or(0);
+            self.mint_operation(name, generation, "update", who)
+                .await
+                .ok()
+                .and_then(|op| op["meta"]["name"].as_str().map(str::to_string))
+        } else {
+            None
+        };
+        Ok(Changed {
+            resource: document,
+            operation,
+        })
     }
 
     /// Report the status of an object, as the node agent that owns it.
@@ -2697,6 +3678,7 @@ impl Api {
         // because something still names it, or because the revision moved — must
         // not have had its credential destroyed on the way to finding out.
         if name.collection() == "users" {
+            self.unbind_everywhere(name.id()).await;
             if let Err(e) = self.inner.identity.forget(name.id()).await {
                 // Loud, and not fatal. The user is gone either way; what is left
                 // is a credential nobody can reach through a route that exists,
@@ -2711,13 +3693,36 @@ impl Api {
         // deleted user's does: a token that outlived the node it speaks for is a
         // credential for an object that no longer exists, and the only honest
         // lifetime for it is the node's.
-        if name.collection() == "nodes" {
+        // Nodes *and* pools. A pool's credential was never forgotten: the
+        // branch named only nodes, and nothing anywhere checks that the agent
+        // a credential speaks for still exists — so deleting a pool left a
+        // working way into the cell, for ever, under the name of a machine
+        // that was gone.
+        if matches!(name.collection(), "nodes" | "pools") {
             if let Err(e) = self.inner.identity.forget_node(name.id()).await {
                 tracing::error!(
-                    node = name.id(),
-                    "deleted the node but could not remove its agent credential: {e}"
+                    agent = name.id(),
+                    kind = name.collection(),
+                    "deleted the object but could not remove its agent credential: {e}"
                 );
             }
+        }
+        // Recorded whether the object went now or is waiting on a finalizer:
+        // both are "somebody asked for this to go", and that is the question
+        // the line answers.
+        self.record_change(who, "delete", name).await;
+        // Same reason as a patch: a delete that is waiting on a finalizer is
+        // work in progress, and "did my volume actually go" had no handle. An
+        // object that went on the spot mints nothing — there is nothing left
+        // to follow.
+        let mut deleted = deleted;
+        if !deleted.gone {
+            let generation = deleted.resource["meta"]["generation"].as_u64().unwrap_or(0);
+            deleted.operation = self
+                .mint_operation(name, generation, "delete", who)
+                .await
+                .ok()
+                .and_then(|op| op["meta"]["name"].as_str().map(str::to_string));
         }
         Ok(deleted)
     }
@@ -3076,11 +4081,18 @@ impl Api {
                 ))
             })
             .collect();
-        let (candidate, rejected) =
-            match place(&instance, &nodes, &occupied, &with_group, &classes, &closed) {
-                Ok(node) => (Some(node), Vec::new()),
-                Err(chain) => (None, chain),
-            };
+        let (candidate, rejected) = match place(
+            &instance,
+            &nodes,
+            &occupied,
+            &with_group,
+            &classes,
+            &closed,
+            velstra_cloud_model::meta::Timestamp::now(),
+        ) {
+            Ok(node) => (Some(node), Vec::new()),
+            Err(chain) => (None, chain),
+        };
         let placed = instance.spec.node.clone().or(candidate);
         let rejected: Vec<Value> = rejected
             .iter()
@@ -3501,6 +4513,50 @@ impl Api {
     ///
     /// `fallback` is the instance a change is being made against, since a
     /// change carries only what it changes.
+    /// Refuse to open a volume that another guest already holds.
+    ///
+    /// One writer at a time is the whole contract of a block device. Two
+    /// guests with the same RBD image or the same logical volume open
+    /// read-write on two machines do not fail: they succeed, and the
+    /// filesystem is destroyed by the second one's cache. Nothing else in the
+    /// platform was checking — an attachment is per (volume, instance), so two
+    /// of them are two different objects and neither collided with the other.
+    ///
+    /// Refused at admission rather than left to the pool agent, because by the
+    /// time an agent sees it the other node has already opened the device.
+    ///
+    /// A second attachment of the same volume to the *same* guest is not this:
+    /// it is the same open, asked for twice, and it collides on the object's
+    /// own name.
+    async fn refuse_a_second_holder(&self, parent: &str, spec: &Value) -> ApiResult<()> {
+        let Some(volume) = spec.get("volume").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let instance = spec.get("instance").and_then(Value::as_str).unwrap_or("");
+        let held: Vec<velstra_cloud_model::resources::Attachment> = self
+            .typed_list(parent, "attachments")
+            .await
+            .unwrap_or_default();
+        for a in held {
+            if a.meta.is_deleting() {
+                continue;
+            }
+            if a.spec.volume == volume && a.spec.instance != instance {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "{volume} is already attached to {}. A volume is opened by one guest at \
+                         a time: two writers on one device destroy the filesystem, and neither \
+                         of them is told. Detach it there first.",
+                        a.spec.instance
+                    ),
+                )
+                .at("spec.volume"));
+            }
+        }
+        Ok(())
+    }
+
     async fn settle_node(&self, spec: &mut Value, fallback: Option<&str>) -> ApiResult<()> {
         let stated = spec
             .get("node")
@@ -4198,6 +5254,17 @@ impl Api {
             .at("status.node"));
         };
 
+        // Whether the hop from the API to that node is private, read before the
+        // name is consumed below. It goes on the ticket because the moment
+        // somebody opens a console is the moment before they type into it, and
+        // what they type into a serial line is very often a root password.
+        let encrypted = self
+            .node(&node)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|n| n.status.console_tls);
+
         // A viewer gets a window; somebody who may change the guest gets a
         // keyboard. Asked as a question rather than taken from the refusal path,
         // so a viewer is *given a console* rather than told no.
@@ -4259,6 +5326,13 @@ impl Api {
             "ticket": ticket,
             "readOnly": read_only,
             "expiresAt": now.0 + velstra_cloud_model::console::TICKET_LIFETIME_MS,
+            // Whether the hop from the API to the node is private.
+            //
+            // Answered here, at the moment somebody opens a console, because
+            // that is the moment before they type into it — and what they type
+            // into a serial line is very often a root password. A screen that
+            // does not say so is a screen that gets treated as private.
+            "encrypted": encrypted,
         }))
     }
 
@@ -4304,6 +5378,50 @@ impl Api {
         Ok(swept)
     }
 
+    /// Delete idempotency records past their day.
+    ///
+    /// The read path treats an expired record as absent, so nothing is ever
+    /// answered from a stale one — but a key used once and never used again
+    /// leaves a row nothing reads, and without this the store grows one per
+    /// create for ever. The same shape as the console sweep above, and on the
+    /// same timer.
+    pub async fn sweep_spent_idempotency_keys(&self, now: Timestamp) -> ApiResult<usize> {
+        use velstra_cloud_model::idempotency::{IDEMPOTENCY_KIND, Replay};
+
+        let prefix = velstra_cloud_store::prefix_for(&self.inner.placement.cell, IDEMPOTENCY_KIND);
+        let held = self
+            .inner
+            .store
+            .list(&prefix)
+            .await
+            .map_err(ApiError::from)?;
+        let mut swept = 0;
+        for entry in held {
+            // Unreadable is swept too: it is a row this software wrote in a
+            // shape it no longer understands, and keeping it forever helps
+            // nobody.
+            let expired = match serde_json::from_slice::<Replay>(&entry.value) {
+                Ok(record) => record.expired(now),
+                Err(_) => true,
+            };
+            if !expired {
+                continue;
+            }
+            // Against the revision read, so a key being spent right now is not
+            // deleted out from under the create holding it.
+            if self
+                .inner
+                .store
+                .delete(&entry.key, Expect::Revision(entry.revision))
+                .await
+                .is_ok()
+            {
+                swept += 1;
+            }
+        }
+        Ok(swept)
+    }
+
     pub async fn console_endpoint_for(&self, session: &ResourceName) -> ApiResult<String> {
         let session: velstra_cloud_model::resources::ConsoleSession = self.typed(session).await?;
         let node = ResourceName::parse(&format!("nodes/{}", session.spec.node))?;
@@ -4319,6 +5437,29 @@ impl Api {
             .at("status.consoleEndpoint"));
         }
         Ok(node.status.console_endpoint.clone())
+    }
+
+    /// Whether the node serving this console speaks TLS on it.
+    ///
+    /// Read alongside the endpoint, and separately, because the two answer
+    /// different questions: where to connect, and whether what crosses is
+    /// private. A console screen is told the second one — before somebody
+    /// types a root password into a stream that a passive listener on the
+    /// management network can read.
+    pub async fn console_is_private(&self, session: &ResourceName) -> bool {
+        let Ok(session) = self
+            .typed::<velstra_cloud_model::console::ConsoleSessionSpec, velstra_cloud_model::console::ConsoleSessionStatus>(session)
+            .await
+        else {
+            return false;
+        };
+        let Ok(name) = ResourceName::parse(&format!("nodes/{}", session.spec.node)) else {
+            return false;
+        };
+        self.typed::<NodeSpec, NodeStatus>(&name)
+            .await
+            .map(|node| node.status.console_tls)
+            .unwrap_or(false)
     }
 
     /// Who a console stream is opened as, when the ticket is the only credential
@@ -4565,14 +5706,29 @@ impl Api {
         };
         let end = Timestamp(days_from(next_y, next_m) as u64 * 86_400_000);
 
-        let records: Vec<velstra_cloud_model::resources::UsageRecord> =
-            self.typed_list(&name.to_string(), "usage").await?;
+        let records = self.readings_between(name, start, end).await?;
         let mut hours: u64 = 0;
         let mut vcpu_hours: u64 = 0;
         let mut memory_mib_hours: u64 = 0;
         let mut volume_gib_hours: u64 = 0;
         let mut instance_hours: u64 = 0;
         let mut floating_ip_hours: u64 = 0;
+        // The four that were counted and never billed. A quota dimension the
+        // platform tracks and the billing answer omits is worse than one it
+        // does not track at all: the operator sees a number on the project and
+        // no line for it on the bill, and has no way to tell whether that is a
+        // pricing decision or a bug.
+        let mut load_balancer_hours: u64 = 0;
+        let mut device_hours: u64 = 0;
+        let mut snapshot_gib_hours: u64 = 0;
+        let mut backup_gib_hours: u64 = 0;
+        // The one line on a cloud bill that is a flow rather than a level.
+        // Summed, never differenced: each reading already holds its own
+        // interval's traffic, so a month is the sum of its hours and a gap in
+        // the readings is a gap in the bill rather than a number invented from
+        // two ends of it.
+        let mut rx_bytes: u64 = 0;
+        let mut tx_bytes: u64 = 0;
         for r in &records {
             if r.spec.at.0 < start.0 || r.spec.at.0 >= end.0 {
                 continue;
@@ -4583,6 +5739,12 @@ impl Api {
             volume_gib_hours += r.spec.used.volume_gib;
             instance_hours += u64::from(r.spec.used.instances);
             floating_ip_hours += u64::from(r.spec.used.floating_ips);
+            load_balancer_hours += u64::from(r.spec.used.load_balancers);
+            device_hours += u64::from(r.spec.used.devices);
+            snapshot_gib_hours += r.spec.used.snapshot_gib;
+            backup_gib_hours += r.spec.used.backup_gib;
+            rx_bytes = rx_bytes.saturating_add(r.spec.traffic.rx_bytes);
+            tx_bytes = tx_bytes.saturating_add(r.spec.traffic.tx_bytes);
         }
         // How many billable hours the month has held so far, so a gap is a
         // number and not a suspicion.
@@ -4596,6 +5758,12 @@ impl Api {
             "volumeGibHours": volume_gib_hours,
             "instanceHours": instance_hours,
             "floatingIpHours": floating_ip_hours,
+            "loadBalancerHours": load_balancer_hours,
+            "deviceHours": device_hours,
+            "snapshotGibHours": snapshot_gib_hours,
+            "backupGibHours": backup_gib_hours,
+            "rxBytes": rx_bytes,
+            "txBytes": tx_bytes,
         }))
     }
 
@@ -4682,7 +5850,17 @@ impl Api {
             let _ = writeln!(out, "# TYPE velstra_store_revision counter");
             let _ = writeln!(out, "velstra_store_revision {}", rev.0);
         }
+        // What this instance has been asked to do. Every other metric here is
+        // about the cell; these are about the API itself, which is the half an
+        // operator needs when the question is "is it slow" or "who is
+        // hammering it".
+        out.push_str(&self.inner.requests.text());
         Ok(out)
+    }
+
+    /// The request counters, for the layer that fills them.
+    pub fn requests(&self) -> &Requests {
+        &self.inner.requests
     }
 
     /// What maintenance is planned for one node, and what it will cost.
@@ -5914,7 +7092,11 @@ impl Api {
         self.authorize_for(who, Verb::Read, &ResourceName::parse("nodes/any")?, "nodes")
             .await?;
         let nodes: Vec<velstra_cloud_model::resources::Node> = self.typed_list("", "nodes").await?;
-        let h = velstra_cloud_model::reconcile::headroom(&nodes, &self.closed_nodes().await?);
+        let h = velstra_cloud_model::reconcile::headroom(
+            &nodes,
+            &self.closed_nodes().await?,
+            velstra_cloud_model::meta::Timestamp::now(),
+        );
 
         let cap = |c: &velstra_cloud_model::resources::Capacity| {
             json!({
@@ -5967,7 +7149,11 @@ impl Api {
             &project.status.used,
         );
         let nodes: Vec<velstra_cloud_model::resources::Node> = self.typed_list("", "nodes").await?;
-        let room = velstra_cloud_model::reconcile::headroom(&nodes, &self.closed_nodes().await?);
+        let room = velstra_cloud_model::reconcile::headroom(
+            &nodes,
+            &self.closed_nodes().await?,
+            velstra_cloud_model::meta::Timestamp::now(),
+        );
         let startable = velstra_cloud_model::allowance::largest_startable(&dimensions, &room);
 
         Ok(json!({
@@ -6338,6 +7524,8 @@ impl Api {
             && kind != "volumes"
             && kind != "floatingips"
             && kind != "load-balancers"
+            && kind != "snapshots"
+            && kind != "backups"
         {
             // `device-classes` is deliberately absent: a class is a definition
             // of what hardware exists, not a thing a project holds. What is
@@ -6377,12 +7565,32 @@ impl Api {
                 exceeded(quota.instances as u64, count as u64, "instances", "spec")?;
                 exceeded(quota.vcpus as u64, vcpus as u64, "vCPUs", "spec.vcpus")?;
                 exceeded(quota.memory_mib, memory, "MiB of memory", "spec.memoryMib")?;
+                // A guest's root disk is storage the project holds, and the
+                // count that the project's own status reports has always said
+                // so — this door did not, so a project capped at a hundred
+                // gibibytes could take a terabyte in root disks and read back
+                // a status saying it was ten times over. Admission and the
+                // count now ask the same question.
+                let disks = self.volume_gib_now(&parent, &existing).await? + wanted.root_disk_gib;
+                exceeded(quota.volume_gib, disks, "GiB of volume", "spec.rootDiskGib")?;
+                // Counted since the field existed, enforced from here. Hardware
+                // exists once, so a dimension that is reported and not enforced
+                // is the one shape of limit that is purely decorative.
+                let devices = existing
+                    .iter()
+                    .map(|i| i.spec.devices.len() as u64)
+                    .sum::<u64>()
+                    + wanted.devices.len() as u64;
+                exceeded(quota.devices as u64, devices, "devices", "spec.devices")?;
             }
             "volumes" => {
                 let wanted: VolumeSpec = serde_json::from_value(spec.clone())?;
                 let existing: Vec<Volume> = self.typed_list(&parent, "volumes").await?;
                 let count = existing.len() as u32 + 1;
-                let gib = existing.iter().map(|v| v.spec.size_gib).sum::<u64>() + wanted.size_gib;
+                let instances: Vec<Instance> = self.typed_list(&parent, "instances").await?;
+                let gib = existing.iter().map(|v| v.spec.size_gib).sum::<u64>()
+                    + instances.iter().map(|i| i.spec.root_disk_gib).sum::<u64>()
+                    + wanted.size_gib;
                 // Two independent limits on the same collection: a count of
                 // objects and a sum of gibibytes. Either can be the one a
                 // project hits, so both are checked and the one that fails names
@@ -6396,6 +7604,28 @@ impl Api {
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.floating_ips as u64, count, "floating IPs", "spec")?;
             }
+            "snapshots" => {
+                let existing: Vec<velstra_cloud_model::resources::Snapshot> =
+                    self.typed_list(&parent, "snapshots").await?;
+                let count = existing.len() as u64 + 1;
+                exceeded(quota.snapshots as u64, count, "snapshots", "spec")?;
+                // What the ones that exist occupy. The new one adds nothing
+                // here because nothing has been written yet — how much a
+                // snapshot takes is the pool's answer, and it arrives on the
+                // status afterwards. So this refuses the request *after* the
+                // project is already over, which is the honest bound a size
+                // nobody can state in advance allows.
+                let gib = existing.iter().map(|s| s.status.size_gib).sum::<u64>();
+                exceeded(quota.snapshot_gib, gib, "GiB of snapshot", "spec")?;
+            }
+            "backups" => {
+                let existing: Vec<velstra_cloud_model::resources::Backup> =
+                    self.typed_list(&parent, "backups").await?;
+                let count = existing.len() as u64 + 1;
+                exceeded(quota.backups as u64, count, "backups", "spec")?;
+                let gib = existing.iter().map(|b| b.status.size_gib).sum::<u64>();
+                exceeded(quota.backup_gib, gib, "GiB of backup", "spec")?;
+            }
             _ => {
                 let existing: Vec<velstra_cloud_model::loadbalancer::LoadBalancer> =
                     self.typed_list(&parent, "load-balancers").await?;
@@ -6404,6 +7634,84 @@ impl Api {
             }
         }
         Ok(())
+    }
+
+    /// One project's readings for one month, read as a key range.
+    ///
+    /// **Why not simply list them.** A reading is filed under the zero-padded
+    /// millisecond of its interval, so the lexical order of the names *is* time
+    /// order — and listing the collection to answer "what did this project have
+    /// in August" decoded every reading of every project since the cell was
+    /// built. Ninety days hourly is two thousand rows per project; a tenant
+    /// asking about their own bill made the API decode everybody's.
+    ///
+    /// So it starts at the month's own key and stops at the first row past it.
+    /// A month is at most a few hundred readings whatever the cell has been
+    /// doing since.
+    async fn readings_between(
+        &self,
+        project: &ResourceName,
+        from: Timestamp,
+        until: Timestamp,
+    ) -> ApiResult<Vec<velstra_cloud_model::resources::UsageRecord>> {
+        use velstra_cloud_model::usage::id_for;
+
+        let collection = self.collection("usage")?;
+        let under = format!("{project}/usage/");
+        // Exclusive, so the first key asked for is the one *below* the month's
+        // first id. The ids are fixed-width, so subtracting a millisecond is a
+        // string one place below the boundary and never skips a reading taken
+        // exactly on it.
+        let mut after = Some(format!(
+            "{under}{}",
+            id_for(Timestamp(from.0.saturating_sub(1)))
+        ));
+        let mut found = Vec::new();
+        loop {
+            let (page, more) = collection
+                .list_page(after.as_deref(), READINGS_PER_PAGE)
+                .await?;
+            let empty = page.is_empty();
+            for document in page {
+                // Through `joined`, because a stored name serialises as its
+                // segments and not as a string — the mistake that made this
+                // scan find nothing at all the first time.
+                let Some(name) = joined(&document["meta"]["name"]) else {
+                    continue;
+                };
+                // Past this project's rows entirely: the listing is one range
+                // over every project, and the next project's keys sort after
+                // this one's.
+                if !name.starts_with(&under) {
+                    return Ok(found);
+                }
+                after = Some(name);
+                let Ok(record) =
+                    serde_json::from_value::<velstra_cloud_model::resources::UsageRecord>(document)
+                else {
+                    continue;
+                };
+                if record.spec.at.0 >= until.0 {
+                    return Ok(found);
+                }
+                found.push(record);
+            }
+            if empty || !more {
+                return Ok(found);
+            }
+        }
+    }
+
+    /// The gibibytes a project already holds: its volumes, plus the root disks
+    /// of the guests it is running.
+    ///
+    /// One place, because the two doors that ask — creating a volume and
+    /// creating a guest — were answering differently, and the count the
+    /// project's own status reports was a third answer again.
+    async fn volume_gib_now(&self, parent: &str, instances: &[Instance]) -> ApiResult<u64> {
+        let volumes: Vec<Volume> = self.typed_list(parent, "volumes").await?;
+        Ok(volumes.iter().map(|v| v.spec.size_gib).sum::<u64>()
+            + instances.iter().map(|i| i.spec.root_disk_gib).sum::<u64>())
     }
 
     // ---- typed helpers ----------------------------------------------------
@@ -6961,12 +8269,31 @@ fn check_role(spec: &Value) -> ApiResult<()> {
 ///
 /// Without this an image with no digest was a perfectly acceptable object, and
 /// the first thing to notice would have been a node with nothing to fetch.
-fn check_image(spec: &Value) -> ApiResult<()> {
+/// Whether the document being checked is a whole spec or the part of one a
+/// change carries.
+///
+/// It matters for exactly one class of rule: "this field must be present".
+/// A patch carries what it changes, so judging one as if it were a whole spec
+/// refuses every change for want of a field the object already has. That is
+/// not hypothetical — it made images uneditable: the console offered a form,
+/// and every save came back "an image says which bytes it is".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Document {
+    Whole,
+    Part,
+}
+
+fn check_image(spec: &Value, document: Document) -> ApiResult<()> {
     let said = |key: &str| {
         spec.get(key)
             .and_then(Value::as_str)
             .is_some_and(|v| !v.is_empty())
     };
+    if document == Document::Part {
+        // Nothing below is about a field's *value*; they are all about a field
+        // being there at all, which a change does not have to restate.
+        return Ok(());
+    }
     if said("from") {
         // Publishing. What is missing comes off the image being published from,
         // and `settle_published_image` has already put it here — so anything
@@ -6997,12 +8324,12 @@ fn check_image(spec: &Value) -> ApiResult<()> {
     Ok(())
 }
 
-fn check_rules(kind: &str, spec: &Value) -> ApiResult<()> {
+fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     if kind == "load-balancers" {
         return check_listeners(spec);
     }
     if kind == "images" {
-        return check_image(spec);
+        return check_image(spec, document);
     }
     if kind == "roles" {
         return check_role(spec);
@@ -7019,6 +8346,14 @@ fn check_rules(kind: &str, spec: &Value) -> ApiResult<()> {
                 .map_err(|e| ApiError::invalid(format!("{e}")).at(format!("spec.rules[{i}]")))?;
         validate(&parsed)
             .map_err(|e| ApiError::invalid(e.to_string()).at(format!("spec.rules[{i}]")))?;
+        // And whether a datapath could be given it. A rule that is coherent
+        // and unprogrammable used to be accepted, stored and shown — and then
+        // the whole *port* failed to program and the guest waiting on it never
+        // started, with the reason only in an agent's journal on a machine the
+        // person who wrote the rule does not have.
+        velstra_cloud_model::security::programmable(&parsed).map_err(|e| {
+            ApiError::new(Code::FailedPrecondition, e.to_string()).at(format!("spec.rules[{i}]"))
+        })?;
     }
     Ok(())
 }
