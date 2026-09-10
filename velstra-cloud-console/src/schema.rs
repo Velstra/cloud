@@ -3511,6 +3511,42 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
         derived: false,
         at_creation: false,
     },
+    Field {
+        key: "sessionAffinity",
+        label: "Keep a client on one member",
+        kind: Kind::Switch,
+        required: false,
+        // A variation on how the pool is used, not part of deciding to have
+        // one: the default spreads every connection, which is what a balancer
+        // is for.
+        advanced: true,
+        help: "For a service that keeps something per client between \
+               connections — a session in memory, an upload in pieces. The \
+               cost: one client is one member, so a pool fronting few busy \
+               clients spreads worse, and everyone behind one NAT counts as \
+               one client.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "draining",
+        label: "Draining",
+        kind: Kind::RefList {
+            collection: "ports",
+            also: None,
+            spelling: Spelling::Name,
+        },
+        required: false,
+        advanced: true,
+        help: "Members being taken out of service: they take no new \
+               connections and keep the ones they have until the clients are \
+               done. Every name here has to be one of the members. Removing a \
+               member outright cuts its connections instead.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
 ];
 
 /// A storage pool, which is infrastructure in the same sense a node is: an
@@ -5618,6 +5654,19 @@ pub const COLLECTIONS: &[Collection] = &[
 /// The collections, as the script reads them.
 pub fn as_json() -> String {
     serde_json::to_string(COLLECTIONS).expect("the schema is plain data")
+}
+
+/// The same, laid out — the form the React console keeps beside its source.
+///
+/// A single space of indent and no trailing newline, because that is what the
+/// checked-in `schema.json` is and the point of this function is that the file
+/// can be reproduced rather than edited.
+pub fn as_pretty_json() -> String {
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
+    serde::Serialize::serialize(&COLLECTIONS, &mut ser).expect("the schema is plain data");
+    String::from_utf8(out).expect("serde_json writes UTF-8")
 }
 
 #[cfg(test)]
