@@ -145,7 +145,10 @@ impl Algorithm {
         }
     }
 
-    pub fn from_str(tag: &str) -> Option<Self> {
+    /// From the tag a BSD-layout checksums line carries. Not `FromStr`: this
+    /// reads one field of a line, and a value that is not one of the two is a
+    /// line to skip rather than an error to carry.
+    pub fn from_tag(tag: &str) -> Option<Self> {
         match tag.to_ascii_lowercase().as_str() {
             "sha256" => Some(Self::Sha256),
             "sha512" => Some(Self::Sha512),
@@ -183,7 +186,7 @@ impl Digest {
     pub fn parse(value: &str) -> Option<Self> {
         let last = value.rsplit('/').next()?;
         let (tag, hex) = last.split_once(':').or_else(|| last.split_once('-'))?;
-        let algorithm = Algorithm::from_str(tag)?;
+        let algorithm = Algorithm::from_tag(tag)?;
         let hex = hex.to_ascii_lowercase();
         (hex.len() == algorithm.hex_len() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
             .then_some(Self { algorithm, hex })
@@ -289,7 +292,7 @@ pub fn digest_for(checksums: &str, filename: &str) -> Option<String> {
             let algorithm = match tag {
                 // A BSD line names its function; trust it over the length, and
                 // refuse the pair when they disagree.
-                Some(tag) => match Algorithm::from_str(tag) {
+                Some(tag) => match Algorithm::from_tag(tag) {
                     Some(a) => a,
                     None => continue,
                 },

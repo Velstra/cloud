@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::io::AsyncReadExt;
 use velstra_cloud_model::meta::Timestamp;
 
