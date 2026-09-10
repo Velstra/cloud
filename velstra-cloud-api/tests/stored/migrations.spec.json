@@ -1,0 +1,9 @@
+{
+  "connections": 1,
+  "downtime_ms": 300,
+  "from_node": "",
+  "instance": "",
+  "mode": "Live",
+  "timeout_s": 3600,
+  "to_node": ""
+}

@@ -1,0 +1,9 @@
+{
+  "agent_version": "",
+  "allocated_gib": 0,
+  "backend": "",
+  "capacity_gib": 0,
+  "conditions": [],
+  "last_heartbeat": 0,
+  "observed_generation": 0
+}
