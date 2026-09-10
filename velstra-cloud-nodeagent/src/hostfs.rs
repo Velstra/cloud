@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::io::AsyncReadExt;
 use velstra_cloud_model::meta::Timestamp;
 
@@ -364,40 +364,56 @@ pub fn from_qmp_id(id: &str) -> Option<String> {
 
 // ---- images --------------------------------------------------------------
 
-/// The sha256 an image name commits to, if it carries one.
-/// The hex of a `sha256:…` value, whatever spelling it arrives in.
+/// The digest an image commits to — which function, and the hex — whatever
+/// spelling it arrives in.
 ///
 /// Read from the image's **spec**, not from its name. It used to be parsed out
 /// of the name, which forced every image to be called `sha256-<64 hex>` — a
 /// name no operator wants to see in a list where they are choosing an operating
 /// system. The bytes are still addressed by their digest on disk; what changed
 /// is that the object above them may be called `debian-13`.
-pub fn digest_of(image: &str) -> Option<String> {
-    let last = image.rsplit('/').next()?;
-    let hex = last
-        .strip_prefix("sha256:")
-        .or_else(|| last.strip_prefix("sha256-"))?;
-    let hex = hex.to_ascii_lowercase();
-    let valid = hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit());
-    valid.then_some(hex)
+///
+/// The function travels with the hex because Debian publishes only
+/// `SHA512SUMS`: hashing with sha256 what an image commits to in sha512 is a
+/// comparison that can never succeed, and it would fail at fetch time on a node
+/// nobody is watching.
+pub fn digest_of(image: &str) -> Option<velstra_cloud_model::images::Digest> {
+    velstra_cloud_model::images::Digest::parse(image)
 }
 
-pub async fn sha256_file(path: &Path) -> Result<String> {
+/// Hash a file with the function the caller names.
+pub async fn hash_file(
+    path: &Path,
+    algorithm: velstra_cloud_model::images::Algorithm,
+) -> Result<String> {
+    use sha2::Digest as _;
     let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
+    // Two hashers rather than a boxed trait object: `sha2`'s types are not
+    // object safe through `Digest`, and there are exactly two of them.
+    let mut sha256 = Sha256::new();
+    let mut sha512 = sha2::Sha512::new();
     loop {
         let read = file.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        match algorithm {
+            velstra_cloud_model::images::Algorithm::Sha256 => sha256.update(&buffer[..read]),
+            velstra_cloud_model::images::Algorithm::Sha512 => sha512.update(&buffer[..read]),
+        }
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    let bytes: Vec<u8> = match algorithm {
+        velstra_cloud_model::images::Algorithm::Sha256 => sha256.finalize().to_vec(),
+        velstra_cloud_model::images::Algorithm::Sha512 => sha512.finalize().to_vec(),
+    };
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The same, for the one function this platform picks itself: a backup's
+/// digest and a captured image's are ours to name, and they are sha256.
+pub async fn sha256_file(path: &Path) -> Result<String> {
+    hash_file(path, velstra_cloud_model::images::Algorithm::Sha256).await
 }
 
 /// Where a verified image lives on this node, if it is here.
@@ -410,14 +426,15 @@ pub fn image_path(layout: &Layout, digest: &str) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// What a verified image is called on disk: `sha256-<hex>`, from its digest.
+/// What a verified image is called on disk: `<algorithm>-<hex>`, from its
+/// digest.
 ///
 /// The digest and not the name, so two objects carrying the same bytes — a
 /// project's copy of a catalogue image, the same image published twice under
 /// different names — are one file on every node that has it. Names are for
 /// people and there can be several; the bytes have exactly one identity.
 pub fn stored_as(digest: &str) -> Option<String> {
-    digest_of(digest).map(|hex| format!("sha256-{hex}"))
+    digest_of(digest).map(|d| d.stored())
 }
 
 /// Fetch an image from `source` into the incoming directory, then verify and
@@ -441,7 +458,8 @@ pub async fn fetch_image(layout: &Layout, image: &str, digest: &str, source: &st
     // operator a wait rather than a gigabyte.
     let name = stored_as(digest).ok_or_else(|| {
         HostError::failed(format!(
-            "{image} carries no sha256 digest, so this node cannot verify what it downloads"
+            "{image} carries no digest this node can read — `sha256:<64 hex>` or \
+             `sha512:<128 hex>` — so there is nothing to verify what it downloads against"
         ))
     })?;
     if layout.image_dir.join(&name).exists() {
@@ -633,10 +651,11 @@ pub fn image_age_seconds(layout: &Layout, stored_as: &str) -> Option<u64> {
 pub async fn publish_image(layout: &Layout, image: &str, digest: &str) -> Result<()> {
     let expected = digest_of(digest).ok_or_else(|| {
         HostError::failed(format!(
-            "{image} carries no sha256 digest, so this node cannot verify what it downloads"
+            "{image} carries no digest this node can read — `sha256:<64 hex>` or \
+             `sha512:<128 hex>` — so there is nothing to verify what it downloads against"
         ))
     })?;
-    let name = format!("sha256-{expected}");
+    let name = expected.stored();
     let published = layout.image_dir.join(&name);
     if published.exists() {
         return Ok(());
@@ -647,8 +666,11 @@ pub async fn publish_image(layout: &Layout, image: &str, digest: &str) -> Result
             "no copy of {image} has arrived on this node"
         )));
     }
-    let actual = sha256_file(&incoming).await?;
-    if actual != expected {
+    // With the function the image names, never a fixed one: an image
+    // committing to a sha512 and hashed as a sha256 never matches, and the
+    // rejection reads as a bad mirror rather than as this node's mistake.
+    let actual = hash_file(&incoming, expected.algorithm).await?;
+    if actual != expected.hex {
         // Kept, but out of the way. Leaving it under the name it was fetched
         // as bricked that image on that node for good: the next pass found an
         // incoming copy, hashed the same wrong bytes, refused again, and the
@@ -662,8 +684,9 @@ pub async fn publish_image(layout: &Layout, image: &str, digest: &str) -> Result
             tracing::warn!(error = %e, image, "could not set the bad copy aside");
         }
         return Err(HostError::failed(format!(
-            "{image} hashed to {actual}, not {expected}. The copy is kept as {} and the next \
-             fetch starts again.",
+            "{image} hashed to {}:{actual}, not {expected}. The copy is kept as {} and the \
+             next fetch starts again.",
+            expected.algorithm.as_str(),
             rejected.display()
         )));
     }
@@ -1195,6 +1218,78 @@ pub fn capacity(layout: &Layout) -> velstra_cloud_model::resources::Capacity {
 
 #[cfg(test)]
 mod tests {
+
+    /// An image that commits to a sha512 is verified as a sha512.
+    ///
+    /// Debian publishes only `SHA512SUMS` for its cloud images, so this is the
+    /// ordinary path for the distribution most cells start from. Hashing those
+    /// bytes with sha256 produces a value that can never equal the commitment,
+    /// and the node would reject every copy and blame the mirror — on a machine
+    /// nobody is watching.
+    #[tokio::test]
+    async fn an_image_is_verified_with_the_function_it_names() {
+        use velstra_cloud_model::images::Algorithm;
+
+        let dir = std::env::temp_dir().join(format!("velstra-sha512-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = super::Layout {
+            image_dir: dir.join("images"),
+            incoming_dir: dir.join("incoming"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&layout.incoming_dir).unwrap();
+
+        let bytes = b"not really an operating system";
+        let hex = {
+            use sha2::Digest as _;
+            sha2::Sha512::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let digest = format!("sha512:{hex}");
+        std::fs::write(layout.incoming_dir.join(format!("sha512-{hex}")), bytes).unwrap();
+
+        super::publish_image(&layout, "images/debian-13", &digest)
+            .await
+            .expect("a copy that matches its sha512 is published");
+        assert!(
+            layout.image_dir.join(format!("sha512-{hex}")).exists(),
+            "it was not filed under the digest it commits to"
+        );
+
+        // And the mismatch still lands: the same bytes under a sha512 that is
+        // not theirs are refused, and the copy is set aside rather than
+        // bricking the image on this node.
+        let wrong = format!("sha512:{}", "a".repeat(128));
+        std::fs::write(
+            layout
+                .incoming_dir
+                .join(format!("sha512-{}", "a".repeat(128))),
+            bytes,
+        )
+        .unwrap();
+        let err = super::publish_image(&layout, "images/wrong", &wrong)
+            .await
+            .expect_err("bytes that are not the digest are refused");
+        assert!(format!("{err}").contains("sha512:"), "{err}");
+
+        // The hasher itself, both ways, so the two never quietly become one.
+        let file = layout.image_dir.join(format!("sha512-{hex}"));
+        assert_eq!(
+            super::hash_file(&file, Algorithm::Sha512).await.unwrap(),
+            hex
+        );
+        assert_eq!(
+            super::hash_file(&file, Algorithm::Sha256)
+                .await
+                .unwrap()
+                .len(),
+            64
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The tail is the *last* bytes, and the total is the whole file.
     ///

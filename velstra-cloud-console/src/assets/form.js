@@ -26,7 +26,8 @@ const CHECKS = {
     return Number.isInteger(n) && n >= 0 && n <= max ? "" : "the prefix must be 0–" + max;
   },
   mac: (s) => /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/.test(s) ? "" : "six hex pairs, like 02:1a:4b:00:11:22",
-  digest: (s) => /^sha256:[0-9a-f]{64}$/.test(s) ? "" : "sha256: followed by 64 hex characters",
+  digest: (s) => /^sha256:[0-9a-f]{64}$/.test(s) || /^sha512:[0-9a-f]{128}$/.test(s) ? ""
+    : "sha256: followed by 64 hex characters, or sha512: followed by 128",
   url: (s) => /^[a-z][a-z0-9+.-]*:\/\/.+/i.test(s) ? "" : "expected a URL with a scheme",
   name: (s) => s.split("/").length % 2 === 0 && s.split("/").every(Boolean)
     ? "" : "a resource name is collection/id pairs, like projects/p1/images/x",
@@ -1344,7 +1345,7 @@ function optionNote(collectionId, o) {
     const where = name.startsWith("projects/")
       ? name.split("/")[1]
       : "catalogue";
-    const digest = (idOf(o) || "").replace(/^sha256-/, "").slice(0, 8);
+    const digest = (idOf(o) || "").replace(/^sha(256|512)-/, "").slice(0, 8);
     // A size nobody has measured yet is left out. It is reported by whoever
     // fetches the bytes, so a freshly published catalogue entry has none — and
     // rendering that as "0" reads as an empty image rather than an unknown one.

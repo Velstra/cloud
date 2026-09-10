@@ -115,20 +115,116 @@ pub fn filename_of(url: &str) -> &str {
         .unwrap_or("")
 }
 
-/// What a node files an image's bytes under: `sha256-<hex>`, from its digest.
+/// Which hash a digest is of.
+///
+/// Two, because the distributions disagree and an image nobody can point at is
+/// worse than a second hash function: Debian publishes only `SHA512SUMS` for
+/// its cloud images, and the RPM family and Ubuntu publish `SHA256SUMS`. The
+/// platform addresses images by content either way — what varies is which
+/// content function, and it is written down in the digest rather than assumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Algorithm {
+    Sha256,
+    Sha512,
+}
+
+impl Algorithm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    /// How many hex digits its output is. This is also how a checksums line is
+    /// recognised: a coreutils line carries no tag, only the hex.
+    pub const fn hex_len(self) -> usize {
+        match self {
+            Self::Sha256 => 64,
+            Self::Sha512 => 128,
+        }
+    }
+
+    /// From the tag a BSD-layout checksums line carries. Not `FromStr`: this
+    /// reads one field of a line, and a value that is not one of the two is a
+    /// line to skip rather than an error to carry.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag.to_ascii_lowercase().as_str() {
+            "sha256" => Some(Self::Sha256),
+            "sha512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
+    fn from_hex_len(len: usize) -> Option<Self> {
+        match len {
+            64 => Some(Self::Sha256),
+            128 => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+}
+
+/// A content digest: which hash, and the hex of it.
+///
+/// Parsed rather than assumed, and from either spelling — `sha256:<hex>` is
+/// what a spec carries and `sha256-<hex>` is what a file on a node is called,
+/// because a colon is not a thing to put in a filename. One type so the two
+/// cannot drift.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Digest {
+    pub algorithm: Algorithm,
+    pub hex: String,
+}
+
+impl Digest {
+    /// From `sha256:<hex>`, `sha512-<hex>`, or the last segment of a path
+    /// spelled either way. `None` for anything whose hex is not the right
+    /// length for the algorithm it claims — a sha512 announced as a sha256 is
+    /// a digest no bytes will ever match, which is a failure at fetch time on
+    /// a machine nobody is looking at.
+    pub fn parse(value: &str) -> Option<Self> {
+        let last = value.rsplit('/').next()?;
+        let (tag, hex) = last.split_once(':').or_else(|| last.split_once('-'))?;
+        let algorithm = Algorithm::from_tag(tag)?;
+        let hex = hex.to_ascii_lowercase();
+        (hex.len() == algorithm.hex_len() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(Self { algorithm, hex })
+    }
+
+    /// Bare hex, with the algorithm known from elsewhere.
+    pub fn from_hex(algorithm: Algorithm, hex: &str) -> Option<Self> {
+        let hex = hex.to_ascii_lowercase();
+        (hex.len() == algorithm.hex_len() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(Self { algorithm, hex })
+    }
+
+    /// What a spec carries: `sha256:<hex>`.
+    pub fn value(&self) -> String {
+        format!("{}:{}", self.algorithm.as_str(), self.hex)
+    }
+
+    /// What a node files the bytes under: `sha256-<hex>`.
+    pub fn stored(&self) -> String {
+        format!("{}-{}", self.algorithm.as_str(), self.hex)
+    }
+}
+
+impl std::fmt::Display for Digest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.value())
+    }
+}
+
+/// What a node files an image's bytes under: `<algorithm>-<hex>`, from its
+/// digest.
 ///
 /// The one place that spelling is decided, so the node that writes the file, the
 /// agent that reports it and the API that matches them cannot disagree — which
 /// they did: the API compared object *names* against filed *digests* and every
 /// image reported as cached nowhere.
 pub fn stored_name(digest: &str) -> Option<String> {
-    let hex = digest
-        .rsplit(':')
-        .next()?
-        .rsplit('-')
-        .next()?
-        .to_ascii_lowercase();
-    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256-{hex}"))
+    Digest::parse(digest).map(|d| d.stored())
 }
 
 /// Why a source could not be used.
@@ -171,33 +267,59 @@ pub fn refuse_an_unusable_source(spec: &ImageSourceSpec) -> Result<(), Unusable>
 /// a `*` before the name for "binary mode". Lines that name something else are
 /// skipped rather than guessed at — a file that does not mention this image is
 /// not a file that says anything about it.
+///
+/// **Which hash it is comes off the line, never off the file's name.** A
+/// coreutils line carries no tag, so the hex length decides — 64 is a sha256,
+/// 128 a sha512 — and a BSD line says it outright. `SHA512SUMS` and
+/// `SHA256SUMS` look identical and are not; reading one as the other yields a
+/// digest no bytes will ever match, and the failure lands at fetch time on a
+/// node nobody is watching.
+///
+/// When a file names both for one image — some directories ship a combined
+/// list — the sha256 wins, because it is shorter to read and every other part
+/// of this platform already speaks it.
 pub fn digest_for(checksums: &str, filename: &str) -> Option<String> {
+    let mut fallback: Option<Digest> = None;
     for line in checksums.lines() {
         // Both layouts are tried on every line, not the first that parses:
         // a BSD-tag line also parses as a coreutils one, with `SHA256` as the
         // hex and `(name)` as the name, and stopping there would skip the line
         // that actually says something.
-        for (hex, name) in [bsd_line(line), coreutils_line(line)].into_iter().flatten() {
-            if name == filename
-            // `SHA512SUMS` and `SHA256SUMS` look identical and are not: a
-            // 128-digit hex is a sha512, which this platform does not address
-            // images by. Taken as one it would be a digest no bytes ever match.
-                && hex.len() == 64
-                && hex.chars().all(|c| c.is_ascii_hexdigit())
-            {
-                return Some(hex.to_ascii_lowercase());
+        for (tag, hex, name) in [bsd_line(line), coreutils_line(line)].into_iter().flatten() {
+            if name != filename {
+                continue;
             }
+            let algorithm = match tag {
+                // A BSD line names its function; trust it over the length, and
+                // refuse the pair when they disagree.
+                Some(tag) => match Algorithm::from_tag(tag) {
+                    Some(a) => a,
+                    None => continue,
+                },
+                None => match Algorithm::from_hex_len(hex.len()) {
+                    Some(a) => a,
+                    None => continue,
+                },
+            };
+            let Some(digest) = Digest::from_hex(algorithm, hex) else {
+                continue;
+            };
+            if digest.algorithm == Algorithm::Sha256 {
+                return Some(digest.value());
+            }
+            fallback.get_or_insert(digest);
         }
     }
-    None
+    fallback.map(|d| d.value())
 }
 
 /// `<hex>  <name>`, with an optional `*` for binary mode. Debian, Ubuntu and
-/// everything else that ships `SHA256SUMS` from GNU coreutils.
-fn coreutils_line(line: &str) -> Option<(&str, &str)> {
+/// everything else that ships `SHA256SUMS` or `SHA512SUMS` from GNU coreutils.
+/// No tag: the caller reads the function off the hex's length.
+fn coreutils_line(line: &str) -> Option<(Option<&str>, &str, &str)> {
     let mut parts = line.split_whitespace();
     let (hex, name) = (parts.next()?, parts.next()?);
-    Some((hex, name.strip_prefix('*').unwrap_or(name)))
+    Some((None, hex, name.strip_prefix('*').unwrap_or(name)))
 }
 
 /// `SHA256 (<name>) = <hex>` — the BSD tag layout.
@@ -207,11 +329,16 @@ fn coreutils_line(line: &str) -> Option<(&str, &str)> {
 /// RPM-family cloud image directory got an empty family and a message about a
 /// SHA512SUMS mix-up that was not what happened.
 ///
-/// Only the `SHA256` tag: the same rule as above, for the same reason.
-fn bsd_line(line: &str) -> Option<(&str, &str)> {
-    let rest = line.trim().strip_prefix("SHA256")?.trim_start();
+/// The tag is returned rather than matched here: it says which function the
+/// line is about, and that is the caller's decision to make.
+fn bsd_line(line: &str) -> Option<(Option<&str>, &str, &str)> {
+    let line = line.trim();
+    let tag = ["SHA256", "SHA512"]
+        .into_iter()
+        .find(|t| line.starts_with(t))?;
+    let rest = line.strip_prefix(tag)?.trim_start();
     let (name, hex) = rest.strip_prefix('(')?.split_once(')')?;
-    Some((hex.trim_start().strip_prefix('=')?.trim(), name))
+    Some((Some(tag), hex.trim_start().strip_prefix('=')?.trim(), name))
 }
 
 #[cfg(test)]
@@ -227,10 +354,10 @@ aa  something-else.qcow2
 ";
         assert_eq!(
             digest_for(file, "debian-13-genericcloud-amd64.qcow2").as_deref(),
-            Some("cbf3e1f588f02f8d738dbecb32652d07568cc1d56cd60f72dbed54400ba3ae8d")
+            Some("sha256:cbf3e1f588f02f8d738dbecb32652d07568cc1d56cd60f72dbed54400ba3ae8d")
         );
         assert_eq!(digest_for(file, "not-there.qcow2"), None);
-        // The short one is not a sha256 and is not taken for one.
+        // The short one is neither length and is taken for neither function.
         assert_eq!(digest_for(file, "debian-12-genericcloud-amd64.qcow2"), None);
     }
 
@@ -245,32 +372,62 @@ SHA256 (Rocky-9-GenericCloud-Base.latest.x86_64.qcow2) = aa
 ";
         assert_eq!(
             digest_for(file, "Rocky-9-GenericCloud.latest.x86_64.qcow2").as_deref(),
-            Some("cbf3e1f588f02f8d738dbecb32652d07568cc1d56cd60f72dbed54400ba3ae8d")
+            Some("sha256:cbf3e1f588f02f8d738dbecb32652d07568cc1d56cd60f72dbed54400ba3ae8d")
         );
-        // The short one is not a sha256 and is not taken for one.
+        // The short one is neither length and is taken for neither function.
         assert_eq!(
             digest_for(file, "Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"),
             None
         );
-        // And a sha512 in the same layout is refused like any other.
+        // A BSD line names its function, and is read under the one it names.
         let long = format!("SHA512 (disk.qcow2) = {}\n", "a".repeat(128));
-        assert_eq!(digest_for(&long, "disk.qcow2"), None);
+        assert_eq!(
+            digest_for(&long, "disk.qcow2").as_deref(),
+            Some(format!("sha512:{}", "a".repeat(128)).as_str())
+        );
+        // A tag whose hex is the wrong length for it is a line that contradicts
+        // itself, and neither half is believed.
+        let wrong = format!("SHA512 (disk.qcow2) = {}\n", "a".repeat(64));
+        assert_eq!(digest_for(&wrong, "disk.qcow2"), None);
     }
 
+    /// Debian ships `SHA512SUMS` for its cloud images and no `SHA256SUMS`, so
+    /// this is the ordinary case and not the exotic one. What must never happen
+    /// is the sha512 coming back *labelled* a sha256: that is a digest no bytes
+    /// will ever match, and the failure lands at fetch time on a node nobody is
+    /// watching.
     #[test]
-    fn a_sha512sums_file_is_not_read_as_sha256() {
-        // Both files sit in the same directory with near-identical names, and a
-        // sha512 taken for a sha256 is a digest no bytes will ever match — a
-        // source that looks like it is working and publishes nothing that boots.
+    fn a_sha512sums_file_is_read_as_a_sha512() {
         let file = format!("{}  disk.qcow2\n", "a".repeat(128));
-        assert_eq!(digest_for(&file, "disk.qcow2"), None);
+        assert_eq!(
+            digest_for(&file, "disk.qcow2").as_deref(),
+            Some(format!("sha512:{}", "a".repeat(128)).as_str())
+        );
+    }
+
+    /// A directory that ships both gets read as the one everything else in this
+    /// platform already speaks — and the answer must not depend on which line
+    /// happens to come first.
+    #[test]
+    fn sha256_wins_when_a_file_names_both() {
+        let short = "c".repeat(64);
+        let long = "d".repeat(128);
+        for file in [
+            format!("{long}  disk.qcow2\n{short}  disk.qcow2\n"),
+            format!("{short}  disk.qcow2\n{long}  disk.qcow2\n"),
+        ] {
+            assert_eq!(
+                digest_for(&file, "disk.qcow2").as_deref(),
+                Some(format!("sha256:{short}").as_str())
+            );
+        }
     }
 
     #[test]
     fn binary_mode_names_are_read_too() {
         assert_eq!(
             digest_for(&format!("{}  *disk.qcow2\n", "b".repeat(64)), "disk.qcow2"),
-            Some("b".repeat(64))
+            Some(format!("sha256:{}", "b".repeat(64)))
         );
     }
 
@@ -367,8 +524,8 @@ pub enum SignatureVerdict {
     Refused(String),
 }
 
-/// What is signed: the digest line exactly as `spec.digest` carries it,
-/// `sha256:<64 hex>`, with no trailing newline. Signing the digest rather than
+/// What is signed: the digest line exactly as `spec.digest` carries it —
+/// `sha256:<64 hex>` or `sha512:<128 hex>` — with no trailing newline. Signing the digest rather than
 /// the bytes means a signer never has to hold the image, and a verifier never
 /// has to download it to know whether it may.
 pub fn signed_message(digest: &str) -> &[u8] {
@@ -400,11 +557,13 @@ pub fn judge_signature(
     // The hex is checked, not just the shape. A signature is a claim *about a
     // digest*, so a digest that is not one makes the claim meaningless — and
     // `sha256:` followed by sixty-four arbitrary characters would otherwise
-    // verify happily and be shown as `verified` in the console.
-    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
-    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // verify happily and be shown as `verified` in the console. The message is
+    // over the line as written, so the spelling has to be exact: a value that
+    // parses only after being normalised is not the line anybody signed.
+    if Digest::parse(digest).map(|d| d.value()).as_deref() != Some(digest) {
         return SignatureVerdict::Refused(format!(
-            "a signature is over the digest line, and {digest:?} is not one (`sha256:<64 hex>`)"
+            "a signature is over the digest line, and {digest:?} is not one \
+             (`sha256:<64 hex>` or `sha512:<128 hex>`)"
         ));
     }
     let bytes = match base64::engine::general_purpose::STANDARD.decode(signature) {
