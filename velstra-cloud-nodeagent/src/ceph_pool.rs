@@ -700,16 +700,36 @@ impl CephPool {
                 file.display()
             )));
         }
-        self.import_image(image, &file).await?;
+        // The digest that was handed in, not one parsed back out of the name.
+        // `stored` is `<algorithm>-<hex>`, derived from the image's **spec** by
+        // whoever knows the object; the name is for people.
+        self.import_image(image, stored, &file).await?;
         Ok(())
     }
 
-    pub async fn import_image(&self, image: &str, file: &std::path::Path) -> Result<bool> {
-        let expected = crate::hostfs::digest_of(image).ok_or_else(|| {
+    /// Publish `file` into the image pool as `image`, verified against
+    /// `digest`.
+    ///
+    /// `digest` is `<algorithm>-<hex>` — what a node files the bytes under, and
+    /// what the image's `spec.digest` says. **Not** read out of `image`, which
+    /// is a resource name: that is what `hostfs::digest_of`'s own doc comment
+    /// says not to do, and doing it here excluded almost every image in a cell
+    /// from ever reaching a Ceph pool. An image the API minted is called
+    /// `debian-13-cbf3e1f5`; a capture is `<label>-sha256-<hex>`; only an
+    /// image-source publish is named after its digest. Everything else was
+    /// refused with "does not carry a digest in its name" — accurate,
+    /// unactionable, and about a name the tenant never chose.
+    pub async fn import_image(
+        &self,
+        image: &str,
+        digest: &str,
+        file: &std::path::Path,
+    ) -> Result<bool> {
+        let expected = crate::hostfs::digest_of(digest).ok_or_else(|| {
             HostError::failed(format!(
-                "{image} does not carry a digest in its name, so there is nothing to verify \
-                 the bytes against. An image's id is its digest — that is what makes it safe \
-                 to clone from years later."
+                "{image} carries no digest this pool can read ({digest:?}), so there is nothing \
+                 to verify the bytes against. An image's identity is its digest — that is what \
+                 makes it safe to clone from years later."
             ))
         })?;
 
@@ -906,28 +926,54 @@ mod tests {
         );
     }
 
-    /// An image whose name carries no digest cannot be published at all.
+    /// An image with no readable digest cannot be published at all — and the
+    /// digest is the one it *carries*, never the one in its name.
     ///
-    /// The name *is* the promise about the bytes. Without one there is nothing
+    /// The digest is the promise about the bytes. Without one there is nothing
     /// to verify against, and an image that cannot be verified is one every
     /// volume cloned from it inherits on trust.
+    ///
+    /// Reading it out of the resource name excluded almost every image there
+    /// is: an image the API minted is called `debian-13-cbf3e1f5`, a capture is
+    /// `<label>-sha256-<hex>`, and only an image-source publish is named after
+    /// its digest. All of them were refused for a name the tenant never chose.
     #[tokio::test]
-    async fn an_image_with_no_digest_in_its_name_is_refused_before_anything_is_written() {
+    async fn an_image_is_verified_against_the_digest_it_carries_not_its_name() {
         // `rbd` deliberately points at something that is not there: if this
         // reached the cluster at all, the error would be about the command
-        // rather than about the name, and that is the failure being ruled out.
+        // rather than about the digest, and that is the failure being ruled out.
         let mut config = CephConfig::new("v", "i");
         config.rbd = "/nonexistent/rbd".into();
         let pool = CephPool::new(config);
+
+        // A readable name and a real digest beside it: this must get past the
+        // check and fail on the cluster, not on the name.
         let err = pool
             .import_image(
-                "projects/p1/images/ubuntu-24.04",
+                "projects/p1/images/debian-13-cbf3e1f5",
+                &format!("sha256-{}", "a".repeat(64)),
                 std::path::Path::new("/dev/null"),
             )
             .await
             .unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("does not carry a digest"), "{text}");
+        assert!(
+            !text.contains("carries no digest"),
+            "an image with a perfectly good digest was refused for its name: {text}"
+        );
+
+        // And nothing readable at all is still refused before a byte is
+        // written.
+        let err = pool
+            .import_image(
+                "projects/p1/images/ubuntu-24.04",
+                "ubuntu-24.04",
+                std::path::Path::new("/dev/null"),
+            )
+            .await
+            .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("carries no digest"), "{text}");
         assert!(
             !text.contains("rbd"),
             "it reached the cluster first: {text}"

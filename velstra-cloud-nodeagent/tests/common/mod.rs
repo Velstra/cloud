@@ -161,6 +161,23 @@ pub fn node_agent(
     )
 }
 
+/// The same node, told to insist on signed images.
+pub fn node_agent_requiring_signatures(
+    store: Arc<dyn Store>,
+    node: &str,
+    vmm: &FakeVmm,
+    datapath: &FakeDatapath,
+) -> Agent {
+    let mut config = AgentConfig::new(node, REGION, CELL);
+    config.require_signed_images = true;
+    Agent::new(
+        store,
+        config,
+        Arc::new(vmm.clone()),
+        Arc::new(datapath.clone()),
+    )
+}
+
 pub fn meta(name: &str) -> Meta {
     let mut meta = Meta::new(
         ResourceName::parse(name).unwrap(),

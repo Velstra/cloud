@@ -1775,7 +1775,31 @@ impl Api {
             if governing_project(&name).as_deref() == home {
                 continue;
             }
-            self.authorize(who, Verb::Read, &name).await?;
+            if let Err(refused) = self.authorize(who, Verb::Read, &name).await {
+                // An image its owner shared. Sharing is a *read* grant, and it
+                // is decided from the object's own `shared_with` — so it lives
+                // in `may_read`, which has the document, and not in `judge`,
+                // which does not. This path asked `judge` and nothing else, so
+                // a shared image could be read and never booted: the grant let
+                // a tenant see the bytes on offer and refused every instance
+                // that named them.
+                //
+                // Claimed in `docs/rest-contract.md`, on `ImageSpec` and in
+                // `may_read`'s own comment ("read and boot"); tested nowhere,
+                // because the test that covers sharing never made an instance.
+                //
+                // One extra read, on the refusal path only, for images only.
+                if name.collection() != "images" {
+                    return Err(refused);
+                }
+                let Some(document) = self.collection("images")?.get(&name.to_string()).await?
+                else {
+                    return Err(refused);
+                };
+                if !self.may_read(who, &name, &document).await {
+                    return Err(refused);
+                }
+            }
         }
         Ok(())
     }
@@ -2929,7 +2953,7 @@ impl Api {
                 .await?;
         }
         self.check_cell(&name, kind).await?;
-        self.check_quota(&name, kind, &spec).await?;
+        self.check_quota(&name, kind, &spec, None).await?;
 
         let mut meta = Meta::new(name.clone(), self.inner.placement.clone());
         if let Some(labels) = body.get("meta").and_then(|m| m.get("labels")) {
@@ -3538,6 +3562,11 @@ impl Api {
             // that will not happen, and answering `200` to one is agreeing to
             // something that will not be done.
             collection.check_known(spec)?;
+            // After the shape is settled, never before: quota reads the spec as
+            // its real type, and asking first means a mistyped field is
+            // reported as a failed parse with no field named rather than as the
+            // field it was.
+            self.check_quota_after_this_change(name, spec).await?;
             if name.collection() == "nodes" && spec.get("vcpu_overcommit").is_some() {
                 refuse_an_unusable_overcommit(spec)?;
             }
@@ -6959,6 +6988,50 @@ impl Api {
         Ok(())
     }
 
+    /// Ask the caps about the object this change would leave behind.
+    ///
+    /// A patch carries only what it changes, so the question cannot be put to
+    /// the patch: `{"vcpus": 512}` says nothing about the memory that is also
+    /// counted. What is checked is the **stored spec with the change laid over
+    /// it** — the guest as it would be — and the stored object is taken out of
+    /// the sums, so a tenant sitting at their cap may still make a guest
+    /// smaller.
+    ///
+    /// Only for the collections that are capped at all; everything else does
+    /// not read the object.
+    async fn check_quota_after_this_change(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let kind = name.collection();
+        if !matches!(
+            kind,
+            "instances" | "volumes" | "floatingips" | "load-balancers" | "snapshots" | "backups"
+        ) {
+            return Ok(());
+        }
+        // What is stored, as the wire has it. A patch is judged against the
+        // whole object rather than against its own fields, and the merge is the
+        // same one the write itself performs.
+        let Some(stored) = self.collection(kind)?.get(&name.to_string()).await? else {
+            return Ok(());
+        };
+        let Some(mut whole) = stored.get("spec").cloned() else {
+            return Ok(());
+        };
+        crate::collection::overlay(&mut whole, spec);
+        // Only the answer this is here for. A merged spec that will not parse
+        // is a *shape* problem, and the write itself reports one far better —
+        // it measures the failure against the stored copy and names the field.
+        // Quota reporting it first would replace "spec.rootDiskGib does not
+        // take that value" with a bare parse error naming nothing.
+        match self.check_quota(name, kind, &whole, Some(name)).await {
+            Err(e) if e.code == Code::ResourceExhausted => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     async fn refuse_a_moved_pool(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
         let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
             return Ok(());
@@ -7561,7 +7634,27 @@ impl Api {
         .at("meta.name"))
     }
 
-    async fn check_quota(&self, name: &ResourceName, kind: &str, spec: &Value) -> ApiResult<()> {
+    /// Refuse a spec that would put a project over one of its caps.
+    ///
+    /// `replacing` is the object whose spec this one takes the place of, or
+    /// `None` for something being made. It exists because this is asked on
+    /// **both** doors: a cap enforced only at create is not a cap, it is a
+    /// speed bump — a tenant capped at eight vCPUs made a one-vCPU guest and
+    /// patched it to five hundred and twelve, and the platform said 200 and
+    /// then reported itself as sixty-four times over its own limit.
+    ///
+    /// Every dimension below is a fresh sum over what exists plus the one being
+    /// written. On a change the object being changed is taken out of that sum
+    /// first, so what is counted is the world as it would be afterwards — not
+    /// the old guest and the new one together, which would refuse a tenant at
+    /// their cap for making their guest *smaller*.
+    async fn check_quota(
+        &self,
+        name: &ResourceName,
+        kind: &str,
+        spec: &Value,
+        replacing: Option<&ResourceName>,
+    ) -> ApiResult<()> {
         if kind != "instances"
             && kind != "volumes"
             && kind != "floatingips"
@@ -7599,7 +7692,11 @@ impl Api {
         match kind {
             "instances" => {
                 let wanted: InstanceSpec = serde_json::from_value(spec.clone())?;
-                let existing: Vec<Instance> = self.typed_list(&parent, "instances").await?;
+                let existing = without(
+                    self.typed_list::<InstanceSpec, InstanceStatus>(&parent, "instances")
+                        .await?,
+                    replacing,
+                );
                 let count = existing.len() as u32 + 1;
                 let vcpus = existing.iter().map(|i| i.spec.vcpus).sum::<u32>() + wanted.vcpus;
                 let memory =
@@ -7627,8 +7724,16 @@ impl Api {
             }
             "volumes" => {
                 let wanted: VolumeSpec = serde_json::from_value(spec.clone())?;
-                let existing: Vec<Volume> = self.typed_list(&parent, "volumes").await?;
+                let existing = without(
+                    self.typed_list::<VolumeSpec, velstra_cloud_model::resources::VolumeStatus>(
+                        &parent, "volumes",
+                    )
+                    .await?,
+                    replacing,
+                );
                 let count = existing.len() as u32 + 1;
+                // Not filtered: a volume's change never alters an instance's
+                // root disk, and vice versa.
                 let instances: Vec<Instance> = self.typed_list(&parent, "instances").await?;
                 let gib = existing.iter().map(|v| v.spec.size_gib).sum::<u64>()
                     + instances.iter().map(|i| i.spec.root_disk_gib).sum::<u64>()
@@ -7641,14 +7746,23 @@ impl Api {
                 exceeded(quota.volume_gib, gib, "GiB of volume", "spec.sizeGib")?;
             }
             "floatingips" => {
-                let existing: Vec<velstra_cloud_model::resources::FloatingIp> =
-                    self.typed_list(&parent, "floatingips").await?;
+                let existing = without(
+                    self.typed_list::<
+                        velstra_cloud_model::resources::FloatingIpSpec,
+                        velstra_cloud_model::resources::FloatingIpStatus,
+                    >(&parent, "floatingips")
+                    .await?,
+                    replacing,
+                );
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.floating_ips as u64, count, "floating IPs", "spec")?;
             }
             "snapshots" => {
-                let existing: Vec<velstra_cloud_model::resources::Snapshot> =
-                    self.typed_list(&parent, "snapshots").await?;
+                let existing = without(
+                    self.typed_list::<SnapshotSpec, SnapshotStatus>(&parent, "snapshots")
+                        .await?,
+                    replacing,
+                );
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.snapshots as u64, count, "snapshots", "spec")?;
                 // What the ones that exist occupy. The new one adds nothing
@@ -7661,16 +7775,28 @@ impl Api {
                 exceeded(quota.snapshot_gib, gib, "GiB of snapshot", "spec")?;
             }
             "backups" => {
-                let existing: Vec<velstra_cloud_model::resources::Backup> =
-                    self.typed_list(&parent, "backups").await?;
+                let existing = without(
+                    self.typed_list::<
+                        velstra_cloud_model::backup::BackupSpec,
+                        velstra_cloud_model::backup::BackupStatus,
+                    >(&parent, "backups")
+                    .await?,
+                    replacing,
+                );
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.backups as u64, count, "backups", "spec")?;
                 let gib = existing.iter().map(|b| b.status.size_gib).sum::<u64>();
                 exceeded(quota.backup_gib, gib, "GiB of backup", "spec")?;
             }
             _ => {
-                let existing: Vec<velstra_cloud_model::loadbalancer::LoadBalancer> =
-                    self.typed_list(&parent, "load-balancers").await?;
+                let existing = without(
+                    self.typed_list::<LoadBalancerSpec, LoadBalancerStatus>(
+                        &parent,
+                        "load-balancers",
+                    )
+                    .await?,
+                    replacing,
+                );
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.load_balancers as u64, count, "load balancers", "spec")?;
             }
@@ -7924,6 +8050,22 @@ fn taken(error: ApiError, kind: &str, name: &ResourceName) -> ApiError {
         None => format!("{article} {singular} called {} already exists", name.id()),
     };
     ApiError::new(Code::AlreadyExists, message).at("id")
+}
+/// The same list without the object a change is about.
+///
+/// Quota counts the world as it would be after the write, so the object being
+/// replaced is not also counted in its old shape.
+fn without<S, T>(
+    objects: Vec<Resource<S, T>>,
+    replacing: Option<&ResourceName>,
+) -> Vec<Resource<S, T>> {
+    let Some(name) = replacing else {
+        return objects;
+    };
+    objects
+        .into_iter()
+        .filter(|o| &o.meta.name != name)
+        .collect()
 }
 
 fn exceeded(limit: u64, wanted: u64, what: &str, field: &str) -> ApiResult<()> {
@@ -8367,6 +8509,74 @@ fn check_image(spec: &Value, document: Document) -> ApiResult<()> {
     Ok(())
 }
 
+/// Refuse a subnet that describes a segment the node cannot build.
+///
+/// **Where this was missing.** Nothing validated a subnet at all, and a node
+/// takes its two fields almost verbatim: `plan` runs
+/// `ip addr replace <gateway>/<prefix> dev <bridge>`, and the NAT rule is
+/// written from the CIDR. The only check anywhere was that the gateway's
+/// *family* matched the range — so a tenant could write `10.0.0.0/24` with a
+/// gateway of `192.168.1.1` and put a route on the node that competes with its
+/// own management address, or a CIDR of `0.0.0.0/0` and have the node
+/// masquerade the world.
+///
+/// A subnet is one of the few things a tenant writes that a node acts on
+/// directly, so this is where it is judged: a refusal here is a sentence
+/// somebody reads, and the same mistake found on the node is a warning in a
+/// journal on a machine they do not have.
+fn check_subnet(spec: &Value, document: Document) -> ApiResult<()> {
+    use velstra_cloud_model::network::Cidr;
+
+    let text = |key: &str| spec.get(key).and_then(Value::as_str).unwrap_or_default();
+    let (cidr, gateway) = (text("cidr"), text("gateway"));
+    // A change carries what it changes, so a patch that names neither is not
+    // about the shape of the segment.
+    if document == Document::Part && cidr.is_empty() && gateway.is_empty() {
+        return Ok(());
+    }
+    let Ok(range) = Cidr::parse(cidr) else {
+        return Err(ApiError::invalid(format!(
+            "`{cidr}` is not a range — a subnet is written `10.0.0.0/24` or `fd00:1::/64`, and \
+             the node builds its segment out of exactly this"
+        ))
+        .at("spec.cidr"));
+    };
+    // A range this wide is not a subnet, it is every address there is: the
+    // node would masquerade out of it and route into it, and nothing else on
+    // the machine would be reachable.
+    let too_wide = if range.address.is_ipv4() { 8 } else { 16 };
+    if range.prefix_len < too_wide {
+        return Err(ApiError::invalid(format!(
+            "/{} is wider than a segment can be (/{too_wide} at most): the node holds this \
+             range on a bridge and translates out of it, so a range that covers the machine's \
+             own addresses takes the machine off its network",
+            range.prefix_len
+        ))
+        .at("spec.cidr"));
+    }
+    if gateway.is_empty() {
+        return Ok(());
+    }
+    let Ok(address) = gateway.parse::<std::net::IpAddr>() else {
+        return Err(ApiError::invalid(format!(
+            "`{gateway}` is not an address, and the node puts this one on a bridge as the \
+             segment's way out"
+        ))
+        .at("spec.gateway"));
+    };
+    // The check that was actually missing. A gateway outside its own range is
+    // a route the node installs on itself for somebody else's network.
+    if !range.contains(address) {
+        return Err(ApiError::invalid(format!(
+            "the gateway {gateway} is not inside {cidr}, so no guest on this segment could \
+             reach it — and the node would hold that address on its bridge, competing with \
+             whatever else on this machine is on {gateway}"
+        ))
+        .at("spec.gateway"));
+    }
+    Ok(())
+}
+
 fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     if kind == "load-balancers" {
         check_listeners(spec)?;
@@ -8383,6 +8593,9 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     }
     if kind == "roles" {
         return check_role(spec);
+    }
+    if kind == "subnets" {
+        return check_subnet(spec, document);
     }
     if kind != "security-groups" {
         return Ok(());

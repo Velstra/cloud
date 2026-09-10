@@ -38,6 +38,54 @@ async fn one_instance_on(
     (store, vmm, datapath, agent)
 }
 
+/// `--require-signed-images` refuses an unsigned image whether or not the
+/// bytes are already here.
+///
+/// It was asked in one place: the `PullImage` arm. And `PullImage` is emitted
+/// only when the bytes are **absent** — so on a cell that had been running for
+/// a while, turning signature enforcement on stopped nothing. Every cached
+/// digest went on booting, including through new unsigned image objects any
+/// tenant could register on a digest already in the cache. The contract says
+/// the node "judges again before it fetches", which was true and was not the
+/// whole rule: nothing judged before it *booted*.
+#[tokio::test]
+async fn an_unsigned_image_is_refused_even_when_the_bytes_are_already_here() {
+    let store = store();
+    create_port(&store, PORT_A, "10.0.0.5/24", "node-a").await;
+    create_instance(&store, I1, Some("node-a"), Some("node-a"), &[PORT_A]).await;
+    let vmm = FakeVmm::new();
+    let datapath = FakeDatapath::new();
+
+    // The cell as it is after a while of running: the bytes are already on this
+    // machine, filed under their digest. No `PullImage` will ever be emitted
+    // for them again — which is what made the old gate unreachable.
+    vmm.cache_image("sha256:a563f72f58d859571895f7b2777cada5baf5c39c00560a285ad546a899833913");
+
+    let strict = node_agent_requiring_signatures(store.clone(), "node-a", &vmm, &datapath);
+    let pass = strict.resync().await;
+    assert!(
+        pass.failures > 0,
+        "an unsigned image booted anyway: {pass:?}"
+    );
+    assert!(
+        !vmm.is_running(I1),
+        "the guest was started from an image this node refuses to trust"
+    );
+    let stored = read_instance(&store, I1).await;
+    let host = condition(&stored.status.conditions, "HostActions");
+    assert!(
+        host.message.contains("signature") || host.message.contains("signed"),
+        "the refusal did not say what stopped it: {host:?}"
+    );
+
+    // The same cell without the flag still boots it: this refuses unsigned
+    // images, not every image.
+    let relaxed = node_agent(store.clone(), "node-a", &vmm, &datapath);
+    let pass = relaxed.resync().await;
+    assert_eq!(pass.failures, 0, "{pass:?}");
+    assert!(vmm.is_running(I1));
+}
+
 #[tokio::test]
 async fn one_pass_takes_a_new_instance_all_the_way_to_running() {
     let (store, vmm, datapath, agent) = one_instance_on("node-a").await;
