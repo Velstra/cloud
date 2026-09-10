@@ -707,7 +707,7 @@ impl CephPool {
     pub async fn import_image(&self, image: &str, file: &std::path::Path) -> Result<bool> {
         let expected = crate::hostfs::digest_of(image).ok_or_else(|| {
             HostError::failed(format!(
-                "{image} does not carry a sha256 in its name, so there is nothing to verify \
+                "{image} does not carry a digest in its name, so there is nothing to verify \
                  the bytes against. An image's id is its digest — that is what makes it safe \
                  to clone from years later."
             ))
@@ -720,15 +720,17 @@ impl CephPool {
         // First, and before a byte is written into the cluster. An image
         // published under a name it does not match is inherited by every volume
         // cloned from it, and this is the only place the mismatch is visible.
-        let actual = crate::hostfs::sha256_file(file)
+        // With the function the image commits to, not a fixed one.
+        let actual = crate::hostfs::hash_file(file, expected.algorithm)
             .await
             .map_err(|e| HostError::failed(format!("hashing {}: {e}", file.display())))?;
-        if actual != expected {
+        if actual != expected.hex {
             return Err(HostError::failed(format!(
-                "{} hashes to sha256:{actual}, and {image} commits to sha256:{expected}. \
+                "{} hashes to {}:{actual}, and {image} commits to {expected}. \
                  Refused: publishing it would put the wrong bytes behind a name every future \
                  volume trusts.",
-                file.display()
+                file.display(),
+                expected.algorithm.as_str()
             )));
         }
 
@@ -925,7 +927,7 @@ mod tests {
             .await
             .unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("does not carry a sha256"), "{text}");
+        assert!(text.contains("does not carry a digest"), "{text}");
         assert!(
             !text.contains("rbd"),
             "it reached the cluster first: {text}"
@@ -937,16 +939,28 @@ mod tests {
         // Both spellings, because `sha256:` is what the model writes and
         // `sha256-` is what survives a resource name — and an import that
         // understood only one would refuse half the images in the cell.
+        use velstra_cloud_model::images::{Algorithm, Digest};
         let hex = "a".repeat(64);
+        for spelling in [
+            format!("projects/p1/images/sha256:{hex}"),
+            format!("projects/p1/images/sha256-{hex}"),
+        ] {
+            assert_eq!(
+                crate::hostfs::digest_of(&spelling),
+                Digest::from_hex(Algorithm::Sha256, &hex)
+            );
+        }
+        // And a sha512, which is what Debian's images commit to. It has to come
+        // back saying so: hashed as a sha256 it would never match, and the
+        // import would blame the mirror.
+        let long = "b".repeat(128);
         assert_eq!(
-            crate::hostfs::digest_of(&format!("projects/p1/images/sha256:{hex}")),
-            Some(hex.clone())
+            crate::hostfs::digest_of(&format!("projects/p1/images/sha512-{long}"))
+                .map(|d| d.algorithm),
+            Some(Algorithm::Sha512)
         );
-        assert_eq!(
-            crate::hostfs::digest_of(&format!("projects/p1/images/sha256-{hex}")),
-            Some(hex)
-        );
-        // Not a digest: too short, and not hex.
+        // Not a digest: too short, not hex, or the wrong length for what it
+        // claims to be.
         assert_eq!(
             crate::hostfs::digest_of("projects/p1/images/sha256-abc"),
             None
@@ -954,6 +968,11 @@ mod tests {
         assert_eq!(
             crate::hostfs::digest_of(&format!("projects/p1/images/sha256-{}", "z".repeat(64))),
             None
+        );
+        assert_eq!(
+            crate::hostfs::digest_of(&format!("projects/p1/images/sha512-{hex}")),
+            None,
+            "a sha512 tag over 64 hex digits is a name that contradicts itself"
         );
     }
 

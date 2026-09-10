@@ -727,7 +727,7 @@
         "description": "Where a family's images come from. The cell asks the checksums file what the current digest is, over https so the certificate is checked, and publishes an image when the answer is one it does not have. Nothing about a running guest changes: a machine keeps the bytes it was built from, and \"always the newest\" means new machines get it.",
         "properties": {
           "checksums": {
-            "description": "A `sha256sum`-style file covering the image's filename. **https only**, and refused otherwise — this is the one value the whole arrangement trusts, and whoever can rewrite it chooses what every new guest in this cell boots.",
+            "description": "A `sha256sum`- or `sha512sum`-style file covering the image's filename — Debian publishes only the latter for its cloud images, and either is read. **https only**, and refused otherwise: this is the one value the whole arrangement trusts, and whoever can rewrite it chooses what every new guest in this cell boots.",
             "format": "uri",
             "type": "string"
           },
@@ -804,7 +804,7 @@
             "type": "array"
           },
           "signature": {
-            "description": "An Ed25519 signature over `sha256:<digest>`, base64. Accepted only when it verifies under a key the cell was started with; refused otherwise, so a stored signature is a verified one.",
+            "description": "An Ed25519 signature over the digest line as written — `sha256:<hex>` or `sha512:<hex>` — base64. Accepted only when it verifies under a key the cell was started with; refused otherwise, so a stored signature is a verified one.",
             "type": "string"
           },
           "sizeBytes": {

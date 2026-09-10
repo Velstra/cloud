@@ -8332,7 +8332,8 @@ fn check_image(spec: &Value, document: Document) -> ApiResult<()> {
     }
     if !said("digest") {
         return Err(ApiError::invalid(
-            "an image says which bytes it is — `sha256:…` — because that is what makes fetching \
+            "an image says which bytes it is — `sha256:…` or `sha512:…` — because that is \
+             what makes fetching \
              one verifiable. Name an existing image in `from` to publish it instead, and \
              everything describing the bytes is taken from that one.",
         )
