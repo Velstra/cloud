@@ -8417,16 +8417,11 @@ fn check_draining(spec: &Value) -> ApiResult<()> {
     if draining.is_empty() {
         return Ok(());
     }
-    velstra_cloud_model::loadbalancer::validate_draining(&list("members"), &draining).map_err(
-        |why| {
-            ApiError::invalid(format!(
-                "{why}. `draining` names members being taken out of service, so every name in it \
-                 has to be one of `members` — a name that is not stays there doing nothing, which \
-                 reads exactly like a member that has finished draining"
-            ))
-            .at("spec.draining")
-        },
-    )
+    // The model's own words, unadorned: it already names the port and says why
+    // the change would do nothing. Anything added here restates it, and the
+    // sentence a person reads at the API is the sentence they act on.
+    velstra_cloud_model::loadbalancer::validate_draining(&list("members"), &draining)
+        .map_err(|why| ApiError::invalid(why.to_string()).at("spec.draining"))
 }
 
 fn check_listeners(spec: &Value) -> ApiResult<()> {
