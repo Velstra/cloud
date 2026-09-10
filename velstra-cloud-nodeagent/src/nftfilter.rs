@@ -56,6 +56,13 @@ pub struct Guarded {
     /// but it is what the chain is named after, because it is short, unique
     /// and stable across passes.
     pub tap: String,
+    /// The MAC the platform gave this port, when it chose one.
+    ///
+    /// Not used by the firewall — it matches addresses — but carried here so
+    /// one description of a port serves both tables: `antispoof` binds the
+    /// address to the wire it may arrive on, and doing that from a second,
+    /// separately-built list is how the two drift.
+    pub mac: Option<String>,
     /// The addresses the guest holds. Both families where it has both.
     ///
     /// A port with none is left unfiltered even when it has rules: there is
@@ -298,6 +305,7 @@ mod tests {
 
     fn guarded(rules: Vec<ResolvedRule>) -> Guarded {
         Guarded {
+            mac: None,
             port: "projects/p1/ports/web".into(),
             tap: "vt0web1a2b".into(),
             addresses: vec!["10.19.136.5".into()],
@@ -433,6 +441,7 @@ mod tests {
                 "0.0.0.0/0",
             )]),
             Guarded {
+                mac: None,
                 port: "projects/p1/ports/db".into(),
                 tap: "vt0db99ff".into(),
                 addresses: vec!["10.19.136.6".into()],

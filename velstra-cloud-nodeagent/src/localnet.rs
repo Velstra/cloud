@@ -134,6 +134,9 @@ pub struct LocalNet {
     /// one reset of the counters. What it must never do is *skip* a write that
     /// was needed, and comparing the whole text is what makes that impossible.
     filter_in_force: std::sync::Mutex<Option<String>>,
+    /// The same, for the anti-spoofing table. Its counters answer "how often
+    /// did this guest claim somebody else's address", which a rewrite erases.
+    antispoof_in_force: std::sync::Mutex<Option<String>>,
 }
 
 impl LocalNet {
@@ -144,6 +147,7 @@ impl LocalNet {
             nft: "nft".to_string(),
             advertising: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             filter_in_force: std::sync::Mutex::new(None),
+            antispoof_in_force: std::sync::Mutex::new(None),
         }
     }
 
@@ -408,6 +412,11 @@ impl LocalNet {
         segments: &[Segment],
         guarded: &[crate::nftfilter::Guarded],
     ) -> Result<()> {
+        // Before anything else, and unconditionally: what a guest may claim to
+        // be does not depend on whether it carries firewall rules, and a pass
+        // that built the wires first would leave a window in which it could
+        // claim anything. See [`crate::antispoof`].
+        self.antispoof(guarded).await?;
         if segments.is_empty() {
             // Still swept, and still rewritten: the last guest leaving a node
             // has to take its NAT rule *and* its bridge with it. "Nothing to do"
@@ -514,6 +523,39 @@ impl LocalNet {
             "`ip {}` failed: {stderr}",
             args.join(" ")
         )))
+    }
+
+    /// Write what each guest may claim to be, unless it is already in force.
+    ///
+    /// Cached like the firewall and for the same reason: rewriting a table
+    /// zeroes its counters, and "how often did this guest claim somebody
+    /// else's address" is a number an operator reads after the fact.
+    async fn antispoof(&self, guarded: &[crate::nftfilter::Guarded]) -> Result<()> {
+        let bound: Vec<crate::antispoof::Bound> = guarded
+            .iter()
+            .map(|g| crate::antispoof::Bound {
+                port: g.port.clone(),
+                tap: g.tap.clone(),
+                addresses: g.addresses.clone(),
+                mac: g.mac.clone(),
+            })
+            .collect();
+        let wanted = crate::antispoof::ruleset(&bound);
+        {
+            let in_force = self
+                .antispoof_in_force
+                .lock()
+                .expect("the cache is never poisoned");
+            if in_force.as_deref() == Some(wanted.as_str()) {
+                return Ok(());
+            }
+        }
+        self.nft(&wanted).await?;
+        *self
+            .antispoof_in_force
+            .lock()
+            .expect("the cache is never poisoned") = Some(wanted);
+        Ok(())
     }
 
     /// Write the per-port firewall, unless it is already what is in force.
@@ -1378,6 +1420,7 @@ mod balancer_addresses {
         // ruleset is in force.
         net.nft = "/nonexistent/bin/nft".to_string();
         let guarded = vec![crate::nftfilter::Guarded {
+            mac: None,
             port: "projects/p1/ports/web".into(),
             tap: "vtweb1a2b".into(),
             addresses: vec!["10.19.136.5".into()],

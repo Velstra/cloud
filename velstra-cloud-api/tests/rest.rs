@@ -688,6 +688,82 @@ async fn a_change_is_counted_against_the_quota_as_a_create_is() {
     );
 }
 
+/// A subnet the node could not build is refused where it is written.
+///
+/// Nothing validated one at all, and a node acts on both fields almost
+/// verbatim: `ip addr replace <gateway>/<prefix> dev <bridge>` and a
+/// masquerade rule out of the range. The only check anywhere was that the
+/// gateway's *family* matched — so a gateway outside its own range became a
+/// route the node installed on itself for somebody else's network, and
+/// `0.0.0.0/0` made it masquerade the world.
+#[tokio::test]
+async fn a_subnet_the_node_could_not_build_is_refused_where_it_is_written() {
+    let h = Harness::new();
+    h.post("projects", json!({ "id": "p1", "spec": {} })).await;
+    h.post(
+        "projects/p1/networks",
+        json!({ "id": "n1", "spec": { "mtu": 1500 } }),
+    )
+    .await;
+
+    let make = |spec: serde_json::Value| {
+        let h = &h;
+        async move {
+            h.post("projects/p1/subnets", json!({ "id": "s1", "spec": spec }))
+                .await
+        }
+    };
+
+    // A gateway outside its own range: no guest could reach it, and the node
+    // would hold that address on a bridge.
+    let refused = make(json!({
+        "network": "projects/p1/networks/n1",
+        "cidr": "10.0.0.0/24",
+        "gateway": "192.168.1.1"
+    }))
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.field(), "spec.gateway");
+
+    // Every address there is. The node masquerades out of the range it holds.
+    let refused = make(json!({
+        "network": "projects/p1/networks/n1",
+        "cidr": "0.0.0.0/0",
+        "gateway": "10.0.0.1"
+    }))
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.field(), "spec.cidr");
+
+    // Not a range at all.
+    let refused = make(json!({
+        "network": "projects/p1/networks/n1",
+        "cidr": "10.0.0.0",
+        "gateway": "10.0.0.1"
+    }))
+    .await;
+    assert_eq!(refused.field(), "spec.cidr");
+
+    // And the ordinary one still goes through.
+    let made = make(json!({
+        "network": "projects/p1/networks/n1",
+        "cidr": "10.19.136.0/24",
+        "gateway": "10.19.136.1"
+    }))
+    .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+}
+
 // ---- explain -------------------------------------------------------------
 
 #[tokio::test]
