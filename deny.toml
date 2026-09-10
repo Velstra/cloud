@@ -71,6 +71,10 @@ confidence-threshold = 0.9
 name = "velstra-cloud-api"
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
+name = "velstra-cloud-cli"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
 name = "velstra-cloud-console"
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
