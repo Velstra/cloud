@@ -1,0 +1,2788 @@
+[
+ {
+  "id": "list-attachments",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/attachments",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Attachments",
+  "tags": [
+   "Attachments"
+  ]
+ },
+ {
+  "id": "create-attachments",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/attachments",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Attachments",
+  "tags": [
+   "Attachments"
+  ]
+ },
+ {
+  "id": "delete-attachments",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/attachments/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Attachments",
+  "tags": [
+   "Attachments"
+  ]
+ },
+ {
+  "id": "get-attachments",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/attachments/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Attachments",
+  "tags": [
+   "Attachments"
+  ]
+ },
+ {
+  "id": "patch-attachments",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/attachments/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Attachments",
+  "tags": [
+   "Attachments"
+  ]
+ },
+ {
+  "id": "reportStatus-attachments",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/attachments/{name}:reportStatus",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
+  "tags": [
+   "Attachments"
+  ]
+ },
+ {
+  "id": "list-audit",
+  "method": "GET",
+  "path": "/api/v1/audit",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Audit",
+  "tags": [
+   "Audit"
+  ]
+ },
+ {
+  "id": "delete-audit",
+  "method": "DELETE",
+  "path": "/api/v1/audit/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Audit",
+  "tags": [
+   "Audit"
+  ]
+ },
+ {
+  "id": "get-audit",
+  "method": "GET",
+  "path": "/api/v1/audit/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Audit",
+  "tags": [
+   "Audit"
+  ]
+ },
+ {
+  "id": "list-bgp-peers",
+  "method": "GET",
+  "path": "/api/v1/bgp-peers",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List BGP peers",
+  "tags": [
+   "BGP peers"
+  ]
+ },
+ {
+  "id": "create-bgp-peers",
+  "method": "POST",
+  "path": "/api/v1/bgp-peers",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of BGP peers",
+  "tags": [
+   "BGP peers"
+  ]
+ },
+ {
+  "id": "delete-bgp-peers",
+  "method": "DELETE",
+  "path": "/api/v1/bgp-peers/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of BGP peers",
+  "tags": [
+   "BGP peers"
+  ]
+ },
+ {
+  "id": "get-bgp-peers",
+  "method": "GET",
+  "path": "/api/v1/bgp-peers/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of BGP peers",
+  "tags": [
+   "BGP peers"
+  ]
+ },
+ {
+  "id": "patch-bgp-peers",
+  "method": "PATCH",
+  "path": "/api/v1/bgp-peers/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of BGP peers",
+  "tags": [
+   "BGP peers"
+  ]
+ },
+ {
+  "id": "list-backup-schedules",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/backup-schedules",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Backup schedules",
+  "tags": [
+   "Backup schedules"
+  ]
+ },
+ {
+  "id": "create-backup-schedules",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/backup-schedules",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Backup schedules",
+  "tags": [
+   "Backup schedules"
+  ]
+ },
+ {
+  "id": "delete-backup-schedules",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/backup-schedules/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Backup schedules",
+  "tags": [
+   "Backup schedules"
+  ]
+ },
+ {
+  "id": "get-backup-schedules",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/backup-schedules/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Backup schedules",
+  "tags": [
+   "Backup schedules"
+  ]
+ },
+ {
+  "id": "patch-backup-schedules",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/backup-schedules/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Backup schedules",
+  "tags": [
+   "Backup schedules"
+  ]
+ },
+ {
+  "id": "list-backup-targets",
+  "method": "GET",
+  "path": "/api/v1/backup-targets",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Backup targets",
+  "tags": [
+   "Backup targets"
+  ]
+ },
+ {
+  "id": "create-backup-targets",
+  "method": "POST",
+  "path": "/api/v1/backup-targets",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Backup targets",
+  "tags": [
+   "Backup targets"
+  ]
+ },
+ {
+  "id": "delete-backup-targets",
+  "method": "DELETE",
+  "path": "/api/v1/backup-targets/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Backup targets",
+  "tags": [
+   "Backup targets"
+  ]
+ },
+ {
+  "id": "get-backup-targets",
+  "method": "GET",
+  "path": "/api/v1/backup-targets/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Backup targets",
+  "tags": [
+   "Backup targets"
+  ]
+ },
+ {
+  "id": "patch-backup-targets",
+  "method": "PATCH",
+  "path": "/api/v1/backup-targets/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Backup targets",
+  "tags": [
+   "Backup targets"
+  ]
+ },
+ {
+  "id": "list-backups",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/backups",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Backups",
+  "tags": [
+   "Backups"
+  ]
+ },
+ {
+  "id": "create-backups",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/backups",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Backups",
+  "tags": [
+   "Backups"
+  ]
+ },
+ {
+  "id": "delete-backups",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/backups/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Backups",
+  "tags": [
+   "Backups"
+  ]
+ },
+ {
+  "id": "get-backups",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/backups/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Backups",
+  "tags": [
+   "Backups"
+  ]
+ },
+ {
+  "id": "list-captures",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/captures",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Captures",
+  "tags": [
+   "Captures"
+  ]
+ },
+ {
+  "id": "create-captures",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/captures",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Captures",
+  "tags": [
+   "Captures"
+  ]
+ },
+ {
+  "id": "delete-captures",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/captures/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Captures",
+  "tags": [
+   "Captures"
+  ]
+ },
+ {
+  "id": "get-captures",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/captures/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Captures",
+  "tags": [
+   "Captures"
+  ]
+ },
+ {
+  "id": "openapi",
+  "method": "GET",
+  "path": "/api/v1/openapi.json",
+  "params": [],
+  "query": [],
+  "body": false,
+  "summary": "This document.",
+  "tags": [
+   "Cell"
+  ]
+ },
+ {
+  "id": "metrics",
+  "method": "GET",
+  "path": "/metrics",
+  "params": [],
+  "query": [],
+  "body": false,
+  "summary": "Prometheus text exposition, behind the same bearer token as everything else.",
+  "tags": [
+   "Cell"
+  ]
+ },
+ {
+  "id": "list-ceph-clusters",
+  "method": "GET",
+  "path": "/api/v1/ceph-clusters",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Ceph",
+  "tags": [
+   "Ceph"
+  ]
+ },
+ {
+  "id": "create-ceph-clusters",
+  "method": "POST",
+  "path": "/api/v1/ceph-clusters",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Ceph",
+  "tags": [
+   "Ceph"
+  ]
+ },
+ {
+  "id": "delete-ceph-clusters",
+  "method": "DELETE",
+  "path": "/api/v1/ceph-clusters/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Ceph",
+  "tags": [
+   "Ceph"
+  ]
+ },
+ {
+  "id": "get-ceph-clusters",
+  "method": "GET",
+  "path": "/api/v1/ceph-clusters/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Ceph",
+  "tags": [
+   "Ceph"
+  ]
+ },
+ {
+  "id": "patch-ceph-clusters",
+  "method": "PATCH",
+  "path": "/api/v1/ceph-clusters/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Ceph",
+  "tags": [
+   "Ceph"
+  ]
+ },
+ {
+  "id": "list-device-classes",
+  "method": "GET",
+  "path": "/api/v1/device-classes",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Device classes",
+  "tags": [
+   "Device classes"
+  ]
+ },
+ {
+  "id": "create-device-classes",
+  "method": "POST",
+  "path": "/api/v1/device-classes",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Device classes",
+  "tags": [
+   "Device classes"
+  ]
+ },
+ {
+  "id": "delete-device-classes",
+  "method": "DELETE",
+  "path": "/api/v1/device-classes/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Device classes",
+  "tags": [
+   "Device classes"
+  ]
+ },
+ {
+  "id": "get-device-classes",
+  "method": "GET",
+  "path": "/api/v1/device-classes/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Device classes",
+  "tags": [
+   "Device classes"
+  ]
+ },
+ {
+  "id": "patch-device-classes",
+  "method": "PATCH",
+  "path": "/api/v1/device-classes/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Device classes",
+  "tags": [
+   "Device classes"
+  ]
+ },
+ {
+  "id": "list-flavors",
+  "method": "GET",
+  "path": "/api/v1/flavors",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Flavors",
+  "tags": [
+   "Flavors"
+  ]
+ },
+ {
+  "id": "create-flavors",
+  "method": "POST",
+  "path": "/api/v1/flavors",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Flavors",
+  "tags": [
+   "Flavors"
+  ]
+ },
+ {
+  "id": "delete-flavors",
+  "method": "DELETE",
+  "path": "/api/v1/flavors/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Flavors",
+  "tags": [
+   "Flavors"
+  ]
+ },
+ {
+  "id": "get-flavors",
+  "method": "GET",
+  "path": "/api/v1/flavors/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Flavors",
+  "tags": [
+   "Flavors"
+  ]
+ },
+ {
+  "id": "patch-flavors",
+  "method": "PATCH",
+  "path": "/api/v1/flavors/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Flavors",
+  "tags": [
+   "Flavors"
+  ]
+ },
+ {
+  "id": "list-floatingips",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/floatingips",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Floating IPs",
+  "tags": [
+   "Floating IPs"
+  ]
+ },
+ {
+  "id": "create-floatingips",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/floatingips",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Floating IPs",
+  "tags": [
+   "Floating IPs"
+  ]
+ },
+ {
+  "id": "delete-floatingips",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/floatingips/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Floating IPs",
+  "tags": [
+   "Floating IPs"
+  ]
+ },
+ {
+  "id": "get-floatingips",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/floatingips/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Floating IPs",
+  "tags": [
+   "Floating IPs"
+  ]
+ },
+ {
+  "id": "patch-floatingips",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/floatingips/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Floating IPs",
+  "tags": [
+   "Floating IPs"
+  ]
+ },
+ {
+  "id": "explainReach-floatingips",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/floatingips/{name}:explainReach",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Whether the address reaches a guest, and every hop that decides it.",
+  "tags": [
+   "Floating IPs"
+  ]
+ },
+ {
+  "id": "list-folders",
+  "method": "GET",
+  "path": "/api/v1/folders",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Folders",
+  "tags": [
+   "Folders"
+  ]
+ },
+ {
+  "id": "create-folders",
+  "method": "POST",
+  "path": "/api/v1/folders",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Folders",
+  "tags": [
+   "Folders"
+  ]
+ },
+ {
+  "id": "delete-folders",
+  "method": "DELETE",
+  "path": "/api/v1/folders/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Folders",
+  "tags": [
+   "Folders"
+  ]
+ },
+ {
+  "id": "get-folders",
+  "method": "GET",
+  "path": "/api/v1/folders/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Folders",
+  "tags": [
+   "Folders"
+  ]
+ },
+ {
+  "id": "patch-folders",
+  "method": "PATCH",
+  "path": "/api/v1/folders/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Folders",
+  "tags": [
+   "Folders"
+  ]
+ },
+ {
+  "id": "list-image-sources",
+  "method": "GET",
+  "path": "/api/v1/image-sources",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Image sources",
+  "tags": [
+   "Image sources"
+  ]
+ },
+ {
+  "id": "create-image-sources",
+  "method": "POST",
+  "path": "/api/v1/image-sources",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Image sources",
+  "tags": [
+   "Image sources"
+  ]
+ },
+ {
+  "id": "delete-image-sources",
+  "method": "DELETE",
+  "path": "/api/v1/image-sources/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Image sources",
+  "tags": [
+   "Image sources"
+  ]
+ },
+ {
+  "id": "get-image-sources",
+  "method": "GET",
+  "path": "/api/v1/image-sources/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Image sources",
+  "tags": [
+   "Image sources"
+  ]
+ },
+ {
+  "id": "patch-image-sources",
+  "method": "PATCH",
+  "path": "/api/v1/image-sources/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Image sources",
+  "tags": [
+   "Image sources"
+  ]
+ },
+ {
+  "id": "list-images",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/images",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Images",
+  "tags": [
+   "Images"
+  ]
+ },
+ {
+  "id": "create-images",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/images",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Images",
+  "tags": [
+   "Images"
+  ]
+ },
+ {
+  "id": "delete-images",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/images/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Images",
+  "tags": [
+   "Images"
+  ]
+ },
+ {
+  "id": "get-images",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/images/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Images",
+  "tags": [
+   "Images"
+  ]
+ },
+ {
+  "id": "patch-images",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/images/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Images",
+  "tags": [
+   "Images"
+  ]
+ },
+ {
+  "id": "list-instances",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/instances",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Instances",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "create-instances",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/instances",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Instances",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "delete-instances",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/instances/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Instances",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "get-instances",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/instances/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Instances",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "patch-instances",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/instances/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Instances",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "console-instances",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/instances/{name}:console",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Open a console session to the guest; the answer names the session and its ticket.",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "consoleStream-instances",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/instances/{name}:consoleStream",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [
+   "session",
+   "ticket"
+  ],
+  "body": false,
+  "summary": "The console stream itself, as a WebSocket upgrade.",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "explainMigration-instances",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/instances/{name}:explainMigration",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [
+   "mode"
+  ],
+  "body": false,
+  "summary": "Where the guest could move, and which node refused for what.",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "explainPlacement-instances",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/instances/{name}:explainPlacement",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Why the guest is where it is \u2014 or which rule stopped it going anywhere.",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "explainRecovery-instances",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/instances/{name}:explainRecovery",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "What would happen to the guest if its node stopped answering.",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "reportStatus-instances",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/instances/{name}:reportStatus",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
+  "tags": [
+   "Instances"
+  ]
+ },
+ {
+  "id": "list-load-balancers",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/load-balancers",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Load balancers",
+  "tags": [
+   "Load balancers"
+  ]
+ },
+ {
+  "id": "create-load-balancers",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/load-balancers",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Load balancers",
+  "tags": [
+   "Load balancers"
+  ]
+ },
+ {
+  "id": "delete-load-balancers",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/load-balancers/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Load balancers",
+  "tags": [
+   "Load balancers"
+  ]
+ },
+ {
+  "id": "get-load-balancers",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/load-balancers/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Load balancers",
+  "tags": [
+   "Load balancers"
+  ]
+ },
+ {
+  "id": "patch-load-balancers",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/load-balancers/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Load balancers",
+  "tags": [
+   "Load balancers"
+  ]
+ },
+ {
+  "id": "list-maintenance-windows",
+  "method": "GET",
+  "path": "/api/v1/maintenance-windows",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Maintenance",
+  "tags": [
+   "Maintenance"
+  ]
+ },
+ {
+  "id": "create-maintenance-windows",
+  "method": "POST",
+  "path": "/api/v1/maintenance-windows",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Maintenance",
+  "tags": [
+   "Maintenance"
+  ]
+ },
+ {
+  "id": "delete-maintenance-windows",
+  "method": "DELETE",
+  "path": "/api/v1/maintenance-windows/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Maintenance",
+  "tags": [
+   "Maintenance"
+  ]
+ },
+ {
+  "id": "get-maintenance-windows",
+  "method": "GET",
+  "path": "/api/v1/maintenance-windows/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Maintenance",
+  "tags": [
+   "Maintenance"
+  ]
+ },
+ {
+  "id": "patch-maintenance-windows",
+  "method": "PATCH",
+  "path": "/api/v1/maintenance-windows/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Maintenance",
+  "tags": [
+   "Maintenance"
+  ]
+ },
+ {
+  "id": "list-migrations",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/migrations",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Migrations",
+  "tags": [
+   "Migrations"
+  ]
+ },
+ {
+  "id": "delete-migrations",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/migrations/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Migrations",
+  "tags": [
+   "Migrations"
+  ]
+ },
+ {
+  "id": "get-migrations",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/migrations/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Migrations",
+  "tags": [
+   "Migrations"
+  ]
+ },
+ {
+  "id": "list-networks",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/networks",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Networks",
+  "tags": [
+   "Networks"
+  ]
+ },
+ {
+  "id": "create-networks",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/networks",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Networks",
+  "tags": [
+   "Networks"
+  ]
+ },
+ {
+  "id": "delete-networks",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/networks/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Networks",
+  "tags": [
+   "Networks"
+  ]
+ },
+ {
+  "id": "get-networks",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/networks/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Networks",
+  "tags": [
+   "Networks"
+  ]
+ },
+ {
+  "id": "patch-networks",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/networks/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Networks",
+  "tags": [
+   "Networks"
+  ]
+ },
+ {
+  "id": "list-nodes",
+  "method": "GET",
+  "path": "/api/v1/nodes",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Nodes",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "create-nodes",
+  "method": "POST",
+  "path": "/api/v1/nodes",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Nodes",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "get-nodes",
+  "method": "GET",
+  "path": "/api/v1/nodes/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Nodes",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "patch-nodes",
+  "method": "PATCH",
+  "path": "/api/v1/nodes/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Nodes",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "explainMaintenance-nodes",
+  "method": "GET",
+  "path": "/api/v1/nodes/{name}:explainMaintenance",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "What taking the machine out of service would move, and where to.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "issueCredential-nodes",
+  "method": "POST",
+  "path": "/api/v1/nodes/{name}:issueCredential",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Mint a fresh credential for a machine that already exists; shown once.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "reportStatus-nodes",
+  "method": "POST",
+  "path": "/api/v1/nodes/{name}:reportStatus",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "The machine's own report. A node identity only; `If-Match` carries the revision read.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "explainCapacity-nodes",
+  "method": "GET",
+  "path": "/api/v1/nodes:explainCapacity",
+  "params": [],
+  "query": [
+   "node",
+   "pool"
+  ],
+  "body": false,
+  "summary": "What the cell has in silicon and what it can still schedule.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "explainCpu-nodes",
+  "method": "GET",
+  "path": "/api/v1/nodes:explainCpu",
+  "params": [],
+  "query": [],
+  "body": false,
+  "summary": "The cell's processor generations, and what can migrate where.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "list-operations",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/operations",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Operations",
+  "tags": [
+   "Operations"
+  ]
+ },
+ {
+  "id": "get-operations",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/operations/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Operations",
+  "tags": [
+   "Operations"
+  ]
+ },
+ {
+  "id": "list-pools",
+  "method": "GET",
+  "path": "/api/v1/pools",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Pools",
+  "tags": [
+   "Pools"
+  ]
+ },
+ {
+  "id": "create-pools",
+  "method": "POST",
+  "path": "/api/v1/pools",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Pools",
+  "tags": [
+   "Pools"
+  ]
+ },
+ {
+  "id": "get-pools",
+  "method": "GET",
+  "path": "/api/v1/pools/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Pools",
+  "tags": [
+   "Pools"
+  ]
+ },
+ {
+  "id": "patch-pools",
+  "method": "PATCH",
+  "path": "/api/v1/pools/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Pools",
+  "tags": [
+   "Pools"
+  ]
+ },
+ {
+  "id": "issueCredential-pools",
+  "method": "POST",
+  "path": "/api/v1/pools/{name}:issueCredential",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Mint a fresh credential for a pool that already exists; shown once.",
+  "tags": [
+   "Pools"
+  ]
+ },
+ {
+  "id": "list-ports",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/ports",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Ports",
+  "tags": [
+   "Ports"
+  ]
+ },
+ {
+  "id": "create-ports",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/ports",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Ports",
+  "tags": [
+   "Ports"
+  ]
+ },
+ {
+  "id": "delete-ports",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/ports/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Ports",
+  "tags": [
+   "Ports"
+  ]
+ },
+ {
+  "id": "get-ports",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/ports/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Ports",
+  "tags": [
+   "Ports"
+  ]
+ },
+ {
+  "id": "patch-ports",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/ports/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Ports",
+  "tags": [
+   "Ports"
+  ]
+ },
+ {
+  "id": "reportStatus-ports",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/ports/{name}:reportStatus",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
+  "tags": [
+   "Ports"
+  ]
+ },
+ {
+  "id": "list-projects",
+  "method": "GET",
+  "path": "/api/v1/projects",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Projects",
+  "tags": [
+   "Projects"
+  ]
+ },
+ {
+  "id": "create-projects",
+  "method": "POST",
+  "path": "/api/v1/projects",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Projects",
+  "tags": [
+   "Projects"
+  ]
+ },
+ {
+  "id": "delete-projects",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Projects",
+  "tags": [
+   "Projects"
+  ]
+ },
+ {
+  "id": "get-projects",
+  "method": "GET",
+  "path": "/api/v1/projects/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Projects",
+  "tags": [
+   "Projects"
+  ]
+ },
+ {
+  "id": "patch-projects",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Projects",
+  "tags": [
+   "Projects"
+  ]
+ },
+ {
+  "id": "explainQuota-projects",
+  "method": "GET",
+  "path": "/api/v1/projects/{name}:explainQuota",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "What the project has left, and what it could actually start.",
+  "tags": [
+   "Projects"
+  ]
+ },
+ {
+  "id": "explainUsage-projects",
+  "method": "GET",
+  "path": "/api/v1/projects/{name}:explainUsage",
+  "params": [
+   "name"
+  ],
+  "query": [
+   "month"
+  ],
+  "body": false,
+  "summary": "What the project had, and when.",
+  "tags": [
+   "Projects"
+  ]
+ },
+ {
+  "id": "list-roles",
+  "method": "GET",
+  "path": "/api/v1/roles",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Roles",
+  "tags": [
+   "Roles"
+  ]
+ },
+ {
+  "id": "create-roles",
+  "method": "POST",
+  "path": "/api/v1/roles",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Roles",
+  "tags": [
+   "Roles"
+  ]
+ },
+ {
+  "id": "delete-roles",
+  "method": "DELETE",
+  "path": "/api/v1/roles/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Roles",
+  "tags": [
+   "Roles"
+  ]
+ },
+ {
+  "id": "get-roles",
+  "method": "GET",
+  "path": "/api/v1/roles/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Roles",
+  "tags": [
+   "Roles"
+  ]
+ },
+ {
+  "id": "patch-roles",
+  "method": "PATCH",
+  "path": "/api/v1/roles/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Roles",
+  "tags": [
+   "Roles"
+  ]
+ },
+ {
+  "id": "list-routers",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/routers",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Routers",
+  "tags": [
+   "Routers"
+  ]
+ },
+ {
+  "id": "create-routers",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/routers",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Routers",
+  "tags": [
+   "Routers"
+  ]
+ },
+ {
+  "id": "delete-routers",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/routers/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Routers",
+  "tags": [
+   "Routers"
+  ]
+ },
+ {
+  "id": "get-routers",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/routers/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Routers",
+  "tags": [
+   "Routers"
+  ]
+ },
+ {
+  "id": "patch-routers",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/routers/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Routers",
+  "tags": [
+   "Routers"
+  ]
+ },
+ {
+  "id": "list-security-groups",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/security-groups",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Security groups",
+  "tags": [
+   "Security groups"
+  ]
+ },
+ {
+  "id": "create-security-groups",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/security-groups",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Security groups",
+  "tags": [
+   "Security groups"
+  ]
+ },
+ {
+  "id": "delete-security-groups",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/security-groups/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Security groups",
+  "tags": [
+   "Security groups"
+  ]
+ },
+ {
+  "id": "get-security-groups",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/security-groups/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Security groups",
+  "tags": [
+   "Security groups"
+  ]
+ },
+ {
+  "id": "patch-security-groups",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/security-groups/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Security groups",
+  "tags": [
+   "Security groups"
+  ]
+ },
+ {
+  "id": "sign-in",
+  "method": "POST",
+  "path": "/api/v1/sessions",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Sign in with a username and password; the answer carries the token every other route wants.",
+  "tags": [
+   "Sessions"
+  ]
+ },
+ {
+  "id": "sign-out",
+  "method": "DELETE",
+  "path": "/api/v1/sessions/current",
+  "params": [],
+  "query": [],
+  "body": false,
+  "summary": "Sign out: end the session this token names.",
+  "tags": [
+   "Sessions"
+  ]
+ },
+ {
+  "id": "whoami",
+  "method": "GET",
+  "path": "/api/v1/sessions/current",
+  "params": [],
+  "query": [],
+  "body": false,
+  "summary": "Who this token is, and what it may do (`cellAdmin`, and the strongest rung per project).",
+  "tags": [
+   "Sessions"
+  ]
+ },
+ {
+  "id": "list-snapshot-schedules",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/snapshot-schedules",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Snapshot schedules",
+  "tags": [
+   "Snapshot schedules"
+  ]
+ },
+ {
+  "id": "create-snapshot-schedules",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/snapshot-schedules",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Snapshot schedules",
+  "tags": [
+   "Snapshot schedules"
+  ]
+ },
+ {
+  "id": "delete-snapshot-schedules",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/snapshot-schedules/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Snapshot schedules",
+  "tags": [
+   "Snapshot schedules"
+  ]
+ },
+ {
+  "id": "get-snapshot-schedules",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/snapshot-schedules/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Snapshot schedules",
+  "tags": [
+   "Snapshot schedules"
+  ]
+ },
+ {
+  "id": "patch-snapshot-schedules",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/snapshot-schedules/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Snapshot schedules",
+  "tags": [
+   "Snapshot schedules"
+  ]
+ },
+ {
+  "id": "list-subnets",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/subnets",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Subnets",
+  "tags": [
+   "Subnets"
+  ]
+ },
+ {
+  "id": "create-subnets",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/subnets",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Subnets",
+  "tags": [
+   "Subnets"
+  ]
+ },
+ {
+  "id": "delete-subnets",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/subnets/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Subnets",
+  "tags": [
+   "Subnets"
+  ]
+ },
+ {
+  "id": "get-subnets",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/subnets/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Subnets",
+  "tags": [
+   "Subnets"
+  ]
+ },
+ {
+  "id": "patch-subnets",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/subnets/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Subnets",
+  "tags": [
+   "Subnets"
+  ]
+ },
+ {
+  "id": "list-usage",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/usage",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Usage",
+  "tags": [
+   "Usage"
+  ]
+ },
+ {
+  "id": "get-usage",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/usage/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Usage",
+  "tags": [
+   "Usage"
+  ]
+ },
+ {
+  "id": "list-users",
+  "method": "GET",
+  "path": "/api/v1/users",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Users",
+  "tags": [
+   "Users"
+  ]
+ },
+ {
+  "id": "create-users",
+  "method": "POST",
+  "path": "/api/v1/users",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Users",
+  "tags": [
+   "Users"
+  ]
+ },
+ {
+  "id": "set-password",
+  "method": "PUT",
+  "path": "/api/v1/users/{id}/password",
+  "params": [
+   "id"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Set a password. One's own with the current one; anybody's as a cell operator.",
+  "tags": [
+   "Users"
+  ]
+ },
+ {
+  "id": "mint-token",
+  "method": "POST",
+  "path": "/api/v1/users/{id}/tokens",
+  "params": [
+   "id"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Mint a token for a service account. Shown once; several may exist so rotation has no gap.",
+  "tags": [
+   "Users"
+  ]
+ },
+ {
+  "id": "delete-users",
+  "method": "DELETE",
+  "path": "/api/v1/users/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Users",
+  "tags": [
+   "Users"
+  ]
+ },
+ {
+  "id": "get-users",
+  "method": "GET",
+  "path": "/api/v1/users/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Users",
+  "tags": [
+   "Users"
+  ]
+ },
+ {
+  "id": "patch-users",
+  "method": "PATCH",
+  "path": "/api/v1/users/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Users",
+  "tags": [
+   "Users"
+  ]
+ },
+ {
+  "id": "list-volumes",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/volumes",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List Volumes",
+  "tags": [
+   "Volumes"
+  ]
+ },
+ {
+  "id": "create-volumes",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/volumes",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Volumes",
+  "tags": [
+   "Volumes"
+  ]
+ },
+ {
+  "id": "delete-volumes",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/volumes/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Volumes",
+  "tags": [
+   "Volumes"
+  ]
+ },
+ {
+  "id": "get-volumes",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/volumes/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Volumes",
+  "tags": [
+   "Volumes"
+  ]
+ },
+ {
+  "id": "patch-volumes",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/volumes/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Volumes",
+  "tags": [
+   "Volumes"
+  ]
+ },
+ {
+  "id": "reportStatus-volumes",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/volumes/{name}:reportStatus",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "The owning agent's report. A node identity only; `If-Match` carries the revision read.",
+  "tags": [
+   "Volumes"
+  ]
+ },
+ {
+  "id": "list-console-sessions",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/console-sessions",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List console-sessions",
+  "tags": [
+   "console-sessions"
+  ]
+ },
+ {
+  "id": "create-console-sessions",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/console-sessions",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of console-sessions",
+  "tags": [
+   "console-sessions"
+  ]
+ },
+ {
+  "id": "delete-console-sessions",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/console-sessions/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of console-sessions",
+  "tags": [
+   "console-sessions"
+  ]
+ },
+ {
+  "id": "get-console-sessions",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/console-sessions/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of console-sessions",
+  "tags": [
+   "console-sessions"
+  ]
+ },
+ {
+  "id": "patch-console-sessions",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/console-sessions/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of console-sessions",
+  "tags": [
+   "console-sessions"
+  ]
+ },
+ {
+  "id": "list-snapshots",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/snapshots",
+  "params": [
+   "project"
+  ],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision"
+  ],
+  "body": false,
+  "summary": "List snapshots",
+  "tags": [
+   "snapshots"
+  ]
+ },
+ {
+  "id": "create-snapshots",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/snapshots",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of snapshots",
+  "tags": [
+   "snapshots"
+  ]
+ },
+ {
+  "id": "delete-snapshots",
+  "method": "DELETE",
+  "path": "/api/v1/projects/{project}/snapshots/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of snapshots",
+  "tags": [
+   "snapshots"
+  ]
+ },
+ {
+  "id": "get-snapshots",
+  "method": "GET",
+  "path": "/api/v1/projects/{project}/snapshots/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of snapshots",
+  "tags": [
+   "snapshots"
+  ]
+ },
+ {
+  "id": "patch-snapshots",
+  "method": "PATCH",
+  "path": "/api/v1/projects/{project}/snapshots/{name}",
+  "params": [
+   "project",
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of snapshots",
+  "tags": [
+   "snapshots"
+  ]
+ },
+ {
+  "id": "create-migrations",
+  "method": "POST",
+  "path": "/api/v1/projects/{project}/migrations",
+  "params": [
+   "project"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Migrations",
+  "tags": [
+   "Migrations"
+  ]
+ },
+ {
+  "id": "list-tokens",
+  "method": "GET",
+  "path": "/api/v1/users/{id}/tokens",
+  "params": [
+   "id"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Every token this account holds, without the tokens \u2014 id, purpose and when it was minted.",
+  "tags": [
+   "Users"
+  ]
+ },
+ {
+  "id": "revoke-token",
+  "method": "DELETE",
+  "path": "/api/v1/users/{id}/tokens/{token}",
+  "params": [
+   "id",
+   "token"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Take one token out of use. Already gone is not an error.",
+  "tags": [
+   "Users"
+  ]
+ }
+]
