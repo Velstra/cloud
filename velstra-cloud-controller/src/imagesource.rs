@@ -13,12 +13,12 @@
 
 use std::sync::Arc;
 
-use tracing::info;
+use tracing::{info, warn};
 use velstra_cloud_model::{
     ConditionStatus,
     images::{ImageSourceSpec, ImageSourceStatus},
     meta::{Condition, Meta, Placement, ResourceName, Timestamp, set_condition},
-    resources::{ImageFormat, ImageSpec, ImageStatus, Resource},
+    resources::{ImageFormat, ImageSpec, ImageState, ImageStatus, Resource},
 };
 use velstra_cloud_store::TypedStore;
 
@@ -128,13 +128,63 @@ impl<F: Fetch> ImageSourceController<F> {
                 source_url: spec.url.clone(),
                 source_instance: None,
                 signature: None,
+                state: ImageState::Active,
+                replacement: String::new(),
+                shared_with: Default::default(),
             },
             ImageStatus::default(),
         );
         self.images
             .create(&image, &velstra_cloud_model::Writer::controller(WRITER))
             .await?;
+        self.retire_what_this_supersedes(spec, &name).await;
         Ok(name.to_string())
+    }
+
+    /// Deprecate the images this one has just replaced.
+    ///
+    /// Publishing a newer image into a family already changes what
+    /// `families/<family>` resolves to — but that leaves the old one looking
+    /// exactly as current as the new one on every list and every form, and the
+    /// only way to tell them apart is to compare dates by eye. Saying it on
+    /// the object is what makes "which of these should I be using" answerable
+    /// without knowing how the family rule works.
+    ///
+    /// Only images from **this same source**: a family can hold images
+    /// somebody published by hand, and a rotation deprecating those would be
+    /// this controller reaching outside what it owns.
+    ///
+    /// Best effort and never fatal. The new image exists either way, and a
+    /// rotation that failed because a *label* could not be written would be a
+    /// cell that stops getting security updates over a cosmetic field.
+    async fn retire_what_this_supersedes(&self, spec: &ImageSourceSpec, published: &ResourceName) {
+        let Ok(images) = self.images.list().await else {
+            warn!("could not read the images to deprecate what a new one replaces");
+            return;
+        };
+        for image in images {
+            if image.meta.name == *published
+                || image.spec.family != spec.family
+                || image.spec.source_url != spec.url
+                || image.meta.deleted_at.is_some()
+                || image.spec.state != ImageState::Active
+            {
+                continue;
+            }
+            let mut next = image.clone();
+            next.spec.state = ImageState::Deprecated;
+            next.spec.replacement = published.to_string();
+            next.meta.generation += 1;
+            if let Err(e) = self
+                .images
+                .update(&next, &velstra_cloud_model::Writer::controller(WRITER))
+                .await
+            {
+                warn!(image = %image.meta.name, error = %e, "could not deprecate a superseded image");
+            } else {
+                info!(image = %image.meta.name, replacement = %published, "deprecated: a newer image of this family was published");
+            }
+        }
     }
 
     /// Take away the versions past `keep`, and only ones nobody is using.
@@ -675,6 +725,9 @@ mod tests {
                     source_url: url.into(),
                     source_instance: None,
                     signature: None,
+                    state: ImageState::Active,
+                    replacement: String::new(),
+                    shared_with: Default::default(),
                 },
                 ImageStatus::default(),
             );
@@ -855,6 +908,87 @@ mod tests {
         assert!(
             left.contains(&format!("sha256-{}", "e".repeat(64))),
             "a hand-made image was taken away by a source's retention: {left:?}"
+        );
+    }
+
+    // ---- superseding: publishing a newer image deprecates what it replaced
+
+    /// The case this exists for: yesterday's image stops looking as current as
+    /// today's, and says where to go.
+    #[tokio::test]
+    async fn a_new_image_deprecates_the_one_it_replaces() {
+        let (raw, _says, c, sources) = fixture(Ok(sums(DIGEST))).await;
+        let store: Arc<dyn Store> = raw.clone();
+        let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store, "cell-1", "images");
+        let url = "http://cloud.example/debian-13-genericcloud-amd64.qcow2";
+        let old = "b".repeat(64);
+        versions(&images, url, "debian-13", &[&old]).await;
+
+        let source = a_source();
+        sources
+            .create(&source, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+        let source = sources.get("image-sources/debian").await.unwrap().unwrap();
+        c.reconcile("image-sources/debian", Some(&source))
+            .await
+            .unwrap();
+
+        let was = images
+            .get(&format!("images/sha256-{old}"))
+            .await
+            .unwrap()
+            .expect("the older image is still there");
+        assert_eq!(
+            was.spec.state,
+            ImageState::Deprecated,
+            "the superseded image still looks as current as its replacement"
+        );
+        assert_eq!(was.spec.replacement, format!("images/sha256-{DIGEST}"));
+
+        let now = images
+            .get(&format!("images/sha256-{DIGEST}"))
+            .await
+            .unwrap()
+            .expect("the new image");
+        assert_eq!(now.spec.state, ImageState::Active);
+    }
+
+    /// And it does not reach outside what it publishes: a hand-made image in
+    /// the same family is somebody else's, deprecating included.
+    #[tokio::test]
+    async fn an_image_from_elsewhere_is_not_deprecated() {
+        let (raw, _says, c, sources) = fixture(Ok(sums(DIGEST))).await;
+        let store: Arc<dyn Store> = raw.clone();
+        let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store, "cell-1", "images");
+        let mine = "e".repeat(64);
+        versions(
+            &images,
+            "http://elsewhere.example/patched.qcow2",
+            "debian-13",
+            &[&mine],
+        )
+        .await;
+
+        let source = a_source();
+        sources
+            .create(&source, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+        let source = sources.get("image-sources/debian").await.unwrap().unwrap();
+        c.reconcile("image-sources/debian", Some(&source))
+            .await
+            .unwrap();
+
+        let untouched = images
+            .get(&format!("images/sha256-{mine}"))
+            .await
+            .unwrap()
+            .expect("the hand-made image");
+        assert_eq!(
+            untouched.spec.state,
+            ImageState::Active,
+            "a rotation deprecated an image it did not publish"
         );
     }
 }

@@ -93,17 +93,30 @@ restart *into* — an empty machine wearing a familiar name.
 
 The metrics say everything (`/metrics` on the API and the controller). An
 alert is for the handful of conditions where waiting until somebody reads a
-dashboard is already too late. The controller judges four, on every resync
+dashboard is already too late. The controller judges eight, on every resync
 pass, and tells somebody only when one **appears** or **goes away** — a pool at
 85 % is at 85 % on every pass, and what a person wants to hear is that it
 became so:
 
-| rule | fires when |
-|---|---|
-| `node-silent` | a machine has not reported for longer than its own `fenceAfterS` plus a minute — the moment its guests are certainly stopped and recovery may move them |
-| `pool-nearly-full` | a pool has allocated 80 % of its capacity (`--alert-pool-full-percent`) |
-| `quota-exhausted` | a project has used every unit of some dimension, so its next create is refused |
-| `stuck` | an object has disagreed with itself — unconverged, unreported, not ready, deletion blocked — for 15 minutes (`--alert-stuck-after`) |
+| rule | severity | fires when |
+|---|---|---|
+| `node-silent` | critical | a machine has not reported for longer than its own `fenceAfterS` plus a minute — the moment its guests are certainly stopped and recovery may move them |
+| `ceph-error` | critical | the cluster says `HEALTH_ERR` |
+| `ceph-osd-down` | critical | a disk is not up, or is up and out |
+| `ceph-warning` | warning | the cluster says `HEALTH_WARN`, with the checks it named |
+| `ceph-nearly-full` | warning | the cluster holds 80 % of its raw capacity |
+| `pool-nearly-full` | warning | a pool has allocated 80 % of its capacity (`--alert-pool-full-percent`) |
+| `quota-exhausted` | warning | a project has used every unit of some dimension, so its next create is refused |
+| `stuck` | warning | an object has disagreed with itself — unconverged, unreported, not ready, deletion blocked — for 15 minutes (`--alert-stuck-after`) |
+
+Two rungs and no more. A scheme with five is a scheme where three of them mean
+"later", and the only decision a rota makes is whether to wake somebody. The
+severity is on the webhook body and in the mail subject, which is what a
+receiver routes on.
+
+**A machine inside a maintenance window does not page.** Declare the window
+before you pull the power and `node-silent` stays quiet until it closes; being
+paged for work you announced is how a team learns to ignore the pager.
 
 Two targets, both optional, both tried, one failing never stopping the other:
 
@@ -112,16 +125,30 @@ velstra-cloud-controller …   --alert-webhook https://hooks.example.org/velstra
 ```
 
 The webhook receives one JSON object per transition —
-`{"kind":"firing"|"resolved","rule":…,"subject":…,"message":…,"cell":…,"at":…}`
+`{"kind":"firing"|"resolved","rule":…,"severity":…,"subject":…,"message":…,"cell":…,"at":…}`
 — and the mail goes through a sendmail-compatible binary
 (`--alert-sendmail`, `/usr/sbin/sendmail` by default; msmtp works). On NixOS the
 same knobs are `velstra.cloud.controlPlane.alerts.{webhook,mailTo,mailFrom}`.
 
+A message a target refuses is **kept and tried again** on the next pass, up to
+a few hundred; `alerts_undelivered` is how many are waiting. Before that they
+were dropped, and the drop was silent — the firing set is updated before
+delivery is attempted, so nothing would ever mention it again.
+
+**Point your monitoring at the heartbeat.** Every rule here fires only when
+something is wrong, so a controller that is down, or has lost the election, or
+whose store reads are failing, produces exactly the stream a healthy cell does:
+none. Once a minute the leader posts
+`{"kind":"heartbeat","rule":"watchdog","subject":<cell>,"firing":<count>,…}` to
+the webhook. Alert on its **absence** — that is the thing that makes the quiet
+mean something.
+
 Only the leader delivers, so a cell with three controllers says each thing
 once. A restarted controller repeats every open alert once, deliberately: for
 something that exists to be noticed, that is the right side to err on. What is
-firing right now is `alerts_firing{rule}` on the controller's metrics, and
-whether deliveries are getting through is `alert_deliveries_total{target,outcome}`.
+firing right now is `alerts_firing{rule,severity}` on the controller's metrics,
+and whether deliveries are getting through is
+`alert_deliveries_total{target,outcome}`.
 
 ---
 

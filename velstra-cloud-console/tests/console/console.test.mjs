@@ -419,7 +419,7 @@ await test("a failed placement shows the rejection chain per node", async () => 
 await test("asked and is are shown side by side, and the disagreement is named", async () => {
   await open(page, "volumes");
   const it = await pick("volume whose size has not been provisioned yet",
-    `(x) => pick(spec(x), "sizeGib") !== pick(status(x), "actualSizeGib")`);
+    `(x) => pick(spec(x), "sizeGib") !== pick(statusOf(x), "actualSizeGib")`);
   await openRow(page, it.id);
   const seen = await page.evaluate(`(() => {
     const rows = [...document.querySelectorAll("#sheet table.pairs tbody tr")];
@@ -436,7 +436,7 @@ await test("asked and is are shown side by side, and the disagreement is named",
 await test("an object that agrees says so rather than staying silent", async () => {
   await open(page, "volumes");
   const it = await pick("volume that is the size it was asked to be",
-    `(x) => pick(spec(x), "sizeGib") === pick(status(x), "actualSizeGib")`);
+    `(x) => pick(spec(x), "sizeGib") === pick(statusOf(x), "actualSizeGib")`);
   await openRow(page, it.id);
   check(/agrees/.test(await sheetText(page)), "a pair that agrees is not marked");
 });
@@ -522,8 +522,8 @@ await test("choosing an instance fills in the node it is on", async () => {
   // scheduler has not run yet there is nothing to derive.
   const placed = await page.evaluate(`(async () => {
     const all = await options("instances");
-    const r = all.find((x) => at(status(x), "node") || at(spec(x), "node"));
-    return r ? { name: nameOf(r), node: at(status(r), "node") || at(spec(r), "node") } : null;
+    const r = all.find((x) => at(statusOf(x), "node") || at(spec(x), "node"));
+    return r ? { name: nameOf(r), node: at(statusOf(r), "node") || at(spec(r), "node") } : null;
   })()`);
   if (!placed) skip("this API's seed holds no instance that has been placed on a node");
   const got = await page.evaluate(`(async () => {
@@ -544,7 +544,7 @@ await test("attaching to an instance that was never placed says why, at the choi
   await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
   await open(page, "instances");
   const unplaced = await pick("instance that was never placed",
-    `(x) => !at(status(x), "node") && !at(spec(x), "node")`);
+    `(x) => !at(statusOf(x), "node") && !at(spec(x), "node")`);
   await open(page, "attachments");
   await page.evaluate(`document.getElementById("newbtn").click()`);
   const said = await page.evaluate(`(async () => {
@@ -602,7 +602,7 @@ await test("a reference is sent the way the platform spells it", async () => {
   // is what opens the volume, and an unplaced instance has none to give.
   const placed = await page.evaluate(`(async () => {
     const all = await options("instances");
-    const r = all.find((x) => at(status(x), "node") || at(spec(x), "node"));
+    const r = all.find((x) => at(statusOf(x), "node") || at(spec(x), "node"));
     return r ? nameOf(r) : null;
   })()`);
   if (!placed) skip("this API's seed holds no instance that has been placed on a node");
@@ -877,8 +877,8 @@ const migratable = async () => {
       // a run whose cell simply had nothing to move.
       return { trouble: String(e.message || e) };
     }
-    const r = view.items.find((x) => at(status(x), "node") && !busy.has(nameOf(x)));
-    return r ? { id: idOf(r), name: nameOf(r), node: at(status(r), "node") } : {};
+    const r = view.items.find((x) => at(statusOf(x), "node") && !busy.has(nameOf(x)));
+    return r ? { id: idOf(r), name: nameOf(r), node: at(statusOf(r), "node") } : {};
   })()`);
   if (found.trouble) {
     throw new Error("the migrations could not be read, so no guest could be chosen to move: "
@@ -905,9 +905,9 @@ const ownMigration = async () => {
     // failed, and a failed guest is refused by every destination — which
     // reads as "this cell can receive nothing" and skips the whole test.
     const r = view.items.find(
-      (x) => at(status(x), "node") && at(status(x), "state") === "Running",
+      (x) => at(statusOf(x), "node") && at(statusOf(x), "state") === "Running",
     );
-    return r ? { name: nameOf(r), node: at(status(r), "node") } : null;
+    return r ? { name: nameOf(r), node: at(statusOf(r), "node") } : null;
   })()`);
   if (!guest) skip("this cell holds no placed guest to move");
   // The platform's own answer about this guest, so the destination is one it has
@@ -1148,7 +1148,7 @@ await test("a migration can be started, and lands on the object that follows it"
   // So: the condition is present and agrees with the screen…
   const moved = await page.evaluate(`(() => {
     const r = view.items.find((x) => idOf(x) === ${JSON.stringify(MOVED)});
-    return (pick(status(r), "conditions") || []).find((c) => c.kind === "Moved") || null;
+    return (pick(statusOf(r), "conditions") || []).find((c) => c.kind === "Moved") || null;
   })()`);
   check(moved && moved.reason === "PreparingReceiver",
     "the API did not compute a Moved condition for a migration nobody has prepared: "
@@ -1161,7 +1161,7 @@ await test("a migration can be started, and lands on the object that follows it"
   const withoutCondition = await page.evaluate(`(() => {
     const r = view.items.find((x) => idOf(x) === ${JSON.stringify(MOVED)});
     const bare = JSON.parse(JSON.stringify(r));
-    (status(bare) || {}).conditions = [];
+    (statusOf(bare) || {}).conditions = [];
     return movedWords(bare, migrationFacts(bare)).word;
   })()`);
   check(withoutCondition === "Not listening yet",
@@ -1195,7 +1195,7 @@ await test("the guest says where it is and where it is going, without a second l
     if (!ms.length) return null;
     const name = String(pick(spec(ms[0]), "instance"));
     const r = view.items.find((x) => nameOf(x) === name);
-    return r ? { id: idOf(r), node: at(status(r), "node"), to: String(pick(spec(ms[0]), "toNode")),
+    return r ? { id: idOf(r), node: at(statusOf(r), "node"), to: String(pick(spec(ms[0]), "toNode")),
                  migration: idOf(ms[0]) } : null;
   })()`);
   if (!it) skip("nothing in this cell is being migrated");
@@ -1223,7 +1223,7 @@ await test("a receiver that is not listening is not called progress", async () =
   await page.evaluate(`closeSheet()`);
   await open(page, "migrations");
   const it = await pick("migration whose receiver is not up",
-    `(x) => pick(status(x), "receiverReady") !== true && !deletedAt(x)`);
+    `(x) => pick(statusOf(x), "receiverReady") !== true && !deletedAt(x)`);
   await openRow(page, it.id);
   const text = await sheetText(page);
   check(/Not listening yet/.test(text),
@@ -1235,10 +1235,10 @@ await test("a receiver that is not listening is not called progress", async () =
 await test("a transfer shows what was copied, never a percentage of a promise", async () => {
   await open(page, "migrations");
   const it = await pick("migration that is really sending",
-    `(x) => pick(status(x), "receiverReady") === true && Number(pick(status(x), "transferredMib") || 0) > 0`);
+    `(x) => pick(statusOf(x), "receiverReady") === true && Number(pick(statusOf(x), "transferredMib") || 0) > 0`);
   const copied = await page.evaluate(`(() => {
     const r = view.items.find((x) => idOf(x) === ${JSON.stringify(it.id)});
-    return Number(pick(status(r), "transferredMib"));
+    return Number(pick(statusOf(r), "transferredMib"));
   })()`);
   await openRow(page, it.id);
   const text = await sheetText(page);
@@ -2181,7 +2181,7 @@ await test("a disk already given to this cluster can still be taken back", async
   await sleep(500);
   const seen = await page.evaluate(`(async () => {
     const nodes = await options("nodes");
-    const disk = (at(status(nodes.find((n) => idOf(n) === "node-a")), "devices") || [])
+    const disk = (at(statusOf(nodes.find((n) => idOf(n) === "node-a")), "devices") || [])
       .find((d) => d.path.endsWith("0001"));
     const row = document.querySelector('#f-osds .disk[data-device$="0001"]');
     return { reported: at(disk, "state.kind"),

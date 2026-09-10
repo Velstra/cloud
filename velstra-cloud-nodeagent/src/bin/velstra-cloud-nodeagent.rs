@@ -71,6 +71,26 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8447")]
     console_listen: SocketAddr,
 
+    /// A certificate and key for the console listener, so the stream between
+    /// the API and this node is private.
+    ///
+    /// **Why this one connection is worth a certificate.** What crosses it is a
+    /// serial line — the bytes a guest writes and the bytes an operator types,
+    /// which on a console is very often a root password. The API's own port has
+    /// spoken TLS from the start; this hop behind it went in the clear across
+    /// whatever network a cell's machines share, and a passive listener there
+    /// got something immediately useful.
+    ///
+    /// Both or neither. Given, the console is served over TLS and the node says
+    /// so on its status, which is what makes the API connect with `wss://` and
+    /// what lets a console screen tell somebody whether their keystrokes are
+    /// private. Missing, it is plaintext — and the platform says *that*, rather
+    /// than leaving it to be assumed.
+    #[arg(long, env = "VELSTRA_CONSOLE_TLS_CERT", requires = "console_tls_key")]
+    console_tls_cert: Option<std::path::PathBuf>,
+    #[arg(long, env = "VELSTRA_CONSOLE_TLS_KEY", requires = "console_tls_cert")]
+    console_tls_key: Option<std::path::PathBuf>,
+
     /// What to tell the cell this node's console address is.
     ///
     /// Empty derives it, which is what a single-homed machine wants: the local
@@ -112,6 +132,32 @@ struct Args {
     /// the reason on the guest that needed it. Needs at least one key.
     #[arg(long, env = "VELSTRA_REQUIRE_SIGNED_IMAGES")]
     require_signed_images: bool,
+    /// Answer DNS for the guests on this node.
+    ///
+    /// On for the same reason DHCP is: a guest that comes up with an address
+    /// and no resolver cannot install a package or reach any host by name,
+    /// which is the first thing anybody tries. It answers for this cell's own
+    /// guests and forwards everything else to whatever this node resolves
+    /// with. Turn it off where something else is authoritative for these
+    /// subnets.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    dns: bool,
+
+    /// The suffix this cell's own names live under.
+    ///
+    /// Never a real public suffix: a guest asking for `db-1.<zone>` must not
+    /// be answerable by somebody else's zone if this responder is ever
+    /// bypassed.
+    #[arg(long, default_value = velstra_cloud_nodeagent::dns::DEFAULT_ZONE)]
+    dns_zone: String,
+
+    /// Where questions this cell cannot answer are sent.
+    ///
+    /// Empty means "whatever this node itself resolves with", read from
+    /// `/etc/resolv.conf` at startup. Naming them explicitly is for a node
+    /// whose own resolver is not one a guest should be sent to.
+    #[arg(long, value_delimiter = ',')]
+    dns_forward_to: Vec<std::net::IpAddr>,
 
     /// How often the responder looks for taps that have appeared or gone.
     #[arg(long, default_value = "2")]
@@ -414,7 +460,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         VmmKind::CloudHypervisor | VmmKind::Qemu => DatapathKind::Tap,
     }) {
         DatapathKind::Fake => Arc::new(FakeDatapath::new()),
-        DatapathKind::Tap => Arc::new(TapDatapath::new(&args.tap_prefix, args.tap_owner)),
+        DatapathKind::Tap => {
+            let tap = TapDatapath::new(&args.tap_prefix, args.tap_owner);
+            // A node that holds its guests' gateways also holds the chain
+            // where their firewall belongs, and writes one — so a port
+            // carrying rules is programmed rather than refused. Without the
+            // flag a bare tap still refuses, which is the honest answer when
+            // nothing on the machine would enforce them.
+            Arc::new(if args.local_network {
+                tap.filtered_elsewhere()
+            } else {
+                tap
+            })
+        }
         DatapathKind::Fabric => {
             let Some(endpoint) = &args.fabric else {
                 return Err(
@@ -554,7 +612,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     node: args.node.clone(),
                 }),
             };
-            match velstra_cloud_nodeagent::console::serve(args.console_listen, consoles).await {
+            let console_tls = args
+                .console_tls_cert
+                .clone()
+                .zip(args.console_tls_key.clone())
+                .map(|(cert, key)| velstra_cloud_nodeagent::console::ConsoleTls { cert, key });
+            agent.set_console_tls(console_tls.is_some());
+            match velstra_cloud_nodeagent::console::serve(
+                args.console_listen,
+                consoles,
+                console_tls,
+            )
+            .await
+            {
                 Ok((bound, task)) => {
                     let advertised = if args.console_advertise.is_empty() {
                         advertise_from(bound, args.api.as_deref())
@@ -613,9 +683,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    // Beside DHCP and for the same reason, with the same failure posture: a
+    // device it cannot bind costs those guests their names, not the node.
+    let upstreams = if args.dns_forward_to.is_empty() {
+        let text = tokio::fs::read_to_string("/etc/resolv.conf")
+            .await
+            .unwrap_or_default();
+        velstra_cloud_nodeagent::dns::upstreams_from_resolv_conf(&text)
+    } else {
+        args.dns_forward_to.clone()
+    };
+    if args.dns {
+        if upstreams.is_empty() {
+            // Said once, loudly. Guests still get each other's names; what
+            // they cannot do is reach anything off the cell by name, and an
+            // operator debugging that should not have to guess why.
+            tracing::warn!(
+                "answering DNS with nowhere to forward: this node has no resolver of its own, \
+                 so guests will resolve each other and nothing else. Pass --dns-forward-to."
+            );
+        }
+        tokio::spawn(velstra_cloud_nodeagent::dns::serve(
+            agent.guests(),
+            agent.names(),
+            // Beside the metadata service, on the address every guest already
+            // reaches. See the note on `dns::serve`.
+            std::net::SocketAddr::from((
+                velstra_cloud_nodeagent::metadata::ADDRESS,
+                velstra_cloud_nodeagent::dns::PORT,
+            )),
+            args.dns_zone.clone(),
+            upstreams.clone(),
+            Duration::from_secs(args.dhcp_scan_secs),
+        ));
+    }
+
     tracing::info!(
         node = %args.node, cell = %args.cell, region = %args.region,
-        metadata = %bound, dhcp = args.dhcp, "agent up"
+        metadata = %bound, dhcp = args.dhcp, dns = args.dns,
+        forwarding_to = upstreams.len(), "agent up"
     );
 
     agent

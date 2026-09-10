@@ -90,6 +90,44 @@ pub fn router(consoles: Consoles) -> Router {
         .with_state(consoles)
 }
 
+/// A certificate and key for the console listener, read from disk.
+///
+/// **Why the console of all things.** What crosses this connection is a serial
+/// line: the bytes a guest writes and the bytes an operator types, which on a
+/// console is very often a root password. It is the one stream in this platform
+/// where a passive listener on the management network gets something
+/// immediately useful. The API's own port has spoken TLS from the start; this
+/// hop behind it did not.
+pub struct ConsoleTls {
+    pub cert: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+}
+
+impl ConsoleTls {
+    /// Load them, or say which file could not be read.
+    ///
+    /// Loud rather than silent: an agent told to serve TLS and unable to is an
+    /// agent that must not fall back to plaintext. Somebody asked for the
+    /// stream to be private, and quietly giving them a cleartext one is worse
+    /// than not starting.
+    fn config(&self) -> Result<tokio_rustls::rustls::ServerConfig, String> {
+        let certs = std::fs::read(&self.cert)
+            .map_err(|e| format!("reading {}: {e}", self.cert.display()))?;
+        let key =
+            std::fs::read(&self.key).map_err(|e| format!("reading {}: {e}", self.key.display()))?;
+        let chain: Vec<_> = rustls_pemfile::certs(&mut certs.as_slice())
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("{} is not a certificate: {e}", self.cert.display()))?;
+        let private = rustls_pemfile::private_key(&mut key.as_slice())
+            .map_err(|e| format!("{} is not a key: {e}", self.key.display()))?
+            .ok_or_else(|| format!("{} holds no private key", self.key.display()))?;
+        tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, private)
+            .map_err(|e| format!("that certificate and key do not go together: {e}"))
+    }
+}
+
 /// Bind and serve, answering with the address actually bound.
 ///
 /// The bound address is what gets reported on the node's status: a node that
@@ -98,12 +136,30 @@ pub fn router(consoles: Consoles) -> Router {
 pub async fn serve(
     listen: SocketAddr,
     consoles: Consoles,
+    tls: Option<ConsoleTls>,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let bound = listener.local_addr()?;
     let app = router(consoles);
+    let Some(tls) = tls else {
+        let task = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!(error = %e, "the console service stopped");
+            }
+        });
+        return Ok((bound, task));
+    };
+    let config = tls
+        .config()
+        .map_err(|e| std::io::Error::other(format!("the console's certificate: {e}")))?;
+    let listener = listener.into_std()?;
     let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        let acceptor =
+            axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(config));
+        if let Err(e) = axum_server::from_tcp_rustls(listener, acceptor)
+            .serve(app.into_make_service())
+            .await
+        {
             tracing::error!(error = %e, "the console service stopped");
         }
     });

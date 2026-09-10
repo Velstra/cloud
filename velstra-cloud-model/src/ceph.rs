@@ -41,7 +41,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    meta::Condition,
+    meta::{Condition, Timestamp},
     resources::{Observed, Resource},
 };
 
@@ -183,6 +183,157 @@ pub struct NodeCeph {
     /// was missing.
     #[serde(default)]
     pub trusts_key: bool,
+
+    /// What `ceph status` and its siblings say about the cluster as a whole,
+    /// as read from here.
+    ///
+    /// Reported the same way and for the same reason as `pools`: only a node
+    /// with the admin keyring can ask, so those nodes report what they saw and
+    /// the controller keeps the freshest answer. `None` is "could not ask", not
+    /// "the cluster is empty" — a node that is not an admin says nothing here
+    /// rather than reporting zeros that would read as a cluster with no disks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<CephSeen>,
+}
+
+/// The cluster as Ceph itself describes it.
+///
+/// Everything above this in the status is what the platform *made*: which
+/// monitors it asked for and which report running. This is what Ceph *says*
+/// — health, placement groups, fill, throughput, the state of every OSD — and
+/// it is the part an operator who ran Ceph before goes looking for first.
+/// Read by a node that holds the admin keyring, carried on its own status,
+/// and lifted onto the cluster's status by the controller with the name of
+/// the node that read it and the moment it did. The moment matters: a
+/// reading is only as good as it is recent, and a stale one says so through
+/// [`at`](CephSeen::at) instead of pretending.
+///
+/// Sizes are bytes and rates are per second, as integers: Ceph reports
+/// kilobytes in one place and bytes in the next, and a status that made its
+/// reader remember which is a status that gets misread.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CephSeen {
+    /// `HEALTH_OK`, `HEALTH_WARN` or `HEALTH_ERR`, as Ceph spells it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub health: String,
+    /// Every standing health check, with the sentence Ceph attaches to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<CephWarning>,
+    /// Placement groups by state — `active+clean` is the one to hope for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pgs: Vec<PgState>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pgs_total: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub objects: u64,
+    /// Raw bytes used and held across every OSD, replicas included.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub used_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_bytes: u64,
+    /// Client throughput at the moment of reading. Ceph omits a rate that is
+    /// zero, and so does this.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub read_bps: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub write_bps: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub read_ops: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub write_ops: u64,
+    /// Every OSD the cluster knows, running or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub osds: Vec<OsdSeen>,
+    /// Every pool, with what it holds and how it is replicated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_stats: Vec<PoolSeen>,
+    /// When this was read.
+    #[serde(default, skip_serializing_if = "is_unset")]
+    pub at: Timestamp,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_unset(t: &Timestamp) -> bool {
+    t.0 == 0
+}
+
+/// One standing health check.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CephWarning {
+    /// Ceph's code for it — `POOL_NO_REDUNDANCY`, `OSD_DOWN`.
+    pub code: String,
+    /// `HEALTH_WARN` or `HEALTH_ERR`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub severity: String,
+    /// The sentence Ceph attaches, written for a person.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+/// How many placement groups are in one state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgState {
+    pub state: String,
+    pub count: u64,
+}
+
+/// One OSD as the cluster sees it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsdSeen {
+    /// Ceph's number for it — the `0` in `osd.0`.
+    pub id: u64,
+    /// The host it lives on, by the name Ceph knows — which is the node's
+    /// bare id, because that is what the platform registers hosts as.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    /// The disk it was made from. Ceph knows the kernel name (`sda`); the
+    /// controller turns that into the path the node reports the disk by, so
+    /// this lines up with `spec.osds` and a reader can tell which row is
+    /// which disk.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
+    /// The daemon is running.
+    #[serde(default)]
+    pub up: bool,
+    /// The disk takes data. An OSD that is up but out is draining; one that
+    /// is down but in is what the cluster is waiting for.
+    #[serde(default)]
+    pub r#in: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub used_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_bytes: u64,
+    /// Placement groups placed here.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pgs: u64,
+    /// `hdd`, `ssd` or `nvme`, as Ceph classified it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub class: String,
+}
+
+/// One pool, as it actually is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolSeen {
+    pub pool: String,
+    /// Bytes stored before replication — what the pool's users put in it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stored_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub objects: u64,
+    /// How much more this pool could take, at its replication.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_avail_bytes: u64,
+    /// The replication the pool has — beside `spec.pools[].size`, which is the
+    /// one it was asked for.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_size: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pg_num: u64,
 }
 
 /// The smallest disk worth making an OSD of.
@@ -386,6 +537,16 @@ pub struct CephClusterStatus {
     /// Pools that exist.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools_present: Vec<String>,
+    /// What Ceph says about itself, flattened in beside what the platform
+    /// made: `health`, `pgs`, `usedBytes`, the OSD table. Lifted from the
+    /// admin node with the freshest reading and never cleared — when no node
+    /// can ask, the last answer stays with its own `at`, which is more honest
+    /// than a blank.
+    #[serde(flatten)]
+    pub seen: CephSeen,
+    /// The node whose reading `seen` is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seen_by: String,
 }
 
 impl Observed for CephClusterStatus {

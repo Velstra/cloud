@@ -189,6 +189,9 @@ async fn seed(h: &Harness) {
                 ..Default::default()
             },
             NodeStatus {
+                // A live machine. Nothing is placed on one that has gone quiet,
+                // so a fixture without a heartbeat is a fixture nothing schedules on.
+                last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
                 shared_state: false,
                 vmm: "qemu".into(),
                 fetching: Vec::new(),

@@ -146,9 +146,27 @@ async fn a_tenant_reads_the_refusals_about_their_own_objects_and_nobody_elses() 
         !his.items.is_empty(),
         "the person who was refused cannot read the sentence they were given"
     );
+    // Every line he is shown is either his own or about an object he may
+    // read. It is not "only lines whose subject is Bob": the audit now also
+    // carries who *changed* what, and a change to Bob's own project is his to
+    // see — it is how a tenant learns their project was touched. What must
+    // never appear is a line about somebody else's namespace.
     assert!(
-        his.items.iter().all(|r| r["spec"]["subject"] == json!(BOB)),
-        "somebody else's refusals were handed to a tenant: {:?}",
+        his.items.iter().all(|r| {
+            let subject = r["spec"]["subject"].as_str().unwrap_or_default();
+            let target = r["spec"]["target"].as_str().unwrap_or_default();
+            subject == BOB || target == "projects/p2" || target.starts_with("projects/p2/")
+        }),
+        "somebody else's audit lines were handed to a tenant: {:?}",
+        his.items
+    );
+    assert!(
+        !his.items.iter().any(|r| {
+            let target = r["spec"]["target"].as_str().unwrap_or_default();
+            target.starts_with("projects/p1")
+                && r["spec"]["subject"].as_str().unwrap_or_default() != BOB
+        }),
+        "a tenant was shown another project's audit lines: {:?}",
         his.items
     );
 }
@@ -1224,10 +1242,15 @@ async fn a_tenant_sees_nothing_in_the_audit() {
         .await
         .expect("a list is filtered, never refused");
     assert!(
-        seen.items
-            .iter()
-            .all(|r| r["spec"]["subject"] == json!(ADA)),
-        "a tenant was shown refusals that are neither theirs nor about their \
+        seen.items.iter().all(|r| {
+            let subject = r["spec"]["subject"].as_str().unwrap_or_default();
+            let target = r["spec"]["target"].as_str().unwrap_or_default();
+            // Hers by subject, or about her own project — the audit carries
+            // changes as well as refusals now, and "ops created projects/p1"
+            // is a line the owner of p1 is meant to be able to read.
+            subject == ADA || target == "projects/p1" || target.starts_with("projects/p1/")
+        }),
+        "a tenant was shown audit lines that are neither theirs nor about their \
          own objects: {:?}",
         seen.items
     );
@@ -3364,6 +3387,11 @@ async fn a_tenant_sums_their_own_bill_and_not_a_neighbours() {
                     instances: 1,
                     ..Default::default()
                 },
+                traffic: velstra_cloud_model::usage::Traffic {
+                    rx_bytes: 1_000,
+                    tx_bytes: 2_000,
+                    ..Default::default()
+                },
             },
             Default::default(),
         );
@@ -3709,4 +3737,134 @@ async fn a_flavor_is_a_menu_the_cell_writes_and_a_tenant_orders_from() {
         .map(|_| ())
         .expect_err("an imaginary size");
     assert!(refused.to_string().contains("not a flavor"), "{refused}");
+}
+
+/// Offboarding by deletion was unsafe: a binding names a subject as a plain
+/// string, so nothing noticed the account was still named by one. Every grant
+/// stayed in place, and the next account created with that id — a plausible
+/// collision on a system where ids are names — inherited all of it.
+#[tokio::test]
+async fn deleting_an_account_takes_its_grants_with_it() {
+    let api = cell().await;
+
+    let before = api
+        .get(&name("projects/p1"), &who(OPERATOR))
+        .await
+        .expect("the fixture has a project");
+    assert!(
+        before["spec"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["members"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|x| x == ADA))),
+        "the fixture does not bind ada, so this proves nothing: {}",
+        before["spec"]["bindings"]
+    );
+
+    // The fixture binds ada without ever making a user object for her, so the
+    // account has to exist before it can be deleted.
+    api.create(
+        "",
+        "users",
+        &json!({ "meta": { "name": format!("users/{ADA}") }, "spec": { "display_name": "Ada" } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("a cell operator may make an account");
+    api.delete(&name(&format!("users/{ADA}")), None, &who(OPERATOR))
+        .await
+        .expect("a cell operator may delete an account");
+
+    let after = api
+        .get(&name("projects/p1"), &who(OPERATOR))
+        .await
+        .expect("the project is still there");
+    // An empty set of bindings is not serialised at all, so absent is the
+    // right answer as much as an array without her in it.
+    let left = after["spec"]["bindings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !left.iter().any(|b| b["members"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|x| x == ADA))),
+        "a deleted account kept its grant: {}",
+        after["spec"]["bindings"]
+    );
+}
+
+/// An image ada shares with bob's project is one bob can read — and nothing
+/// more.
+///
+/// Without this an operator building one hardened base image had to copy the
+/// bytes into every project that needed it, and then keep every copy's
+/// lifecycle in step by hand. The grant is deliberately one-way and
+/// read-only: bob can boot from it, and cannot deprecate, retire or delete
+/// somebody else's image.
+#[tokio::test]
+async fn an_image_shared_with_another_project_is_readable_there_and_not_writable() {
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "images",
+        &json!({
+            "id": "sha256-golden",
+            "spec": {
+                "digest": "sha256:golden",
+                "format": "Raw",
+                "size_bytes": 1024,
+                "source_url": "https://example.invalid/golden.img"
+            }
+        }),
+        &who(ADA),
+    )
+    .await
+    .expect("ada may publish into her own project");
+    let image = name("projects/p1/images/sha256-golden");
+
+    // Before the grant: bob cannot see it at all.
+    let refused = api
+        .get(&image, &who(BOB))
+        .await
+        .expect_err("bob read another tenant's image");
+    assert_eq!(refused.code, Code::PermissionDenied);
+
+    api.patch(
+        &image,
+        &json!({ "spec": { "shared_with": ["projects/p2"] } }),
+        None,
+        &who(ADA),
+    )
+    .await
+    .expect("ada may share her own image");
+
+    // After it: bob reads it.
+    let seen = api
+        .get(&image, &who(BOB))
+        .await
+        .expect("a shared image is readable by the project it was shared with");
+    assert_eq!(seen["spec"]["digest"], "sha256:golden");
+
+    // And still cannot change it. Sharing is a read grant; editing goes
+    // through the ordinary authorisation, which knows nothing about it.
+    let refused = api
+        .patch(
+            &image,
+            &json!({ "spec": { "state": "Obsolete" } }),
+            None,
+            &who(BOB),
+        )
+        .await
+        .expect_err("a read grant let somebody retire another tenant's image");
+    assert_eq!(refused.code, Code::PermissionDenied);
+
+    let refused = api
+        .delete(&image, None, &who(BOB))
+        .await
+        .err()
+        .expect("a read grant let somebody delete another tenant's image");
+    assert_eq!(refused.code, Code::PermissionDenied);
 }

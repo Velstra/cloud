@@ -131,7 +131,7 @@ function internetBlock(f) {
     : f.nodes
         .filter((n) => at(spec(n), "gateway") === true)
         .map((n) => {
-          const heard = at(status(n), "lastHeartbeat");
+          const heard = at(statusOf(n), "lastHeartbeat");
           return idOf(n) + (heard ? " (heard from " + ago(heard) + ")" : " (never heard from)");
         });
 
@@ -149,8 +149,8 @@ function internetBlock(f) {
       : {}));
 
   for (const peer of f.bgp || []) {
-    const state = at(status(peer), "session") || "no session yet";
-    const announced = at(status(peer), "announced");
+    const state = at(statusOf(peer), "session") || "no session yet";
+    const announced = at(statusOf(peer), "announced");
     box.appendChild(mapRow(1, "bgp", idOf(peer),
       at(spec(peer), "peer") + " · AS " + at(spec(peer), "peerAs") + " · " + state +
         (announced ? " · " + announced + " prefixes" : ""),
@@ -158,7 +158,7 @@ function internetBlock(f) {
   }
   for (const fip of f.floating) {
     const port = at(spec(fip), "port");
-    const address = at(status(fip), "address") || at(spec(fip), "address") || "no address yet";
+    const address = at(statusOf(fip), "address") || at(spec(fip), "address") || "no address yet";
     box.appendChild(mapRow(1, "floating ip", idOf(fip),
       port ? address + " → " + shortName(String(port)) : address + " — in front of nothing yet",
       { goes: nameOf(fip), onclick: () => openFromMap("floatingips", fip) }));
@@ -175,9 +175,9 @@ function subnetRows(box, f, index, subnet, depth) {
   const name = nameOf(subnet);
   const on = [...index.values()].filter((e) => String(at(spec(e.port), "subnet")) === name);
   for (const entry of on) {
-    const address = at(status(entry.port), "address") || at(spec(entry.port), "address") || "no address yet";
+    const address = at(statusOf(entry.port), "address") || at(spec(entry.port), "address") || "no address yet";
     if (entry.guest) {
-      const state = at(status(entry.guest), "state") || "unknown";
+      const state = at(statusOf(entry.guest), "state") || "unknown";
       box.appendChild(mapRow(depth, "guest", idOf(entry.guest),
         address + " · " + state + (entry.floating.length
           ? " · reachable from outside"
@@ -194,7 +194,7 @@ function subnetRows(box, f, index, subnet, depth) {
   }
   for (const lb of f.balancers) {
     if (String(at(spec(lb), "subnet")) !== name) continue;
-    const vip = at(status(lb), "vip") || at(spec(lb), "vip") || "no address yet";
+    const vip = at(statusOf(lb), "vip") || at(spec(lb), "vip") || "no address yet";
     const members = (at(spec(lb), "members") || []).length;
     box.appendChild(mapRow(depth, "balancer", idOf(lb),
       vip + " · " + members + (members === 1 ? " member" : " members"),
@@ -210,7 +210,7 @@ function networkRows(box, f, index, network, depth) {
   const name = nameOf(network);
   const mine = f.subnets.filter((s) => String(at(spec(s), "network")) === name);
   box.appendChild(mapRow(depth, "network", idOf(network),
-    "VNI " + (at(status(network), "vni") || at(spec(network), "vni") || "—") +
+    "VNI " + (at(statusOf(network), "vni") || at(spec(network), "vni") || "—") +
       " · MTU " + (at(spec(network), "mtu") || "—"),
     { goes: name, onclick: () => openFromMap("networks", network) }));
   if (!mine.length) {
@@ -223,8 +223,8 @@ function networkRows(box, f, index, network, depth) {
     return;
   }
   for (const subnet of mine) {
-    const used = at(status(subnet), "allocated");
-    const free = at(status(subnet), "available");
+    const used = at(statusOf(subnet), "allocated");
+    const free = at(statusOf(subnet), "available");
     box.appendChild(mapRow(depth + 1, "subnet", idOf(subnet),
       (at(spec(subnet), "cidr") || "no range") +
         " · gateway " + (at(spec(subnet), "gateway") || "none") +
@@ -288,16 +288,16 @@ function graphOf(f, index) {
     const span = Math.max(1, on.length + lbs.length);
     const first = slot;
     for (const entry of on) {
-      const address = at(status(entry.port), "address") || at(spec(entry.port), "address") || "";
+      const address = at(statusOf(entry.port), "address") || at(spec(entry.port), "address") || "";
       if (entry.guest) {
-        const state = at(status(entry.guest), "state") || "unknown";
+        const state = at(statusOf(entry.guest), "state") || "unknown";
         nodes.push({ id: nameOf(entry.guest), kind: "guest", label: idOf(entry.guest),
           sub: address, x: slot * SLOT, y: 3 * ROW, w: W,
           state: state === "Running" ? "settled" : (state === "Failed" ? "failing" : "drifting"),
           goes: { coll: "instances", item: entry.guest } });
         edges.push({ from: nameOf(entry.guest), to: nameOf(network), label: "" });
         for (const fip of entry.floating) {
-          const pub = at(status(fip), "address") || at(spec(fip), "address") || "";
+          const pub = at(statusOf(fip), "address") || at(spec(fip), "address") || "";
           edges.push({ from: "internet", to: nameOf(entry.guest), label: pub, dashed: true });
         }
       } else {
@@ -309,7 +309,7 @@ function graphOf(f, index) {
       slot += 1;
     }
     for (const lb of lbs) {
-      const vip = at(status(lb), "vip") || at(spec(lb), "vip") || "";
+      const vip = at(statusOf(lb), "vip") || at(spec(lb), "vip") || "";
       nodes.push({ id: nameOf(lb), kind: "balancer", label: idOf(lb), sub: vip,
         x: slot * SLOT, y: 3 * ROW, w: W, goes: { coll: "load-balancers", item: lb } });
       edges.push({ from: nameOf(lb), to: nameOf(network), label: "" });
@@ -345,7 +345,7 @@ function graphOf(f, index) {
   // The internet crowns the middle of everything that reaches it.
   const width = Math.max(1, slot) * SLOT;
   const sessions = (f.bgp || [])
-    .map((p) => at(spec(p), "peer") + " " + (at(status(p), "session") || ""))
+    .map((p) => at(spec(p), "peer") + " " + (at(statusOf(p), "session") || ""))
     .join(" · ");
   nodes.push({ id: "internet", kind: "internet", label: "Internet",
     sub: sessions, x: (width - SLOT) / 2, y: 0, w: W });

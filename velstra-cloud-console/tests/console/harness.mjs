@@ -44,6 +44,9 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
   const proc = spawn(CHROME, [
     "--headless=new",
     `--remote-debugging-port=${port}`,
+    // A real cell answers with the certificate it made for itself; the suite
+    // still has to be able to reach it.
+    ...(process.env.CONSOLE_INSECURE ? ["--ignore-certificate-errors"] : []),
     "--no-first-run",
     "--no-default-browser-check",
     // There is no user namespace to sandbox into in a build sandbox, and the

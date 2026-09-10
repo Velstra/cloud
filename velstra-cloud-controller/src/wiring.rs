@@ -33,12 +33,12 @@ use velstra_cloud_store::{Cached, Store, TypedStore, prefix_for};
 
 use crate::{
     LoopConfig, Metrics, address::AddressController, attachment::AttachmentController,
-    ceph::CephController, disk::DiskController, drift, floating_ip::FloatingIpController,
-    instance::InstanceController, load_balancer::LoadBalancerController,
-    migration::MigrationController, network::NetworkController, operations::OperationsController,
-    port::PortController, quota::QuotaController, router::RouterController, run_when_leading,
-    scheduler::Scheduler, snapshot::SnapshotController, status::StatusWriter,
-    volume::VolumeController,
+    backup::BackupController, ceph::CephController, disk::DiskController, drift,
+    floating_ip::FloatingIpController, instance::InstanceController,
+    load_balancer::LoadBalancerController, migration::MigrationController,
+    network::NetworkController, operations::OperationsController, port::PortController,
+    quota::QuotaController, router::RouterController, run_when_leading, scheduler::Scheduler,
+    snapshot::SnapshotController, status::StatusWriter, volume::VolumeController,
 };
 
 /// The cell the controllers work for.
@@ -196,6 +196,7 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
                 store.clone(),
                 prefix_for(id, "instances")
             ),
+            instances.clone(),
             id,
         ),
         ports.clone()
@@ -210,9 +211,10 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
         DiskController::new(attachments.clone(), instances.clone()),
         instances.clone()
     );
+    let pools: TypedStore<PoolSpec, PoolStatus> = TypedStore::new(store.clone(), id, "pools");
     spawn!(
         "attachment",
-        AttachmentController::new(attachments.clone(), volumes.clone()),
+        AttachmentController::new(attachments.clone(), volumes.clone()).with_pools(pools.clone()),
         attachments.clone()
     );
     spawn!(
@@ -233,6 +235,16 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
                 load_balancers.clone(),
                 store.clone(),
                 prefix_for(id, "load-balancers"),
+            ),
+            Cached::start(
+                TypedStore::new(store.clone(), id, "snapshots"),
+                store.clone(),
+                prefix_for(id, "snapshots"),
+            ),
+            Cached::start(
+                TypedStore::new(store.clone(), id, "backups"),
+                store.clone(),
+                prefix_for(id, "backups"),
             ),
             StatusWriter::new(store.clone(), id, "projects", "quota"),
             id,
@@ -321,6 +333,7 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
             networks.clone(),
             subnets.clone(),
             ports.clone(),
+            nodes.clone(),
             floating_ips.clone(),
             cell.fabric.clone(),
         ),
@@ -330,6 +343,13 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
         "snapshot",
         SnapshotController::new(snapshots.clone()),
         snapshots.clone()
+    );
+    // The guard on a backup's bytes. Without it, expiring a record left the
+    // file on the target for ever.
+    spawn!(
+        "backup",
+        BackupController::new(backups.clone()),
+        backups.clone()
     );
     spawn!(
         "snapshot-schedule",
@@ -378,9 +398,35 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
     let mut scan_shutdown = loops.shutdown.clone();
     let leading = loops.leader.clone();
     let mut notifier = crate::alerts::Notifier::new(loops.alerts.clone(), id, metrics.clone());
-    let pools: TypedStore<PoolSpec, PoolStatus> = TypedStore::new(store.clone(), id, "pools");
     let scanned_nodes = nodes.clone();
     let scanned_projects = projects.clone();
+    // Read here rather than through the quota controller: by the time this
+    // task runs, that controller belongs to the runner.
+    // The operator's own statement that a machine is out on purpose. Read on
+    // the alert pass so that declared work does not page anybody.
+    let alert_windows: TypedStore<
+        velstra_cloud_model::maintenance::MaintenanceWindowSpec,
+        velstra_cloud_model::maintenance::MaintenanceWindowStatus,
+    > = TypedStore::new(store.clone(), id, "maintenance-windows");
+    let usage_records: TypedStore<
+        velstra_cloud_model::usage::UsageRecordSpec,
+        velstra_cloud_model::usage::UsageRecordStatus,
+    > = TypedStore::new(store.clone(), id, "usage");
+    let scanned_networks = networks.clone();
+    let scanned_ports = ports.clone();
+    let scanned_routers = routers.clone();
+    let scanned_fips = floating_ips.clone();
+    let scanned_lbs = load_balancers.clone();
+    let scanned_ceph = ceph_clusters.clone();
+    // The copies and the places they go. Without these a backup that fails
+    // every night — no room, no target, a snapshot that will not take — says
+    // so only on its own object, which nobody reads until they need it.
+    let scanned_backups = backups.clone();
+    let backup_targets: TypedStore<
+        velstra_cloud_model::backup::BackupTargetSpec,
+        velstra_cloud_model::backup::BackupTargetStatus,
+    > = TypedStore::new(store.clone(), id, "backup-targets");
+    let scanned_targets = backup_targets.clone();
     out.push((
         "drift",
         Box::pin(async move {
@@ -398,6 +444,21 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
                             drift::scan("migrations", &migrations, &scan_metrics, now).await,
                             drift::scan("volumes", &volumes, &scan_metrics, now).await,
                             drift::scan("snapshots", &snapshots, &scan_metrics, now).await,
+                            // The network's own objects. Without these, every
+                            // networking failure was invisible until a
+                            // customer complained: a network stuck
+                            // unmirrorable, a port the datapath refused, a
+                            // floating IP that never landed.
+                            drift::scan("networks", &scanned_networks, &scan_metrics, now).await,
+                            drift::scan("ports", &scanned_ports, &scan_metrics, now).await,
+                            drift::scan("routers", &scanned_routers, &scan_metrics, now).await,
+                            drift::scan("floatingips", &scanned_fips, &scan_metrics, now).await,
+                            drift::scan("load-balancers", &scanned_lbs, &scan_metrics, now).await,
+                            drift::scan("backups", &scanned_backups, &scan_metrics, now).await,
+                            drift::scan("backup-targets", &scanned_targets, &scan_metrics, now)
+                                .await,
+                            // And the cluster the volumes live on.
+                            drift::scan("ceph-clusters", &scanned_ceph, &scan_metrics, now).await,
                         ];
                         let mut divergent = Vec::new();
                         for scan in scans {
@@ -410,15 +471,45 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
                             scanned_nodes.list(),
                             pools.list(),
                             scanned_projects.list(),
+                            scanned_ceph.list(),
+                            backup_targets.list(),
                         );
                         match listed {
-                            Ok((nodes, pools, projects)) => {
+                            Ok((nodes, pools, projects, ceph, targets)) => {
+                                // A read that fails means no window is
+                                // honoured this pass, which is the safe
+                                // direction: a missed suppression is a page
+                                // somebody can ignore, and an invented one is
+                                // a real outage nobody hears about.
+                                let windows: Vec<_> = alert_windows
+                                    .list()
+                                    .await
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .map(crate::scheduler::window_view)
+                                    .collect();
                                 let alerts = crate::alerts::evaluate(
-                                    &nodes, &pools, &projects, &divergent, notifier.rules(), now,
+                                    &nodes,
+                                    &pools,
+                                    &projects,
+                                    &ceph,
+                                    &targets,
+                                    &divergent,
+                                    &windows,
+                                    notifier.rules(),
+                                    now,
                                 );
                                 // Every process judges; only the leader tells anybody.
                                 let deliver = *leading.borrow();
                                 notifier.observe(alerts, deliver).await;
+                                // The same list, put to a second use: readings
+                                // of projects that are gone. The leader only —
+                                // this deletes, and every process doing it
+                                // would be three deletes racing for one row.
+                                if deliver {
+                                    crate::quota::sweep_orphaned_usage(&usage_records, &projects)
+                                        .await;
+                                }
                             }
                             Err(error) => error!(%error, "alert pass could not list the cell"),
                         }

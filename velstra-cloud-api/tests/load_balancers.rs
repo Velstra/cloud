@@ -136,7 +136,10 @@ async fn a_load_balancer_is_created_changed_and_deleted_by_its_own_tenant() {
         )
         .await
         .expect("draining the pool is a legitimate change");
-    assert_eq!(changed["meta"]["generation"].as_u64().unwrap(), before + 1);
+    assert_eq!(
+        changed.resource["meta"]["generation"].as_u64().unwrap(),
+        before + 1
+    );
 
     api.delete(&name("projects/p1/load-balancers/web"), None, &who(ADA))
         .await

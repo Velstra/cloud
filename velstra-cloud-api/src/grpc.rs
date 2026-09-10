@@ -146,6 +146,28 @@ fn authorization(metadata: &MetadataMap) -> Option<String> {
 
 /// An empty revision means the caller did not say which version it is
 /// replacing, which is last-writer-wins — the same as an absent `If-Match`.
+/// Keep only what the request's `update_mask` names.
+///
+/// The whole reason this exists: proto3 has no absent scalar, so an update
+/// carrying a message means "make the object look like this" — and a client
+/// resizing a guest also writes its cloud-init, its ports and its placement
+/// policy with whatever it happened to be holding. See
+/// [`velstra_cloud_model::mask`].
+///
+/// No mask at all, or an empty one, is the old behaviour and is left alone:
+/// nothing that worked stops working.
+fn masked(
+    whole: &Value,
+    mask: Option<&velstra_cloud_proto::prost_types::FieldMask>,
+    kind: &str,
+) -> ApiResult<Value> {
+    let Some(mask) = mask else {
+        return Ok(whole.clone());
+    };
+    velstra_cloud_model::mask::apply(whole, &mask.paths, kind)
+        .map_err(|why| ApiError::invalid(why.to_string()).at("update_mask"))
+}
+
 fn expect(revision: &str) -> ApiResult<Option<Revision>> {
     if revision.is_empty() {
         return Ok(None);
@@ -271,9 +293,13 @@ macro_rules! service {
                             .await?;
                     }
                     let spec = <$spec>::from(&sent.spec.unwrap_or_default());
-                    let body = json!({ "spec": spec, "meta": { "labels": meta.labels } });
+                    let whole = json!({ "spec": spec, "meta": { "labels": meta.labels } });
+                    // Only what the mask names. Empty is everything, which is
+                    // what every client had before this existed — see
+                    // `velstra_cloud_model::mask`, where the reasoning lives.
+                    let body = masked(&whole, request.update_mask.as_ref(), $kind)?;
                     let updated = self.api.patch(&name, &body, expect(&request.revision)?, &who).await?;
-                    let resource: Resource<$spec, $status> = typed(updated)?;
+                    let resource: Resource<$spec, $status> = typed(updated.resource)?;
                     Ok(Response::new(v1::$message::from(&resource)))
                 }
 

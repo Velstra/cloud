@@ -442,6 +442,10 @@ fn translate_all(rules: &[ResolvedRule]) -> Result<Vec<pb::PortRule>> {
 
 #[async_trait]
 impl Datapath for FabricDatapath {
+    fn datapath_name(&self) -> &'static str {
+        "fabric"
+    }
+
     async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>> {
         // From the taps, not from the fabric. The question this answers is what
         // *this machine* is carrying, and the tap is the machine's own record of

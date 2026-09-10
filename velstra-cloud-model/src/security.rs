@@ -180,6 +180,77 @@ pub enum RuleError {
     RemoteNotCidr,
 }
 
+/// How many ports one rule may span.
+///
+/// The datapath keys a rule on a single port, so a range becomes one rule per
+/// port. Sixty-four is where that stops being a translation and starts being a
+/// way to fill a table.
+pub const MOST_PORTS_IN_A_RULE: u32 = 64;
+
+/// Why a rule that is perfectly well-formed cannot be put on a wire.
+///
+/// Separate from [`RuleError`] because it is a different kind of no.
+/// `RuleError` says the rule contradicts itself and would be wrong on any
+/// platform. This says the rule is coherent and *this* datapath cannot key on
+/// it — a limit that could lift tomorrow without the rule having changed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Unprogrammable {
+    #[error(
+        "`any` names every protocol, and the datapath keys a rule on one. Write it as separate tcp, udp and icmp rules, or say which protocol you meant."
+    )]
+    EveryProtocol,
+    #[error(
+        "this allows every {protocol} port, and the datapath keys a rule on one. Name a port, or a range of at most {MOST_PORTS_IN_A_RULE}."
+    )]
+    EveryPort { protocol: &'static str },
+    #[error(
+        "this spans {width} ports ({from}-{to}), and the datapath keys a rule on one. At most {MOST_PORTS_IN_A_RULE} are expanded."
+    )]
+    TooManyPorts { width: u32, from: u16, to: u16 },
+}
+
+/// Whether a datapath can be given this rule at all.
+///
+/// **Why this is refused at the door rather than discovered on a wire.** These
+/// three shapes are exactly what the fabric turns down, and until it was asked
+/// the rule had already been accepted, stored and shown on a screen. The port
+/// then failed to program — the *whole* port, not the one rule — and the guest
+/// waiting on it never started. Nothing anywhere said why: the sentence existed,
+/// in an agent's journal, on a machine the person who wrote the rule does not
+/// have.
+///
+/// Two of these are the commonest rules in any cloud — "everything from this
+/// group" and "all TCP from anywhere" — so refusing them is a real loss. It is
+/// still the better half of the trade: a rule that is refused with a sentence
+/// naming what to write instead costs somebody a minute, and a rule that is
+/// accepted and silently wedges an instance costs an afternoon.
+pub fn programmable(rule: &SecurityRule) -> Result<(), Unprogrammable> {
+    if rule.protocol == Protocol::Any {
+        return Err(Unprogrammable::EveryProtocol);
+    }
+    match rule.ports {
+        None if rule.protocol.has_ports() => Err(Unprogrammable::EveryPort {
+            protocol: match rule.protocol {
+                Protocol::Tcp => "tcp",
+                Protocol::Udp => "udp",
+                _ => "",
+            },
+        }),
+        Some(range) => {
+            let width = u32::from(range.to).saturating_sub(u32::from(range.from)) + 1;
+            if width > MOST_PORTS_IN_A_RULE {
+                return Err(Unprogrammable::TooManyPorts {
+                    width,
+                    from: range.from,
+                    to: range.to,
+                });
+            }
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
 /// Refuse a rule that cannot mean what it appears to mean.
 ///
 /// Deliberately narrow: it rejects rules that are self-contradictory, never
@@ -670,5 +741,79 @@ mod tests {
         assert_eq!(c.status, ConditionStatus::False);
         assert_eq!(c.reason, "PortsPending");
         assert!(c.message.contains("projects/p/ports/b"), "{}", c.message);
+    }
+}
+
+#[cfg(test)]
+mod programmable_tests {
+    use super::*;
+
+    fn rule(protocol: Protocol, ports: Option<PortRange>) -> SecurityRule {
+        SecurityRule {
+            direction: Direction::Ingress,
+            protocol,
+            ports,
+            remote: Remote::Cidr("0.0.0.0/0".into()),
+        }
+    }
+
+    /// The ordinary rule goes through untouched.
+    #[test]
+    fn a_rule_naming_a_protocol_and_a_port_is_fine() {
+        assert!(programmable(&rule(Protocol::Tcp, Some(PortRange { from: 443, to: 443 }))).is_ok());
+        assert!(
+            programmable(&rule(
+                Protocol::Tcp,
+                Some(PortRange {
+                    from: 8000,
+                    to: 8063
+                })
+            ))
+            .is_ok()
+        );
+        // A protocol with no ports is keyed at port zero, and needs none.
+        assert!(programmable(&rule(Protocol::Icmp, None)).is_ok());
+    }
+
+    /// The two commonest rules in any cloud, both refused — with a sentence
+    /// naming what to write instead. They were accepted, stored and shown, and
+    /// then the whole *port* failed to program and the guest waiting on it
+    /// never started, with the reason only in an agent's journal.
+    #[test]
+    fn every_protocol_and_every_port_are_refused_in_words() {
+        let any = programmable(&rule(Protocol::Any, None)).expect_err("`any` was accepted");
+        assert!(
+            any.to_string().contains("separate tcp, udp and icmp"),
+            "{any}"
+        );
+
+        let wide = programmable(&rule(Protocol::Tcp, None)).expect_err("portless tcp was accepted");
+        assert!(wide.to_string().contains("Name a port"), "{wide}");
+        assert!(wide.to_string().contains("tcp"), "{wide}");
+    }
+
+    /// And a range wider than the datapath expands.
+    #[test]
+    fn a_range_too_wide_to_expand_is_refused_with_its_width() {
+        let all = programmable(&rule(Protocol::Tcp, Some(PortRange { from: 1, to: 65535 })))
+            .expect_err("every port was accepted as a range");
+        assert!(all.to_string().contains("65535 ports"), "{all}");
+        assert!(all.to_string().contains("1-65535"), "{all}");
+    }
+
+    /// One more than the limit is refused; exactly the limit is not. A bound
+    /// that is off by one is a bound somebody hits without understanding why.
+    #[test]
+    fn the_limit_is_where_it_says_it_is() {
+        let at = PortRange {
+            from: 100,
+            to: 100 + MOST_PORTS_IN_A_RULE as u16 - 1,
+        };
+        assert!(programmable(&rule(Protocol::Tcp, Some(at))).is_ok());
+        let over = PortRange {
+            from: 100,
+            to: 100 + MOST_PORTS_IN_A_RULE as u16,
+        };
+        assert!(programmable(&rule(Protocol::Tcp, Some(over))).is_err());
     }
 }

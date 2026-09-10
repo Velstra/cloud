@@ -38,11 +38,6 @@ fn exempt(collection: &str, field: &str) -> Option<&'static str> {
              whole set replaces all of it on every save and loses whatever a \
              colleague did in between",
         ),
-        ("images", "signature") => Some(
-            "nothing in this platform verifies a signature, so the API refuses \
-             one — and a box that records a security claim nothing checks is \
-             where the claim comes from. It comes back with verification",
-        ),
         ("instances", "node") => Some(
             "where a guest runs is the scheduler's answer, not an operator's \
              request; forcing it is a separate deliberate action",
@@ -148,6 +143,14 @@ mod complete {
             encryption_key: Some("projects/p1/keys/k".into()),
             source_image: Some("projects/p1/images/sha256-abc".into()),
             source_snapshot: Some("projects/p1/volumes/v/snapshots/s".into()),
+            // Not `Default`: a field that serialises to nothing is a field
+            // this test cannot see, and the whole point is that it sees every
+            // one of them.
+            limits: velstra_cloud_model::throttle::Limits {
+                iops: 5_000,
+                read_mibps: 200,
+                write_mibps: 100,
+            },
         }
     }
 
@@ -181,6 +184,9 @@ mod complete {
             size_bytes: 1,
             source_url: "http://images.invalid/x".into(),
             signature: Some("sig".into()),
+            state: velstra_cloud_model::resources::ImageState::Deprecated,
+            replacement: "images/sha256-new".into(),
+            shared_with: Default::default(),
         }
     }
 
@@ -821,6 +827,22 @@ mod settled {
             console_bytes: 0,
             devices: Vec::new(),
             cpu: None,
+            usage: Some(velstra_cloud_model::resources::GuestUsage {
+                at: Timestamp(1),
+                cpu_ms: 1_000,
+                cpu_percent: 12,
+                memory_mib: 480,
+                rx_bytes: 1_024,
+                tx_bytes: 2_048,
+                rx_packets: 8,
+                tx_packets: 9,
+                rx_total: 1_024,
+                tx_total: 2_048,
+                disk_read_bytes: 4_096,
+                disk_write_bytes: 8_192,
+                disk_read_ops: 1,
+                disk_write_ops: 2,
+            }),
             observed_generation: 1,
             conditions: vec![],
             state: InstanceState::Running,
@@ -876,6 +898,40 @@ mod settled {
                 even_if_unsuitable: false,
             }],
             pools_present: vec!["velstra-volumes".into()],
+            seen: velstra_cloud_model::ceph::CephSeen {
+                health: "HEALTH_OK".into(),
+                pgs: vec![velstra_cloud_model::ceph::PgState {
+                    state: "active+clean".into(),
+                    count: 64,
+                }],
+                pgs_total: 64,
+                objects: 95,
+                used_bytes: 371_761_152,
+                total_bytes: 124_012_986_368,
+                osds: vec![velstra_cloud_model::ceph::OsdSeen {
+                    id: 0,
+                    host: "hv-1".into(),
+                    device: "/dev/sdb".into(),
+                    up: true,
+                    r#in: true,
+                    used_bytes: 371_761_152,
+                    total_bytes: 124_012_986_368,
+                    pgs: 64,
+                    class: "hdd".into(),
+                }],
+                pool_stats: vec![velstra_cloud_model::ceph::PoolSeen {
+                    pool: "velstra-volumes".into(),
+                    stored_bytes: 2093,
+                    objects: 6,
+                    max_avail_bytes: 117_440_577_536,
+                    size: 1,
+                    min_size: 1,
+                    pg_num: 32,
+                }],
+                at: velstra_cloud_model::meta::Timestamp(1_788_800_000_000),
+                ..Default::default()
+            },
+            seen_by: "hv-1".into(),
         }
     }
 }

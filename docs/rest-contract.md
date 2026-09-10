@@ -17,6 +17,41 @@ rewrites it). Feed it to a client generator or a Terraform provider framework;
 this document stays the place the *meaning* is written down, because a schema
 says what a field is called and not why it is derived or what refuses it.
 
+## What a gRPC update changes: `update_mask`
+
+The one place where the two surfaces genuinely differ, and it is not a
+decoration.
+
+A `PATCH` carries only what it changes; everything left out stays as it is.
+A gRPC update cannot say that: proto3 has no absent scalar, so a field the
+caller never touched arrives at its zero value and is byte-for-byte the same
+as one they deliberately set to zero. An update carrying a message therefore
+means *make the object look like this* — and a client resizing a guest writes
+its cloud-init, its ports and its placement policy at the same time, with
+whatever it happened to be holding.
+
+Every `Update…Request` carries a `google.protobuf.FieldMask`:
+
+```
+UpdateInstanceRequest {
+  instance:    { meta: { name: "projects/p1/instances/i1" }, spec: { vcpus: 8 } }
+  update_mask: { paths: ["spec.vcpus"] }
+}
+```
+
+Paths are relative to the resource — `spec.vcpus`, `meta.labels` — and both
+spellings of a step are accepted (`spec.memory_mib` and `spec.memoryMib`),
+because a generated client whose JSON mapping is lowerCamelCase hands its user
+the camel one and neither is a typo. A path that names a **branch** keeps the
+whole branch, as AIP-134 says.
+
+**An empty mask means every field the message carries**, which is the
+behaviour every existing client already has — so adding this breaks nothing.
+It is also the reason to send one.
+
+A path that names a field nobody has is **refused**, not ignored: a caller who
+writes `spec.vcpu` and is answered OK has been told their change was made.
+
 ## Names and shapes
 
 A resource is addressed the way AIP addresses one:
@@ -110,6 +145,160 @@ Filtering is **not** refusing, and the audit reflects that: narrowing a list
 writes nothing, however many objects it skips. `audit` records somebody who
 reached for a thing by name and was told no.
 
+### Sharing an image with another project
+
+```
+PATCH /api/v1/projects/p1/images/sha256-golden  {"spec": {"sharedWith": ["projects/p2"]}}
+PATCH /api/v1/projects/p1/images/sha256-golden  {"spec": {"sharedWith": ["*"]}}
+```
+
+`*` is every project in the cell — how a provider publishes one golden image
+instead of copying it into every tenant.
+
+The grant is **one-way and read-only**. A project it is shared with can read
+the image and boot from it; it cannot edit, deprecate, retire or delete it.
+Editing goes through the ordinary authorisation, which knows nothing about
+sharing.
+
+It grants nothing a person did not already hold: the question asked of each
+named project is the ordinary "may this caller read images *there*", so sharing
+only says which image their existing access now reaches.
+
+### A firewall on a cell with no fabric
+
+A node that is the first hop for its guests (`VELSTRA_LOCAL_NETWORK=1`) now
+puts security-group rules in force itself, as an nftables chain per port. Until
+this existed such a cell had one choice: no rules, or no guests — the tap
+datapath refused a port carrying rules rather than accepting them and filtering
+nothing.
+
+The rules mean the same thing they mean on the fabric:
+
+- A port with **no** rules is unfiltered.
+- A port with **any** rule is default-deny in both directions, and that rule is
+  the whole of what is allowed. Anything else would mean adding a rule could
+  silently widen a port.
+- The **answer** to something already allowed comes back without a second rule
+  in the other direction.
+- A port number in a rule always names the service being reached: ingress 443
+  is somebody connecting to the guest's 443, egress 443 is the guest
+  connecting to somebody's 443.
+
+What each port turned away is reported on the port:
+
+```json
+"status": {
+  "dropped": {
+    "inboundPackets": 12, "inboundBytes": 800,
+    "outboundPackets": 3, "outboundBytes": 200
+  }
+}
+```
+
+Absent means **nothing is judging this port** — no rules, or a datapath that
+counts elsewhere. Deliberately not zero: zero says "nothing was dropped", and
+the truth there is "nothing was judged". It is the one number that tells a
+firewall apart from a route and from a service that is not listening.
+
+### Narrowing a list by time
+
+Every object carries `meta.createdAt`, so every collection takes the same
+range:
+
+```
+GET /api/v1/audit?since=1h
+GET /api/v1/audit?since=1788960000000&until=1788963600000
+GET /api/v1/projects/p1/operations?since=7d&until=1d
+```
+
+`since` and `until` are either **milliseconds since the epoch** — the same
+number every timestamp in this API is — or a **span back from now**: `30s`,
+`30m`, `6h`, `7d`. The span form exists because "the refusals of the last
+hour" is the question people actually have, and making somebody compute an
+epoch to ask it is how a filter ends up unused.
+
+`since` is inclusive and `until` exclusive, so two adjacent ranges neither
+overlap nor skip. A value that parses as neither is refused rather than
+ignored: silently returning the whole audit is the shape where a page loads in
+development and times out in production.
+
+On most collections the range is a filter, and costs a walk. On the **audit**
+it is an index: an audit id is `{kind}-{minute}-{hash}`, so the log is stored
+sorted by kind and then by minute, and a range is read by seeking into each
+kind's keys rather than by walking past every record written before it. On a
+cell with two hundred thousand records that is the difference between an answer
+and a timeout.
+
+### Ordering a list
+
+```
+GET /api/v1/audit?since=24h&orderBy=createdAt desc&pageSize=50
+```
+
+Two fields, `name` and `createdAt`, each optionally followed by ` desc`. Those
+are the two orders every collection has and that mean the same thing in all of
+them; sorting on a status field would order half a list by a value the other
+half does not carry.
+
+An ordered listing is a **top-N, not a pageable ordered stream**. The API reads
+everything the filter admits, sorts it, and returns the first `pageSize` of the
+sorted order — so "the fifty newest refusals" really is the fifty newest. There
+is no `nextPageToken`: a token is a key in the store's own order, and following
+one would give a list ordered inside each page and unordered across them. When
+the answer was cut, the body carries `"truncated": true`.
+
+**`orderBy` and `pageToken` together are refused.** Ask for a larger
+`pageSize`, or page unordered and sort at the client.
+
+Narrow first. `orderBy` reads everything the filter admits, so an ordered
+request over a large collection should carry a `since` — on the audit that is
+served by a key range and costs nothing (below), while an unfiltered ordered
+read of a whole log is exactly as expensive as it sounds.
+
+### Asking for only some fields
+
+```
+GET /api/v1/projects/p1/instances?fields=status.phase,status.addresses
+```
+
+A read mask: comma-separated dotted paths, applied to the answer. `meta.name`
+comes back whether it was named or not — a row without its name is one nothing
+can be done with, and a caller who forgets it should get a list they cannot
+use rather than an error they have to read.
+
+The mask is applied to the finished document, so a computed field can be named:
+`status.addresses` is not in the store.
+
+### What a volume may take from its pool
+
+A pool is shared and its disks are finite. Two places carry a number, and the
+split is the design:
+
+```
+PATCH /api/v1/pools/rbd            {"spec": {"volumeCeiling": {"iops": 5000, "readMibps": 200, "writeMibps": 100}}}
+PATCH /api/v1/projects/p1/volumes/logs  {"spec": {"limits": {"iops": 1000}}}
+```
+
+- A **volume** carries what it asked for. Sizing a database volume differently
+  from a log volume is a legitimate thing to want, and it is the tenant's to
+  say.
+- A **pool** carries the ceiling. It is the operator's, it applies to every
+  volume in the pool, and a tenant cannot raise it. Asking for more than the
+  ceiling **gets the ceiling**, not a refusal — a refusal would make a ceiling
+  somebody lowers break every volume that was already above it.
+
+The default is the part that matters. A volume that names no limit on a pool
+that has a ceiling gets **the ceiling**, not "unlimited" — otherwise the lever
+does nothing, because nobody sets a limit on themselves.
+
+Zero is unlimited in both places, and that is what a cell starts with: nothing
+here changes behaviour until an operator sets a ceiling.
+
+The settled number is mirrored onto the **attachment** (`spec.limits`), which
+is the object the node holds — a node is told about neither volumes nor pools.
+It is programmed when the disk is opened, so a changed ceiling reaches a
+running guest at its next attach rather than immediately.
+
 ### Snapshot schedules
 
 The cheap half of the pair:
@@ -200,8 +389,33 @@ guest" are readings, not a bill:
 GET /api/v1/projects/p1:explainUsage?month=2026-08
 { "month": "2026-08", "hours": 49, "hoursInMonthSoFar": 744,
   "vcpuHours": 49, "memoryGibHours": 49, "volumeGibHours": 196,
-  "instanceHours": 49, "floatingIpHours": 12 }
+  "instanceHours": 49, "floatingIpHours": 12,
+  "loadBalancerHours": 49, "deviceHours": 0,
+  "snapshotGibHours": 320, "backupGibHours": 0,
+  "rxBytes": 9182736, "txBytes": 1827364 }
 ```
+
+Every dimension the platform counts has a line here. A dimension it tracks on
+the project and leaves out of this answer is worse than one it does not track:
+the operator sees a number on the project, no line for it on the bill, and no
+way to tell a pricing decision from a bug.
+
+`rxBytes` and `txBytes` are the one line that is a **flow** rather than a
+level, and `tx` is the egress every cloud charges for. Each hourly reading
+already holds its own interval's traffic, so the month is the sum of its hours
+— no subtraction anywhere, and a gap in the readings is a gap in the bill
+rather than a number invented from two ends of it. The node carries each
+guest's totals across a tap that was remade, so a restart or a migration no
+longer loses everything since the last reading.
+
+**It under-counts by design**, in two places, and both err the same way. A
+guest deleted mid-interval takes its unbilled bytes with it: it is no longer in
+the sum, so the difference comes out smaller and is clamped at zero rather than
+going negative. And an hour whose predecessor carried nothing at all bills
+nothing — otherwise the first reading after this field existed would have put
+every guest's whole life onto one hour's line. A bill that quietly over-charges
+for traffic nobody can point at is the one nobody forgives.
+
 
 Each reading is one hour at what the reading says — the industry's own
 arithmetic. `month` omitted means the current one; a spelling that is not
@@ -212,6 +426,101 @@ number instead of a suspicion. Authorised as a read of the project, so a tenant
 sums their own bill and nobody else's. What the platform deliberately does not
 have is prices: metric-hours times a price list is the billing system's line of
 business, and this answer is what it multiplies.
+
+### Two families at once
+
+IPv6 reaches a guest by being **written into its netplan**, which the guest
+fetches from the metadata service over its IPv4 address. There are no router
+advertisements and no DHCPv6 in this platform; the address is stated, the same
+way the v4 one is.
+
+A subnet holds one range, and the fabric's network holds one range against
+which it checks every port's address — so two families means two networks, two
+subnets and two ports on one guest:
+
+```
+POST /api/v1/projects/p1/networks   { "id": "v6",  "spec": { "vni": 5006, "mtu": 1500 } }
+POST /api/v1/projects/p1/subnets    { "id": "v6",  "spec": { "network": "projects/p1/networks/v6",
+                                                             "cidr": "fd00:19:136::/64",
+                                                             "gateway": "fd00:19:136::1" } }
+POST /api/v1/projects/p1/ports      { "id": "p6",  "spec": { "network": "projects/p1/networks/v6",
+                                                             "subnet": "projects/p1/subnets/v6" } }
+POST /api/v1/projects/p1/instances  { "id": "web-1", "spec": {
+    "ports": ["projects/p1/ports/p4", "projects/p1/ports/p6"], … } }
+```
+
+The allocator hands out v6 addresses like any other (`fd00:19:136::2`), and
+`status.addresses` carries both. Each family gets **its own default route** —
+they are different route tables and cannot race, and a guest given a v6 address
+with no way off its own link can reach its neighbour and nothing else.
+
+**A guest with no v4 address at all** cannot reach the metadata service — it
+listens on a v4 link-local — so it cannot fetch the configuration that would
+tell it its v6 address. The one mechanism that breaks that circle is a router
+advertisement, and an advertisement has to come from the machine that holds the
+gateway.
+
+On a cell whose datapath is the local bridge, that machine is the node, and it
+advertises: one prefix per v6 segment, on-link and autonomous, so a guest builds
+its own address and learns its default route without asking anybody. It also
+answers a router solicitation, which is what a guest sends at boot rather than
+waiting five minutes for the next unsolicited one.
+
+On a cell whose datapath is the **fabric**, the gateway lives there and the node
+holds only a tap — so the node says nothing, because a router claiming a link it
+does not route is worse than no router. A v6-only guest on such a cell needs the
+fabric to advertise. Dual-stack, above, works on both.
+
+### What a guest is using
+
+`status.usage` on an instance, written by the node that runs it:
+
+```
+GET /api/v1/projects/p1/instances/web-1
+{ "status": { "usage": {
+    "at": 1787998635432,
+    "cpuMs": 1843250, "cpuPercent": 137,
+    "memoryMib": 7910,
+    "rxBytes": 9182736, "txBytes": 1827364,
+    "rxPackets": 12345, "txPackets": 6789 } } }
+```
+
+**Counters, plus one rate.** The cumulative figures are for a monitoring
+system, which takes its own differences and never has to trust this platform's
+idea of an interval. `cpuPercent` is for a person: `100` is one vCPU
+saturated, so a four-vCPU guest can reach `400`. It is measured over the
+interval since the previous reading, never since boot — an average since boot
+converges on a number that stops moving, which is the one shape of graph that
+cannot show a problem.
+
+Milliseconds rather than seconds for the CPU counter, because the rate is a
+difference of two readings: over a thirty-second pass a guest using three
+percent of one core advances a whole-second counter by zero or one, and the
+graph is then a square wave.
+
+Three things to know:
+
+* These are the **host's** numbers — CPU the kernel charged the guest's
+  machine, resident memory the host is holding for it, bytes across the wires
+  this node programmed. What the guest believes about itself needs an agent
+  inside it, and no cloud gets that from outside.
+* `rx` and `tx` are named **from the guest's side**. The host's tap sees them
+  the other way round; the swap happens once, on the node.
+* The field is **absent** on a guest that is not running, and after a restart
+  the counters begin again. Absence is the answer, never a zero: a zero reads
+  as idle, and idle is something people act on.
+
+Disk read and write come from the VMM's own monitor — `query-blockstats` on
+QEMU, `vm.counters` on Cloud Hypervisor — summed across every disk the guest
+holds, because a guest with a root disk and two volumes is one guest:
+
+```
+"diskReadBytes": 5368709120, "diskWriteBytes": 1073741824,
+"diskReadOps": 40000, "diskWriteOps": 12000
+```
+
+They are the VMM's answer rather than the host's, because the host sees a file
+being written and not which guest disk it was.
 
 ### A way into a guest: the console
 
@@ -502,6 +811,36 @@ Changing bindings needs `admin` — kept apart from everything else so an editor
 cannot grant themselves more than they were given. A role name that does not
 parse reads as `viewer`: a typo lands on the least, not the most.
 
+### Withdrawing an image
+
+An image is content-addressed and immutable, so one is never replaced — a newer
+one is published beside it and `families/<family>` resolves to that instead. On
+its own that leaves the superseded image looking exactly as current as its
+replacement on every list, so `spec.state` says where it is in its life:
+
+| | |
+|---|---|
+| `Active` | the ordinary state; chosen by family |
+| `Deprecated` | still boots; no longer chosen by family, so new guests land on the newer image while everything pinned to the digest keeps working |
+| `Obsolete` | refused for anything new; guests already built from it are untouched |
+
+`spec.replacement` names what to use instead, and it is read out in the
+refusal:
+
+```
+409 { "error": { "code": "FAILED_PRECONDITION", "field": "spec.image",
+                 "message": "images/debian-13-old has been retired, so nothing new is built
+                             from it. Guests already running on it are unaffected.
+                             Use images/debian-13-new instead." } }
+```
+
+Publishing from an image source does this by itself: the newer image deprecates
+the one it supersedes, with `replacement` pointing forward. Only images that
+source published — a hand-made image in the same family is somebody else's.
+
+Deleting an image is still what reclaims the bytes. The states are the notice
+period before it.
+
 ### Publishing an image into the catalogue
 
 An image under a project is that project's; one under the cell is the
@@ -635,6 +974,39 @@ because an outage caused by housekeeping above somebody is the wrong answer.
 Quota and policy do **not** inherit. They are the project's own, decided by the
 cell for that project.
 
+### What a project is capped at
+
+Twelve dimensions, every one counted from the objects that exist rather than
+tracked as a running total — a total that is incremented on create and
+decremented on delete is wrong the first time either half is missed, and it
+fails closed.
+
+| | |
+|---|---|
+| `instances`, `vcpus`, `memoryMib` | the guests and what they are made of |
+| `volumes`, `volumeGib` | volume objects, and the gibibytes they and the guests' root disks take together |
+| `floatingIps`, `loadBalancers` | addresses and services the cell has a finite number of |
+| `devices` | passed-through PCI hardware, which exists once and cannot be oversubscribed |
+| `snapshots`, `snapshotGib`, `backups`, `backupGib` | copies, and what they occupy |
+
+Two things about the storage dimensions are worth stating because they surprise
+people:
+
+* A guest's **root disk counts as volume storage**. A project capped at 100 GiB
+  cannot take 100 GiB of volumes *and* a 40 GiB guest.
+* Snapshot and backup gibibytes are counted from what each one **turned out to
+  occupy**, which the pool reports afterwards. A new snapshot therefore adds
+  nothing to the sum at the moment it is asked for: the limit refuses the next
+  one once the project is already over, which is the honest bound a size nobody
+  can state in advance allows. The count (`snapshots`, `backups`) has no such
+  caveat.
+
+**A limit of zero means nobody set one**, in every dimension. It is not a limit
+of none.
+
+`GET /api/v1/projects/p1:explainQuota` answers all twelve at once, with what is
+left in each and whether the quota or the cell is the binding constraint.
+
 ### What the cell allows a project
 
 A quota says **how much**. A project's policy says **what kind**, and it is the
@@ -684,6 +1056,52 @@ to keep meaning what it meant.
 - **Deletion is two-phase and visible.** DELETE sets `meta.deletedAt` and
   returns 202 with the object; the object stays listable, with its finalizers,
   until they are released. A client that wants "gone" waits for 404.
+- **A rule the datapath cannot key on is refused where it is written.** The
+  datapath keys a rule on one protocol and one port, so `protocol: "any"`, a
+  TCP or UDP rule with no port, and a range wider than 64 ports are refused
+  with a sentence naming what to write instead. They used to be accepted and
+  shown, and then the *whole port* failed to program and the guest waiting on
+  it never started.
+- **A second subnet on a network the fabric is carrying is refused.** The
+  fabric's network holds one range and checks every port's address against it;
+  two subnets have no faithful mirror. Adding one used to leave the network
+  quietly unmirrored — working until the next fabric restart. On a cell with no
+  fabric, several subnets per network work and are not refused.
+- **A create can be retried.** Send `Idempotency-Key: <your own string>` and
+  the second attempt of the same create is answered with the first attempt's
+  operation and target, having made nothing new. See below.
+
+### Retrying a create
+
+A create that carries its own `id` is already safe to repeat: the second
+attempt answers 409 `AlreadyExists`, which a client reads as "mine". A create
+that lets the platform pick the name is not — the request that timed out may
+have been accepted, and the only way to find out is to look, which is the race
+the retry was trying to avoid.
+
+`Idempotency-Key` closes that. Invent a key, send it on every attempt of the
+same create, and:
+
+- the first attempt does the work and remembers the answer;
+- a second attempt with the **same body** is answered with that same answer,
+  202, plus `x-velstra-idempotent-replay: true`, and makes nothing new;
+- a second attempt with a **different body** is refused with 409 — a key stands
+  for one create, and answering a different request with somebody else's object
+  is the failure this check exists to prevent;
+- an attempt that arrives while the first is still in flight gets 409 `Aborted`
+  and should be retried in a moment;
+- a create that **failed** does not spend the key, so the corrected retry may
+  reuse it.
+
+Keys are remembered for a day and are scoped to the caller, so two tenants who
+pick the same string never collide. Registering a node or a pool does not take
+a key: its answer carries a credential shown once, which a replay could not
+return.
+
+```http
+POST /api/v1/projects/p1/instances
+Idempotency-Key: 4d1f0f2c-1b6e-4a9e-9d3f-6a0b2c8e1a77
+```
 
 ## Derived fields
 
@@ -1121,6 +1539,41 @@ What a client may rely on:
 
 Like `security-groups`, this collection is served on the JSON surface only;
 there is no gRPC service for it yet.
+
+### Where a balancer actually balances
+
+Two datapaths, two answers, and the object says which:
+
+* **With a fabric**, the controller programs one fabric service per listener and
+  the fabric balances wherever the packet arrives.
+* **Without one** — the local-bridge datapath, the single box that is a whole
+  cell — each node holds the balancer's address on its own bridge and forwards
+  connections to the members *it carries*. It says so in `status.balancers`, and
+  the balancer's own condition reads `Served` naming those nodes, or
+  `NoDataPlane` when nothing is answering.
+
+The second was nothing at all until recently: a balancer on a fabric-less cell
+took an address, said nothing and forwarded nothing, while being in the model,
+on the console, in this document and in the API.
+
+**It does not terminate TLS, and that is a decision.** The stream is passed
+through byte for byte and whichever guest receives it presents the certificate —
+which is what a network load balancer *is*, and what AWS's NLB does. Terminating
+would mean this platform holding a tenant's private key, and it has nowhere safe
+to hold one: it refuses `encryptionKey` for exactly that reason and would be
+contradicting itself. So a public HTTPS service is a balancer with a `Tcp`
+listener on 443 and a guest that speaks TLS:
+
+```
+{ "spec": { "listeners": [ { "protocol": "Tcp", "port": 443, "memberPort": 443 } ],
+            "members": [ "projects/p1/ports/web-a", "projects/p1/ports/web-b" ] } }
+```
+
+Two more things it does not do, stated so nobody looks for them: it balances
+**only across members on the node holding the address** — without a fabric there
+is no path from one machine to a guest on another, so a member elsewhere is one
+that node could not reach — and it is round robin, with no weights and no
+least-connections. Both are real things and neither is worth pretending to have.
 
 ## Long-running operations
 

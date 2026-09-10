@@ -400,9 +400,18 @@ impl Reconciler for FloatingIpController {
                     .await?;
                 return Ok(());
             }
-            // Every guard is off, this one included — the record is the store's
-            // to remove now, and there is nothing left here to hold it up.
-            FinalizerStep::Delete => return Ok(()),
+            // Every guard is off, this one included. The record does not go on
+            // its own: `may_delete` is the *controller's* leave to remove it,
+            // and nothing else will — found live, where a floating IP whose
+            // address the fabric had let go stayed on the board for good, with
+            // `deletedAt` set and no finalizer left to wait for.
+            FinalizerStep::Delete => {
+                self.floating
+                    .delete(name, fip.meta.revision, &Writer::controller(WHO))
+                    .await?;
+                info!(floating_ip = %name, "gone");
+                return Ok(());
+            }
             FinalizerStep::Wait if fip.meta.is_deleting() => {
                 if !fip.meta.has_finalizer(FABRIC_RELEASE_FINALIZER) {
                     // Somebody else's guard is still on. Waiting is the whole

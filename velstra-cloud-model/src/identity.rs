@@ -197,6 +197,37 @@ pub struct NodeCredentialSpec {
     /// When it was issued, so an operator can see a credential's age.
     #[serde(default)]
     pub issued_at: Timestamp,
+    /// When it stops working, if ever.
+    ///
+    /// `None` — the default, and what every credential minted before this
+    /// field is — never expires. That is the honest default rather than the
+    /// safe-looking one: an agent reads its token file once at startup and
+    /// holds it for the life of the process, so a credential that expired on
+    /// its own would take a machine's agent down at a moment nobody chose,
+    /// with no way for the agent to fetch another. Until an agent can reload,
+    /// an expiry is something an operator opts a *particular* credential into
+    /// — the one they issued for a contractor, or the one they are rotating
+    /// away from and want to see stop being used.
+    ///
+    /// Rotation without this is: issue a second credential, put it on the
+    /// machine, restart the agent, revoke the first. Issuing never revokes, so
+    /// there is no window where the machine has no way in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
+    /// What it is for, in the operator's own words.
+    ///
+    /// The same field a service account's token carries, for the same reason:
+    /// an operator looking at three credentials for one machine has to know
+    /// which is which before revoking one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
+}
+
+impl NodeCredentialSpec {
+    /// Whether this credential still opens the door at `now`.
+    pub fn live_at(&self, now: Timestamp) -> bool {
+        self.expires_at.is_none_or(|end| now.0 < end.0)
+    }
 }
 
 /// What a credential speaks for.

@@ -43,6 +43,18 @@ struct Args {
     /// the variable. Without any, every signature is refused at admission.
     #[arg(long, env = "VELSTRA_IMAGE_SIGNING_KEYS", value_delimiter = ',')]
     image_signing_key: Vec<String>,
+    /// Whose certificates to believe when a node serves its guest console over
+    /// TLS.
+    ///
+    /// A cell's nodes carry certificates its own authority signed, so the
+    /// public trust store answers "unknown issuer" to every one of them.
+    /// Usually the same CA file the agents are given with `--api-ca`.
+    ///
+    /// Empty falls back to the public roots, which is right for a node with a
+    /// publicly-signed name and wrong for every private cell — and a cell whose
+    /// nodes serve no TLS never reaches this code at all.
+    #[arg(long, env = "VELSTRA_CONSOLE_CA", default_value = "")]
+    console_ca: String,
 
     /// Print the REST surface as OpenAPI 3.1 and exit, serving nothing.
     ///
@@ -265,6 +277,9 @@ async fn main() -> anyhow::Result<()> {
     if !args.store_backup_dir.is_empty() {
         api = api.with_store_backups(std::path::PathBuf::from(&args.store_backup_dir));
     }
+    if !args.console_ca.is_empty() {
+        api = api.with_console_ca(std::path::PathBuf::from(&args.console_ca));
+    }
     if args.writes_per_second > 0 {
         let rate = velstra_cloud_model::limit::Rate {
             per_second: args.writes_per_second,
@@ -318,13 +333,64 @@ async fn main() -> anyhow::Result<()> {
         let router = velstra_cloud_api::proxy::Router::new(routing_store, &args.cell, cells);
         velstra_cloud_api::server_routed(api, router)
     };
+    /// How long in-flight work has once shutdown has been asked for.
+    const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    // What ends the server: SIGTERM from systemd or a container runtime, or a
+    // Ctrl-C from somebody at a terminal. Without this the process is killed
+    // outright on every `systemctl restart`, container rollout and node
+    // reboot: in-flight creates are dropped between the store write and the
+    // answer, and every open console and watch is severed rather than closed.
+    async fn ending() {
+        let interrupt = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        #[cfg(unix)]
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                // No signal handler is not a reason to refuse to serve; it
+                // just means only Ctrl-C ends this process politely.
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot listen for SIGTERM; shutdown will be abrupt");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            _ = interrupt => {}
+            _ = terminate => {}
+        }
+        tracing::info!("shutting down: no new connections, in-flight requests finish");
+        // And a floor under how long that takes. Node agents hold watch
+        // streams open for hours by design, so "wait for every connection to
+        // close" is "wait for ever" — a restart would sit until systemd lost
+        // patience and killed it, which is the abrupt end this exists to
+        // avoid. Twenty seconds is long enough for any ordinary request and
+        // short enough that a rollout is not held up by one websocket.
+        tokio::spawn(async {
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            tracing::warn!(
+                "connections still open after {}s; going anyway",
+                SHUTDOWN_GRACE.as_secs()
+            );
+            std::process::exit(0);
+        });
+    }
+
     match tls {
         None => {
             tracing::warn!(
                 "serving plaintext: no --tls-cert. A password crosses this connection in \
                  the clear, so put TLS in front of it before it leaves a network you trust"
             );
-            axum::serve(listener, served).await?;
+            axum::serve(listener, served)
+                .with_graceful_shutdown(ending())
+                .await?;
         }
         Some((cert, key)) => {
             // Chosen here rather than left to rustls, which will not choose: with
@@ -339,7 +405,16 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("reading {cert} and {key}: {e}"))?;
             tracing::info!(cert = %cert, "serving https");
+            // axum-server takes the handle rather than a future: the same
+            // shutdown, spelled its way.
+            let handle = axum_server::Handle::new();
+            let closing = handle.clone();
+            tokio::spawn(async move {
+                ending().await;
+                closing.graceful_shutdown(Some(SHUTDOWN_GRACE));
+            });
             axum_server::bind_rustls(address, config)
+                .handle(handle)
                 .serve(served.into_make_service())
                 .await?;
         }

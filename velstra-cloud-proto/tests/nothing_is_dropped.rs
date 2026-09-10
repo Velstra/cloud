@@ -166,8 +166,13 @@ survives_the_wire!(
         volume_gib: 20_000,
         floating_ips: 12,
         load_balancers: 6,
+        snapshots: 100,
+        snapshot_gib: 5_000,
+        backups: 30,
+        backup_gib: 9_000,
     },
-    { instances, vcpus, memory_mib, volumes, volume_gib, floating_ips, load_balancers, devices }
+    { instances, vcpus, memory_mib, volumes, volume_gib, floating_ips, load_balancers, devices,
+      snapshots, snapshot_gib, backups, backup_gib }
 );
 
 #[test]
@@ -198,6 +203,10 @@ fn a_project_spec_survives_the_wire_except_its_bindings() {
             volume_gib: 20_000,
             floating_ips: 12,
             load_balancers: 6,
+            snapshots: 0,
+            snapshot_gib: 0,
+            backups: 0,
+            backup_gib: 0,
         },
         bindings: vec![velstra_cloud_model::authz::Binding {
             role: velstra_cloud_model::authz::Role::Admin,
@@ -271,6 +280,10 @@ survives_the_wire!(
             volume_gib: 300,
             floating_ips: 2,
             load_balancers: 2,
+            snapshots: 0,
+            snapshot_gib: 0,
+            backups: 0,
+            backup_gib: 0,
         },
     },
     { observed_generation, conditions, used }
@@ -319,6 +332,9 @@ survives_the_wire!(
     resources::NodeStatus {
         shared_state: true,
         vmm: "qemu".into(),
+        datapath: "fabric".into(),
+        console_tls: true,
+        balancers: vec!["projects/p1/load-balancers/web".into()],
         fetching: vec!["sha256-0123456789abcdef".into()],
         pci_devices: vec![velstra_cloud_model::pci::PciDevice {
             address: "0000:41:00.0".into(),
@@ -390,6 +406,47 @@ survives_the_wire!(
             address: "10.0.0.5".into(),
             ssh_pubkey: "ssh-ed25519 AAAA cluster".into(),
             trusts_key: true,
+            seen: Some(velstra_cloud_model::ceph::CephSeen {
+                health: "HEALTH_WARN".into(),
+                warnings: vec![velstra_cloud_model::ceph::CephWarning {
+                    code: "POOL_NO_REDUNDANCY".into(),
+                    severity: "HEALTH_WARN".into(),
+                    message: "1 pool(s) have no replicas configured".into(),
+                }],
+                pgs: vec![velstra_cloud_model::ceph::PgState {
+                    state: "active+clean".into(),
+                    count: 64,
+                }],
+                pgs_total: 64,
+                objects: 95,
+                used_bytes: 371_761_152,
+                total_bytes: 124_012_986_368,
+                read_bps: 1024,
+                write_bps: 2048,
+                read_ops: 3,
+                write_ops: 4,
+                osds: vec![velstra_cloud_model::ceph::OsdSeen {
+                    id: 0,
+                    host: "hv-1".into(),
+                    device: "/dev/disk/by-id/wwn-0x7000".into(),
+                    up: true,
+                    r#in: true,
+                    used_bytes: 371_761_152,
+                    total_bytes: 124_012_986_368,
+                    pgs: 64,
+                    class: "hdd".into(),
+                }],
+                pool_stats: vec![velstra_cloud_model::ceph::PoolSeen {
+                    pool: "velstra-volumes".into(),
+                    stored_bytes: 2093,
+                    objects: 6,
+                    max_avail_bytes: 117_440_577_536,
+                    size: 1,
+                    min_size: 1,
+                    pg_num: 32,
+                }],
+                at: meta::Timestamp(1_788_800_000_000),
+            }),
         }),
         cpu: Some(velstra_cloud_model::cpu::NodeCpu {
             arch: "x86_64".into(),
@@ -410,7 +467,7 @@ survives_the_wire!(
     {
         observed_generation, conditions, capacity, allocated, agent_version,
         console_endpoint, last_heartbeat, images, devices, ceph, cpu, pci_devices,
-        vmm, fetching, shared_state,
+        vmm, datapath, console_tls, balancers, fetching, shared_state,
     }
 );
 
@@ -430,8 +487,11 @@ survives_the_wire!(
         size_bytes: 4_294_967_296,
         source_url: "https://example.invalid/img.qcow2".into(),
         signature: Some("base64-signature".into()),
+        state: resources::ImageState::Deprecated,
+        replacement: "images/sha256-def".into(),
+        shared_with: vec!["projects/p2".into()],
     },
-    { digest, format, size_bytes, source_url, signature, source_instance, family, version, from }
+    { digest, format, size_bytes, source_url, signature, source_instance, family, version, from, state, replacement, shared_with }
 );
 
 survives_the_wire!(
@@ -529,10 +589,26 @@ survives_the_wire!(
         addresses: vec!["10.0.0.5".into()],
         vmm_pid: Some(4242),
         started_at: Some(meta::Timestamp(1_786_732_801_000)),
+        usage: Some(resources::GuestUsage {
+            at: meta::Timestamp(1_786_732_861_000),
+            cpu_ms: 1_843_250,
+            cpu_percent: 137,
+            memory_mib: 7_910,
+            rx_bytes: 9_182_736,
+            tx_bytes: 1_827_364,
+            rx_packets: 12_345,
+            tx_packets: 6_789,
+            rx_total: 91_827_360,
+            tx_total: 18_273_640,
+            disk_read_bytes: 5_368_709_120,
+            disk_write_bytes: 1_073_741_824,
+            disk_read_ops: 40_000,
+            disk_write_ops: 12_000,
+        }),
     },
     {
         observed_generation, conditions, state, node, addresses, vmm_pid, started_at,
-        cpu, devices, console_tail, console_bytes, running_size, stop_requested_at,
+        cpu, devices, console_tail, console_bytes, running_size, stop_requested_at, usage,
     }
 );
 
@@ -549,8 +625,13 @@ survives_the_wire!(
         encryption_key: Some("projects/p1/keys/k1".into()),
         source_image: Some("projects/p1/images/sha256-abc".into()),
         source_snapshot: Some("projects/p1/volumes/v1/snapshots/nightly".into()),
+        limits: velstra_cloud_model::throttle::Limits {
+            iops: 5_000,
+            read_mibps: 200,
+            write_mibps: 100,
+        },
     },
-    { size_gib, pool, encryption_key, source_image, source_snapshot, source_backup }
+    { size_gib, pool, encryption_key, source_image, source_snapshot, source_backup, limits }
 );
 
 survives_the_wire!(
@@ -603,8 +684,13 @@ survives_the_wire!(
         node: "node-a".into(),
         at: "/srv/velstra/pool/projects~p1~volumes~data.qcow2".into(),
         read_only: true,
+        limits: velstra_cloud_model::throttle::Limits {
+            iops: 3_000,
+            read_mibps: 150,
+            write_mibps: 75,
+        },
     },
-    { volume, instance, node, at, read_only }
+    { volume, instance, node, at, read_only, limits }
 );
 
 survives_the_wire!(
@@ -703,8 +789,15 @@ survives_the_wire!(
         node: Some("node-a".into()),
         programmed: true,
         tap_device: Some("vtweb1a2b".into()),
+        answering: vec![80, 8080],
+        dropped: Some(resources::Dropped {
+            inbound_packets: 12,
+            inbound_bytes: 800,
+            outbound_packets: 3,
+            outbound_bytes: 200,
+        }),
     },
-    { observed_generation, conditions, node, programmed, tap_device }
+    { observed_generation, conditions, node, programmed, tap_device, answering, dropped }
 );
 
 // ---- operation ------------------------------------------------------------
@@ -817,6 +910,10 @@ whole_object_survives!(
             volume_gib: 20_000,
             floating_ips: 12,
             load_balancers: 6,
+            snapshots: 0,
+            snapshot_gib: 0,
+            backups: 0,
+            backup_gib: 0,
         },
         // Not carried on the wire; see the spec test above.
         bindings: Vec::new(),
@@ -834,6 +931,10 @@ whole_object_survives!(
             volume_gib: 300,
             floating_ips: 2,
             load_balancers: 2,
+            snapshots: 0,
+            snapshot_gib: 0,
+            backups: 0,
+            backup_gib: 0,
         },
     }
 );
@@ -854,6 +955,9 @@ whole_object_survives!(
     resources::NodeStatus {
         shared_state: false,
         vmm: "qemu".into(),
+        datapath: "fabric".into(),
+        console_tls: true,
+        balancers: vec!["projects/p1/load-balancers/web".into()],
         fetching: Vec::new(),
         pci_devices: Vec::new(),
         cpu: None,
@@ -898,6 +1002,9 @@ whole_object_survives!(
         size_bytes: 4_294_967_296,
         source_url: "https://example.invalid/img.qcow2".into(),
         signature: Some("base64-signature".into()),
+        state: resources::ImageState::Obsolete,
+        replacement: "images/sha256-def".into(),
+        shared_with: Default::default(),
     },
     resources::ImageStatus {
         observed_generation: 2,
@@ -916,6 +1023,7 @@ whole_object_survives!(
         encryption_key: Some("projects/p1/keys/k1".into()),
         source_image: None,
         source_snapshot: None,
+        limits: Default::default(),
     },
     resources::VolumeStatus {
         observed_generation: 3,
@@ -954,6 +1062,7 @@ whole_object_survives!(
         node: "node-a".into(),
         at: String::new(),
         read_only: true,
+        limits: Default::default(),
     },
     resources::AttachmentStatus {
         observed_generation: 2,
@@ -1061,6 +1170,8 @@ whole_object_survives!(
         node: Some("node-a".into()),
         programmed: true,
         tap_device: Some("vtweb1a2b".into()),
+        answering: vec![80, 8080],
+        dropped: None,
     }
 );
 
@@ -1121,6 +1232,7 @@ whole_object_survives!(
         console_bytes: 0,
         devices: Vec::new(),
         cpu: None,
+        usage: None,
         observed_generation: 6,
         conditions: vec![a_condition()],
         state: resources::InstanceState::Failed,

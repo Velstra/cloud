@@ -57,10 +57,12 @@
 
 pub mod agent;
 pub mod api_cell;
+pub mod balancer;
 pub mod bgp;
 pub mod cell;
 pub mod ceph_deploy;
 pub mod ceph_pool;
+pub mod ceph_seen;
 pub mod cephadm;
 pub mod cloud_hypervisor;
 pub mod console;
@@ -68,6 +70,7 @@ pub mod datapath;
 pub mod devices;
 pub mod dhcp;
 pub mod directory_pool;
+pub mod dns;
 pub mod fabric;
 pub mod fake;
 pub mod guests;
@@ -77,9 +80,11 @@ pub mod hostfs;
 pub mod localnet;
 pub mod lvm_pool;
 pub mod metadata;
+pub mod nftfilter;
 pub mod pcidev;
 pub mod pool;
 pub mod qemu;
+pub mod ra;
 pub(crate) mod reporting;
 pub mod sink;
 

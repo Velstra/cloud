@@ -411,8 +411,12 @@ impl CephAdmin {
         *last = None;
     }
 
-    async fn ceph(&self, args: &[String]) -> Result<Vec<u8>> {
+    pub(crate) async fn ceph(&self, args: &[String]) -> Result<Vec<u8>> {
+        // Bounded, because a node that has a `ceph.conf` but no keyring —
+        // every non-admin node — would otherwise sit in each question for
+        // the CLI's own default of minutes, once per question, once per pass.
         let out = tokio::process::Command::new(&self.ceph)
+            .arg("--connect-timeout=15")
             .args(args)
             .output()
             .await

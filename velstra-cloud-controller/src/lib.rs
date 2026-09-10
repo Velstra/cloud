@@ -25,6 +25,7 @@ pub mod address;
 pub mod alerts;
 pub mod attachment;
 pub mod backoff;
+pub mod backup;
 pub mod backup_schedule;
 pub mod capture;
 pub mod ceph;

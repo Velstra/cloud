@@ -27,7 +27,8 @@ platform with fewer boxes in it.
 | a second and third machine, or several cells | [Setting up a cell](setup-guide.md) |
 | to run it day to day: maintenance, recovery, which copy survives which loss | [Operating it](operating.md) |
 | the appliance image, the installer ISO, the Debian package | [Installing it](install.md) |
-| to drive it from a script | [The REST contract](rest-contract.md) |
+| to drive it from a terminal or a script | [The command line](cli.md) |
+| to drive it from a program | [The REST contract](rest-contract.md) |
 | to generate a client, or feed an IDE | [`openapi.json`](openapi.json) — OpenAPI 3.1, generated from the router and served at `/api/v1/openapi.json` |
 | a cell of mixed processor generations | [CPU heterogeneity](cpu-heterogeneity.md) |
 | the decision record behind the packaging | [Deployment and devices](deployment-and-devices.md) |

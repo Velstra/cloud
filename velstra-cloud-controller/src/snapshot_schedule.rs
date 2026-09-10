@@ -246,6 +246,7 @@ mod tests {
                 encryption_key: None,
                 source_image: None,
                 source_snapshot: None,
+                limits: Default::default(),
             },
             VolumeStatus::default(),
         );
