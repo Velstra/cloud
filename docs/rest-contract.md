@@ -870,7 +870,8 @@ may boot from the catalogue; only the cell may put something in it.
 ### Signed images
 
 `spec.signature` is an Ed25519 signature over the **digest line** — the string
-`spec.digest` carries, `sha256:<64 hex>`, no newline — written as base64. The
+`spec.digest` carries, `sha256:<64 hex>` or `sha512:<128 hex>`, no newline —
+written as base64, over the spelling as stored rather than a normalised one. The
 API judges it at admission under the keys it was started with
 (`--image-signing-key`, repeatable; `VELSTRA_IMAGE_SIGNING_KEYS`, comma-separated):
 
@@ -2697,9 +2698,15 @@ permissive than the store.
 
 ## Image families and where images come from
 
-An image's name is its `sha256`, which is what makes fetching one verifiable and
-what made every screen ask people to choose an operating system from
-`images/sha256-cbf3e1f588f02f8d738dbecb…`. `spec.family` is the name a person
+An image's name is its **digest**, which is what makes fetching one verifiable
+and what made every screen ask people to choose an operating system from
+`images/sha256-cbf3e1f588f02f8d738dbecb…`. Two functions are addressed by, and
+the digest says which: `sha256:<64 hex>` and `sha512:<128 hex>`. Not a
+preference — Debian publishes only `SHA512SUMS` for its cloud images and the RPM
+family and Ubuntu publish `SHA256SUMS`, so a platform that insisted on one of
+them could not point at half the distributions people actually run. A node hashes
+with the function the image names; a checksums file naming both is read as the
+sha256. `spec.family` is the name a person
 uses — `debian-13` — and `spec.version` says which one in the family.
 
 An instance may name **`families/<family>`** instead of an image:

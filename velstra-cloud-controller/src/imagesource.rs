@@ -104,10 +104,10 @@ impl<F: Fetch> ImageSourceController<F> {
     async fn publish(
         &self,
         spec: &ImageSourceSpec,
-        digest: &str,
+        digest: &velstra_cloud_model::images::Digest,
         now: Timestamp,
     ) -> Result<String> {
-        let id = format!("sha256-{digest}");
+        let id = digest.stored();
         let name = ResourceName::parse(&format!("images/{id}"))
             .map_err(|e| crate::Error::Refused(e.to_string()))?;
         if self.images.get(&name.to_string()).await?.is_some() {
@@ -122,7 +122,7 @@ impl<F: Fetch> ImageSourceController<F> {
                 // every time gives no version of its own, and "which one is
                 // this" has to be answerable by a person reading a list.
                 version: iso_day(now),
-                digest: format!("sha256:{digest}"),
+                digest: digest.value(),
                 format: ImageFormat::Qcow2,
                 size_bytes: 0,
                 source_url: spec.url.clone(),
@@ -349,7 +349,9 @@ impl<F: Fetch> Reconciler for ImageSourceController<F> {
         };
 
         let filename = velstra_cloud_model::images::filename_of(&source.spec.url);
-        let Some(digest) = velstra_cloud_model::images::digest_for(&body, filename) else {
+        let Some(digest) = velstra_cloud_model::images::digest_for(&body, filename)
+            .and_then(|d| velstra_cloud_model::images::Digest::parse(&d))
+        else {
             set_condition(
                 &mut next.status.conditions,
                 Condition::new(
@@ -357,8 +359,10 @@ impl<F: Fetch> Reconciler for ImageSourceController<F> {
                     ConditionStatus::False,
                     "NotListed",
                     &format!(
-                        "{} names no sha256 for `{filename}`. A SHA512SUMS file is not a \
-                         SHA256SUMS file, and this platform addresses images by sha256.",
+                        "{} names no digest for `{filename}` this platform can read. A \
+                         checksums file says which bytes a file is as a sha256 or a sha512, \
+                         one per line, in either the coreutils or the BSD-tag layout; a file \
+                         that mentions this image under none of those says nothing about it.",
                         source.spec.checksums
                     ),
                     source.meta.generation,
@@ -368,6 +372,10 @@ impl<F: Fetch> Reconciler for ImageSourceController<F> {
         };
 
         let published = self.publish(&source.spec, &digest, now).await?;
+        // Compared and stored as the tagged value, so a source that moved from
+        // one hash function to the other reads as a change rather than as the
+        // same image under a name nothing files it under.
+        let digest = digest.value();
         let is_new = source.status.last_digest != digest;
         next.status.last_digest = digest;
         next.status.published = published.clone();
@@ -570,7 +578,9 @@ mod tests {
             .await
             .unwrap()
             .expect("the source is still there");
-        assert_eq!(stored.status.last_digest, DIGEST);
+        // Tagged, not bare: which function it is travels with the hex, so a
+        // source that moves between them reads as a change.
+        assert_eq!(stored.status.last_digest, format!("sha256:{DIGEST}"));
         assert_eq!(stored.status.published, format!("images/sha256-{DIGEST}"));
         let checked = condition(&stored.status.conditions, CHECKED).expect("it says it looked");
         assert_eq!(checked.status, ConditionStatus::True);
@@ -643,15 +653,45 @@ mod tests {
         );
     }
 
+    /// Debian publishes `SHA512SUMS` for its cloud images and no `SHA256SUMS`
+    /// at all, so a source pointed at the distribution most people start with
+    /// used to be a source that could never publish anything. It publishes
+    /// now, under the hash the file actually gives — and it is *filed* under
+    /// that hash too, because a sha512 recorded as a sha256 is a digest no
+    /// bytes will ever match.
     #[tokio::test]
-    async fn a_sha512sums_file_is_reported_as_naming_nothing() {
-        // The two files sit side by side in every distribution's directory and
-        // an operator will paste the wrong one. Taking a sha512 for a sha256
-        // would publish an image whose digest no bytes ever match — a source
-        // that looks healthy and hands out something that cannot boot.
+    async fn a_sha512sums_file_publishes_under_sha512() {
+        let hex = "b".repeat(128);
+        let (_raw, _says, c, sources) =
+            fixture(Ok(format!("{hex}  debian-13-genericcloud-amd64.qcow2\n"))).await;
+        let source = a_source();
+        sources
+            .create(&source, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+        let source = sources
+            .get("image-sources/debian")
+            .await
+            .unwrap()
+            .expect("stored");
+        c.reconcile("image-sources/debian", Some(&source))
+            .await
+            .unwrap();
+        let stored = sources.get("image-sources/debian").await.unwrap().unwrap();
+        let checked = condition(&stored.status.conditions, CHECKED).unwrap();
+        assert_eq!(checked.status, ConditionStatus::True, "{}", checked.message);
+        assert_eq!(stored.status.last_digest, format!("sha512:{hex}"));
+        assert_eq!(stored.status.published, format!("images/sha512-{hex}"));
+    }
+
+    /// A checksums file that mentions the image under neither function still
+    /// says nothing about it, and the source says so rather than publishing
+    /// something it invented.
+    #[tokio::test]
+    async fn a_length_that_is_neither_names_nothing() {
         let (_raw, _says, c, sources) = fixture(Ok(format!(
             "{}  debian-13-genericcloud-amd64.qcow2\n",
-            "a".repeat(128)
+            "a".repeat(40)
         )))
         .await;
         let source = a_source();

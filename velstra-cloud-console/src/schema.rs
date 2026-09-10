@@ -2422,10 +2422,11 @@ const IMAGE_SOURCE_FIELDS: &[Field] = &[
         },
         required: true,
         advanced: false,
-        help: "A `sha256sum`-style file covering the image's filename. **https \
-               only**, and refused otherwise — this is the one value the whole \
-               arrangement trusts, and whoever can rewrite it chooses what every \
-               new guest in this cell boots.",
+        help: "A `sha256sum`- or `sha512sum`-style file covering the image's \
+               filename — Debian publishes only the latter for its cloud images, \
+               and either is read. **https only**, and refused otherwise: this is \
+               the one value the whole arrangement trusts, and whoever can rewrite \
+               it chooses what every new guest in this cell boots.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -2640,9 +2641,10 @@ const IMAGE_FIELDS: &[Field] = &[
         },
         required: false,
         advanced: true,
-        help: "An Ed25519 signature over `sha256:<digest>`, base64. Accepted only when it \
-               verifies under a key the cell was started with; refused otherwise, so a \
-               stored signature is a verified one.",
+        help: "An Ed25519 signature over the digest line as written — `sha256:<hex>` or \
+               `sha512:<hex>` — base64. Accepted only when it verifies under a key the \
+               cell was started with; refused otherwise, so a stored signature is a \
+               verified one.",
         when_empty: "unsigned",
         derived: false,
         at_creation: false,
