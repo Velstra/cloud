@@ -421,6 +421,86 @@ jobs:
             echo "::endgroup::"
           done
 
+  # The package, installed for real on a Debian-family machine.
+  #
+  # Everything the `deb` check proves is proved by *inspecting* the package —
+  # its contents, its interpreter, its `Depends` floor, its units, its version
+  # ordering. What none of it proves is that `dpkg` will take it, that
+  # `postinst` runs, or that installing a second time over the first does what
+  # an upgrade does. That gap was found by reading the checks: every VM in this
+  # repository is NixOS, and a `.deb` on NixOS is a file nobody opens.
+  #
+  # The runner is Ubuntu, which is the family this package targets, so the
+  # honest test is to install it here rather than to build a Debian image to
+  # install it in. It runs on every change, because it is a minute.
+  deb-install:
+    name: deb — installed and upgraded
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Build the package
+        run: |
+          set -euo pipefail
+          nix build .#deb -L --out-link result-deb
+          cp -L result-deb ./velstra-cloud.deb
+          dpkg-deb --field ./velstra-cloud.deb Version Package
+
+      - name: Install it
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y ./velstra-cloud.deb
+          # The five binaries the package promises, and they run — a package
+          # whose interpreter or `Depends` floor is wrong installs cleanly and
+          # fails here.
+          for bin in velstra velstra-cloud-api velstra-cloud-controller \
+                     velstra-cloud-nodeagent velstra-cloud-poolagent velstra-cloud-node; do
+            command -v "$bin" > /dev/null || { echo "::error::$bin is not on PATH"; exit 1; }
+          done
+          velstra --help > /dev/null
+          velstra-cloud-api --help > /dev/null
+
+      - name: The units are installed, gated, and not started
+        run: |
+          set -euo pipefail
+          # `postinst` must not enable anything: a machine that installs the
+          # package has not yet been told which roles it plays, and a unit that
+          # started on install would come up with no seed and fail.
+          for unit in velstra-cloud-api velstra-cloud-controller \
+                      velstra-cloud-nodeagent velstra-cloud-poolagent; do
+            systemctl cat "$unit" > /dev/null || { echo "::error::$unit is not installed"; exit 1; }
+            state=$(systemctl is-enabled "$unit" || true)
+            case "$state" in
+              disabled|static|"") ;;
+              *) echo "::error::$unit is $state after install; nothing should be enabled"; exit 1 ;;
+            esac
+          done
+
+      - name: Install it again — what an upgrade does
+        run: |
+          set -euo pipefail
+          # The second install re-runs `postinst`, which is where a
+          # migrate-seed or a setup step that is not idempotent shows itself.
+          # An operator upgrading a cell does exactly this.
+          sudo apt-get install -y --reinstall ./velstra-cloud.deb
+          velstra --help > /dev/null
+          systemctl cat velstra-cloud-api > /dev/null
+
+      - name: And it removes cleanly
+        run: |
+          set -euo pipefail
+          sudo apt-get remove -y velstra-cloud
+          ! command -v velstra-cloud-api > /dev/null || {
+            echo "::error::the package was removed and its binary is still there"; exit 1;
+          }
+
   # The virtual-machine checks: a NixOS system per check, booted for real.
   #
   # Nightly and on demand rather than per pull request, and the reason is
@@ -435,6 +515,43 @@ jobs:
   #
   # If this ever needs to be per-pull-request, the answer is a self-hosted
   # runner with a persistent store, not trimming the list.
+  supply-chain:
+    name: advisories, licences, SBOM
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # `cargo-deny` answers two questions this repository could not answer
+      # before: whether anything we depend on has a published advisory, and
+      # whether we are allowed to ship what we ship. `deny.toml` holds both
+      # policies, with the reasoning next to each list.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+      # The bill of materials, in the format an auditor and a scanner both
+      # read. Attached to the run rather than committed: it is a fact about a
+      # build, and a file in the tree would be a fact about whenever somebody
+      # last remembered to regenerate it.
+      #
+      # This is what makes "are you affected by CVE-2026-XXXX" answerable at
+      # all — the answer is a grep over this file for the version that was
+      # actually shipped, not a reading of Cargo.toml.
+      - name: Build the SBOM
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-cyclonedx --version 0.5.7
+          cargo cyclonedx --format json --all --spec-version 1.5
+          # One document for the workspace, named for what it describes.
+          find . -name "*.cdx.json" -print
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: "**/*.cdx.json"
+          if-no-files-found: error
+          retention-days: 90
+
   nix-vm:
     name: nix — virtual machines
     runs-on: ubuntu-24.04
