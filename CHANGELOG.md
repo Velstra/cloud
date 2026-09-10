@@ -13,6 +13,8 @@ is. A tag makes that revision a real one instead of `dirty`.
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-09-10
+
 ### Added
 
 - **Retryable creates.** `Idempotency-Key` on every create: the second attempt
