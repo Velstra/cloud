@@ -56,7 +56,12 @@ pub struct NoSuchPath {
 /// a mask uses those names, but a generated client in a language whose JSON
 /// mapping is lowerCamelCase will hand its user the camel spelling, and there
 /// is no reading under which one of the two is a typo.
-pub fn apply(whole: &Value, paths: &[String], kind: &str) -> Result<Value, NoSuchPath> {
+pub fn apply(
+    whole: &Value,
+    paths: &[String],
+    kind: &str,
+    knows: &dyn Fn(&[&str]) -> bool,
+) -> Result<Value, NoSuchPath> {
     if paths.is_empty() || paths.iter().any(|p| p == EVERYTHING) {
         return Ok(whole.clone());
     }
@@ -69,13 +74,30 @@ pub fn apply(whole: &Value, paths: &[String], kind: &str) -> Result<Value, NoSuc
                 kind: kind.to_string(),
             });
         }
-        let Some(found) = pick(whole, &steps) else {
-            return Err(NoSuchPath {
-                path: path.clone(),
-                kind: kind.to_string(),
-            });
-        };
-        graft(whole, &mut out, &steps, found);
+        match pick(whole, &steps) {
+            Some(found) => graft(whole, &mut out, &steps, found),
+            // Not in the body — which is two different things, and reading them
+            // as one made clearing a field impossible over a mask.
+            //
+            // Sixteen spec fields vanish from the wire at their default
+            // (`skip_serializing_if`), and that is deliberate: it is what lets
+            // a whole-object update mean "leave what I did not send alone". So
+            // a mask naming such a field found nothing and was told the field
+            // does not exist — and unsharing an image, detaching a floating IP
+            // and taking a guest's flavor off, the one operation a field mask
+            // is *for*, all answered "not a field of a images".
+            //
+            // `knows` asks the type instead of the body. When the type has the
+            // field, the path selects it and the empty value is written: the
+            // caller said to write it, so it is written.
+            None if knows(&steps) => graft(whole, &mut out, &steps, Value::Null),
+            None => {
+                return Err(NoSuchPath {
+                    path: path.clone(),
+                    kind: kind.to_string(),
+                });
+            }
+        }
     }
     Ok(out)
 }
@@ -163,10 +185,17 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A caller that knows nothing beyond the body — the shape these tests were
+    /// written against. The real question is asked of a spec type, which lives
+    /// a layer up in the API.
+    fn body_only(_: &[&str]) -> bool {
+        false
+    }
+
     /// The whole point: a resize does not write the guest's cloud-init.
     #[test]
     fn only_what_the_mask_names_is_carried_through() {
-        let masked = apply(&whole(), &paths(&["spec.vcpus"]), "instances").unwrap();
+        let masked = apply(&whole(), &paths(&["spec.vcpus"]), "instances", &body_only).unwrap();
         assert_eq!(masked, json!({ "spec": { "vcpus": 4 } }));
     }
 
@@ -176,6 +205,7 @@ mod tests {
             &whole(),
             &paths(&["spec.vcpus", "spec.memory_mib", "meta.labels"]),
             "instances",
+            &body_only,
         )
         .unwrap();
         assert_eq!(
@@ -193,7 +223,13 @@ mod tests {
     /// same patch a REST client writes.
     #[test]
     fn the_camel_spelling_of_a_path_finds_the_same_field() {
-        let masked = apply(&whole(), &paths(&["spec.memoryMib"]), "instances").unwrap();
+        let masked = apply(
+            &whole(),
+            &paths(&["spec.memoryMib"]),
+            "instances",
+            &body_only,
+        )
+        .unwrap();
         assert_eq!(masked, json!({ "spec": { "memory_mib": 2048 } }));
     }
 
@@ -201,7 +237,7 @@ mod tests {
     /// what somebody writing `spec` expects.
     #[test]
     fn naming_a_branch_keeps_the_branch() {
-        let masked = apply(&whole(), &paths(&["spec"]), "instances").unwrap();
+        let masked = apply(&whole(), &paths(&["spec"]), "instances", &body_only).unwrap();
         assert_eq!(masked["spec"], whole()["spec"]);
         assert!(masked.get("meta").is_none(), "{masked}");
     }
@@ -210,9 +246,12 @@ mod tests {
     /// already has, so adding masks breaks nobody.
     #[test]
     fn an_empty_mask_is_the_old_behaviour() {
-        assert_eq!(apply(&whole(), &[], "instances").unwrap(), whole());
         assert_eq!(
-            apply(&whole(), &paths(&[EVERYTHING]), "instances").unwrap(),
+            apply(&whole(), &[], "instances", &body_only).unwrap(),
+            whole()
+        );
+        assert_eq!(
+            apply(&whole(), &paths(&[EVERYTHING]), "instances", &body_only).unwrap(),
             whole()
         );
     }
@@ -221,8 +260,8 @@ mod tests {
     /// happened. Refused, with the path in the sentence.
     #[test]
     fn a_path_nobody_has_is_refused_by_name() {
-        let refusal =
-            apply(&whole(), &paths(&["spec.vcpu"]), "instances").expect_err("a typo was accepted");
+        let refusal = apply(&whole(), &paths(&["spec.vcpu"]), "instances", &body_only)
+            .expect_err("a typo was accepted");
         assert_eq!(refusal.path, "spec.vcpu");
         assert!(refusal.to_string().contains("spec.vcpu"), "{refusal}");
         assert!(refusal.to_string().contains("instances"), "{refusal}");
@@ -230,7 +269,7 @@ mod tests {
 
     #[test]
     fn an_empty_path_is_not_a_path() {
-        assert!(apply(&whole(), &paths(&[""]), "instances").is_err());
+        assert!(apply(&whole(), &paths(&[""]), "instances", &body_only).is_err());
     }
 
     /// A field whose value happens to be zero is still a field. The mask is
@@ -239,7 +278,7 @@ mod tests {
     #[test]
     fn a_zero_is_carried_through_like_any_other_value() {
         let sent = json!({ "spec": { "vcpus": 0, "memory_mib": 2048 } });
-        let masked = apply(&sent, &paths(&["spec.vcpus"]), "instances").unwrap();
+        let masked = apply(&sent, &paths(&["spec.vcpus"]), "instances", &body_only).unwrap();
         assert_eq!(masked, json!({ "spec": { "vcpus": 0 } }));
     }
 }

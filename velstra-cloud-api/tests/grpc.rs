@@ -572,6 +572,90 @@ async fn a_mask_keeps_a_grpc_update_from_writing_its_neighbours() {
     );
 }
 
+/// A mask can take a field *off*, which is the one thing a field mask is for.
+///
+/// The path was checked against the request body, and sixteen spec fields
+/// vanish from the wire at their default — deliberately, because that is what
+/// makes an unmasked update leave what it did not send alone. So a mask naming
+/// such a field found nothing there and was told the field does not exist:
+///
+///     update_mask { paths: "spec.flavor" }, flavor unset
+///     → INVALID_ARGUMENT: update_mask names spec.flavor,
+///       which is not a field of a instances
+///
+/// Taking a guest's flavor off, unsharing an image, detaching a floating IP —
+/// every clearing operation was unreachable over masked gRPC, and the refusal
+/// said the field was imaginary.
+#[tokio::test]
+async fn a_mask_can_take_a_field_off() {
+    let both = Both::new();
+    create(&both, "i1", 2).await;
+    // The menu the guest orders from; a flavor a client names has to exist.
+    both.http(
+        "POST",
+        "flavors",
+        Some(json!({ "id": "m1-small", "spec": {
+            "vcpus": 2, "memoryMib": 2048, "rootDiskGib": 10 } })),
+    )
+    .await;
+    both.http(
+        "PATCH",
+        "projects/p1/instances/i1",
+        Some(json!({ "spec": { "flavor": "m1-small" } })),
+    )
+    .await;
+    let (_, body) = both.http("GET", "projects/p1/instances/i1", None).await;
+    assert_eq!(
+        body["spec"]["flavor"], "flavors/m1-small",
+        "{}",
+        body["spec"]
+    );
+
+    // The mask names it and the message leaves it unset: that is "clear it".
+    both.grpc
+        .update_instance(signed(UpdateInstanceRequest {
+            instance: Some(instance("projects/p1/instances/i1", 2)),
+            revision: String::new(),
+            update_mask: Some(velstra_cloud_proto::prost_types::FieldMask {
+                paths: vec!["spec.flavor".into()],
+            }),
+        }))
+        .await
+        .expect("a mask could not take a field off");
+
+    let (_, body) = both.http("GET", "projects/p1/instances/i1", None).await;
+    assert!(
+        body["spec"]["flavor"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "the flavor is still there: {}",
+        body["spec"]
+    );
+    // And nothing else moved: the mask named one field.
+    assert_eq!(body["spec"]["vcpus"], json!(2));
+
+    // A path that really is nothing is still refused — the guard the body
+    // check was there to be.
+    let refused = both
+        .grpc
+        .update_instance(signed(UpdateInstanceRequest {
+            instance: Some(instance("projects/p1/instances/i1", 2)),
+            revision: String::new(),
+            update_mask: Some(velstra_cloud_proto::prost_types::FieldMask {
+                paths: vec!["spec.flavour".into()],
+            }),
+        }))
+        .await
+        .expect_err("a misspelling was accepted once the guard learned to say yes");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(
+        refused.message().contains("spec.flavour"),
+        "{}",
+        refused.message()
+    );
+}
+
 /// A mask naming a field nobody has is refused, with the path in the sentence.
 ///
 /// A caller who writes `spec.vcpu` and is answered OK has been told their
