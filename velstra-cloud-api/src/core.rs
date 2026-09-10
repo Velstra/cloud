@@ -2876,7 +2876,7 @@ impl Api {
             self.settle_network(&mut spec).await?;
         }
         if kind == "images" {
-            self.settle_published_image(&mut spec).await?;
+            self.settle_published_image(who, &mut spec).await?;
         }
         if kind == "folders" || kind == "projects" {
             self.refuse_a_parent_that_cannot_be_one(kind, &name, &spec)
@@ -6569,7 +6569,7 @@ impl Api {
     /// image may be given a different family or version, which is exactly what
     /// somebody promoting `our-base` from a project into `debian-13-hardened`
     /// wants. Only what they did not say is taken.
-    async fn settle_published_image(&self, spec: &mut Value) -> ApiResult<()> {
+    async fn settle_published_image(&self, who: &Identity, spec: &mut Value) -> ApiResult<()> {
         let Some(from) = spec
             .get("from")
             .and_then(Value::as_str)
@@ -6585,6 +6585,19 @@ impl Api {
                                    `projects/p1/images/sha256-3f9a2b`",
             )
             .at("spec.from"));
+        }
+        // Asked before the read, not after. `from` is the one reference this
+        // platform consumes at create — it is copied out and stored empty — so
+        // it is not in `refs::fields`, and nothing else was asking. Without this
+        // a tenant could publish from any image in the cell, including another
+        // project's capture of a running guest, which is that guest's disk; and
+        // the "there is no image called X" refusal below was an existence oracle
+        // over every image name in the cell.
+        //
+        // The cell's own catalogue still publishes: a cell-scoped image has no
+        // governing project and `judge` lets everybody read those.
+        if let Ok(name) = ResourceName::parse(&from) {
+            self.authorize(who, Verb::Read, &name).await?;
         }
         let Some(source) =
             self.collection("images")?.get(&from).await?.and_then(|d| {
