@@ -1124,10 +1124,17 @@ impl Agent {
             Err(e) => {
                 // A port whose segment cannot be read is a port that must not be
                 // programmed: putting a frame on the wrong wire is worse than
-                // putting it on none. The pass says so on the object rather than
-                // guessing at a VNI.
-                tracing::warn!(error = %e, "could not list networks");
-                BTreeMap::new()
+                // putting it on none.
+                //
+                // The pass **stops**, as it does for ports, rather than carrying
+                // on with an empty map. An empty map is not "nothing is known",
+                // it is "nothing exists" — every port loses its network, the
+                // host-bridge guard below reads false, and the plan that follows
+                // is a plan to take this machine's networking apart. One failed
+                // read is not a reason to do that.
+                tracing::error!(error = %e, "could not list networks; skipping the pass");
+                pass.failures += 1;
+                return;
             }
         };
 
@@ -1140,8 +1147,15 @@ impl Agent {
                 .map(|s| (s.meta.name.to_string(), s))
                 .collect::<BTreeMap<_, _>>(),
             Err(e) => {
-                tracing::warn!(error = %e, "could not list subnets");
-                BTreeMap::new()
+                // Same as networks and ports above, and for the sharper reason:
+                // a segment is built from the subnets a port names, so an empty
+                // map is zero segments, and zero segments is `ip link del` for
+                // every bridge on this node — every running guest's wire, its
+                // gateway, its DHCP and its route to the metadata address, gone
+                // because one list call timed out.
+                tracing::error!(error = %e, "could not list subnets; skipping the pass");
+                pass.failures += 1;
+                return;
             }
         };
 

@@ -61,6 +61,12 @@ pub struct Bridge {
     /// this platform puts on a bridge, so anything else here is something to
     /// remove.
     pub addresses: Vec<String>,
+    /// The interfaces enslaved to it — the guests' taps.
+    ///
+    /// Read for one reason: `removals` promises not to delete a bridge that
+    /// still has something on it, and until this field existed it could not
+    /// tell. The promise was in prose and the code deleted unconditionally.
+    pub members: Vec<String>,
 }
 
 /// One segment with a guest on this node: where it is, and who is on it.
@@ -257,6 +263,26 @@ impl LocalNet {
         else {
             return Vec::new();
         };
+        // Who is enslaved to what, in one call. An `ip link show` entry carries
+        // `master` when it has one, so the members of every bridge fall out of a
+        // single read rather than one per bridge.
+        let mut members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if let Ok(links) = self.ip_output(&["-j", "link", "show"]).await
+            && let Ok(links) = serde_json::from_slice::<serde_json::Value>(&links)
+        {
+            for link in links.as_array().map(Vec::as_slice).unwrap_or_default() {
+                let (Some(name), Some(master)) = (
+                    link.get("ifname").and_then(|v| v.as_str()),
+                    link.get("master").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                members
+                    .entry(master.to_string())
+                    .or_default()
+                    .push(name.to_string());
+            }
+        }
         let Ok(links) = serde_json::from_slice::<serde_json::Value>(&out) else {
             return Vec::new();
         };
@@ -283,7 +309,12 @@ impl LocalNet {
                         ))
                     })
                     .collect();
-                Some(Bridge { name, addresses })
+                let members = members.get(&name).cloned().unwrap_or_default();
+                Some(Bridge {
+                    name,
+                    addresses,
+                    members,
+                })
             })
             .collect()
     }
@@ -342,6 +373,19 @@ impl LocalNet {
                             steps.push(step(["addr", "del", address, "dev", &bridge.name]));
                         }
                     }
+                }
+                // Nothing wants this bridge — but something is still on it.
+                // A guest whose port the control plane has forgotten is a guest
+                // that is still running, and cutting its wire is the one mistake
+                // here a person cannot undo from the console. Said out loud, and
+                // left standing; the next pass looks again.
+                None if !bridge.members.is_empty() => {
+                    tracing::warn!(
+                        bridge = %bridge.name,
+                        members = %bridge.members.join(", "),
+                        "no segment wants this bridge, but it still carries interfaces; \
+                         leaving it alone"
+                    );
                 }
                 None => steps.push(step(["link", "del", &bridge.name])),
             }
@@ -983,11 +1027,59 @@ mod the_datapath_has_to_take_things_away_too {
         }
     }
 
+    /// An empty bridge — nothing enslaved to it, so `removals` may take it.
     pub(crate) fn bridge(name: &str, addresses: &[&str]) -> Bridge {
         Bridge {
             name: name.to_string(),
             addresses: addresses.iter().map(|a| a.to_string()).collect(),
+            members: Vec::new(),
         }
+    }
+
+    /// The same, still carrying a guest's tap.
+    pub(crate) fn bridge_with(name: &str, addresses: &[&str], members: &[&str]) -> Bridge {
+        Bridge {
+            members: members.iter().map(|m| m.to_string()).collect(),
+            ..bridge(name, addresses)
+        }
+    }
+
+    /// A bridge nothing wants is taken away — unless a guest is still on it.
+    ///
+    /// The promise was in `removals`' own doc comment and nowhere in its code:
+    /// `Bridge` did not carry its members, so "left alone" could not be decided
+    /// and every unwanted bridge was deleted. That is survivable when the
+    /// control plane really has forgotten one port; it is a node-wide outage
+    /// when the *reason* nothing wants the bridge is that a list call failed and
+    /// the pass carried on with an empty world.
+    #[test]
+    fn a_bridge_with_a_guest_still_on_it_is_left_alone() {
+        let net = LocalNet::new("vt");
+        let name = net.bridge_for("projects/p/subnets/gone");
+
+        // Nothing wants it and nothing is on it: it goes.
+        let empty = bridge(&name, &["10.42.0.1/24"]);
+        let flat: Vec<String> = net
+            .removals(&[], &[empty])
+            .iter()
+            .map(|s| s.join(" "))
+            .collect();
+        assert!(
+            flat.iter().any(|s| s == &format!("link del {name}")),
+            "an empty bridge nothing wants was kept: {flat:?}"
+        );
+
+        // Nothing wants it and a tap is still enslaved to it: it stays.
+        let carrying = bridge_with(&name, &["10.42.0.1/24"], &["vtportabc123"]);
+        let flat: Vec<String> = net
+            .removals(&[], &[carrying])
+            .iter()
+            .map(|s| s.join(" "))
+            .collect();
+        assert!(
+            !flat.iter().any(|s| s.starts_with("link del")),
+            "a guest's wire was cut: {flat:?}"
+        );
     }
 
     #[test]
