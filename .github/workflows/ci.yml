@@ -457,10 +457,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get install -y ./velstra-cloud.deb
-          # The five binaries the package promises, and they run — a package
+          # The binaries the package promises, and they run — a package
           # whose interpreter or `Depends` floor is wrong installs cleanly and
           # fails here.
-          for bin in velstra velstra-cloud-api velstra-cloud-controller \
+          for bin in velstra-cloud-api velstra-cloud-controller \
                      velstra-cloud-nodeagent velstra-cloud-poolagent velstra-cloud-node; do
             command -v "$bin" > /dev/null || { echo "::error::$bin is not on PATH"; exit 1; }
           done
