@@ -1,0 +1,126 @@
+# What this repository will and will not carry.
+#
+# Two questions, and they are different: **advisories** ask whether a crate we
+# depend on has a published vulnerability, and **licences** ask whether we are
+# allowed to ship it. Both are answered in CI on every change, because the
+# moment to find out that a transitive dependency was yanked for a
+# use-after-free is not the moment somebody asks "are you affected by CVE-X".
+#
+# The lists below are deliberately short. An allow-list of licences that grows
+# every time a build fails is an allow-list nobody reads; each addition here is
+# a decision somebody made once, on purpose, and it is written down.
+
+[graph]
+# The platforms this is actually built for. Without this the graph includes
+# every target's dependencies — `r-efi` under an LGPL, pulled in by
+# `getrandom` for UEFI, is in the tree and is never linked into anything this
+# repository ships. Judging a licence on a crate that is not built is how an
+# allow-list ends up carrying entries nobody can explain.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+# A published vulnerability against anything we ship fails the build; that is
+# the default and it is not softened here.
+#
+# `unmaintained` and `unsound` say *which* crates those advisories are looked
+# for in, not how loudly they land. `workspace` means the ones this repository
+# names itself: a crate three levels down being unmaintained is real, and it is
+# not something a release at three in the morning can act on — the ones we
+# chose are.
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "workspace"
+ignore = []
+
+[licenses]
+# Permissive only. Anything else — GPL, LGPL, MPL, AGPL, or no licence at all —
+# stops the build and gets a decision rather than an exception. The list holds
+# nothing that matches nothing: an entry that is there "just in case" is one
+# nobody can explain later.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # The Mozilla root store, under the Community Data License Agreement's
+    # permissive variant — a data licence rather than a code one, which is
+    # what a list of certificate authorities is.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# The workspace's own crates are AGPL-3.0-or-later. Named one by one rather
+# than put on the list above, and rather than reached for with `private`
+# (which only covers crates marked `publish = false`, and none of these are):
+# the list is about what this repository may *carry*, and an AGPL crate that
+# came from outside it should still stop the build. Naming ours keeps that
+# true.
+
+[[licenses.exceptions]]
+name = "velstra-cloud-api"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-cli"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+name = "velstra-cloud-console"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-controller"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-e2e"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-fabric"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-model"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-node"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-nodeagent"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-proto"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-store"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-wire"
+allow = ["AGPL-3.0-or-later"]
+
+[bans]
+# Two copies of the same crate is a build that got bigger for no reason, and
+# occasionally two copies of a *lock*. A warning, not an error: the workspace
+# does not control its transitive graph, and failing on it would mean pinning
+# other people's dependencies.
+multiple-versions = "warn"
+# Deliberately not `wildcards = "deny"`. The only wildcards in this tree are
+# the path dependencies between its own crates, which is how a workspace is
+# written; `allow-wildcard-paths` would excuse them, but only for crates
+# marked `publish = false`, and none of these are. Turning the check on would
+# mean saying something about publishing to crates.io in order to get an
+# answer about dependency hygiene — two decisions in one, and the second one
+# is not this file's to make.
+
+[sources]
+# Only crates.io. A git dependency is a version nobody can audit and a build
+# that stops working when somebody force-pushes.
+unknown-registry = "deny"
+unknown-git = "deny"
