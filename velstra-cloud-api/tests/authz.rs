@@ -3930,4 +3930,57 @@ async fn an_image_shared_with_another_project_is_readable_there_and_not_writable
         .err()
         .expect("a read grant let somebody delete another tenant's image");
     assert_eq!(refused.code, Code::PermissionDenied);
+
+    // And the half this test used to claim in prose and never check: bob can
+    // **boot** it. Sharing is decided from the object's own `shared_with`, so
+    // it lives in `may_read`, which has the document — and the reference check
+    // asked `judge`, which does not. The grant let bob see the bytes on offer
+    // and refused every guest that named them.
+    let booted = api
+        .create(
+            "projects/p2",
+            "instances",
+            &json!({ "id": "web", "spec": {
+                "image": "projects/p1/images/sha256-golden",
+                "vcpus": 1, "memory_mib": 512, "root_disk_gib": 10 } }),
+            &who(BOB),
+        )
+        .await;
+    assert!(
+        booted.is_ok(),
+        "a shared image could be read and not booted: {:?}",
+        booted.err().map(|e| e.message)
+    );
+
+    // An image nobody shared is still refused, so the fallback grants nothing
+    // sharing did not.
+    api.create(
+        "projects/p1",
+        "images",
+        &json!({
+            "id": "sha256-private",
+            "spec": {
+                "digest": "sha256:private",
+                "format": "Raw",
+                "size_bytes": 1024,
+                "source_url": "https://example.invalid/private.img"
+            }
+        }),
+        &who(ADA),
+    )
+    .await
+    .expect("ada may publish into her own project");
+    let refused = api
+        .create(
+            "projects/p2",
+            "instances",
+            &json!({ "id": "sneaky", "spec": {
+                "image": "projects/p1/images/sha256-private",
+                "vcpus": 1, "memory_mib": 512, "root_disk_gib": 10 } }),
+            &who(BOB),
+        )
+        .await
+        .err()
+        .expect("an unshared image was bootable from another project");
+    assert_eq!(refused.code, Code::PermissionDenied);
 }

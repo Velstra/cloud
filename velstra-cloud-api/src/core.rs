@@ -1775,7 +1775,31 @@ impl Api {
             if governing_project(&name).as_deref() == home {
                 continue;
             }
-            self.authorize(who, Verb::Read, &name).await?;
+            if let Err(refused) = self.authorize(who, Verb::Read, &name).await {
+                // An image its owner shared. Sharing is a *read* grant, and it
+                // is decided from the object's own `shared_with` — so it lives
+                // in `may_read`, which has the document, and not in `judge`,
+                // which does not. This path asked `judge` and nothing else, so
+                // a shared image could be read and never booted: the grant let
+                // a tenant see the bytes on offer and refused every instance
+                // that named them.
+                //
+                // Claimed in `docs/rest-contract.md`, on `ImageSpec` and in
+                // `may_read`'s own comment ("read and boot"); tested nowhere,
+                // because the test that covers sharing never made an instance.
+                //
+                // One extra read, on the refusal path only, for images only.
+                if name.collection() != "images" {
+                    return Err(refused);
+                }
+                let Some(document) = self.collection("images")?.get(&name.to_string()).await?
+                else {
+                    return Err(refused);
+                };
+                if !self.may_read(who, &name, &document).await {
+                    return Err(refused);
+                }
+            }
         }
         Ok(())
     }
