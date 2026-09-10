@@ -47,9 +47,19 @@ jobs:
       - name: Build the Debian package
         run: |
           nix build .#deb -L --out-link result-deb
-          # The store path is a symlink to one file; give the release a copy
-          # under the name apt will see.
-          cp -L result-deb "$(basename "$(readlink -f result-deb)")"
+          # The store path is a symlink to one file, and its basename carries
+          # the store hash — `<32 chars>-velstra-cloud_<version>_amd64.deb`.
+          # That prefix is nix's, not the package's: apt names a file
+          # `<package>_<version>_<arch>.deb`, and an asset called anything else
+          # is one somebody has to rename before `apt install ./…` will look at
+          # it. Stripped here, so the release carries the name it is installed
+          # under.
+          name="$(basename "$(readlink -f result-deb)" | sed 's/^[a-z0-9]\{32\}-//')"
+          cp -L result-deb "$name"
+          # The package's own idea of its name has to be the file's, or the
+          # rename above was a guess that happened to look right.
+          dpkg-deb --show --showformat='${Package}_${Version}_${Architecture}.deb\n' "$name" \
+            | grep -Fxq "$name"
           ls -l ./*.deb
 
       - name: Publish GitHub release
