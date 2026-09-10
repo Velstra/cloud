@@ -101,6 +101,12 @@ let
     "velstra-cloud-api.service" = unit {
       role = "control-plane";
       description = "Velstra Cloud API";
+      # The store first. On a fresh boot the API came up before etcd accepted
+      # a connection, exited with "tcp connect error", and was restarted five
+      # seconds later — every boot, in the journal as a failure. Ordering is
+      # cheaper than a retry loop, and etcd is what the seed says this machine
+      # runs when it is the control plane.
+      after = "network-online.target etcd.service";
       exec = ''
         /bin/sh -c 'if [ -f /var/lib/velstra/bootstrap-password ]; then \
           VELSTRA_BOOTSTRAP_PASSWORD="$(cat /var/lib/velstra/bootstrap-password)"; \
@@ -118,6 +124,7 @@ let
     "velstra-cloud-controller.service" = unit {
       role = "control-plane";
       description = "Velstra Cloud controllers";
+      after = "network-online.target etcd.service velstra-cloud-api.service";
       exec = bin "velstra-cloud-controller";
     };
     # Both agents are handed their answers on the command line, built from the
@@ -334,7 +341,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     # sends the loader to the system paths, which is where Debian's libraries
     # are.
     for b in velstra-cloud-api velstra-cloud-controller velstra-cloud-nodeagent \
-             velstra-cloud-poolagent velstra-cloud-node; do
+             velstra-cloud-poolagent velstra-cloud-node velstra; do
       cp ${velstra-cloud}/bin/$b "$root/usr/bin/$b"
       chmod 0755 "$root/usr/bin/$b"
       patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 \
