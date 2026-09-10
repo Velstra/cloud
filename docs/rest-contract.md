@@ -50,7 +50,19 @@ behaviour every existing client already has — so adding this breaks nothing.
 It is also the reason to send one.
 
 A path that names a field nobody has is **refused**, not ignored: a caller who
-writes `spec.vcpu` and is answered OK has been told their change was made.
+writes `spec.vcpu` and is answered OK has been told their change was made. The
+question is put to the *type*, not to the message — a field at its default is
+not on the wire at all, and reading its absence as "no such field" made
+**clearing** one impossible, which is the operation a mask exists for. So a
+mask may name a field the message leaves unset, and that writes the empty
+value:
+
+```
+UpdateImage { image: { sharedWith: [] }, updateMask: { paths: ["spec.sharedWith"] } }
+```
+
+unshares it, where an unmasked update carrying the same message would leave
+every other field alone and this one too.
 
 ## Names and shapes
 
@@ -982,6 +994,14 @@ tracked as a running total — a total that is incremented on create and
 decremented on delete is wrong the first time either half is missed, and it
 fails closed.
 
+**Asked on both doors.** A create is counted, and so is a change: a cap
+enforced only at creation is not a cap, and a tenant capped at eight vCPUs
+could make a one-vCPU guest and `PATCH` it to five hundred and twelve. A change
+is judged on the object as it *would be* — the stored spec with the change laid
+over it, since a patch carries only what it moves — and the object being
+changed is taken out of the sums first, so a project sitting exactly at its cap
+may still make a guest smaller.
+
 | | |
 |---|---|
 | `instances`, `vcpus`, `memoryMib` | the guests and what they are made of |
@@ -1560,8 +1580,8 @@ What a client may rely on:
   has been retired — an address that kept answering after its object vanished
   would be traffic arriving somewhere nothing can explain.
 - **Quota**: a project's `quota.loadBalancers` caps how many a project may
-  hold, counted from what exists like every other dimension, and refused at
-  create with `RESOURCE_EXHAUSTED`.
+  hold, counted from what exists like every other dimension, and refused with
+  `RESOURCE_EXHAUSTED`.
 
 ### The address is the cell's, not the world's
 
@@ -2340,6 +2360,19 @@ objects** — a field removed from the code must not make yesterday's data
 unreadable — and wrong at the door: an operator answered `200` goes home
 believing memory is overcommitted. So the strictness is at the boundary and not
 on the types.
+
+**At every depth, not only the top.** A field inside a known object, or inside
+an element of a list, is refused the same way and the path says where it sat:
+
+```
+PATCH /api/v1/projects/p1/volumes/logs   { "spec": { "limits": { "readMbps": 200 } } }
+400 { "error": { "code": "INVALID_ARGUMENT", "field": "spec.limits.readMbps", … } }
+```
+
+`limits` is a field a volume has and `readMbps` is not a field of `Limits`
+(`readMibps` is). Until this descended, that request answered `200` and the
+volume kept the pool's ceiling — an operator told the tenant was throttled when
+nothing had been written.
 
 An unknown field carrying *nothing* — `null`, `""`, `0`, `[]`, `{}` — is
 accepted in silence. That is somebody echoing back an object or clearing a

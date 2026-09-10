@@ -413,6 +413,15 @@ where
 
         for (key, value) in fields {
             if known(key) {
+                // Known at the top — but a known field can be an object or a
+                // list of them, and until this descended, everything inside one
+                // was accepted and dropped. `{"limits":{"readMbps":200}}` on a
+                // volume answered 200 and kept the pool's ceiling, because
+                // `limits` is a field this type has and `read_mbps` is not a
+                // field of `Limits`.
+                if let Some(path) = unknown_within(value, echoed.get(key)) {
+                    return Err(refuse_unknown(self.kind(), &format!("{key}.{path}")));
+                }
                 continue;
             }
             // An unknown field carrying nothing is somebody echoing back an
@@ -423,11 +432,7 @@ where
             if is_nothing(value) {
                 continue;
             }
-            return Err(ApiError::invalid(format!(
-                "there is no field called {key} on a {}; nothing would have been done with it",
-                self.kind()
-            ))
-            .at(format!("spec.{key}")));
+            return Err(refuse_unknown(self.kind(), key));
         }
         Ok(())
     }
@@ -537,7 +542,7 @@ where
 /// Copy `patch` onto `into`, one level at a time, keeping keys neither knows.
 ///
 /// Unknown keys are kept deliberately: they are the whole point of the caller.
-fn overlay(into: &mut Value, patch: &Value) {
+pub(crate) fn overlay(into: &mut Value, patch: &Value) {
     let (Some(into), Some(patch)) = (into.as_object_mut(), patch.as_object()) else {
         *into = patch.clone();
         return;
@@ -550,6 +555,59 @@ fn overlay(into: &mut Value, patch: &Value) {
             }
         }
     }
+}
+
+/// The refusal, in one place, so the sentence a nested field gets is the
+/// sentence a top-level one gets.
+fn refuse_unknown(kind: &str, path: &str) -> ApiError {
+    ApiError::invalid(format!(
+        "there is no field called {path} on a {kind}; nothing would have been done with it"
+    ))
+    .at(format!("spec.{path}"))
+}
+
+/// The path of the first field inside `sent` that did not survive the round
+/// trip — or `None` when everything inside it did.
+///
+/// **The echo is the authority, not a schema.** `echoed` is what the type
+/// produced after parsing what was sent, so a key serde dropped is exactly a
+/// key the type does not have, at any depth. That is the same test the
+/// top-level loop makes; this walks it down through objects and through the
+/// elements of lists.
+///
+/// It fails *open* wherever the two shapes cannot be compared — a field whose
+/// serialised form is not its written form, a list the type reordered or
+/// collapsed. A guard that guessed there would refuse fields that do exist,
+/// which is worse than the gap it closes: a legitimate request answered with a
+/// sentence saying the field is imaginary.
+fn unknown_within(sent: &Value, echoed: Option<&Value>) -> Option<String> {
+    let (Some(sent), Some(echoed)) = (sent.as_object(), echoed?.as_object()) else {
+        // Not two objects. If both are arrays, compare element by element; the
+        // round trip preserves order and length for a list of records, and
+        // anything else is a shape this cannot judge.
+        return match (sent.as_array(), echoed?.as_array()) {
+            (Some(sent), Some(echoed)) if sent.len() == echoed.len() => sent
+                .iter()
+                .zip(echoed)
+                .enumerate()
+                .find_map(|(i, (s, e))| unknown_within(s, Some(e)).map(|p| format!("{i}.{p}"))),
+            _ => None,
+        };
+    };
+    for (key, value) in sent {
+        match echoed.get(key) {
+            Some(echo) => {
+                if let Some(deeper) = unknown_within(value, Some(echo)) {
+                    return Some(format!("{key}.{deeper}"));
+                }
+            }
+            // Sent and gone. Nothing carrying nothing is somebody echoing an
+            // object back, exactly as at the top level.
+            None if !is_nothing(value) => return Some(key.clone()),
+            None => {}
+        }
+    }
+    None
 }
 
 /// Whether a value carries no intention: absent, empty, or zero.

@@ -2929,7 +2929,7 @@ impl Api {
                 .await?;
         }
         self.check_cell(&name, kind).await?;
-        self.check_quota(&name, kind, &spec).await?;
+        self.check_quota(&name, kind, &spec, None).await?;
 
         let mut meta = Meta::new(name.clone(), self.inner.placement.clone());
         if let Some(labels) = body.get("meta").and_then(|m| m.get("labels")) {
@@ -3538,6 +3538,11 @@ impl Api {
             // that will not happen, and answering `200` to one is agreeing to
             // something that will not be done.
             collection.check_known(spec)?;
+            // After the shape is settled, never before: quota reads the spec as
+            // its real type, and asking first means a mistyped field is
+            // reported as a failed parse with no field named rather than as the
+            // field it was.
+            self.check_quota_after_this_change(name, spec).await?;
             if name.collection() == "nodes" && spec.get("vcpu_overcommit").is_some() {
                 refuse_an_unusable_overcommit(spec)?;
             }
@@ -6959,6 +6964,50 @@ impl Api {
         Ok(())
     }
 
+    /// Ask the caps about the object this change would leave behind.
+    ///
+    /// A patch carries only what it changes, so the question cannot be put to
+    /// the patch: `{"vcpus": 512}` says nothing about the memory that is also
+    /// counted. What is checked is the **stored spec with the change laid over
+    /// it** — the guest as it would be — and the stored object is taken out of
+    /// the sums, so a tenant sitting at their cap may still make a guest
+    /// smaller.
+    ///
+    /// Only for the collections that are capped at all; everything else does
+    /// not read the object.
+    async fn check_quota_after_this_change(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let kind = name.collection();
+        if !matches!(
+            kind,
+            "instances" | "volumes" | "floatingips" | "load-balancers" | "snapshots" | "backups"
+        ) {
+            return Ok(());
+        }
+        // What is stored, as the wire has it. A patch is judged against the
+        // whole object rather than against its own fields, and the merge is the
+        // same one the write itself performs.
+        let Some(stored) = self.collection(kind)?.get(&name.to_string()).await? else {
+            return Ok(());
+        };
+        let Some(mut whole) = stored.get("spec").cloned() else {
+            return Ok(());
+        };
+        crate::collection::overlay(&mut whole, spec);
+        // Only the answer this is here for. A merged spec that will not parse
+        // is a *shape* problem, and the write itself reports one far better —
+        // it measures the failure against the stored copy and names the field.
+        // Quota reporting it first would replace "spec.rootDiskGib does not
+        // take that value" with a bare parse error naming nothing.
+        match self.check_quota(name, kind, &whole, Some(name)).await {
+            Err(e) if e.code == Code::ResourceExhausted => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     async fn refuse_a_moved_pool(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
         let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
             return Ok(());
@@ -7561,7 +7610,27 @@ impl Api {
         .at("meta.name"))
     }
 
-    async fn check_quota(&self, name: &ResourceName, kind: &str, spec: &Value) -> ApiResult<()> {
+    /// Refuse a spec that would put a project over one of its caps.
+    ///
+    /// `replacing` is the object whose spec this one takes the place of, or
+    /// `None` for something being made. It exists because this is asked on
+    /// **both** doors: a cap enforced only at create is not a cap, it is a
+    /// speed bump — a tenant capped at eight vCPUs made a one-vCPU guest and
+    /// patched it to five hundred and twelve, and the platform said 200 and
+    /// then reported itself as sixty-four times over its own limit.
+    ///
+    /// Every dimension below is a fresh sum over what exists plus the one being
+    /// written. On a change the object being changed is taken out of that sum
+    /// first, so what is counted is the world as it would be afterwards — not
+    /// the old guest and the new one together, which would refuse a tenant at
+    /// their cap for making their guest *smaller*.
+    async fn check_quota(
+        &self,
+        name: &ResourceName,
+        kind: &str,
+        spec: &Value,
+        replacing: Option<&ResourceName>,
+    ) -> ApiResult<()> {
         if kind != "instances"
             && kind != "volumes"
             && kind != "floatingips"
@@ -7599,7 +7668,11 @@ impl Api {
         match kind {
             "instances" => {
                 let wanted: InstanceSpec = serde_json::from_value(spec.clone())?;
-                let existing: Vec<Instance> = self.typed_list(&parent, "instances").await?;
+                let existing = without(
+                    self.typed_list::<InstanceSpec, InstanceStatus>(&parent, "instances")
+                        .await?,
+                    replacing,
+                );
                 let count = existing.len() as u32 + 1;
                 let vcpus = existing.iter().map(|i| i.spec.vcpus).sum::<u32>() + wanted.vcpus;
                 let memory =
@@ -7627,8 +7700,16 @@ impl Api {
             }
             "volumes" => {
                 let wanted: VolumeSpec = serde_json::from_value(spec.clone())?;
-                let existing: Vec<Volume> = self.typed_list(&parent, "volumes").await?;
+                let existing = without(
+                    self.typed_list::<VolumeSpec, velstra_cloud_model::resources::VolumeStatus>(
+                        &parent, "volumes",
+                    )
+                    .await?,
+                    replacing,
+                );
                 let count = existing.len() as u32 + 1;
+                // Not filtered: a volume's change never alters an instance's
+                // root disk, and vice versa.
                 let instances: Vec<Instance> = self.typed_list(&parent, "instances").await?;
                 let gib = existing.iter().map(|v| v.spec.size_gib).sum::<u64>()
                     + instances.iter().map(|i| i.spec.root_disk_gib).sum::<u64>()
@@ -7641,14 +7722,23 @@ impl Api {
                 exceeded(quota.volume_gib, gib, "GiB of volume", "spec.sizeGib")?;
             }
             "floatingips" => {
-                let existing: Vec<velstra_cloud_model::resources::FloatingIp> =
-                    self.typed_list(&parent, "floatingips").await?;
+                let existing = without(
+                    self.typed_list::<
+                        velstra_cloud_model::resources::FloatingIpSpec,
+                        velstra_cloud_model::resources::FloatingIpStatus,
+                    >(&parent, "floatingips")
+                    .await?,
+                    replacing,
+                );
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.floating_ips as u64, count, "floating IPs", "spec")?;
             }
             "snapshots" => {
-                let existing: Vec<velstra_cloud_model::resources::Snapshot> =
-                    self.typed_list(&parent, "snapshots").await?;
+                let existing = without(
+                    self.typed_list::<SnapshotSpec, SnapshotStatus>(&parent, "snapshots")
+                        .await?,
+                    replacing,
+                );
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.snapshots as u64, count, "snapshots", "spec")?;
                 // What the ones that exist occupy. The new one adds nothing
@@ -7661,16 +7751,28 @@ impl Api {
                 exceeded(quota.snapshot_gib, gib, "GiB of snapshot", "spec")?;
             }
             "backups" => {
-                let existing: Vec<velstra_cloud_model::resources::Backup> =
-                    self.typed_list(&parent, "backups").await?;
+                let existing = without(
+                    self.typed_list::<
+                        velstra_cloud_model::backup::BackupSpec,
+                        velstra_cloud_model::backup::BackupStatus,
+                    >(&parent, "backups")
+                    .await?,
+                    replacing,
+                );
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.backups as u64, count, "backups", "spec")?;
                 let gib = existing.iter().map(|b| b.status.size_gib).sum::<u64>();
                 exceeded(quota.backup_gib, gib, "GiB of backup", "spec")?;
             }
             _ => {
-                let existing: Vec<velstra_cloud_model::loadbalancer::LoadBalancer> =
-                    self.typed_list(&parent, "load-balancers").await?;
+                let existing = without(
+                    self.typed_list::<LoadBalancerSpec, LoadBalancerStatus>(
+                        &parent,
+                        "load-balancers",
+                    )
+                    .await?,
+                    replacing,
+                );
                 let count = existing.len() as u64 + 1;
                 exceeded(quota.load_balancers as u64, count, "load balancers", "spec")?;
             }
@@ -7924,6 +8026,22 @@ fn taken(error: ApiError, kind: &str, name: &ResourceName) -> ApiError {
         None => format!("{article} {singular} called {} already exists", name.id()),
     };
     ApiError::new(Code::AlreadyExists, message).at("id")
+}
+/// The same list without the object a change is about.
+///
+/// Quota counts the world as it would be after the write, so the object being
+/// replaced is not also counted in its old shape.
+fn without<S, T>(
+    objects: Vec<Resource<S, T>>,
+    replacing: Option<&ResourceName>,
+) -> Vec<Resource<S, T>> {
+    let Some(name) = replacing else {
+        return objects;
+    };
+    objects
+        .into_iter()
+        .filter(|o| &o.meta.name != name)
+        .collect()
 }
 
 fn exceeded(limit: u64, wanted: u64, what: &str, field: &str) -> ApiResult<()> {
