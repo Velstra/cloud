@@ -273,7 +273,11 @@
         # told to install NixOS first.
         #   nix build .#deb
         deb = import ./nix/debian.nix {
-          inherit pkgs lib velstra-cloud version;
+          inherit pkgs lib velstra-cloud;
+          # `debVersion`, not `version`: the package's own name for itself has
+          # to move between builds or apt refuses every upgrade. See the long
+          # note where it is computed.
+          version = debVersion;
         };
 
         controller-image = ociImage {
@@ -1560,6 +1564,33 @@
               dpkg-deb --field "$deb" Depends | grep -q "libc6 (>= ''${want#GLIBC_})" || {
                 echo "::error::the binaries need $want and the package does not say so" >&2
                 dpkg-deb --field "$deb" Depends >&2
+                exit 1
+              }
+
+              # The version has to be something apt will *upgrade to*, which is
+              # the one property `debVersion` exists for and the one nothing
+              # checked. A package whose version never moves answers
+              # "velstra-cloud is already the newest version" and does nothing —
+              # reported from a real box, where the way out was `--reinstall`.
+              #
+              # Two claims, both made with dpkg's own comparison rather than by
+              # eye: this build is strictly newer than the plain `${version}` it
+              # is built from, and strictly newer than the same version stamped
+              # an hour earlier. The second is what proves the *timestamp* leads:
+              # with the revision first, half of all builds would sort backwards
+              # and apt would refuse them as downgrades.
+              got=$(dpkg-deb --field "$deb" Version)
+              test -n "$got" || { echo "the package has no Version field" >&2; exit 1; }
+              dpkg --compare-versions "$got" gt "${version}" || {
+                echo "::error::$got does not sort above ${version}, so apt would not upgrade to it" >&2
+                exit 1
+              }
+              # `0.1.0+20260908180712.65bd401` -> stamp `20260908180712`.
+              stamp=''${got#*+}
+              stamp=''${stamp%%.*}
+              earlier="''${got%%+*}+$((stamp - 1)).zzzzzzz"
+              dpkg --compare-versions "$got" gt "$earlier" || {
+                echo "::error::$got does not sort above $earlier — the timestamp is not leading" >&2
                 exit 1
               }
 

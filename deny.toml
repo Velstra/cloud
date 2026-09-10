@@ -1,0 +1,77 @@
+# What this repository will and will not carry.
+#
+# Two questions, and they are different: **advisories** ask whether a crate we
+# depend on has a published vulnerability, and **licences** ask whether we are
+# allowed to ship it. Both are answered in CI on every change, because the
+# moment to find out that a transitive dependency was yanked for a
+# use-after-free is not the moment somebody asks "are you affected by CVE-X".
+#
+# The lists below are deliberately short. An allow-list of licences that grows
+# every time a build fails is an allow-list nobody reads; each addition here is
+# a decision somebody made once, on purpose, and it is written down.
+
+[graph]
+# The platforms this is actually built for. Without this the graph includes
+# every target's dependencies — `r-efi` under an LGPL, pulled in by
+# `getrandom` for UEFI, is in the tree and is never linked into anything this
+# repository ships. Judging a licence on a crate that is not built is how an
+# allow-list ends up carrying entries nobody can explain.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+# Anything with a published advisory fails the build. Unmaintained crates and
+# unsound ones warn rather than fail: both are real, neither is a reason to
+# stop a release at three in the morning, and a warning that is read is worth
+# more than an error that gets `--ignore`d into permanence.
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "warn"
+ignore = []
+
+[licenses]
+# Permissive, plus the two weak-copyleft licences whose terms are satisfied by
+# linking: MPL-2.0 is file-level and LGPL is not carried statically here.
+# Anything else — GPL, AGPL, or no licence at all — stops the build and gets a
+# decision rather than an exception.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # The Mozilla root store, under the Community Data License Agreement's
+    # permissive variant — a data licence rather than a code one, which is
+    # what a list of certificate authorities is.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# The workspace's own crates are AGPL-3.0-or-later and are not judged against
+# the list above: the list is about what this repository may *carry*, and its
+# own licence is a decision, not a dependency.
+private = { ignore = true }
+
+[bans]
+# Two copies of the same crate is a build that got bigger for no reason, and
+# occasionally two copies of a *lock*. A warning, not an error: the workspace
+# does not control its transitive graph, and failing on it would mean pinning
+# other people's dependencies.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io. A git dependency is a version nobody can audit and a build
+# that stops working when somebody force-pushes.
+unknown-registry = "deny"
+unknown-git = "deny"

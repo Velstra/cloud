@@ -1,0 +1,63 @@
+name: Release
+
+# When a `vX.Y.Z` tag is pushed (by `cargo release`), publish a GitHub release
+# whose body IS that version's CHANGELOG section, and attach the Debian package
+# built from that exact tag — because "which build am I running" is a question
+# an operator has to be able to answer without compiling anything.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Everything between `## [<version>]` and the next `## [` heading.
+          awk -v v="$version" '
+            $0 ~ ("^## \\[" v "\\]") { inblock = 1; next }
+            inblock && /^## \[/ { exit }
+            inblock { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+          {
+            echo
+            echo "---"
+            echo "Full changelog: [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md)"
+          } >> RELEASE_NOTES.md
+          echo "----- release notes for $version -----"
+          cat RELEASE_NOTES.md
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Build the Debian package
+        run: |
+          nix build .#deb -L --out-link result-deb
+          # The store path is a symlink to one file; give the release a copy
+          # under the name apt will see.
+          cp -L result-deb "$(basename "$(readlink -f result-deb)")"
+          ls -l ./*.deb
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag \
+            ./*.deb
