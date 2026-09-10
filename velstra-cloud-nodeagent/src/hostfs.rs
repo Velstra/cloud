@@ -437,6 +437,29 @@ pub fn stored_as(digest: &str) -> Option<String> {
     digest_of(digest).map(|d| d.stored())
 }
 
+/// How long a fetch may make no progress before it is abandoned.
+///
+/// **This is a safety control, not a convenience.** The agent's pass is serial:
+/// the heartbeat and the self-fence both run in the same loop as the fetch, so
+/// a download that never returns is a node that stops saying it is alive and
+/// never fences itself either — while its guests keep running. At
+/// `fenceAfterS + 60 s` the control plane takes the node for gone and starts
+/// those guests somewhere else, and on shared storage that is two machines
+/// writing one volume.
+///
+/// `ha.rs` says the agent "really does self-fence", tested by killing its
+/// connection. That is the case that works — the read fails at once and the
+/// pass returns. A mirror that accepts the connection and then sends nothing is
+/// the case that did not, and it had no bound at all.
+///
+/// Applied per stalled read rather than to the whole download: a large image on
+/// a slow link is not a fault, and cutting it off at a wall-clock deadline would
+/// make big images unfetchable rather than making the node safe.
+const STALLED_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long to wait for the far end to accept a connection at all.
+const CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Fetch an image from `source` into the incoming directory, then verify and
 /// publish it.
 ///
@@ -528,6 +551,11 @@ async fn fetch_https(url: &str, dest: &Path) -> Result<()> {
 
     let response = reqwest::Client::builder()
         .user_agent(concat!("velstra-cloud/", env!("CARGO_PKG_VERSION")))
+        // Not a total deadline: `read_timeout` bounds the gap between bytes, so
+        // a slow-but-moving mirror finishes and a silent one does not hold the
+        // pass. See `STALLED_AFTER`.
+        .connect_timeout(CONNECT_WITHIN)
+        .read_timeout(STALLED_AFTER)
         .build()
         .map_err(|e| HostError::failed(format!("no https client: {e}")))?
         .get(url)
@@ -568,8 +596,14 @@ async fn fetch_http(url: &str, dest: &Path) -> Result<()> {
         .host()
         .ok_or_else(|| HostError::failed(format!("{url} names no host")))?;
     let port = uri.port_u16().unwrap_or(80);
-    let stream = tokio::net::TcpStream::connect((host, port))
+    let stream = tokio::time::timeout(CONNECT_WITHIN, tokio::net::TcpStream::connect((host, port)))
         .await
+        .map_err(|_| {
+            HostError::failed(format!(
+                "connecting to {host}:{port}: nothing answered within {} s",
+                CONNECT_WITHIN.as_secs()
+            ))
+        })?
         .map_err(|e| HostError::failed(format!("connecting to {host}:{port}: {e}")))?;
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
@@ -603,7 +637,18 @@ async fn fetch_http(url: &str, dest: &Path) -> Result<()> {
     }
 
     let mut file = tokio::fs::File::create(dest).await?;
-    while let Some(frame) = response.frame().await {
+    // Bounded per frame, for the reason `STALLED_AFTER` gives: an unbounded
+    // read here is an unbounded pass, and an unbounded pass is a node that
+    // neither reports nor fences while its guests keep running.
+    while let Some(frame) = match tokio::time::timeout(STALLED_AFTER, response.frame()).await {
+        Ok(frame) => frame,
+        Err(_) => {
+            return Err(HostError::failed(format!(
+                "fetching {url}: nothing arrived for {} s",
+                STALLED_AFTER.as_secs()
+            )));
+        }
+    } {
         let frame = frame.map_err(|e| HostError::failed(format!("reading {url}: {e}")))?;
         if let Some(chunk) = frame.data_ref() {
             file.write_all(chunk).await?;
