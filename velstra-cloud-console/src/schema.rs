@@ -1061,6 +1061,77 @@ const PROJECT_FIELDS: &[Field] = &[
         derived: false,
         at_creation: false,
     },
+    Field {
+        key: "quota.snapshots",
+        label: "Snapshots",
+        kind: Kind::Number {
+            unit: "snapshots",
+            min: 0,
+            max: 1_000_000,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Cheap to ask for and occupying a pool for as long as they exist. \
+               A schedule nobody is watching is the ordinary way a cell fills up.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "quota.snapshotGib",
+        label: "Snapshot storage",
+        kind: Kind::Number {
+            unit: "GiB",
+            min: 0,
+            max: 1 << 30,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Counted from what each snapshot turned out to occupy, which the \
+               pool reports after the fact.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "quota.backups",
+        label: "Backups",
+        kind: Kind::Number {
+            unit: "backups",
+            min: 0,
+            max: 1_000_000,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Separate from snapshots because they live on a backup target \
+               rather than in the pool.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "quota.backupGib",
+        label: "Backup storage",
+        kind: Kind::Number {
+            unit: "GiB",
+            min: 0,
+            max: 1 << 30,
+            step: 1,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Counted from what each backup turned out to occupy.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
 ];
 
 const FAMILY_FIELDS: &[Field] = &[
@@ -1355,8 +1426,8 @@ const INSTANCE_FIELDS: &[Field] = &[
             step: 1,
             scale: Scale::None,
         },
-        required: true,
-        advanced: false,
+        required: false,
+        advanced: true,
         help: "",
         when_empty: "",
         derived: false,
@@ -1376,8 +1447,8 @@ const INSTANCE_FIELDS: &[Field] = &[
             step: 256,
             scale: Scale::Mib,
         },
-        required: true,
-        advanced: false,
+        required: false,
+        advanced: true,
         help: "",
         when_empty: "",
         derived: false,
@@ -1507,7 +1578,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         // empty now means the project's default network, so the honest thing is
         // to say which network they are getting rather than ask. The line beside
         // the Create button says it.
-        advanced: true,
+        advanced: false,
         help: "Left empty, this guest joins your project's default network — made \
                the first time somebody needs it, so two machines in a project can \
                talk without anybody configuring anything.",
@@ -1524,7 +1595,7 @@ const INSTANCE_FIELDS: &[Field] = &[
         },
         required: false,
         // Almost always cloud-init's business rather than a field typed here.
-        advanced: true,
+        advanced: false,
         help: "Read by cloud-init on the guest's **first** boot and never again, \
                so adding one to a machine that has already started does nothing \
                to that machine. Without a key and without a password set in \
@@ -1540,7 +1611,7 @@ const INSTANCE_FIELDS: &[Field] = &[
             placeholder: "#cloud-config",
         },
         required: false,
-        advanced: true,
+        advanced: false,
         help: "Handed to the guest on first boot.",
         when_empty: "",
         derived: false,
@@ -1793,16 +1864,17 @@ const VOLUME_FIELDS: &[Field] = &[
     Field {
         key: "pool",
         label: "Pool",
-        kind: Kind::Text {
-            placeholder: "chosen for you",
-            check: Check::Id,
+        kind: Kind::Ref {
+            collection: "pools",
+            filter_by: None,
+            spelling: Spelling::Id,
         },
         // Which pool holds the bytes is the platform's business: left empty,
         // the cell picks the accepting pool with the most room and writes it
         // down. It was a required field, which meant a tenant had to name a
         // pool they are not allowed to list — a form no customer could fill in.
         required: false,
-        advanced: true,
+        advanced: false,
         help: "Left empty, the cell chooses: the accepting pool with the most \
                room. Naming one is for operators pinning a volume to specific \
                hardware — a tenant cannot list pools and does not need to.",
@@ -1853,6 +1925,31 @@ const VOLUME_FIELDS: &[Field] = &[
         at_creation: true,
     },
     Field {
+        key: "sourceBackup",
+        label: "From backup",
+        // The other half of restoring, and the half that matters when a pool
+        // is lost: a snapshot lives beside the volume it was taken from, a
+        // backup lives on a target somewhere else. A picker rather than a
+        // typed name, because backups *are* a collection the console lists.
+        kind: Kind::Ref {
+            collection: "backups",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: false,
+        // Beside the other two sources for the same reason they are: this is
+        // an ordinary reason to make a volume, and the only route back from a
+        // lost pool. Behind the disclosure it would be unreachable exactly
+        // when somebody is looking for it.
+        advanced: false,
+        help: "Restores that copy into a new volume. This is the way back \
+               when the pool the volume lived on is gone.",
+        when_empty: "This project has no backups yet. A backup is made from a \
+                     volume, or on a schedule.",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
         key: "encryptionKey",
         label: "Encryption key",
         kind: Kind::Text {
@@ -1861,11 +1958,67 @@ const VOLUME_FIELDS: &[Field] = &[
         },
         required: false,
         advanced: true,
-        help: "Empty means the bytes are stored in the clear, which is a \
-               decision rather than a default.",
+        help: "Not yet: this cell has no key manager, so a key here is refused \
+               and the bytes are stored in the clear. The field is here for \
+               when one exists.",
         when_empty: "",
         derived: false,
         at_creation: true,
+    },
+    Field {
+        key: "limits.iops",
+        label: "IOPS",
+        kind: Kind::Number {
+            unit: "/s",
+            min: 0,
+            max: 10_000_000,
+            step: 100,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "What this volume may take. Left at zero it takes the pool's \
+               ceiling, if the pool has one — and asking for more than the \
+               ceiling gets the ceiling rather than a refusal.",
+        when_empty: "unlimited",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "limits.readMibps",
+        label: "Read",
+        kind: Kind::Number {
+            unit: "MiB/s",
+            min: 0,
+            max: 1_000_000,
+            step: 10,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Read bandwidth. Zero takes the pool's ceiling.",
+        when_empty: "unlimited",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "limits.writeMibps",
+        label: "Write",
+        kind: Kind::Number {
+            unit: "MiB/s",
+            min: 0,
+            max: 1_000_000,
+            step: 10,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Write bandwidth. Zero takes the pool's ceiling. Separate from \
+               reads because they are not the same cost on any backend here: a \
+               write to a replicated Ceph pool is three writes.",
+        when_empty: "unlimited",
+        derived: false,
+        at_creation: false,
     },
 ];
 
@@ -2090,7 +2243,9 @@ const SUBNET_FIELDS: &[Field] = &[
         },
         required: false,
         advanced: false,
-        help: "",
+        help: "Left empty the guests use this cell's own resolver, which names \
+               the project's other machines and forwards everything else. Name \
+               one here to send them somewhere of your own instead.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -2489,6 +2644,72 @@ const IMAGE_FIELDS: &[Field] = &[
                verifies under a key the cell was started with; refused otherwise, so a \
                stored signature is a verified one.",
         when_empty: "unsigned",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "state",
+        label: "Life stage",
+        kind: Kind::Choice {
+            options: &[
+                Choice {
+                    value: "Active",
+                    label: "In service",
+                },
+                Choice {
+                    value: "Deprecated",
+                    label: "Deprecated — still boots, no longer chosen",
+                },
+                Choice {
+                    value: "Obsolete",
+                    label: "Retired — nothing new is built from it",
+                },
+            ],
+        },
+        required: false,
+        // Advanced because publishing is not where this is decided: a new
+        // image is in service by definition, and the stage is changed months
+        // later, on the image that was superseded. The one-click path for that
+        // is on the object itself, not on this form.
+        advanced: true,
+        help: "An image is never replaced, only superseded. Deprecating one stops a family \
+               choosing it while everything pinned to it keeps working; retiring it refuses \
+               anything new. Neither touches a running guest.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "replacement",
+        label: "Use instead",
+        kind: Kind::Ref {
+            collection: "images",
+            spelling: Spelling::Name,
+            filter_by: None,
+        },
+        required: false,
+        advanced: true,
+        help: "Named in the refusal a tenant reads, so they are told where to go rather than \
+               only that the door is shut.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "sharedWith",
+        label: "Shared with",
+        kind: Kind::TextList {
+            placeholder: "projects/p2",
+            check: Check::None,
+        },
+        required: false,
+        // The one control on this page that gives something away, so it sits
+        // behind the disclosure rather than beside the size.
+        advanced: true,
+        help: "Projects that may boot from this image besides this one, or `*` \
+               for every project in the cell. A one-way grant: whoever receives \
+               it can boot and cannot edit, retire or delete.",
+        when_empty: "this project only",
         derived: false,
         at_creation: false,
     },
@@ -3321,6 +3542,63 @@ const POOL_FIELDS: &[Field] = &[
         derived: false,
         at_creation: false,
     },
+    Field {
+        key: "volumeCeiling.iops",
+        label: "Ceiling — IOPS",
+        kind: Kind::Number {
+            unit: "/s",
+            min: 0,
+            max: 10_000_000,
+            step: 100,
+            scale: Scale::None,
+        },
+        required: false,
+        // The operator's lever, and the reason there is one: without it a
+        // single tenant running `fio` takes the latency of every other volume
+        // in this pool with them. A volume that asks for nothing gets this,
+        // which is what makes it bind at all — nobody limits themselves.
+        advanced: true,
+        help: "The most any one volume in this pool may take. A volume that \
+               names nothing of its own gets this; one that asks for more is \
+               brought down to it. Zero is no ceiling.",
+        when_empty: "no ceiling",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "volumeCeiling.readMibps",
+        label: "Ceiling — Read",
+        kind: Kind::Number {
+            unit: "MiB/s",
+            min: 0,
+            max: 1_000_000,
+            step: 10,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "",
+        when_empty: "no ceiling",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "volumeCeiling.writeMibps",
+        label: "Ceiling — Write",
+        kind: Kind::Number {
+            unit: "MiB/s",
+            min: 0,
+            max: 1_000_000,
+            step: 10,
+            scale: Scale::None,
+        },
+        required: false,
+        advanced: true,
+        help: "",
+        when_empty: "no ceiling",
+        derived: false,
+        at_creation: false,
+    },
 ];
 
 /// Moving a guest, asked for as an object.
@@ -3556,6 +3834,37 @@ pub const COLLECTIONS: &[Collection] = &[
                 label: "Memory",
                 cell: Cell::Number { unit: "MiB" },
                 width: 104,
+            },
+            // What it is *using*, beside what it was *given*. The pair is the
+            // whole point: a guest with four vCPUs at 3 % and one with one
+            // vCPU at 190 % are the two conversations worth having, and until
+            // this column existed neither was visible from a board.
+            Column {
+                path: "status.usage.cpuPercent",
+                label: "CPU used",
+                cell: Cell::Number { unit: "%" },
+                width: 88,
+            },
+            Column {
+                path: "status.usage.memoryMib",
+                label: "Memory used",
+                cell: Cell::Number { unit: "MiB" },
+                width: 112,
+            },
+            // What has crossed its wires and its disks. Cumulative, so a board
+            // sorted on it answers "which guest is doing the most", which is
+            // the question somebody scanning a list of forty is asking.
+            Column {
+                path: "status.usage.txTotal",
+                label: "Sent",
+                cell: Cell::Bytes,
+                width: 96,
+            },
+            Column {
+                path: "status.usage.diskWriteBytes",
+                label: "Written",
+                cell: Cell::Bytes,
+                width: 96,
             },
             Column {
                 path: "status.node",
@@ -3844,6 +4153,21 @@ pub const COLLECTIONS: &[Collection] = &[
                 cell: Cell::Mono,
                 width: 120,
             },
+            // The one number that tells a firewall apart from a route and from
+            // a service that is not listening. Empty when nothing is judging
+            // this port, which is not the same as nothing being dropped.
+            Column {
+                path: "status.dropped.inboundPackets",
+                label: "Dropped in",
+                cell: Cell::Number { unit: "" },
+                width: 104,
+            },
+            Column {
+                path: "status.dropped.outboundPackets",
+                label: "Dropped out",
+                cell: Cell::Number { unit: "" },
+                width: 104,
+            },
         ],
         agreements: &[],
         creatable: true,
@@ -3995,6 +4319,16 @@ pub const COLLECTIONS: &[Collection] = &[
                 label: "Version",
                 cell: Cell::Text,
                 width: 120,
+            },
+            // Beside the version, because the pair is the question: which of
+            // these near-identical rows should I be using. Without it the only
+            // way to tell a superseded image from a current one is to compare
+            // dates by eye and know how the family rule works.
+            Column {
+                path: "spec.state",
+                label: "Stage",
+                cell: Cell::Text,
+                width: 104,
             },
             Column {
                 path: "spec.format",
@@ -4169,6 +4503,30 @@ pub const COLLECTIONS: &[Collection] = &[
                 label: "Memory used",
                 cell: Cell::Number { unit: "MiB" },
                 width: 128,
+            },
+            // What carries this node's guests' traffic. On a board because the
+            // answers are not interchangeable and one of them — a bare `tap` —
+            // is a wire with nothing at the other end: right on a node whose
+            // fabric holds the segment, a dead end on one without. An operator
+            // scanning a list of machines is exactly who needs to see that two
+            // of them disagree.
+            Column {
+                path: "status.datapath",
+                label: "Wires",
+                cell: Cell::Text,
+                width: 116,
+            },
+            // Whether the console stream from the API to this node is private.
+            // Beside the wires because it is the same question one layer up:
+            // what crosses the cell's own network, and in what state.
+            Column {
+                path: "status.consoleTls",
+                label: "Console",
+                cell: Cell::Yes {
+                    yes: "Encrypted",
+                    no: "Cleartext",
+                },
+                width: 108,
             },
             Column {
                 path: "status.agentVersion",
@@ -5036,7 +5394,7 @@ pub const COLLECTIONS: &[Collection] = &[
         columns: &[
             Column {
                 path: "spec.displayName",
-                label: "Name",
+                label: "Display name",
                 cell: Cell::Text,
                 width: 176,
             },
@@ -5100,6 +5458,21 @@ pub const COLLECTIONS: &[Collection] = &[
                 label: "OSDs",
                 cell: Cell::Count,
                 width: 80,
+            },
+            // What Ceph says, beside what was made. `HEALTH_OK` is a word an
+            // operator who ran Ceph before reads in one glance and one they
+            // used to have to shell in for.
+            Column {
+                path: "status.health",
+                label: "Health",
+                cell: Cell::Text,
+                width: 120,
+            },
+            Column {
+                path: "status.usedBytes",
+                label: "Used",
+                cell: Cell::Bytes,
+                width: 96,
             },
         ],
         agreements: &[Agreement {
@@ -5696,6 +6069,12 @@ mod tests {
         // forces the question "would almost everyone fill this in", and
         // everything else keeps existing exactly where it was, one disclosure
         // deeper.
+        //
+        // Five, since the instance form was walked through by someone who
+        // arrives from another cloud: what they fill in every time is the
+        // image, the size, the network, the key and the first-boot file. The
+        // three sizes the flavor stands for moved under "custom size", which
+        // is what paid for the two that came up.
         for c in COLLECTIONS.iter().filter(|c| c.creatable) {
             let common = c
                 .fields
@@ -5703,7 +6082,7 @@ mod tests {
                 .filter(|f| !f.advanced && !f.derived)
                 .count();
             assert!(
-                common <= 4,
+                common <= 5,
                 "{} asks {common} things before it asks anything advanced",
                 c.id
             );

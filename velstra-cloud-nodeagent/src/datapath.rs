@@ -101,6 +101,18 @@ pub struct TapDatapath {
     /// difference between "no ports" and "no answer", and the agent acts very
     /// differently on the two.
     ip: String,
+    /// Whether somebody else on this node puts the port's rules in force.
+    ///
+    /// A bare tap enforces nothing, so a port carrying rules is refused rather
+    /// than silently unfiltered — that refusal is the honest half of this
+    /// datapath and it stays. But a node that is the *first hop* for its
+    /// guests writes an nftables chain per port
+    /// ([`crate::nftfilter`]), and on such a node the rules are enforced;
+    /// refusing them there would refuse a firewall that works.
+    ///
+    /// Set by whoever builds the agent, because that is the party that knows
+    /// which of the two this node is.
+    filtered_elsewhere: bool,
 }
 
 impl TapDatapath {
@@ -109,7 +121,18 @@ impl TapDatapath {
             prefix: prefix.to_string(),
             owner,
             ip: "ip".to_string(),
+            filtered_elsewhere: false,
         }
+    }
+
+    /// Say that this node puts security-group rules in force some other way.
+    ///
+    /// True on a node that is the first hop for its guests: it holds the
+    /// gateway, so it also holds the `forward` chain where a per-port firewall
+    /// belongs. See [`filtered_elsewhere`](Self::filtered_elsewhere).
+    pub fn filtered_elsewhere(mut self) -> Self {
+        self.filtered_elsewhere = true;
+        self
     }
 
     /// The tap device carrying `port`.
@@ -202,12 +225,53 @@ fn parse_link(line: &str) -> Option<(String, Option<String>)> {
 
 #[async_trait]
 impl Datapath for TapDatapath {
+    /// A wire and nothing else. Whether this node *also* holds the segments'
+    /// gateways is the agent's business, not this type's — see
+    /// [`crate::agent::Agent`], which reports `local-network` when it does.
+    fn datapath_name(&self) -> &'static str {
+        "tap"
+    }
+
     /// The ports this machine is carrying, read from the kernel.
     ///
     /// The rules come back empty because none are in force, and that is the
     /// truthful answer rather than an omission: the agent compares what it wants
     /// with what is here, so claiming rules would be the way to make it stop
     /// asking for them.
+    /// Whether this port is up to date.
+    ///
+    /// The default compares what was observed with what is wanted, and this
+    /// datapath cannot observe rules: a tap carries no filter, so
+    /// [`Self::observe`] reports none. Once the node puts them in force
+    /// elsewhere — an nftables chain per port, written by
+    /// [`crate::localnet`] — that comparison is a permanent disagreement: an
+    /// empty list against a non-empty one, on every pass, for ever.
+    ///
+    /// It is not a cosmetic disagreement. `reconcile_instance` treats a port
+    /// that does not agree as one that is not programmed, so the guest behind
+    /// it never becomes ready to run. A guest with a security group would sit
+    /// at `Stopped` and the platform would say `HostActions: Done` — which is
+    /// exactly what it did until this existed.
+    ///
+    /// The honest answer is that this datapath has nothing to disagree about:
+    /// it does not hold the rules. Whoever does recomputes them whole from the
+    /// current objects on every pass, before any guest is acted on, so "the
+    /// rules in force are the current ones" is true by construction rather
+    /// than by comparison. Where nothing holds them, a port carrying rules is
+    /// refused in `program` and never reaches this question.
+    fn agrees(
+        &self,
+        port: &str,
+        have: &ProgrammedPort,
+        want: &[velstra_cloud_model::security::ResolvedRule],
+    ) -> bool {
+        if self.filtered_elsewhere {
+            return true;
+        }
+        let _ = port;
+        have.rules == want
+    }
+
     async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>> {
         // An error, never an empty map. "I could not ask" and "this node carries
         // nothing" are the same value to a caller that conflates them, and the
@@ -286,7 +350,7 @@ impl Datapath for TapDatapath {
         } = spec;
 
         let mut unenforceable = Vec::new();
-        if !rules.is_empty() {
+        if !rules.is_empty() && !self.filtered_elsewhere {
             unenforceable.push(format!("{} security-group rule(s)", rules.len()));
         }
         if let Some(mbit) = rate_limit_mbit {
@@ -454,6 +518,74 @@ mod tests {
         let mut dp = TapDatapath::new("vt", None);
         dp.ip = "/nonexistent/bin/ip".to_string();
         assert!(dp.observe().await.is_err());
+    }
+
+    /// A port whose rules something else holds is never out of date.
+    ///
+    /// The default comparison is against what `observe` saw, and a tap carries
+    /// no filter — so on a node that puts the rules in force elsewhere it is
+    /// an empty list against a non-empty one, for ever. That is not cosmetic:
+    /// a port that does not agree counts as not programmed, and the guest
+    /// behind it never becomes ready to run. Found on a live cell, where a
+    /// guest with one security group sat at `Stopped` while the platform said
+    /// `HostActions: Done`.
+    #[test]
+    fn a_port_whose_rules_are_held_elsewhere_is_never_stale() {
+        use velstra_cloud_model::security::{Direction, PortRange, Protocol};
+        let want = vec![ResolvedRule {
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            ports: Some(PortRange { from: 443, to: 443 }),
+            remote: "0.0.0.0/0".into(),
+        }];
+        // What this datapath can see: a tap, and no rules on it.
+        let have = ProgrammedPort {
+            tap: "vtweb1a2b".into(),
+            rules: Vec::new(),
+        };
+        assert!(TapDatapath::new("vt", None).filtered_elsewhere().agrees(
+            "projects/p1/ports/web",
+            &have,
+            &want
+        ));
+        // And where nothing holds them, the disagreement is real — though a
+        // port like this is refused in `program` before it gets here.
+        assert!(!TapDatapath::new("vt", None).agrees("projects/p1/ports/web", &have, &want));
+    }
+
+    /// The refusal is about *this datapath enforcing nothing*, not about the
+    /// rules being unenforceable. A node that is the first hop writes an
+    /// nftables chain per port, so on one of those the same port is
+    /// programmed — refusing there would refuse a firewall that works.
+    #[tokio::test]
+    async fn a_port_with_rules_is_programmed_where_something_does_enforce_them() {
+        use velstra_cloud_model::security::{Direction, PortRange, Protocol};
+        let mut dp = TapDatapath::new("vt", None).filtered_elsewhere();
+        // The `ip` calls cannot work in a test, and that is the point: what is
+        // asserted is that it got past the refusal and reached the kernel,
+        // rather than turning the port away on its rules alone.
+        dp.ip = "/nonexistent/bin/ip".to_string();
+        let rule = ResolvedRule {
+            direction: Direction::Ingress,
+            protocol: Protocol::Tcp,
+            ports: Some(PortRange { from: 443, to: 443 }),
+            remote: "0.0.0.0/0".into(),
+        };
+        let refused = dp
+            .program(
+                "projects/p1/ports/web",
+                &PortSpec::default(),
+                &NetworkSpec::default(),
+                &[rule],
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            !refused.contains("security-group rule"),
+            "the rules were refused where something enforces them: {refused}"
+        );
     }
 
     #[tokio::test]

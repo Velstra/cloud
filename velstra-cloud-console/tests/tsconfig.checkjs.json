@@ -1,0 +1,32 @@
+// Opt-in type check for the console's JavaScript. Nothing is compiled and
+// nothing is shipped: `tsc` reads the same files the page inlines and reports
+// what it can prove wrong. Not wired into `run.sh`, because that would put a
+// TypeScript download in a test suite that today needs only node — adopt it
+// when you want it:
+//
+//     npx -p typescript@5 tsc -p velstra-cloud-console/tests/tsconfig.checkjs.json
+//
+// It found two real defects on 2026-09-06: a duplicated key in the label map,
+// and `const status` shadowing `window.status`, which accounted for thirty of
+// the fifty-three messages on its own. The sixteen that remain are missing
+// annotations, not defects — `$()` returns an HTMLElement and the call sites
+// know it is an input, `SCHEMA` is injected by the page, and `openForm` takes
+// two optional fields it has never been told are optional.
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "strict": false,
+    "module": "none"
+  },
+  "include": [
+    "../src/assets/*.js"
+  ]
+}

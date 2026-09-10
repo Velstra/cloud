@@ -48,6 +48,58 @@ pub struct EtcdStore {
     newest_seen: Arc<AtomicU64>,
 }
 
+/// How long any one call to the store may take before it is a failure.
+///
+/// Generous for a healthy cluster — a write that has to reach a quorum on
+/// spinning disks is milliseconds, not seconds — and it is not there for the
+/// slow case. It is there for the case that has no answer at all: a
+/// blackholed partition, where the packets leave and nothing ever comes back.
+/// Without a deadline such a call hangs for ever, and the caller with it.
+///
+/// That is not an abstract worry here. The leader's whole safety argument is
+/// that a leader which cannot renew its lease within one lease period stands
+/// down, so the challenger can take over without two of them running at once.
+/// Standing down requires *noticing*, and a renewal that hangs is never
+/// refused — so the old leader kept believing it led while the new one
+/// started. Two controllers reconciling one cell is the single state this
+/// platform's whole design cannot survive.
+const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// And how long the first connection may take. Shorter than a call: a process
+/// that cannot reach the store at startup should say so and be restarted, not
+/// sit silently in a connect.
+const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn options() -> etcd_client::ConnectOptions {
+    // Deliberately **not** `with_timeout`: that applies per request, and a
+    // watch is a request that is meant to last for hours. The deadline is
+    // applied to the calls that should finish, in `bounded` below.
+    etcd_client::ConnectOptions::new()
+        .with_connect_timeout(CONNECT_DEADLINE)
+        // A dead peer that never sends a FIN leaves the connection looking
+        // healthy for as long as the kernel is willing to wait. The pings are
+        // what turn that into an error the caller can act on.
+        .with_keep_alive(std::time::Duration::from_secs(15), CALL_DEADLINE)
+        .with_keep_alive_while_idle(true)
+}
+
+/// Run one store call under [`CALL_DEADLINE`].
+///
+/// Wrapped per call rather than set on the connection, because a watch is a
+/// call too and it is meant to last for hours; a connection-wide deadline
+/// would sever every watch in the cell every ten seconds.
+async fn bounded<T>(what: &str, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(CALL_DEADLINE, call).await {
+        Ok(answer) => answer,
+        Err(_) => Err(StoreError::Backend(format!(
+            "the store did not answer a {what} within {}s. Treated as a failure rather than \
+             waited on: a call that never returns is how a leader that cannot renew its lease \
+             fails to notice, and two leaders is the one state this platform cannot survive.",
+            CALL_DEADLINE.as_secs()
+        ))),
+    }
+}
+
 impl EtcdStore {
     /// Connect and learn where the store currently is.
     ///
@@ -57,7 +109,9 @@ impl EtcdStore {
     /// zero — which would replay the entire history — or from "now", which
     /// would race.
     pub async fn connect<E: AsRef<str>, S: AsRef<[E]>>(endpoints: S) -> Result<Self> {
-        let client = Client::connect(endpoints, None).await.map_err(backend)?;
+        let client = Client::connect(endpoints, Some(options()))
+            .await
+            .map_err(backend)?;
         let store = Self {
             client,
             newest_seen: Arc::new(AtomicU64::new(0)),
@@ -77,180 +131,199 @@ impl EtcdStore {
 #[async_trait]
 impl Store for EtcdStore {
     async fn get(&self, key: &str) -> Result<Option<Entry>> {
-        let response = self
-            .client
-            .kv_client()
-            .get(key, None)
-            .await
-            .map_err(backend)?;
-        self.observe(response.header());
-        response.kvs().first().map(entry).transpose()
+        bounded("get", async {
+            let response = self
+                .client
+                .kv_client()
+                .get(key, None)
+                .await
+                .map_err(backend)?;
+            self.observe(response.header());
+            response.kvs().first().map(entry).transpose()
+        })
+        .await
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<Entry>> {
-        // etcd answers a range in one message and a message has a size ceiling,
-        // so a collection large enough to reach it has to be read in pages.
-        // Every page after the first is pinned to the revision the first was
-        // read at: without that, a write landing between two pages would show
-        // one object twice or hide another, and a controller that lists in
-        // order to reconcile would be acting on a collection that never
-        // existed.
-        //
-        // Key order is what makes this work at all, and it is the same order on
-        // both backends: etcd compares keys as bytes, which is how Rust orders
-        // the `String` keys the memory store holds.
-        let mut kv = self.client.kv_client();
-        let end = range_end(prefix);
-        let mut start = prefix.as_bytes().to_vec();
-        let mut pinned: Option<i64> = None;
-        let mut entries = Vec::new();
-        loop {
-            let mut options = GetOptions::new()
-                .with_range(end.clone())
-                .with_limit(LIST_PAGE);
-            if let Some(revision) = pinned {
-                options = options.with_revision(revision);
+        bounded("list", async {
+            // etcd answers a range in one message and a message has a size ceiling,
+            // so a collection large enough to reach it has to be read in pages.
+            // Every page after the first is pinned to the revision the first was
+            // read at: without that, a write landing between two pages would show
+            // one object twice or hide another, and a controller that lists in
+            // order to reconcile would be acting on a collection that never
+            // existed.
+            //
+            // Key order is what makes this work at all, and it is the same order on
+            // both backends: etcd compares keys as bytes, which is how Rust orders
+            // the `String` keys the memory store holds.
+            let mut kv = self.client.kv_client();
+            let end = range_end(prefix);
+            let mut start = prefix.as_bytes().to_vec();
+            let mut pinned: Option<i64> = None;
+            let mut entries = Vec::new();
+            loop {
+                let mut options = GetOptions::new()
+                    .with_range(end.clone())
+                    .with_limit(LIST_PAGE);
+                if let Some(revision) = pinned {
+                    options = options.with_revision(revision);
+                }
+                let response = kv.get(start, Some(options)).await.map_err(backend)?;
+                let revision = self.observe(response.header());
+                for kv in response.kvs() {
+                    entries.push(entry(kv)?);
+                }
+                if !response.more() {
+                    return Ok(entries);
+                }
+                let Some(last) = entries.last() else {
+                    return Err(StoreError::Backend(
+                        "etcd reported more of a range after returning none of it".to_string(),
+                    ));
+                };
+                // The next page starts at the key just past the last one seen.
+                start = last.key.as_bytes().to_vec();
+                start.push(0);
+                pinned.get_or_insert(revision.0 as i64);
             }
-            let response = kv.get(start, Some(options)).await.map_err(backend)?;
-            let revision = self.observe(response.header());
-            for kv in response.kvs() {
-                entries.push(entry(kv)?);
-            }
-            if !response.more() {
-                return Ok(entries);
-            }
-            let Some(last) = entries.last() else {
-                return Err(StoreError::Backend(
-                    "etcd reported more of a range after returning none of it".to_string(),
-                ));
-            };
-            // The next page starts at the key just past the last one seen.
-            start = last.key.as_bytes().to_vec();
-            start.push(0);
-            pinned.get_or_insert(revision.0 as i64);
-        }
+        })
+        .await
     }
 
     async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Page> {
-        // One range request, bounded by the caller's limit — the point of the
-        // whole exercise. `list` above loops because it must return everything;
-        // here the ceiling is the answer, so there is nothing to loop over.
-        //
-        // No `with_revision`: see the trait's note on what paging promises. A
-        // revision held across client round trips is one etcd may compact
-        // underneath the caller, and the price of that promise is answering
-        // `410 Gone` to somebody whose token merely got old.
-        let mut kv = self.client.kv_client();
-        let start = match after {
-            // Strictly after: the resume key is the last one already delivered,
-            // and etcd ranges are inclusive at the start. Appending the zero byte
-            // is the successor of a key under byte-wise comparison, which is the
-            // ordering etcd uses.
-            Some(after) => {
-                let mut start = after.as_bytes().to_vec();
-                start.push(0);
-                start
-            }
-            None => prefix.as_bytes().to_vec(),
-        };
-        let options = GetOptions::new()
-            .with_range(range_end(prefix))
-            .with_limit(limit as i64);
-        let response = kv.get(start, Some(options)).await.map_err(backend)?;
-        self.observe(response.header());
-        let entries = response
-            .kvs()
-            .iter()
-            .map(entry)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Page {
-            entries,
-            more: response.more(),
+        bounded("list", async {
+            // One range request, bounded by the caller's limit — the point of the
+            // whole exercise. `list` above loops because it must return everything;
+            // here the ceiling is the answer, so there is nothing to loop over.
+            //
+            // No `with_revision`: see the trait's note on what paging promises. A
+            // revision held across client round trips is one etcd may compact
+            // underneath the caller, and the price of that promise is answering
+            // `410 Gone` to somebody whose token merely got old.
+            let mut kv = self.client.kv_client();
+            let start = match after {
+                // Strictly after: the resume key is the last one already delivered,
+                // and etcd ranges are inclusive at the start. Appending the zero byte
+                // is the successor of a key under byte-wise comparison, which is the
+                // ordering etcd uses.
+                Some(after) => {
+                    let mut start = after.as_bytes().to_vec();
+                    start.push(0);
+                    start
+                }
+                None => prefix.as_bytes().to_vec(),
+            };
+            let options = GetOptions::new()
+                .with_range(range_end(prefix))
+                .with_limit(limit as i64);
+            let response = kv.get(start, Some(options)).await.map_err(backend)?;
+            self.observe(response.header());
+            let entries = response
+                .kvs()
+                .iter()
+                .map(entry)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Page {
+                entries,
+                more: response.more(),
+            })
         })
+        .await
     }
 
     async fn put(&self, key: &str, value: Vec<u8>, expect: Expect) -> Result<Revision> {
-        let mut kv = self.client.kv_client();
-        let compare = match expect {
-            Expect::Any => {
-                let response = kv.put(key, value, None).await.map_err(backend)?;
-                return Ok(self.observe(response.header()));
+        bounded("write", async {
+            let mut kv = self.client.kv_client();
+            let compare = match expect {
+                Expect::Any => {
+                    let response = kv.put(key, value, None).await.map_err(backend)?;
+                    return Ok(self.observe(response.header()));
+                }
+                // A key that has never existed has a create revision of zero. That
+                // is etcd's way of spelling "absent", and it is why a create needs
+                // no read of its own.
+                Expect::Absent => Compare::create_revision(key, CompareOp::Equal, 0),
+                Expect::Revision(want) => {
+                    Compare::mod_revision(key, CompareOp::Equal, want.0 as i64)
+                }
+            };
+            // The `or_else` read is what makes a refusal informative, and it has to
+            // be in the same transaction: a follow-up read would report whatever
+            // the key looks like by then, not the state the compare actually lost
+            // to.
+            let txn = Txn::new()
+                .when([compare])
+                .and_then([TxnOp::put(key, value, None)])
+                .or_else([TxnOp::get(key, None)]);
+            let response = kv.txn(txn).await.map_err(backend)?;
+            let revision = self.observe(response.header());
+            if response.succeeded() {
+                return Ok(revision);
             }
-            // A key that has never existed has a create revision of zero. That
-            // is etcd's way of spelling "absent", and it is why a create needs
-            // no read of its own.
-            Expect::Absent => Compare::create_revision(key, CompareOp::Equal, 0),
-            Expect::Revision(want) => Compare::mod_revision(key, CompareOp::Equal, want.0 as i64),
-        };
-        // The `or_else` read is what makes a refusal informative, and it has to
-        // be in the same transaction: a follow-up read would report whatever
-        // the key looks like by then, not the state the compare actually lost
-        // to.
-        let txn = Txn::new()
-            .when([compare])
-            .and_then([TxnOp::put(key, value, None)])
-            .or_else([TxnOp::get(key, None)]);
-        let response = kv.txn(txn).await.map_err(backend)?;
-        let revision = self.observe(response.header());
-        if response.succeeded() {
-            return Ok(revision);
-        }
-        Err(match (expect, found(&response)) {
-            // The create compare only fails one way, and this is it.
-            (Expect::Absent, _) => StoreError::Exists {
-                key: key.to_string(),
-            },
-            // A key that is gone reads as revision zero rather than as a
-            // separate error, because to a writer holding a stale copy the
-            // situation is the same one: what you have is not what is there.
-            (Expect::Revision(expected), actual) => StoreError::Conflict {
-                key: key.to_string(),
-                expected,
-                actual: actual.unwrap_or(Revision(0)),
-            },
-            (Expect::Any, _) => StoreError::Backend(format!(
-                "an unconditional put of {key} was refused by a compare it never made"
-            )),
+            Err(match (expect, found(&response)) {
+                // The create compare only fails one way, and this is it.
+                (Expect::Absent, _) => StoreError::Exists {
+                    key: key.to_string(),
+                },
+                // A key that is gone reads as revision zero rather than as a
+                // separate error, because to a writer holding a stale copy the
+                // situation is the same one: what you have is not what is there.
+                (Expect::Revision(expected), actual) => StoreError::Conflict {
+                    key: key.to_string(),
+                    expected,
+                    actual: actual.unwrap_or(Revision(0)),
+                },
+                (Expect::Any, _) => StoreError::Backend(format!(
+                    "an unconditional put of {key} was refused by a compare it never made"
+                )),
+            })
         })
+        .await
     }
 
     async fn delete(&self, key: &str, expect: Expect) -> Result<Revision> {
-        let compare = match expect {
-            Expect::Revision(want) => Compare::mod_revision(key, CompareOp::Equal, want.0 as i64),
-            // Existence is a condition even for an unconditional delete: a key
-            // that is not there is `Missing`, not a quiet no-op that reports a
-            // revision as if something happened. `Expect::Absent` lands here
-            // too, and means the same as `Any` — it is not a sentence anyone
-            // can finish about a delete, and the memory store ignores it in the
-            // same place.
-            _ => Compare::create_revision(key, CompareOp::Greater, 0),
-        };
-        let txn = Txn::new()
-            .when([compare])
-            .and_then([TxnOp::delete(key, None)])
-            .or_else([TxnOp::get(key, None)]);
-        let response = self.client.kv_client().txn(txn).await.map_err(backend)?;
-        let revision = self.observe(response.header());
-        if response.succeeded() {
-            return Ok(revision);
-        }
-        Err(match (expect, found(&response)) {
-            // Gone beats stale, and the order matters: a caller that deleted
-            // the same object twice should be told it is gone, not handed a
-            // revision complaint it cannot act on. The memory store checks
-            // existence first for the same reason.
-            (_, None) => StoreError::Missing {
-                key: key.to_string(),
-            },
-            (Expect::Revision(expected), Some(actual)) => StoreError::Conflict {
-                key: key.to_string(),
-                expected,
-                actual,
-            },
-            (_, Some(_)) => StoreError::Backend(format!(
-                "an unconditional delete of {key} was refused while the key was present"
-            )),
+        bounded("delete", async {
+            let compare = match expect {
+                Expect::Revision(want) => {
+                    Compare::mod_revision(key, CompareOp::Equal, want.0 as i64)
+                }
+                // Existence is a condition even for an unconditional delete: a key
+                // that is not there is `Missing`, not a quiet no-op that reports a
+                // revision as if something happened. `Expect::Absent` lands here
+                // too, and means the same as `Any` — it is not a sentence anyone
+                // can finish about a delete, and the memory store ignores it in the
+                // same place.
+                _ => Compare::create_revision(key, CompareOp::Greater, 0),
+            };
+            let txn = Txn::new()
+                .when([compare])
+                .and_then([TxnOp::delete(key, None)])
+                .or_else([TxnOp::get(key, None)]);
+            let response = self.client.kv_client().txn(txn).await.map_err(backend)?;
+            let revision = self.observe(response.header());
+            if response.succeeded() {
+                return Ok(revision);
+            }
+            Err(match (expect, found(&response)) {
+                // Gone beats stale, and the order matters: a caller that deleted
+                // the same object twice should be told it is gone, not handed a
+                // revision complaint it cannot act on. The memory store checks
+                // existence first for the same reason.
+                (_, None) => StoreError::Missing {
+                    key: key.to_string(),
+                },
+                (Expect::Revision(expected), Some(actual)) => StoreError::Conflict {
+                    key: key.to_string(),
+                    expected,
+                    actual,
+                },
+                (_, Some(_)) => StoreError::Backend(format!(
+                    "an unconditional delete of {key} was refused while the key was present"
+                )),
+            })
         })
+        .await
     }
 
     fn watch(&self, prefix: &str, from: Option<Revision>) -> mpsc::Receiver<Event> {
@@ -353,27 +426,33 @@ impl Store for EtcdStore {
     }
 
     async fn compact(&self, keep: Revision) -> Result<()> {
-        match self.client.kv_client().compact(keep.0 as i64, None).await {
-            Ok(_) => Ok(()),
-            // Somebody — another API replica, an operator's etcdctl — got
-            // there first. The history is gone either way, which is all this
-            // asked for.
-            Err(e) if e.to_string().contains("has been compacted") => Ok(()),
-            Err(e) => Err(backend(e)),
-        }
+        bounded("compaction", async {
+            match self.client.kv_client().compact(keep.0 as i64, None).await {
+                Ok(_) => Ok(()),
+                // Somebody — another API replica, an operator's etcdctl — got
+                // there first. The history is gone either way, which is all this
+                // asked for.
+                Err(e) if e.to_string().contains("has been compacted") => Ok(()),
+                Err(e) => Err(backend(e)),
+            }
+        })
+        .await
     }
 
     async fn revision(&self) -> Result<Revision> {
-        // An empty transaction is the cheapest thing that returns a header and
-        // nothing else. It compares nothing and writes nothing, so it does not
-        // move the revision it reports.
-        let response = self
-            .client
-            .kv_client()
-            .txn(Txn::new())
-            .await
-            .map_err(backend)?;
-        Ok(self.observe(response.header()))
+        bounded("revision read", async {
+            // An empty transaction is the cheapest thing that returns a header and
+            // nothing else. It compares nothing and writes nothing, so it does not
+            // move the revision it reports.
+            let response = self
+                .client
+                .kv_client()
+                .txn(Txn::new())
+                .await
+                .map_err(backend)?;
+            Ok(self.observe(response.header()))
+        })
+        .await
     }
 }
 

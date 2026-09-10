@@ -240,6 +240,22 @@ impl GuestRegistry {
         self.inner.read().unwrap().taps.clone()
     }
 
+    /// Every guest this node can answer for, once each.
+    ///
+    /// The indices key by address and by wire, so a guest with two NICs is in
+    /// both twice; this is the view a resolver needs, which is per guest.
+    pub fn all(&self) -> Vec<Arc<GuestView>> {
+        let index = self.inner.read().unwrap();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut out = Vec::new();
+        for (view, _) in index.by_address.values() {
+            if seen.insert(view.instance_id.clone()) {
+                out.push(view.clone());
+            }
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.inner.read().unwrap().by_address.len()
     }

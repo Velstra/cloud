@@ -61,6 +61,10 @@ fn fields(kind: &str) -> &'static [(&'static str, Form)] {
         "volumes" => &[
             ("source_image", Form::Name),
             ("source_snapshot", Form::Name),
+            // The way back from a lost pool. A reference like the other two, so
+            // a name that points at no backup is refused when the volume is
+            // made rather than discovered by the pool agent much later.
+            ("source_backup", Form::Name),
             // A pool is named by its id, like a node. Nothing checked this, and
             // the cost was silent: `pools/local` was accepted, no pool's watch
             // filter ever matched it, and the volume sat unprovisioned for ever

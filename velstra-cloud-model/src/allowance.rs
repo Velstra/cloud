@@ -88,6 +88,10 @@ pub fn dimensions(limit: &Quota, used: &Quota) -> Vec<Dimension> {
             used.load_balancers.into(),
         ),
         d("devices", limit.devices.into(), used.devices.into()),
+        d("snapshots", limit.snapshots.into(), used.snapshots.into()),
+        d("snapshotGib", limit.snapshot_gib, used.snapshot_gib),
+        d("backups", limit.backups.into(), used.backups.into()),
+        d("backupGib", limit.backup_gib, used.backup_gib),
     ]
 }
 
@@ -214,8 +218,19 @@ mod tests {
         // Every dimension is present whether or not it is in use: a screen that
         // showed only the interesting ones would rearrange itself between two
         // reads of the same page.
-        assert_eq!(d.len(), 8);
-        assert!(d.iter().any(|d| d.name == "devices"));
+        assert_eq!(d.len(), 12);
+        for expected in [
+            "devices",
+            "snapshots",
+            "snapshotGib",
+            "backups",
+            "backupGib",
+        ] {
+            assert!(
+                d.iter().any(|d| d.name == expected),
+                "{expected} is missing"
+            );
+        }
     }
 
     /// A limit lowered under what is already running is a real thing an

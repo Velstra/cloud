@@ -27,7 +27,7 @@ use axum::{
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
-use velstra_cloud_model::meta::{ResourceName, Revision};
+use velstra_cloud_model::meta::{ResourceName, Revision, Timestamp};
 
 use crate::{
     auth::{Identity, identify},
@@ -60,17 +60,68 @@ pub fn router(api: Api) -> Router {
         // natively, and an unauthenticated metrics port would hand the cell's
         // machine names and capacity to whoever finds it.
         .route("/metrics", get(metrics))
+        // The cell's names, for the resolver a node agent runs. Behind the
+        // token like everything else here — it says who is asking, and only a
+        // node's resolver and a cell operator may.
+        //
+        // Its own surface rather than a widening of `instances`: a node is
+        // given the guests it holds and nothing else, deliberately, and
+        // opening that up to serve DNS would hand every node every tenant's
+        // machines with their specs. What a resolver needs is three fields —
+        // a name, a subnet and an address — and every guest on a subnet can
+        // already discover all three by scanning it.
+        .route("/api/v1/directory", get(directory))
         .route(
             // A token for a service account. POST because it **makes** one, and
             // the answer carries it — once. Nothing can read it back.
+            //
+            // GET lists what an account holds, without the tokens: an operator
+            // asked "how many tokens does this pipeline have, and which is the
+            // one from the contractor" could not answer before, and the only
+            // revocation was deleting the account.
             "/api/v1/users/:id/tokens",
-            axum::routing::post(mint_service_token),
+            axum::routing::post(mint_service_token).get(list_service_tokens),
+        )
+        .route(
+            // And take one out of use, by the id the list gives.
+            "/api/v1/users/:id/tokens/:token",
+            axum::routing::delete(revoke_service_token),
+        )
+        // The same two questions about a machine's own credentials, which could
+        // not be asked at all: `:issueCredential` is additive by design, so an
+        // operator who had issued three had three live ways into the cell and
+        // no way to see or remove two of them.
+        //
+        // Spelled out per collection rather than with a `:kind` segment: the
+        // generic object route is a catch-all, and a parameter in that
+        // position collides with it.
+        .route(
+            "/api/v1/nodes/:id/credentials",
+            axum::routing::get(list_node_credentials),
+        )
+        .route(
+            "/api/v1/nodes/:id/credentials/:credential",
+            axum::routing::delete(revoke_node_credential),
+        )
+        .route(
+            "/api/v1/pools/:id/credentials",
+            axum::routing::get(list_pool_credentials),
+        )
+        .route(
+            "/api/v1/pools/:id/credentials/:credential",
+            axum::routing::delete(revoke_pool_credential),
         )
         // The layer goes on before the console's routes, so only the API is
         // behind a token. The page itself is markup with no data in it — it
         // carries the sign-in form, and demanding a token to fetch the form
         // that asks for one is a locked door with the key inside.
         .layer(middleware::from_fn_with_state(api.clone(), authenticate))
+        // Outside the token layer, so probes and sign-ins are counted too. A
+        // request nobody can see is a request nobody can debug: before this
+        // there was no latency, no status distribution, no request id to quote
+        // back to a customer, and no way to answer "which tenant is hammering
+        // us".
+        .layer(middleware::from_fn_with_state(api.clone(), observe))
         // Outside the layer, and it has to be: this is the route that *issues*
         // the token every other route demands. Behind the layer it would be a
         // door whose key is on the other side of it.
@@ -78,6 +129,21 @@ pub fn router(api: Api) -> Router {
         // Documentation, not data: the same schema the console page below
         // embeds, so it is served the way the page is — without a token.
         .route("/api/v1/openapi.json", get(openapi))
+        // Probes, unauthenticated because the things that probe — a load
+        // balancer, a container runtime, an orchestrator — hold no token and
+        // never will. They are also the reason these routes exist at all
+        // rather than the catch-all below answering 200 for every path: a
+        // probe that cannot fail is a probe that never takes anything out of
+        // rotation.
+        //
+        // `healthz` is liveness: this process is running and its executor is
+        // not wedged. It touches nothing else, because a liveness probe that
+        // depends on the store restarts every API in the cell when etcd
+        // hiccups. `readyz` is readiness: this instance can reach the store,
+        // so it can actually answer. Neither says whether the *cell* is well;
+        // that is what the alerts are for.
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/", get(console))
         .route("/favicon.ico", get(favicon))
         // A deep link into the console is a path this API does not serve and
@@ -85,6 +151,107 @@ pub fn router(api: Api) -> Router {
         // rather than a 404, because a single-page console routes it itself.
         .route("/*path", get(console))
         .with_state(api)
+}
+
+/// The header a caller can quote back, and that every log line carries.
+pub const REQUEST_ID_HEADER: &str = "x-velstra-request-id";
+
+/// Count and time every request, and give each one an id.
+///
+/// The id is taken from the caller when they sent one, so a trace that starts
+/// at their load balancer keeps one identity all the way through; otherwise
+/// one is minted here. It goes back on the response *and* into the log line,
+/// which is the whole point: a customer quoting an id gets the request.
+///
+/// The route is the matched path, not the URL — `/api/v1/*name` and not
+/// `/api/v1/projects/acme/instances/db-1`. A per-object label would put one
+/// time series per guest into the metrics and take the process down with it.
+async fn observe(
+    State(api): State<Api>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "other".into());
+    let id = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_graphic()))
+        .map(|v| v.to_string())
+        .unwrap_or_else(new_request_id);
+    let started = std::time::Instant::now();
+    let mut answer = next.run(request).await;
+    let micros = started.elapsed().as_micros() as u64;
+    let status = answer.status().as_u16();
+    api.requests().record(&method, &route, status, micros);
+    if let Ok(value) = axum::http::HeaderValue::from_str(&id) {
+        answer.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    // One line per request, at info. A refusal or a failure is worth a louder
+    // line: those are the ones somebody goes looking for.
+    let ms = micros as f64 / 1000.0;
+    if status >= 500 {
+        tracing::error!(request = %id, %method, %route, status, ms, "served");
+    } else if status >= 400 {
+        tracing::info!(request = %id, %method, %route, status, ms, "refused");
+    } else {
+        tracing::info!(request = %id, %method, %route, status, ms, "served");
+    }
+    answer
+}
+
+/// A short, unique-enough id for one request.
+///
+/// Not a UUID: nothing joins on these, they are quoted by a person reading a
+/// log or a customer reading an error. Sixteen hex characters of the clock and
+/// a counter is enough to find one line among a day of them.
+fn new_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    format!("{:012x}{:04x}", now & 0xffff_ffff_ffff, n & 0xffff)
+}
+
+/// Every guest in the cell that has a name and an address, for the resolvers.
+///
+/// A node agent's, and only a node agent's: it is the one caller that answers
+/// DNS, and the answer is scoped again on the way out — a guest is told about
+/// its own subnet and no other.
+async fn directory(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if crate::sessions::agent_node(&who).is_none() && !api.is_operator(&who) {
+        return Err(ApiError::forbidden(
+            "the directory is what a node's resolver answers from; it is not a tenant's view",
+        ));
+    }
+    Ok(Json(serde_json::json!({ "items": api.directory().await? })))
+}
+
+/// Liveness: the process answers.
+async fn healthz() -> Response {
+    (StatusCode::OK, "ok\n").into_response()
+}
+
+/// Readiness: the store answers, so this instance can serve.
+async fn readyz(State(api): State<Api>) -> Response {
+    if api.store_answers().await {
+        (StatusCode::OK, "ready\n").into_response()
+    } else {
+        // 503 rather than 500: this is a "come back later", and every load
+        // balancer and orchestrator reads it that way.
+        (StatusCode::SERVICE_UNAVAILABLE, "store unreachable\n").into_response()
+    }
 }
 
 // --- signing in -----------------------------------------------------------
@@ -102,11 +269,31 @@ struct SignInBody {
 /// other route requires. The refusal is deliberately the same sentence for every
 /// cause; see `crate::sessions`.
 async fn sign_in(State(api): State<Api>, Json(body): Json<SignInBody>) -> ApiResult<Response> {
-    let signed_in = api
-        .identity()
-        .sign_in(&body.username, &body.password)
-        .await?;
-    Ok((StatusCode::CREATED, Json(signed_in)).into_response())
+    let verdict = api.identity().sign_in(&body.username, &body.password).await;
+    match verdict {
+        Ok(signed_in) => {
+            api.record_session(
+                velstra_cloud_model::audit::AuditKind::SignedIn,
+                &signed_in.subject,
+                "",
+            )
+            .await;
+            Ok((StatusCode::CREATED, Json(signed_in)).into_response())
+        }
+        Err(e) => {
+            // The failures are the half an operator needs when they are asked
+            // whether an account was under attack, and the model has carried
+            // the kind for them since the beginning without anybody writing
+            // one. The username is recorded as submitted — it may be nobody.
+            api.record_session(
+                velstra_cloud_model::audit::AuditKind::Refused,
+                &body.username,
+                &e.message,
+            )
+            .await;
+            Err(e)
+        }
+    }
 }
 
 /// End the session the caller presented.
@@ -121,6 +308,12 @@ async fn sign_out(
 ) -> ApiResult<StatusCode> {
     let token = bearer(&headers).unwrap_or_default();
     api.identity().sign_out(&token).await?;
+    api.record_session(
+        velstra_cloud_model::audit::AuditKind::SignedOut,
+        &_who.subject,
+        "",
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -203,6 +396,142 @@ struct TokenBody {
 /// A cell operator's, like creating the account: a token is authority, and an
 /// account able to mint its own would be an account that cannot be contained by
 /// taking one away.
+/// Every token an account holds, without the tokens themselves.
+async fn list_service_tokens(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // The same rung as minting. Knowing how many keys exist for an account is
+    // knowing about the way into the cell.
+    if !api.is_operator(&who) {
+        return Err(ApiError::forbidden(
+            "an account's tokens are a way into this cell; only a cell operator may list them",
+        ));
+    }
+    let held = api.identity().service_credentials_for(&id).await?;
+    Ok(Json(serde_json::json!({
+        "items": held
+            .iter()
+            .map(|c| serde_json::json!({
+                "id": c.meta.name.id(),
+                "purpose": c.spec.purpose,
+                "issuedAt": c.spec.issued_at.0,
+            }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+async fn list_node_credentials(
+    api: State<Api>,
+    who: Extension<Identity>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    list_agent_credentials(api, who, "nodes", id).await
+}
+
+async fn list_pool_credentials(
+    api: State<Api>,
+    who: Extension<Identity>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    list_agent_credentials(api, who, "pools", id).await
+}
+
+async fn revoke_node_credential(
+    api: State<Api>,
+    who: Extension<Identity>,
+    Path((id, credential)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    revoke_agent_credential(api, who, "nodes", id, credential).await
+}
+
+async fn revoke_pool_credential(
+    api: State<Api>,
+    who: Extension<Identity>,
+    Path((id, credential)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    revoke_agent_credential(api, who, "pools", id, credential).await
+}
+
+/// Every credential a machine holds, without the tokens.
+async fn list_agent_credentials(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+    _kind: &'static str,
+    id: String,
+) -> ApiResult<Json<serde_json::Value>> {
+    // The same rung as issuing one. Knowing how many keys exist for a machine
+    // is knowing about the ways into the cell.
+    if !api.is_operator(&who) {
+        return Err(ApiError::forbidden(
+            "a machine's credentials are a way into this cell; only a cell operator may list them",
+        ));
+    }
+    let held = api.identity().agent_credentials_for(&id).await?;
+    Ok(Json(serde_json::json!({
+        "items": held
+            .iter()
+            .map(|c| serde_json::json!({
+                "id": c.meta.name.id(),
+                "purpose": c.spec.purpose,
+                "issuedAt": c.spec.issued_at.0,
+                "expiresAt": c.spec.expires_at.map(|t| t.0),
+            }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// Take one machine credential out of use.
+async fn revoke_agent_credential(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+    kind: &'static str,
+    id: String,
+    credential: String,
+) -> ApiResult<StatusCode> {
+    if !api.is_operator(&who) {
+        return Err(ApiError::forbidden(
+            "revoking a credential is a change to who can reach this cell; only a cell operator              may",
+        ));
+    }
+    api.identity()
+        .revoke_agent_credential(&id, &credential)
+        .await?;
+    api.record_change(
+        &who,
+        "delete",
+        &velstra_cloud_model::meta::ResourceName::parse(&format!("{kind}/{id}"))
+            .map_err(|e| ApiError::invalid(e.to_string()))?,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Take one token out of use.
+async fn revoke_service_token(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+    Path((id, token)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    if !api.is_operator(&who) {
+        return Err(ApiError::forbidden(
+            "revoking a token is a change to who can reach this cell; only a cell operator may",
+        ));
+    }
+    api.identity()
+        .revoke_service_credential(&id, &token)
+        .await?;
+    api.record_change(
+        &who,
+        "delete",
+        &velstra_cloud_model::meta::ResourceName::parse(&format!("users/{id}"))
+            .map_err(|e| ApiError::invalid(e.to_string()))?,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn mint_service_token(
     State(api): State<Api>,
     Extension(who): Extension<Identity>,
@@ -463,7 +792,13 @@ fn target(path: &str) -> ApiResult<Target> {
 /// where a load test passes and production does not.
 fn paging_from(query: &BTreeMap<String, String>) -> ApiResult<Paging> {
     let size = match query.get("pageSize") {
-        None => None,
+        // A caller who says nothing gets a page, not the collection. The
+        // unbounded default was the one shape in which a single `curl` — or a
+        // generated client, or a Terraform provider — pulled a cell's whole
+        // audit log into one response and one allocation. Internal callers
+        // that genuinely need everything say so with `Paging::unpaged()`;
+        // over HTTP there is a `nextPageToken` and AIP-158 says to follow it.
+        None => Some(crate::paging::DEFAULT_PAGE_SIZE),
         Some(raw) => Some(raw.parse::<usize>().map_err(|_| {
             ApiError::invalid(format!("pageSize must be a whole number, and was {raw:?}"))
                 .at("pageSize")
@@ -474,6 +809,200 @@ fn paging_from(query: &BTreeMap<String, String>) -> ApiResult<Paging> {
         Some(raw) => Some(PageToken::decode(raw)?),
     };
     Ok(Paging { size, token })
+}
+
+/// Read `?since=` / `?until=` off a query string.
+///
+/// Two spellings, because the two questions people actually ask have different
+/// shapes: an absolute moment (`since=1788960000000`, milliseconds since the
+/// epoch, the same number every timestamp in this API is) and a span back from
+/// now (`since=1h`, `since=30m`, `since=7d`). "The refusals of the last hour"
+/// is the second one, and making somebody compute an epoch to ask it is how a
+/// filter ends up unused.
+///
+/// A value that parses as neither is refused rather than ignored: a client
+/// sending `since=yesterday` and silently receiving the whole audit is the
+/// shape where a page loads in development and times out in production.
+fn moment_from(
+    query: &BTreeMap<String, String>,
+    key: &str,
+    now: Timestamp,
+) -> ApiResult<Option<Timestamp>> {
+    let Some(raw) = query.get(key) else {
+        return Ok(None);
+    };
+    if let Ok(ms) = raw.parse::<u64>() {
+        return Ok(Some(Timestamp(ms)));
+    }
+    let (count, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let seconds: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        _ => {
+            return Err(ApiError::invalid(format!(
+                "{key} is milliseconds since the epoch, or a span back from now like 30m, 6h or \
+                 7d, and was {raw:?}"
+            ))
+            .at(key));
+        }
+    };
+    let count: u64 = count.parse().map_err(|_| {
+        ApiError::invalid(format!(
+            "{key} is milliseconds since the epoch, or a span back from now like 30m, 6h or 7d, \
+             and was {raw:?}"
+        ))
+        .at(key)
+    })?;
+    Ok(Some(Timestamp(now.0.saturating_sub(
+        count.saturating_mul(seconds).saturating_mul(1_000),
+    ))))
+}
+
+/// How a listing is to be ordered, read off `?orderBy=`.
+///
+/// AIP-132's spelling: a field name, optionally followed by ` desc`. Two
+/// fields and no more — `name` and `createdAt` — because those are the two
+/// orders a collection has that mean the same thing in every collection.
+/// Sorting on a status field would order half a list by a value the other half
+/// does not carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Order {
+    by: OrderKey,
+    descending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderKey {
+    Name,
+    CreatedAt,
+}
+
+/// Read `?orderBy=` off a query string.
+///
+/// An ordered listing is a **top-N, not a pageable ordered stream**, and that
+/// is the whole design. A page is a slice of the store's own key order and the
+/// token is a key, so sorting the hundred rows of one page by creation time
+/// would give a list that is ordered inside each page and unordered across
+/// them — which looks sorted and is not, and is the kind of wrong that is
+/// found months later.
+///
+/// So an ordered request reads everything the filter admits, sorts it, and
+/// returns the first `pageSize` of the sorted order with **no** page token.
+/// "The fifty newest refusals" is the question people have, and it now has an
+/// answer that is actually the fifty newest. Continuing past that is refused
+/// rather than answered wrongly: `pageToken` and `orderBy` together are an
+/// error.
+fn order_from(query: &BTreeMap<String, String>) -> ApiResult<Option<Order>> {
+    let Some(raw) = query.get("orderBy") else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    let (field, descending) = match raw.rsplit_once(char::is_whitespace) {
+        Some((field, "desc")) => (field.trim(), true),
+        Some((field, "asc")) => (field.trim(), false),
+        Some(_) => (raw, false),
+        None => (raw, false),
+    };
+    let by = match field {
+        "name" | "meta.name" => OrderKey::Name,
+        "createdAt" | "meta.createdAt" => OrderKey::CreatedAt,
+        other => {
+            return Err(ApiError::invalid(format!(
+                "orderBy is name or createdAt, either alone or followed by desc, and was \
+                 {other:?}. Those are the two orders every collection has; a status field is \
+                 not one every object carries."
+            ))
+            .at("orderBy"));
+        }
+    };
+    Ok(Some(Order { by, descending }))
+}
+
+/// Order a page of wire documents in place.
+fn sorted(items: &mut [Value], order: Order) {
+    items.sort_by(|a, b| {
+        let ord = match order.by {
+            OrderKey::Name => {
+                let name = |v: &Value| {
+                    v.get("meta")
+                        .and_then(|m| m.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                name(a).cmp(&name(b))
+            }
+            OrderKey::CreatedAt => {
+                let at = |v: &Value| {
+                    v.get("meta")
+                        .and_then(|m| m.get("createdAt"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                };
+                at(a).cmp(&at(b))
+            }
+        };
+        if order.descending { ord.reverse() } else { ord }
+    });
+}
+
+/// Keep only the paths named in `?fields=`, plus `meta.name`.
+///
+/// AIP-157's read mask, spelled as a comma-separated list of dotted paths:
+/// `?fields=meta.name,status.conditions`. A board that shows four columns of a
+/// guest was pulling the whole document — cloud-init, every condition, every
+/// address — for every row.
+///
+/// `meta.name` is always kept, whether it was asked for or not: a document
+/// without its name is a row nothing can be done with, and a caller who
+/// forgets it gets a list they cannot use rather than an error they can read.
+fn only_fields(document: &Value, fields: &[Vec<String>]) -> Value {
+    let mut out = Value::Object(serde_json::Map::new());
+    for path in fields {
+        if let Some(found) = pick(document, path) {
+            graft(&mut out, path, found);
+        }
+    }
+    if let Some(name) = document.get("meta").and_then(|m| m.get("name")) {
+        graft(&mut out, &["meta".into(), "name".into()], name.clone());
+    }
+    out
+}
+
+fn pick(document: &Value, path: &[String]) -> Option<Value> {
+    let mut at = document;
+    for step in path {
+        at = at.get(step)?;
+    }
+    Some(at.clone())
+}
+
+fn graft(into: &mut Value, path: &[String], leaf: Value) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut at = into;
+    for step in parents {
+        if !at.get(step).map(Value::is_object).unwrap_or(false) {
+            at[step] = Value::Object(serde_json::Map::new());
+        }
+        at = &mut at[step];
+    }
+    at[last] = leaf;
+}
+
+/// Read `?fields=` off a query string, as dotted paths.
+fn fields_from(query: &BTreeMap<String, String>) -> Option<Vec<Vec<String>>> {
+    let raw = query.get("fields")?;
+    let paths: Vec<Vec<String>> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split('.').map(str::to_string).collect())
+        .collect();
+    (!paths.is_empty()).then_some(paths)
 }
 
 // ---- handlers -------------------------------------------------------------
@@ -535,9 +1064,30 @@ async fn read(
             let endpoint = api
                 .console_endpoint_for(&ResourceName::parse(&session)?)
                 .await?;
-            let url = format!("ws://{endpoint}/console?session={session}&ticket={ticket}");
+            // `wss://` when the node says it serves TLS on this port, and
+            // `ws://` when it says it does not. Asked of the node rather than
+            // configured here: only the machine knows what it actually bound,
+            // and an API that assumed TLS would fail every attach on a node
+            // that has no certificate — while one that assumed plaintext would
+            // throw away the protection on a node that does.
+            let private = api
+                .console_is_private(&ResourceName::parse(&session)?)
+                .await;
+            let scheme = if private { "wss" } else { "ws" };
+            let url = format!("{scheme}://{endpoint}/console?session={session}&ticket={ticket}");
+            if !private {
+                // Once per attach, and deliberately at `warn`: what crosses
+                // this connection is a serial line, and an operator typing a
+                // root password into it is the ordinary use.
+                tracing::warn!(
+                    %endpoint,
+                    "this console stream is not encrypted — give the node \
+                     --console-tls-cert and --console-tls-key to make it private"
+                );
+            }
+            let connector = crate::console_proxy::trust(api.console_ca());
             Ok(upgrade.on_upgrade(move |socket| async move {
-                if let Err(e) = crate::console_proxy::relay(socket, url).await {
+                if let Err(e) = crate::console_proxy::relay(socket, url, connector).await {
                     tracing::warn!(error = %e, "a console stream could not be relayed");
                 }
             }))
@@ -648,6 +1198,15 @@ async fn read(
                 },
                 None => filter,
             };
+            // `?since=1h&until=10m` — the slice of a collection somebody
+            // actually wants. On `meta.createdAt`, so it means the same thing
+            // in every collection.
+            let now = Timestamp::now();
+            let filter = Filter {
+                since: moment_from(&query, "since", now)?,
+                until: moment_from(&query, "until", now)?,
+                ..filter
+            };
             if query.get("watch").map(|w| w == "true").unwrap_or(false) {
                 return watch(api, &parent, &kind, query.get("fromRevision"), filter, &who).await;
             }
@@ -656,18 +1215,68 @@ async fn read(
             // what every existing client expects and what a controller wants;
             // a caller who asks for either gets a page and a token.
             let paging = paging_from(&query)?;
+            // `?orderBy=` and paging are refused together rather than
+            // combined: see `order_from`. Checked before the read, so a caller
+            // who asked for something impossible does not pay for a listing
+            // first.
+            let order = order_from(&query)?;
+            if order.is_some() && paging.token.is_some() {
+                return Err(ApiError::invalid(
+                    "orderBy and pageToken cannot both be asked for. An ordered listing is the \
+                     first page of the sorted order and nothing after it: a page token is a key \
+                     in the store's own order, and following one would give a list that is \
+                     ordered inside each page and unordered across them. Ask for a larger \
+                     pageSize, or page unordered and sort at the client.",
+                )
+                .at("orderBy"));
+            }
+            // Ordered: read everything the filter admits, sort it, and hand
+            // back the first page of the sorted order. The read is bounded by
+            // the filter and not by the page, which is what makes "the fifty
+            // newest" actually the fifty newest.
+            let read = if order.is_some() {
+                crate::paging::Paging::unpaged()
+            } else {
+                paging.clone()
+            };
             let listing = api
-                .list_page_for(&parent, &kind, &filter, &paging, &who)
+                .list_page_for(&parent, &kind, &filter, &read, &who)
                 .await?;
+            let truncated_by_order =
+                order.is_some() && listing.items.len() > paging.resolved_size();
+            let mut items: Vec<Value> = listing.items.into_iter().map(to_wire).collect();
+            if let Some(order) = order {
+                sorted(&mut items, order);
+                items.truncate(paging.resolved_size());
+            }
+            // Last, on the wire document, so a caller can name a computed
+            // field — `status.addresses` is not in the store and is exactly
+            // the kind of thing a board asks for.
+            if let Some(fields) = fields_from(&query) {
+                items = items.iter().map(|d| only_fields(d, &fields)).collect();
+            }
             let mut body = json!({
-                "items": listing.items.into_iter().map(to_wire).collect::<Vec<_>>(),
+                "items": items,
                 "revision": listing.revision.to_string(),
             });
             // Present only when there is more. An always-present field that is
             // sometimes empty invites `if (body.nextPageToken !== undefined)`,
             // which loops forever.
-            if let Some(token) = listing.next_page_token {
+            //
+            // Never for an ordered listing: the token is a key in the store's
+            // own order, and handing one back would invite exactly the walk
+            // that produces a list ordered inside each page and unordered
+            // across them.
+            if order.is_none()
+                && let Some(token) = listing.next_page_token
+            {
                 body["nextPageToken"] = json!(token);
+            }
+            // …but say that the answer was cut, so a caller asking for the
+            // fifty newest of two hundred is not left thinking there were
+            // fifty.
+            if truncated_by_order {
+                body["truncated"] = json!(true);
             }
             Ok((
                 StatusCode::OK,
@@ -714,7 +1323,10 @@ async fn create(
         // POST, and never GET: it mints a credential, and a GET that did that
         // is one a browser can be made to issue from somebody else's page.
         Target::Verb { name, verb } if verb == "issueCredential" => {
-            let issued = api.issue_credential(&name, &identity).await?;
+            // The body is optional: `{}` is the ordinary case, and a caller
+            // may say `purpose` and `expiresAt`.
+            let ask = document(&body).unwrap_or_else(|_| serde_json::json!({}));
+            let issued = api.issue_credential(&name, &ask, &identity).await?;
             return Ok((StatusCode::OK, Json(issued)).into_response());
         }
         Target::Verb { name, verb } if verb == "reportStatus" => {
@@ -739,13 +1351,28 @@ async fn create(
             ));
         }
     };
-    let created = api
-        .create(&parent, &kind, &document(&body)?, &identity)
+    // A key makes the retry safe; without one this is the create it always was.
+    // Read from the header rather than the body on purpose: the body is
+    // fingerprinted, and a field that changed between two attempts of the same
+    // create would make every retry look like a different request.
+    let key = headers
+        .get(crate::core::IDEMPOTENCY_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let (created, replayed) = api
+        .create_with_key(&parent, &kind, &document(&body)?, &identity, key)
         .await?;
     // 202, because the object exists but has not converged. The operation is
     // what a client waits on, and it is a resource it can come back to rather
-    // than a connection it has to hold.
-    Ok((StatusCode::ACCEPTED, Json(created_body(&created))).into_response())
+    // than a connection it has to hold. A replay answers the same way, with a
+    // header saying so — a client that ignores it is still correct.
+    let mut answer = (StatusCode::ACCEPTED, Json(created_body(&created))).into_response();
+    if replayed {
+        answer.headers_mut().insert(
+            crate::core::REPLAYED_HEADER,
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
+    Ok(answer)
 }
 
 async fn patch(
@@ -763,7 +1390,11 @@ async fn patch(
     let updated = api
         .patch(&name, &document(&body)?, if_match(&headers)?, &who)
         .await?;
-    Ok(object(StatusCode::OK, updated))
+    Ok(with_operation(
+        StatusCode::OK,
+        updated.resource,
+        updated.operation,
+    ))
 }
 
 async fn delete(
@@ -781,7 +1412,11 @@ async fn delete(
     // 202 whether or not anything still holds the object: the client asked, the
     // deletion is recorded, and "gone" is something it learns by getting a 404
     // rather than by reading a different success code.
-    Ok(object(StatusCode::ACCEPTED, deleted.resource))
+    Ok(with_operation(
+        StatusCode::ACCEPTED,
+        deleted.resource,
+        deleted.operation,
+    ))
 }
 
 /// A watch is a read, and a read is authorised. It used not to be: this took no
@@ -828,16 +1463,35 @@ async fn watch(
 /// One object, with its revision as the ETag — which is the whole of the
 /// contract's "send it back as `If-Match`".
 fn object(status: StatusCode, document: Value) -> Response {
+    with_operation(status, document, None)
+}
+
+/// The name of the header that carries the operation minted for a change.
+///
+/// A create answers `202` with the operation in the body, because there is no
+/// object yet to be the body. A change and a delete already have a body — the
+/// object — so the handle goes in a header rather than reshaping a response
+/// every client already reads. It is additive: a client that does not look
+/// sees exactly what it saw before.
+pub const OPERATION_HEADER: &str = "velstra-operation";
+
+fn with_operation(status: StatusCode, document: Value, operation: Option<String>) -> Response {
     let revision = document["meta"]["revision"]
         .as_u64()
         .unwrap_or_default()
         .to_string();
-    (
+    let mut response = (
         status,
         [(header::ETAG, format!("\"{revision}\""))],
         Json(to_wire(document)),
     )
-        .into_response()
+        .into_response();
+    if let Some(operation) = operation
+        && let Ok(value) = operation.parse()
+    {
+        response.headers_mut().insert(OPERATION_HEADER, value);
+    }
+    response
 }
 
 fn document(body: &Bytes) -> ApiResult<Value> {
@@ -923,5 +1577,135 @@ mod tests {
         assert_eq!(etag("\"412\""), Some(Revision(412)));
         assert_eq!(etag("W/\"412\""), Some(Revision(412)));
         assert_eq!(if_match(&HeaderMap::new()).unwrap(), None);
+    }
+    fn q(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_span_back_from_now_is_a_moment() {
+        let now = Timestamp(1_000_000_000);
+        assert_eq!(
+            moment_from(&q(&[("since", "1h")]), "since", now).unwrap(),
+            Some(Timestamp(1_000_000_000 - 3_600_000))
+        );
+        assert_eq!(
+            moment_from(&q(&[("since", "30m")]), "since", now).unwrap(),
+            Some(Timestamp(1_000_000_000 - 1_800_000))
+        );
+        assert_eq!(
+            moment_from(&q(&[("since", "7d")]), "since", now).unwrap(),
+            Some(Timestamp(1_000_000_000 - 604_800_000))
+        );
+    }
+
+    #[test]
+    fn an_absolute_moment_is_taken_as_it_is() {
+        assert_eq!(
+            moment_from(&q(&[("until", "412")]), "until", Timestamp(9)).unwrap(),
+            Some(Timestamp(412))
+        );
+        assert_eq!(moment_from(&q(&[]), "since", Timestamp(9)).unwrap(), None);
+    }
+
+    /// A span nobody can parse is refused, not ignored: silently returning the
+    /// whole audit is the shape where a page loads in development and times
+    /// out in production.
+    #[test]
+    fn a_span_in_words_is_refused_with_the_spellings_that_work() {
+        let e = moment_from(&q(&[("since", "yesterday")]), "since", Timestamp(9))
+            .expect_err("this is not a span");
+        let said = format!("{e:?}");
+        assert!(said.contains("30m"), "{said}");
+    }
+
+    #[test]
+    fn an_order_is_a_field_and_a_direction() {
+        assert_eq!(
+            order_from(&q(&[("orderBy", "createdAt desc")])).unwrap(),
+            Some(Order {
+                by: OrderKey::CreatedAt,
+                descending: true
+            })
+        );
+        assert_eq!(
+            order_from(&q(&[("orderBy", "name")])).unwrap(),
+            Some(Order {
+                by: OrderKey::Name,
+                descending: false
+            })
+        );
+        assert_eq!(order_from(&q(&[])).unwrap(), None);
+    }
+
+    /// Two fields and no more, and the refusal says which — a status field is
+    /// not one every object in a collection carries.
+    #[test]
+    fn an_order_on_something_else_is_refused_by_name() {
+        let e = order_from(&q(&[("orderBy", "status.phase")])).expect_err("not an order");
+        let said = format!("{e:?}");
+        assert!(said.contains("createdAt"), "{said}");
+    }
+
+    #[test]
+    fn ordering_puts_the_newest_first_when_asked_to() {
+        let mut items = vec![
+            json!({"meta": {"name": "b", "createdAt": 200}}),
+            json!({"meta": {"name": "a", "createdAt": 300}}),
+            json!({"meta": {"name": "c", "createdAt": 100}}),
+        ];
+        sorted(
+            &mut items,
+            Order {
+                by: OrderKey::CreatedAt,
+                descending: true,
+            },
+        );
+        let names: Vec<&str> = items
+            .iter()
+            .map(|i| i["meta"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        sorted(
+            &mut items,
+            Order {
+                by: OrderKey::Name,
+                descending: false,
+            },
+        );
+        let names: Vec<&str> = items
+            .iter()
+            .map(|i| i["meta"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_read_mask_keeps_what_was_asked_for_and_the_name() {
+        let document = json!({
+            "meta": {"name": "projects/p1/instances/i1", "labels": {"env": "prod"}},
+            "spec": {"cloudInit": "#cloud-config\nlots and lots"},
+            "status": {"phase": "Running", "addresses": ["10.0.0.2"]},
+        });
+        let fields = fields_from(&q(&[("fields", "status.phase, meta.labels")])).unwrap();
+        let trimmed = only_fields(&document, &fields);
+        assert_eq!(trimmed["status"]["phase"], "Running");
+        assert_eq!(trimmed["meta"]["labels"]["env"], "prod");
+        // The name comes back whether it was named or not: a row without it is
+        // one nothing can be done with.
+        assert_eq!(trimmed["meta"]["name"], "projects/p1/instances/i1");
+        assert!(trimmed["spec"].is_null(), "{trimmed}");
+        assert!(trimmed["status"]["addresses"].is_null(), "{trimmed}");
+    }
+
+    #[test]
+    fn a_read_mask_naming_nothing_that_exists_still_gives_back_the_name() {
+        let document = json!({"meta": {"name": "nodes/hv-1"}});
+        let fields = fields_from(&q(&[("fields", "status.nothing.here")])).unwrap();
+        let trimmed = only_fields(&document, &fields);
+        assert_eq!(trimmed["meta"]["name"], "nodes/hv-1");
     }
 }

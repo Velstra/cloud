@@ -8,7 +8,8 @@
 
 const $ = (id) => document.getElementById(id);
 
-/// `el("td.name", "i1")`, `el("button.btn.primary", {onclick}, "Create")`.
+/// `el("td.name", "i1")`, `el("span.state.failing", mark("failing"), "failing")`.
+/// Buttons are `btn()` in `ui.js`, which is this plus what a press has to do.
 function el(spec, ...rest) {
   const [tag, ...classes] = spec.split(".");
   const node = document.createElement(tag || "div");

@@ -24,14 +24,31 @@
 //! * no `algorithm` — the datapath has exactly one behaviour (flow-hash with
 //!   connection stickiness), and an enum of choices it ignores is a control
 //!   that lies;
-//! * no health check and no per-member health in `status` — nothing in this
-//!   platform probes a backend, and the fabric's listing carries no health, so
-//!   any value here would be an assertion made by something that cannot see.
-//!   A member that is gone *as an object* is refused loudly at reference-check
-//!   and reconcile time instead.
+//! * no `algorithm` in `status` beyond what the fabric does.
 //!
 //! When the fabric grows any of those capabilities, the field arrives in the
 //! same commit as the code that reads it — never before.
+//!
+//! ## Health, and where it comes from now
+//!
+//! This module used to say the same about health: nothing in the platform
+//! could probe a backend, so any claim about one would be an assertion made by
+//! something that cannot see. The fabric still reports no health — but the
+//! *node* holding a member's tap can reach it, and now does: it opens a TCP
+//! connection to the member port a listener names and reports what answered on
+//! [`crate::resources::PortStatus::answering`].
+//!
+//! The balancer has no notion of health either, so the lever is the pool
+//! itself: a member that is not answering is left out of what is programmed,
+//! and put back when it answers again. That is a real health check with a real
+//! effect — a crashed backend stops receiving its share of connections instead
+//! of being handed one in four.
+//!
+//! It fails **open**, and that is the important half: if nothing in a pool
+//! answers, every member is programmed. A probe is a thing that can be wrong —
+//! a node that cannot see its guests, a listener on a port the guest opens
+//! late — and a wrong probe that emptied the pool would turn a monitoring
+//! failure into an outage. See [`serving`].
 
 use std::fmt;
 
@@ -112,10 +129,14 @@ pub struct LoadBalancerSpec {
 pub struct ObservedListener {
     pub protocol: Protocol,
     pub port: u16,
-    /// How many pool members the fabric holds for this listener. A count of
-    /// what is programmed, emphatically not health — nothing in this platform
-    /// probes a member, and a number that claimed to be "healthy" would be a
-    /// claim made by something that cannot see.
+    /// How many pool members the fabric holds for this listener.
+    ///
+    /// What is *programmed*, which is now the members that answered — plus the
+    /// whole pool when none did. So a number below `spec.members.len()` says
+    /// something has stopped answering, and a number equal to it says either
+    /// that everything is well or that nothing was probed. It is still a count
+    /// of what the fabric holds rather than a health field: the health lives
+    /// on the ports, written by the node that can actually see them.
     pub members: u32,
 }
 
@@ -272,15 +293,28 @@ pub fn desired_services(
     spec: &LoadBalancerSpec,
     vni: u32,
     vip: &str,
-    member_port_ids: &[String],
+    // Each member's fabric port id, and the ports the node holding it saw
+    // answer. An empty list is "nobody looked", not "nothing answers" — see
+    // [`serving`], which fails open on it.
+    member_port_ids: &[(String, Vec<u32>)],
 ) -> Vec<FabricService> {
     spec.listeners
         .iter()
         .map(|listener| {
-            let mut members: Vec<FabricMember> = member_port_ids
+            // Zero means the member answers on the port the client asked for.
+            let at = if listener.member_port == 0 {
+                listener.port
+            } else {
+                listener.member_port
+            };
+            let pool: Vec<(String, bool)> = member_port_ids
                 .iter()
+                .map(|(id, answering)| (id.clone(), answering.contains(&u32::from(at))))
+                .collect();
+            let mut members: Vec<FabricMember> = serving(&pool)
+                .into_iter()
                 .map(|port_id| FabricMember {
-                    port_id: port_id.clone(),
+                    port_id,
                     port: listener.member_port,
                 })
                 .collect();
@@ -476,7 +510,7 @@ mod tests {
             &s,
             4711,
             "10.20.0.100",
-            &["fp-a".into(), "fp-b".into()],
+            &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
         );
         assert_eq!(desired.len(), 2);
         assert_eq!(desired[0].port, 443);
@@ -500,7 +534,13 @@ mod tests {
     #[test]
     fn a_member_named_twice_is_one_member() {
         let s = spec(vec![listener(Protocol::Tcp, 80, 0)], vec![]);
-        let desired = desired_services(NAME, &s, 1, "10.0.0.9", &["fp-a".into(), "fp-a".into()]);
+        let desired = desired_services(
+            NAME,
+            &s,
+            1,
+            "10.0.0.9",
+            &[("fp-a".into(), vec![]), ("fp-a".into(), vec![])],
+        );
         assert_eq!(desired[0].members.len(), 1);
     }
 
@@ -509,7 +549,7 @@ mod tests {
         // Idempotence, stated as a test: the mirror of a settled object is
         // empty, or every resync would tear the datapath down and rebuild it.
         let s = spec(vec![listener(Protocol::Tcp, 443, 0)], vec![]);
-        let desired = desired_services(NAME, &s, 4711, "10.20.0.100", &["fp-a".into()]);
+        let desired = desired_services(NAME, &s, 4711, "10.20.0.100", &[("fp-a".into(), vec![])]);
         assert!(mirror_actions(NAME, &desired, &desired).is_empty());
 
         // The same pool in another order is the same pool.
@@ -520,7 +560,7 @@ mod tests {
             &s2,
             4711,
             "10.20.0.100",
-            &["fp-b".into(), "fp-a".into()],
+            &[("fp-b".into(), vec![]), ("fp-a".into(), vec![])],
         );
         reordered[0].members = {
             let mut m = both[0].members.clone();
@@ -532,7 +572,7 @@ mod tests {
             &s2,
             4711,
             "10.20.0.100",
-            &["fp-a".into(), "fp-b".into()],
+            &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
         );
         assert!(mirror_actions(NAME, &desired_two, &reordered).is_empty());
     }
@@ -544,14 +584,14 @@ mod tests {
             &spec(vec![listener(Protocol::Tcp, 443, 0)], vec![]),
             4711,
             "10.20.0.100",
-            &["fp-a".into()],
+            &[("fp-a".into(), vec![])],
         );
         let after = desired_services(
             NAME,
             &spec(vec![listener(Protocol::Tcp, 443, 0)], vec![]),
             4711,
             "10.20.0.100",
-            &["fp-a".into(), "fp-b".into()],
+            &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
         );
         let actions = mirror_actions(NAME, &after, &before);
         assert_eq!(
@@ -636,7 +676,7 @@ mod tests {
             &spec(vec![listener(Protocol::Tcp, 443, 0)], vec![]),
             4711,
             "10.20.0.100",
-            &["fp-a".into(), "fp-b".into()],
+            &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
         );
         assert_eq!(
             observed_listeners(&desired),
@@ -645,6 +685,144 @@ mod tests {
                 port: 443,
                 members: 2
             }]
+        );
+    }
+}
+
+/// Which members of a pool are worth programming, given what answered.
+///
+/// Fails open: a pool where nothing answers is programmed whole. The probe is
+/// the thing most likely to be wrong — a node that cannot see its guests, a
+/// service that opens its port a second after the guest is up — and an empty
+/// pool is a blackholed address. Sending traffic to a backend that may be down
+/// is what happened before any of this existed; sending it nowhere is worse.
+///
+/// Order is preserved, because the fabric hashes flows across the list and a
+/// reordering would move every existing connection.
+pub fn serving(members: &[(String, bool)]) -> Vec<String> {
+    let answering: Vec<String> = members
+        .iter()
+        .filter(|(_, up)| *up)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if answering.is_empty() {
+        return members.iter().map(|(name, _)| name.clone()).collect();
+    }
+    answering
+}
+
+#[cfg(test)]
+mod health_in_services {
+    use super::*;
+
+    fn balancer(member_port: u16) -> LoadBalancerSpec {
+        LoadBalancerSpec {
+            network: "projects/p1/networks/n1".into(),
+            subnet: "projects/p1/subnets/s1".into(),
+            vip: Some("10.0.0.9".into()),
+            listeners: vec![Listener {
+                protocol: Protocol::Tcp,
+                port: 443,
+                member_port,
+            }],
+            members: vec!["projects/p1/ports/a".into(), "projects/p1/ports/b".into()],
+        }
+    }
+
+    /// A crashed backend used to keep its share of every connection: the
+    /// fabric spreads flows across whatever it is given, and it was given
+    /// every member named. Now the one that stopped answering is left out.
+    #[test]
+    fn a_member_that_stopped_answering_is_not_programmed() {
+        let services = desired_services(
+            "projects/p1/load-balancers/web",
+            &balancer(8080),
+            5000,
+            "10.0.0.9",
+            &[("fp-a".into(), vec![8080]), ("fp-b".into(), vec![])],
+        );
+        let members: Vec<&str> = services[0]
+            .members
+            .iter()
+            .map(|m| m.port_id.as_str())
+            .collect();
+        assert_eq!(members, vec!["fp-a"], "the dead member kept its share");
+    }
+
+    /// Zero means the member answers on the port the client asked for, so
+    /// that is the port the probe has to have seen.
+    #[test]
+    fn a_listener_with_no_member_port_is_probed_on_its_own() {
+        let services = desired_services(
+            "projects/p1/load-balancers/web",
+            &balancer(0),
+            5000,
+            "10.0.0.9",
+            &[("fp-a".into(), vec![443]), ("fp-b".into(), vec![8080])],
+        );
+        let members: Vec<&str> = services[0]
+            .members
+            .iter()
+            .map(|m| m.port_id.as_str())
+            .collect();
+        assert_eq!(members, vec!["fp-a"]);
+    }
+
+    /// Nobody looked — an older node, a balancer just created, a probe that
+    /// has not run. Every member is programmed, exactly as before any of this
+    /// existed.
+    #[test]
+    fn an_unprobed_pool_is_programmed_whole() {
+        let services = desired_services(
+            "projects/p1/load-balancers/web",
+            &balancer(8080),
+            5000,
+            "10.0.0.9",
+            &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
+        );
+        assert_eq!(services[0].members.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::serving;
+
+    fn pool(members: &[(&str, bool)]) -> Vec<(String, bool)> {
+        members.iter().map(|(n, up)| (n.to_string(), *up)).collect()
+    }
+
+    /// The whole point: a crashed backend stops being handed one connection in
+    /// four. Before this, the fabric spread flows across every member named,
+    /// and a member that had stopped answering kept its share.
+    #[test]
+    fn a_member_that_does_not_answer_is_left_out() {
+        let out = serving(&pool(&[("a", true), ("b", false), ("c", true)]));
+        assert_eq!(out, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    /// A probe is a thing that can be wrong. A node that cannot see its guests
+    /// would otherwise empty the pool and blackhole the address — turning a
+    /// monitoring failure into an outage.
+    #[test]
+    fn a_pool_where_nothing_answers_is_programmed_whole() {
+        let out = serving(&pool(&[("a", false), ("b", false)]));
+        assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// The fabric hashes flows across the list, so a reordering moves every
+    /// connection that already exists.
+    #[test]
+    fn the_order_is_the_order_it_was_given() {
+        let out = serving(&pool(&[("c", true), ("a", true), ("b", true)]));
+        assert_eq!(out, vec!["c".to_string(), "a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_pool_stays_empty() {
+        assert!(
+            serving(&[]).is_empty(),
+            "a drained pool is a legitimate state"
         );
     }
 }

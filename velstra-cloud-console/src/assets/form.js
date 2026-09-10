@@ -154,7 +154,7 @@ function generateMac() {
 const DERIVE = {
   attachments: {
     instance: {
-      values: (obj) => ({ node: at(status(obj), "node") || at(spec(obj), "node") || "" }),
+      values: (obj) => ({ node: at(statusOf(obj), "node") || at(spec(obj), "node") || "" }),
       // An instance the scheduler has not placed has no node to take, and an
       // attachment without one cannot exist — the node is what has to open the
       // volume. Saying so where the choice was made beats a required field the
@@ -371,8 +371,7 @@ function fieldControl(form, f) {
       input.addEventListener("input", () => commit(input.value, input));
       if (f.check === "mac") {
         box.appendChild(el("div", { style: "display:flex;gap:var(--space-2)" }, input,
-          el("button.btn", { type: "button", onclick: () => { input.value = generateMac(); commit(input.value, input); } },
-            "Generate")));
+          btn("Generate", { onclick: () => { input.value = generateMac(); commit(input.value, input); } })));
       } else {
         box.appendChild(input);
       }
@@ -404,10 +403,14 @@ function renderTextList(form, f, host, setErr) {
     const input = el("input", { type: "text", value, placeholder: f.placeholder || "", spellcheck: "false" });
     input.addEventListener("input", () => { values[i] = input.value; commit(); input.classList.toggle("bad", !!check(f.check || "none", input.value)); });
     host.appendChild(el("div.row", input,
-      el("button.btn", { type: "button", "aria-label": "remove", onclick: () => { values.splice(i, 1); renderTextList(form, f, host, setErr); commit(); } }, "−")));
+      btn("−", {
+    "aria-label": "remove",
+    onclick: () => { values.splice(i, 1); renderTextList(form, f, host, setErr); commit(); },
+  })));
   });
-  host.appendChild(el("button.btn", { type: "button", onclick: () => { values.push(""); renderTextList(form, f, host, setErr); } },
-    "Add" + (values.length ? " another" : "")));
+  host.appendChild(btn("Add" + (values.length ? " another" : ""), {
+    onclick: () => { values.push(""); renderTextList(form, f, host, setErr); },
+  }));
 }
 
 // One rule is direction, protocol, an optional port range and a remote. They
@@ -482,14 +485,13 @@ function renderGrantList(form, f, host, setErr) {
     host.appendChild(el("div.grant",
       el("div.grantverb", verb),
       boxes,
-      el("button.btn", { type: "button", onclick: () => { grants.splice(i, 1); redraw(); } }, "Remove"),
+      btn("Remove", { onclick: () => { grants.splice(i, 1); redraw(); } }),
     ));
   });
 
-  host.appendChild(el("button.btn", {
-    type: "button",
+  host.appendChild(btn("Add a grant", {
     onclick: () => { grants.push({ verb: "operate", collections: [] }); redraw(); },
-  }, "Add a grant"));
+  }));
 
   // Said under the control rather than in the help text, because it is the thing
   // people get wrong: they grant `operate` and expect the screen to be readable.
@@ -600,12 +602,14 @@ function renderRuleList(form, f, host, setErr) {
       row.appendChild(pick);
     }
 
-    row.appendChild(el("button.btn", { type: "button", "aria-label": "remove", onclick: () => { rules.splice(i, 1); redraw(); } }, "\u2212"));
+    row.appendChild(btn("\u2212", { "aria-label": "remove", onclick: () => { rules.splice(i, 1); redraw(); } }));
     host.appendChild(row);
   });
 
-  host.appendChild(el("button.btn", { type: "button", id: "addrule", onclick: () => { rules.push(blankRule()); redraw(); } },
-    "Add" + (rules.length ? " another" : " a rule")));
+  host.appendChild(btn("Add" + (rules.length ? " another" : " a rule"), {
+    id: "addrule",
+    onclick: () => { rules.push(blankRule()); redraw(); },
+  }));
 }
 
 // One listener is a protocol, the port the address answers on, and the port
@@ -664,11 +668,13 @@ function renderListenerList(form, f, host, setErr) {
       port,
       el("span.idx", "members on"),
       member,
-      el("button.btn", { type: "button", "aria-label": "remove", onclick: () => { listeners.splice(i, 1); redraw(); } }, "−")));
+      btn("−", { "aria-label": "remove", onclick: () => { listeners.splice(i, 1); redraw(); } })));
   });
 
-  host.appendChild(el("button.btn", { type: "button", id: "addlistener", onclick: () => { listeners.push(blankListener()); redraw(); } },
-    "Add" + (listeners.length ? " another" : " a listener")));
+  host.appendChild(btn("Add" + (listeners.length ? " another" : " a listener"), {
+    id: "addlistener",
+    onclick: () => { listeners.push(blankListener()); redraw(); },
+  }));
 }
 
 // Picking disks for Ceph, which is the one control on this page that destroys
@@ -761,7 +767,7 @@ function renderDiskList(form, f, host, setErr) {
 
   for (const n of nodes) {
     const node = idOf(n);
-    const devices = at(status(n), "devices") || [];
+    const devices = at(statusOf(n), "devices") || [];
     const rows = el("div.diskrows");
     for (const d of devices) {
       const device = pick(d, "path") || "";
@@ -777,10 +783,10 @@ function renderDiskList(form, f, host, setErr) {
       row.appendChild(el("span.note", diskNote(d)));
       row.appendChild(why
         ? el("span.why", "Not offered: " + why)
-        : el("button.btn" + (taken ? "" : ".primary"), {
-          type: "button", "data-disk": taken ? "remove" : "add",
+        : btn(taken ? "Remove" : "Add", {
+          primary: !taken, "data-disk": taken ? "remove" : "add",
           onclick: () => (taken ? drop(node, device) : add(node, device)),
-        }, taken ? "Remove" : "Add"));
+        }));
       rows.appendChild(row);
     }
     host.appendChild(el("div.disknode",
@@ -793,7 +799,7 @@ function renderDiskList(form, f, host, setErr) {
   // this, and dropping these rows from the screen would let an edit that never
   // touched them silently look like it had removed them.
   const stray = chosen.filter((o) => !nodes.some((n) => idOf(n) === pick(o, "node") &&
-    (at(status(n), "devices") || []).some((d) => pick(d, "path") === pick(o, "device"))));
+    (at(statusOf(n), "devices") || []).some((d) => pick(d, "path") === pick(o, "device"))));
   if (stray.length) {
     host.appendChild(el("div.disknode",
       el("div.diskhost", "Not reported",
@@ -803,7 +809,7 @@ function renderDiskList(form, f, host, setErr) {
         return el("div.disk.chosen", { "data-node": node, "data-device": device },
           el("span.mono", device),
           el("span.note", "on " + node),
-          el("button.btn", { type: "button", "data-disk": "remove", onclick: () => drop(node, device) }, "Remove"));
+          btn("Remove", { "data-disk": "remove", onclick: () => drop(node, device) }));
       }))));
   }
 
@@ -853,13 +859,13 @@ function renderPoolList(form, f, host, setErr) {
     host.appendChild(el("div.row", name,
       el("span.lab", "copies"), copies,
       el("span.lab", "floor"), floor,
-      el("button.btn", { type: "button", "aria-label": "remove",
-        onclick: () => { pools.splice(i, 1); redraw(); } }, "−")));
+      btn("−", { "aria-label": "remove", onclick: () => { pools.splice(i, 1); redraw(); } })));
   });
 
-  host.appendChild(el("button.btn", { type: "button", id: "addpool",
-    onclick: () => { pools.push(blankPool(f)); redraw(); } },
-  "Add" + (pools.length ? " another" : " a pool")));
+  host.appendChild(btn("Add" + (pools.length ? " another" : " a pool"), {
+    id: "addpool",
+    onclick: () => { pools.push(blankPool(f)); redraw(); },
+  }));
 }
 
 /// What a reference list offers, in the order it offers it.
@@ -921,21 +927,28 @@ function renderRefList(form, f, host) {
     });
     // The order is the order they are attached in, so it has to be changeable.
     host.appendChild(el("div.row", el("span.idx", String(i + 1)), s,
-      el("button.btn", { type: "button", "aria-label": "up", disabled: i === 0 ? "" : null,
-        onclick: () => { [values[i - 1], values[i]] = [values[i], values[i - 1]]; renderRefList(form, f, host); commit(); } }, "↑"),
-      el("button.btn", { type: "button", "aria-label": "down", disabled: i === values.length - 1 ? "" : null,
-        onclick: () => { [values[i + 1], values[i]] = [values[i], values[i + 1]]; renderRefList(form, f, host); commit(); } }, "↓")));
+      btn("↑", {
+    "aria-label": "up",
+    disabled: i === 0 ? "" : null,
+    onclick: () => { [values[i - 1], values[i]] = [values[i], values[i - 1]]; renderRefList(form, f, host); commit(); },
+  }),
+      btn("↓", {
+    "aria-label": "down",
+    disabled: i === values.length - 1 ? "" : null,
+    onclick: () => { [values[i + 1], values[i]] = [values[i], values[i + 1]]; renderRefList(form, f, host); commit(); },
+  })));
   });
-  host.appendChild(el("button.btn", { type: "button", disabled: offered.length ? null : "",
+  host.appendChild(btn(offered.length ? "Add" + (values.length ? " another" : "") : "Nothing to attach yet", {
+    disabled: offered.length ? null : "",
     onclick: () => {
-      // The first thing that can actually be chosen, which is not always the
-      // first thing on offer: a network with two subnets is shown and refused.
-      const usable = choices.find((c) => !c.vague);
-      const first = usable ? (f.spelling === "id" ? idOf(usable.o) : nameOf(usable.o)) : "";
-      values.push(first); form.values[f.key] = values; renderRefList(form, f, host);
-      form.revalidate();
-    } },
-    offered.length ? "Add" + (values.length ? " another" : "") : "Nothing to attach yet"));
+        // The first thing that can actually be chosen, which is not always the
+        // first thing on offer: a network with two subnets is shown and refused.
+        const usable = choices.find((c) => !c.vague);
+        const first = usable ? (f.spelling === "id" ? idOf(usable.o) : nameOf(usable.o)) : "";
+        values.push(first); form.values[f.key] = values; renderRefList(form, f, host);
+        form.revalidate();
+      },
+  }));
   // "Nothing to attach yet" is true and useless on its own. A project that has
   // never had a network reaches this on its very first guest, and what it needs
   // is the order to do things in — not a disabled button.
@@ -1076,7 +1089,7 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
   dialog.appendChild(notes);
   dialog.appendChild(problems);
 
-  const submit = el("button.btn.primary", { type: "button", id: "submitform" }, submitLabel);
+  const submit = btn(submitLabel, { primary: true, id: "submitform" });
   submit.addEventListener("click", async () => {
     form.revalidate();
     const missing = coll.fields.filter((f) => f.required && !f.derived &&
@@ -1093,21 +1106,12 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
       return;
     }
     problems.classList.add("hidden");
-    submit.setAttribute("disabled", "");
-    // The verb in the present tense and a spinner: the request can take a
-    // second, and a dimmed button for that second says nothing about whether
-    // anything was sent.
-    const label = submit.textContent;
-    submit.classList.add("busy");
-    submit.textContent = (/^(Create|Save|Add|Move|Migrate|Attach|Apply)\b/.exec(label) || ["Working"])[0]
-      .replace(/e?$/, "") + "ing…";
+    working(submit);
     try {
       await onSubmit(form);
       closeDialog();
     } catch (e) {
-      submit.removeAttribute("disabled");
-      submit.classList.remove("busy");
-      submit.textContent = label;
+      settled(submit);
       // The API points at the offending path when there is one, so the message
       // lands on the control rather than in a banner nobody can act on. When it
       // does not, one refusal is still placeable without guessing: the only
@@ -1126,7 +1130,7 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
 
   dialog.appendChild(el("div.dialogacts",
     el("span.grow"),
-    el("button.btn", { type: "button", id: "cancelform", onclick: closeDialog }, "Cancel"),
+    btn("Cancel", { id: "cancelform", onclick: closeDialog }),
     submit));
 
   document.body.appendChild(scrim);
@@ -1332,7 +1336,7 @@ function imageTitle(o) {
 }
 
 function optionNote(collectionId, o) {
-  const st = status(o), sp = spec(o);
+  const st = statusOf(o), sp = spec(o);
   if (collectionId === "images") {
     // Where it lives, because two projects may hold the same bytes and a
     // catalogue image is not the same offer as one of your own.
@@ -1521,11 +1525,11 @@ function showAgentToken(id, token, kind) {
         "role is answered there; a pool added here is being pointed at a machine " +
         "that already runs one."),
     el("div.formacts",
-      el("button.btn", { type: "button", id: "copytoken",
-        onclick: () => navigator.clipboard && navigator.clipboard.writeText(token) },
-        "Copy the token"),
-      el("button.btn.primary", { type: "button", id: "tokendone",
-        onclick: () => closeDialog() }, "I have written it down")));
+      btn("Copy the token", {
+    id: "copytoken",
+    onclick: () => navigator.clipboard && navigator.clipboard.writeText(token),
+  }),
+      btn("I have written it down", { primary: true, id: "tokendone", onclick: () => closeDialog() })));
 }
 
 /// What the form may send: not the id, which is not part of the spec, and not
@@ -1621,7 +1625,7 @@ function openPasswordDialog(user) {
     problems.classList.remove("hidden");
   };
 
-  const submit = el("button.btn.primary", { type: "button", id: "submitpassword" }, "Set password");
+  const submit = btn("Set password", { primary: true, id: "submitpassword" });
   submit.addEventListener("click", async () => {
     if (own && !current.value) return stop("Enter your current password to confirm the change.");
     if (first.value !== again.value) return stop("The two entries do not match.");
@@ -1650,7 +1654,7 @@ function openPasswordDialog(user) {
 
   dialog.appendChild(el("div.dialogacts",
     el("span.grow"),
-    el("button.btn", { type: "button", id: "cancelpassword", onclick: closeDialog }, "Cancel"),
+    btn("Cancel", { id: "cancelpassword", onclick: closeDialog }),
     submit));
 
   document.body.appendChild(scrim);

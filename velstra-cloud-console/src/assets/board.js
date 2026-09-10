@@ -168,19 +168,30 @@ function renderFleet() {
   if (failed) box.appendChild(el("span.state.failing", mark("failing"), failed + " unreadable"));
 }
 
-/// Everything the last sweep found that has not settled, newest first.
+/// Everything the last sweep found that has not settled, worst first.
 ///
 /// Read off the census rather than fetched again: the sweep already lists every
 /// collection on the way in, and asking a second time would double the cost of
 /// signing in to show the same objects.
+///
+/// The order used to be the order the collections happen to sit in the rail,
+/// which put a failing guest under three networks that had merely not reported
+/// yet. It is now the order the words mean: broken, then slipping, then silent,
+/// then on its way out — and inside each, by name, so the list does not
+/// reshuffle itself between two sweeps that found the same thing.
+const VERDICT_ORDER = { failing: 0, drifting: 1, unreported: 2, deleting: 3, settled: 4 };
+
 function unsettledEverywhere() {
   const out = [];
   for (const c of collections()) {
     const seen = census[c.id];
     if (!seen || !seen.ok) continue;
-    for (const item of seen.unsettledItems || []) out.push({ coll: c, item });
+    for (const item of seen.unsettledItems || []) {
+      out.push({ coll: c, item, kind: verdict(item, c.condition).kind });
+    }
   }
-  return out;
+  const rank = (r) => (r.kind in VERDICT_ORDER ? VERDICT_ORDER[r.kind] : 9);
+  return out.sort((a, b) => rank(a) - rank(b) || nameOf(a.item).localeCompare(nameOf(b.item)));
 }
 
 async function sweep() {
@@ -363,10 +374,24 @@ function renderBoard() {
     columnsFor(coll).map((c) => el("th", { style: "width:" + c.width + "px" }, c.label)));
 
   const body = $("boardbody");
+  // The verdicts as they stood a moment ago, read off the rows about to be
+  // thrown away. A refresh replaces this table in place, so without this the
+  // only way to find out that one guest started failing while you were reading
+  // is to read all forty rows again.
+  const before = new Map([...body.querySelectorAll("tr[data-name]")]
+    .map((tr) => [tr.dataset.name, tr.dataset.verdict]));
+  const had = before.size > 0;
   clear(body);
   const rows = view.items.slice().sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
   for (const r of rows) {
-    const tr = el("tr", { tabindex: "0", "data-name": nameOf(r) });
+    const v = verdict(r, coll.condition);
+    const tr = el("tr", { tabindex: "0", "data-name": nameOf(r), "data-verdict": v.kind });
+    // Marked only where there was a table to compare against, and only on the
+    // rows that actually moved: on the first render of a board every row would
+    // otherwise announce itself, which says nothing.
+    if (had && before.has(nameOf(r)) && before.get(nameOf(r)) !== v.kind) {
+      tr.classList.add("changed");
+    }
     const open = () => openSheet(coll, r);
     tr.addEventListener("click", open);
     tr.addEventListener("keydown", (e) => { if (e.key === "Enter") open(); });
@@ -452,14 +477,15 @@ function renderPicked() {
   if (n) {
     bar.appendChild(el("span.pickcount", n + " selected"));
     for (const a of bulkActions(coll)) {
-      bar.appendChild(el("button.btn" + (a.destroys ? ".danger" : ""), {
-        type: "button", "data-bulk": a.id, onclick: () => askBulk(coll, a),
-      }, a.label));
+      bar.appendChild(btn(a.label, {
+        destroys: a.destroys, "data-bulk": a.id, onclick: () => askBulk(coll, a),
+      }));
     }
   }
-  bar.appendChild(el("button.btn", { type: "button", id: "pickclear",
-    onclick: () => { view.picked.clear(); bulkOutcome = null; renderBoard(); } },
-    n ? "Clear" : "Dismiss"));
+  bar.appendChild(btn(n ? "Clear" : "Dismiss", {
+    id: "pickclear",
+    onclick: () => { view.picked.clear(); bulkOutcome = null; renderBoard(); },
+  }));
   const host = el("span.bulkresult", { id: "bulkresult" });
   if (bulkOutcome) for (const node of bulkOutcome) host.appendChild(node);
   bar.appendChild(host);
@@ -478,10 +504,12 @@ function askBulk(coll, action) {
   fill(host,
     el("span.err", "Delete " + names.slice(0, 5).join(", ") +
       (names.length > 5 ? " and " + (names.length - 5) + " more" : "") + "? "),
-    el("button.btn.danger", { type: "button", id: "bulkyes",
-      onclick: () => runBulk(coll, action) }, "Delete " + names.length),
-    el("button.btn", { type: "button", id: "bulkno",
-      onclick: () => clear(host) }, "Keep them"));
+    btn("Delete " + names.length, {
+    danger: true,
+    id: "bulkyes",
+    onclick: () => runBulk(coll, action),
+  }),
+    btn("Keep them", { id: "bulkno", onclick: () => clear(host) }));
 }
 
 /// Do it, one at a time, and report every outcome.
@@ -542,11 +570,31 @@ function renderListHead() {
   const mayCreate = (!OPERATOR_WRITES.includes(coll.id) || (session.who && session.who.cellAdmin))
     && allows("create");
   if (coll.creatable && mayCreate) {
-    acts.appendChild(el("button.btn.primary", { type: "button", id: "newbtn",
-      onclick: () => openCreate(coll) }, "New " + coll.singular));
+    acts.appendChild(btn("New " + coll.singular, { primary: true, id: "newbtn", onclick: () => openCreate(coll) }));
   }
-  acts.appendChild(el("button.btn", { type: "button", id: "refreshbtn",
-    onclick: () => show(coll.id) }, "Refresh"));
+  // The console already has a busy button — a spinner, and a slower one under
+  // `prefers-reduced-motion`. This press re-reads the whole collection, so it
+  // is exactly the press that needs it: a button that goes quiet for a second
+  // and a half is a button somebody presses twice.
+  acts.appendChild(btn("Refresh", {
+    id: "refreshbtn",
+    onclick: async (e) => {
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        btn.classList.add("busy");
+        btn.textContent = "Refreshing…";
+        try { await show(coll.id); } finally {
+          // `show` rebuilds this bar, so the button that was pressed is usually
+          // gone by now. Restoring it anyway keeps the one path where it is not
+          // — a refusal before the re-render — from leaving a dead control.
+          if (btn.isConnected) {
+            btn.disabled = false;
+            btn.classList.remove("busy");
+            btn.textContent = "Refresh";
+          }
+        }
+      },
+  }));
   renderFilter(coll);
 }
 
@@ -582,11 +630,9 @@ function renderFilter(coll) {
   });
   box.appendChild(el("label.filterlabel", { for: "labelfilter" }, "Labels"));
   box.appendChild(input);
-  box.appendChild(el("button.btn", { type: "button", id: "applyfilter",
-    onclick: () => applyFilter(coll, input.value) }, "Narrow"));
+  box.appendChild(btn("Narrow", { id: "applyfilter", onclick: () => applyFilter(coll, input.value) }));
   if (session.labels) {
-    box.appendChild(el("button.btn", { type: "button", id: "clearfilter",
-      onclick: () => applyFilter(coll, "") }, "Show all"));
+    box.appendChild(btn("Show all", { id: "clearfilter", onclick: () => applyFilter(coll, "") }));
     box.appendChild(el("span.filternote.muted",
       "Showing only what carries " + session.labels + "."));
   }
@@ -942,6 +988,7 @@ async function showOverview() {
   view.map = false;
   view.items = [];
   view.picked.clear();
+  view.attentionKind = null;
   bulkOutcome = null;
   $("picked").classList.add("hidden");
   location.hash = "#overview";
@@ -989,7 +1036,31 @@ function renderOverviewBody() {
         ? " Nothing in this cell is drifting or failing."
         : " Nothing in this project is drifting or failing."))));
   } else {
-    for (const { coll, item } of attention) {
+    // What the number is made of, and a way to see only one part of it.
+    //
+    // The header says "10 not settled", which is two different nights depending
+    // on whether it is two failing guests or ten objects that have never
+    // reported. The breakdown is the same list, counted; each part narrows the
+    // rows below rather than opening anything, so nothing is hidden that the
+    // count did not already say was there.
+    const byKind = attention.reduce((m, r) => (m[r.kind] = (m[r.kind] || 0) + 1, m), {});
+    const kinds = Object.keys(byKind).sort((a, b) =>
+      (VERDICT_ORDER[a] ?? 9) - (VERDICT_ORDER[b] ?? 9));
+    if (kinds.length > 1) {
+      const tally = el("div.tally", el("span.muted", attention.length + " not settled —"));
+      for (const k of kinds) {
+        const on = view.attentionKind === k;
+        tally.appendChild(el("button.tallybtn" + (on ? ".on" : ""), {
+          type: "button", "aria-pressed": on ? "true" : "false",
+          onclick: () => { view.attentionKind = on ? null : k; renderOverviewBody(); },
+        }, mark(k), byKind[k] + " " + k));
+      }
+      panel.appendChild(tally);
+    }
+    const shown = view.attentionKind
+      ? attention.filter((r) => r.kind === view.attentionKind)
+      : attention;
+    for (const { coll, item } of shown) {
       const v = verdict(item, coll.condition);
       panel.appendChild(el("div.overrow",
         el("button.linky", { type: "button", "data-goes": nameOf(item),
@@ -997,7 +1068,7 @@ function renderOverviewBody() {
         el("span.state." + v.kind, mark(v.kind), v.label || v.kind),
         el("span.muted", coll.singular + (v.detail ? " — " + v.detail : ""))));
     }
-    if (total > attention.length) {
+    if (total > attention.length && !view.attentionKind) {
       panel.appendChild(el("p.muted",
         (total - attention.length) + " more are not settled. " +
         "A cell where everything is drifting has one problem, not four hundred — " +

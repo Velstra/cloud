@@ -188,7 +188,7 @@ function keystroke(event) {
 function consoleSection(host, coll, id) {
   let close = null;
   const screenHost = el("div");
-  const button = el("button.btn.quiet", { type: "button" }, "Attach");
+  const button = btn("Attach", { quiet: true });
 
   const stop = () => {
     if (close) close();

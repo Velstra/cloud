@@ -637,3 +637,82 @@ async fn a_tenant_listing_their_own_project_does_not_pay_for_the_cell() {
          shape, not the linear one: {costs:?}"
     );
 }
+
+/// A tenant asking about one month's bill must not make the API decode every
+/// reading the cell has ever taken.
+///
+/// A reading is filed under the zero-padded millisecond of its interval, so the
+/// lexical order of the names is time order — and until this was read as a key
+/// range, `:explainUsage` listed the whole collection. Ninety days hourly is
+/// two thousand rows per project; a tenant asking about their own August made
+/// the API decode everybody's year.
+#[tokio::test]
+async fn a_months_bill_reads_a_month_and_not_a_year() {
+    let raw = Counting::new();
+    let store: Arc<dyn Store> = raw.clone();
+    let verifier: Arc<dyn velstra_cloud_api::TokenVerifier> =
+        Arc::new(velstra_cloud_api::StaticTokenVerifier::single("t"));
+    let api = velstra_cloud_api::Api::new(store.clone(), "eu-central", "cell-1", verifier)
+        .with_cell_admins(vec!["ops".to_string()]);
+    let who = velstra_cloud_api::Identity::new("ops");
+    api.create(
+        "",
+        "projects",
+        &serde_json::json!({"id": "p1", "spec": {"quota": {}}}),
+        &who,
+    )
+    .await
+    .unwrap();
+
+    // A year of hourly readings, written past the API the way the controller
+    // writes them.
+    let usage = velstra_cloud_store::TypedStore::<
+        velstra_cloud_model::usage::UsageRecordSpec,
+        velstra_cloud_model::usage::UsageRecordStatus,
+    >::new(store.clone(), "cell-1", "usage");
+    let now = velstra_cloud_model::meta::Timestamp::now();
+    let hour = velstra_cloud_model::usage::INTERVAL_MS;
+    let year = 365 * 24;
+    for i in 0..year {
+        let at = velstra_cloud_model::meta::Timestamp(now.0 - i * hour);
+        let record = velstra_cloud_model::resources::Resource::new(
+            velstra_cloud_model::meta::Meta::new(
+                format!(
+                    "projects/p1/usage/{}",
+                    velstra_cloud_model::usage::id_for(at)
+                )
+                .parse()
+                .unwrap(),
+                velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+            ),
+            velstra_cloud_model::usage::UsageRecordSpec {
+                project: "projects/p1".into(),
+                at,
+                used: Default::default(),
+                traffic: Default::default(),
+            },
+            Default::default(),
+        );
+        usage
+            .create(
+                &record,
+                &velstra_cloud_model::access::Writer::controller("usage"),
+            )
+            .await
+            .unwrap();
+    }
+
+    raw.reset();
+    api.explain_usage(&"projects/p1".parse().unwrap(), None, &who)
+        .await
+        .expect("the month adds up");
+    let read = raw.read();
+
+    // A month is at most 744 hourly readings. Anything near the year says the
+    // scan is still reading the whole collection.
+    assert!(
+        read < 2 * 744,
+        "a month's bill read {read} entries out of {year} — the scan is still reading the year"
+    );
+    eprintln!("a month's bill read {read} entries out of {year} in the store");
+}

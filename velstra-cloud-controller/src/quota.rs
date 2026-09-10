@@ -13,12 +13,13 @@
 //! full and nothing in the system can prove otherwise.
 
 use velstra_cloud_model::{
+    backup::{BackupSpec, BackupStatus},
     loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
     meta::{Meta, ResourceName, Timestamp, set_condition},
     reconcile::{count_quota, quota_condition},
     resources::{
         FloatingIpSpec, FloatingIpStatus, InstanceSpec, InstanceStatus, Project, ProjectSpec,
-        ProjectStatus, Quota, Resource, VolumeSpec, VolumeStatus,
+        ProjectStatus, Quota, Resource, SnapshotSpec, SnapshotStatus, VolumeSpec, VolumeStatus,
     },
     usage::{UsageRecordSpec, UsageRecordStatus},
 };
@@ -40,6 +41,10 @@ pub struct QuotaController {
     volumes: Cached<VolumeSpec, VolumeStatus>,
     floating: Cached<FloatingIpSpec, FloatingIpStatus>,
     balancers: Cached<LoadBalancerSpec, LoadBalancerStatus>,
+    /// Snapshots and backups, for the two dimensions that are counted from
+    /// what a pool reported rather than from what somebody asked for.
+    snapshots: Cached<SnapshotSpec, SnapshotStatus>,
+    backups: Cached<BackupSpec, BackupStatus>,
     status: StatusWriter<ProjectSpec, ProjectStatus>,
     /// Where a reading of what this project had goes, when one is taken.
     ///
@@ -54,11 +59,17 @@ pub struct QuotaController {
 }
 
 impl QuotaController {
+    /// Eight arguments, six of them the collections a quota is counted from.
+    /// A struct holding them would exist to be built at the one call site that
+    /// has them and taken apart here.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instances: Cached<InstanceSpec, InstanceStatus>,
         volumes: Cached<VolumeSpec, VolumeStatus>,
         floating: Cached<FloatingIpSpec, FloatingIpStatus>,
         balancers: Cached<LoadBalancerSpec, LoadBalancerStatus>,
+        snapshots: Cached<SnapshotSpec, SnapshotStatus>,
+        backups: Cached<BackupSpec, BackupStatus>,
         status: StatusWriter<ProjectSpec, ProjectStatus>,
         cell: &str,
     ) -> Self {
@@ -67,6 +78,8 @@ impl QuotaController {
             volumes,
             floating,
             balancers,
+            snapshots,
+            backups,
             status,
             usage: None,
             interval_ms: velstra_cloud_model::usage::INTERVAL_MS,
@@ -106,7 +119,7 @@ impl QuotaController {
     /// missing from a bill, which is a thing to notice; a reading that could
     /// not be written and took the quota count down with it would be a cell
     /// that stops enforcing limits because its accountant is unwell.
-    async fn record(&self, project: &Project, used: &Quota, now: Timestamp) {
+    async fn record(&self, project: &Project, used: &Quota, carried: (u64, u64), now: Timestamp) {
         let Some(store) = &self.usage else {
             return;
         };
@@ -116,12 +129,24 @@ impl QuotaController {
         let Ok(name) = ResourceName::parse(&name) else {
             return;
         };
+        // The reading before this one, for the traffic. Read rather than
+        // remembered: a controller that kept a table would forget it on every
+        // restart and bill a month's traffic as one hour's.
+        let previous = self
+            .newest_reading(&project.meta.name.to_string(), at)
+            .await;
+        let traffic = velstra_cloud_model::usage::Traffic::between(
+            previous.as_ref().map(|r| &r.spec.traffic),
+            carried.0,
+            carried.1,
+        );
         let record = Resource::new(
             Meta::new(name, project.meta.placement.clone()),
             UsageRecordSpec {
                 project: project.meta.name.to_string(),
                 at,
                 used: used.clone(),
+                traffic,
             },
             UsageRecordStatus::default(),
         );
@@ -140,6 +165,26 @@ impl QuotaController {
                                      "this project's usage was not written down"),
         }
         self.prune(project, now).await;
+    }
+
+    /// The newest reading of this project taken strictly before `at`.
+    ///
+    /// `None` when there is none, which is the first reading a project ever
+    /// gets. The readings are filed under a zero-padded millisecond, so the
+    /// lexical order of their names is time order and "the newest before this"
+    /// is the last one that sorts below the id being written.
+    async fn newest_reading(
+        &self,
+        project: &str,
+        at: Timestamp,
+    ) -> Option<velstra_cloud_model::resources::UsageRecord> {
+        let store = self.usage.as_ref()?;
+        let records = store.list().await.ok()?;
+        let mine = format!("{project}/usage/");
+        records
+            .into_iter()
+            .filter(|r| r.meta.name.to_string().starts_with(&mine) && r.spec.at.0 < at.0)
+            .max_by_key(|r| r.spec.at.0)
     }
 
     /// Take away readings older than the retention.
@@ -172,6 +217,98 @@ impl QuotaController {
                 .await;
         }
     }
+
+    /// Take away every reading of a project that no longer exists.
+    ///
+    /// Deleting a project deliberately leaves its records behind — they are
+    /// what a bill is reconstructed from, and holding a project hostage to its
+    /// own accounting was a real incident. But "left behind" was taken
+    /// literally: nothing ever came back for them. This is the coming back.
+    ///
+    /// Not on a retention: the project is gone, so the readings are already
+    /// past being about anything. An operator who needs the history takes it
+    /// out before deleting, which is the same thing every cloud asks.
+    async fn forget(&self, project: &str) {
+        let Some(store) = &self.usage else {
+            return;
+        };
+        let Ok(records) = store.list().await else {
+            tracing::warn!(
+                project,
+                "could not read the usage to forget a deleted project's"
+            );
+            return;
+        };
+        let mine = format!("{project}/usage/");
+        let mut gone = 0;
+        for record in records {
+            let name = record.meta.name.to_string();
+            if !name.starts_with(&mine) {
+                continue;
+            }
+            if store
+                .delete(
+                    &name,
+                    record.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller(WRITER),
+                )
+                .await
+                .is_ok()
+            {
+                gone += 1;
+            }
+        }
+        if gone > 0 {
+            tracing::info!(project, readings = gone, "forgot a deleted project's usage");
+        }
+    }
+}
+
+/// Take away readings belonging to projects that are gone.
+///
+/// A project deleted while this process was down leaves rows nothing
+/// reconciles: the resync lists projects that *exist*, so the missing one is
+/// never visited and [`QuotaController::forget`] is never called. This is the
+/// sweep that closes that window, run from the same periodic pass the alerts
+/// are — a free function rather than a method because the controller it would
+/// hang off is owned by the runner by then.
+pub async fn sweep_orphaned_usage(
+    store: &TypedStore<UsageRecordSpec, UsageRecordStatus>,
+    live: &[Project],
+) -> usize {
+    {
+        let Ok(records) = store.list().await else {
+            return 0;
+        };
+        let live: std::collections::BTreeSet<String> =
+            live.iter().map(|p| p.meta.name.to_string()).collect();
+        let mut gone = 0;
+        for record in records {
+            // The record's own field, not the name it is filed under: they
+            // agree, and the field is what a bill is read from.
+            if live.contains(&record.spec.project) {
+                continue;
+            }
+            if store
+                .delete(
+                    &record.meta.name.to_string(),
+                    record.meta.revision,
+                    &velstra_cloud_model::access::Writer::controller(WRITER),
+                )
+                .await
+                .is_ok()
+            {
+                gone += 1;
+            }
+        }
+        if gone > 0 {
+            tracing::info!(
+                readings = gone,
+                "swept usage belonging to projects that are gone"
+            );
+        }
+        gone
+    }
 }
 
 /// The project a resource is charged to, as a name.
@@ -196,14 +333,26 @@ impl Reconciler for QuotaController {
         // Leaving this to the resync alone would mean the API admits work
         // against a number that is up to a resync interval out of date, which
         // is exactly how a project overshoots its limit.
-        ["instances", "volumes", "floatingips", "load-balancers"]
-            .into_iter()
-            .map(|kind| Related::named(prefix_for(&self.cell, kind), owning_project))
-            .collect()
+        [
+            "instances",
+            "volumes",
+            "floatingips",
+            "load-balancers",
+            "snapshots",
+            "backups",
+        ]
+        .into_iter()
+        .map(|kind| Related::named(prefix_for(&self.cell, kind), owning_project))
+        .collect()
     }
 
-    async fn reconcile(&self, _name: &str, object: Option<&Project>) -> Result<()> {
+    async fn reconcile(&self, name: &str, object: Option<&Project>) -> Result<()> {
         let Some(project) = object else {
+            // Gone. Its readings are not, and nothing else would ever look at
+            // them again: pruning runs inside this reconcile, so a deleted
+            // project's rows were kept for ever — the delete guard skips
+            // records on purpose, so there was nothing left to notice them.
+            self.forget(name).await;
             return Ok(());
         };
 
@@ -211,16 +360,22 @@ impl Reconciler for QuotaController {
         let (volumes, _) = self.volumes.all().await;
         let (floating, _) = self.floating.all().await;
         let (balancers, _) = self.balancers.all().await;
+        let (snapshots, _) = self.snapshots.all().await;
+        let (backups, _) = self.backups.all().await;
         let instances: Vec<_> = instances.iter().map(|i| (**i).clone()).collect();
         let volumes: Vec<_> = volumes.iter().map(|v| (**v).clone()).collect();
         let floating: Vec<_> = floating.iter().map(|f| (**f).clone()).collect();
         let balancers: Vec<_> = balancers.iter().map(|l| (**l).clone()).collect();
+        let snapshots: Vec<_> = snapshots.iter().map(|s| (**s).clone()).collect();
+        let backups: Vec<_> = backups.iter().map(|b| (**b).clone()).collect();
         let used = count_quota(
             &project.meta.name,
             &instances,
             &volumes,
             &floating,
             &balancers,
+            &snapshots,
+            &backups,
         );
 
         let mut next = project.clone();
@@ -239,7 +394,18 @@ impl Reconciler for QuotaController {
         // project *had*, and writing one from a count this pass has not yet
         // stood behind would put a number in a bill that the project's own
         // status disagrees with.
-        self.record(project, &next.status.used, Timestamp::now())
+        // Every guest's lifetime traffic, summed. The node carries each one
+        // across a tap that was remade, so this is a total that only ever goes
+        // up — which is what makes the difference between two readings a
+        // number somebody can be charged for.
+        let carried = instances
+            .iter()
+            .filter(|i| i.meta.name.is_under(&project.meta.name))
+            .filter_map(|i| i.status.usage.as_ref())
+            .fold((0u64, 0u64), |(rx, tx), u| {
+                (rx.saturating_add(u.rx_total), tx.saturating_add(u.tx_total))
+            });
+        self.record(project, &next.status.used, carried, Timestamp::now())
             .await;
         Ok(())
     }
@@ -320,6 +486,19 @@ mod tests {
                 ),
                 raw.clone(),
                 prefix_for("cell-1", "load-balancers"),
+            ),
+            Cached::start(
+                TypedStore::<
+                    velstra_cloud_model::resources::SnapshotSpec,
+                    velstra_cloud_model::resources::SnapshotStatus,
+                >::new(raw.clone(), "cell-1", "snapshots"),
+                raw.clone(),
+                prefix_for("cell-1", "snapshots"),
+            ),
+            Cached::start(
+                TypedStore::<BackupSpec, BackupStatus>::new(raw.clone(), "cell-1", "backups"),
+                raw.clone(),
+                prefix_for("cell-1", "backups"),
             ),
             StatusWriter::new(raw, "cell-1", "projects", "quota"),
             "cell-1",
@@ -525,6 +704,8 @@ mod recording {
             cached!("volumes"),
             cached!("floatingips"),
             cached!("load-balancers"),
+            cached!("snapshots"),
+            cached!("backups"),
             StatusWriter::new(store.clone(), "cell-1", "projects", WRITER),
             "cell-1",
         )
@@ -569,7 +750,7 @@ mod recording {
         let base = Timestamp(1_787_824_800_000);
         for offset in [0, 1_000, 59 * 60_000] {
             controller
-                .record(&project, &used, Timestamp(base.0 + offset))
+                .record(&project, &used, (0, 0), Timestamp(base.0 + offset))
                 .await;
         }
         let rows = usage.list().await.expect("the store answers");
@@ -581,7 +762,7 @@ mod recording {
         // The next hour is its own row, or nothing would ever be recorded
         // twice.
         controller
-            .record(&project, &used, Timestamp(base.0 + 60 * 60_000))
+            .record(&project, &used, (0, 0), Timestamp(base.0 + 60 * 60_000))
             .await;
         assert_eq!(usage.list().await.unwrap().len(), 2);
     }
@@ -609,7 +790,12 @@ mod recording {
         let base = 1_787_824_800_000u64;
         for i in 0..6 {
             controller
-                .record(&project, &Quota::default(), Timestamp(base + i * hour))
+                .record(
+                    &project,
+                    &Quota::default(),
+                    (0, 0),
+                    Timestamp(base + i * hour),
+                )
                 .await;
         }
         let rows = usage.list().await.expect("the store answers");
@@ -624,5 +810,103 @@ mod recording {
             rows.iter().all(|r| r.spec.at.0 >= base + 2 * hour),
             "a reading older than the retention was kept"
         );
+    }
+
+    /// A deleted project's readings go with it.
+    ///
+    /// They used to stay for ever: pruning runs inside the reconcile, and a
+    /// project that no longer exists is never reconciled. The delete guard
+    /// skips records deliberately — that was the fix for projects being held
+    /// hostage by their own accounting — so nothing anywhere came back for
+    /// them.
+    #[tokio::test]
+    async fn the_readings_of_a_deleted_project_are_forgotten() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let usage: TypedStore<UsageRecordSpec, UsageRecordStatus> =
+            TypedStore::new(store.clone(), "cell-1", "usage");
+        let hour = 60 * 60_000u64;
+        let controller = recorder(&store, hour, 90 * 24 * hour);
+        let base = 1_787_824_800_000u64;
+
+        for id in ["p1", "p2"] {
+            let project = Resource::new(
+                Meta::new(
+                    format!("projects/{id}").parse().unwrap(),
+                    velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+                ),
+                ProjectSpec::default(),
+                ProjectStatus::default(),
+            );
+            for i in 0..3 {
+                controller
+                    .record(
+                        &project,
+                        &Quota::default(),
+                        (0, 0),
+                        Timestamp(base + i * hour),
+                    )
+                    .await;
+            }
+        }
+        assert_eq!(usage.list().await.unwrap().len(), 6);
+
+        // The reconcile that sees it gone.
+        controller.reconcile("projects/p1", None).await.unwrap();
+
+        let left = usage.list().await.unwrap();
+        assert_eq!(left.len(), 3, "a deleted project's readings were kept");
+        assert!(
+            left.iter().all(|r| r.spec.project == "projects/p2"),
+            "the wrong project's readings were taken away"
+        );
+    }
+
+    /// And the ones no delete event was ever seen for — a project removed
+    /// while this process was down — are swept by the periodic pass.
+    #[tokio::test]
+    async fn readings_of_a_project_nobody_saw_go_are_swept() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let usage: TypedStore<UsageRecordSpec, UsageRecordStatus> =
+            TypedStore::new(store.clone(), "cell-1", "usage");
+        let projects: TypedStore<ProjectSpec, ProjectStatus> =
+            TypedStore::new(store.clone(), "cell-1", "projects");
+        let hour = 60 * 60_000u64;
+        let controller = recorder(&store, hour, 90 * 24 * hour);
+        let base = 1_787_824_800_000u64;
+
+        let mut live = Vec::new();
+        for id in ["p1", "p2"] {
+            let project = Resource::new(
+                Meta::new(
+                    format!("projects/{id}").parse().unwrap(),
+                    velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+                ),
+                ProjectSpec::default(),
+                ProjectStatus::default(),
+            );
+            controller
+                .record(&project, &Quota::default(), (0, 0), Timestamp(base))
+                .await;
+            // Only one of them is still there.
+            if id == "p2" {
+                projects
+                    .create(
+                        &project,
+                        &velstra_cloud_model::access::Writer::controller(WRITER),
+                    )
+                    .await
+                    .unwrap();
+                live.push(projects.get("projects/p2").await.unwrap().unwrap());
+            }
+        }
+        assert_eq!(usage.list().await.unwrap().len(), 2);
+
+        assert_eq!(sweep_orphaned_usage(&usage, &live).await, 1);
+        let left = usage.list().await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].spec.project, "projects/p2");
+
+        // And it is not a sweep that eats its own tail on the next pass.
+        assert_eq!(sweep_orphaned_usage(&usage, &live).await, 0);
     }
 }

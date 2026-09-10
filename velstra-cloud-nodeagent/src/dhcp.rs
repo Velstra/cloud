@@ -425,7 +425,24 @@ fn build(
     if let Some(gateway) = gateway {
         options.push((option::ROUTER, gateway.octets().to_vec()));
     }
-    let dns = interface.v4_dns();
+    // The subnet's own resolvers when it names any; otherwise this node's, at
+    // the metadata address. A guest used to come up with an address, a gateway
+    // and no resolver at all — the default subnet is made with `dns: []` — so
+    // the out-of-the-box machine could not install a package or reach a host
+    // by name, which is the first thing anybody tries.
+    //
+    // The metadata address rather than the gateway, and for the same reason
+    // `fallback_id` uses it: the gateway may be the fabric rather than this
+    // node, and a resolver a guest cannot reach is worse than none. This
+    // address is link-local, is always the node the guest is on, and is
+    // already the one address every guest can reach — it is where the
+    // responder listens.
+    let named = interface.v4_dns();
+    let dns: Vec<Ipv4Addr> = if !named.is_empty() {
+        named
+    } else {
+        vec![crate::metadata::ADDRESS]
+    };
     if !dns.is_empty() {
         options.push((
             option::DNS,
@@ -616,7 +633,7 @@ pub async fn serve(guests: GuestRegistry, server: Server, every: Duration) {
 /// a master hears nothing, which is the failure this exists to prevent — but
 /// binding to a device that does not exist fails outright, and a responder that
 /// stopped answering everybody because one `ip` call failed would be worse.
-async fn l3_device(tap: &str) -> String {
+pub(crate) async fn l3_device(tap: &str) -> String {
     let output = tokio::process::Command::new("ip")
         .args(["-o", "link", "show", "dev", tap])
         .output()
@@ -843,6 +860,33 @@ mod tests {
         // The gateway answers for renewals, because it is the address the
         // guest can reach on its own network.
         assert_eq!(options[&option::SERVER_ID], vec![10, 20, 0, 1]);
+    }
+
+    /// A guest used to come up with an address, a gateway and no resolver at
+    /// all: the default subnet is created with `dns: []`, so the
+    /// out-of-the-box machine could not install a package or reach a host by
+    /// name. The node answers DNS on the gateway, so that is what a subnet
+    /// naming none hands out.
+    #[test]
+    fn a_subnet_that_names_no_resolver_hands_out_the_gateway() {
+        let guests = GuestRegistry::new();
+        let mut only = view("projects/p1/instances/i1", "10.20.0.10/24", TAP, MAC);
+        only.interfaces[0].dns.clear();
+        guests.replace(vec![only]);
+
+        let reply = answer(
+            TAP,
+            &request(MessageType::Discover, MAC, &[]),
+            &guests,
+            &Server::default(),
+        )
+        .unwrap();
+        let (_, _, options) = parsed(&reply);
+        assert_eq!(
+            options[&option::DNS],
+            vec![169, 254, 169, 254],
+            "a guest was left with no resolver"
+        );
     }
 
     #[test]

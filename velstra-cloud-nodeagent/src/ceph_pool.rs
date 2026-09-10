@@ -83,6 +83,19 @@ pub struct CephConfig {
     /// meant no test could substitute it, which is why the pool path had unit
     /// tests about argv and nothing that ran the loop.
     pub ceph: String,
+    /// Where verified image files live on this machine, if any do.
+    ///
+    /// The node agent's image directory, under the same naming
+    /// (`sha256-<hex>`), so a pool and a node on one machine share the bytes.
+    /// It is what makes a volume-from-image work at all here: cloning needs the
+    /// image *in the cluster*, and the only thing that ever put one there was
+    /// an operator running `--import-image` by hand. A tenant who picked an
+    /// image the cluster had not been given got a volume that never
+    /// provisioned and a sentence only visible in an agent's log.
+    ///
+    /// `None` — the default — keeps the old behaviour: refuse and say the
+    /// image was never imported.
+    pub images: Option<std::path::PathBuf>,
 }
 
 impl CephConfig {
@@ -92,6 +105,7 @@ impl CephConfig {
             image_pool: image_pool.to_string(),
             user: "client.admin".to_string(),
             conf: None,
+            images: None,
             rbd: "rbd".to_string(),
             ceph: "ceph".to_string(),
         }
@@ -432,15 +446,18 @@ impl Storage for CephPool {
                 self.rbd(&["create", "--size", &format!("{gib}G"), &target])
                     .await?;
             }
-            Origin::Image(image) => {
+            Origin::Image {
+                name: image,
+                stored,
+            } => {
                 let parent = rbd_name(image);
                 if !self.image_is_clonable(&parent).await? {
-                    return Err(HostError::failed(format!(
-                        "{image} has no protected `@{IMAGE_BASE_SNAPSHOT}` snapshot in pool {}, \
-                         so nothing can be cloned from it. An image is made clonable when it is \
-                         imported; this one was not, or the snapshot was unprotected since.",
-                        self.config.image_pool
-                    )));
+                    // Bring it in, if this machine has the bytes. The import is
+                    // idempotent and verifies the digest in the name, so doing
+                    // it here is the same act an operator would have performed
+                    // by hand — just at the moment somebody actually needs it,
+                    // which is the only moment anybody knows they do.
+                    self.bring_in(image, stored).await?;
                 }
                 // The whole point of this backend: copy-on-write, no bytes
                 // moved, ready when the command returns. The clone lands in the
@@ -529,38 +546,20 @@ impl Storage for CephPool {
     }
 
     async fn copy_out(&self, volume: &str, path: &str) -> Result<u64> {
-        // `rbd export` writes the image out as a flat file. It returns when the
-        // file is written, which is what `Storage::copy_out` requires — and it
-        // is written to a `.partial` first, because the name a restore will
-        // read months from now must never have been on a half-written file.
-        let partial = format!("{path}.partial");
-        let _ = std::fs::remove_file(&partial);
-        if let Some(parent) = std::path::Path::new(path).parent()
-            && !parent.exists()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                HostError::failed(format!("{} is not usable: {e}", parent.display()))
-            })?;
-        }
-        if let Err(e) = self
-            .rbd(&[
-                "export",
-                &spec(&self.config.pool, &rbd_name(volume)),
-                &partial,
-            ])
+        self.export_to(&spec(&self.config.pool, &rbd_name(volume)), path)
             .await
-        {
-            let _ = std::fs::remove_file(&partial);
-            return Err(e);
-        }
-        std::fs::rename(&partial, path).map_err(|e| {
-            HostError::failed(format!(
-                "{path} was exported and could not be moved into place: {e}"
-            ))
-        })?;
-        std::fs::metadata(path)
-            .map(|m| m.len())
-            .map_err(|e| HostError::failed(format!("{path} was written and cannot be read: {e}")))
+    }
+
+    /// From the snapshot, which RBD names with an `@`. A backup copies a
+    /// moment; `rbd export` of a live image copies a smear of them.
+    async fn copy_out_snapshot(&self, snapshot: &str, path: &str) -> Result<u64> {
+        let Some((volume, snap)) = snapshot_location(snapshot) else {
+            return Err(HostError::failed(format!(
+                "{snapshot} is not a snapshot's name, so there is nothing to export"
+            )));
+        };
+        let from = format!("{}@{snap}", spec(&self.config.pool, &rbd_name(&volume)));
+        self.export_to(&from, path).await
     }
 
     async fn take_snapshot(&self, snapshot: &str, volume: &str) -> Result<()> {
@@ -664,6 +663,47 @@ impl CephPool {
     ///
     /// Idempotent: an image already present and clonable is left alone, so this
     /// is safe to run from a loop, a retry or an operator who is not sure.
+    /// Put an image into the cluster from this machine's own copy.
+    ///
+    /// Refuses with the sentence the caller needs when there is nothing to
+    /// import from: which image, where it was looked for, and what has to
+    /// happen instead. "No protected snapshot" was true and useless — it named
+    /// a Ceph concept and no action.
+    async fn bring_in(&self, image: &str, stored: Option<&str>) -> Result<()> {
+        let Some(dir) = &self.config.images else {
+            return Err(HostError::failed(format!(
+                "{image} is not in pool {}, and this pool agent was not told where images live \
+                 on this machine, so it cannot bring it in. Import it with \
+                 `velstra-cloud-poolagent --import-image`.",
+                self.config.image_pool
+            )));
+        };
+        // Under the digest, which is how every node files an image: the name
+        // is for people and there can be several, and the bytes have exactly
+        // one identity. Handed in rather than parsed out of the name, because
+        // an image named `debian-13-85a969b7` carries eight hex digits and the
+        // file carries sixty-four.
+        let Some(stored) = stored else {
+            return Err(HostError::failed(format!(
+                "{image} carries no digest this pool could read, so there is nothing to verify \
+                 an import against"
+            )));
+        };
+        let file = dir.join(stored);
+        if !file.exists() {
+            return Err(HostError::failed(format!(
+                "{image} is not in pool {} and this machine has no copy of it at {} to import. \
+                 The node agent fetches an image when a guest needs it; a volume made from one \
+                 the cluster has never seen has to wait for that, or for an operator to import \
+                 it.",
+                self.config.image_pool,
+                file.display()
+            )));
+        }
+        self.import_image(image, &file).await?;
+        Ok(())
+    }
+
     pub async fn import_image(&self, image: &str, file: &std::path::Path) -> Result<bool> {
         let expected = crate::hostfs::digest_of(image).ok_or_else(|| {
             HostError::failed(format!(
@@ -777,6 +817,37 @@ impl CephPool {
     }
 }
 
+impl CephPool {
+    /// `rbd export` one image or snapshot out to `path`.
+    async fn export_to(&self, from: &str, path: &str) -> Result<u64> {
+        // `rbd export` writes the image out as a flat file. It returns when the
+        // file is written, which is what `Storage::copy_out` requires — and it
+        // is written to a `.partial` first, because the name a restore will
+        // read months from now must never have been on a half-written file.
+        let partial = format!("{path}.partial");
+        let _ = std::fs::remove_file(&partial);
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                HostError::failed(format!("{} is not usable: {e}", parent.display()))
+            })?;
+        }
+        if let Err(e) = self.rbd(&["export", from, &partial]).await {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
+        std::fs::rename(&partial, path).map_err(|e| {
+            HostError::failed(format!(
+                "{path} was exported and could not be moved into place: {e}"
+            ))
+        })?;
+        std::fs::metadata(path)
+            .map(|m| m.len())
+            .map_err(|e| HostError::failed(format!("{path} was written and cannot be read: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +856,52 @@ mod tests {
         let mut config = CephConfig::new("velstra-volumes", "velstra-images");
         config.user = "client.velstra".into();
         CephPool::new(config)
+    }
+
+    /// A volume from an image the cluster has never been given used to fail
+    /// with a sentence about a protected snapshot — true, and naming a Ceph
+    /// concept rather than an action. Now the pool brings the image in from
+    /// this machine's own copy, and says what to do when there is none.
+    #[tokio::test]
+    async fn an_image_the_cluster_lacks_is_named_along_with_where_it_was_looked_for() {
+        let dir = std::env::temp_dir().join(format!("velstra-ceph-images-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory to look in");
+        let mut config = CephConfig::new("v", "i");
+        config.rbd = "/nonexistent/rbd".into();
+        config.images = Some(dir.clone());
+        let pool = CephPool::new(config);
+        let hex = "b".repeat(64);
+        let err = pool
+            .bring_in(
+                &format!("projects/p1/images/sha256-{hex}"),
+                Some(&format!("sha256-{hex}")),
+            )
+            .await
+            .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains(&format!("sha256-{hex}")), "{text}");
+        assert!(text.contains("no copy of it at"), "{text}");
+        // The action, not the mechanism: what has to happen for this to work.
+        assert!(text.contains("node agent fetches an image"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And a pool that was never told where images live says that, rather than
+    /// looking in a directory it invented.
+    #[tokio::test]
+    async fn a_pool_with_no_image_directory_says_so() {
+        let pool = CephPool::new(CephConfig::new("v", "i"));
+        let err = pool
+            .bring_in(
+                &format!("images/sha256-{}", "c".repeat(64)),
+                Some("sha256-c"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("was not told where images live"),
+            "{err}"
+        );
     }
 
     /// An image whose name carries no digest cannot be published at all.

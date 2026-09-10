@@ -530,12 +530,9 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             VolumeSpec {
-                source_backup: None,
                 size_gib,
                 pool: "pool-a".into(),
-                encryption_key: None,
-                source_image: None,
-                source_snapshot: None,
+                ..Default::default()
             },
             VolumeStatus::default(),
         );

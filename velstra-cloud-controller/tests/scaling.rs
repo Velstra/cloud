@@ -246,6 +246,7 @@ async fn one_instance_moving_does_not_cost_the_whole_cell() {
         let controller = PortController::new(
             TypedStore::new(store.clone(), "cell-1", "ports"),
             mirror,
+            TypedStore::new(store.clone(), "cell-1", "instances"),
             "cell-1",
         );
 
@@ -367,6 +368,22 @@ async fn a_resync_of_every_controller_grows_with_the_cell_not_its_square() {
                 >::new(store.clone(), "cell-1", "load-balancers"),
                 store.clone(),
                 velstra_cloud_store::prefix_for("cell-1", "load-balancers"),
+            ),
+            velstra_cloud_store::Cached::start(
+                TypedStore::<
+                    velstra_cloud_model::resources::SnapshotSpec,
+                    velstra_cloud_model::resources::SnapshotStatus,
+                >::new(store.clone(), "cell-1", "snapshots"),
+                store.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "snapshots"),
+            ),
+            velstra_cloud_store::Cached::start(
+                TypedStore::<
+                    velstra_cloud_model::backup::BackupSpec,
+                    velstra_cloud_model::backup::BackupStatus,
+                >::new(store.clone(), "cell-1", "backups"),
+                store.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "backups"),
             ),
             velstra_cloud_controller::status::StatusWriter::new(
                 store.clone(),

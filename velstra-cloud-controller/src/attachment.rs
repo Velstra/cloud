@@ -30,6 +30,14 @@ pub struct AttachmentController {
         velstra_cloud_model::resources::VolumeSpec,
         velstra_cloud_model::resources::VolumeStatus,
     >,
+    /// Read for one field too — `spec.volumeCeiling`, the most any one volume
+    /// in a pool may take — for the same reason and by the same route.
+    pools: Option<
+        TypedStore<
+            velstra_cloud_model::resources::PoolSpec,
+            velstra_cloud_model::resources::PoolStatus,
+        >,
+    >,
 }
 
 impl AttachmentController {
@@ -43,7 +51,24 @@ impl AttachmentController {
         Self {
             attachments,
             volumes,
+            pools: None,
         }
+    }
+
+    /// Where the ceiling comes from.
+    ///
+    /// Optional so every existing caller and test keeps working: without it a
+    /// volume's own limits are mirrored unchanged, which is what a cell with
+    /// no ceilings does anyway.
+    pub fn with_pools(
+        mut self,
+        pools: TypedStore<
+            velstra_cloud_model::resources::PoolSpec,
+            velstra_cloud_model::resources::PoolStatus,
+        >,
+    ) -> Self {
+        self.pools = Some(pools);
+        self
     }
 
     /// Copy `volume.status.at` onto the attachment, when it has changed.
@@ -60,20 +85,57 @@ impl AttachmentController {
         if attachment.meta.is_deleting() {
             return Ok(false);
         }
-        let at = self
-            .volumes
-            .get(&attachment.spec.volume)
-            .await?
-            .and_then(|v| v.status.at)
+        let volume = self.volumes.get(&attachment.spec.volume).await?;
+        let at = volume
+            .as_ref()
+            .and_then(|v| v.status.at.clone())
             .unwrap_or_default();
-        // Only forward: a volume that stops reporting a place has not moved, and
-        // clearing it under a guest with the disk open would make the next pass
-        // refuse to close what it can no longer name.
-        if at.is_empty() || at == attachment.spec.at {
+        // The same move as `at`, and it has to happen here for the same
+        // reason: the node is told about neither the volume nor its pool, and
+        // both are needed to know what this disk may take. A volume whose pool
+        // is not readable keeps its own limits — a ceiling nobody can read is
+        // not a reason to throttle somebody to zero.
+        let limits = match (&self.pools, volume.as_ref()) {
+            (Some(pools), Some(volume)) => {
+                // Either spelling: a volume's `spec.pool` is a bare id when a
+                // person wrote one and a full name when the API settled it,
+                // and the volume controller reads it both ways for the same
+                // reason. A lookup that only knew one of them would silently
+                // find no ceiling — which reads exactly like a cell that has
+                // none.
+                let asked = volume.spec.pool.trim();
+                let ceiling = if asked.is_empty() {
+                    Default::default()
+                } else {
+                    pools
+                        .list()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|p| p.meta.name.id() == asked || p.meta.name.to_string() == asked)
+                        .map(|p| p.spec.volume_ceiling)
+                        .unwrap_or_default()
+                };
+                velstra_cloud_model::throttle::effective(volume.spec.limits, ceiling)
+            }
+            (_, Some(volume)) => volume.spec.limits,
+            (_, None) => attachment.spec.limits,
+        };
+        // Only forward for the place: a volume that stops reporting one has not
+        // moved, and clearing it under a guest with the disk open would make
+        // the next pass refuse to close what it can no longer name. The limits
+        // have no such rule — they are a computation over two specs, and both
+        // directions are meaningful.
+        let place_moved = !at.is_empty() && at != attachment.spec.at;
+        let limits_moved = limits != attachment.spec.limits;
+        if !place_moved && !limits_moved {
             return Ok(false);
         }
         let mut next = attachment.clone();
-        next.spec.at = at;
+        if place_moved {
+            next.spec.at = at;
+        }
+        next.spec.limits = limits;
         // A spec change moves the generation — the store refuses one that does
         // not, and it is right to: an observer comparing `observedGeneration`
         // against a spec that changed underneath it would report on a shape it
@@ -203,6 +265,7 @@ mod tests {
                 node: "node-a".into(),
                 at: String::new(),
                 read_only: false,
+                limits: Default::default(),
             },
             AttachmentStatus::default(),
         );
@@ -350,6 +413,7 @@ mod release_tests {
                         node: "node-a".into(),
                         at: String::new(),
                         read_only: false,
+                        limits: Default::default(),
                     },
                     AttachmentStatus::default(),
                 ),
@@ -478,6 +542,7 @@ mod telling_the_node_where_the_bytes_are {
                 node: "nodes/n1".into(),
                 at: String::new(),
                 read_only: false,
+                limits: Default::default(),
             },
             AttachmentStatus::default(),
         );
@@ -511,6 +576,78 @@ mod telling_the_node_where_the_bytes_are {
         store.get(ATTACHMENT).await.unwrap().unwrap()
     }
 
+    async fn cell_with_pools() -> (
+        AttachmentController,
+        TypedStore<AttachmentSpec, AttachmentStatus>,
+        TypedStore<VolumeSpec, VolumeStatus>,
+        TypedStore<
+            velstra_cloud_model::resources::PoolSpec,
+            velstra_cloud_model::resources::PoolStatus,
+        >,
+    ) {
+        let raw: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let attachments = TypedStore::new(raw.clone(), "cell-1", "attachments");
+        let volumes: TypedStore<VolumeSpec, VolumeStatus> =
+            TypedStore::new(raw.clone(), "cell-1", "volumes");
+        let pools = TypedStore::new(raw.clone(), "cell-1", "pools");
+        (
+            AttachmentController::new(attachments.clone(), volumes.clone())
+                .with_pools(pools.clone()),
+            attachments,
+            volumes,
+            pools,
+        )
+    }
+
+    async fn a_placed_volume_wanting(
+        store: &TypedStore<VolumeSpec, VolumeStatus>,
+        limits: velstra_cloud_model::throttle::Limits,
+    ) {
+        let object: Volume = velstra_cloud_model::Resource::new(
+            meta(VOLUME),
+            VolumeSpec {
+                size_gib: 2,
+                // The bare id, which is what a person writes and what the API
+                // stores when it settles one. The full name is the other
+                // spelling and both have to resolve.
+                pool: "rbd".into(),
+                limits,
+                ..Default::default()
+            },
+            VolumeStatus {
+                provisioned: true,
+                at: Some(PLACE.into()),
+                ..Default::default()
+            },
+        );
+        store
+            .create(&object, &Writer::controller("test"))
+            .await
+            .unwrap();
+    }
+
+    async fn a_pool_with_ceiling(
+        store: &TypedStore<
+            velstra_cloud_model::resources::PoolSpec,
+            velstra_cloud_model::resources::PoolStatus,
+        >,
+        volume_ceiling: velstra_cloud_model::throttle::Limits,
+    ) {
+        let object = velstra_cloud_model::Resource::new(
+            meta("pools/rbd"),
+            velstra_cloud_model::resources::PoolSpec {
+                accepting: true,
+                volume_ceiling,
+                ..Default::default()
+            },
+            velstra_cloud_model::resources::PoolStatus::default(),
+        );
+        store
+            .create(&object, &Writer::controller("test"))
+            .await
+            .unwrap();
+    }
+
     async fn a_placed_volume(store: &TypedStore<VolumeSpec, VolumeStatus>) {
         let object: Volume = velstra_cloud_model::Resource::new(
             meta(VOLUME),
@@ -528,6 +665,74 @@ mod telling_the_node_where_the_bytes_are {
             .create(&object, &Writer::controller("test"))
             .await
             .unwrap();
+    }
+
+    /// The ceiling an operator set on the pool reaches the guest's disk.
+    ///
+    /// Three objects and two of them the node never sees: the volume says what
+    /// it wants, the pool says the most it may have, and the node is told
+    /// neither. The settled number has to be computed where both are readable
+    /// and mirrored onto the object the node does hold — the same move
+    /// `spec.at` makes, and for the same reason.
+    #[tokio::test]
+    async fn the_pools_ceiling_reaches_the_node_on_the_attachment() {
+        let (controller, attachments, volumes, pools) = cell_with_pools().await;
+        let attachment = an_attachment(&attachments).await;
+        a_placed_volume_wanting(
+            &volumes,
+            velstra_cloud_model::throttle::Limits {
+                iops: 50_000,
+                read_mibps: 0,
+                write_mibps: 4_000,
+            },
+        )
+        .await;
+        a_pool_with_ceiling(
+            &pools,
+            velstra_cloud_model::throttle::Limits {
+                iops: 5_000,
+                read_mibps: 200,
+                write_mibps: 100,
+            },
+        )
+        .await;
+
+        controller
+            .reconcile(ATTACHMENT, Some(&attachment))
+            .await
+            .unwrap();
+
+        let after = attachments.get(ATTACHMENT).await.unwrap().unwrap();
+        assert_eq!(
+            after.spec.limits,
+            velstra_cloud_model::throttle::Limits {
+                // Asked for ten times the ceiling: brought down to it.
+                iops: 5_000,
+                // Asked for nothing: gets the ceiling, which is the line the
+                // whole mechanism turns on — nobody limits themselves.
+                read_mibps: 200,
+                write_mibps: 100,
+            },
+            "the node was not told what this disk may take"
+        );
+    }
+
+    /// A cell where nobody set a ceiling behaves exactly as it did before any
+    /// of this existed: nothing is written, so nothing churns.
+    #[tokio::test]
+    async fn a_cell_with_no_ceilings_writes_no_limits() {
+        let (controller, attachments, volumes, pools) = cell_with_pools().await;
+        let attachment = an_attachment(&attachments).await;
+        a_placed_volume_wanting(&volumes, Default::default()).await;
+        a_pool_with_ceiling(&pools, Default::default()).await;
+
+        controller
+            .reconcile(ATTACHMENT, Some(&attachment))
+            .await
+            .unwrap();
+
+        let after = attachments.get(ATTACHMENT).await.unwrap().unwrap();
+        assert!(after.spec.limits.is_unlimited(), "{:?}", after.spec.limits);
     }
 
     #[tokio::test]

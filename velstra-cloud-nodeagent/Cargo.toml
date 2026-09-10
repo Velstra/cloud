@@ -18,6 +18,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # the TCP stream is simply wrapped. The root of trust is the cell's certificate,
 # pinned from a file, never "accept anything".
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# Serving the console over TLS. `axum::serve` takes a plain listener; this is
+# the same server with a rustls acceptor in front of it, and it is one
+# dependency rather than a hand-rolled accept loop around `tokio-rustls`.
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 rustls-pemfile = "2"
 futures-util = "0.3"
 velstra-cloud-fabric = { workspace = true }

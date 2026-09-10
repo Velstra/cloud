@@ -10,6 +10,11 @@ repository.workspace = true
 [dependencies]
 velstra-cloud-model = { workspace = true }
 prost = { workspace = true }
+# For `google.protobuf.FieldMask`, which every update request carries. The
+# well-known types are compiled into this crate by prost-build unless they are
+# taken from here, and taking them from here is what makes a mask this crate
+# builds the same type as one a generated client builds.
+prost-types = { workspace = true }
 tonic = { workspace = true }
 
 [build-dependencies]

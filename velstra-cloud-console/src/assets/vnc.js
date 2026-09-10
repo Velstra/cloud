@@ -328,10 +328,8 @@ async function showScreen(name) {
   const status = el("p.muted", "Asking for the screen…");
   const canvas = el("canvas", { class: "vncscreen", tabindex: "0",
     "aria-label": "the guest's display; focus and type" });
-  const back = el("button.btn", { type: "button",
-    onclick: () => { closeScreen(); show("instances"); } }, "Back to instances");
-  const salute = el("button.btn", { type: "button", id: "ctrlaltdel", disabled: "" },
-    "Ctrl+Alt+Del");
+  const back = btn("Back to instances", { onclick: () => { closeScreen(); show("instances"); } });
+  const salute = btn("Ctrl+Alt+Del", { id: "ctrlaltdel", disabled: "" });
   box.appendChild(el("div.screenacts", back, salute, status));
   box.appendChild(canvas);
 

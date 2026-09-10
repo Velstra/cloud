@@ -141,6 +141,26 @@ impl Agent {
         // from a shared list every node would have to write into.
         next.status.images = host.images.iter().cloned().collect();
         next.status.vmm = self.vmm.vmm_name().to_string();
+        // What carries this node's guests' traffic. `local-network` rather
+        // than `tap` when this node also holds the segments' gateways: from a
+        // guest's point of view those are two different machines, and only one
+        // of them is a way out.
+        next.status.console_tls = self.config.console_tls;
+        // What this node is answering for right now, read off the listeners it
+        // is actually holding rather than off the plan it made — the same rule
+        // every other field here follows.
+        next.status.balancers = {
+            let held = self.balancing.lock().expect("the map is never poisoned");
+            let mut names: Vec<String> =
+                held.values().map(|r| r.service.balancer.clone()).collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        next.status.datapath = match self.datapath.datapath_name() {
+            "tap" if self.localnet.is_some() => "local-network".to_string(),
+            other => other.to_string(),
+        };
         next.status.fetching = host.fetching.iter().cloned().collect();
         // The disks this machine has, and what each is doing. Reported for the
         // same reason the images are: nobody else can see them, and the console

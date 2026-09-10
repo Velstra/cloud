@@ -60,7 +60,7 @@ const MIGRATION_MODES = {
 /// Everything the screens below read off a migration, in one place, so the
 /// dialog and the sheet cannot describe the same object differently.
 function migrationFacts(r) {
-  const sp = spec(r), st = status(r);
+  const sp = spec(r), st = statusOf(r);
   const node = (key, fallback) => {
     const v = pick(sp, key);
     return v === null || v === undefined || v === "" ? fallback : String(v);
@@ -252,7 +252,7 @@ async function migrationInto(host, r) {
 
   const live = mine.filter((m) => !deletedAt(m) && !migrationArrived(m));
   const done = mine.filter((m) => !deletedAt(m) && migrationArrived(m));
-  const on = at(status(r), "node");
+  const on = at(statusOf(r), "node");
 
   fill(host, where,
     live.map((m) => migrationLine(m)),
@@ -268,15 +268,14 @@ async function migrationInto(host, r) {
         // screen is for reading the guest. Moving it is deliberate, not the
         // default thing to do here.
         ? el("div", { style: "margin-top:var(--space-4)" },
-          el("button.btn", { type: "button", id: "migratebtn", onclick: () => openMigrate(r) },
-            "Migrate…"))
+          btn("Migrate…", { id: "migratebtn", onclick: () => openMigrate(r) }))
         : el("p.faint", "No node has this guest, so there is nothing to move."));
 }
 
 /// The one fact, said plainly — including the honest version of the gap in the
 /// middle of a migration, where nobody has it.
 function whereItIs(r) {
-  const on = at(status(r), "node");
+  const on = at(statusOf(r), "node");
   const assigned = at(spec(r), "node");
   if (on) {
     return el("p", el("span.mono", String(on)), el("span.muted", " has this guest."));
@@ -314,7 +313,7 @@ function openMigrate(r) {
   const migrations = collection("migrations");
   const instances = collection("instances");
   if (!migrations || !instances) return null;
-  const from = at(status(r), "node") || at(spec(r), "node") || "";
+  const from = at(statusOf(r), "node") || at(spec(r), "node") || "";
   return openCreate(migrations, {
     title: "Migrate " + idOf(r),
     blurb: "Ask that this guest run on another node. Nothing about the instance changes when this is " +

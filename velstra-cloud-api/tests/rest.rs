@@ -172,6 +172,17 @@ impl Harness {
         self.send("GET", path, None, &[]).await
     }
 
+    /// A GET with a query string, spelled as pairs so a test does not have to
+    /// escape one.
+    async fn get_query(&self, path: &str, query: &[(&str, &str)]) -> Answer {
+        let query: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.replace(' ', "%20")))
+            .collect();
+        self.send("GET", &format!("{path}?{}", query.join("&")), None, &[])
+            .await
+    }
+
     async fn post(&self, path: &str, body: Value) -> Answer {
         self.send("POST", path, Some(body), &[]).await
     }
@@ -616,6 +627,9 @@ async fn explain_placement_answers_with_the_chain_of_rejections() {
             gateway: false,
         },
         NodeStatus {
+            // A live machine. Nothing is placed on one that has gone quiet,
+            // so a fixture without a heartbeat is a fixture nothing schedules on.
+            last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
             // Like the fixture's other machines: one state directory between
             // them, so what these tests are about is what they say they are
             // about — capacity, an image, a CPU — and not the disk rule.
@@ -1174,6 +1188,9 @@ async fn two_nodes(h: &Harness) {
                 gateway: false,
             },
             NodeStatus {
+                // A live machine. Nothing is placed on one that has gone quiet,
+                // so a fixture without a heartbeat is a fixture nothing schedules on.
+                last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
                 vmm: "qemu".into(),
                 // The fixture's two machines share one state directory, which is
                 // what makes a guest movable between them at all. Every
@@ -1230,6 +1247,9 @@ async fn two_nodes(h: &Harness) {
             gateway: false,
         },
         NodeStatus {
+            // A live machine. Nothing is placed on one that has gone quiet,
+            // so a fixture without a heartbeat is a fixture nothing schedules on.
+            last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
             // Like the fixture's other machines: one state directory between
             // them, so what these tests are about is what they say they are
             // about — capacity, an image, a CPU — and not the disk rule.
@@ -1642,6 +1662,9 @@ async fn a_destination_without_the_image_is_refused_with_the_sentence() {
             gateway: false,
         },
         NodeStatus {
+            // A live machine. Nothing is placed on one that has gone quiet,
+            // so a fixture without a heartbeat is a fixture nothing schedules on.
+            last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
             // Like the fixture's other machines: one state directory between
             // them, so what these tests are about is what they say they are
             // about — capacity, an image, a CPU — and not the disk rule.
@@ -2543,6 +2566,9 @@ async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reaso
             gateway: false,
         },
         NodeStatus {
+            // A live machine. Nothing is placed on one that has gone quiet,
+            // so a fixture without a heartbeat is a fixture nothing schedules on.
+            last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
             // Like the fixture's other machines: one state directory between
             // them, so what these tests are about is what they say they are
             // about — capacity, an image, a CPU — and not the disk rule.
@@ -2645,18 +2671,17 @@ async fn a_disk_on_a_node_that_has_not_reported_is_not_refused() {
 
 // ---- images --------------------------------------------------------------
 
-/// An image carrying a signature is refused, with the reason.
+/// An image carrying a signature on a project that trusts no keys is refused.
 ///
-/// The field was declared as "a cosign-style signature, verified before a node
-/// will boot it", and nothing has ever read it — while the console offered a
-/// box to type one into and a column headed *Signed*. An operator could paste
-/// anything and the platform reported, at a glance, that the image was signed.
-///
-/// Refused rather than stored and ignored, because storing it is where the
-/// claim comes from: every place an unchecked claim is displayed becomes
-/// evidence somebody will cite.
+/// The field was once refused outright, because nothing read it while the
+/// console showed a column headed *Signed* — so anybody could paste anything
+/// and the platform reported at a glance that the image was signed. It is
+/// verified now, and this is the remaining case where it cannot be: a project
+/// that names no publishers has nothing to check against, and an unverifiable
+/// claim is the state the field was refused for.
+
 #[tokio::test]
-async fn an_image_carrying_a_signature_nothing_verifies_is_refused() {
+async fn an_image_carrying_a_signature_nothing_can_check_is_refused() {
     let h = Harness::new();
     let answer = h
         .post(
@@ -3127,9 +3152,20 @@ async fn a_projects_allowance_says_whether_the_quota_or_the_cell_is_in_the_way()
     // that showed only the interesting ones would rearrange itself between two
     // reads of the same screen.
     let dims = answer.body["dimensions"].as_array().unwrap();
-    assert_eq!(dims.len(), 8, "{dims:?}");
+    assert_eq!(dims.len(), 12, "{dims:?}");
     assert_eq!(dims[0]["name"], json!("instances"));
-    assert!(dims.iter().any(|d| d["name"] == json!("devices")));
+    for expected in [
+        "devices",
+        "snapshots",
+        "snapshotGib",
+        "backups",
+        "backupGib",
+    ] {
+        assert!(
+            dims.iter().any(|d| d["name"] == json!(expected)),
+            "{expected} is not on the allowance"
+        );
+    }
 
     // Nobody set a memory quota, so `left` is null rather than zero — the two
     // are different answers and a screen must not render one as the other.
@@ -3403,6 +3439,7 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
         velstra_cloud_model::resources::PoolSpec {
             accepting: true,
             labels: vec![],
+            volume_ceiling: Default::default(),
         },
         velstra_cloud_model::resources::PoolStatus {
             backend: "directory".into(),
@@ -3433,6 +3470,7 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
             encryption_key: None,
             source_image: None,
             source_snapshot: None,
+            limits: Default::default(),
         },
         Default::default(),
     );
@@ -4141,6 +4179,7 @@ async fn a_usage_record_cannot_be_written_edited_or_deleted_through_the_api() {
             project: "projects/p1".into(),
             at,
             used: Default::default(),
+            traffic: Default::default(),
         },
         Default::default(),
     );
@@ -4439,6 +4478,7 @@ async fn a_volume_with_no_pool_named_is_put_somewhere_rather_than_nowhere() {
             velstra_cloud_model::resources::PoolSpec {
                 accepting,
                 labels: Vec::new(),
+                volume_ceiling: Default::default(),
             },
             velstra_cloud_model::resources::PoolStatus {
                 capacity_gib: 1000,
@@ -4869,4 +4909,208 @@ async fn a_value_the_field_does_not_take_says_so_about_the_value() {
         message.contains("no field called"),
         "an unknown field stopped saying so: {message}"
     );
+}
+
+/// The key was in the model, in the OpenAPI and on both consoles' forms, and
+/// every storage backend answered "there is no KMS for this pool to ask" —
+/// after the volume had been accepted. A tenant who filled it in got a volume
+/// that never provisioned and a sentence only visible in an agent's log.
+#[tokio::test]
+async fn a_volume_that_asks_to_be_encrypted_is_refused_where_it_is_asked() {
+    let h = Harness::new();
+    h.pool("pool-a").await;
+
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "secret", "spec": { "sizeGib": 1, "encryptionKey": "projects/p1/keys/k" } }),
+        )
+        .await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(refused.field(), "spec.encryptionKey");
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no key manager"),
+        "the refusal does not say why: {}",
+        refused.body
+    );
+
+    // And the refusal is about the key and nothing else: the same request
+    // without one gets past this check and is judged on its own merits.
+    let plain = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "plain", "spec": { "sizeGib": 1 } }),
+        )
+        .await;
+    assert_ne!(plain.field(), "spec.encryptionKey", "{}", plain.body);
+}
+
+/// A node is given the guests it holds and nothing else, deliberately — so a
+/// resolver built on that named the machines on one hypervisor and no others.
+/// This is the narrow view it answers from instead: a name, a subnet and an
+/// address, which every guest on a subnet can already learn by scanning it.
+#[tokio::test]
+async fn the_directory_is_names_and_addresses_and_nothing_else() {
+    let h = Harness::new();
+    let listed = h.get("directory").await;
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    let items = listed.body["items"].as_array().expect("a list");
+    for row in items {
+        let fields: Vec<&String> = row.as_object().expect("an object").keys().collect();
+        assert_eq!(
+            fields.len(),
+            3,
+            "the directory carries more than a resolver needs: {row}"
+        );
+        assert!(row["hostname"].is_string() && row["subnet"].is_string());
+        // The address, without its prefix: a resolver answers with an address.
+        let address = row["address"].as_str().unwrap();
+        assert!(
+            !address.contains('/'),
+            "an address carries a prefix: {address}"
+        );
+    }
+}
+
+/// The audit read by time range finds exactly what walking the whole log
+/// finds.
+///
+/// The range is served by seeking into the store's keys rather than scanning —
+/// an audit id carries the minute it was written in, so the log is its own
+/// index. The risk of an optimisation like that is that it *misses* something:
+/// a kind it forgot to seek over, a minute boundary it lands one past. So the
+/// answer is compared against the plain walk, which is the thing it replaces.
+#[tokio::test]
+async fn a_time_range_over_the_audit_finds_what_the_whole_walk_finds() {
+    let h = Harness::new();
+    // Something to write records about. Creating and deleting are two kinds
+    // of change, so the log has more than one shape of id in it.
+    for id in ["ra", "rb", "rc"] {
+        let made = h.post("projects", json!({ "id": id, "spec": {} })).await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    }
+
+    let names = |answer: &Answer| -> Vec<String> {
+        answer.body["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|i| i["meta"]["name"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let whole = h.get_query("audit", &[("pageSize", "1000")]).await;
+    let ranged = h
+        .get_query("audit", &[("pageSize", "1000"), ("since", "1h")])
+        .await;
+    assert_eq!(ranged.status, StatusCode::OK, "{:?}", ranged.body);
+    let mut expected = names(&whole);
+    let mut found = names(&ranged);
+    expected.sort();
+    found.sort();
+    assert!(!expected.is_empty(), "the fixture wrote no audit records");
+    assert_eq!(found, expected, "the range missed records the walk found");
+
+    // And a range that ends before anything happened finds nothing — so the
+    // seek is a range and not a way of returning the whole log quickly.
+    let none = h
+        .get_query("audit", &[("pageSize", "1000"), ("until", "1h")])
+        .await;
+    assert!(names(&none).is_empty(), "{:?}", none.body);
+}
+
+/// An ordered listing is the first page of the *whole* sorted order, not a
+/// sorted page.
+///
+/// The distinction is the entire reason `orderBy` is shaped the way it is: a
+/// page is a slice of the store's own key order, so sorting one page gives a
+/// list that is ordered inside each page and unordered across them. Here there
+/// are more projects than the page holds, and the newest has to come back
+/// first regardless of where its key sorts.
+#[tokio::test]
+async fn an_ordered_listing_is_the_top_of_the_whole_order() {
+    let h = Harness::new();
+    // Named so that the store's key order and the creation order disagree:
+    // `zz` is made first and sorts last.
+    for id in ["zz", "yy", "xx", "ww", "vv"] {
+        let made = h.post("projects", json!({ "id": id, "spec": {} })).await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    }
+
+    let answer = h
+        .get_query(
+            "projects",
+            &[("pageSize", "2"), ("orderBy", "createdAt desc")],
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+    let items = answer.body["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(items.len(), 2, "{:?}", answer.body);
+    // The two most recently created, which are the last two made — and not the
+    // two that happen to sort first.
+    let names: Vec<&str> = items
+        .iter()
+        .filter_map(|i| i["meta"]["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["projects/vv", "projects/ww"],
+        "{:?}",
+        answer.body
+    );
+
+    // No page token, because there is no next page of a sorted order — and a
+    // flag saying the answer was cut, so nobody reads two as "there were two".
+    assert!(answer.body["nextPageToken"].is_null(), "{:?}", answer.body);
+    assert_eq!(answer.body["truncated"], json!(true), "{:?}", answer.body);
+
+    // Following a token while ordering is refused rather than answered wrongly.
+    let refused = h
+        .get_query(
+            "projects",
+            &[("orderBy", "name"), ("pageToken", "whatever")],
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+}
+
+/// A ceiling can be taken off again.
+///
+/// A field that vanishes from the wire at its default is one nobody can set
+/// *back* to its default: the API decides "is this a field you have" by
+/// round-tripping the value, and a value that disappears on the way out is
+/// indistinguishable from a field that does not exist. Found live, taking a
+/// pool's volume ceiling off — `there is no field called volume_ceiling on a
+/// pools`, about a field the same request had set five minutes earlier.
+#[tokio::test]
+async fn a_ceiling_that_was_set_can_be_taken_off_again() {
+    let h = Harness::new();
+    h.post("pools", json!({ "id": "rbd", "spec": {} })).await;
+
+    let on = h
+        .patch(
+            "pools/rbd",
+            json!({ "spec": { "volumeCeiling": { "iops": 5000, "readMibps": 200, "writeMibps": 100 } } }),
+        )
+        .await;
+    assert_eq!(on.status, StatusCode::OK, "{:?}", on.body);
+    assert_eq!(on.body["spec"]["volumeCeiling"]["iops"], 5000);
+
+    let off = h
+        .patch(
+            "pools/rbd",
+            json!({ "spec": { "volumeCeiling": { "iops": 0, "readMibps": 0, "writeMibps": 0 } } }),
+        )
+        .await;
+    assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
+    assert_eq!(off.body["spec"]["volumeCeiling"]["iops"], 0);
 }

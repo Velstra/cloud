@@ -226,6 +226,9 @@ impl Cell {
                 size_bytes: 1024,
                 source_url: "file:///var/lib/velstra/images/abc.raw".into(),
                 signature: None,
+                state: Default::default(),
+                replacement: String::new(),
+                shared_with: Default::default(),
             },
             ImageStatus::default(),
         );
@@ -284,6 +287,11 @@ impl Cell {
             hugepages_1gi: 0,
         };
         node.status.observed_generation = node.meta.generation;
+        // A machine that has never said anything is one the scheduler will not
+        // place on, which is the right rule and makes this a fixture that has
+        // to say something. Without it every test here placed guests on a node
+        // that, in a real cell, had been silent since the epoch.
+        node.status.last_heartbeat = velstra_cloud_model::meta::Timestamp::now();
         set_condition(
             &mut node.status.conditions,
             Condition::ready(node.meta.generation),
