@@ -93,6 +93,19 @@ pub struct Receiver {
     pub received_mib: u64,
 }
 
+/// What one guest's disks have moved since it started.
+///
+/// Summed over every disk it holds: a guest with a root disk and two volumes
+/// is one guest, and "is this thing hammering the pool" is not a question with
+/// three answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskTraffic {
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+}
+
 /// Everything the reconcile functions need to know about this machine, gathered
 /// in one scan so a single pass sees one consistent picture of the host.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -101,6 +114,15 @@ pub struct HostState {
     pub vms: BTreeMap<String, VmObservation>,
     /// Instance names that have a root disk.
     pub disks: BTreeSet<String>,
+    /// How big each of those root disks actually is, in gibibytes, keyed the
+    /// same way. Beside `disks` rather than folded into it: existence and size
+    /// are different questions, and every reader of `disks` asks the first.
+    ///
+    /// It exists because a growth of the root disk was accepted by the API,
+    /// charged against the quota and shown in the console as pending — and
+    /// then nothing ever applied it, because "is there a disk" was the only
+    /// question anybody asked about one.
+    pub disk_gib: BTreeMap<String, u64>,
     /// Image digests present *and verified*. An unverified copy is not in here,
     /// because "cached" is what the agent boots from without asking again.
     pub images: BTreeSet<String>,
@@ -251,6 +273,51 @@ pub trait Vmm: Send + Sync + 'static {
         format: velstra_cloud_model::resources::ImageFormat,
     ) -> Result<()>;
 
+    /// Make an existing root disk bigger.
+    ///
+    /// Only bigger. Shrinking a disk a filesystem is living on destroys it,
+    /// and the platform's answer to a smaller number is to refuse the change,
+    /// not to act on it.
+    ///
+    /// The guest is not running when this is called — growing under a running
+    /// guest needs the VMM to be told, and until it is, the platform's answer
+    /// to a resize is the same as for vCPUs and memory: it takes effect on the
+    /// next start, and the object says so.
+    async fn grow_disk(&self, instance: &str, gib: u64) -> Result<()>;
+
+    /// Remove a cached image from this machine, by the name its bytes are
+    /// filed under. Already gone is not a failure.
+    ///
+    /// On the backend rather than derived by the agent, for the reason
+    /// `disk_path` gives: where a backend keeps its files is the backend's.
+    async fn forget_image(&self, stored_as: &str) -> Result<()>;
+
+    /// What this guest's disks have moved, summed across every one of them.
+    ///
+    /// Asked of the VMM rather than worked out from the host, because the host
+    /// sees a file being written and not which guest disk it was — and a
+    /// number derived from something else is one an operator would size
+    /// storage from.
+    ///
+    /// `None` for a guest that is not running here, and for a backend that
+    /// cannot answer. Absence, never a zero: a zero reads as "this guest
+    /// touches no disk", which is something people act on.
+    ///
+    /// Default `None`, so a backend that has nothing to say — the fake, and
+    /// anything written later — does not have to pretend.
+    async fn disk_traffic(&self, _instance: &str) -> Option<DiskTraffic> {
+        None
+    }
+
+    /// How long ago that image was written, in seconds, or `None` when this
+    /// machine does not have it.
+    ///
+    /// The publish time in practice — nothing touches the file afterwards —
+    /// so it answers "how long since this node fetched it" and not "how long
+    /// since a guest used it". The difference is what makes the sweep safe:
+    /// an image something references is never removed however old it is.
+    async fn image_age_seconds(&self, stored_as: &str) -> Option<u64>;
+
     /// Where this guest's root disk is on this machine, for something that has
     /// to read the bytes rather than boot them.
     ///
@@ -292,12 +359,18 @@ pub trait Vmm: Send + Sync + 'static {
     /// volume or an RBD image, and the version that guessed built
     /// `…/instances/<guest>/<volume>`: a path nothing ever writes, so every
     /// attach failed with `No such file or directory`.
+    ///
+    /// `limits` is what the attachment says this disk may take, already
+    /// settled against its pool's ceiling by a controller — see
+    /// [`velstra_cloud_model::throttle`]. Unlimited is the ordinary case and
+    /// programs nothing.
     async fn open_volume(
         &self,
         instance: &str,
         volume: &str,
         at: &str,
         read_only: bool,
+        limits: velstra_cloud_model::throttle::Limits,
     ) -> Result<String>;
 
     async fn close_volume(&self, instance: &str, volume: &str) -> Result<()>;
@@ -361,6 +434,17 @@ pub struct ProgrammedPort {
 
 #[async_trait]
 pub trait Datapath: Send + Sync + 'static {
+    /// What this is, in one word, for the node's own status.
+    ///
+    /// It matters because the answers are not interchangeable and one of them
+    /// is a dead end: a bare `tap` gives a guest a wire that leads nowhere,
+    /// which is right on a node whose fabric carries the segment and wrong on
+    /// one without. Until this was reported, nothing anywhere said which of the
+    /// two a node was — and the symptom was a guest with an address that could
+    /// reach nothing, on a cell whose seed had simply never mentioned a
+    /// datapath.
+    fn datapath_name(&self) -> &'static str;
+
     /// Port resource name to what the datapath has for it, for the ports
     /// programmed on this node right now.
     async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>>;

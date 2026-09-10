@@ -48,6 +48,14 @@ pub enum AuditKind {
     SignedIn,
     /// A session ended, by the person or by having its user's password changed.
     SignedOut,
+    /// Somebody changed something: created it, edited it, or deleted it.
+    ///
+    /// The other three kinds are about *access*; this one is about the estate.
+    /// It exists because an operation is minted only when an object is
+    /// created, so "who deleted that instance" and "who changed the project's
+    /// bindings" had no answer anywhere in the platform — the two questions
+    /// asked first after an incident.
+    Changed,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -59,7 +67,8 @@ pub struct AuditSpec {
     /// particular object.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target: String,
-    /// `read`, `write`, `administer` — what they were trying to do with it.
+    /// What they were doing with it: `read`, `write` or `administer` for a
+    /// refusal, and `create`, `update` or `delete` for a change.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub verb: String,
     /// The sentence they were given.
@@ -90,6 +99,32 @@ pub struct AuditStatus {
 /// target is a resource name — both carry characters a resource id may not, and
 /// a name built by mangling them would collide in ways nobody could predict.
 /// The fields are all on the object; the id only has to be stable and unique.
+/// The id prefixes an audit record can start with, in the order the store
+/// holds them.
+///
+/// Public because a range scan needs them: an id is `{kind}-{minute}-{hash}`,
+/// so the keys sort by kind first and by minute inside each kind. A caller
+/// asking for a time range has to seek once per kind, and this is the list to
+/// seek over.
+pub const KINDS: &[&str] = &["changed", "refused", "signin", "signout"];
+
+/// The exclusive cursor a range scan for `kind` from `at` starts after.
+///
+/// `{kind}-{minute}` with no hash, which is a **prefix** of every id written in
+/// that minute — and a prefix sorts below everything that extends it. The
+/// store's cursor is exclusive, so starting after this key includes the whole
+/// minute rather than skipping it. That is why nothing is subtracted here: an
+/// off-by-one in the other direction would drop a minute of records, silently.
+///
+/// The minute is decimal and unpadded, so this ordering holds only while every
+/// minute has the same number of digits. That is eight digits from March 1989
+/// to April 2160, which covers every record this platform will ever hold.
+/// Stated rather than hidden: the alternative is a padded id nobody can read,
+/// for a problem nobody here will have.
+pub fn seek_from(kind: &str, at: Timestamp) -> String {
+    format!("{kind}-{}", at.0 / 60_000)
+}
+
 pub fn record_id(
     kind: AuditKind,
     subject: &str,
@@ -109,12 +144,64 @@ pub fn record_id(
         AuditKind::Refused => "refused",
         AuditKind::SignedIn => "signin",
         AuditKind::SignedOut => "signout",
+        AuditKind::Changed => "changed",
     };
     format!("{kind}-{minute}-{:016x}", h.finish())
 }
 
 #[cfg(test)]
 mod tests {
+    /// The seek key sorts below every record of that minute and above every
+    /// record of the minute before — which is the whole of what a range scan
+    /// needs from it.
+    ///
+    /// The minutes here are eight digits, as every minute between 1989 and
+    /// 2160 is: the ordering is lexicographic and only holds at a fixed width,
+    /// which `seek_from` says out loud.
+    #[test]
+    fn the_seek_key_lands_just_below_the_minute_asked_for() {
+        let minute = 29_814_793u64;
+        let at = Timestamp(minute * MIN + 30_000);
+        let seek = seek_from("refused", at);
+        let inside = record_id(AuditKind::Refused, "a", "read", "t", at);
+        let before = record_id(
+            AuditKind::Refused,
+            "a",
+            "read",
+            "t",
+            Timestamp((minute - 2) * MIN),
+        );
+        assert!(seek.as_str() < inside.as_str(), "{seek} !< {inside}");
+        assert!(before.as_str() < seek.as_str(), "{before} !< {seek}");
+    }
+
+    /// Every kind a record can be written as is one this list names — a kind
+    /// missing here is a range scan that silently skips a quarter of the log.
+    #[test]
+    fn every_kind_is_in_the_list_a_scan_seeks_over() {
+        for kind in [
+            AuditKind::Refused,
+            AuditKind::SignedIn,
+            AuditKind::SignedOut,
+            AuditKind::Changed,
+        ] {
+            let id = record_id(kind, "a", "read", "t", Timestamp(0));
+            assert!(
+                KINDS.iter().any(|k| id.starts_with(&format!("{k}-"))),
+                "{id} starts with no known kind"
+            );
+        }
+    }
+
+    /// The store holds them in this order, so a scan that walks the list in
+    /// order walks the store in order.
+    #[test]
+    fn the_kinds_are_listed_in_the_order_the_store_holds_them() {
+        let mut sorted = KINDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, KINDS);
+    }
+
     use super::*;
 
     const MIN: u64 = 60_000;

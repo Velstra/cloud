@@ -294,6 +294,7 @@ mod tests {
                 encryption_key: None,
                 source_image: None,
                 source_snapshot: None,
+                limits: Default::default(),
             },
             velstra_cloud_model::resources::VolumeStatus::default(),
         );

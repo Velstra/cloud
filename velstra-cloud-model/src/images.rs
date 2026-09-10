@@ -173,19 +173,45 @@ pub fn refuse_an_unusable_source(spec: &ImageSourceSpec) -> Result<(), Unusable>
 /// not a file that says anything about it.
 pub fn digest_for(checksums: &str, filename: &str) -> Option<String> {
     for line in checksums.lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(hex), Some(name)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let name = name.strip_prefix('*').unwrap_or(name);
-        // `SHA512SUMS` and `SHA256SUMS` look identical and are not: a 128-digit
-        // hex is a sha512, which this platform does not address images by. Taken
-        // as one would be a digest that never matches any bytes.
-        if name == filename && hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(hex.to_ascii_lowercase());
+        // Both layouts are tried on every line, not the first that parses:
+        // a BSD-tag line also parses as a coreutils one, with `SHA256` as the
+        // hex and `(name)` as the name, and stopping there would skip the line
+        // that actually says something.
+        for (hex, name) in [bsd_line(line), coreutils_line(line)].into_iter().flatten() {
+            if name == filename
+            // `SHA512SUMS` and `SHA256SUMS` look identical and are not: a
+            // 128-digit hex is a sha512, which this platform does not address
+            // images by. Taken as one it would be a digest no bytes ever match.
+                && hex.len() == 64
+                && hex.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Some(hex.to_ascii_lowercase());
+            }
         }
     }
     None
+}
+
+/// `<hex>  <name>`, with an optional `*` for binary mode. Debian, Ubuntu and
+/// everything else that ships `SHA256SUMS` from GNU coreutils.
+fn coreutils_line(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.split_whitespace();
+    let (hex, name) = (parts.next()?, parts.next()?);
+    Some((hex, name.strip_prefix('*').unwrap_or(name)))
+}
+
+/// `SHA256 (<name>) = <hex>` — the BSD tag layout.
+///
+/// Fedora, Rocky, AlmaLinux and CentOS Stream all ship their `*-CHECKSUM`
+/// files this way, so without it an operator pointing a source at any
+/// RPM-family cloud image directory got an empty family and a message about a
+/// SHA512SUMS mix-up that was not what happened.
+///
+/// Only the `SHA256` tag: the same rule as above, for the same reason.
+fn bsd_line(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().strip_prefix("SHA256")?.trim_start();
+    let (name, hex) = rest.strip_prefix('(')?.split_once(')')?;
+    Some((hex.trim_start().strip_prefix('=')?.trim(), name))
 }
 
 #[cfg(test)]
@@ -206,6 +232,29 @@ aa  something-else.qcow2
         assert_eq!(digest_for(file, "not-there.qcow2"), None);
         // The short one is not a sha256 and is not taken for one.
         assert_eq!(digest_for(file, "debian-12-genericcloud-amd64.qcow2"), None);
+    }
+
+    /// Fedora, Rocky, AlmaLinux and CentOS Stream ship their checksums this
+    /// way. Without it, an operator pointing a source at any of them got an
+    /// empty family and a message blaming a SHA512SUMS mix-up.
+    #[test]
+    fn the_bsd_tag_layout_is_read_too() {
+        let file = "\
+SHA256 (Rocky-9-GenericCloud.latest.x86_64.qcow2) = cbf3e1f588f02f8d738dbecb32652d07568cc1d56cd60f72dbed54400ba3ae8d
+SHA256 (Rocky-9-GenericCloud-Base.latest.x86_64.qcow2) = aa
+";
+        assert_eq!(
+            digest_for(file, "Rocky-9-GenericCloud.latest.x86_64.qcow2").as_deref(),
+            Some("cbf3e1f588f02f8d738dbecb32652d07568cc1d56cd60f72dbed54400ba3ae8d")
+        );
+        // The short one is not a sha256 and is not taken for one.
+        assert_eq!(
+            digest_for(file, "Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"),
+            None
+        );
+        // And a sha512 in the same layout is refused like any other.
+        let long = format!("SHA512 (disk.qcow2) = {}\n", "a".repeat(128));
+        assert_eq!(digest_for(&long, "disk.qcow2"), None);
     }
 
     #[test]

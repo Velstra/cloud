@@ -346,6 +346,9 @@ pub async fn observe_node(
     if let Ok(key) = admin.pubkey().await {
         me.ssh_pubkey = key;
     }
+    // Health, fill, the OSD table: what Ceph says rather than what was made.
+    // Same rule as the three above — kept if it came, nothing if it did not.
+    me.seen = admin.seen().await.ok();
     me.trusts_key = trusts(&admin.authorized_keys, cluster_key).await;
     me
 }

@@ -117,6 +117,9 @@ pub struct AgentConfig {
     /// a real answer: the API then says so rather than offering a button that
     /// leads nowhere.
     pub console_endpoint: String,
+    /// Whether the console listener above speaks TLS. See
+    /// [`Agent::set_console_tls`].
+    pub console_tls: bool,
     /// Whether this machine's state directory is storage every node reaches.
     /// Told, never worked out — see the flag's own documentation.
     pub shared_state: bool,
@@ -127,6 +130,21 @@ pub struct AgentConfig {
     pub image_signing_keys: Vec<velstra_cloud_model::images::SigningKey>,
     /// Refuse to fetch an image that carries no signature at all.
     pub require_signed_images: bool,
+    /// How long a cached image nothing here needs is kept, in seconds.
+    ///
+    /// Zero keeps everything, which is what this node did before there was a
+    /// sweep at all: the cache grew with every distinct image ever booted here
+    /// and never shrank, on the filesystem the guests' disks live on.
+    pub image_keep_seconds: u64,
+    /// How often a guest's utilisation is *reported*, in milliseconds.
+    ///
+    /// Five minutes, which is what every cloud calls basic monitoring. It is a
+    /// separate cadence from the resync on purpose: every counter in a reading
+    /// moves on every pass, so reporting one per resync would be a status
+    /// write per guest per pass — a hundred guests on a thirty-second loop is
+    /// three writes a second of traffic counters, waking every watcher in the
+    /// cell. The reading is worth having and it is not worth that.
+    pub usage_every_ms: u64,
 }
 
 impl AgentConfig {
@@ -137,9 +155,15 @@ impl AgentConfig {
             resync: Duration::from_secs(30),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             console_endpoint: String::new(),
+            console_tls: false,
             shared_state: false,
             image_signing_keys: Vec::new(),
             require_signed_images: false,
+            // A month. Long enough that a base image booted now and then is
+            // never re-fetched in practice; short enough that a node does not
+            // carry a year of one-off images.
+            image_keep_seconds: 30 * 24 * 60 * 60,
+            usage_every_ms: 5 * 60 * 1000,
         }
     }
 }
@@ -176,18 +200,96 @@ impl Agent {
     /// a pass to count against can count it. A node that could not make the far
     /// end has guests that will boot and reach nothing, which is a failure of
     /// the pass and not a detail of it.
+    /// Hold a listener for every balancer this node can serve, and let go of
+    /// the ones it cannot.
+    ///
+    /// **Only on the local datapath.** A cell with a fabric has its balancers
+    /// programmed there, by the controller, and a second one here would be two
+    /// things answering for one address. `self.localnet` is what says which
+    /// cell this is.
+    ///
+    /// Started and stopped rather than reconfigured: a listener is cheap to
+    /// replace and a half-updated one is a bug nobody can see. The plan is
+    /// stable across passes, so an unchanged world starts nothing.
+    async fn balance(
+        &self,
+        balancers: &[velstra_cloud_model::loadbalancer::LoadBalancer],
+        ports: &BTreeMap<String, Port>,
+    ) {
+        if self.localnet.is_none() {
+            return;
+        }
+        let answering: BTreeMap<String, Vec<u32>> = ports
+            .iter()
+            .map(|(name, port)| (name.clone(), port.status.answering.to_vec()))
+            .collect();
+        let node = self.config.node.clone();
+        let mine = |port: &Port| port.status.node.as_deref() == Some(node.as_str());
+        let want = crate::balancer::plan(balancers, ports, &mine, &answering);
+
+        let wanted: BTreeMap<std::net::SocketAddr, crate::balancer::Service> =
+            want.into_iter().map(|s| (s.at, s)).collect();
+        // Let go first: an address on its way out may be the one an address on
+        // its way in needs. The lock is not held across the bind below — an
+        // await inside it would make this future non-Send, and the reason to
+        // want that is only convenience.
+        let stale: Vec<std::net::SocketAddr> = {
+            let held = self.balancing.lock().expect("the map is never poisoned");
+            held.iter()
+                .filter(|(at, running)| wanted.get(at) != Some(&running.service))
+                .map(|(at, _)| *at)
+                .collect()
+        };
+        for at in stale {
+            let running = {
+                let mut held = self.balancing.lock().expect("the map is never poisoned");
+                held.remove(&at)
+            };
+            if let Some(running) = running {
+                tracing::info!(%at, balancer = %running.service.balancer, "no longer balancing");
+                running.stop();
+            }
+        }
+        for (at, service) in wanted {
+            if self
+                .balancing
+                .lock()
+                .expect("the map is never poisoned")
+                .contains_key(&at)
+            {
+                continue;
+            }
+            // Only what actually bound goes in the map, because the map is what
+            // this node reports as served. A listener that could not take its
+            // address is not a service, and saying it is sends somebody looking
+            // at the wrong end of the problem.
+            if let Some(running) = crate::balancer::start(service).await {
+                self.balancing
+                    .lock()
+                    .expect("the map is never poisoned")
+                    .insert(at, running);
+            }
+        }
+    }
+
     async fn ensure_first_hop(
         &self,
         ports: &BTreeMap<String, Port>,
         subnets: &BTreeMap<String, velstra_cloud_model::resources::Subnet>,
         networks: &BTreeMap<String, NetworkSpec>,
         taps: &BTreeMap<String, String>,
+        balancers: &[velstra_cloud_model::loadbalancer::LoadBalancer],
+        // What each port on this node is allowed. Resolved by the caller,
+        // which is the party that has the groups — this is a builder, and the
+        // rule the rest of this module follows is that a builder reads
+        // nothing.
+        guarded: &[crate::nftfilter::Guarded],
     ) -> bool {
         let Some(localnet) = &self.localnet else {
             return true;
         };
-        let segments = crate::localnet::segments(ports, subnets, networks, taps);
-        match localnet.apply(&segments).await {
+        let segments = crate::localnet::segments(ports, subnets, networks, taps, balancers);
+        match localnet.apply(&segments, guarded).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(error = %e, "could not make this node the first hop");
@@ -333,6 +435,12 @@ pub struct Agent {
     /// and giving it a grace period from startup is what stops a control plane
     /// that is merely slow to come up from taking every guest down with it.
     last_report: AtomicU64,
+    /// The cell's names, refreshed every pass and read by the resolver.
+    names: crate::dns::Names,
+    /// The balancer listeners this node is holding open, by the socket they
+    /// bound. Kept because a listener is a running task and the pass has to be
+    /// able to tell "already serving this" from "serve this now".
+    balancing: std::sync::Mutex<BTreeMap<std::net::SocketAddr, crate::balancer::Running>>,
     /// When this node last asked a guest to power down for a cold move, per
     /// instance, in milliseconds since the epoch.
     ///
@@ -386,6 +494,7 @@ impl Agent {
         let cell = config.placement.cell.clone();
         Self {
             writer: Writer::agent(&config.node),
+            balancing: std::sync::Mutex::new(BTreeMap::new()),
             instances: TypedStore::new(store.clone(), &cell, "instances"),
             attachments: TypedStore::new(store.clone(), &cell, "attachments"),
             ports: TypedStore::new(store.clone(), &cell, "ports"),
@@ -406,6 +515,7 @@ impl Agent {
             sink: None,
             handover_asked: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             last_report: AtomicU64::new(velstra_cloud_model::meta::Timestamp::now().0),
+            names: crate::dns::Names::new(),
             fence_after_s: AtomicU32::new(0),
             bgp: None,
             bgp_applied: std::sync::Mutex::new(None),
@@ -513,6 +623,13 @@ impl Agent {
     /// from. Handed out so all three share one map rather than three that can
     /// differ — a guest leased an address the metadata service does not think
     /// it has is a guest nobody can debug.
+    /// Every guest in the cell that has a name and an address, for the
+    /// resolver. Cell-wide rather than this node's: a name that resolved only
+    /// for guests sharing a hypervisor would be a name nobody could rely on.
+    pub fn names(&self) -> crate::dns::Names {
+        self.names.clone()
+    }
+
     pub fn guests(&self) -> GuestRegistry {
         self.guests.clone()
     }
@@ -535,6 +652,15 @@ impl Agent {
     /// Where this node answers a console attach, once its listener is up.
     pub fn set_console_endpoint(&mut self, endpoint: &str) {
         self.config.console_endpoint = endpoint.to_string();
+    }
+
+    /// Whether this node's console stream is private.
+    ///
+    /// Reported so the API knows to connect with `wss://` — and so a console
+    /// screen can tell somebody, before they type a root password into it,
+    /// whether their keystrokes cross the management network in the clear.
+    pub fn set_console_tls(&mut self, on: bool) {
+        self.config.console_tls = on;
     }
 
     /// The interval this agent reconciles at — exactly what it was asked for.
@@ -670,6 +796,19 @@ impl Agent {
     /// The deadline comes from the node's spec, which this agent last read while
     /// it could still read anything. A node that has never been given one does
     /// not fence — and is never recovered from, which is the honest pair.
+    /// Pretend the last successful report was this long ago.
+    ///
+    /// For tests only, and there is no other way in: `last_report` is stamped
+    /// by a report landing, so a test that wanted to exercise fencing would
+    /// otherwise have to sleep out the deadline.
+    #[doc(hidden)]
+    pub fn pretend_last_report_was(&self, ago: std::time::Duration) {
+        let then = velstra_cloud_model::meta::Timestamp::now()
+            .0
+            .saturating_sub(ago.as_millis() as u64);
+        self.last_report.store(then, Ordering::Relaxed);
+    }
+
     async fn self_fence_pass(&self, host: &crate::host::HostState, pass: &mut Pass) {
         let fence_after_s = self.fence_after_s.load(Ordering::Relaxed);
         let last = velstra_cloud_model::meta::Timestamp(self.last_report.load(Ordering::Relaxed));
@@ -849,6 +988,66 @@ impl Agent {
     ///
     /// performs no actions and writes nothing — which is the property that
     /// makes the resync interval a matter of taste rather than of load.
+    /// One pass over this machine: read it, reconcile it, report it — and,
+    /// whatever happened, decide whether to fence itself.
+    ///
+    /// The fence is out here rather than at the end of the pass, and that is
+    /// the whole point: the pass gives up early whenever a control-plane read
+    /// fails, which is *exactly* the outage self-fencing exists for. With the
+    /// call inside, a node partitioned from the control plane kept every guest
+    /// running while the recovery controller started them somewhere else.
+    /// One reading of what a guest is using, from this host's own view.
+    ///
+    /// The process for CPU and memory, and the guest's taps for its traffic.
+    /// Both are the **host's** numbers: what the kernel charged the VMM and
+    /// what crossed the wires this node programmed. What the guest believes
+    /// about itself would need an agent inside it, and no cloud gets that from
+    /// outside.
+    ///
+    /// `None` when the guest is not running here or has no process to read —
+    /// absence rather than zero, because a zero reads as idle and idle is
+    /// something people decide on.
+    async fn sample_guest(
+        &self,
+        host: &crate::host::HostState,
+        name: &str,
+        stored: &velstra_cloud_model::resources::Instance,
+        taps: &BTreeMap<String, String>,
+    ) -> Option<crate::agent::status::Sampled> {
+        let vm = host.vms.get(name)?;
+        if vm.state != velstra_cloud_model::resources::InstanceState::Running {
+            return None;
+        }
+        let process = crate::hostfs::sample_process(vm.pid?)?;
+        let mut sample = crate::agent::status::Sampled {
+            cpu_ms: process.cpu_ms,
+            memory_mib: process.memory_mib,
+            // The VMM's own answer. A backend that will not give one leaves
+            // the disk numbers at nothing, which is what they are: unknown,
+            // and the field says so by being zero across the board rather
+            // than by a separate flag nobody would read.
+            disk: self.vmm.disk_traffic(name).await.unwrap_or_default(),
+            ..Default::default()
+        };
+        // Summed across the guest's wires, because a guest with two is one
+        // guest. Counted at the host end of each tap, so what the host
+        // *received* is what the guest sent — the names are swapped back here,
+        // once, rather than in every reader.
+        for port in &stored.spec.ports {
+            let Some(device) = taps.get(port) else {
+                continue;
+            };
+            let Some(counters) = crate::hostfs::link_counters(device) else {
+                continue;
+            };
+            sample.rx_bytes = sample.rx_bytes.saturating_add(counters.tx_bytes);
+            sample.tx_bytes = sample.tx_bytes.saturating_add(counters.rx_bytes);
+            sample.rx_packets = sample.rx_packets.saturating_add(counters.tx_packets);
+            sample.tx_packets = sample.tx_packets.saturating_add(counters.rx_packets);
+        }
+        Some(sample)
+    }
+
     pub async fn resync(&self) -> Pass {
         let mut pass = Pass::default();
 
@@ -865,12 +1064,25 @@ impl Agent {
         let baseline = self.declared_baseline().await;
         Self::present_baseline(&mut host, baseline);
         let host = host;
+        // The view the fence judges by, taken before the pass so it survives
+        // an early exit. One clone per pass, against the cost of not fencing.
+        let seen = host.clone();
+        self.reconcile_pass(host, &mut pass).await;
+        // Last, and unconditionally. If the report inside landed, the deadline
+        // has just been pushed out and nothing here fires; if it did not — or
+        // if the pass never got that far — this is what notices.
+        self.self_fence_pass(&seen, &mut pass).await;
+        pass
+    }
+
+    /// Everything one pass does, once the machine has been read.
+    async fn reconcile_pass(&self, host: crate::host::HostState, pass: &mut Pass) {
         let programmed = match self.datapath.observe().await {
             Ok(programmed) => programmed,
             Err(e) => {
                 tracing::error!(error = %e, "could not read the datapath; skipping the pass");
                 pass.failures += 1;
-                return pass;
+                return;
             }
         };
 
@@ -882,7 +1094,7 @@ impl Agent {
             Err(e) => {
                 tracing::error!(error = %e, "could not list ports");
                 pass.failures += 1;
-                return pass;
+                return;
             }
         };
 
@@ -952,7 +1164,7 @@ impl Agent {
             Err(e) => {
                 tracing::error!(error = %e, "could not list instances");
                 pass.failures += 1;
-                return pass;
+                return;
             }
         };
 
@@ -970,14 +1182,14 @@ impl Agent {
             Err(e) => {
                 tracing::error!(error = %e, "could not list migrations");
                 pass.failures += 1;
-                return pass;
+                return;
             }
         };
         // Sending comes first in the pass because a send that lands changes
         // what the instance loop below is looking at: the guest is gone from
         // this machine, and the only right thing to do about that is to report
         // it, not to start it again.
-        let mut moving = self.source_pass(&migrations, &host, &mut pass).await;
+        let mut moving = self.source_pass(&migrations, &host, pass).await;
         // Both halves of "leave this instance alone", in one place and before
         // any instance is acted on: what this node is giving up, and what is on
         // its way here.
@@ -990,21 +1202,33 @@ impl Agent {
                 Err(e) => {
                     tracing::error!(error = %e, "could not re-read this machine after a handover");
                     pass.failures += 1;
-                    return pass;
+                    return;
                 }
             }
         };
+
+        // The cell's balancers, read once: the first hop needs their addresses
+        // on the bridge, and the balancing below needs the objects themselves.
+        // Empty when they cannot be read, which costs a pass of balancing and
+        // nothing else.
+        let balancers = self.cell.load_balancers().await.unwrap_or_default();
 
         // Before a single guest is acted on. A port programmed on an earlier
         // pass — after a restart, say — has a tap and no bridge until somebody
         // makes one, and the guest on it is already running.
         let taps_now = taps_of(&programmed);
+        // What every port on this node is allowed, resolved once for the pass.
+        // On the local datapath this is the firewall; on the fabric it is
+        // programmed there instead and this list is unused.
+        let guarded = self.guarded(&ports, &groups, &taps_now);
         if !self
-            .ensure_first_hop(&ports, &subnets, &networks, &taps_now)
+            .ensure_first_hop(&ports, &subnets, &networks, &taps_now, &balancers, &guarded)
             .await
         {
             pass.failures += 1;
         }
+        // And the listeners in front of them, once the addresses are held.
+        self.balance(&balancers, &ports).await;
 
         let mut mine = Vec::new();
         for instance in &instances {
@@ -1019,7 +1243,7 @@ impl Agent {
                 // it again would be this node writing about an object it no
                 // longer owns — which the store would rightly refuse.
                 if instance.status.node.as_deref() == Some(self.config.node.as_str()) {
-                    self.release_instance(instance, &mut pass).await;
+                    self.release_instance(instance, pass).await;
                 }
                 continue;
             }
@@ -1028,7 +1252,7 @@ impl Agent {
                 instance.spec.node.as_deref(),
             ) {
                 Ownership::Mine => {
-                    self.instance_pass(instance, &host, &programmed, &cell, &moving, &mut pass)
+                    self.instance_pass(instance, &host, &programmed, &cell, &moving, pass)
                         .await;
                     mine.push(instance);
                 }
@@ -1038,7 +1262,7 @@ impl Agent {
                         &self.instances,
                         instance,
                         |status| status.node = Some(me),
-                        &mut pass,
+                        pass,
                     )
                     .await
                 }
@@ -1054,17 +1278,33 @@ impl Agent {
         // tap sweep below then tried to remove, and was refused, every pass,
         // for ever ("Device or resource busy").
         //
-        // Cell-wide, not this node's share: a guest mid-arrival or mid-handover
-        // still has its record, so the only guests this touches are the ones
-        // nobody's books mention at all. The list read failing returns early
-        // above, so an unreadable store never looks like an empty one.
+        // **Only guests this agent's own state directory holds.** The list
+        // above is this node's share and never was the cell — `CellReader`
+        // says so in one line ("the instances this node holds or has been
+        // given"), and the comment that used to sit here claimed otherwise.
+        // On that false premise the sweep reads as "an instance nobody's books
+        // mention", and what it actually means is "an instance *I* was not
+        // handed" — which is every other agent's guest on the same machine.
+        //
+        // Found by running a second agent on a live node, exactly as
+        // `--tap-prefix` and `--bridge-prefix` invite ("two agents on one
+        // machine need two"): it stopped the first agent's guest within
+        // seconds of starting, and the guest's own agent had to bring it back.
+        //
+        // `host.disks` is read from this agent's `run_dir`, so it is precisely
+        // "guests I made". The case this sweep exists for — a QEMU that
+        // outlived its instance by two days — is one of those, so nothing it
+        // was written to catch escapes.
+        //
+        // The list read failing returns early above, so an unreadable store
+        // never looks like an empty one.
         let known: BTreeSet<String> = instances.iter().map(|i| i.meta.name.to_string()).collect();
         for name in host.vms.keys() {
-            if known.contains(name) {
+            if known.contains(name) || !host.disks.contains(name) {
                 continue;
             }
             tracing::warn!(instance = %name,
-                "stopping a guest whose instance is gone from the cell");
+                "stopping a guest of mine whose instance is gone from my share of the cell");
             // `kill`, not `stop`: the graceful path asks over the monitor, and
             // an orphan whose directory was deleted has no monitor left to ask
             // — its unit is the only handle that still works.
@@ -1083,14 +1323,14 @@ impl Agent {
                         attachment.status.node.as_deref(),
                         Some(attachment.spec.node.as_str()),
                     ) {
-                        Ownership::Mine => self.attachment_pass(attachment, &host, &mut pass).await,
+                        Ownership::Mine => self.attachment_pass(attachment, &host, pass).await,
                         Ownership::Claim => {
                             let me = self.config.node.clone();
                             self.claim(
                                 &self.attachments,
                                 attachment,
                                 |status| status.node = Some(me),
-                                &mut pass,
+                                pass,
                             )
                             .await
                         }
@@ -1113,7 +1353,7 @@ impl Agent {
             Err(e) => {
                 tracing::error!(error = %e, "could not re-read the datapath");
                 pass.failures += 1;
-                return pass;
+                return;
             }
         };
 
@@ -1176,9 +1416,28 @@ impl Agent {
             Err(e) => {
                 tracing::error!(error = %e, "could not re-read the datapath after the sweep");
                 pass.failures += 1;
-                return pass;
+                return;
             }
         };
+        // What answers, for the members something is actually sending traffic
+        // to. Before the ports are reported on, so the reading lands in the
+        // same write as everything else this node says about them.
+        let answering = match self.cell.load_balancers().await {
+            Ok(balancers) => self.probe_members(&balancers, &ports).await,
+            Err(e) => {
+                // No health checking this pass, not a failed one: the balancer
+                // fails open, so every member keeps its share exactly as it did
+                // before any of this existed.
+                tracing::debug!(error = %e, "could not read the cell's balancers; not probing");
+                BTreeMap::new()
+            }
+        };
+
+        // What each port's firewall turned away, read once for the pass. Empty
+        // on a datapath that does not filter here, which is what makes the
+        // status absent rather than zero.
+        let turned_away = self.turned_away(&ports, &groups, &taps).await;
+
         for port in ports.values() {
             let name = port.meta.name.to_string();
             let owner = port.status.node.as_deref();
@@ -1192,28 +1451,52 @@ impl Agent {
             let mine_to_report = owner == Some(self.config.node.as_str())
                 || (owner.is_none() && referenced.contains(name.as_str()));
             if mine_to_report {
-                self.port_pass(port, &taps, in_my_share.contains(name.as_str()), &mut pass)
-                    .await;
+                self.port_pass(
+                    port,
+                    &taps,
+                    in_my_share.contains(name.as_str()),
+                    answering.get(name.as_str()),
+                    turned_away.get(name.as_str()).copied(),
+                    pass,
+                )
+                .await;
             }
         }
 
         // The routing daemon, after the wires: what this cell announces is a
         // statement about addresses the passes above have just made true.
-        self.bgp_pass(&mut pass).await;
+        self.bgp_pass(pass).await;
 
         // Receiving comes last, so that on the pass where a guest arrives and
         // is claimed above, the receiver it came through is taken down in the
         // same sweep. A receiver left listening holds a memory reservation on a
         // node that is not running the guest.
-        self.destination_pass(&migrations, &taps, &cell, &host, &mut pass)
+        self.destination_pass(&migrations, &taps, &cell, &host, pass)
             .await;
 
         // After the guests, because a capture is of a stopped guest and the
         // pass above is what stops one: asked for and acted on in the same
         // sweep rather than a resync later.
-        self.capture_pass(&mine, &mut pass).await;
+        self.capture_pass(&mine, pass).await;
 
-        self.refresh_guests(&mine, &ports, &taps, &mut pass).await;
+        self.refresh_guests(&mine, &ports, &taps, pass).await;
+        // What this node keeps that nothing needs any more. After the guests,
+        // because a guest that started this pass is what keeps its image.
+        self.forget_unneeded_images(&host, &cell, &mine, pass).await;
+
+        // And the cell's names. Asked for separately from `instances`, which
+        // is only what this node holds: a name is only useful if the machine
+        // next door can use it, and that machine is usually on another node.
+        match self.cell.directory().await {
+            Ok(names) => self.names.replace(names),
+            Err(e) => {
+                // Kept rather than cleared. A resolver that forgot every name
+                // because one read failed would take the cell's DNS down for
+                // a hiccup; the names it holds are still the names it had.
+                tracing::warn!(error = %e, "could not read the cell's names; keeping the last set");
+                pass.failures += 1;
+            }
+        }
         // Before the node status is written, because the status is where this
         // node's Ceph report goes and the pass fills it in.
         let mut host = host;
@@ -1221,14 +1504,8 @@ impl Agent {
         // objects know — sysfs cannot tell a passed-through device from a free
         // one — so the overlay happens here, once, on the way to the report.
         Self::mark_held_devices(&mut host, &mine);
-        self.ceph_pass(&mut host, &mut pass).await;
-        self.node_pass(&mine, &host, &mut pass).await;
-        // Last, and after the report: if that report landed, the deadline has
-        // just been pushed out and nothing here fires. If it did not, this is
-        // the pass that notices — and the ordering means an agent never fences
-        // itself over a report it was about to make successfully.
-        self.self_fence_pass(&host, &mut pass).await;
-        pass
+        self.ceph_pass(&mut host, pass).await;
+        self.node_pass(&mine, &host, pass).await;
     }
 
     fn ownership(&self, owner: Option<&str>, assigned: Option<&str>) -> Ownership {
@@ -1293,6 +1570,12 @@ impl Agent {
                 &name,
                 stored.meta.is_deleting(),
                 stored.spec.console,
+                // No reading on the deciding pass: what a guest is *using* is
+                // reported, never acted on, so taking one here would be work
+                // done once per round for a number nothing in the loop reads.
+                None,
+                stored.spec.vcpus,
+                self.config.usage_every_ms,
             );
 
             let actions = reconcile_instance(
@@ -1331,6 +1614,9 @@ impl Agent {
                     })
                     .collect::<Vec<_>>(),
                 host.disks.contains(&name),
+                // And how big it actually is, so a growth the API accepted and
+                // the quota charged for reaches the disk.
+                host.disk_gib.get(&name).copied(),
                 // What else is on this machine, and how far along it is. The
                 // order is a property of the node rather than of any guest, so
                 // it can only be answered here — with the whole list in hand.
@@ -1428,6 +1714,12 @@ impl Agent {
             &name,
             stored.meta.is_deleting(),
             stored.spec.console,
+            // The reading that is reported. Taken once, on the pass that
+            // writes the status, from the host's own view of the guest's
+            // process and its wires.
+            self.sample_guest(&host, &name, stored, &taps).await,
+            stored.spec.vcpus,
+            self.config.usage_every_ms,
         );
         next.status.addresses = if stored.meta.is_deleting() {
             Vec::new()
@@ -1518,6 +1810,67 @@ impl Agent {
         effective.rules
     }
 
+    /// What each port's firewall turned away, from the kernel's own counters.
+    ///
+    /// Empty unless this node is the first hop: on any other datapath the
+    /// rules are enforced somewhere else, and inventing a zero here would
+    /// claim a firewall this node does not have.
+    async fn turned_away(
+        &self,
+        ports: &BTreeMap<String, Port>,
+        groups: &BTreeMap<String, SecurityGroup>,
+        taps: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, crate::nftfilter::Dropped> {
+        let Some(localnet) = &self.localnet else {
+            return BTreeMap::new();
+        };
+        let guarded = self.guarded(ports, groups, taps);
+        if guarded.iter().all(|g| g.rules.is_empty()) {
+            return BTreeMap::new();
+        }
+        match localnet.filter_counters().await {
+            Ok(listing) => crate::nftfilter::counters(&listing, &guarded),
+            Err(e) => {
+                // A reading this node could not take is not a failed pass:
+                // everything else it says about the port is still true, and
+                // the previous reading stays where it is.
+                tracing::debug!(error = %e, "could not read the firewall's counters");
+                BTreeMap::new()
+            }
+        }
+    }
+
+    /// Every port on this node, its wire, and what it is allowed.
+    ///
+    /// One place, so the firewall and the datapath cannot disagree about which
+    /// rules are in force. A port with no tap yet is left out rather than
+    /// guarded on a name nothing carries.
+    fn guarded(
+        &self,
+        ports: &BTreeMap<String, Port>,
+        groups: &BTreeMap<String, SecurityGroup>,
+        taps: &BTreeMap<String, String>,
+    ) -> Vec<crate::nftfilter::Guarded> {
+        ports
+            .iter()
+            .filter_map(|(name, port)| {
+                Some(crate::nftfilter::Guarded {
+                    port: name.clone(),
+                    tap: taps.get(name)?.clone(),
+                    // What the guest actually holds. The firewall matches on
+                    // the address rather than the wire — see
+                    // `crate::nftfilter` — because a tap enslaved to a bridge
+                    // is not what the forward hook sees.
+                    // One address per port, which is what the model gives it.
+                    // A dual-stack guest gets a second port, so both are
+                    // guarded, each by its own chain.
+                    addresses: port.spec.address.iter().cloned().collect(),
+                    rules: self.rules_for(&port.spec, groups, ports),
+                })
+            })
+            .collect()
+    }
+
     async fn perform_instance(
         &self,
         action: &Action,
@@ -1552,6 +1905,7 @@ impl Agent {
                      node has nowhere to fetch it from"
                 ))),
             },
+            Action::GrowDisk { instance, gib } => self.vmm.grow_disk(instance, *gib).await,
             Action::CreateDisk {
                 instance,
                 gib,
@@ -1597,8 +1951,16 @@ impl Agent {
                                     // arm reports on the *port*, and a bridge
                                     // this node could not make is not something
                                     // the port did wrong.
-                                    self.ensure_first_hop(ports, cell.subnets, networks, &taps)
-                                        .await;
+                                    let guarded = self.guarded(ports, groups, &taps);
+                                    self.ensure_first_hop(
+                                        ports,
+                                        cell.subnets,
+                                        networks,
+                                        &taps,
+                                        &[],
+                                        &guarded,
+                                    )
+                                    .await;
                                 }
                             }
                             programmed.map(|_| ())
@@ -2020,7 +2382,13 @@ impl Agent {
                     ));
                 }
                 self.vmm
-                    .open_volume(instance, volume, &attachment.spec.at, *read_only)
+                    .open_volume(
+                        instance,
+                        volume,
+                        &attachment.spec.at,
+                        *read_only,
+                        attachment.spec.limits,
+                    )
                     .await
                     .map(|_| ())
             }
@@ -2180,11 +2548,169 @@ impl Agent {
     /// it, because a port exists to be plugged into something. What is left is
     /// to say what the datapath actually has, and to clean up a port that is
     /// being deleted on its own.
+    /// Remove cached images this node has no use for.
+    ///
+    /// A hypervisor's image cache grew with every distinct image ever booted
+    /// there and never shrank — on the filesystem that also holds every
+    /// guest's root disk. Two rules, in order of how sure they are:
+    ///
+    /// * an image the **cell no longer has** can never be needed again, so it
+    ///   goes as soon as it is unreferenced here;
+    /// * an image nothing on this node references and that was fetched longer
+    ///   ago than the keep window goes too. It is a cache: the cost of being
+    ///   wrong is one download, and the cost of never being wrong is a full
+    ///   disk.
+    ///
+    /// Never an image a guest on this node was made from and never one being
+    /// fetched. A guest's root disk is a *copy*, so removing the image it came
+    /// from does not touch it — but a guest whose disk is not made yet still
+    /// needs it, and that is what the reference check is for.
+    async fn forget_unneeded_images(
+        &self,
+        host: &crate::host::HostState,
+        cell: &crate::agent::CellView<'_>,
+        mine: &[&Instance],
+        pass: &mut Pass,
+    ) {
+        let keep_for = self.config.image_keep_seconds;
+        if keep_for == 0 {
+            return;
+        }
+        // What the guests here are made from, by the name the bytes are filed
+        // under. An instance with no disk yet still counts: it is about to be.
+        let needed: std::collections::BTreeSet<String> = mine
+            .iter()
+            // A guest being torn down does not need the image it was made
+            // from: its disk is a copy, and the copy is what is being removed.
+            .filter(|i| !i.meta.is_deleting())
+            .filter_map(|i| cell.images.get(i.spec.image.as_str()))
+            .filter_map(|i| crate::hostfs::stored_as(&i.digest))
+            .collect();
+        // Every digest the cell still knows, whoever holds it.
+        let known: std::collections::BTreeSet<String> = cell
+            .images
+            .values()
+            .filter_map(|i| crate::hostfs::stored_as(&i.digest))
+            .collect();
+
+        for stored in &host.images {
+            if needed.contains(stored) || host.fetching.contains(stored) {
+                continue;
+            }
+            let unknown = !known.contains(stored);
+            let old = self
+                .vmm
+                .image_age_seconds(stored)
+                .await
+                .is_some_and(|age| age >= keep_for);
+            if !unknown && !old {
+                continue;
+            }
+            match self.vmm.forget_image(stored).await {
+                Ok(()) => pass.actions += 1,
+                Err(e) => {
+                    tracing::warn!(image = %stored, error = %e, "could not remove a cached image");
+                    pass.failures += 1;
+                }
+            }
+        }
+    }
+
+    /// Which member ports of this node's guests actually answer.
+    ///
+    /// The control plane cannot reach a guest on a tenant overlay — that is
+    /// why this platform had no health checking at all — but the node holding
+    /// the tap can. One TCP connection per (member, listener port), with a
+    /// short deadline: an open connection is the only evidence that costs
+    /// nothing to interpret. Nothing is written to the guest and nothing is
+    /// sent; the connection is closed as soon as it is made.
+    ///
+    /// Only the ports a balancer names are probed. A node that scanned its
+    /// guests would be doing something nobody asked for, and slowly.
+    async fn probe_members(
+        &self,
+        balancers: &[velstra_cloud_model::loadbalancer::LoadBalancer],
+        ports: &BTreeMap<String, Port>,
+    ) -> BTreeMap<String, Vec<u32>> {
+        use std::collections::BTreeSet;
+        // (port name) -> the listener ports something sends to it on.
+        let mut wanted: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+        for balancer in balancers {
+            for member in &balancer.spec.members {
+                for listener in &balancer.spec.listeners {
+                    // The port the *member* answers on, which is the listener's
+                    // own port when it says nothing else.
+                    let at = if listener.member_port == 0 {
+                        listener.port
+                    } else {
+                        listener.member_port
+                    };
+                    wanted.entry(member.clone()).or_default().insert(at);
+                }
+            }
+        }
+
+        let mut answering: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        for (name, listener_ports) in wanted {
+            let Some(port) = ports.get(&name) else {
+                continue;
+            };
+            // Only this node's own guests: another node probes its own, and a
+            // probe across the overlay from here would be answering about a
+            // machine this node cannot see.
+            if port.status.node.as_deref() != Some(self.config.node.as_str()) {
+                continue;
+            }
+            let Some(address) = port.spec.address.as_deref() else {
+                continue;
+            };
+            let Some(address) = address
+                .split('/')
+                .next()
+                .and_then(|a| a.parse::<std::net::IpAddr>().ok())
+            else {
+                continue;
+            };
+            let mut up = Vec::new();
+            for at in listener_ports {
+                if Self::answers(address, at).await {
+                    up.push(u32::from(at));
+                }
+            }
+            answering.insert(name, up);
+        }
+        answering
+    }
+
+    /// Whether something accepts a connection there, within a moment.
+    ///
+    /// Two seconds: long enough for a loaded guest to accept, short enough
+    /// that a pass is not held up by a pool of dead ones. A refused connection
+    /// and a timed-out one are the same answer — nothing is serving.
+    async fn answers(address: std::net::IpAddr, port: u16) -> bool {
+        matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::net::TcpStream::connect((address, port)),
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
     async fn port_pass(
         &self,
         stored: &Port,
         taps: &BTreeMap<String, String>,
         in_my_share: bool,
+        // Which of this port's listener ports answered, when something is
+        // sending traffic to it. `None` is "nobody asked", which is not the
+        // same as "nothing answered" — see `PortStatus::answering`.
+        answering: Option<&Vec<u32>>,
+        // What this port's firewall turned away, when something on this node
+        // is filtering it. `None` is "nothing is judging this port", which is
+        // not the same as "nothing was dropped".
+        dropped: Option<crate::nftfilter::Dropped>,
         pass: &mut Pass,
     ) {
         let name = stored.meta.name.to_string();
@@ -2229,6 +2755,23 @@ impl Agent {
         next.status.observed_generation = stored.meta.generation;
         next.status.programmed = taps.contains_key(&name);
         next.status.tap_device = taps.get(&name).cloned();
+        // Kept rather than cleared when nobody asked: a balancer that was
+        // removed leaves the last reading behind, and the next pass that cares
+        // replaces it. The balancer fails open either way, so a stale reading
+        // costs nothing — and it is still the truest thing this node knows.
+        if let Some(up) = answering {
+            next.status.answering = up.clone();
+        }
+        // Same rule as `answering`, and for the same reason: a reading that
+        // stops arriving is not a reading of zero.
+        if let Some(d) = dropped {
+            next.status.dropped = Some(velstra_cloud_model::resources::Dropped {
+                inbound_packets: d.inbound_packets,
+                inbound_bytes: d.inbound_bytes,
+                outbound_packets: d.outbound_packets,
+                outbound_bytes: d.outbound_bytes,
+            });
+        }
         let ready = if next.status.programmed {
             Condition::ready(stored.meta.generation)
         } else {

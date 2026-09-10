@@ -56,8 +56,15 @@ pub struct LvmConfig {
     pub lvcreate: String,
     pub lvremove: String,
     pub lvextend: String,
+    /// Frees the extents of a volume being destroyed. Best effort — see
+    /// [`LvmPool::destroy`].
+    pub blkdiscard: String,
     /// For writing an image into a fresh volume, and reading one out.
     pub qemu_img: String,
+    /// Where verified image files live on this machine, under the same naming
+    /// (`sha256-<hex>`) the node agent uses. `None` — the default — is a pool
+    /// that cannot make a volume from an image and says so.
+    pub images: Option<std::path::PathBuf>,
 }
 
 impl LvmConfig {
@@ -70,7 +77,9 @@ impl LvmConfig {
             lvcreate: "lvcreate".into(),
             lvremove: "lvremove".into(),
             lvextend: "lvextend".into(),
+            blkdiscard: "blkdiscard".into(),
             qemu_img: "qemu-img".into(),
+            images: None,
         }
     }
 }
@@ -126,8 +135,26 @@ impl LvmPool {
     }
 
     /// Create one logical volume of `gib`, thin if this pool has a thin pool.
+    ///
+    /// `--zero y --wipesignatures y` on both shapes, and they are not
+    /// belt-and-braces: a volume group is reused, so the extents a new logical
+    /// volume is cut from are whatever the last volume left there. `lvcreate`
+    /// zeroes only the first 4 KiB by default, and the volume is handed to
+    /// QEMU as a raw device — so without this a tenant reads the previous
+    /// tenant's blocks straight out of their own guest. A thin volume reads as
+    /// zeroes for unwritten blocks, but a thin pool's chunks are also reused,
+    /// and `--zero y` is what makes that guarantee hold on reuse rather than
+    /// only on a fresh pool.
     async fn create_lv(&self, lv: &str, gib: u64) -> Result<()> {
-        let mut args: Vec<String> = vec!["--yes".into(), "--name".into(), lv.to_string()];
+        let mut args: Vec<String> = vec![
+            "--yes".into(),
+            "--zero".into(),
+            "y".into(),
+            "--wipesignatures".into(),
+            "y".into(),
+            "--name".into(),
+            lv.to_string(),
+        ];
         match &self.config.thin_pool {
             Some(thin) => {
                 args.extend([
@@ -354,7 +381,41 @@ impl Storage for LvmPool {
             // There is no atomic "create from" for a thick LV, so the volume is
             // removed again if the copy fails — leaving a blank one behind would
             // be exactly the half-made volume this ordering exists to prevent.
-            Origin::Image(path) | Origin::File(path) => {
+            // An image is a *name*, and this used to treat it as a path —
+            // opening `projects/p1/images/…` as a file, which is nothing on
+            // any machine. It is resolved to the file the node wrote, under
+            // the image's digest.
+            Origin::Image { name, stored } => {
+                let Some(stored) = stored else {
+                    return Err(HostError::failed(format!(
+                        "{name} carries no digest this pool could read, so there is no file to \
+                         copy from"
+                    )));
+                };
+                let Some(dir) = &self.config.images else {
+                    return Err(HostError::failed(format!(
+                        "this LVM pool was not told where images live on this machine, so it \
+                         cannot make a volume from {name}"
+                    )));
+                };
+                let from = dir.join(stored);
+                if !from.exists() {
+                    return Err(HostError::failed(format!(
+                        "{name} is not on this machine, so nothing can be copied from it — \
+                         looked in {}. The node agent fetches an image when a guest needs it.",
+                        from.display()
+                    )));
+                }
+                self.create_lv(&lv, gib).await?;
+                match self.write_into(&from.to_string_lossy(), &device).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let _ = self.destroy(volume).await;
+                        Err(e)
+                    }
+                }
+            }
+            Origin::File(path) => {
                 self.create_lv(&lv, gib).await?;
                 match self.write_into(path, &device).await {
                     Ok(()) => Ok(()),
@@ -393,6 +454,23 @@ impl Storage for LvmPool {
 
     async fn destroy(&self, volume: &str) -> Result<()> {
         let device = self.device(&lv_name(volume));
+        // Discard the extents before handing them back to the group. The
+        // create path zeroes what it hands out, so this is the second half of
+        // the same promise rather than the whole of it — but a discard on an
+        // SSD or a thin pool actually frees the space, and on a group whose
+        // next volume is created by something other than this agent it is the
+        // only thing standing between two tenants.
+        //
+        // Best effort by design: `blkdiscard` is absent on some images and
+        // refused by some devices, and a destroy that failed for want of it
+        // would leak the volume for ever, which is worse. What it cannot do is
+        // make the create path's zeroing optional.
+        if let Err(e) = self
+            .run(&self.config.blkdiscard, &["--force".into(), device.clone()])
+            .await
+        {
+            tracing::debug!(error = %e, device = %device, "discard before remove did not run");
+        }
         match self
             .run(&self.config.lvremove, &["--yes".into(), device])
             .await
@@ -439,7 +517,21 @@ impl Storage for LvmPool {
     }
 
     async fn copy_out(&self, volume: &str, path: &str) -> Result<u64> {
-        let from = self.device(&lv_name(volume));
+        self.copy_device_out(self.device(&lv_name(volume)), path)
+            .await
+    }
+
+    /// From the snapshot's own device. A backup copies a moment, not a device
+    /// a guest is still writing to.
+    async fn copy_out_snapshot(&self, snapshot: &str, path: &str) -> Result<u64> {
+        self.copy_device_out(self.device(&snap_lv_name(snapshot)), path)
+            .await
+    }
+}
+
+impl LvmPool {
+    /// Convert one device in this group out to `path` as qcow2.
+    async fn copy_device_out(&self, from: String, path: &str) -> Result<u64> {
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.exists()
         {

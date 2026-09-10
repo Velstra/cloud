@@ -448,10 +448,31 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
         if let Some(mtu) = nic.mtu {
             out.push_str(&format!("    mtu: {mtu}\n"));
         }
-        // Only the first NIC gets a default route. Two default routes with no
-        // metric between them is a guest whose egress depends on which one the
-        // kernel happened to install second.
-        if n == 0 {
+        // One default route per *family*, and never two of one. Two v4
+        // defaults with no metric between them is a guest whose egress depends
+        // on which one the kernel installed second — but a v4 default and a v6
+        // default are different route tables and cannot race, and a guest
+        // given a v6 address with no way off its own link is a guest that can
+        // reach its neighbour and nothing else.
+        //
+        // Found by writing the dual-stack test: the rule was "only the first
+        // NIC", which was right while every guest had one family and silently
+        // wrong the moment one had two.
+        let family_of = |nic: &Interface| {
+            nic.public
+                .first()
+                .map(|r| r.address.is_ipv4())
+                .or_else(|| nic.gateway.map(|g| g.is_ipv4()))
+                .or_else(|| nic.cidr.map(|c| c.address.is_ipv4()))
+        };
+        let mine = family_of(nic);
+        let first_of_its_family = mine.is_some_and(|want| {
+            usable
+                .iter()
+                .position(|other| family_of(other) == Some(want))
+                == Some(n)
+        });
+        if first_of_its_family {
             match (&public_default, nic.gateway) {
                 // Out through the public address, and the next hop is on-link
                 // and in no subnet — answered by the host itself. That is what
@@ -483,11 +504,28 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
                 }
                 (None, None) => {}
             }
-            if !nic.dns.is_empty() {
-                out.push_str("    nameservers:\n      addresses:\n");
-                for resolver in &nic.dns {
-                    out.push_str(&format!("        - \"{resolver}\"\n"));
-                }
+            // Resolvers once, on the first NIC only: netplan takes them
+            // per-interface and the resolver list is not per-family — a second
+            // copy would be the same addresses said twice.
+            if n > 0 {
+                continue;
+            }
+            // The subnet's own resolvers when it names any; otherwise this
+            // node's, at the address this service is already answering on.
+            //
+            // Written whatever the subnet says, and that is the point: a
+            // subnet is created with `dns: []`, so a guest configured from
+            // here used to come up with an address, a gateway and no resolver
+            // at all. It could not install a package or reach a host by name,
+            // which is the first thing anybody tries.
+            let resolvers: Vec<String> = if nic.dns.is_empty() {
+                vec![ADDRESS.to_string()]
+            } else {
+                nic.dns.iter().map(|d| d.to_string()).collect()
+            };
+            out.push_str("    nameservers:\n      addresses:\n");
+            for resolver in &resolvers {
+                out.push_str(&format!("        - \"{resolver}\"\n"));
             }
         }
     }
@@ -559,6 +597,36 @@ mod tests {
         );
     }
 
+    /// A subnet is created with `dns: []`, so a guest configured from here
+    /// used to come up with an address, a gateway and no resolver at all: it
+    /// could not install a package or reach a host by name. Verified the hard
+    /// way, on a real guest that reported `nameserver 127.0.0.53` and could
+    /// resolve nothing.
+    #[test]
+    fn a_guest_whose_subnet_names_no_resolver_is_pointed_at_this_node() {
+        let mut view = guest();
+        view.interfaces[0].dns.clear();
+        let config = render_network_config(&view).expect("a guest with an address gets a config");
+        assert!(
+            config.contains("nameservers:"),
+            "no resolver at all reached the guest:\n{config}"
+        );
+        assert!(
+            config.contains(&format!("- \"{ADDRESS}\"")),
+            "the node's own resolver was not named:\n{config}"
+        );
+
+        // And a subnet that does name one is left alone.
+        let mut named = guest();
+        named.interfaces[0].dns = vec!["10.9.9.9".parse().unwrap()];
+        let config = render_network_config(&named).unwrap();
+        assert!(config.contains("- \"10.9.9.9\""), "{config}");
+        assert!(
+            !config.contains(&ADDRESS.to_string()),
+            "the operator's own resolver was overridden:\n{config}"
+        );
+    }
+
     #[test]
     fn only_the_first_interface_carries_the_default_route() {
         // Two of them, and the guest's egress becomes a race between whichever
@@ -585,6 +653,46 @@ mod tests {
         let document = render_network_config(&v6).unwrap();
         assert!(document.contains("to: \"::/0\""), "{document}");
         assert!(document.contains("- \"fd00:1::10/64\""), "{document}");
+    }
+
+    /// Dual-stack: a guest with a v4 wire and a v6 wire gets both, each with
+    /// its own family's default route.
+    ///
+    /// This is how IPv6 actually reaches a guest here, and it is worth being
+    /// explicit about because it looks like a gap and is not one. There are no
+    /// router advertisements and no DHCPv6 — the address is *written into the
+    /// netplan*, and the guest fetches that netplan from the metadata service
+    /// over its v4 address. Two families, two subnets, two ports, one
+    /// document. Proven on a live cell: the guest answered a ping on
+    /// `fd00:19:136::2`.
+    ///
+    /// What this shape does not reach is a guest with **no** v4 address at
+    /// all: the metadata service listens on a v4 link-local, so such a guest
+    /// cannot fetch the configuration that would give it its v6 address. That
+    /// needs router advertisements, and those belong to whatever holds the
+    /// gateway — the fabric, not this process.
+    #[test]
+    fn a_dual_stack_guest_gets_both_families_and_a_default_route_for_each() {
+        let mut both = guest();
+        let mut v6 = both.interfaces[0].clone();
+        v6.mac = parse_mac("52:54:00:aa:bb:cc");
+        v6.cidr = Some(Cidr::parse("fd00:19:136::2/64").unwrap());
+        v6.gateway = Some("fd00:19:136::1".parse().unwrap());
+        both.interfaces.push(v6);
+
+        let document = render_network_config(&both).unwrap();
+        assert!(document.contains("- \"10.20.0.10/24\""), "{document}");
+        assert!(document.contains("- \"fd00:19:136::2/64\""), "{document}");
+        // One default route per family, and never two of one: a guest with two
+        // v4 defaults has an egress that is a race between whichever the
+        // kernel installed last.
+        assert_eq!(
+            document.matches("to: \"0.0.0.0/0\"").count(),
+            1,
+            "{document}"
+        );
+        assert_eq!(document.matches("to: \"::/0\"").count(), 1, "{document}");
+        assert_eq!(document.matches("macaddress").count(), 2, "{document}");
     }
 
     #[test]

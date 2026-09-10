@@ -47,6 +47,26 @@ if [ -n "$dupes" ]; then
   exit 1
 fi
 echo "no two top-level names collide" >&2
+
+# …and none of them collides with a name the browser already owns.
+#
+# The check above catches two of our own declarations sharing a name. It does
+# not catch one of ours shadowing `window.status`, `window.name` or `window.open`
+# — which is the same failure with a stranger's half of it: `const status = …`
+# reads fine, works fine, and quietly means that `status` is no longer what
+# every other page on the web means by it. Found by running `tsc --checkJs` over
+# the assets, where one such name accounted for thirty of fifty-three errors.
+owned="status name length open close top self parent origin history event screen \
+location focus blur print stop find scroll alert confirm prompt frames navigator \
+external closed opener menubar toolbar statusbar frameElement"
+shadowed=$(grep -haoE '^(function|const|let|var) [A-Za-z_$][A-Za-z0-9_$]*' "$work/console.js" \
+  | awk '{print $2}' | sort -u | grep -Fxw -f <(echo "$owned" | tr ' ' '\n' | grep -v '^$') || true)
+if [ -n "$shadowed" ]; then
+  echo "a top-level name shadows one the browser already owns:" >&2
+  echo "$shadowed" | sed 's/^/  /' >&2
+  exit 1
+fi
+echo "no top-level name shadows a browser global" >&2
 # The suite checks the names the page reads out of an object against the
 # recorded shape of the API's answers — see `shapes.mjs`.
 export CONSOLE_JS="$work/console.js"

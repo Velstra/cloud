@@ -42,7 +42,7 @@
 //! crashed mid-change and an agent that has never run reach the same machine,
 //! which is the only recovery model this crate has.
 
-use std::{collections::BTreeMap, net::Ipv4Addr};
+use std::{collections::BTreeMap, net::IpAddr};
 
 use crate::host::{HostError, Result};
 
@@ -57,8 +57,9 @@ const TABLE: &str = "velstra-localnet";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bridge {
     pub name: String,
-    /// IPv4 only, as `10.19.136.1/24`. The gateway is the only address this
-    /// platform puts on a bridge, so anything else here is something to remove.
+    /// As `10.19.136.1/24` or `fd00:1::1/64`. The gateway is the only address
+    /// this platform puts on a bridge, so anything else here is something to
+    /// remove.
     pub addresses: Vec<String>,
 }
 
@@ -69,13 +70,27 @@ pub struct Segment {
     pub subnet: String,
     /// The address this node holds on the segment — the gateway the guests were
     /// handed. Held here or held by nobody.
-    pub gateway: Ipv4Addr,
+    ///
+    /// Either family. A v6 subnet used to be dropped on the floor here — the
+    /// gateway would not parse as a `Ipv4Addr`, the loop `continue`d, and the
+    /// segment was never built: no bridge, no gateway, no taps enslaved, and
+    /// nothing anywhere saying so. The model, the allocator and the guest's own
+    /// netplan have all handled v6 for as long as they have existed; this was
+    /// the one place that quietly did not.
+    pub gateway: IpAddr,
     /// How much of the world is on the link, from the subnet's CIDR.
     pub prefix_len: u8,
     /// The range, for the one NAT rule.
     pub network: String,
     /// The taps on this node carrying ports on this segment, in port order.
     pub taps: Vec<String>,
+    /// Load-balancer addresses this node answers on for this segment.
+    ///
+    /// Held as host routes on the bridge — `/32`, or `/128` for v6 — because a
+    /// VIP belongs to no broadcast domain: it is an address this machine
+    /// answers for, not one it hands out. Without them on the bridge the
+    /// listener has nothing to bind and the packets never arrive.
+    pub vips: Vec<IpAddr>,
 }
 
 /// One change to the machine: a command and its arguments.
@@ -90,6 +105,29 @@ pub struct LocalNet {
     prefix: String,
     ip: String,
     nft: String,
+    /// Which bridges already have somebody advertising a route on them.
+    ///
+    /// One task per segment, started when the segment first appears and left
+    /// running: an advertiser is cheap and the alternative — starting one per
+    /// pass — is a guest hearing a hundred routers claim the same link.
+    advertising: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The filter ruleset last written, so an unchanged one is not written
+    /// again.
+    ///
+    /// Every other ruleset here is rewritten whole on every pass, on purpose:
+    /// a table assembled by adding and removing rules is one whose state
+    /// depends on every pass that came before. The filter table is the
+    /// exception, and for one reason — **it counts**. `add`/`delete`/rebuild
+    /// re-creates the table, which sets every counter back to zero, so a
+    /// firewall rewritten every few seconds reports that it has never dropped
+    /// anything. Found on a live cell, where the drops were real and the
+    /// number stayed at nought.
+    ///
+    /// A cache, not state that decides anything: if it is wrong the ruleset is
+    /// written again, which is exactly what happens after a restart and costs
+    /// one reset of the counters. What it must never do is *skip* a write that
+    /// was needed, and comparing the whole text is what makes that impossible.
+    filter_in_force: std::sync::Mutex<Option<String>>,
 }
 
 impl LocalNet {
@@ -98,6 +136,8 @@ impl LocalNet {
             prefix: prefix.to_string(),
             ip: "ip".to_string(),
             nft: "nft".to_string(),
+            advertising: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            filter_in_force: std::sync::Mutex::new(None),
         }
     }
 
@@ -153,6 +193,17 @@ impl LocalNet {
                 "dev",
                 &bridge,
             ]));
+            for vip in &segment.vips {
+                // A host route: the address is answered for, not handed out.
+                let width = if vip.is_ipv4() { 32 } else { 128 };
+                steps.push(step([
+                    "addr",
+                    "replace",
+                    &format!("{vip}/{width}"),
+                    "dev",
+                    &bridge,
+                ]));
+            }
             for tap in &segment.taps {
                 steps.push(step(["link", "set", tap, "master", &bridge]));
             }
@@ -167,6 +218,13 @@ impl LocalNet {
     /// all of it" in one atomic load. `oifname != <bridge>` is what keeps a
     /// guest talking to its neighbour on the same segment from being translated
     /// on the way.
+    /// Only the v4 segments are translated, and that is deliberate rather than
+    /// unfinished. Masquerading IPv6 is a thing people do and a thing every
+    /// v6 document asks them not to: the address space exists so that a host
+    /// can be reached, and a private cloud that hides its guests behind one
+    /// address has thrown that away. A v6 segment here gets a bridge, a
+    /// gateway and forwarding — routed, as v6 is meant to be — and reaches
+    /// whatever the node's own routing can reach.
     pub fn ruleset(&self, segments: &[Segment]) -> String {
         let mut out = String::new();
         out.push_str(&format!("add table ip {TABLE}\n"));
@@ -175,7 +233,7 @@ impl LocalNet {
         out.push_str(
             "  chain postrouting {\n    type nat hook postrouting priority srcnat; policy accept;\n",
         );
-        for segment in segments {
+        for segment in segments.iter().filter(|s| s.gateway.is_ipv4()) {
             out.push_str(&format!(
                 "    ip saddr {} oifname != \"{}\" masquerade\n",
                 segment.network,
@@ -269,9 +327,18 @@ impl LocalNet {
                 .find(|s| self.bridge_for(&s.subnet) == bridge.name);
             match wanted {
                 Some(segment) => {
-                    let keep = format!("{}/{}", segment.gateway, segment.prefix_len);
+                    // The gateway, and every balancer address this node is
+                    // answering for. Anything else on one of our bridges is
+                    // something a previous shape left behind.
+                    let mut keep = vec![format!("{}/{}", segment.gateway, segment.prefix_len)];
+                    keep.extend(
+                        segment
+                            .vips
+                            .iter()
+                            .map(|vip| format!("{vip}/{}", if vip.is_ipv4() { 32 } else { 128 })),
+                    );
                     for address in &bridge.addresses {
-                        if address != &keep {
+                        if !keep.contains(address) {
                             steps.push(step(["addr", "del", address, "dev", &bridge.name]));
                         }
                     }
@@ -286,7 +353,17 @@ impl LocalNet {
     ///
     /// In that order on purpose: a segment that is forwarded before it exists is
     /// a window in which the node routes for a range it does not hold.
-    pub async fn apply(&self, segments: &[Segment]) -> Result<()> {
+    ///
+    /// `guarded` is what each port on this node is allowed — see
+    /// [`crate::nftfilter`]. The firewall goes on **before** forwarding, and
+    /// that ordering is the same rule as the one above: a guest that is
+    /// routed for before its rules are in force is a guest that was briefly
+    /// open to everything.
+    pub async fn apply(
+        &self,
+        segments: &[Segment],
+        guarded: &[crate::nftfilter::Guarded],
+    ) -> Result<()> {
         if segments.is_empty() {
             // Still swept, and still rewritten: the last guest leaving a node
             // has to take its NAT rule *and* its bridge with it. "Nothing to do"
@@ -299,6 +376,7 @@ impl LocalNet {
                 }
             }
             self.nft(&self.ruleset(segments)).await?;
+            self.filter(guarded).await?;
             return Ok(());
         }
         // Removals first: a bridge on its way out may be holding the very
@@ -325,7 +403,40 @@ impl LocalNet {
             }
         }
         self.nft(&self.ruleset(segments)).await?;
-        forwarding_on().await
+        self.filter(guarded).await?;
+        forwarding_on().await?;
+        self.advertise(segments);
+        Ok(())
+    }
+
+    /// Say, on each v6 segment this node holds, that this node is the way out.
+    ///
+    /// **Only v6, and only here.** IPv4 needs none of this: a guest gets its
+    /// address and its gateway from DHCP, or from the netplan the metadata
+    /// service hands it. IPv6 has no DHCP in this platform and the metadata
+    /// service listens on a v4 address — so a guest with no v4 address at all
+    /// cannot reach the thing that would tell it what its v6 address is. A
+    /// router advertisement is the one mechanism that breaks that circle.
+    ///
+    /// **Only on this datapath.** An advertisement has to come from the machine
+    /// that holds the gateway. Here it is this node. On a cell whose datapath
+    /// is the fabric it is not, and this function is not called there — a
+    /// router claiming a link it does not route is worse than no router.
+    fn advertise(&self, segments: &[Segment]) {
+        for segment in segments.iter().filter(|s| s.gateway.is_ipv6()) {
+            let device = self.bridge_for(&segment.subnet);
+            {
+                let mut started = self.advertising.lock().expect("the set is never poisoned");
+                if !started.insert(device.clone()) {
+                    continue;
+                }
+            }
+            let std::net::IpAddr::V6(gateway) = segment.gateway else {
+                continue;
+            };
+            let prefix_len = segment.prefix_len;
+            tokio::spawn(crate::ra::serve(device, gateway, prefix_len));
+        }
     }
 
     /// The same, keeping what it said.
@@ -359,6 +470,53 @@ impl LocalNet {
             "`ip {}` failed: {stderr}",
             args.join(" ")
         )))
+    }
+
+    /// Write the per-port firewall, unless it is already what is in force.
+    ///
+    /// See [`LocalNet::filter_in_force`] for why this one table is not
+    /// rewritten every pass like the others.
+    async fn filter(&self, guarded: &[crate::nftfilter::Guarded]) -> Result<()> {
+        let wanted = crate::nftfilter::ruleset(guarded);
+        {
+            let in_force = self
+                .filter_in_force
+                .lock()
+                .expect("the cache is never poisoned");
+            if in_force.as_deref() == Some(wanted.as_str()) {
+                return Ok(());
+            }
+        }
+        self.nft(&wanted).await?;
+        // Only after it took: a remembered ruleset that was never applied is
+        // the one way this cache could skip a write that mattered.
+        *self
+            .filter_in_force
+            .lock()
+            .expect("the cache is never poisoned") = Some(wanted);
+        Ok(())
+    }
+
+    /// The firewall table as `nft` reports it, counters and all.
+    ///
+    /// JSON because the text form is for people: a counter read out of
+    /// `nft list ruleset` by regular expression is a reading that breaks the
+    /// day somebody changes a word.
+    pub async fn filter_counters(&self) -> Result<serde_json::Value> {
+        let out = tokio::process::Command::new("nft")
+            .args(["-j", "list", "table", "inet", crate::nftfilter::TABLE])
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "nft list table: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+            .into());
+        }
+        serde_json::from_slice(&out.stdout).map_err(|e| {
+            std::io::Error::other(format!("nft answered something that is not JSON: {e}")).into()
+        })
     }
 
     async fn nft(&self, ruleset: &str) -> Result<()> {
@@ -400,10 +558,20 @@ impl LocalNet {
 /// Written through `/proc` rather than `sysctl(8)`, which is one fewer binary a
 /// node has to have — and the file is the thing `sysctl` writes anyway.
 async fn forwarding_on() -> Result<()> {
+    // Both families. The v4 knob alone was enough for as long as this datapath
+    // silently dropped every v6 subnet; now that it carries one, a guest on it
+    // would have a gateway that answers and forwards nothing.
     let path = "/proc/sys/net/ipv4/ip_forward";
-    tokio::fs::write(path, b"1\n")
-        .await
-        .map_err(|e| HostError::failed(format!("writing {path}: {e} — this needs CAP_NET_ADMIN")))
+    tokio::fs::write(path, b"1\n").await.map_err(|e| {
+        HostError::failed(format!("writing {path}: {e} — this needs CAP_NET_ADMIN"))
+    })?;
+    // Best effort: a kernel built without IPv6 has no such file, and refusing
+    // to bring a v4 cell up because of that would be the wrong trade.
+    let v6 = "/proc/sys/net/ipv6/conf/all/forwarding";
+    if let Err(e) = tokio::fs::write(v6, b"1\n").await {
+        tracing::debug!(error = %e, "{v6} could not be written; v6 segments will not forward");
+    }
+    Ok(())
 }
 
 fn step<const N: usize>(args: [&str; N]) -> Step {
@@ -435,6 +603,7 @@ pub fn segments(
     subnets: &BTreeMap<String, velstra_cloud_model::resources::Subnet>,
     networks: &BTreeMap<String, velstra_cloud_model::resources::NetworkSpec>,
     taps: &BTreeMap<String, String>,
+    balancers: &[velstra_cloud_model::loadbalancer::LoadBalancer],
 ) -> Vec<Segment> {
     let mut by_subnet: BTreeMap<String, Segment> = BTreeMap::new();
     for (name, port) in ports {
@@ -457,9 +626,15 @@ pub fn segments(
         let Ok(cidr) = velstra_cloud_model::network::Cidr::parse(&subnet.spec.cidr) else {
             continue;
         };
-        let Ok(gateway) = subnet.spec.gateway.parse::<Ipv4Addr>() else {
+        let Ok(gateway) = subnet.spec.gateway.parse::<IpAddr>() else {
             continue;
         };
+        // A gateway of one family on a range of the other is a subnet nobody
+        // could use, and putting it on a bridge would be this node claiming an
+        // address that belongs to neither.
+        if gateway.is_ipv4() != cidr.address.is_ipv4() {
+            continue;
+        }
         let segment = by_subnet
             .entry(port.spec.subnet.clone())
             .or_insert_with(|| Segment {
@@ -468,10 +643,36 @@ pub fn segments(
                 prefix_len: cidr.prefix_len,
                 network: format!("{}/{}", cidr.network(), cidr.prefix_len),
                 taps: Vec::new(),
+                vips: Vec::new(),
             });
         if !segment.taps.iter().any(|t| t == tap) {
             segment.taps.push(tap.clone());
         }
+    }
+    // The balancer addresses that belong to each segment this node holds. A
+    // balancer on a subnet no guest of this node is on is not this node's to
+    // answer for — its VIP belongs wherever its members are.
+    for balancer in balancers {
+        if balancer.meta.deleted_at.is_some() {
+            continue;
+        }
+        let Some(segment) = by_subnet.get_mut(&balancer.spec.subnet) else {
+            continue;
+        };
+        let Some(vip) = balancer
+            .spec
+            .vip
+            .as_ref()
+            .and_then(|v| v.parse::<IpAddr>().ok())
+        else {
+            continue;
+        };
+        if !segment.vips.contains(&vip) {
+            segment.vips.push(vip);
+        }
+    }
+    for segment in by_subnet.values_mut() {
+        segment.vips.sort();
     }
     by_subnet.into_values().collect()
 }
@@ -560,14 +761,11 @@ mod tests {
             ("projects/p/ports/b".to_string(), "vtb".to_string()),
         ]);
 
-        let segments = segments(&ports, &subnets, &logical(), &taps);
+        let segments = segments(&ports, &subnets, &logical(), &taps, &[]);
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].taps, ["vta", "vtb"]);
         assert_eq!(segments[0].network, "10.42.0.0/24");
-        assert_eq!(
-            segments[0].gateway,
-            "10.42.0.1".parse::<Ipv4Addr>().unwrap()
-        );
+        assert_eq!(segments[0].gateway, "10.42.0.1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -585,7 +783,7 @@ mod tests {
             ("projects/p/ports/b".to_string(), "vtb".to_string()),
         ]);
 
-        let segments = segments(&ports, &subnets, &logical(), &taps);
+        let segments = segments(&ports, &subnets, &logical(), &taps, &[]);
         assert_eq!(segments.len(), 2);
         let bridges: Vec<String> = segments
             .iter()
@@ -605,7 +803,7 @@ mod tests {
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
-        assert!(segments(&ports, &subnets, &logical(), &taps).is_empty());
+        assert!(segments(&ports, &subnets, &logical(), &taps, &[]).is_empty());
     }
 
     /// A port the fabric carries, or one on another node, has no tap here.
@@ -618,7 +816,7 @@ mod tests {
             "10.42.0.2",
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
-        assert!(segments(&ports, &subnets, &logical(), &BTreeMap::new()).is_empty());
+        assert!(segments(&ports, &subnets, &logical(), &BTreeMap::new(), &[]).is_empty());
     }
 
     /// The picture comes from the **ports**, not from running guests — which is
@@ -634,7 +832,7 @@ mod tests {
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
-        assert_eq!(segments(&ports, &subnets, &logical(), &taps).len(), 1);
+        assert_eq!(segments(&ports, &subnets, &logical(), &taps, &[]).len(), 1);
     }
 
     /// Every step has to survive being run on a machine already in the state it
@@ -648,7 +846,7 @@ mod tests {
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
-        let segments = segments(&ports, &subnets, &logical(), &taps);
+        let segments = segments(&ports, &subnets, &logical(), &taps, &[]);
         let net = net();
         assert_eq!(net.plan(&segments), net.plan(&segments));
 
@@ -682,7 +880,7 @@ mod tests {
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
-        let full = net.ruleset(&segments(&ports, &subnets, &logical(), &taps));
+        let full = net.ruleset(&segments(&ports, &subnets, &logical(), &taps, &[]));
         assert!(full.contains("ip saddr 10.42.0.0/24"), "{full}");
         // Added before deleted, or the delete fails on a node where the table
         // was never there.
@@ -752,12 +950,12 @@ mod on_the_machines_own_wire {
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
 
         // On an ordinary network this node is the first hop.
-        assert_eq!(segments(&ports, &subnets, &logical(), &taps).len(), 1);
+        assert_eq!(segments(&ports, &subnets, &logical(), &taps, &[]).len(), 1);
 
         // On the machine's own wire it is nothing at all — no bridge of ours, no
         // address on it, and no rule in the NAT table.
         let host = on_a_host_bridge("projects/p/networks/n");
-        let segments = segments(&ports, &subnets, &host, &taps);
+        let segments = segments(&ports, &subnets, &host, &taps, &[]);
         assert!(segments.is_empty(), "{segments:?}");
         assert!(!net().ruleset(&segments).contains("masquerade"));
     }
@@ -771,7 +969,7 @@ mod the_datapath_has_to_take_things_away_too {
         LocalNet::new("vbr")
     }
 
-    fn segment(subnet: &str, gateway: &str) -> Segment {
+    pub(crate) fn segment(subnet: &str, gateway: &str) -> Segment {
         Segment {
             subnet: subnet.to_string(),
             gateway: gateway.parse().unwrap(),
@@ -781,10 +979,11 @@ mod the_datapath_has_to_take_things_away_too {
                 gateway.rsplit_once('.').unwrap().0.to_string() + ".0"
             ),
             taps: Vec::new(),
+            vips: Vec::new(),
         }
     }
 
-    fn bridge(name: &str, addresses: &[&str]) -> Bridge {
+    pub(crate) fn bridge(name: &str, addresses: &[&str]) -> Bridge {
         Bridge {
             name: name.to_string(),
             addresses: addresses.iter().map(|a| a.to_string()).collect(),
@@ -882,5 +1081,232 @@ mod the_datapath_has_to_take_things_away_too {
             net.removals(std::slice::from_ref(&wanted), &observed),
             net.removals(&[wanted], &observed)
         );
+    }
+}
+
+#[cfg(test)]
+mod v6_tests {
+    use super::{tests::*, *};
+
+    /// A v6 subnet used to be dropped on the floor: the gateway would not parse
+    /// as an `Ipv4Addr`, the loop moved on, and the segment was never built —
+    /// no bridge, no gateway, no taps enslaved, and nothing anywhere saying so.
+    /// The model, the allocator and the guest's own netplan have all handled v6
+    /// for as long as they have existed; this was the one place that quietly
+    /// did not.
+    #[test]
+    fn a_v6_subnet_gets_a_segment_like_any_other() {
+        let ports = BTreeMap::from([port(
+            "projects/p/ports/a",
+            "projects/p/subnets/s6",
+            "fd00:1::10",
+        )]);
+        let subnets = BTreeMap::from([subnet("projects/p/subnets/s6", "fd00:1::/64", "fd00:1::1")]);
+        let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vtap1".to_string())]);
+
+        let segments = segments(&ports, &subnets, &logical(), &taps, &[]);
+        assert_eq!(segments.len(), 1, "a v6 subnet was skipped: {segments:?}");
+        assert_eq!(segments[0].gateway.to_string(), "fd00:1::1");
+        assert_eq!(segments[0].prefix_len, 64);
+        assert_eq!(segments[0].taps, vec!["vtap1".to_string()]);
+    }
+
+    /// And it is **routed**, not translated. Masquerading IPv6 is a thing
+    /// people do and a thing every v6 document asks them not to: the address
+    /// space exists so a host can be reached, and a cloud that hides its guests
+    /// behind one address has thrown that away.
+    #[test]
+    fn a_v6_segment_is_routed_and_not_translated() {
+        let net = LocalNet::new("vt");
+        let v6 = Segment {
+            subnet: "projects/p/subnets/s6".into(),
+            gateway: "fd00:1::1".parse().unwrap(),
+            prefix_len: 64,
+            network: "fd00:1::/64".into(),
+            taps: vec!["vtap1".into()],
+            vips: Vec::new(),
+        };
+        let v4 = Segment {
+            subnet: "projects/p/subnets/s4".into(),
+            gateway: "10.19.136.1".parse().unwrap(),
+            prefix_len: 24,
+            network: "10.19.136.0/24".into(),
+            taps: vec!["vtap2".into()],
+            vips: Vec::new(),
+        };
+        let rules = net.ruleset(&[v6, v4]);
+        assert!(
+            rules.contains("ip saddr 10.19.136.0/24"),
+            "the v4 segment lost its translation: {rules}"
+        );
+        assert!(
+            !rules.contains("fd00:1::/64"),
+            "a v6 range was put behind NAT: {rules}"
+        );
+    }
+
+    /// A gateway of one family on a range of the other is a subnet nobody could
+    /// use, and putting it on a bridge would be this node claiming an address
+    /// belonging to neither.
+    #[test]
+    fn a_gateway_of_the_wrong_family_builds_nothing() {
+        let ports = BTreeMap::from([port(
+            "projects/p/ports/a",
+            "projects/p/subnets/s6",
+            "fd00:1::10",
+        )]);
+        let subnets = BTreeMap::from([subnet(
+            "projects/p/subnets/s6",
+            "fd00:1::/64",
+            "10.19.136.1",
+        )]);
+        let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vtap1".to_string())]);
+        assert!(segments(&ports, &subnets, &logical(), &taps, &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod balancer_addresses {
+    use super::{
+        tests::*,
+        the_datapath_has_to_take_things_away_too::{bridge, segment},
+        *,
+    };
+
+    fn a_balancer(subnet: &str, vip: &str) -> velstra_cloud_model::loadbalancer::LoadBalancer {
+        velstra_cloud_model::resources::Resource::new(
+            velstra_cloud_model::meta::Meta::new(
+                "projects/p/load-balancers/web".parse().unwrap(),
+                velstra_cloud_model::meta::Placement::new("eu", "cell-1"),
+            ),
+            velstra_cloud_model::loadbalancer::LoadBalancerSpec {
+                network: "projects/p/networks/n".into(),
+                subnet: subnet.to_string(),
+                vip: Some(vip.to_string()),
+                listeners: Vec::new(),
+                members: Vec::new(),
+            },
+            Default::default(),
+        )
+    }
+
+    /// A balancer's address goes on the bridge of the segment it belongs to, as
+    /// a host route: it is an address this machine answers for, not one it
+    /// hands out. Without it the listener has nothing to bind and the packets
+    /// never arrive.
+    #[test]
+    fn a_balancers_address_is_held_on_the_bridge() {
+        let ports = BTreeMap::from([port(
+            "projects/p/ports/a",
+            "projects/p/subnets/s",
+            "10.42.0.2",
+        )]);
+        let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
+        let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vtap1".to_string())]);
+
+        let segments = segments(
+            &ports,
+            &subnets,
+            &logical(),
+            &taps,
+            &[a_balancer("projects/p/subnets/s", "10.42.0.9")],
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].vips.len(), 1);
+
+        let plan = LocalNet::new("vt").plan(&segments);
+        let flat: Vec<String> = plan.iter().map(|s| s.join(" ")).collect();
+        assert!(
+            flat.iter().any(|s| s.contains("addr replace 10.42.0.9/32")),
+            "the balancer's address is not held: {flat:?}"
+        );
+    }
+
+    /// And the sweep leaves it there. The removal rule takes off anything on
+    /// one of our bridges that is not the gateway — which, before it knew about
+    /// balancers, meant the address went on in one step and came off in the
+    /// next, for ever.
+    #[test]
+    fn the_sweep_does_not_take_a_balancers_address_back_off() {
+        let net = LocalNet::new("vt");
+        let mut segment = segment("projects/p/subnets/s", "10.42.0.1");
+        segment.vips = vec!["10.42.0.9".parse().unwrap()];
+        let held = bridge(
+            &net.bridge_for("projects/p/subnets/s"),
+            &["10.42.0.1/24", "10.42.0.9/32"],
+        );
+
+        let steps = net.removals(std::slice::from_ref(&segment), &[held]);
+        let flat: Vec<String> = steps.iter().map(|s| s.join(" ")).collect();
+        assert!(
+            !flat.iter().any(|s| s.contains("10.42.0.9")),
+            "the sweep took the balancer's address off again: {flat:?}"
+        );
+
+        // A stale address that belongs to nothing still goes.
+        let stale = bridge(
+            &net.bridge_for("projects/p/subnets/s"),
+            &["10.42.0.1/24", "10.42.0.9/32", "10.9.9.9/32"],
+        );
+        let steps = net.removals(&[segment], &[stale]);
+        let flat: Vec<String> = steps.iter().map(|s| s.join(" ")).collect();
+        assert!(flat.iter().any(|s| s.contains("10.9.9.9")), "{flat:?}");
+    }
+
+    /// A balancer on a subnet no guest of this node is on is not this node's to
+    /// answer for: its address belongs wherever its members are.
+    #[test]
+    fn a_balancer_elsewhere_is_not_held_here() {
+        let ports = BTreeMap::from([port(
+            "projects/p/ports/a",
+            "projects/p/subnets/s",
+            "10.42.0.2",
+        )]);
+        let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
+        let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vtap1".to_string())]);
+        let segments = segments(
+            &ports,
+            &subnets,
+            &logical(),
+            &taps,
+            &[a_balancer("projects/p/subnets/somewhere-else", "10.99.0.9")],
+        );
+        assert!(segments[0].vips.is_empty());
+    }
+    /// An unchanged firewall is not written again — because writing it resets
+    /// every counter, and a counter that resets every few seconds is a
+    /// firewall that reports it has never dropped anything.
+    #[tokio::test]
+    async fn an_unchanged_firewall_is_not_rewritten() {
+        let mut net = LocalNet::new("vt");
+        // A program that cannot be run: the first write fails, so nothing is
+        // remembered, and the second must try again rather than conclude the
+        // ruleset is in force.
+        net.nft = "/nonexistent/bin/nft".to_string();
+        let guarded = vec![crate::nftfilter::Guarded {
+            port: "projects/p1/ports/web".into(),
+            tap: "vtweb1a2b".into(),
+            addresses: vec!["10.19.136.5".into()],
+            rules: vec![velstra_cloud_model::security::ResolvedRule {
+                direction: velstra_cloud_model::security::Direction::Ingress,
+                protocol: velstra_cloud_model::security::Protocol::Tcp,
+                ports: Some(velstra_cloud_model::security::PortRange { from: 443, to: 443 }),
+                remote: "0.0.0.0/0".into(),
+            }],
+        }];
+        assert!(net.filter(&guarded).await.is_err());
+        assert!(
+            net.filter(&guarded).await.is_err(),
+            "a write that failed was remembered as in force"
+        );
+
+        // And a write that took is remembered, so the same ruleset costs
+        // nothing on the next pass.
+        net.nft = "true".to_string();
+        net.filter(&guarded).await.expect("this one takes");
+        net.nft = "/nonexistent/bin/nft".to_string();
+        net.filter(&guarded)
+            .await
+            .expect("an unchanged ruleset was written again");
     }
 }

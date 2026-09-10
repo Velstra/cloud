@@ -177,7 +177,7 @@ function pendingChanges(r) {
   // nothing in between — and the API was the one that did not have it, so the
   // board could not show what the sheet knew. The API answers it now, on every
   // read, and this renders the answer.
-  const answered = at(status(r), "pendingChanges");
+  const answered = at(statusOf(r), "pendingChanges");
   if (!Array.isArray(answered)) return [];
   const labels = { vcpus: "vCPU", memoryMib: "Memory", rootDiskGib: "Root disk" };
   return answered.map((c) => ({
@@ -189,7 +189,7 @@ function pendingChanges(r) {
 
 /// A node's PCI devices, each with what it drags along.
 function passableBlock(r) {
-  const devices = at(status(r), "pciDevices");
+  const devices = at(statusOf(r), "pciDevices");
   if (!Array.isArray(devices) || !devices.length) return null;
   return el("div.pending",
     el("div.why.muted",
@@ -261,7 +261,7 @@ function agreementTable(coll, r) {
   let any = false;
   for (const a of coll.agreements) {
     const asked = at(spec(r), a.asked);
-    const is = at(status(r), a.is);
+    const is = at(statusOf(r), a.is);
     const empty = (x) => x === null || x === undefined || x === "";
     if (empty(asked) && empty(is)) continue;
     any = true;
@@ -374,7 +374,7 @@ function specTable(coll, r) {
 function statusTable(r) {
   const table = el("table.kv");
   const body = el("tbody");
-  for (const [k, v] of Object.entries(status(r))) {
+  for (const [k, v] of Object.entries(statusOf(r))) {
     if (k === "conditions" || k === "observedGeneration" || k === "observed_generation") continue;
     // A millisecond timestamp reads as one wherever the name says "when":
     // `startedAt`, `lastHeartbeat`, and a user's `lastLogin` — which showed as
@@ -415,7 +415,7 @@ function conditionAge(c) {
 }
 
 function conditionsTable(r) {
-  const cs = pick(status(r), "conditions") || [];
+  const cs = pick(statusOf(r), "conditions") || [];
   if (!cs.length) return el("p.faint", "No conditions have been written yet.");
   const table = el("table.conds",
     el("thead", el("tr",
@@ -504,7 +504,7 @@ async function historyInto(host, name) {
     const { operations, refusals } = await historyOf(name);
     const lines = [];
     for (const o of operations) {
-      const s = status(o);
+      const s = statusOf(o);
       const at = pick(s, "finishedAt") || pick(meta(o), "createdAt");
       lines.push({
         at: Number(at || 0),
@@ -692,16 +692,15 @@ function deleteControl(coll, r, opts = {}) {
         ? el("p" + (opts.grave ? ".err" : ".muted"), { id: "deletewarning" }, opts.warning)
         : el("span.muted", verb + " " + idOf(r) + "? "),
       el("span.btns",
-        el("button.btn.quiet", { type: "button", id: "confirmdelete", onclick: go }, verb),
-        el("button.btn", { type: "button", onclick: rest }, "Keep")));
+        btn(verb, { quiet: true, id: "confirmdelete", onclick: go }),
+        btn("Keep", { onclick: rest })));
   };
   const rest = () => fill(host,
-    el("button.btn.quiet", { type: "button", id: "deletebtn", onclick: ask }, verb));
+    btn(verb, { quiet: true, id: "deletebtn", onclick: ask }));
   const go = async () => {
     // Say so while it runs: a delete that answers in a second reads as one
     // that did nothing until the row is gone.
-    const pressed = host.querySelector("#confirmdelete");
-    if (pressed) { pressed.disabled = true; pressed.classList.add("busy"); pressed.textContent = "Deleting…"; }
+    working(host.querySelector("#confirmdelete"));
     try {
       await remove(coll, idOf(r), revision(r));
       toast(opts.done || "Deletion asked for. It stays visible until its finalizers let go.");
@@ -729,11 +728,10 @@ function credentialControl(coll, r) {
       "Mint a new token for " + id + "? The one it has now keeps working until " +
       "this " + coll.singular + " is deleted — this issues, it does not revoke. "),
     el("span.btns",
-      el("button.btn.quiet", { type: "button", id: "confirmissuecred", onclick: go }, "Issue"),
-      el("button.btn", { type: "button", onclick: rest }, "Keep the old one")));
+      btn("Issue", { quiet: true, id: "confirmissuecred", onclick: go }),
+      btn("Keep the old one", { onclick: rest })));
   const rest = () => fill(host,
-    el("button.btn.quiet", { type: "button", id: "issuecredbtn", onclick: ask },
-      "New agent token"));
+    btn("New agent token", { quiet: true, id: "issuecredbtn", onclick: ask }));
   const go = async () => {
     try {
       const answer = await issueCredential(coll, id);
@@ -760,7 +758,7 @@ function renderSheet(coll, r) {
     el("div.grow",
       el("h2", idOf(r)),
       el("p.faint.mono", { title: nameOf(r) }, coll.singular + " · " + nameOf(r))),
-    el("button.btn", { type: "button", id: "closesheet", onclick: closeSheet }, "Close")));
+    btn("Close", { id: "closesheet", onclick: closeSheet })));
 
   const acts = el("div.sheetacts");
   // Objects whose fields are the cell's even when a tenant may open the sheet:
@@ -775,23 +773,23 @@ function renderSheet(coll, r) {
   // gets neither. Drawn from `whoami`, so the button that appears is one
   // that will be accepted.
   if (coll.editable && holdsThePen && allows("edit")) {
-    acts.appendChild(el("button.btn.primary", { type: "button", id: "editbtn",
-      onclick: () => openEdit(coll, r) }, "Edit"));
+    acts.appendChild(btn("Edit", { primary: true, id: "editbtn", onclick: () => openEdit(coll, r) }));
   }
   // Placement is a statement about the machine room, and the API refuses the
   // verb to anybody who cannot see machines — so the button only exists where
   // pressing it answers.
   if (coll.explainable && session.who && session.who.cellAdmin) {
-    acts.appendChild(el("button.btn", { type: "button", id: "explainbtn",
-      onclick: () => explainInto($("explain"), coll, r) }, "Explain placement"));
+    acts.appendChild(btn("Explain placement", {
+    id: "explainbtn",
+    onclick: () => explainInto($("explain"), coll, r),
+  }));
   }
   // A password is not a field on this sheet and cannot be: the platform stores
   // a hash and cannot show one. Setting it is therefore an *action*, next to the
   // others, rather than a control that would have to render a value it has no
   // way to read.
   if (coll.id === "users") {
-    acts.appendChild(el("button.btn", { type: "button", id: "setpasswordbtn",
-      onclick: () => openPasswordDialog(idOf(r)) }, "Set password"));
+    acts.appendChild(btn("Set password", { id: "setpasswordbtn", onclick: () => openPasswordDialog(idOf(r)) }));
   }
   // A machine that already exists, and a credential it needs now. Registration
   // mints one and the platform keeps only a hash, which is right for a secret
@@ -875,8 +873,11 @@ function renderSheet(coll, r) {
     // framebuffer at sheet width is a postage stamp, and unlike the serial
     // console — whose last lines are useful at any size — a screen you cannot
     // read is not a smaller version of the feature.
-    host.appendChild(el("button.btn.quiet", { type: "button", id: "screenbtn",
-      onclick: () => { closeSheet(); showScreen(nameOf(r)); } }, "Open screen"));
+    host.appendChild(btn("Open screen", {
+    quiet: true,
+    id: "screenbtn",
+    onclick: () => { closeSheet(); showScreen(nameOf(r)); },
+  }));
   }
 
   const pairs = agreementTable(coll, r);

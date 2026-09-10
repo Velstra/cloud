@@ -600,6 +600,36 @@ async fn fetch_http(url: &str, dest: &Path) -> Result<()> {
 /// Fetching them is [`fetch_image`]'s job; this one's is to refuse to boot
 /// anything it has not hashed itself. Identical on both backends because it is
 /// about bytes on a disk and not about a hypervisor.
+/// Remove a published image from this node.
+///
+/// Nothing did this before: a hypervisor's cache grew with every distinct
+/// image ever booted on it and never shrank, on the filesystem that also holds
+/// every guest's root disk.
+pub fn forget_image(layout: &Layout, stored_as: &str) -> Result<()> {
+    let path = layout.image_dir.join(stored_as);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            tracing::info!(image = stored_as, "removed a cached image");
+            Ok(())
+        }
+        // Already gone is the answer, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(HostError::failed(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// How long ago a cached image was last written, in seconds.
+///
+/// The publish time in practice: nothing touches the file afterwards, so this
+/// is "how long since this node fetched it" rather than "how long since a
+/// guest used it". Said plainly because the difference decides what the sweep
+/// above means — a base image booted daily for a year still reads as a year
+/// old, and is kept only because something references it.
+pub fn image_age_seconds(layout: &Layout, stored_as: &str) -> Option<u64> {
+    let at = std::fs::metadata(layout.image_dir.join(stored_as)).ok()?;
+    at.modified().ok()?.elapsed().ok().map(|d| d.as_secs())
+}
+
 pub async fn publish_image(layout: &Layout, image: &str, digest: &str) -> Result<()> {
     let expected = digest_of(digest).ok_or_else(|| {
         HostError::failed(format!(
@@ -619,10 +649,22 @@ pub async fn publish_image(layout: &Layout, image: &str, digest: &str) -> Result
     }
     let actual = sha256_file(&incoming).await?;
     if actual != expected {
-        // Leave the bad copy where it is: deleting it destroys the evidence of
-        // whatever produced it.
+        // Kept, but out of the way. Leaving it under the name it was fetched
+        // as bricked that image on that node for good: the next pass found an
+        // incoming copy, hashed the same wrong bytes, refused again, and the
+        // only way out was somebody deleting a file by hand. Moved aside, the
+        // evidence survives and the next fetch has somewhere to land.
+        //
+        // One rejected copy per image, overwritten: a node that kept every bad
+        // download of a bad mirror would fill the disk the guests live on.
+        let rejected = incoming.with_extension("rejected");
+        if let Err(e) = std::fs::rename(&incoming, &rejected) {
+            tracing::warn!(error = %e, image, "could not set the bad copy aside");
+        }
         return Err(HostError::failed(format!(
-            "{image} hashed to {actual}, not {expected}"
+            "{image} hashed to {actual}, not {expected}. The copy is kept as {} and the next \
+             fetch starts again.",
+            rejected.display()
         )));
     }
     std::fs::create_dir_all(&layout.image_dir)?;
@@ -665,6 +707,34 @@ async fn convert_to_raw(from: &Path, to: &Path) -> Result<()> {
         from.display(),
         String::from_utf8_lossy(&out.stderr).trim()
     )))
+}
+
+/// Grow a root disk that already exists to `gib`, and never shrink it.
+///
+/// A raw file, so growing it is making it longer: the bytes past the old end
+/// read as zeroes and the filesystem inside grows into them when the guest
+/// next looks. Sparse, so the space is not spent until it is written.
+///
+/// Silent when the disk is already that big or bigger — including when it is
+/// *bigger*, which is what a shrink would be, and which this refuses to do
+/// rather than destroying the filesystem living on it.
+pub async fn grow_disk(layout: &Layout, instance: &str, gib: u64) -> Result<()> {
+    let path = layout.disk(instance);
+    let want = gib.saturating_mul(1024 * 1024 * 1024);
+    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    let now = file.metadata()?.len();
+    if now >= want {
+        return Ok(());
+    }
+    file.set_len(want)?;
+    file.sync_all()?;
+    tracing::info!(
+        instance,
+        from_gib = now / (1024 * 1024 * 1024),
+        to_gib = gib,
+        "grew a root disk"
+    );
+    Ok(())
 }
 
 pub async fn create_disk(
@@ -1421,5 +1491,141 @@ mod trimming_the_console {
             "half a line survived: {second_line:?}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+// ---- what a guest is using -------------------------------------------------
+
+/// One reading of a host process, from `/proc`.
+///
+/// Two numbers, and both are what the *host* sees: CPU time the kernel has
+/// charged to the VMM process, and how much memory it is actually holding.
+/// Neither is what the guest believes about itself, and that is deliberate —
+/// the guest's own belief needs an agent inside it, and the host's view is the
+/// one that decides whether a node is full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessSample {
+    /// User + system time, in milliseconds.
+    pub cpu_ms: u64,
+    /// Resident set size, in mebibytes.
+    pub memory_mib: u64,
+}
+
+/// Read one process's CPU time and resident memory.
+///
+/// `None` when the process is gone or `/proc` is not readable — a machine
+/// where this cannot be answered reports nothing rather than zero, because a
+/// zero reads as "idle" and idle is a decision somebody makes on.
+pub fn sample_process(pid: u32) -> Option<ProcessSample> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field can hold spaces and brackets, so the fields after it are
+    // found from the *last* `)` rather than by splitting the whole line — the
+    // classic way to misparse this file.
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After the `)` the first field is `state`, so utime is index 11 and stime
+    // 12 counting from there (fields 14 and 15 of the file, one-based).
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(ProcessSample {
+        // Ticks are hundredths of a second, so a tick is ten milliseconds.
+        cpu_ms: (utime + stime).saturating_mul(1000 / USER_HZ),
+        // From `status` rather than from `stat`'s page count: `VmRSS` is
+        // already in kibibytes, which spares this a page-size lookup and the
+        // one unsafe call it would need.
+        memory_mib: resident_kib(pid)? / 1024,
+    })
+}
+
+/// Ticks per second, as `/proc` reports CPU time.
+///
+/// A constant of the Linux userspace ABI rather than of the kernel's own
+/// timer: `/proc` has reported in hundredths of a second since it existed, and
+/// changing `CONFIG_HZ` does not change it. Reading it at runtime would mean
+/// an unsafe call for a number that cannot vary.
+const USER_HZ: u64 = 100;
+
+/// Resident memory in kibibytes, from `/proc/<pid>/status`.
+fn resident_kib(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Bytes and packets across one link, from `sysfs`.
+///
+/// Counted at the **host** end of the tap, so "received" here is what the
+/// guest sent. Named from the guest's side anyway, because that is whose
+/// traffic a person is asking about — see [`link_counters`]'s caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkCounters {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+}
+
+/// Read one network device's counters. `None` when the device is not there.
+pub fn link_counters(device: &str) -> Option<LinkCounters> {
+    // A device name comes from this node's own datapath, never from a request
+    // — but it becomes a path, so a name that could climb out of the
+    // directory is refused rather than trusted.
+    if device.is_empty() || device.contains('/') || device.contains("..") {
+        return None;
+    }
+    let read = |what: &str| -> Option<u64> {
+        std::fs::read_to_string(format!("/sys/class/net/{device}/statistics/{what}"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some(LinkCounters {
+        rx_bytes: read("rx_bytes")?,
+        tx_bytes: read("tx_bytes")?,
+        rx_packets: read("rx_packets")?,
+        tx_packets: read("tx_packets")?,
+    })
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    /// This process is one `/proc` certainly has, so the parse is exercised
+    /// against a real file rather than a fixture that agrees with the parser.
+    #[test]
+    fn a_running_process_reads_back_with_memory() {
+        let me = sample_process(std::process::id()).expect("this process is in /proc");
+        assert!(
+            me.memory_mib > 0,
+            "a running test binary holds no resident memory: {me:?}"
+        );
+    }
+
+    /// And one that is not there answers nothing rather than zero.
+    #[test]
+    fn a_process_that_is_gone_reads_as_nothing() {
+        // A pid above the kernel's maximum cannot exist.
+        assert_eq!(sample_process(u32::MAX), None);
+    }
+
+    /// The loopback device exists on every machine this runs on.
+    #[test]
+    fn a_real_link_reads_back() {
+        assert!(link_counters("lo").is_some(), "no counters for lo");
+        assert_eq!(link_counters("no-such-device-here"), None);
+    }
+
+    /// A name that could climb out of `/sys/class/net` is refused before it
+    /// becomes a path.
+    #[test]
+    fn a_device_name_cannot_escape_its_directory() {
+        assert_eq!(link_counters("../../etc"), None);
+        assert_eq!(link_counters(""), None);
     }
 }

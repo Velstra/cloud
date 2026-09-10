@@ -380,8 +380,11 @@ impl Vmm for CloudHypervisorVmm {
         for entry in hostfs::read_dir_names(&self.layout.run_dir)? {
             let instance = unslug(&entry);
             let dir = self.layout.run_dir.join(&entry);
-            if dir.join("root.raw").exists() {
+            let disk = dir.join("root.raw");
+            if disk.exists() {
                 host.disks.insert(instance.clone());
+                host.disk_gib
+                    .insert(instance.clone(), hostfs::disk_gib(&disk));
             }
             if hostfs::unit_is_active(self.layout.scope, &self.send_unit(&instance)).await {
                 host.sending.insert(instance.clone());
@@ -490,6 +493,26 @@ impl Vmm for CloudHypervisorVmm {
         let source = hostfs::image_path(&self.layout, image);
         hostfs::create_disk(&self.layout, instance, gib, source.as_deref(), format).await
     }
+    async fn grow_disk(&self, instance: &str, gib: u64) -> Result<()> {
+        hostfs::grow_disk(&self.layout, instance, gib).await
+    }
+    async fn forget_image(&self, stored_as: &str) -> Result<()> {
+        hostfs::forget_image(&self.layout, stored_as)
+    }
+
+    async fn image_age_seconds(&self, stored_as: &str) -> Option<u64> {
+        hostfs::image_age_seconds(&self.layout, stored_as)
+    }
+
+    /// **Untested against a live VMM;** the reply shape it reads is tested
+    /// against bytes in [`disk_traffic_of`].
+    async fn disk_traffic(&self, instance: &str) -> Option<crate::host::DiskTraffic> {
+        let body = self
+            .api(instance, "GET", "/api/v1/vm.counters", "")
+            .await
+            .ok()?;
+        Some(disk_traffic_of(&body))
+    }
 
     /// Covered by `tests/cloud_hypervisor_boots_a_guest.rs`, which starts a real guest and
     /// reads its console: "running" is what a VMM reports for a machine that
@@ -575,6 +598,7 @@ impl Vmm for CloudHypervisorVmm {
         volume: &str,
         at: &str,
         read_only: bool,
+        limits: velstra_cloud_model::throttle::Limits,
     ) -> Result<String> {
         // `at`, not a path derived from the guest's directory. The version that
         // derived one built `…/<guest>/<volume>` — a path nothing ever writes —
@@ -582,11 +606,20 @@ impl Vmm for CloudHypervisorVmm {
         // does not know whether a volume is a file, a logical volume or an RBD
         // image, and is not in a position to guess.
         let _ = (instance, volume);
-        let body = serde_json::json!({
+        let mut disk = serde_json::json!({
             "path": at,
             "readonly": read_only,
-        })
-        .to_string();
+        });
+        // The ceiling, if there is one. Cloud Hypervisor takes it on the disk
+        // itself rather than as a later call, so it is set here and at no
+        // other moment — which is why a changed ceiling reaches a guest at its
+        // next attach and not before. The attachment's own doc says so.
+        if !limits.is_unlimited()
+            && let Some(rate) = rate_limiter(limits)
+        {
+            disk["rate_limiter_config"] = rate;
+        }
+        let body = disk.to_string();
         let response = self
             .api(instance, "PUT", "/api/v1/vm.add-disk", &body)
             .await?;
@@ -1001,6 +1034,45 @@ fn parse_response(raw: &[u8]) -> Result<String> {
 /// it was given. The volume is read back from that path rather than from an id,
 /// because this backend has no node-names: the path *is* the identity, and it is
 /// the one the pool published.
+/// Cloud Hypervisor's `rate_limiter_config`, from what the attachment says.
+///
+/// A token bucket per second: `size` is the budget and `refill_time` the
+/// millisecond window it refills over, so a one-second window makes the number
+/// read as "per second" — which is what the platform's units mean.
+///
+/// `None` when there is nothing to say, so the caller never writes an empty
+/// limiter onto a disk. An empty one is not the same as none: the VMM reads a
+/// present bucket of zero as a disk that may do nothing at all.
+fn rate_limiter(limits: velstra_cloud_model::throttle::Limits) -> Option<serde_json::Value> {
+    let mut config = serde_json::Map::new();
+    // One bandwidth bucket, and it has to carry reads and writes together
+    // because that is all the VMM offers here. The larger of the two is the
+    // honest reading of a pair of one-directional limits under one bucket:
+    // taking the smaller would throttle the direction nobody limited.
+    let mibps = limits.read_mibps.max(limits.write_mibps);
+    if mibps > 0 {
+        config.insert(
+            "bandwidth".into(),
+            serde_json::json!({
+                "size": u64::from(mibps) * 1024 * 1024,
+                "one_time_burst": 0,
+                "refill_time": 1_000,
+            }),
+        );
+    }
+    if limits.iops > 0 {
+        config.insert(
+            "ops".into(),
+            serde_json::json!({
+                "size": u64::from(limits.iops),
+                "one_time_burst": 0,
+                "refill_time": 1_000,
+            }),
+        );
+    }
+    (!config.is_empty()).then_some(serde_json::Value::Object(config))
+}
+
 fn open_volumes(body: &str) -> Vec<(String, String)> {
     let Ok(info) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
@@ -1263,7 +1335,19 @@ mod tests {
             vmm.observe().await.unwrap().images.is_empty(),
             "a node cached bytes it had not verified"
         );
-        assert!(arrived.exists(), "the evidence was deleted");
+        // Kept, but out of the way. Left under the name it was fetched as, the
+        // next pass hashed the same wrong bytes and refused again for ever —
+        // that image was bricked on that node until somebody deleted a file by
+        // hand. Moved aside, the evidence survives and a retry has somewhere
+        // to land.
+        assert!(
+            !arrived.exists(),
+            "a bad copy still blocks the name it came under"
+        );
+        assert!(
+            arrived.with_extension("rejected").exists(),
+            "the evidence was deleted rather than set aside"
+        );
     }
 
     #[tokio::test]
@@ -1506,5 +1590,112 @@ mod tests {
         assert!(size_of(r#"{"config":{"cpus":{}}}"#, 40).is_none());
         assert!(size_of(r#"{"config":{"cpus":{"boot_vcpus":4}}}"#, 40).is_none());
         assert!(size_of("not json at all", 40).is_none());
+    }
+}
+
+/// `vm.counters`, added up.
+///
+/// This backend answers with an object keyed by device id, each holding its own
+/// counters — a different shape from QEMU's list, which is why the two are
+/// parsed in two places rather than through one type that would have to be
+/// wrong for one of them.
+///
+/// Every device, including the root disk: it is a disk this guest is using, and
+/// leaving it out would answer "no disk traffic" about a guest that does
+/// nothing but write to it. Names vary by version (`read_bytes`, `_disk0_read_bytes`),
+/// so the counters are matched by what their key *ends* with.
+pub fn disk_traffic_of(body: &str) -> crate::host::DiskTraffic {
+    let mut out = crate::host::DiskTraffic::default();
+    let Ok(answer) = serde_json::from_str::<serde_json::Value>(body) else {
+        return out;
+    };
+    let Some(devices) = answer.as_object() else {
+        return out;
+    };
+    for (device, counters) in devices {
+        // Only the block devices. Cloud Hypervisor keys this answer by device
+        // id — `_disk0`, `_net0` — and the counter names underneath are the
+        // same words for both, so reading them all would add a guest's network
+        // traffic to its disk figures. The taps already carry the network side,
+        // and counting it twice in two units is worse than not counting it.
+        if !device.contains("disk") {
+            continue;
+        }
+        let Some(counters) = counters.as_object() else {
+            continue;
+        };
+        for (key, value) in counters {
+            let Some(number) = value.as_u64() else {
+                continue;
+            };
+            if key.ends_with("read_bytes") {
+                out.read_bytes = out.read_bytes.saturating_add(number);
+            } else if key.ends_with("write_bytes") {
+                out.write_bytes = out.write_bytes.saturating_add(number);
+            } else if key.ends_with("read_ops") {
+                out.read_ops = out.read_ops.saturating_add(number);
+            } else if key.ends_with("write_ops") {
+                out.write_ops = out.write_ops.saturating_add(number);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod counters_tests {
+    use super::*;
+
+    /// The shape this backend really answers with: an object per device, and
+    /// the block ones counted while the network ones are left to the taps.
+    #[test]
+    fn the_disks_are_counted_and_the_wires_are_not() {
+        let body = r#"{
+            "_disk0": {
+                "read_bytes": 1048576, "write_bytes": 4194304,
+                "read_ops": 64, "write_ops": 128
+            },
+            "_disk1": {
+                "read_bytes": 2000, "write_bytes": 3000,
+                "read_ops": 2, "write_ops": 3
+            }
+        }"#;
+        let seen = disk_traffic_of(body);
+        assert_eq!(seen.read_bytes, 1_050_576);
+        assert_eq!(seen.write_bytes, 4_197_304);
+        assert_eq!(seen.read_ops, 66);
+        assert_eq!(seen.write_ops, 131);
+    }
+
+    /// A guest's wires are not its disks. The counter names are the same
+    /// words under both, so reading every device would add the network
+    /// traffic to the disk figures — and the taps already carry that side.
+    #[test]
+    fn the_network_counters_are_left_alone_even_beside_a_disk() {
+        let body = r#"{
+            "_net0": {"read_bytes": 900, "write_bytes": 800, "read_ops": 9, "write_ops": 8},
+            "_disk0": {"read_bytes": 10, "write_bytes": 20, "read_ops": 1, "write_ops": 2}
+        }"#;
+        let seen = disk_traffic_of(body);
+        assert_eq!(seen.read_bytes, 10, "the wires were counted as a disk");
+        assert_eq!(seen.write_bytes, 20);
+        assert_eq!(seen.read_ops, 1);
+        assert_eq!(seen.write_ops, 2);
+
+        let only_wires = r#"{"_net0": {"read_bytes": 900, "write_bytes": 800}}"#;
+        assert_eq!(
+            disk_traffic_of(only_wires),
+            crate::host::DiskTraffic::default()
+        );
+    }
+
+    /// And a body that is not an object is nothing rather than a panic.
+    #[test]
+    fn an_odd_body_reads_as_nothing() {
+        assert_eq!(
+            disk_traffic_of("not json"),
+            crate::host::DiskTraffic::default()
+        );
+        assert_eq!(disk_traffic_of("[]"), crate::host::DiskTraffic::default());
     }
 }

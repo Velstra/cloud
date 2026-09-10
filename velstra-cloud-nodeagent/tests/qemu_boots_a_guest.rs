@@ -70,6 +70,38 @@ async fn a_stock_cloud_image_boots_and_says_so() {
     let run_dir = PathBuf::from(format!("/tmp/vq-boot-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&run_dir);
     std::fs::create_dir_all(&run_dir).expect("a run directory");
+    // Taken away however this test ends, and that matters: the tidy-up at the
+    // bottom only runs when everything passed, so every *failing* run left two
+    // hundred megabytes of disk image behind. Forty-seven of them filled a
+    // fourteen-gigabyte /tmp, after which nothing on this machine could build —
+    // a failing test that makes the next failure worse.
+    //
+    // The unit goes first. Removing the directory out from under a running
+    // QEMU leaves a process with a deleted disk, holding the unit name so the
+    // next run cannot start — which is how a machine ends up with a
+    // twenty-six-minute-old guest from a test that failed in one.
+    struct TidyUp {
+        dir: PathBuf,
+        unit: String,
+    }
+    impl Drop for TidyUp {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "kill", "--signal=SIGKILL", &self.unit])
+                .status();
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "reset-failed", &self.unit])
+                .status();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    let _tidy = TidyUp {
+        dir: run_dir.clone(),
+        unit: format!(
+            "velstra-vm-{}.service",
+            "projects/p1/instances/boot-1".replace('/', "_")
+        ),
+    };
 
     let layout = Layout {
         run_dir: run_dir.join("instances"),

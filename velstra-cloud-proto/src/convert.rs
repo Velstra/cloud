@@ -180,6 +180,10 @@ impl From<&resources::Quota> for v1::Quota {
             floating_ips: q.floating_ips,
             load_balancers: q.load_balancers,
             devices: q.devices,
+            snapshots: q.snapshots,
+            snapshot_gib: q.snapshot_gib,
+            backups: q.backups,
+            backup_gib: q.backup_gib,
         }
     }
 }
@@ -195,6 +199,10 @@ impl From<&v1::Quota> for resources::Quota {
             floating_ips: q.floating_ips,
             load_balancers: q.load_balancers,
             devices: q.devices,
+            snapshots: q.snapshots,
+            snapshot_gib: q.snapshot_gib,
+            backups: q.backups,
+            backup_gib: q.backup_gib,
         }
     }
 }
@@ -392,6 +400,9 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             agent_version: s.agent_version.clone(),
             console_endpoint: s.console_endpoint.clone(),
             vmm: s.vmm.clone(),
+            datapath: s.datapath.clone(),
+            console_tls: s.console_tls,
+            balancers: s.balancers.clone(),
             shared_state: s.shared_state,
             fetching: s.fetching.clone(),
             last_heartbeat: millis(s.last_heartbeat),
@@ -706,6 +717,7 @@ impl From<&ceph::NodeCeph> for v1::NodeCeph {
             address: c.address.clone(),
             ssh_pubkey: c.ssh_pubkey.clone(),
             trusts_key: c.trusts_key,
+            seen: c.seen.as_ref().map(Into::into),
         }
     }
 }
@@ -723,6 +735,131 @@ impl From<&v1::NodeCeph> for ceph::NodeCeph {
             address: c.address.clone(),
             ssh_pubkey: c.ssh_pubkey.clone(),
             trusts_key: c.trusts_key,
+            seen: c.seen.as_ref().map(Into::into),
+        }
+    }
+}
+
+impl From<&ceph::CephSeen> for v1::CephSeen {
+    fn from(s: &ceph::CephSeen) -> Self {
+        Self {
+            health: s.health.clone(),
+            warnings: s
+                .warnings
+                .iter()
+                .map(|w| v1::CephWarning {
+                    code: w.code.clone(),
+                    severity: w.severity.clone(),
+                    message: w.message.clone(),
+                })
+                .collect(),
+            pgs: s
+                .pgs
+                .iter()
+                .map(|p| v1::PgState {
+                    state: p.state.clone(),
+                    count: p.count,
+                })
+                .collect(),
+            pgs_total: s.pgs_total,
+            objects: s.objects,
+            used_bytes: s.used_bytes,
+            total_bytes: s.total_bytes,
+            read_bps: s.read_bps,
+            write_bps: s.write_bps,
+            read_ops: s.read_ops,
+            write_ops: s.write_ops,
+            osds: s
+                .osds
+                .iter()
+                .map(|o| v1::OsdSeen {
+                    id: o.id,
+                    host: o.host.clone(),
+                    device: o.device.clone(),
+                    up: o.up,
+                    r#in: o.r#in,
+                    used_bytes: o.used_bytes,
+                    total_bytes: o.total_bytes,
+                    pgs: o.pgs,
+                    class: o.class.clone(),
+                })
+                .collect(),
+            pool_stats: s
+                .pool_stats
+                .iter()
+                .map(|p| v1::PoolSeen {
+                    pool: p.pool.clone(),
+                    stored_bytes: p.stored_bytes,
+                    objects: p.objects,
+                    max_avail_bytes: p.max_avail_bytes,
+                    size: p.size,
+                    min_size: p.min_size,
+                    pg_num: p.pg_num,
+                })
+                .collect(),
+            at: s.at.0,
+        }
+    }
+}
+
+impl From<&v1::CephSeen> for ceph::CephSeen {
+    fn from(s: &v1::CephSeen) -> Self {
+        Self {
+            health: s.health.clone(),
+            warnings: s
+                .warnings
+                .iter()
+                .map(|w| ceph::CephWarning {
+                    code: w.code.clone(),
+                    severity: w.severity.clone(),
+                    message: w.message.clone(),
+                })
+                .collect(),
+            pgs: s
+                .pgs
+                .iter()
+                .map(|p| ceph::PgState {
+                    state: p.state.clone(),
+                    count: p.count,
+                })
+                .collect(),
+            pgs_total: s.pgs_total,
+            objects: s.objects,
+            used_bytes: s.used_bytes,
+            total_bytes: s.total_bytes,
+            read_bps: s.read_bps,
+            write_bps: s.write_bps,
+            read_ops: s.read_ops,
+            write_ops: s.write_ops,
+            osds: s
+                .osds
+                .iter()
+                .map(|o| ceph::OsdSeen {
+                    id: o.id,
+                    host: o.host.clone(),
+                    device: o.device.clone(),
+                    up: o.up,
+                    r#in: o.r#in,
+                    used_bytes: o.used_bytes,
+                    total_bytes: o.total_bytes,
+                    pgs: o.pgs,
+                    class: o.class.clone(),
+                })
+                .collect(),
+            pool_stats: s
+                .pool_stats
+                .iter()
+                .map(|p| ceph::PoolSeen {
+                    pool: p.pool.clone(),
+                    stored_bytes: p.stored_bytes,
+                    objects: p.objects,
+                    max_avail_bytes: p.max_avail_bytes,
+                    size: p.size,
+                    min_size: p.min_size,
+                    pg_num: p.pg_num,
+                })
+                .collect(),
+            at: meta::Timestamp(s.at),
         }
     }
 }
@@ -737,6 +874,9 @@ impl From<&v1::NodeStatus> for resources::NodeStatus {
             agent_version: s.agent_version.clone(),
             console_endpoint: s.console_endpoint.clone(),
             vmm: s.vmm.clone(),
+            datapath: s.datapath.clone(),
+            console_tls: s.console_tls,
+            balancers: s.balancers.clone(),
             shared_state: s.shared_state,
             fetching: s.fetching.clone(),
             last_heartbeat: timestamp(s.last_heartbeat),
@@ -769,6 +909,28 @@ impl From<v1::ImageFormat> for resources::ImageFormat {
     }
 }
 
+impl From<resources::ImageState> for v1::ImageState {
+    fn from(s: resources::ImageState) -> Self {
+        match s {
+            resources::ImageState::Active => Self::Active,
+            resources::ImageState::Deprecated => Self::Deprecated,
+            resources::ImageState::Obsolete => Self::Obsolete,
+        }
+    }
+}
+
+impl From<v1::ImageState> for resources::ImageState {
+    fn from(s: v1::ImageState) -> Self {
+        match s {
+            v1::ImageState::Deprecated => Self::Deprecated,
+            v1::ImageState::Obsolete => Self::Obsolete,
+            // Unspecified is what every image written before the field says,
+            // and every one of those is in service.
+            _ => Self::Active,
+        }
+    }
+}
+
 impl From<&resources::ImageSpec> for v1::ImageSpec {
     fn from(s: &resources::ImageSpec) -> Self {
         Self {
@@ -781,6 +943,9 @@ impl From<&resources::ImageSpec> for v1::ImageSpec {
             source_url: s.source_url.clone(),
             source_instance: s.source_instance.clone(),
             signature: s.signature.clone(),
+            state: v1::ImageState::from(s.state) as i32,
+            replacement: s.replacement.clone(),
+            shared_with: s.shared_with.clone(),
         }
     }
 }
@@ -797,6 +962,9 @@ impl From<&v1::ImageSpec> for resources::ImageSpec {
             source_url: s.source_url.clone(),
             source_instance: s.source_instance.clone(),
             signature: s.signature.clone(),
+            state: s.state().into(),
+            replacement: s.replacement.clone(),
+            shared_with: s.shared_with.clone(),
         }
     }
 }
@@ -990,6 +1158,7 @@ impl From<&resources::InstanceStatus> for v1::InstanceStatus {
             console_bytes: s.console_bytes,
             running_size: s.running_size.as_ref().map(Into::into),
             stop_requested_at: s.stop_requested_at.map(|t| t.0 as i64).unwrap_or(0),
+            usage: s.usage.as_ref().map(Into::into),
         }
     }
 }
@@ -1012,6 +1181,49 @@ impl From<&v1::InstanceStatus> for resources::InstanceStatus {
             vmm_pid: s.vmm_pid,
             started_at: s.started_at.map(timestamp),
             cpu: s.cpu.as_ref().map(Into::into),
+            usage: s.usage.as_ref().map(Into::into),
+        }
+    }
+}
+
+impl From<&resources::GuestUsage> for v1::GuestUsage {
+    fn from(u: &resources::GuestUsage) -> Self {
+        Self {
+            at: u.at.0 as i64,
+            cpu_ms: u.cpu_ms,
+            cpu_percent: u.cpu_percent,
+            memory_mib: u.memory_mib,
+            rx_bytes: u.rx_bytes,
+            tx_bytes: u.tx_bytes,
+            rx_packets: u.rx_packets,
+            tx_packets: u.tx_packets,
+            rx_total: u.rx_total,
+            tx_total: u.tx_total,
+            disk_read_bytes: u.disk_read_bytes,
+            disk_write_bytes: u.disk_write_bytes,
+            disk_read_ops: u.disk_read_ops,
+            disk_write_ops: u.disk_write_ops,
+        }
+    }
+}
+
+impl From<&v1::GuestUsage> for resources::GuestUsage {
+    fn from(u: &v1::GuestUsage) -> Self {
+        Self {
+            at: velstra_cloud_model::meta::Timestamp(u.at as u64),
+            cpu_ms: u.cpu_ms,
+            cpu_percent: u.cpu_percent,
+            memory_mib: u.memory_mib,
+            rx_bytes: u.rx_bytes,
+            tx_bytes: u.tx_bytes,
+            rx_packets: u.rx_packets,
+            tx_packets: u.tx_packets,
+            rx_total: u.rx_total,
+            tx_total: u.tx_total,
+            disk_read_bytes: u.disk_read_bytes,
+            disk_write_bytes: u.disk_write_bytes,
+            disk_read_ops: u.disk_read_ops,
+            disk_write_ops: u.disk_write_ops,
         }
     }
 }
@@ -1027,6 +1239,27 @@ impl From<&resources::VolumeSpec> for v1::VolumeSpec {
             source_image: s.source_image.clone(),
             source_snapshot: s.source_snapshot.clone(),
             source_backup: s.source_backup.clone(),
+            limits: (!s.limits.is_unlimited()).then(|| (&s.limits).into()),
+        }
+    }
+}
+
+impl From<&v1::VolumeLimits> for velstra_cloud_model::throttle::Limits {
+    fn from(l: &v1::VolumeLimits) -> Self {
+        Self {
+            iops: l.iops,
+            read_mibps: l.read_mibps,
+            write_mibps: l.write_mibps,
+        }
+    }
+}
+
+impl From<&velstra_cloud_model::throttle::Limits> for v1::VolumeLimits {
+    fn from(l: &velstra_cloud_model::throttle::Limits) -> Self {
+        Self {
+            iops: l.iops,
+            read_mibps: l.read_mibps,
+            write_mibps: l.write_mibps,
         }
     }
 }
@@ -1040,6 +1273,7 @@ impl From<&v1::VolumeSpec> for resources::VolumeSpec {
             source_image: s.source_image.clone(),
             source_snapshot: s.source_snapshot.clone(),
             source_backup: s.source_backup.clone(),
+            limits: s.limits.as_ref().map(Into::into).unwrap_or_default(),
         }
     }
 }
@@ -1120,6 +1354,7 @@ impl From<&resources::AttachmentSpec> for v1::AttachmentSpec {
             node: s.node.clone(),
             at: s.at.clone(),
             read_only: s.read_only,
+            limits: (!s.limits.is_unlimited()).then(|| (&s.limits).into()),
         }
     }
 }
@@ -1132,6 +1367,7 @@ impl From<&v1::AttachmentSpec> for resources::AttachmentSpec {
             node: s.node.clone(),
             at: s.at.clone(),
             read_only: s.read_only,
+            limits: s.limits.as_ref().map(Into::into).unwrap_or_default(),
         }
     }
 }
@@ -1380,6 +1616,30 @@ impl From<&resources::PortStatus> for v1::PortStatus {
             node: s.node.clone(),
             programmed: s.programmed,
             tap_device: s.tap_device.clone(),
+            answering: s.answering.clone(),
+            dropped: s.dropped.as_ref().map(Into::into),
+        }
+    }
+}
+
+impl From<&resources::Dropped> for v1::Dropped {
+    fn from(d: &resources::Dropped) -> Self {
+        Self {
+            inbound_packets: d.inbound_packets,
+            inbound_bytes: d.inbound_bytes,
+            outbound_packets: d.outbound_packets,
+            outbound_bytes: d.outbound_bytes,
+        }
+    }
+}
+
+impl From<&v1::Dropped> for resources::Dropped {
+    fn from(d: &v1::Dropped) -> Self {
+        Self {
+            inbound_packets: d.inbound_packets,
+            inbound_bytes: d.inbound_bytes,
+            outbound_packets: d.outbound_packets,
+            outbound_bytes: d.outbound_bytes,
         }
     }
 }
@@ -1392,6 +1652,8 @@ impl From<&v1::PortStatus> for resources::PortStatus {
             node: s.node.clone(),
             programmed: s.programmed,
             tap_device: s.tap_device.clone(),
+            answering: s.answering.clone(),
+            dropped: s.dropped.as_ref().map(Into::into),
         }
     }
 }
@@ -1648,6 +1910,13 @@ impl From<&velstra_cloud_model::reconcile::Explanation> for v1::Rejection {
                 "NotReady",
                 "the node has not reported itself ready".to_string(),
             ),
+            Rejected::Silent { quiet_ms } => (
+                "Silent",
+                format!(
+                    "the node has not reported for {} seconds; nothing is placed on a machine that has gone quiet",
+                    quiet_ms / 1000
+                ),
+            ),
             Rejected::InsufficientVcpus { free, want } => {
                 ("InsufficientVcpus", format!("{free} free, {want} wanted"))
             }
@@ -1759,6 +2028,7 @@ mod tests {
             InstanceStatus {
                 running_size: None,
                 stop_requested_at: None,
+                usage: None,
                 console_tail: String::new(),
                 console_bytes: 0,
                 devices: Vec::new(),

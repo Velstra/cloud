@@ -230,6 +230,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut config = LvmConfig::new(&group);
             config.thin_pool = args.lvm_thin_pool.clone();
+            // The same directory the other two backends use, and the one the
+            // node agent publishes into: a volume from an image reads the file
+            // the node already fetched.
+            config.images = Some(args.images.clone());
             tracing::info!(
                 group = %group,
                 thin = ?config.thin_pool,
@@ -323,5 +327,9 @@ fn ceph_config(args: &Args) -> CephConfig {
     let mut config = CephConfig::new(&args.ceph_pool, &args.ceph_image_pool);
     config.user = args.ceph_user.clone();
     config.conf = args.ceph_conf.clone();
+    // The same directory the directory pool uses, and the same one the node
+    // agent publishes into. It is what lets a volume-from-image work without
+    // an operator having imported the image by hand first.
+    config.images = Some(args.images.clone());
     config
 }

@@ -462,7 +462,7 @@ async fn a_pool_that_already_exists_can_still_be_given_a_credential() {
     .expect("an operator registers a pool");
 
     let issued = api
-        .issue_credential(&name("pools/local-2"), &who(OPERATOR))
+        .issue_credential(&name("pools/local-2"), &json!({}), &who(OPERATOR))
         .await
         .expect("an operator issues a pool a new credential");
     let token = issued["poolToken"]
@@ -485,7 +485,7 @@ async fn a_new_credential_does_not_close_the_door_on_the_old_one() {
     let (api, _store) = cell();
     let first = register_node(&api, "node-a").await;
     let issued = api
-        .issue_credential(&name("nodes/node-a"), &who(OPERATOR))
+        .issue_credential(&name("nodes/node-a"), &json!({}), &who(OPERATOR))
         .await
         .unwrap();
     let second = issued["nodeToken"].as_str().unwrap();
@@ -507,7 +507,7 @@ async fn a_new_credential_does_not_close_the_door_on_the_old_one() {
 async fn a_credential_is_only_issued_for_a_machine_the_cell_knows() {
     let (api, _store) = cell();
     assert!(
-        api.issue_credential(&name("nodes/never-registered"), &who(OPERATOR))
+        api.issue_credential(&name("nodes/never-registered"), &json!({}), &who(OPERATOR))
             .await
             .is_err(),
         "a credential was minted for a machine the cell has never heard of"
@@ -521,7 +521,7 @@ async fn a_credential_is_only_issued_for_a_machine_the_cell_knows() {
     .await
     .unwrap();
     let refused = api
-        .issue_credential(&name("projects/p1"), &who(OPERATOR))
+        .issue_credential(&name("projects/p1"), &json!({}), &who(OPERATOR))
         .await
         .expect_err("a project has no agent");
     assert!(refused.to_string().contains("node or a pool"), "{refused}");

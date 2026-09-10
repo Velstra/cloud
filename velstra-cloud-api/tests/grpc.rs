@@ -159,6 +159,7 @@ async fn a_change_over_one_transport_is_visible_over_the_other() {
         .update_instance(signed(UpdateInstanceRequest {
             instance: Some(instance("projects/p1/instances/i1", 8)),
             revision: String::new(),
+            update_mask: None,
         }))
         .await
         .unwrap()
@@ -207,6 +208,7 @@ async fn both_transports_refuse_a_status_write() {
         .update_instance(signed(UpdateInstanceRequest {
             instance: Some(sent),
             revision: String::new(),
+            update_mask: None,
         }))
         .await
         .expect_err("gRPC accepted a status an agent had not reported");
@@ -257,6 +259,7 @@ async fn a_grpc_update_is_conditional_on_a_revision_the_way_if_match_is() {
         .update_instance(signed(UpdateInstanceRequest {
             instance: Some(instance("projects/p1/instances/i1", 16)),
             revision: stale,
+            update_mask: None,
         }))
         .await
         .expect_err("a stale write won");
@@ -403,6 +406,7 @@ async fn a_derived_field_is_derived_on_both_transports() {
                     node: String::new(),
                     at: String::new(),
                     read_only: false,
+                    limits: Default::default(),
                 }),
                 status: None,
             }),
@@ -499,5 +503,100 @@ async fn grpc_list_operations_shows_a_tenant_only_their_own() {
     assert!(
         names.iter().all(|n| !n.contains("/p2/")),
         "gRPC handed a tenant another tenant's operations: {names:?}"
+    );
+}
+
+/// A mask keeps a gRPC update from writing what it did not come to change.
+///
+/// This is the defect the mask exists for. proto3 has no absent scalar, so an
+/// update carrying a message means "make the object look like this" — and a
+/// client resizing a guest writes its cloud-init at the same time, with
+/// whatever it happened to be holding. First the damage, then the fix, in one
+/// test so neither half can drift from the other.
+#[tokio::test]
+async fn a_mask_keeps_a_grpc_update_from_writing_its_neighbours() {
+    let both = Both::new();
+    create(&both, "i1", 2).await;
+    // Something on the object that no resize should touch, written over REST
+    // as a tenant would.
+    both.http(
+        "PATCH",
+        "projects/p1/instances/i1",
+        Some(json!({ "spec": { "userData": "#cloud-config\nthe tenant's own" } })),
+    )
+    .await;
+
+    // Without a mask: the whole message wins, and the cloud-init the client
+    // never set — because it could not — is gone.
+    both.grpc
+        .update_instance(signed(UpdateInstanceRequest {
+            instance: Some(instance("projects/p1/instances/i1", 4)),
+            revision: String::new(),
+            update_mask: None,
+        }))
+        .await
+        .unwrap();
+    let (_, body) = both.http("GET", "projects/p1/instances/i1", None).await;
+    assert_eq!(body["spec"]["vcpus"], json!(4));
+    assert!(
+        body["spec"]["userData"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "the unmasked update was supposed to overwrite it: {}",
+        body["spec"]
+    );
+
+    // Put it back, then do the same resize with a mask.
+    both.http(
+        "PATCH",
+        "projects/p1/instances/i1",
+        Some(json!({ "spec": { "userData": "#cloud-config\nthe tenant's own" } })),
+    )
+    .await;
+    both.grpc
+        .update_instance(signed(UpdateInstanceRequest {
+            instance: Some(instance("projects/p1/instances/i1", 8)),
+            revision: String::new(),
+            update_mask: Some(velstra_cloud_proto::prost_types::FieldMask {
+                paths: vec!["spec.vcpus".into()],
+            }),
+        }))
+        .await
+        .unwrap();
+    let (_, body) = both.http("GET", "projects/p1/instances/i1", None).await;
+    assert_eq!(body["spec"]["vcpus"], json!(8), "the resize did not happen");
+    assert_eq!(
+        body["spec"]["userData"], "#cloud-config\nthe tenant's own",
+        "the masked update wrote a field it did not name"
+    );
+}
+
+/// A mask naming a field nobody has is refused, with the path in the sentence.
+///
+/// A caller who writes `spec.vcpu` and is answered OK has been told their
+/// change was made. This is the same rule the REST surface applies to an
+/// unknown field.
+#[tokio::test]
+async fn a_mask_naming_nothing_is_refused_by_name() {
+    let both = Both::new();
+    create(&both, "i1", 2).await;
+
+    let refused = both
+        .grpc
+        .update_instance(signed(UpdateInstanceRequest {
+            instance: Some(instance("projects/p1/instances/i1", 4)),
+            revision: String::new(),
+            update_mask: Some(velstra_cloud_proto::prost_types::FieldMask {
+                paths: vec!["spec.vcpu".into()],
+            }),
+        }))
+        .await
+        .expect_err("a mask naming nothing was accepted");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(
+        refused.message().contains("spec.vcpu"),
+        "{}",
+        refused.message()
     );
 }

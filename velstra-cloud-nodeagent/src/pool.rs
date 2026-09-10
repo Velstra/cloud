@@ -149,6 +149,10 @@ fn free_gib(dir: &std::path::Path) -> u64 {
 struct Copies {
     backups: Vec<velstra_cloud_model::resources::Backup>,
     targets: Vec<velstra_cloud_model::resources::BackupTarget>,
+    /// The cell's images, for the one thing a backend cannot work out: what an
+    /// image is called on disk. A node files one under its digest, and the
+    /// digest lives on the object rather than in the name.
+    images: Vec<velstra_cloud_model::resources::Image>,
 }
 
 impl Copies {
@@ -158,6 +162,21 @@ impl Copies {
     /// its target is not one this machine knows about — three different reasons
     /// and one answer, because the caller's next move is the same for all
     /// three: refuse, and say so on the volume.
+    /// What an image is called on this machine's disk: `sha256-<hex>`, from
+    /// the digest on the object.
+    ///
+    /// `None` when the image is not one this pool was told about, or carries
+    /// no readable digest. The backends then say which image and where they
+    /// looked, rather than opening a path they invented — which is what all
+    /// three used to do, each in a different spelling.
+    fn stored_name_of(&self, image: &str) -> Option<String> {
+        let object = self
+            .images
+            .iter()
+            .find(|i| i.meta.name.to_string() == image)?;
+        velstra_cloud_model::images::stored_name(&object.spec.digest)
+    }
+
     fn path_of(&self, backup: &str) -> Option<String> {
         let backup = self
             .backups
@@ -188,7 +207,28 @@ impl Copies {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin<'a> {
     Blank,
-    Image(&'a str),
+    /// An image, by name **and** by what it is called on disk.
+    ///
+    /// Two fields because the two backends need different halves and neither
+    /// can work out the other's. Ceph needs the *name*: an RBD image is filed
+    /// under one, and a clone names its parent. A directory or an LVM pool
+    /// needs the *file*, and a node files an image under its digest —
+    /// `sha256-<hex>` — because the bytes have one identity and the names for
+    /// them are many.
+    ///
+    /// That was the bug: each backend guessed the other's spelling. The
+    /// directory pool looked for the resource name with its slashes flattened,
+    /// LVM treated the name as a path outright, and only Ceph was right. A
+    /// first-class operation, advertised in the API, the console and the
+    /// contract, worked on one backend of three.
+    ///
+    /// `stored` is `None` for an image whose digest could not be read — the
+    /// object is gone, or a cell that hands this agent no images at all. The
+    /// backends then say so rather than opening a path they invented.
+    Image {
+        name: &'a str,
+        stored: Option<&'a str>,
+    },
     Snapshot(&'a str),
     /// A file on this machine — a backup on a target that is mounted here.
     File(&'a str),
@@ -199,6 +239,15 @@ pub enum Origin<'a> {
 /// The resource's name with its slashes flattened, exactly as an image is
 /// stored on a node — so a person looking at a target with `ls` can read which
 /// copy is which, and two cells sharing a target cannot collide.
+/// The snapshot id a backup takes its moment under.
+///
+/// Derived from the backup's own name so it is stable across passes: the same
+/// backup asks for the same moment, and a leftover from a crashed pass is
+/// recognisable rather than mistaken for somebody else's snapshot.
+pub fn backup_moment(backup: &str) -> String {
+    format!("backup-{}", backup.rsplit('/').next().unwrap_or(backup))
+}
+
 pub fn backup_path(target_path: &str, backup: &str) -> String {
     format!(
         "{}/{}",
@@ -270,6 +319,20 @@ pub trait Storage: Send + Sync {
     /// half-written file, and a backup is never taken twice: the second copy
     /// would be of a different moment under a name somebody trusts.
     async fn copy_out(&self, volume: &str, path: &str) -> Result<u64>;
+
+    /// The same, from a snapshot rather than from the live volume.
+    ///
+    /// This is what a backup uses. Reading a device a guest is still writing
+    /// to for minutes does not produce an image of a moment: it produces
+    /// blocks from many moments, which is strictly worse than the
+    /// crash-consistent copy the contract promises, and which no filesystem
+    /// checker can put back together. A snapshot is a moment, and every
+    /// backend here already knows how to take one.
+    ///
+    /// The cost is not free and is worth stating: on a directory pool a
+    /// snapshot is a second copy of the file, so a backup there needs the
+    /// volume's size in spare room while it runs.
+    async fn copy_out_snapshot(&self, snapshot: &str, path: &str) -> Result<u64>;
 }
 
 #[derive(Clone, Debug)]
@@ -609,7 +672,16 @@ impl PoolAgent {
                 return Copies::default();
             }
         };
-        Copies { backups, targets }
+        // Best effort and never fatal: an agent whose cell hands it no images
+        // still restores, snapshots and provisions blank volumes. Only a
+        // volume *from an image* needs this, and that one then refuses with
+        // the reason rather than guessing a filename.
+        let images = self.cell.images().await.unwrap_or_default();
+        Copies {
+            backups,
+            targets,
+            images,
+        }
     }
 
     /// What each target looks like from this machine.
@@ -952,6 +1024,14 @@ impl PoolAgent {
             }
         }
 
+        // Deleting: take the bytes off the target and say so, before anything
+        // else. Without this a `keep: 7` schedule expired the *record* every
+        // day and left the file — half a terabyte a week of copies nothing
+        // referenced, nothing counted and nothing could ever find again.
+        if stored.meta.is_deleting() {
+            self.release_copy(stored, targets, pass).await;
+            return;
+        }
         // Already made. This is every pass after the first, and it has to cost
         // one comparison: a copy that exists is never made again, because a
         // copy made later is of a different moment under a name somebody
@@ -992,8 +1072,51 @@ impl PoolAgent {
             return;
         }
 
+        // Is there room to write at all? Asked before a byte is read, because
+        // the alternative is discovering it after minutes of copying — with a
+        // truncated file on the target and a filesystem too full for anybody
+        // else's backup, or for the delete that would make room. Skipped when
+        // nobody reports on the target: unknown is not "full", and the copy
+        // then fails on the write, loudly, on this backup. Same rule as
+        // writability, and see `room_on` for why this is not "does this copy
+        // fit".
+        if target.status.agent.is_some()
+            && let Err(why) = velstra_cloud_model::backup::room_on(
+                &target.meta.name.to_string(),
+                target.status.free_gib,
+            )
+        {
+            self.backup_trouble(stored, why.to_string(), "NoRoom", pass)
+                .await;
+            return;
+        }
+
         let path = backup_path(&target.spec.path, &name);
-        let written = match self.storage.copy_out(&stored.spec.volume, &path).await {
+        // A snapshot first, and the copy from that. Reading a device the guest
+        // is still writing to for minutes gives blocks from many moments,
+        // which is not the crash-consistent copy the contract promises and is
+        // not something a filesystem checker can repair. Named after the
+        // backup, so a leftover from an agent that died mid-copy is
+        // identifiable and is retaken rather than restored from.
+        let moment = format!("{}/snapshots/{}", stored.spec.volume, backup_moment(&name));
+        // Taken fresh every time: a leftover from a crashed pass is of the
+        // wrong moment, and a copy of it would wear this backup's name.
+        let _ = self.storage.destroy_snapshot(&moment).await;
+        if let Err(e) = self
+            .storage
+            .take_snapshot(&moment, &stored.spec.volume)
+            .await
+        {
+            self.backup_trouble(
+                stored,
+                format!("could not take the moment to copy: {e}"),
+                "NoMoment",
+                pass,
+            )
+            .await;
+            return;
+        }
+        let written = match self.storage.copy_out_snapshot(&moment, &path).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!(backup = %name, error = %e, "this copy could not be made");
@@ -1005,6 +1128,12 @@ impl PoolAgent {
         };
         pass.actions += 1;
 
+        // The moment has been read; it costs space until it is gone. Best
+        // effort: a snapshot that will not go is worth a line, not a failed
+        // backup whose bytes are already on the target.
+        if let Err(e) = self.storage.destroy_snapshot(&moment).await {
+            tracing::warn!(backup = %name, error = %e, "the moment taken for this copy could not be removed");
+        }
         // The source's size as this pool has it, which is the smallest volume
         // that can be restored from the copy — a different number from what the
         // copy occupies, and both are worth knowing.
@@ -1071,6 +1200,83 @@ impl PoolAgent {
     /// On the backup rather than in a log on whichever machine happens to run
     /// this pool: "why is there no copy" is asked by somebody looking at the
     /// backup, months later, and a log line is not where they will look.
+    /// Remove a deleted backup's bytes from the target, and let the record go.
+    ///
+    /// The path is derived the same way it was written, so this finds the file
+    /// the copy went to and nothing else. A copy that is already gone is not a
+    /// failure — a delete whose answer was lost has to be safe to ask again.
+    ///
+    /// A target that no longer exists is the one case where the bytes cannot
+    /// be reached. The record is released anyway, with the reason on it: a
+    /// backup held for ever by a target somebody removed is a project that can
+    /// never be deleted, and those bytes went with the target's filesystem.
+    async fn release_copy(
+        &self,
+        stored: &velstra_cloud_model::resources::Backup,
+        targets: &[velstra_cloud_model::resources::BackupTarget],
+        pass: &mut Pass,
+    ) {
+        let name = stored.meta.name.to_string();
+        let mut gone = true;
+        let mut why = String::new();
+        match targets
+            .iter()
+            .find(|t| t.meta.name.to_string() == stored.spec.target)
+        {
+            Some(target) => {
+                let path = backup_path(&target.spec.path, &name);
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        pass.actions += 1;
+                        tracing::info!(backup = %name, %path, "took a deleted copy off the target");
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        gone = false;
+                        why = format!("{path}: {e}");
+                        pass.failures += 1;
+                        tracing::warn!(backup = %name, error = %e, "could not remove a deleted copy");
+                    }
+                }
+            }
+            None => {
+                why = format!(
+                    "{} no longer exists, so this copy's bytes cannot be reached from here",
+                    stored.spec.target
+                );
+                tracing::warn!(backup = %name, "released a copy whose target is gone");
+            }
+        }
+        let mut next = stored.clone();
+        next.status.taken = false;
+        next.status.observed_generation = stored.meta.generation;
+        if !why.is_empty() {
+            set_condition(
+                &mut next.status.conditions,
+                Condition::new(
+                    "Ready",
+                    ConditionStatus::False,
+                    "CopyNotRemoved",
+                    &why,
+                    stored.meta.generation,
+                ),
+            );
+        }
+        set_condition(
+            &mut next.status.conditions,
+            release_condition(gone, true, stored.meta.generation),
+        );
+        reporting::report(
+            &self.backups,
+            self.sink.as_ref(),
+            stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
+    }
+
     async fn backup_trouble(
         &self,
         stored: &velstra_cloud_model::resources::Backup,
@@ -1221,9 +1427,19 @@ impl PoolAgent {
                 // backup, the target it names and that target's path, and a
                 // backend has none of the three. What a backend is handed is a
                 // file it can open.
+                let stored = match source {
+                    VolumeSource::Image(image) => copies.stored_name_of(image),
+                    _ => None,
+                };
                 let origin = match source {
                     VolumeSource::Blank => Origin::Blank,
-                    VolumeSource::Image(image) => Origin::Image(image),
+                    // Resolved here and nowhere else, exactly as a backup is:
+                    // it takes the image object and this pool has one, while a
+                    // backend has neither.
+                    VolumeSource::Image(image) => Origin::Image {
+                        name: image,
+                        stored: stored.as_deref(),
+                    },
                     VolumeSource::Snapshot(snapshot) => Origin::Snapshot(snapshot),
                     VolumeSource::Backup(backup) => {
                         let Some(path) = copies.path_of(backup) else {
@@ -1567,10 +1783,10 @@ impl Storage for FakePool {
         }
         inner.volumes.insert(volume.to_string(), gib);
         match source {
-            Origin::Image(image) => {
+            Origin::Image { name, .. } => {
                 inner
                     .from_image
-                    .insert(volume.to_string(), image.to_string());
+                    .insert(volume.to_string(), name.to_string());
             }
             Origin::Snapshot(snapshot) => {
                 inner
@@ -1671,6 +1887,23 @@ impl Storage for FakePool {
         // the source, not of whatever this fake happened to put on disk. A
         // target's free space is computed from the former.
         Ok(gib * 1024 * 1024 * 1024)
+    }
+
+    /// From a snapshot, which is what a backup copies. The bytes are those of
+    /// the volume the snapshot was taken from, so a test that corrupts a copy
+    /// still knows what the difference is.
+    async fn copy_out_snapshot(&self, snapshot: &str, path: &str) -> Result<u64> {
+        self.fault("copy_out", snapshot)?;
+        let volume = {
+            let inner = self.inner.lock().unwrap();
+            let Some(taken) = inner.snapshots.get(snapshot) else {
+                return Err(HostError::failed(format!(
+                    "{snapshot} is not in this pool, so there is nothing to copy out"
+                )));
+            };
+            taken.volume.clone()
+        };
+        self.copy_out(&volume, path).await
     }
 }
 
@@ -1860,6 +2093,7 @@ mod tests {
                     encryption_key: None,
                     source_image: None,
                     source_snapshot: None,
+                    limits: Default::default(),
                 },
                 VolumeStatus::default(),
             );
@@ -1952,6 +2186,17 @@ mod tests {
                 .unwrap()
         }
 
+        /// Ask for a backup to go, the way the API does: a deletion stamp and
+        /// the finalizer still on it.
+        async fn delete_backup(&self, id: &str) {
+            let mut b = self.reload_backup(id).await;
+            b.meta.deleted_at = Some(velstra_cloud_model::meta::Timestamp::now());
+            self.backups
+                .update(&b, &velstra_cloud_model::access::Writer::controller("pool"))
+                .await
+                .unwrap();
+        }
+
         async fn reload_backup(&self, id: &str) -> velstra_cloud_model::resources::Backup {
             self.backups
                 .get(&format!("projects/p1/backups/{id}"))
@@ -2023,6 +2268,7 @@ mod tests {
                 PoolSpec {
                     accepting: true,
                     labels: vec![],
+                    volume_ceiling: Default::default(),
                 },
                 PoolStatus::default(),
             );
@@ -2066,6 +2312,7 @@ mod tests {
                     encryption_key: None,
                     source_image: None,
                     source_snapshot: None,
+                    limits: Default::default(),
                 },
                 VolumeStatus::default(),
             );
@@ -2599,6 +2846,72 @@ mod tests {
     /// A backup is bytes leaving the pool, and until this the platform had the
     /// object, the schedule, the retention and the console — and nothing that
     /// ever wrote one.
+    /// A copy is of a moment, not of a device the guest is still writing to.
+    /// A minutes-long read of a live volume gives blocks from many moments,
+    /// which is not the crash-consistent copy the contract promises — and the
+    /// moment is put back afterwards, or every backup would leave one behind.
+    #[tokio::test]
+    async fn a_copy_is_taken_from_a_moment_and_the_moment_is_put_back() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        agent.resync().await;
+        cell.backup("b1", "nvme", "archive").await;
+        agent.resync().await;
+        agent.resync().await;
+
+        let taken = cell.reload_backup("b1").await;
+        assert!(taken.status.taken, "the copy was never made");
+        let seen = cell.fake.observe().await.unwrap();
+        assert_eq!(
+            seen.snapshots.len(),
+            0,
+            "the moment taken for the copy was left in the pool: {:?}",
+            seen.snapshots.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Deleting a backup used to take the record and leave the file: `keep: 7`
+    /// on a nightly schedule added the volume's size to the target every day,
+    /// for ever, uncounted and unreachable once the record was gone.
+    #[tokio::test]
+    async fn deleting_a_backup_takes_its_bytes_off_the_target() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        agent.resync().await;
+        cell.backup("b1", "nvme", "archive").await;
+        agent.resync().await;
+        agent.resync().await;
+        let taken = cell.reload_backup("b1").await;
+        assert!(taken.status.taken);
+        let path = backup_path(
+            &cell.target_dir("archive", true),
+            &taken.meta.name.to_string(),
+        );
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the copy was never written to {path}"
+        );
+
+        cell.delete_backup("b1").await;
+        agent.resync().await;
+
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the record went and the bytes stayed at {path}"
+        );
+        let released = cell.reload_backup("b1").await;
+        assert_eq!(
+            velstra_cloud_model::meta::condition(&released.status.conditions, "Released")
+                .map(|c| c.status),
+            Some(ConditionStatus::True),
+            "the agent did not say it had let go"
+        );
+    }
+
     #[tokio::test]
     async fn a_backup_is_claimed_copied_out_and_reported() {
         let (cell, agent) = cell("nvme");

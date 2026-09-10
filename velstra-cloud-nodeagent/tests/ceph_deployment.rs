@@ -82,12 +82,16 @@ impl Recorder {
         let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("ceph-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // The reply is chosen by the first *word* — the agent puts global
+        // options such as `--connect-timeout` in front of it, and those are
+        // not the command.
         let script = dir.join("record");
         std::fs::write(
             &script,
             format!(
                 "#!/bin/sh\n\
                  echo \"$@\" >> '{dir}/argv'\n\
+                 while [ \"${{1#--}}\" != \"$1\" ]; do shift; done\n\
                  if [ -f '{dir}/reply-'\"$1\" ]; then cat '{dir}/reply-'\"$1\"; fi\n\
                  exit 0\n",
                 dir = dir.display()

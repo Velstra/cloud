@@ -233,6 +233,7 @@ impl Reconciler for Scheduler {
             &Self::grouped_with(&all),
             &classes,
             &closed,
+            velstra_cloud_model::meta::Timestamp::now(),
         ) {
             Err(why) => {
                 // The rejection chain goes on the object, because an operator
@@ -368,6 +369,8 @@ mod tests {
                     gateway: false,
                 },
                 NodeStatus {
+                    // A live machine: nothing is placed on one that has gone quiet.
+                    last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
                     shared_state: false,
                     vmm: "qemu".into(),
                     fetching: Vec::new(),

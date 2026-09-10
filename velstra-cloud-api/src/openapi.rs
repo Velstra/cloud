@@ -273,6 +273,12 @@ fn collection_paths(
         Some(c) => (c.creatable, c.editable, c.deletable),
         None => (true, true, true),
     };
+    // The console's `creatable` says whether a screen offers a blank form,
+    // and for migrations it deliberately does not — one is started from the
+    // guest, where the destinations can be explained. The API accepts the
+    // `POST` all the same (from a cell operator), and a document that hid it
+    // would tell an SDK the move cannot be asked for at all.
+    let creatable = creatable || kind == "migrations";
 
     let mut list_params = params.clone();
     list_params.extend([
@@ -281,6 +287,10 @@ fn collection_paths(
         query_param("labels", "string", "Only objects carrying these labels, as `key=value,key2=value2`."),
         query_param("watch", "boolean", "`true` streams changes as server-sent events instead of listing."),
         query_param("fromRevision", "string", "With `watch`: the revision a list reported, so nothing between the list and the watch is lost."),
+        query_param("since", "string", "Only objects created at or after this moment: milliseconds since the epoch, or a span back from now like `30m`, `6h`, `7d`."),
+        query_param("until", "string", "Only objects created before this moment, same spellings as `since`. Exclusive, so two adjacent ranges neither overlap nor skip."),
+        query_param("orderBy", "string", "`name` or `createdAt`, optionally followed by ` desc`. An ordered listing is a top-N: everything the filter admits is read and sorted, and the first `pageSize` of the sorted order is returned with no `nextPageToken` (and `\"truncated\": true` when the answer was cut). Refused together with `pageToken`."),
+        query_param("fields", "string", "A read mask: comma-separated dotted paths, as `meta.name,status.conditions`. `meta.name` is always returned."),
     ]);
     let mut collection = Map::new();
     collection.insert("get".into(), json!({
@@ -309,7 +319,11 @@ fn collection_paths(
             "tags": [title],
             "summary": format!("Create one of {title}"),
             "operationId": format!("create-{kind}"),
-            "parameters": params,
+            // The idempotency key alongside the path's own parameters: a
+            // create that lets the platform pick the name is otherwise unsafe
+            // to retry, and a generated client that does not know the header
+            // exists cannot retry at all.
+            "parameters": params.iter().cloned().chain([idempotency_param()]).collect::<Vec<_>>(),
             "requestBody": { "required": true, "content": { "application/json": { "schema": {
                 "type": "object",
                 "required": ["id", "spec"],
@@ -320,7 +334,25 @@ fn collection_paths(
                 },
             } } } },
             "responses": {
-                "201": { "description": "Created.", "content": { "application/json": { "schema": { "$ref": format!("#/components/schemas/{schema}") } } } },
+                // 202, and the body is not the resource. The object exists and
+                // has not converged; what comes back is the operation to wait
+                // on, the name it was given, and — for a node or a pool, once
+                // and never again — the agent's token. A document that
+                // promised 201-with-the-resource generated clients that were
+                // wrong on the single most important call in the API.
+                "202": {
+                    "description": "Accepted. The object exists and is converging; poll the operation named here.",
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "required": ["operation", "target"],
+                        "properties": {
+                            "operation": { "type": "string", "description": "The operation's resource name. Read it to learn when the object settled." },
+                            "target": { "type": "string", "description": "The name the object was given." },
+                            "nodeToken": { "type": "string", "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again." },
+                            "poolToken": { "type": "string", "description": "Only when a pool was registered: the pool agent's bearer token, returned once and never readable again." },
+                        },
+                    } } },
+                },
                 "default": error_response(),
             },
         }));
@@ -437,7 +469,10 @@ const VERBS: &[Verb] = &[
         method: "get",
         on_collection: false,
         summary: "Where the guest could move, and which node refused for what.",
-        query: &[("mode", "`live` or `cold`; they refuse different things.")],
+        query: &[(
+            "mode",
+            "`Live`, `PostCopy` or `Reboot` (stop here, start there); they refuse different things. Default `Live`.",
+        )],
     },
     Verb {
         collection: "instances",
@@ -525,7 +560,7 @@ const VERBS: &[Verb] = &[
         verb: "issueCredential",
         method: "post",
         on_collection: false,
-        summary: "Mint a fresh credential for a machine that already exists; shown once.",
+        summary: "Mint a fresh credential for a machine that already exists; shown once. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
         query: &[],
     },
     Verb {
@@ -533,7 +568,7 @@ const VERBS: &[Verb] = &[
         verb: "issueCredential",
         method: "post",
         on_collection: false,
-        summary: "Mint a fresh credential for a pool that already exists; shown once.",
+        summary: "Mint a fresh credential for a pool that already exists; shown once. The body may carry `purpose` and `expiresAt`.",
         query: &[],
     },
     Verb {
@@ -666,7 +701,91 @@ fn fixed_paths(paths: &mut Map<String, Value>) {
                 "default": error_response(),
             },
         },
+        "get": {
+            "tags": ["Users"],
+            "summary": "Every token this account holds, without the tokens — id, purpose and when it was minted.",
+            "operationId": "list-tokens",
+            "parameters": [path_param("id", "The service account.")],
+            "responses": {
+                "200": { "description": "What the account holds.", "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": { "items": { "type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "Name it to revoke it." },
+                            "purpose": { "type": "string" },
+                            "issuedAt": { "type": "integer", "description": "Milliseconds since the epoch." },
+                        },
+                    } } },
+                } } } },
+                "default": error_response(),
+            },
+        },
     }));
+    paths.insert(
+        "/api/v1/users/{id}/tokens/{token}".into(),
+        json!({
+            "delete": {
+                "tags": ["Users"],
+                "summary": "Take one token out of use. Already gone is not an error.",
+                "operationId": "revoke-token",
+                "parameters": [
+                    path_param("id", "The service account."),
+                    path_param("token", "The id the list gives."),
+                ],
+                "responses": {
+                    "204": { "description": "Gone." },
+                    "default": error_response(),
+                },
+            },
+        }),
+    );
+    for (kind, title, machine) in [
+        ("nodes", "Nodes", "node"),
+        ("pools", "Pools", "storage pool"),
+    ] {
+        paths.insert(format!("/api/v1/{kind}/{{id}}/credentials"), json!({
+            "get": {
+                "tags": [title],
+                "summary": format!("Every credential this {machine}'s agent holds, without the tokens — id, purpose, when it was issued and when it ends."),
+                "operationId": format!("list-{kind}-credentials"),
+                "parameters": [path_param("id", &format!("The {machine}."))],
+                "responses": {
+                    "200": { "description": "What the machine holds.", "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "properties": { "items": { "type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "Name it to revoke it." },
+                                "purpose": { "type": "string" },
+                                "issuedAt": { "type": "integer", "description": "Milliseconds since the epoch." },
+                                "expiresAt": { "type": "integer", "nullable": true, "description": "Absent means it does not expire, which is the default: an agent reads its token once at startup and cannot fetch another." },
+                            },
+                        } } },
+                    } } } },
+                    "default": error_response(),
+                },
+            },
+        }));
+        paths.insert(
+            format!("/api/v1/{kind}/{{id}}/credentials/{{credential}}"),
+            json!({
+                "delete": {
+                    "tags": [title],
+                    "summary": "Take one credential out of use. Already gone is not an error.",
+                    "operationId": format!("revoke-{kind}-credential"),
+                    "parameters": [
+                        path_param("id", &format!("The {machine}.")),
+                        path_param("credential", "The id the list gives."),
+                    ],
+                    "responses": {
+                        "204": { "description": "Gone." },
+                        "default": error_response(),
+                    },
+                },
+            }),
+        );
+    }
     paths.insert("/metrics".into(), json!({
         "get": {
             "tags": ["Cell"],
@@ -744,6 +863,22 @@ fn error_response() -> Value {
     json!({
         "description": "Refused, with a code a program can branch on and a sentence a person can read.",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+    })
+}
+
+/// The header that makes a create safely retryable.
+fn idempotency_param() -> Value {
+    json!({
+        "name": crate::core::IDEMPOTENCY_HEADER,
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string", "maxLength": velstra_cloud_model::idempotency::LONGEST_KEY },
+        "description":
+            "A key of the caller's own invention, sent again on every retry of the same create. \
+             The second attempt is answered with the first attempt's operation and target instead \
+             of making a second object, and carries `x-velstra-idempotent-replay: true`. Reusing \
+             a key for a different request is refused. Keys are remembered for a day. Registering \
+             a node or a pool does not take one: its answer carries a credential shown only once.",
     })
 }
 

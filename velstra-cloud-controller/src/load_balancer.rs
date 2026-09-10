@@ -65,6 +65,14 @@ pub struct LoadBalancerController {
     networks: TypedStore<NetworkSpec, NetworkStatus>,
     subnets: TypedStore<SubnetSpec, SubnetStatus>,
     ports: TypedStore<PortSpec, PortStatus>,
+    /// Read for one question: which nodes are answering for a balancer on a
+    /// cell that has no fabric. Each node says so on its own status, and this
+    /// is where those reports are added up — an aggregate is not a fact
+    /// anybody owns.
+    nodes: TypedStore<
+        velstra_cloud_model::resources::NodeSpec,
+        velstra_cloud_model::resources::NodeStatus,
+    >,
     floating: TypedStore<
         velstra_cloud_model::resources::FloatingIpSpec,
         velstra_cloud_model::resources::FloatingIpStatus,
@@ -81,6 +89,10 @@ impl LoadBalancerController {
         networks: TypedStore<NetworkSpec, NetworkStatus>,
         subnets: TypedStore<SubnetSpec, SubnetStatus>,
         ports: TypedStore<PortSpec, PortStatus>,
+        nodes: TypedStore<
+            velstra_cloud_model::resources::NodeSpec,
+            velstra_cloud_model::resources::NodeStatus,
+        >,
         floating: TypedStore<
             velstra_cloud_model::resources::FloatingIpSpec,
             velstra_cloud_model::resources::FloatingIpStatus,
@@ -93,6 +105,7 @@ impl LoadBalancerController {
             networks,
             subnets,
             ports,
+            nodes,
             floating,
             fabric: fabric.map(Arc::from),
         }
@@ -143,11 +156,17 @@ impl LoadBalancerController {
     /// yet. One fabric id per member, order preserved; a member that resolves
     /// to nothing stops the whole pool, loudly, for the reason in the module
     /// doc.
+    /// Each member's fabric port id, and what the node holding it saw answer.
+    ///
+    /// The health comes along because the same read already has the Port: the
+    /// node that owns it writes there which of the listener ports accepted a
+    /// connection, and the balancer leaves the rest out. See
+    /// [`velstra_cloud_model::loadbalancer::serving`] — it fails open.
     async fn resolve_members(
         &self,
         fabric_ports: &[pb::PortInfo],
         members: &[String],
-    ) -> Result<std::result::Result<Vec<String>, String>> {
+    ) -> Result<std::result::Result<Vec<(String, Vec<u32>)>, String>> {
         if members.is_empty() {
             return Ok(Ok(Vec::new()));
         }
@@ -170,7 +189,7 @@ impl LoadBalancerController {
             };
             let host = node.strip_prefix("nodes/").unwrap_or(node);
             match fabric_ports.iter().find(|p| p.tap == tap && p.host == host) {
-                Some(p) => ids.push(p.id.clone()),
+                Some(p) => ids.push((p.id.clone(), port.status.answering.clone())),
                 None => waiting.push(format!(
                     "{name} is placed on {host} but the fabric has no port for it yet"
                 )),
@@ -311,7 +330,15 @@ impl Reconciler for LoadBalancerController {
                     .await?;
                 return Ok(());
             }
-            FinalizerStep::Delete => return Ok(()),
+            // The last guard is off; the removal is this controller's to make.
+            // Returning here left every deleted balancer on the board for good.
+            FinalizerStep::Delete => {
+                self.balancers
+                    .delete(name, lb.meta.revision, &Writer::controller(WHO))
+                    .await?;
+                info!(load_balancer = %name, "gone");
+                return Ok(());
+            }
             FinalizerStep::Wait if lb.meta.is_deleting() => {
                 if !lb.meta.has_finalizer(FABRIC_RELEASE_FINALIZER) {
                     // Somebody else's guard; this one is already released.
@@ -378,9 +405,39 @@ impl Reconciler for LoadBalancerController {
         }
 
         let Some(endpoint) = self.fabric.clone() else {
-            // No fabric, no data plane — and nothing claims one is being
-            // programmed.
-            return Ok(());
+            // No fabric — but that is no longer the end of it. On the local
+            // datapath each node answers for the balancers whose members it
+            // carries, in userspace, and says so on its own status. Nobody owns
+            // a balancer's status, so this is where those reports are added up.
+            let serving = match self.nodes.list().await {
+                Ok(nodes) => velstra_cloud_model::resources::nodes_serving(name, &nodes),
+                Err(e) => {
+                    warn!(load_balancer = %name, error = %e, "cannot read the nodes");
+                    return Ok(());
+                }
+            };
+            if serving.is_empty() {
+                return self
+                    .settle(
+                        lb,
+                        ConditionStatus::False,
+                        "NoDataPlane",
+                        "nothing is answering on this address. A cell with a fabric programs its \
+                         balancers there; a cell without one has each node answer for the \
+                         members it carries, and no node here is doing either.",
+                        None,
+                    )
+                    .await;
+            }
+            return self
+                .settle(
+                    lb,
+                    ConditionStatus::True,
+                    "Served",
+                    &format!("answered on {}", serving.join(", ")),
+                    None,
+                )
+                .await;
         };
 
         let Some(network) = self.networks.get(&lb.spec.network).await? else {
@@ -588,6 +645,7 @@ mod tests {
                 TypedStore::new(self.raw.clone(), CELL, "networks"),
                 self.subnets.clone(),
                 self.ports.clone(),
+                TypedStore::new(self.raw.clone(), CELL, "nodes"),
                 TypedStore::new(self.raw.clone(), CELL, "floatingips"),
                 None,
             )
@@ -740,11 +798,58 @@ mod tests {
             "nothing guards the fabric's half of a deletion"
         );
         assert_eq!(after.spec.vip.as_deref(), Some("10.20.0.2"));
-        assert!(
-            condition(&after.status.conditions, READY).is_none_or(|c| c.reason != "Programmed"),
+        let said = condition(&after.status.conditions, READY)
+            .expect("a fabricless cell said nothing about a load balancer holding an address");
+        assert_eq!(
+            said.reason, "NoDataPlane",
             "a load balancer claimed to be programmed with no fabric to program"
         );
+        assert!(
+            said.message.contains("nothing is answering"),
+            "{}",
+            said.message
+        );
         assert!(after.status.vip.is_empty());
+    }
+
+    /// And when a node *is* answering, the balancer says so — with which
+    /// nodes. On the local datapath each node holds the address for the members
+    /// it carries and reports what it serves; nobody owns a balancer's status,
+    /// so this is where those reports are added up.
+    #[tokio::test]
+    async fn a_fabricless_cell_says_which_nodes_are_answering() {
+        let f = Fixture::new();
+        f.subnet("10.20.0.0/24").await;
+        f.balancer(Some("10.20.0.50")).await;
+        let nodes: velstra_cloud_store::TypedStore<
+            velstra_cloud_model::resources::NodeSpec,
+            velstra_cloud_model::resources::NodeStatus,
+        > = velstra_cloud_store::TypedStore::new(f.raw.clone(), CELL, "nodes");
+        let mut node = velstra_cloud_model::resources::Resource::new(
+            velstra_cloud_model::meta::Meta::new(
+                "nodes/hv-1".parse().unwrap(),
+                velstra_cloud_model::meta::Placement::new("eu", CELL),
+            ),
+            velstra_cloud_model::resources::NodeSpec::default(),
+            velstra_cloud_model::resources::NodeStatus::default(),
+        );
+        node.status.balancers = vec![LB.to_string()];
+        nodes
+            .create(&node, &Writer::controller("test"))
+            .await
+            .unwrap();
+
+        let c = f.controller();
+        for _ in 0..3 {
+            let now = f.current().await;
+            c.reconcile(LB, Some(&now)).await.unwrap();
+        }
+
+        let after = f.current().await;
+        let said = condition(&after.status.conditions, READY)
+            .expect("nothing was said about a balancer a node is answering for");
+        assert_eq!(said.reason, "Served");
+        assert!(said.message.contains("hv-1"), "{}", said.message);
     }
 
     /// A load balancer with no listeners waits and says what for, rather than

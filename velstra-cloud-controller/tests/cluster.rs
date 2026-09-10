@@ -95,6 +95,22 @@ impl Cell {
                 self.raw.clone(),
                 velstra_cloud_store::prefix_for("cell-1", "load-balancers"),
             ),
+            velstra_cloud_store::Cached::start(
+                TypedStore::<
+                    velstra_cloud_model::resources::SnapshotSpec,
+                    velstra_cloud_model::resources::SnapshotStatus,
+                >::new(self.raw.clone(), "cell-1", "snapshots"),
+                self.raw.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "snapshots"),
+            ),
+            velstra_cloud_store::Cached::start(
+                TypedStore::<
+                    velstra_cloud_model::backup::BackupSpec,
+                    velstra_cloud_model::backup::BackupStatus,
+                >::new(self.raw.clone(), "cell-1", "backups"),
+                self.raw.clone(),
+                velstra_cloud_store::prefix_for("cell-1", "backups"),
+            ),
             StatusWriter::new(self.raw.clone(), "cell-1", "projects", "quota"),
             "cell-1",
         )
@@ -149,6 +165,8 @@ fn node(id: &str) -> Node {
             gateway: false,
         },
         NodeStatus {
+            // A live machine: nothing is placed on one that has gone quiet.
+            last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
             shared_state: false,
             vmm: "qemu".into(),
             fetching: Vec::new(),
@@ -248,6 +266,7 @@ async fn settled_cell() -> Cell {
             node: "node-a".into(),
             at: String::new(),
             read_only: false,
+            limits: Default::default(),
         },
         AttachmentStatus {
             observed_generation: 1,
@@ -443,6 +462,9 @@ impl Store for DiesAfter {
         self.inner.list_page(prefix, after, limit).await
     }
 
+    // `fetch_update` was renamed to `try_update` in a Rust newer than this
+    // workspace's minimum, so the old name is the one that compiles here.
+    #[allow(deprecated)]
     async fn put(
         &self,
         key: &str,

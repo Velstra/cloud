@@ -746,6 +746,30 @@ pub struct Quota {
     /// exists, like every other dimension here.
     #[serde(default)]
     pub devices: u32,
+    /// A count of snapshot objects, and the gibibytes they hold.
+    ///
+    /// Snapshots were the one thing a project could make without limit. They
+    /// are cheap to ask for — one call, no scheduling, no address — and they
+    /// occupy a pool for as long as they exist, so an automated schedule with
+    /// nobody watching it is the ordinary way a cell fills up. Two dimensions
+    /// for the same reason volumes have two: a thousand tiny snapshots and one
+    /// enormous one are different problems.
+    ///
+    /// The gibibytes come from each snapshot's *status*, because how much a
+    /// snapshot actually occupies is the pool's answer and not the asker's.
+    /// A snapshot that has not been taken yet therefore counts as nothing,
+    /// which is honest: nothing has been written.
+    #[serde(default)]
+    pub snapshots: u32,
+    #[serde(default)]
+    pub snapshot_gib: u64,
+    /// The same, for backups. Separate from snapshots because they live
+    /// somewhere else — a backup target rather than the pool — and an operator
+    /// capping one is usually not capping the other.
+    #[serde(default)]
+    pub backups: u32,
+    #[serde(default)]
+    pub backup_gib: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -929,6 +953,50 @@ pub struct NodeStatus {
     /// was possible and knowing which you had was not.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vmm: String,
+    /// What carries this node's guests' traffic: `tap`, `local-network`,
+    /// `fabric` or `fake`.
+    ///
+    /// Reported for exactly the reason the VMM above is, and the consequence is
+    /// sharper. `tap` — the default when nothing is said — gives a guest a wire
+    /// **that leads nowhere**: it is the right answer on a node whose fabric
+    /// carries the segment, and a silent dead end on one without. A guest there
+    /// has an address, a gateway that answers nothing, and no way off its own
+    /// machine. Nothing anywhere said which of the two a node was.
+    ///
+    /// Found on a live cell: `node.env` named no datapath, so every node
+    /// defaulted to a bare tap, and the reason guests could not reach the
+    /// internet was a setting nobody had been asked about.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub datapath: String,
+    /// Whether the console stream between the API and this node is private.
+    ///
+    /// A console carries a serial line: the bytes a guest writes and the bytes
+    /// an operator types, which is very often a root password. The API's own
+    /// port has spoken TLS from the start; this hop behind it went in the clear
+    /// across whatever network a cell's machines share, and a passive listener
+    /// there got something immediately useful.
+    ///
+    /// Reported rather than assumed, and reported *false* by default, because
+    /// the point of the field is the case where it is false: it is what makes
+    /// the API connect with `wss://` when it can, and what lets a console
+    /// screen say so before somebody types a password into it.
+    #[serde(default)]
+    pub console_tls: bool,
+    /// Load balancers this node is answering for, by resource name.
+    ///
+    /// Only the local datapath fills this in: a cell with a fabric has its
+    /// balancers programmed there, and a node that also answered would be a
+    /// second thing holding one address.
+    ///
+    /// It is how a balancer on a fabric-less cell can say anything true about
+    /// itself at all. Nobody owns a `LoadBalancer`'s status — balancing happens
+    /// wherever the packet arrives — so the controller writes it, and on such a
+    /// cell the controller has no way of knowing what happened. Each node
+    /// saying what it serves is the same shape as `images`: an aggregate
+    /// computed from what the machines report, never a list any one of them
+    /// maintains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub balancers: Vec<String>,
     /// Images this node is fetching right now, by the name the bytes are filed
     /// under. See [`nodes_fetching`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1052,6 +1120,19 @@ pub fn pending_changes(instance: &Instance) -> Vec<PendingChange> {
 
 /// Which nodes hold an image, computed from what each node reports about
 /// itself. Never stored — see [`NodeStatus::images`].
+/// The nodes answering for a balancer, out of what each one reported.
+///
+/// The same arrangement `nodes_holding` uses for an image, and for the same
+/// reason: an aggregate is not a fact anybody owns, and a list on the balancer
+/// itself would need every node in the cell writing into one field.
+pub fn nodes_serving(balancer: &str, nodes: &[Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|node| node.status.balancers.iter().any(|b| b == balancer))
+        .map(|node| node.meta.name.id().to_string())
+        .collect()
+}
+
 pub fn nodes_holding(stored_as: &str, nodes: &[Node]) -> Vec<String> {
     nodes
         .iter()
@@ -1152,14 +1233,19 @@ pub const FAMILIES: &str = "families";
 ///
 /// Anything on its way out is skipped: handing a new guest an image that is
 /// being deleted is how a machine ends up unable to boot minutes after it was
-/// created.
+/// created. A deprecated or obsolete image is skipped for the same reason one
+/// step earlier — see [`ImageState`].
 pub fn newest_of_family<'a, I>(images: I, family: &str) -> Option<&'a Image>
 where
     I: IntoIterator<Item = &'a Image>,
 {
     images
         .into_iter()
-        .filter(|i| i.spec.family == family && i.meta.deleted_at.is_none())
+        .filter(|i| {
+            i.spec.family == family
+                && i.meta.deleted_at.is_none()
+                && i.spec.state.chosen_by_family()
+        })
         .max_by_key(|i| i.meta.created_at.0)
 }
 
@@ -1227,21 +1313,14 @@ pub struct ImageSpec {
     pub format: ImageFormat,
     pub size_bytes: u64,
     pub source_url: String,
-    /// **Nothing verifies this, and the API refuses to store it.**
+    /// An Ed25519 signature over this image's digest, base64.
     ///
-    /// It was declared as "a cosign-style signature, verified before a node will
-    /// boot it". No code has ever read it: not the node that pulls the image,
-    /// not the one that boots it, not the API. What did read it was the
-    /// console, which offered a box to type one into and a column headed
-    /// *Signed* showing yes or no — so an operator could paste anything at all
-    /// and the platform would report, at a glance, that the image was signed.
-    ///
-    /// A field that is merely unused is dead weight. One that is unused while
-    /// something reports a security property from it is worse than not having
-    /// it, because every place it is displayed becomes evidence somebody will
-    /// cite. So it is refused on the way in
-    /// ([`crate::resources::UNVERIFIED_SIGNATURE`]) rather than stored and
-    /// ignored: the platform will not hold a claim it cannot check.
+    /// **Checked on the way in.** It was declared once as "a cosign-style
+    /// signature, verified before a node will boot it" and nothing read it —
+    /// while the console showed a *Signed* column derived from it, so anybody
+    /// could paste anything and the platform would report at a glance that the
+    /// image was signed. It was refused rather than stored for exactly as long
+    /// as that was true: the platform will not hold a claim it cannot check.
     ///
     /// Verification exists now: an Ed25519 signature over the digest line,
     /// base64, judged by [`crate::images::judge_signature`] under the keys the
@@ -1252,9 +1331,53 @@ pub struct ImageSpec {
     /// under its own keys before it fetches, and can be told to refuse
     /// unsigned images altogether (`--require-signed-images`).
     pub signature: Option<String>,
+    /// Where this image is in its life. See [`ImageState`].
+    ///
+    /// Written by an operator, never by the platform — except that publishing
+    /// a newer image into a family deprecates the one it supersedes, which is
+    /// the case that would otherwise never be done by hand.
+    #[serde(default)]
+    pub state: ImageState,
+    /// What to use instead, by resource name.
+    ///
+    /// Set alongside `state` so that the refusal a tenant reads names the
+    /// image they should move to rather than telling them only that the one
+    /// they asked for is gone. Empty is allowed: an image can be retired with
+    /// nothing to replace it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replacement: String,
+    /// Projects that may read and boot this image, besides the one it is in.
+    ///
+    /// By project name (`projects/p2`), or the single entry `*` for every
+    /// project in the cell — which is how a provider publishes a golden image
+    /// once instead of copying it into every tenant.
+    ///
+    /// A one-way grant, written by whoever holds the image, and read-only for
+    /// whoever receives it: a project it is shared with can boot from it and
+    /// cannot edit, retire or delete it. Without this an operator building one
+    /// hardened base image had to copy the bytes into every project that
+    /// needed it, and then keep every copy's lifecycle in step by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_with: Vec<String>,
 }
 
-/// What the API says when an image arrives carrying a signature.
+/// The entry in [`ImageSpec::shared_with`] that means every project.
+pub const SHARED_WITH_EVERY_PROJECT: &str = "*";
+
+/// Whether `project` is named in `shared_with`.
+///
+/// Both spellings, because both are what somebody writes: `projects/p2` is the
+/// resource name this platform uses everywhere, and `p2` is what a person
+/// types. The `*` entry matches every project.
+pub fn shared_with_project(shared_with: &[String], project: &str) -> bool {
+    let project = project.strip_prefix("projects/").unwrap_or(project);
+    shared_with.iter().any(|entry| {
+        entry == SHARED_WITH_EVERY_PROJECT
+            || entry.strip_prefix("projects/").unwrap_or(entry) == project
+    })
+}
+
+/// What the API says when an image arrives carrying a signature it cannot check.
 ///
 /// Here rather than in the API crate because it is a statement about the model:
 /// the reason is a property of the field, and a caller reading this type should
@@ -1269,6 +1392,56 @@ pub enum ImageFormat {
     #[default]
     Raw,
     Qcow2,
+}
+
+/// Where an image is in its life.
+///
+/// An image is immutable and content-addressed, so it is never *replaced* — a
+/// newer one is published beside it and the family points at that instead. But
+/// "the family points elsewhere" is not enough on its own: somebody who pinned
+/// the old digest a year ago keeps booting it, and nothing anywhere tells them
+/// the base they are building on stopped being maintained. Every public cloud
+/// grew the same three rungs for exactly that reason.
+///
+/// - `Active` — the ordinary state. Chosen by family, offered on the forms.
+/// - `Deprecated` — still boots, no longer chosen. A family resolves past it,
+///   so new guests get the newer image while the pinned ones keep working.
+///   This is the state an image should sit in for months.
+/// - `Obsolete` — refused for anything new. Guests already built from it keep
+///   running: the bytes are still there, and taking a running fleet down is
+///   not what an operator means by retiring an image.
+///
+/// Deleting remains separate and is still what actually reclaims the bytes.
+/// The states are the notice period before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageState {
+    #[default]
+    Active,
+    Deprecated,
+    Obsolete,
+}
+
+impl ImageState {
+    /// Whether a family may resolve to an image in this state.
+    ///
+    /// Only `Active`: the whole point of deprecating is that new guests stop
+    /// landing on it while the name still works for whoever pinned it.
+    pub fn chosen_by_family(self) -> bool {
+        matches!(self, ImageState::Active)
+    }
+
+    /// Whether something new may be built from an image in this state.
+    pub fn usable(self) -> bool {
+        !matches!(self, ImageState::Obsolete)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageState::Active => "Active",
+            ImageState::Deprecated => "Deprecated",
+            ImageState::Obsolete => "Obsolete",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1559,6 +1732,20 @@ pub struct InstanceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_requested_at: Option<Timestamp>,
 
+    /// What this guest is actually using, as the node last saw it.
+    ///
+    /// The platform could say what a guest had been *given* and never what it
+    /// was *using*, which is the difference between an inventory and a cloud.
+    /// Without it there is no right-sizing conversation, no "this has been at
+    /// 3 % for a month", and no cost page that means anything: every number a
+    /// tenant could see was one they had typed in themselves.
+    ///
+    /// `None` on a guest that is not running, on a node that cannot read its
+    /// own process table, and on every guest reported by an older agent.
+    /// Absence is the honest answer — a zero would read as "idle".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<GuestUsage>,
+
     /// The last of what this guest wrote to its serial console.
     ///
     /// Published when [`InstanceSpec::console`] is on, and always while the
@@ -1641,6 +1828,19 @@ pub struct VolumeSpec {
     /// Restoring is making a new volume from a copy, which is this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_backup: Option<String>,
+    /// What this volume may take from its pool.
+    ///
+    /// The tenant's half of the pair; the pool carries the ceiling. Zero in
+    /// any field is "no limit of my own", which on a pool with a ceiling means
+    /// the ceiling — see [`crate::throttle`], where the reasoning lives.
+    ///
+    /// Always serialised, even when it is nothing. A field that disappears at
+    /// its default is one that cannot be *set back* to its default: the API's
+    /// "is this a field you have" check works by round-tripping the value, and
+    /// a value that vanishes on the way out looks exactly like a field nobody
+    /// has. Found live, taking a pool's ceiling off again.
+    #[serde(default)]
+    pub limits: crate::throttle::Limits,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1948,6 +2148,96 @@ impl Assigned for SnapshotSpec {
     }
 }
 
+/// What one guest is using, as the node that runs it sees it.
+///
+/// **Counters, plus one rate.** The cumulative figures are what a monitoring
+/// system wants — it takes its own differences and never has to trust this
+/// process's idea of an interval — and `cpu_percent` is what a *person* wants,
+/// because "1 843 seconds of CPU" answers no question anybody asks. Both, for
+/// the same reason a `spec` and a `status` are both kept: they are different
+/// facts and neither substitutes.
+///
+/// **Where each number comes from.** CPU and memory are the *host's* view of
+/// the guest's process; traffic is counted at the host end of its taps; disk
+/// is the VMM's own answer, because the host sees a file being written and not
+/// which guest disk it was. Three sources, one shape, and none of them is a
+/// number derived from another.
+/// Snake case, like every other type here, and `default` on the struct so an
+/// object written before a field existed still reads. The camelCase the wire
+/// carries is the wire layer's doing, once, for the whole document — a type
+/// that renamed its own fields was converted twice and arrived as a status the
+/// API could not parse. Found on a live node, which retried it every few
+/// seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuestUsage {
+    /// When this was taken. A reader compares it against now to decide
+    /// whether it is still worth anything.
+    pub at: Timestamp,
+    /// CPU time this guest's machine has consumed since it started, in
+    /// **milliseconds**. Cumulative, and it resets when the guest does — which
+    /// is a fact about the guest and not a glitch.
+    ///
+    /// Milliseconds rather than the conventional seconds because the rate
+    /// below is computed from two of these: over a thirty-second pass, a guest
+    /// using three percent of one core advances a whole-second counter by zero
+    /// or one, and the graph that comes out is a square wave between 0 % and
+    /// 3 %. A consumer that wants seconds divides.
+    pub cpu_ms: u64,
+    /// Share of the vCPUs it was given, over the interval since the last
+    /// reading, in percent. `100` is one vCPU saturated; a guest with four
+    /// vCPUs can reach `400`.
+    ///
+    /// Over an interval and never since boot: an average since boot converges
+    /// on a number that stops changing, which is the one shape of graph that
+    /// cannot show a problem.
+    pub cpu_percent: u32,
+    /// Resident memory of the guest's machine, in mebibytes. What the host is
+    /// actually holding for it, which is the number that fills a node — not
+    /// what the guest believes it has.
+    pub memory_mib: u64,
+    /// Bytes and packets across this guest's wires, as the tap counts them.
+    /// Cumulative, and they **reset** when a tap is remade or the guest moves.
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    /// The same bytes, carried across every reset: what this guest has moved
+    /// since the node started watching it.
+    ///
+    /// The raw counters above are what a tap says, and a tap says zero again
+    /// every time it is remade — a restart, a migration, a datapath reprogram.
+    /// Differencing those to bill somebody would silently lose everything
+    /// between the last reading and the reset, and a bill that quietly loses
+    /// traffic is worse than one that has none. So the node adds each pass's
+    /// increment onto this and never lets it go backwards, which is what makes
+    /// it something an hourly reading can subtract.
+    #[serde(default)]
+    pub rx_total: u64,
+    #[serde(default)]
+    pub tx_total: u64,
+    /// Bytes and operations this guest's disks have moved since it started,
+    /// as the hypervisor counts them.
+    ///
+    /// Every disk it holds, summed: a guest with a root disk and two volumes
+    /// is one guest, and a person asking "is this thing hammering the pool"
+    /// does not want three numbers. Cumulative, and they reset when the guest
+    /// does — the same shape as the CPU counter beside them, and for the same
+    /// reason.
+    ///
+    /// These come from the VMM's own monitor rather than from the host's
+    /// process, because the host sees a file being written and not which
+    /// guest disk it was.
+    #[serde(default)]
+    pub disk_read_bytes: u64,
+    #[serde(default)]
+    pub disk_write_bytes: u64,
+    #[serde(default)]
+    pub disk_read_ops: u64,
+    #[serde(default)]
+    pub disk_write_ops: u64,
+}
+
 pub type Snapshot = Resource<SnapshotSpec, SnapshotStatus>;
 
 /// The guard a **volume** carries while any snapshot has been taken from it.
@@ -1979,6 +2269,21 @@ pub struct PoolSpec {
     /// half way.
     pub accepting: bool,
     pub labels: Vec<String>,
+    /// The most any one volume in this pool may take.
+    ///
+    /// The operator's lever, and the reason there is one: without it a single
+    /// tenant running `fio` takes the latency of every other volume in the
+    /// pool with them, and the platform has nothing to say and nothing to
+    /// pull. A volume that names no limit of its own gets this one — the
+    /// default is what makes a ceiling mean anything.
+    ///
+    /// Zero is no ceiling, which is what a cell starts with: nothing changes
+    /// until an operator sets one — and it is written out rather than omitted,
+    /// so "this pool has no ceiling" is something a reader sees rather than
+    /// infers from an absence. See the note on [`VolumeSpec::limits`] for the
+    /// second reason.
+    #[serde(default)]
+    pub volume_ceiling: crate::throttle::Limits,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2052,6 +2357,19 @@ pub struct AttachmentSpec {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub at: String,
     pub read_only: bool,
+    /// What this volume may take, once its pool has had its say.
+    ///
+    /// Mirrored here for exactly the reason `at` is, and by the same
+    /// controller: the node has to program a rate limiter on the device it
+    /// opens, and it is told about neither the volume nor the pool. Computed
+    /// once, where both are readable — see [`crate::throttle::effective`].
+    ///
+    /// Applied when the disk is opened, so a change reaches a running guest at
+    /// its next attach rather than immediately. That is honest about what the
+    /// hypervisors here can do, and it is the same rule the CPU baseline
+    /// follows.
+    #[serde(default)]
+    pub limits: crate::throttle::Limits,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2275,6 +2593,48 @@ pub struct PortStatus {
     /// True when the Velstra agent has the port in its maps.
     pub programmed: bool,
     pub tap_device: Option<String>,
+    /// TCP ports on this guest that accepted a connection when the node last
+    /// looked, of the ports something asked about.
+    ///
+    /// Written by the node holding the port, because it is the only party that
+    /// can reach a guest on a tenant overlay — the control plane cannot, which
+    /// is why this platform had no health checking at all. Only the ports a
+    /// load balancer names are probed: a node that scanned its guests would be
+    /// doing something nobody asked for, and slowly.
+    ///
+    /// Absent is not "unhealthy". A port nobody has asked about, a node too
+    /// old to answer, a probe that has not run yet — all of them read as an
+    /// empty list, and the balancer treats a pool it knows nothing about as a
+    /// pool to send traffic to. Failing open is deliberate; see
+    /// [`crate::loadbalancer::serving`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answering: Vec<u32>,
+    /// What this port's firewall has turned away, as the node last counted.
+    ///
+    /// The question "why can my guest not reach that" had no answer anywhere
+    /// on this platform: the rules were visible, what they *did* was not, and
+    /// somebody debugging had to guess between a firewall, a route and a
+    /// service that was not listening. A drop counter tells the three apart in
+    /// one look.
+    ///
+    /// Absent means nothing is filtering this port — no rules, or a datapath
+    /// that counts elsewhere. Deliberately not zero: zero says "nothing was
+    /// dropped", and the truth there is "nothing was judged".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<Dropped>,
+}
+
+/// What one port's firewall has turned away, counted by the node.
+///
+/// Both directions, because they answer different questions: inbound is
+/// somebody being kept out, outbound is the guest being kept in, and a person
+/// debugging knows which one they meant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dropped {
+    pub inbound_packets: u64,
+    pub inbound_bytes: u64,
+    pub outbound_packets: u64,
+    pub outbound_bytes: u64,
 }
 
 impl Observed for PortStatus {
@@ -2367,6 +2727,67 @@ mod tests {
     use super::*;
     use crate::meta::{ConditionStatus, Placement, ResourceName};
 
+    fn image(id: &str, family: &str, made_at: u64, state: ImageState) -> Image {
+        let mut meta = Meta::new(
+            ResourceName::parse(&format!("images/{id}")).unwrap(),
+            Placement::new("eu-central", "cell-1"),
+        );
+        meta.created_at = crate::meta::Timestamp(made_at);
+        Resource::new(
+            meta,
+            ImageSpec {
+                family: family.into(),
+                state,
+                ..Default::default()
+            },
+            ImageStatus::default(),
+        )
+    }
+
+    /// The newest of a family is the newest one still in service. Publishing a
+    /// replacement is the whole mechanism, and it only works if the family
+    /// stops resolving to what it replaced.
+    #[test]
+    fn a_family_skips_an_image_that_was_superseded() {
+        let old = image("a", "debian-13", 100, ImageState::Active);
+        let new = image("b", "debian-13", 200, ImageState::Active);
+        assert_eq!(
+            newest_of_family([&old, &new], "debian-13").map(|i| i.meta.name.id()),
+            Some("b")
+        );
+
+        let old = image("a", "debian-13", 100, ImageState::Active);
+        let new = image("b", "debian-13", 200, ImageState::Deprecated);
+        assert_eq!(
+            newest_of_family([&old, &new], "debian-13").map(|i| i.meta.name.id()),
+            Some("a"),
+            "a family resolved to an image that had been deprecated"
+        );
+    }
+
+    /// And a family with nothing in service resolves to nothing rather than to
+    /// something retired — the caller is told there is no such family, which
+    /// is true and actionable, instead of being handed bytes nobody maintains.
+    #[test]
+    fn a_family_of_only_retired_images_resolves_to_nothing() {
+        let one = image("a", "debian-13", 100, ImageState::Obsolete);
+        let two = image("b", "debian-13", 200, ImageState::Deprecated);
+        assert!(newest_of_family([&one, &two], "debian-13").is_none());
+    }
+
+    /// Deprecating stops a family choosing it and nothing else; retiring is
+    /// what closes the door.
+    #[test]
+    fn the_two_rungs_mean_different_things() {
+        assert!(ImageState::Active.chosen_by_family());
+        assert!(!ImageState::Deprecated.chosen_by_family());
+        assert!(
+            ImageState::Deprecated.usable(),
+            "a deprecated image stopped being usable, which breaks every pinned digest"
+        );
+        assert!(!ImageState::Obsolete.usable());
+    }
+
     fn instance(generation: u64, observed: u64) -> Instance {
         let mut meta = Meta::new(
             ResourceName::parse("projects/p1/instances/i1").unwrap(),
@@ -2436,6 +2857,7 @@ mod tests {
                 node: "node-a".into(),
                 at: String::new(),
                 read_only: false,
+                limits: Default::default(),
             },
             AttachmentStatus::default(),
         );

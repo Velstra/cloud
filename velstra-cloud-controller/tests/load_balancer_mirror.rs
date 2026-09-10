@@ -283,6 +283,7 @@ async fn a_load_balancer_is_programmed_follows_its_spec_and_is_torn_down() {
         networks.clone(),
         subnets.clone(),
         ports.clone(),
+        velstra_cloud_store::TypedStore::new(raw.clone(), CELL, "nodes"),
         floating.clone(),
         Some(fabric.admin.clone()),
     );

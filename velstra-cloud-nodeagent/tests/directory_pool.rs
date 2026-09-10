@@ -117,16 +117,28 @@ async fn a_volume_from_an_image_has_the_image_in_it_before_it_exists() {
     let pool = dir.pool();
 
     // An image with something recognisable in it, published the way the node
-    // agent publishes one: the resource name, slugged.
-    let image = "projects/p1/images/sha256-abc";
-    let raw = dir.images().join(image.replace('/', "~"));
+    // agent really publishes one: under its **digest**, not under the resource
+    // name with its slashes flattened. This test asserted the flattened name
+    // for as long as the pool looked for it — both were wrong together, which
+    // is how a first-class operation shipped broken on two backends of three.
+    let stored = format!("sha256-{}", "a".repeat(64));
+    let image = "projects/p1/images/debian-13-aaaaaaaa";
+    let raw = dir.images().join(&stored);
     let mut bytes = vec![0u8; 1024 * 1024];
     bytes[..7].copy_from_slice(b"VELSTRA");
     std::fs::write(&raw, &bytes).unwrap();
 
-    pool.provision(VOLUME, 1, Origin::Image(image), None)
-        .await
-        .expect("provisioning from an image");
+    pool.provision(
+        VOLUME,
+        1,
+        Origin::Image {
+            name: image,
+            stored: Some(&stored),
+        },
+        None,
+    )
+    .await
+    .expect("provisioning from an image");
 
     let seen = pool.observe().await.unwrap();
     assert_eq!(seen.volumes.get(VOLUME), Some(&1), "{seen:?}");
@@ -161,12 +173,18 @@ async fn an_image_that_is_not_here_is_refused_rather_than_left_blank() {
         .provision(
             VOLUME,
             1,
-            Origin::Image("projects/p1/images/sha256-nope"),
+            Origin::Image {
+                name: "projects/p1/images/nothing-here",
+                stored: Some("sha256-nope"),
+            },
             None,
         )
         .await
         .expect_err("a volume was made from an image that is not on this machine");
     assert!(err.to_string().contains("not on this machine"), "{err}");
+    // And it says where it looked, which is the difference between a bug
+    // report and a fix.
+    assert!(err.to_string().contains("sha256-nope"), "{err}");
     assert!(
         pool.observe().await.unwrap().volumes.is_empty(),
         "a volume that could not be filled was left behind empty"
@@ -364,4 +382,26 @@ async fn a_volume_someone_has_open_is_still_measurable() {
         Some(&1),
         "a volume somebody has open was not measured"
     );
+}
+
+/// An image whose digest could not be read is refused by name, rather than by
+/// a path the pool invented from whatever it had.
+#[tokio::test]
+async fn an_image_with_no_digest_is_refused_by_name() {
+    let dir = Dir::new("nodigest");
+    let pool = dir.pool();
+    let err = pool
+        .provision(
+            VOLUME,
+            1,
+            Origin::Image {
+                name: "projects/p1/images/handmade",
+                stored: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("a volume was made from an image with no digest");
+    assert!(err.to_string().contains("carries no digest"), "{err}");
+    assert!(err.to_string().contains("handmade"), "{err}");
 }

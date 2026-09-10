@@ -20,12 +20,50 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
+use rustls_pki_types::pem::PemObject;
+
+/// Who to believe when the node's console speaks TLS.
+///
+/// A cell's nodes carry certificates its own authority signed, not ones a
+/// public root vouches for — so the default trust store answers "unknown
+/// issuer" to every one of them. This is the file that CA lives in, and it is
+/// read once per attach rather than held, because an operator who replaces it
+/// should not have to restart the API to be believed.
+///
+/// `None` falls back to the public roots. That is the right default rather than
+/// a refusal: it is what a node with a publicly-signed name needs, and a cell
+/// with neither simply never gets a `wss://` URL to connect to.
+pub fn trust(ca: Option<&std::path::Path>) -> Option<tokio_tungstenite::Connector> {
+    let ca = ca?;
+    let pem = std::fs::read(ca)
+        .map_err(|e| tracing::warn!(path = %ca.display(), error = %e, "the console CA could not be read"))
+        .ok()?;
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls_pki_types::CertificateDer::pem_slice_iter(&pem).flatten() {
+        let _ = roots.add(certificate);
+    }
+    if roots.is_empty() {
+        tracing::warn!(path = %ca.display(), "the console CA file holds no certificate");
+        return None;
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+        config,
+    )))
+}
 
 /// Relay a client's websocket to a node's, until either end stops.
-pub async fn relay(client: WebSocket, node_url: String) -> Result<(), String> {
-    let (node, _) = tokio_tungstenite::connect_async(&node_url)
-        .await
-        .map_err(|e| format!("connecting to {node_url}: {e}"))?;
+pub async fn relay(
+    client: WebSocket,
+    node_url: String,
+    connector: Option<tokio_tungstenite::Connector>,
+) -> Result<(), String> {
+    let (node, _) =
+        tokio_tungstenite::connect_async_tls_with_config(&node_url, None, false, connector)
+            .await
+            .map_err(|e| format!("connecting to {node_url}: {e}"))?;
 
     let (mut to_client, mut from_client) = client.split();
     let (mut to_node, mut from_node) = node.split();

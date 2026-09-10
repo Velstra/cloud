@@ -15,6 +15,8 @@ syntax = "proto3";
 
 package velstra.cloud.v1;
 
+import "google/protobuf/field_mask.proto";
+
 // ---- common ---------------------------------------------------------------
 
 // Where an object lives. Neither coordinate can be changed afterwards: the
@@ -164,6 +166,16 @@ message Quota {
   // once and cannot be oversubscribed, so without a cap one project takes
   // every accelerator in the cell.
   uint32 devices = 8;
+  // Snapshots, and the gibibytes they occupy. Cheap to ask for, occupying a
+  // pool for as long as they exist, and until these existed the one thing a
+  // project could make without limit. The gibibytes come from each snapshot's
+  // status: how much one occupies is the pool's answer, not the asker's.
+  uint32 snapshots = 9;
+  uint64 snapshot_gib = 10;
+  // The same, for backups, which live on a backup target rather than in the
+  // pool — an operator capping one is usually not capping the other.
+  uint32 backups = 11;
+  uint64 backup_gib = 12;
 }
 
 // What a project is allowed to reach for, decided per project by whoever runs
@@ -234,6 +246,20 @@ message UpdateProjectRequest {
   Project project = 1;
   // Empty means last-writer-wins.
   string revision = 2;
+  // Which fields of `Project` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListProjectsResponse {
@@ -353,6 +379,23 @@ message NodeStatus {
   // tell a local filesystem from one mount of a shared one. It is what makes
   // moving a guest possible — a migration transfers memory and not disks.
   bool shared_state = 15;
+  // What carries this node's guests' traffic: `tap`, `local-network`, `fabric`
+  // or `fake`. Reported for the same reason `vmm` is, and it matters more: a
+  // bare `tap` gives a guest a wire with nothing at the other end — right on a
+  // node whose fabric holds the segment, a dead end on one without — and
+  // nothing anywhere said which a node was.
+  string datapath = 16;
+  // Whether the console stream between the API and this node is private. A
+  // console carries a serial line — including the bytes an operator types,
+  // which is very often a root password — and this hop used to go in the clear
+  // across whatever network a cell's machines share.
+  bool console_tls = 17;
+  // Load balancers this node is answering for. Only the local datapath fills
+  // this in — a cell with a fabric programs its balancers there. It is how a
+  // balancer on a fabric-less cell can say anything true about itself: nobody
+  // owns its status, so each node says what it serves and the controller adds
+  // the reports up.
+  repeated string balancers = 18;
 }
 
 // One PCI device, as the node holding it sees it.
@@ -475,6 +518,62 @@ message NodeCeph {
   // Whether this node has that key installed for root. Only the destination can
   // answer "did the key arrive".
   bool trusts_key = 10;
+  // What `ceph status` and its siblings say about the cluster, read from here.
+  // Absent when this node cannot ask; only a node with the admin keyring can.
+  CephSeen seen = 11;
+}
+
+// The cluster as Ceph itself describes it. Bytes and per-second rates, as
+// integers, everywhere.
+message CephSeen {
+  string health = 1;
+  repeated CephWarning warnings = 2;
+  repeated PgState pgs = 3;
+  uint64 pgs_total = 4;
+  uint64 objects = 5;
+  uint64 used_bytes = 6;
+  uint64 total_bytes = 7;
+  uint64 read_bps = 8;
+  uint64 write_bps = 9;
+  uint64 read_ops = 10;
+  uint64 write_ops = 11;
+  repeated OsdSeen osds = 12;
+  repeated PoolSeen pool_stats = 13;
+  // Milliseconds since the epoch, when this was read.
+  uint64 at = 14;
+}
+
+message CephWarning {
+  string code = 1;
+  string severity = 2;
+  string message = 3;
+}
+
+message PgState {
+  string state = 1;
+  uint64 count = 2;
+}
+
+message OsdSeen {
+  uint64 id = 1;
+  string host = 2;
+  string device = 3;
+  bool up = 4;
+  bool in = 5;
+  uint64 used_bytes = 6;
+  uint64 total_bytes = 7;
+  uint64 pgs = 8;
+  string class = 9;
+}
+
+message PoolSeen {
+  string pool = 1;
+  uint64 stored_bytes = 2;
+  uint64 objects = 3;
+  uint64 max_avail_bytes = 4;
+  uint64 size = 5;
+  uint64 min_size = 6;
+  uint64 pg_num = 7;
 }
 
 message Node {
@@ -492,6 +591,20 @@ message CreateNodeRequest {
 message UpdateNodeRequest {
   Node node = 1;
   string revision = 2;
+  // Which fields of `Node` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListNodesResponse {
@@ -546,6 +659,28 @@ message ImageSpec {
   // image is content-addressed, so the same digest is the same bytes and every
   // node that had them cached still has them.
   string from = 9;
+  // Where the image is in its life. An image is immutable, so it is never
+  // replaced — a newer one is published beside it and the family resolves to
+  // that instead. These are the rungs of the notice period before the bytes
+  // are actually deleted: DEPRECATED still boots and is no longer chosen by
+  // family; OBSOLETE refuses anything new while guests already on it keep
+  // running.
+  ImageState state = 10;
+  // What to use instead, by resource name, so the refusal names somewhere to
+  // go. Empty is allowed: an image can be retired with nothing to replace it.
+  string replacement = 11;
+  // Projects that may read and boot this image besides the one it is in, by
+  // name (`projects/p2`), or the single entry `*` for every project in the
+  // cell. A one-way grant: whoever receives it can boot from the image and
+  // cannot edit, retire or delete it.
+  repeated string shared_with = 12;
+}
+
+enum ImageState {
+  IMAGE_STATE_UNSPECIFIED = 0;
+  IMAGE_STATE_ACTIVE = 1;
+  IMAGE_STATE_DEPRECATED = 2;
+  IMAGE_STATE_OBSOLETE = 3;
 }
 
 message ImageStatus {
@@ -570,6 +705,20 @@ message CreateImageRequest {
 message UpdateImageRequest {
   Image image = 1;
   string revision = 2;
+  // Which fields of `Image` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListImagesResponse {
@@ -691,6 +840,36 @@ message InstanceSpec {
   optional string flavor = 18;
 }
 
+message GuestUsage {
+  int64 at = 1;
+  // Milliseconds: the rate below is a difference of two of these, and whole
+  // seconds round a lightly-loaded guest to nothing over one pass.
+  uint64 cpu_ms = 2;
+  // Share of the vCPUs given, over the interval since the last reading, in
+  // percent. 100 is one vCPU saturated.
+  uint32 cpu_percent = 3;
+  // Resident memory of the guest's machine on the host, in mebibytes — what
+  // the host is holding, not what the guest believes it has.
+  uint64 memory_mib = 4;
+  uint64 rx_bytes = 5;
+  uint64 tx_bytes = 6;
+  uint64 rx_packets = 7;
+  uint64 tx_packets = 8;
+  // The same bytes, carried across a tap that was remade. A tap counts from
+  // zero again after a restart, a migration or a datapath reprogram, and
+  // differencing the raw counter to bill somebody loses everything between the
+  // last reading and the reset.
+  uint64 rx_total = 9;
+  uint64 tx_total = 10;
+  // What every disk this guest holds has moved since it started, added up.
+  // From the VMM's own monitor: the host sees a file being written and not
+  // which guest disk it was.
+  uint64 disk_read_bytes = 11;
+  uint64 disk_write_bytes = 12;
+  uint64 disk_read_ops = 13;
+  uint64 disk_write_ops = 14;
+}
+
 message InstanceStatus {
   uint64 observed_generation = 1;
   repeated Condition conditions = 2;
@@ -719,6 +898,11 @@ message InstanceStatus {
   // When this node asked the guest to shut down, for a stop still waiting on
   // it. 0 means nothing is being waited for.
   int64 stop_requested_at = 13;
+  // What this guest is actually using, as the node last saw it. Counters, so a
+  // monitoring system takes its own differences, plus one rate because
+  // "1 843 seconds of CPU" answers no question anybody asks. Absent on a guest
+  // that is not running: a zero would read as idle.
+  GuestUsage usage = 14;
 }
 
 message RunningSize {
@@ -742,6 +926,20 @@ message CreateInstanceRequest {
 message UpdateInstanceRequest {
   Instance instance = 1;
   string revision = 2;
+  // Which fields of `Instance` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListInstancesResponse {
@@ -799,6 +997,22 @@ message VolumeSpec {
   // of the same statement, and a field for the same reason: restoring is
   // making a new volume from a copy, never writing one back in place.
   optional string source_backup = 6;
+  // What this volume may take from its pool. The tenant's half; the pool
+  // carries the ceiling, and a volume that names nothing gets the ceiling.
+  VolumeLimits limits = 7;
+}
+
+// How much of a shared pool one volume may take. Zero is unlimited in every
+// field, which is what a cell starts with.
+message VolumeLimits {
+  // Read and write operations per second, together — the thing a pool runs
+  // out of is operations, and a split budget is two numbers to tune for a
+  // limit that binds on their sum.
+  uint32 iops = 1;
+  uint32 read_mibps = 2;
+  // Separate from reads because they are not the same cost on any backend
+  // this platform runs on: a write to a replicated Ceph pool is three writes.
+  uint32 write_mibps = 3;
 }
 
 message VolumeStatus {
@@ -831,6 +1045,20 @@ message CreateVolumeRequest {
 message UpdateVolumeRequest {
   Volume volume = 1;
   string revision = 2;
+  // Which fields of `Volume` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListVolumesResponse {
@@ -895,6 +1123,20 @@ message CreateSnapshotRequest {
 message UpdateSnapshotRequest {
   Snapshot snapshot = 1;
   string revision = 2;
+  // Which fields of `Snapshot` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListSnapshotsResponse {
@@ -936,6 +1178,10 @@ message AttachmentSpec {
   // volumes — those belong to a pool. The node needs one field of one volume, so
   // the field comes to it on the object it already holds.
   string at = 5;
+  // What this disk may take, once the pool has had its say. Mirrored here for
+  // exactly the reason `at` is, and by the same controller: the node has to
+  // program a rate limiter and is told about neither the volume nor the pool.
+  VolumeLimits limits = 6;
 }
 
 message AttachmentStatus {
@@ -963,6 +1209,20 @@ message CreateAttachmentRequest {
 message UpdateAttachmentRequest {
   Attachment attachment = 1;
   string revision = 2;
+  // Which fields of `Attachment` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListAttachmentsResponse {
@@ -1030,6 +1290,20 @@ message CreateNetworkRequest {
 message UpdateNetworkRequest {
   Network network = 1;
   string revision = 2;
+  // Which fields of `Network` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListNetworksResponse {
@@ -1086,6 +1360,20 @@ message CreateRouterRequest {
 message UpdateRouterRequest {
   Router router = 1;
   string revision = 2;
+  // Which fields of `Router` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListRoutersResponse {
@@ -1151,6 +1439,20 @@ message CreateFloatingIpRequest {
 message UpdateFloatingIpRequest {
   FloatingIp floating_ip = 1;
   string revision = 2;
+  // Which fields of `FloatingIp` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListFloatingIpsResponse {
@@ -1200,6 +1502,20 @@ message CreateSubnetRequest {
 message UpdateSubnetRequest {
   Subnet subnet = 1;
   string revision = 2;
+  // Which fields of `Subnet` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListSubnetsResponse {
@@ -1245,6 +1561,25 @@ message PortStatus {
   // True when the Velstra agent has the port in its maps.
   bool programmed = 4;
   optional string tap_device = 5;
+  // TCP ports on this guest that accepted a connection when the node last
+  // looked, of the ports a load balancer named. Written by the node holding
+  // the port: it is the only party that can reach a guest on a tenant overlay.
+  // Empty is "nothing was asked" and not "unhealthy" — the balancer fails open.
+  repeated uint32 answering = 6;
+  // What this port's firewall turned away, as the node last counted. Absent
+  // means nothing is judging this port — deliberately not zero, which would
+  // say "nothing was dropped" where the truth is "nothing was judged".
+  optional Dropped dropped = 7;
+}
+
+// What one port's firewall turned away. Both directions, because they answer
+// different questions: inbound is somebody kept out, outbound is the guest
+// kept in.
+message Dropped {
+  uint64 inbound_packets = 1;
+  uint64 inbound_bytes = 2;
+  uint64 outbound_packets = 3;
+  uint64 outbound_bytes = 4;
 }
 
 message Port {
@@ -1262,6 +1597,20 @@ message CreatePortRequest {
 message UpdatePortRequest {
   Port port = 1;
   string revision = 2;
+  // Which fields of `Port` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListPortsResponse {
@@ -1350,6 +1699,20 @@ message CreateMigrationRequest {
 message UpdateMigrationRequest {
   Migration migration = 1;
   string revision = 2;
+  // Which fields of `Migration` this request changes, as paths relative to the
+  // resource: `spec.vcpus`, `meta.labels`. Anything not named is left
+  // exactly as it is.
+  //
+  // **Empty means every field the message carries** — which over proto3 is
+  // every field there is, because a field the caller never set arrives at its
+  // zero value and is indistinguishable from one they set to zero. That is
+  // the old behaviour and it stays, so nothing that worked stops working; it
+  // is also the reason to send a mask. Without one, changing a guest's vCPU
+  // count also writes its cloud-init, its ports and its placement policy with
+  // whatever the client happened to have.
+  //
+  // `*` is the explicit spelling of "everything I sent".
+  google.protobuf.FieldMask update_mask = 3;
 }
 
 message ListMigrationsResponse {
