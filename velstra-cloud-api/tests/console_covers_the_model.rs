@@ -231,6 +231,8 @@ mod complete {
                 member_port: 8080,
             }],
             members: vec!["projects/p1/ports/pt1".into()],
+            session_affinity: false,
+            draining: Default::default(),
         }
     }
 }
@@ -880,6 +882,7 @@ mod settled {
                 protocol: velstra_cloud_model::loadbalancer::Protocol::Tcp,
                 port: 443,
                 members: 1,
+                draining: 0,
             }],
         }
     }

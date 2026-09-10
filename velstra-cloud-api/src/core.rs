@@ -3410,6 +3410,10 @@ impl Api {
             }
             self.refuse_a_role_nobody_defined(spec).await?;
             check_rules(name.collection(), spec, Document::Part)?;
+            if name.collection() == "load-balancers" {
+                self.refuse_draining_that_is_not_a_member(name, spec)
+                    .await?;
+            }
             if name.collection() == "volumes" {
                 self.refuse_a_new_source(name, spec).await?;
                 self.refuse_a_moved_pool(name, spec).await?;
@@ -6964,6 +6968,31 @@ impl Api {
         .at("spec.pool"))
     }
 
+    /// A change to either list is judged against both — the one it carries and
+    /// the one already stored.
+    ///
+    /// A patch carries what it changes, so `draining` usually arrives alone,
+    /// and checking it against the members in the same document would pass
+    /// anything. Reading the stored members is what makes the check mean
+    /// something on the request that actually sets a member draining.
+    async fn refuse_draining_that_is_not_a_member(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        if spec.get("draining").is_none() && spec.get("members").is_none() {
+            return Ok(());
+        }
+        let stored: velstra_cloud_model::loadbalancer::LoadBalancer = self.typed(name).await?;
+        let whole = json!({
+            "draining": spec.get("draining").cloned()
+                .unwrap_or_else(|| json!(stored.spec.draining)),
+            "members": spec.get("members").cloned()
+                .unwrap_or_else(|| json!(stored.spec.members)),
+        });
+        check_draining(&whole)
+    }
+
     // ---- migration --------------------------------------------------------
 
     /// Fill in where the guest is now, and refuse a move that cannot work.
@@ -8326,7 +8355,14 @@ fn check_image(spec: &Value, document: Document) -> ApiResult<()> {
 
 fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     if kind == "load-balancers" {
-        return check_listeners(spec);
+        check_listeners(spec)?;
+        // A change carrying only one of the two lists cannot be judged from
+        // itself; `refuse_draining_that_is_not_a_member` reads the other half
+        // off the stored object for that case.
+        if document == Document::Whole {
+            check_draining(spec)?;
+        }
+        return Ok(());
     }
     if kind == "images" {
         return check_image(spec, document);
@@ -8365,6 +8401,34 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
 /// with an error naming a service id nobody typed. The controller checks again
 /// for an object written by an older version of this software — belt to this
 /// brace.
+fn check_draining(spec: &Value) -> ApiResult<()> {
+    let list = |key: &str| -> Vec<String> {
+        spec.get(key)
+            .and_then(Value::as_array)
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let draining = list("draining");
+    if draining.is_empty() {
+        return Ok(());
+    }
+    velstra_cloud_model::loadbalancer::validate_draining(&list("members"), &draining).map_err(
+        |why| {
+            ApiError::invalid(format!(
+                "{why}. `draining` names members being taken out of service, so every name in it \
+                 has to be one of `members` — a name that is not stays there doing nothing, which \
+                 reads exactly like a member that has finished draining"
+            ))
+            .at("spec.draining")
+        },
+    )
+}
+
 fn check_listeners(spec: &Value) -> ApiResult<()> {
     let Some(listeners) = spec.get("listeners").and_then(Value::as_array) else {
         return Ok(());

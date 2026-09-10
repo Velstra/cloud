@@ -447,6 +447,8 @@ mod tests {
                 vip: vip.map(str::to_string),
                 listeners: vec![],
                 members: vec![],
+                session_affinity: false,
+                draining: Default::default(),
             },
             crate::loadbalancer::LoadBalancerStatus::default(),
         )

@@ -122,6 +122,33 @@ pub struct LoadBalancerSpec {
     /// pool, which is a legitimate state to hold a VIP in.
     #[serde(default)]
     pub members: Vec<String>,
+    /// Which of `members` are being taken out of service.
+    ///
+    /// A second list rather than a shape change to `members`, which is a set of
+    /// names and stays one — and an object written before this existed reads as
+    /// every member live, which is what it was.
+    ///
+    /// A draining member takes no *new* connections and keeps the ones it has
+    /// until they end on their own. That is the whole of what it is for: without
+    /// it, taking a machine out means removing it from the pool, and every
+    /// connection it was serving is cut mid-request. Naming a port here that is
+    /// not a member is refused — it is a change that would do nothing, and being
+    /// told it was made is worse than being told it was not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draining: Vec<String>,
+    /// Send every connection from one client address to the same member.
+    ///
+    /// Off by default, which is the even spread: one client's four connections
+    /// reach four members, and a member that dies takes a quarter of that
+    /// client's work rather than all of it. Turn it on for a service that keeps
+    /// something per client *between* connections — a session in memory, an
+    /// upload assembled in pieces, a cache only warm where it was filled.
+    ///
+    /// The cost is stated rather than hidden: one client is one member, so a
+    /// pool fronting few busy clients spreads worse, and a client behind a large
+    /// NAT arrives as one address and is treated as one client.
+    #[serde(default)]
+    pub session_affinity: bool,
 }
 
 /// One listener as the fabric holds it: the fact, not the ask.
@@ -138,6 +165,14 @@ pub struct ObservedListener {
     /// of what the fabric holds rather than a health field: the health lives
     /// on the ports, written by the node that can actually see them.
     pub members: u32,
+    /// How many of those are draining — held, but taking nothing new.
+    ///
+    /// Without this the count above cannot be read: an operator draining a
+    /// member sees `members` unchanged, because a draining member is still one
+    /// the fabric holds, and has no way to tell the drain took from the
+    /// platform having ignored it.
+    #[serde(default)]
+    pub draining: u32,
 }
 
 /// What is. Written by the controller: a load balancer is a cell-wide fact
@@ -210,6 +245,29 @@ impl ListenerInvalid {
     }
 }
 
+/// A port named as draining that is not in the pool.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "spec.draining names {port}, which is not one of this balancer's members. Draining is a \
+     state a member is in, so naming one that is not there is a change that would do nothing — \
+     and being told it was made is worse than being told it was not."
+)]
+pub struct NotAMember {
+    pub port: String,
+}
+
+/// Every name in `draining` has to be a member.
+///
+/// Checked where it is written rather than where it is programmed: the node
+/// that would notice is one machine holding one part of the pool, and the
+/// person who made the change is somewhere else entirely.
+pub fn validate_draining(members: &[String], draining: &[String]) -> Result<(), NotAMember> {
+    match draining.iter().find(|d| !members.contains(d)) {
+        Some(port) => Err(NotAMember { port: port.clone() }),
+        None => Ok(()),
+    }
+}
+
 /// Check that every listener is one the fabric could hold.
 ///
 /// A partial function on purpose: emptiness is not checked here, because a
@@ -243,6 +301,15 @@ pub struct FabricMember {
     pub port_id: String,
     /// Zero keeps the client's destination port, as the fabric spells it.
     pub port: u16,
+    /// Taking no new connections, keeping the ones it has — or `None` when
+    /// this copy does not say.
+    ///
+    /// A fabric older than the field answers a list with nothing here, and
+    /// that is not the same fact as "not draining". The distinction is load
+    /// bearing: `same_service` decides whether to tear a service down and
+    /// build it again, so a difference that can never be closed would drop
+    /// every connection through it on every pass.
+    pub draining: Option<bool>,
 }
 
 /// One load-balanced service as the fabric holds it — or should.
@@ -260,6 +327,9 @@ pub struct FabricService {
     /// Sorted, always: the pool is a set, and two orderings of one set must
     /// compare equal or a converged object would be re-programmed forever.
     pub members: Vec<FabricMember>,
+    /// Every connection from one client address goes to one member — or `None`
+    /// when this copy does not say. See `FabricMember::draining`.
+    pub client_affinity: Option<bool>,
 }
 
 /// The fabric id of one listener's service, derived from the resource name.
@@ -297,6 +367,8 @@ pub fn desired_services(
     // answer. An empty list is "nobody looked", not "nothing answers" — see
     // [`serving`], which fails open on it.
     member_port_ids: &[(String, Vec<u32>)],
+    // The fabric port ids of the members being taken out of service.,
+    draining: &[String],
 ) -> Vec<FabricService> {
     spec.listeners
         .iter()
@@ -311,9 +383,14 @@ pub fn desired_services(
                 .iter()
                 .map(|(id, answering)| (id.clone(), answering.contains(&u32::from(at))))
                 .collect();
+            // A draining member stays in the pool and is marked. Dropping it
+            // instead would be the very thing draining exists to avoid: the
+            // fabric would stop knowing about it, and the connections it is
+            // finishing would have nothing holding them.
             let mut members: Vec<FabricMember> = serving(&pool)
                 .into_iter()
                 .map(|port_id| FabricMember {
+                    draining: Some(draining.contains(&port_id)),
                     port_id,
                     port: listener.member_port,
                 })
@@ -327,6 +404,7 @@ pub fn desired_services(
                 protocol: listener.protocol,
                 port: listener.port,
                 members,
+                client_affinity: Some(spec.session_affinity),
             }
         })
         .collect()
@@ -398,17 +476,30 @@ pub fn mirror_actions(
 /// Whether two copies of one service say the same thing. Members are compared
 /// as sets — both sides sort before comparing, so an ordering difference is
 /// not a difference.
-fn same_service(a: &FabricService, b: &FabricService) -> bool {
-    let sorted = |s: &FabricService| {
+fn same_service(want: &FabricService, held: &FabricService) -> bool {
+    // What the fabric did not state, it is not compared on. A fabric older
+    // than `draining` or `client_affinity` answers nothing for them, and
+    // reading that as "off" would make this comparison fail forever against
+    // every service that asks for either — and this comparison is what decides
+    // whether to remove the service and add it again.
+    let draining_stated = held.members.iter().all(|m| m.draining.is_some());
+    let affinity_stated = held.client_affinity.is_some();
+    let pool = |s: &FabricService| {
         let mut members = s.members.clone();
+        if !draining_stated {
+            for m in &mut members {
+                m.draining = None;
+            }
+        }
         members.sort();
         members
     };
-    a.vni == b.vni
-        && a.vip == b.vip
-        && a.protocol == b.protocol
-        && a.port == b.port
-        && sorted(a) == sorted(b)
+    want.vni == held.vni
+        && want.vip == held.vip
+        && want.protocol == held.protocol
+        && want.port == held.port
+        && pool(want) == pool(held)
+        && (!affinity_stated || want.client_affinity == held.client_affinity)
 }
 
 /// What the status should record once the fabric holds `desired` — the
@@ -420,6 +511,11 @@ pub fn observed_listeners(desired: &[FabricService]) -> Vec<ObservedListener> {
             protocol: s.protocol,
             port: s.port,
             members: s.members.len() as u32,
+            draining: s
+                .members
+                .iter()
+                .filter(|m| m.draining == Some(true))
+                .count() as u32,
         })
         .collect()
 }
@@ -443,6 +539,8 @@ mod tests {
             vip: Some("10.20.0.100".into()),
             listeners,
             members: members.into_iter().map(str::to_string).collect(),
+            session_affinity: false,
+            draining: Default::default(),
         }
     }
 
@@ -511,19 +609,24 @@ mod tests {
             4711,
             "10.20.0.100",
             &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
+            &[],
         );
         assert_eq!(desired.len(), 2);
         assert_eq!(desired[0].port, 443);
         assert_eq!(
             desired[0].members,
             vec![
+                // A desired service always states it: `None` is reserved for
+                // what a fabric did not answer.
                 FabricMember {
                     port_id: "fp-a".into(),
-                    port: 8443
+                    port: 8443,
+                    draining: Some(false),
                 },
                 FabricMember {
                     port_id: "fp-b".into(),
-                    port: 8443
+                    port: 8443,
+                    draining: Some(false),
                 },
             ]
         );
@@ -540,6 +643,7 @@ mod tests {
             1,
             "10.0.0.9",
             &[("fp-a".into(), vec![]), ("fp-a".into(), vec![])],
+            &[],
         );
         assert_eq!(desired[0].members.len(), 1);
     }
@@ -549,7 +653,14 @@ mod tests {
         // Idempotence, stated as a test: the mirror of a settled object is
         // empty, or every resync would tear the datapath down and rebuild it.
         let s = spec(vec![listener(Protocol::Tcp, 443, 0)], vec![]);
-        let desired = desired_services(NAME, &s, 4711, "10.20.0.100", &[("fp-a".into(), vec![])]);
+        let desired = desired_services(
+            NAME,
+            &s,
+            4711,
+            "10.20.0.100",
+            &[("fp-a".into(), vec![])],
+            &[],
+        );
         assert!(mirror_actions(NAME, &desired, &desired).is_empty());
 
         // The same pool in another order is the same pool.
@@ -561,6 +672,7 @@ mod tests {
             4711,
             "10.20.0.100",
             &[("fp-b".into(), vec![]), ("fp-a".into(), vec![])],
+            &[],
         );
         reordered[0].members = {
             let mut m = both[0].members.clone();
@@ -573,6 +685,7 @@ mod tests {
             4711,
             "10.20.0.100",
             &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
+            &[],
         );
         assert!(mirror_actions(NAME, &desired_two, &reordered).is_empty());
     }
@@ -585,6 +698,7 @@ mod tests {
             4711,
             "10.20.0.100",
             &[("fp-a".into(), vec![])],
+            &[],
         );
         let after = desired_services(
             NAME,
@@ -592,6 +706,7 @@ mod tests {
             4711,
             "10.20.0.100",
             &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
+            &[],
         );
         let actions = mirror_actions(NAME, &after, &before);
         assert_eq!(
@@ -619,12 +734,14 @@ mod tests {
             4711,
             "10.20.0.100",
             &[],
+            &[],
         );
         let desired = desired_services(
             NAME,
             &spec(vec![listener(Protocol::Tcp, 443, 0)], vec![]),
             4711,
             "10.20.0.100",
+            &[],
             &[],
         );
         let actions = mirror_actions(NAME, &desired, &held);
@@ -648,12 +765,14 @@ mod tests {
             4711,
             "10.20.0.100",
             &[],
+            &[],
         );
         let theirs = desired_services(
             "projects/p1/load-balancers/web-2",
             &spec(vec![listener(Protocol::Tcp, 443, 0)], vec![]),
             4711,
             "10.20.0.101",
+            &[],
             &[],
         );
         let mut held = mine.clone();
@@ -677,15 +796,141 @@ mod tests {
             4711,
             "10.20.0.100",
             &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
+            &[],
         );
         assert_eq!(
             observed_listeners(&desired),
             vec![ObservedListener {
                 protocol: Protocol::Tcp,
                 port: 443,
-                members: 2
+                members: 2,
+                draining: 0
             }]
         );
+    }
+    /// A fabric that never heard of these fields answers nothing for them, and
+    /// that must not read as a difference: `mirror_actions` closes a difference
+    /// by removing the service and adding it again, so one it can never close
+    /// would drop every connection through that service on every pass, forever,
+    /// against a fabric whose only fault is being older than the field.
+    #[test]
+    fn a_fabric_that_does_not_state_a_field_is_not_compared_on_it() {
+        let mut spec = spec(
+            vec![Listener {
+                protocol: Protocol::Tcp,
+                port: 443,
+                member_port: 8080,
+            }],
+            vec!["projects/p1/ports/a", "projects/p1/ports/b"],
+        );
+        spec.session_affinity = true;
+        spec.draining = vec!["projects/p1/ports/a".into()];
+        let desired = desired_services(
+            NAME,
+            &spec,
+            4711,
+            "10.20.0.100",
+            &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
+            &["fp-a".into()],
+        );
+
+        // What an older fabric answers: the same service, saying nothing about
+        // either field.
+        let older: Vec<FabricService> = desired
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                s.client_affinity = None;
+                for m in &mut s.members {
+                    m.draining = None;
+                }
+                s
+            })
+            .collect();
+        assert!(
+            mirror_actions(NAME, &desired, &older).is_empty(),
+            "a fabric that cannot speak of affinity or draining was rebuilt on every pass"
+        );
+
+        // A fabric that *does* state them, and states them differently, is a
+        // real difference and is programmed again.
+        let disagrees: Vec<FabricService> = desired
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                s.client_affinity = Some(false);
+                s
+            })
+            .collect();
+        assert!(
+            !mirror_actions(NAME, &desired, &disagrees).is_empty(),
+            "the fabric said affinity was off and nothing put it back on"
+        );
+    }
+
+    #[test]
+    fn a_draining_port_that_is_not_a_member_is_refused_by_name() {
+        let members = vec!["projects/p1/ports/a".to_string()];
+        let refusal = validate_draining(&members, &["projects/p1/ports/b".to_string()])
+            .expect_err("a port nobody has was accepted");
+        assert_eq!(refusal.port, "projects/p1/ports/b");
+        assert!(
+            refusal.to_string().contains("projects/p1/ports/b"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn draining_a_member_is_allowed_and_draining_nobody_is_the_ordinary_case() {
+        let members = vec![
+            "projects/p1/ports/a".to_string(),
+            "projects/p1/ports/b".to_string(),
+        ];
+        assert!(validate_draining(&members, &["projects/p1/ports/b".to_string()]).is_ok());
+        assert!(validate_draining(&members, &[]).is_ok());
+    }
+
+    /// A draining member stays in the pool the fabric is given, marked.
+    /// Dropping it would be the very thing draining exists to avoid: the fabric
+    /// would stop knowing about it, and the connections it is finishing would
+    /// have nothing holding them.
+    #[test]
+    fn a_draining_member_reaches_the_fabric_marked_rather_than_missing() {
+        let spec = LoadBalancerSpec {
+            network: "projects/p1/networks/n".into(),
+            subnet: "projects/p1/subnets/s".into(),
+            vip: Some("10.0.0.9".into()),
+            listeners: vec![listener(Protocol::Tcp, 443, 8443)],
+            members: vec!["a".into(), "b".into()],
+            draining: vec!["fabric-b".into()],
+            session_affinity: true,
+        };
+        let services = desired_services(
+            "projects/p1/load-balancers/web",
+            &spec,
+            5000,
+            "10.0.0.9",
+            &[
+                ("fabric-a".to_string(), vec![8443]),
+                ("fabric-b".to_string(), vec![8443]),
+            ],
+            &["fabric-b".to_string()],
+        );
+        assert_eq!(services.len(), 1);
+        let service = &services[0];
+        assert_eq!(
+            service.client_affinity,
+            Some(true),
+            "the affinity was not carried"
+        );
+        assert_eq!(service.members.len(), 2, "the draining member was dropped");
+        let draining: Vec<&str> = service
+            .members
+            .iter()
+            .filter(|m| m.draining == Some(true))
+            .map(|m| m.port_id.as_str())
+            .collect();
+        assert_eq!(draining, vec!["fabric-b"]);
     }
 }
 
@@ -726,6 +971,8 @@ mod health_in_services {
                 member_port,
             }],
             members: vec!["projects/p1/ports/a".into(), "projects/p1/ports/b".into()],
+            session_affinity: false,
+            draining: Default::default(),
         }
     }
 
@@ -740,6 +987,7 @@ mod health_in_services {
             5000,
             "10.0.0.9",
             &[("fp-a".into(), vec![8080]), ("fp-b".into(), vec![])],
+            &[],
         );
         let members: Vec<&str> = services[0]
             .members
@@ -759,6 +1007,7 @@ mod health_in_services {
             5000,
             "10.0.0.9",
             &[("fp-a".into(), vec![443]), ("fp-b".into(), vec![8080])],
+            &[],
         );
         let members: Vec<&str> = services[0]
             .members
@@ -779,6 +1028,7 @@ mod health_in_services {
             5000,
             "10.0.0.9",
             &[("fp-a".into(), vec![]), ("fp-b".into(), vec![])],
+            &[],
         );
         assert_eq!(services[0].members.len(), 2);
     }
