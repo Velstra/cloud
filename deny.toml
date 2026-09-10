@@ -22,20 +22,24 @@ targets = [
 ]
 
 [advisories]
-# Anything with a published advisory fails the build. Unmaintained crates and
-# unsound ones warn rather than fail: both are real, neither is a reason to
-# stop a release at three in the morning, and a warning that is read is worth
-# more than an error that gets `--ignore`d into permanence.
+# A published vulnerability against anything we ship fails the build; that is
+# the default and it is not softened here.
+#
+# `unmaintained` and `unsound` say *which* crates those advisories are looked
+# for in, not how loudly they land. `workspace` means the ones this repository
+# names itself: a crate three levels down being unmaintained is real, and it is
+# not something a release at three in the morning can act on — the ones we
+# chose are.
 yanked = "deny"
 unmaintained = "workspace"
-unsound = "warn"
+unsound = "workspace"
 ignore = []
 
 [licenses]
-# Permissive, plus the two weak-copyleft licences whose terms are satisfied by
-# linking: MPL-2.0 is file-level and LGPL is not carried statically here.
-# Anything else — GPL, AGPL, or no licence at all — stops the build and gets a
-# decision rather than an exception.
+# Permissive only. Anything else — GPL, LGPL, MPL, AGPL, or no licence at all —
+# stops the build and gets a decision rather than an exception. The list holds
+# nothing that matches nothing: an entry that is there "just in case" is one
+# nobody can explain later.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -46,7 +50,6 @@ allow = [
     "ISC",
     "MIT",
     "MIT-0",
-    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
@@ -57,10 +60,46 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-# The workspace's own crates are AGPL-3.0-or-later and are not judged against
-# the list above: the list is about what this repository may *carry*, and its
-# own licence is a decision, not a dependency.
-private = { ignore = true }
+# The workspace's own crates are AGPL-3.0-or-later. Named one by one rather
+# than put on the list above, and rather than reached for with `private`
+# (which only covers crates marked `publish = false`, and none of these are):
+# the list is about what this repository may *carry*, and an AGPL crate that
+# came from outside it should still stop the build. Naming ours keeps that
+# true.
+
+[[licenses.exceptions]]
+name = "velstra-cloud-api"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-console"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-controller"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-e2e"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-fabric"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-model"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-node"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-nodeagent"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-proto"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-store"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "velstra-cloud-wire"
+allow = ["AGPL-3.0-or-later"]
 
 [bans]
 # Two copies of the same crate is a build that got bigger for no reason, and
@@ -68,7 +107,13 @@ private = { ignore = true }
 # does not control its transitive graph, and failing on it would mean pinning
 # other people's dependencies.
 multiple-versions = "warn"
-wildcards = "deny"
+# Deliberately not `wildcards = "deny"`. The only wildcards in this tree are
+# the path dependencies between its own crates, which is how a workspace is
+# written; `allow-wildcard-paths` would excuse them, but only for crates
+# marked `publish = false`, and none of these are. Turning the check on would
+# mean saying something about publishing to crates.io in order to get an
+# answer about dependency hygiene — two decisions in one, and the second one
+# is not this file's to make.
 
 [sources]
 # Only crates.io. A git dependency is a version nobody can audit and a build
