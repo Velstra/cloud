@@ -56,6 +56,7 @@
 //! | [`dhcp`] | An address, a gateway and a name on each tap — publishing what the Port already says. |
 
 pub mod agent;
+pub mod antispoof;
 pub mod api_cell;
 pub mod balancer;
 pub mod bgp;

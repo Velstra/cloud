@@ -156,15 +156,84 @@ fn authorization(metadata: &MetadataMap) -> Option<String> {
 ///
 /// No mask at all, or an empty one, is the old behaviour and is left alone:
 /// nothing that worked stops working.
-fn masked(
+/// Whether `steps` names a field the spec type `S` has.
+///
+/// Asked of the **type**, not of the request, because a request does not carry
+/// a field that is at its default: sixteen spec fields are skipped on the wire
+/// when empty, which is what makes a whole-object update leave what it did not
+/// mention alone.
+///
+/// The test is the one `check_known` already trusts, run the other way round.
+/// A marker is written at the path on a default spec and the document is
+/// parsed:
+///
+/// * it will not parse — serde objected to the marker's *type*, so something
+///   is there to object: the field exists;
+/// * it parses and the marker survives being written back out: the field
+///   exists;
+/// * it parses and the marker is gone — serde ignored a key nobody has.
+///
+/// Nothing here guesses at a schema; the type answers for itself.
+fn knows_field<S>(steps: &[&str]) -> bool
+where
+    S: Default + serde::Serialize + serde::de::DeserializeOwned,
+{
+    const MARKER: &str = "__velstra_probe__";
+    // Only a spec path can be asked about this way. `meta.labels` is an open
+    // map — every key is a field — so it is answered without a probe.
+    let Some(("spec", rest)) = steps.split_first().map(|(head, rest)| (*head, rest)) else {
+        return steps.first() == Some(&"meta");
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let Ok(mut probe) = serde_json::to_value(S::default()) else {
+        return false;
+    };
+    // Built from the inside out: `{"a": {"b": MARKER}}` for `a.b`, then laid
+    // over the default. Every step is snake-cased, because a spec's own JSON is
+    // snake_case — the wire layer camel-cases at the door — and snaking a step
+    // already in that spelling changes nothing.
+    let mut nested = Value::String(MARKER.into());
+    for step in rest.iter().rev() {
+        nested = json!({ snake(step): nested });
+    }
+    crate::collection::overlay(&mut probe, &nested);
+    match serde_json::from_value::<S>(probe) {
+        Err(_) => true,
+        Ok(parsed) => serde_json::to_string(&parsed)
+            .map(|text| text.contains(MARKER))
+            .unwrap_or(false),
+    }
+}
+
+/// `memoryMib` as `memory_mib` — the same second guess `mask::pick` makes, so
+/// both spellings answer alike.
+fn snake(step: &str) -> String {
+    let mut out = String::with_capacity(step.len() + 4);
+    for c in step.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn masked<S>(
     whole: &Value,
     mask: Option<&velstra_cloud_proto::prost_types::FieldMask>,
     kind: &str,
-) -> ApiResult<Value> {
+) -> ApiResult<Value>
+where
+    S: Default + serde::Serialize + serde::de::DeserializeOwned,
+{
     let Some(mask) = mask else {
         return Ok(whole.clone());
     };
-    velstra_cloud_model::mask::apply(whole, &mask.paths, kind)
+    velstra_cloud_model::mask::apply(whole, &mask.paths, kind, &knows_field::<S>)
         .map_err(|why| ApiError::invalid(why.to_string()).at("update_mask"))
 }
 
@@ -297,7 +366,7 @@ macro_rules! service {
                     // Only what the mask names. Empty is everything, which is
                     // what every client had before this existed — see
                     // `velstra_cloud_model::mask`, where the reasoning lives.
-                    let body = masked(&whole, request.update_mask.as_ref(), $kind)?;
+                    let body = masked::<$spec>(&whole, request.update_mask.as_ref(), $kind)?;
                     let updated = self.api.patch(&name, &body, expect(&request.revision)?, &who).await?;
                     let resource: Resource<$spec, $status> = typed(updated.resource)?;
                     Ok(Response::new(v1::$message::from(&resource)))

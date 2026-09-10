@@ -606,6 +606,164 @@ async fn quota_is_counted_from_the_store_and_refused_at_create() {
     );
 }
 
+/// A cap enforced only at create is not a cap.
+///
+/// Every dimension was counted at the door and never again, so a tenant capped
+/// at eight vCPUs made a one-vCPU guest and patched it to five hundred and
+/// twelve. The platform answered 200, and the project's own status then
+/// reported it sixty-four times over the limit it had just been allowed to
+/// pass — the count and the door disagreeing about the same number.
+#[tokio::test]
+async fn a_change_is_counted_against_the_quota_as_a_create_is() {
+    let h = Harness::new();
+    h.post(
+        "projects",
+        json!({ "id": "p1", "spec": { "quota": { "instances": 4, "vcpus": 8, "memoryMib": 8192 } } }),
+    )
+    .await;
+    let one = h.instance("p1", "i1", json!({ "vcpus": 1 })).await;
+
+    // The way round the door.
+    let refused = h.patch(&one, json!({ "spec": { "vcpus": 512 } })).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.error_code(), "RESOURCE_EXHAUSTED");
+    assert_eq!(
+        refused.field(),
+        "spec.vcpus",
+        "the refusal did not name the limit that bit"
+    );
+
+    // Memory is counted on the same pass, and a patch says nothing about it —
+    // so the question is put to the guest as it *would be*, not to the change.
+    let refused = h
+        .patch(&one, json!({ "spec": { "memoryMib": 65536 } }))
+        .await;
+    assert_eq!(refused.error_code(), "RESOURCE_EXHAUSTED");
+    assert_eq!(refused.field(), "spec.memoryMib");
+
+    // What must still be allowed: growing inside the cap, and — the case a
+    // naive fix breaks — a tenant sitting exactly at their cap making a guest
+    // *smaller*. The object being changed is taken out of the sum first, so it
+    // is not counted twice.
+    let allowed = h.patch(&one, json!({ "spec": { "vcpus": 8 } })).await;
+    assert_eq!(allowed.status, StatusCode::OK, "{:?}", allowed.body);
+    let smaller = h.patch(&one, json!({ "spec": { "vcpus": 2 } })).await;
+    assert_eq!(
+        smaller.status,
+        StatusCode::OK,
+        "a tenant at their cap could not make their guest smaller: {:?}",
+        smaller.body
+    );
+
+    // And a volume, where the cap is a sum of gibibytes rather than a count.
+    h.post("pools", json!({ "id": "nvme", "spec": {} })).await;
+    h.post(
+        "projects",
+        json!({ "id": "p2", "spec": { "quota": { "volumes": 4, "volumeGib": 100 } } }),
+    )
+    .await;
+    let volume = h
+        .post(
+            "projects/p2/volumes",
+            json!({ "id": "v1", "spec": { "sizeGib": 10, "pool": "nvme" } }),
+        )
+        .await;
+    assert_eq!(volume.status, StatusCode::ACCEPTED, "{:?}", volume.body);
+    let refused = h
+        .patch(
+            "projects/p2/volumes/v1",
+            json!({ "spec": { "sizeGib": 500 } }),
+        )
+        .await;
+    assert_eq!(
+        refused.error_code(),
+        "RESOURCE_EXHAUSTED",
+        "a volume grew past the project's whole allowance: {:?}",
+        refused.body
+    );
+}
+
+/// A subnet the node could not build is refused where it is written.
+///
+/// Nothing validated one at all, and a node acts on both fields almost
+/// verbatim: `ip addr replace <gateway>/<prefix> dev <bridge>` and a
+/// masquerade rule out of the range. The only check anywhere was that the
+/// gateway's *family* matched — so a gateway outside its own range became a
+/// route the node installed on itself for somebody else's network, and
+/// `0.0.0.0/0` made it masquerade the world.
+#[tokio::test]
+async fn a_subnet_the_node_could_not_build_is_refused_where_it_is_written() {
+    let h = Harness::new();
+    h.post("projects", json!({ "id": "p1", "spec": {} })).await;
+    h.post(
+        "projects/p1/networks",
+        json!({ "id": "n1", "spec": { "mtu": 1500 } }),
+    )
+    .await;
+
+    let make = |spec: serde_json::Value| {
+        let h = &h;
+        async move {
+            h.post("projects/p1/subnets", json!({ "id": "s1", "spec": spec }))
+                .await
+        }
+    };
+
+    // A gateway outside its own range: no guest could reach it, and the node
+    // would hold that address on a bridge.
+    let refused = make(json!({
+        "network": "projects/p1/networks/n1",
+        "cidr": "10.0.0.0/24",
+        "gateway": "192.168.1.1"
+    }))
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.field(), "spec.gateway");
+
+    // Every address there is. The node masquerades out of the range it holds.
+    let refused = make(json!({
+        "network": "projects/p1/networks/n1",
+        "cidr": "0.0.0.0/0",
+        "gateway": "10.0.0.1"
+    }))
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.field(), "spec.cidr");
+
+    // Not a range at all.
+    let refused = make(json!({
+        "network": "projects/p1/networks/n1",
+        "cidr": "10.0.0.0",
+        "gateway": "10.0.0.1"
+    }))
+    .await;
+    assert_eq!(refused.field(), "spec.cidr");
+
+    // And the ordinary one still goes through.
+    let made = make(json!({
+        "network": "projects/p1/networks/n1",
+        "cidr": "10.19.136.0/24",
+        "gateway": "10.19.136.1"
+    }))
+    .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+}
+
 // ---- explain -------------------------------------------------------------
 
 #[tokio::test]
@@ -4849,6 +5007,82 @@ fn a_full_store_is_a_precondition_and_not_an_internal_error() {
     let other: velstra_cloud_api::ApiError =
         velstra_cloud_store::StoreError::Backend("connection reset".into()).into();
     assert_eq!(other.code, velstra_cloud_api::Code::Internal);
+}
+
+/// A field nobody has is refused wherever it sits, not only at the top.
+///
+/// The guard walked one flat map, so everything *inside* a known field was
+/// accepted and dropped. The contract's own volume example was the live case:
+///
+///     PATCH …/volumes/logs { "spec": { "limits": { "readMbps": 200 } } }
+///
+/// answered 200 — `limits` is a field a volume has, `readMbps` is not a field
+/// of `Limits` — and the volume kept the pool's ceiling. An operator who was
+/// told 200 goes away believing a tenant is throttled.
+#[tokio::test]
+async fn a_field_nobody_has_is_refused_however_deep_it_sits() {
+    let h = Harness::new();
+    h.post("pools", json!({ "id": "nvme", "spec": {} })).await;
+    h.post("projects", json!({ "id": "p1", "spec": {} })).await;
+    h.post(
+        "projects/p1/volumes",
+        json!({ "id": "v1", "spec": { "sizeGib": 10, "pool": "nvme" } }),
+    )
+    .await;
+
+    // Inside an object.
+    let refused = h
+        .patch(
+            "projects/p1/volumes/v1",
+            json!({ "spec": { "limits": { "readMbps": 200 } } }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "a field of nothing was accepted: {:?}",
+        refused.body
+    );
+    assert_eq!(
+        refused.field(),
+        "spec.limits.readMbps",
+        "the refusal did not name where the field sat"
+    );
+
+    // The right spelling still goes through, at the same depth.
+    let allowed = h
+        .patch(
+            "projects/p1/volumes/v1",
+            json!({ "spec": { "limits": { "readMibps": 200 } } }),
+        )
+        .await;
+    assert_eq!(allowed.status, StatusCode::OK, "{:?}", allowed.body);
+
+    // Inside an element of a list. A security group's rules are records, and
+    // nothing looked in them at all.
+    let refused = h
+        .post(
+            "projects/p1/security-groups",
+            json!({ "id": "g1", "spec": { "rules": [
+                { "direction": "ingress", "protocol": "tcp",
+                  "ports": { "from": 22, "to": 22 },
+                  "remote": { "cidr": "0.0.0.0/0" },
+                  "prtocol": "udp" }
+            ] } }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "a typo inside a rule was stored and ignored: {:?}",
+        refused.body
+    );
+    assert_eq!(
+        refused.field(),
+        "spec.rules.0.prtocol",
+        "{:?}",
+        refused.body
+    );
 }
 
 #[tokio::test]

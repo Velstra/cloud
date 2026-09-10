@@ -23,10 +23,53 @@ import { entry } from "@/registry";
 
 type Values = Record<string, any>;
 
+// A field's key is a *path*, not a key. Twenty-eight of them carry a dot —
+// every `projects.quota.*` and `projects.policy.*`, six of an instance's
+// placement policy, a volume's limits, a pool's ceiling — and the spec they
+// name is nested. Read flat and written flat, they were sent as
+// `{"quota.vcpus": 40}`: the API stored a key with a dot in its name, the
+// typed read ignored it, and the form read back `undefined` and drew an empty
+// box. The toast said "saved". The old console has had `nest`/`flatten` since
+// the beginning; this one was written without them.
+
+/** The value at a dotted path, or `undefined`. */
+const readAt = (from: any, path: string): any =>
+  path.split(".").reduce((at, step) => (at == null ? at : at[step]), from);
+
+/**
+ * An epoch millisecond as `datetime-local` wants it: the operator's own
+ * timezone, and no seconds.
+ *
+ * Built by hand rather than with `toISOString`, which hands back UTC — and the
+ * control reads what it is given back as *local* time. So a maintenance window
+ * set for two o'clock was shown as two o'clock, and saved an hour or nine
+ * hours off, silently, in whichever direction the offset went. The old console
+ * has carried this function, and a comment naming this exact bug, all along.
+ */
+function localMoment(ms: number): string {
+  if (!Number.isFinite(ms)) return "";
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** `{"quota.vcpus": 40}` as `{"quota": {"vcpus": 40}}`. */
+function nest(flat: Values): Values {
+  const out: Values = {};
+  for (const [path, value] of Object.entries(flat)) {
+    const steps = path.split(".");
+    let at = out;
+    for (const step of steps.slice(0, -1)) at = at[step] ??= {};
+    at[steps[steps.length - 1]] = value;
+  }
+  return out;
+}
+
 const initial = (c: Collection, r?: Resource): Values => {
   const v: Values = {};
   for (const f of c.fields) {
-    const cur = r?.spec?.[f.key];
+    const cur = readAt(r?.spec, f.key);
     v[f.key] = cur !== undefined ? cur
       : f.kind === "switch" ? false
       : /List$/.test(f.kind) ? []
@@ -115,7 +158,7 @@ export function Form({ coll, existing, onDone, onCancel }: {
     for (const f of fields) {
       const v = values[f.key];
       if (v === "" || v == null) continue;
-      if (existing && f.atCreation && existing.spec?.[f.key] !== undefined) continue;
+      if (existing && f.atCreation && readAt(existing.spec, f.key) !== undefined) continue;
       spec[f.key] = f.kind === "number" ? Number(v) : v;
     }
     if (coll.scope === "project" && !project) { setProblem("Choose the project first."); return; }
@@ -124,6 +167,9 @@ export function Form({ coll, existing, onDone, onCancel }: {
       setProblem("Labels are `key=value`, separated by commas.");
       return;
     }
+    // Flat until here, because that is what the controls and the error mapping
+    // below speak; nested exactly once, on the way out.
+    const body = nest(spec);
     try {
       let saved: Resource;
       if (existing) {
@@ -132,12 +178,12 @@ export function Form({ coll, existing, onDone, onCancel }: {
         // change in between is refused here rather than overwritten.
         saved = await call(`patch:${coll.id}`, "PATCH",
           `${basePath(coll, project)}/${encodeURIComponent(idOf(existing))}`,
-          undefined, { spec, labels: written }, existing.meta.revision ? { "if-match": String(existing.meta.revision) } : undefined);
+          undefined, { spec: body, labels: written }, existing.meta.revision ? { "if-match": String(existing.meta.revision) } : undefined);
       } else {
         const name = coll.scope === "project"
           ? `projects/${project}/${coll.id}/${id.trim()}` : `${coll.id}/${id.trim()}`;
         saved = await call(`create:${coll.id}`, "POST", basePath(coll, project), undefined,
-          { meta: { name }, spec, labels: written });
+          { meta: { name }, spec: body, labels: written });
       }
       onDone(saved);
     } catch (e) {
@@ -150,6 +196,7 @@ export function Form({ coll, existing, onDone, onCancel }: {
 
   return (
     <FormProject.Provider value={project}>
+    <FormValues.Provider value={values}>
     <form className="grid gap-5" onSubmit={(e) => { e.preventDefault(); submit(); }}>
       {!existing && storeProject === ALL && coll.scope === "project" && (
         <Row label="Project" help="Every project is on the board; this one gets the new object." error={!project && problem ? "Still needed." : undefined}>
@@ -194,6 +241,7 @@ export function Form({ coll, existing, onDone, onCancel }: {
         <Pressed type="submit" onPress={submit}>{existing ? "Save" : "Create"}</Pressed>
       </div>
     </form>
+    </FormValues.Provider>
     </FormProject.Provider>
   );
 }
@@ -201,6 +249,11 @@ export function Form({ coll, existing, onDone, onCancel }: {
 /** The project the form writes to, for the pickers inside it: their lists
  *  come from that project, not from whatever the rail's picker says. */
 const FormProject = createContext<string | null>(null);
+/// What the form holds right now, so a picker narrowed by another field can
+/// read it. A context rather than a prop because every control is rendered
+/// through one `Control`, and threading one value through it for one kind of
+/// field would put it on every kind.
+const FormValues = createContext<Values | null>(null);
 
 /// `key=value` pairs, or `null` when that is not what was typed.
 ///
@@ -271,7 +324,7 @@ function FieldRow({ f, coll, value, onChange, error, locked }: {
       return (
         <Row label={label} help={help} error={error}>
           <Input {...common} type="datetime-local"
-            value={value ? new Date(Number(value) || value).toISOString().slice(0, 16) : ""}
+            value={value ? localMoment(Number(value) || Date.parse(String(value))) : ""}
             onChange={(e) => onChange(e.target.value ? new Date(e.target.value).getTime() : "")} />
         </Row>
       );
@@ -324,20 +377,34 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
   const formProject = useContext(FormProject);
   const project = formProject || storeProject;
   const target = f.collection ? collection(f.collection) : undefined;
-  const [options, setOptions] = useState<{ id: string; name: string }[]>([]);
+  // What the field is narrowed by, if anything. A subnet picker on a chosen
+  // network offers *that* network's subnets — the schema has said so all along
+  // and this console did not read it, so `ports.subnet` and
+  // `load-balancers.subnet` offered every subnet in the project and a form
+  // could be filled in with two halves that do not belong together.
+  const narrowedBy = useContext(FormValues);
+  const want = f.filterBy ? narrowedBy?.[f.filterBy] : undefined;
+  const [options, setOptions] = useState<{ id: string; name: string; spec: any }[]>([]);
   useEffect(() => {
     if (!target || (target.scope === "project" && (!project || project === ALL))) { setOptions([]); return; }
     call(`list:${target.id}`, "GET", basePath(target, project), { pageSize: 200 })
-      .then((a) => setOptions((a.items ?? []).map((r: Resource) => ({ id: idOf(r), name: r.meta.name }))))
+      .then((a) => setOptions((a.items ?? []).map((r: Resource) =>
+        ({ id: idOf(r), name: r.meta.name, spec: r.spec }))))
       .catch(() => setOptions([]));
   }, [target, project]);
   const spell = (o: { id: string; name: string }) => (f.spelling === "name" ? o.name : o.id);
+  // Nothing at all before the other field is chosen, rather than everything:
+  // an unnarrowed list is a list of wrong answers, and offering them is how a
+  // form gets filled in wrongly with no refusal until the write.
+  const offered = f.filterBy
+    ? (want ? options.filter((o) => readAt(o.spec, f.filterBy!) === want) : [])
+    : options;
 
   if (multiple) {
     const chosen: string[] = value ?? [];
     return (
       <div className="flex flex-wrap gap-2">
-        {options.map((o) => {
+        {offered.map((o) => {
           const v = spell(o); const on = chosen.includes(v);
           return (
             <button key={o.id} type="button" disabled={disabled} aria-pressed={on}
@@ -348,15 +415,24 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
             </button>
           );
         })}
-        {!options.length && <span className="text-xs" style={{ color: "var(--text-faint)" }}>Nothing to pick from yet.</span>}
+        {!offered.length && (
+          <span className="text-xs" style={{ color: "var(--text-faint)" }}>
+            {f.filterBy && !want ? `Choose a ${f.filterBy} first.` : "Nothing to pick from yet."}
+          </span>
+        )}
       </div>
     );
   }
   return (
     <Select value={value || ""} onValueChange={onChange} disabled={disabled}>
-      <SelectTrigger><SelectValue placeholder={f.whenEmpty || `Pick a ${target?.singular ?? "value"}…`} /></SelectTrigger>
+      <SelectTrigger>
+        <SelectValue placeholder={
+          f.filterBy && !want ? `Choose a ${f.filterBy} first…`
+            : f.whenEmpty || `Pick a ${target?.singular ?? "value"}…`
+        } />
+      </SelectTrigger>
       <SelectContent>
-        {options.map((o) => <SelectItem key={o.id} value={spell(o)}>{o.id}</SelectItem>)}
+        {offered.map((o) => <SelectItem key={o.id} value={spell(o)}>{o.id}</SelectItem>)}
       </SelectContent>
     </Select>
   );
