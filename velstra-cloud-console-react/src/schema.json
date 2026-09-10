@@ -1,0 +1,3963 @@
+[
+ {
+  "id": "instances",
+  "title": "Instances",
+  "singular": "instance",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Compute",
+  "scope": "project",
+  "blurb": "Guests. What was asked for is the spec; what the node reports is the status, and they are shown together.",
+  "fields": [
+   {
+    "key": "flavor",
+    "label": "Flavor",
+    "kind": "ref",
+    "collection": "flavors",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "A named size from the cell's menu. Picking one sets the vCPUs,                memory and root disk below; typing sizes instead needs the                project's leave.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "image",
+    "label": "Image",
+    "kind": "ref",
+    "collection": "families",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The newest of the family, resolved once when the machine is made. An existing machine keeps the bytes it was built from.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "vcpus",
+    "label": "vCPUs",
+    "kind": "number",
+    "unit": "",
+    "min": 1,
+    "max": 256,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "memoryMib",
+    "label": "Memory",
+    "kind": "number",
+    "unit": "MiB",
+    "min": 256,
+    "max": 4194304,
+    "step": 256,
+    "scale": "mib",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "rootDiskGib",
+    "label": "Root disk",
+    "kind": "number",
+    "unit": "GiB",
+    "min": 1,
+    "max": 65536,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Set by the flavor when one is picked.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "desiredState",
+    "label": "Power",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Running",
+      "label": "Running"
+     },
+     {
+      "value": "Stopped",
+      "label": "Stopped"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "What it should be doing. Asking twice is the same as asking once.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "ports",
+    "label": "Ports",
+    "kind": "refList",
+    "collection": "ports",
+    "spelling": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "This project has no ports yet, and does not need any: name a network above and one is made. A port of your own is for the case where the address has to outlive the machine.",
+    "help": "For a NIC that already exists \u2014 one holding an address you want this guest to keep. To simply put a machine on a network, name the network above and the port is made for you.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "volumes",
+    "label": "Extra disks",
+    "kind": "refList",
+    "collection": "volumes",
+    "spelling": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "This project has no volumes yet. Make one under Volumes and it can be attached here \u2014 the attachment itself is made for you.",
+    "help": "Attached once the guest is on a node. Take one off the list to detach it.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "networks",
+    "label": "Networks",
+    "kind": "refList",
+    "collection": "networks",
+    "also": "subnets",
+    "spelling": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Left empty, this guest joins your project's default network \u2014 made the first time somebody needs it, so two machines in a project can talk without anybody configuring anything.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "sshKeys",
+    "label": "SSH keys",
+    "kind": "textList",
+    "placeholder": "ssh-ed25519 AAAA\u2026",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Read by cloud-init on the guest's **first** boot and never again, so adding one to a machine that has already started does nothing to that machine. Without a key and without a password set in user-data, the console is the only way in.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "userData",
+    "label": "User data",
+    "kind": "lines",
+    "placeholder": "#cloud-config",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Handed to the guest on first boot.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "node",
+    "label": "Pinned to node",
+    "kind": "ref",
+    "collection": "nodes",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Left empty the scheduler chooses. Moving it afterwards is a migration, not an edit.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "placementPolicy.antiAffinityGroup",
+    "label": "Anti-affinity group",
+    "kind": "text",
+    "placeholder": "web-tier",
+    "check": "id",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Instances in one group are kept off the same node \u2014 what keeps a service alive when a machine dies.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "placementPolicy.spread",
+    "label": "Keeping them apart is",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Required",
+      "label": "a rule"
+     },
+     {
+      "value": "Preferred",
+      "label": "a wish"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "A rule refuses a node that already runs a member \u2014 three replicas of a database must not share a machine even if that means one stays down. A wish takes a crowded node over not running at all, which is what twelve web servers want.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "placementPolicy.affinityGroup",
+    "label": "Affinity group",
+    "kind": "text",
+    "placeholder": "checkout",
+    "check": "id",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "The opposite ask: instances in one group are placed together. For a pair that talks constantly \u2014 an application and the cache it reads on every request \u2014 where a hop between machines is the whole latency budget.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "placementPolicy.affinity",
+    "label": "Keeping them together is",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Required",
+      "label": "a rule"
+     },
+     {
+      "value": "Preferred",
+      "label": "a wish"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "A rule refuses every node but the one the group is already on, and says which that is. A wish places elsewhere rather than not at all.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "placementPolicy.requiredLabels",
+    "label": "Required node labels",
+    "kind": "textList",
+    "placeholder": "gpu",
+    "check": "id",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Only nodes carrying all of these.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "startOrder",
+    "label": "Start order",
+    "kind": "number",
+    "unit": "",
+    "min": 0,
+    "max": 999,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Lower starts first; the same number is a group that starts together. Matters after a power cut, when a node brings back everything it holds at once and the database loses the race for disk to a dozen web servers.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "startDelayS",
+    "label": "Let the group ahead settle",
+    "kind": "number",
+    "unit": "s",
+    "min": 0,
+    "max": 3600,
+    "step": 5,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Measured from the newest start in that group, not each member in turn \u2014 a hundred guests at thirty seconds each would be fifty minutes of nothing happening.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "onNodeLoss",
+    "label": "If its node stops answering",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "leave",
+      "label": "Leave it where it is"
+     },
+     {
+      "value": "restart",
+      "label": "Start it on another node"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Only for a guest whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Nothing is moved until the node has been quiet long enough that its own agent has certainly stopped its guests \u2014 a node with no fencing deadline is never recovered from.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "console",
+    "label": "Show console output",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Publishes what the guest writes to its serial console, so it can be read here. Off by default because it costs a report every time the guest logs a line. A guest that is not running shows its last output whether this is on or not.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "devices",
+    "label": "Passed-through devices",
+    "kind": "refList",
+    "collection": "device-classes",
+    "spelling": "id",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "A class, not a machine's address. Two of the same class means two devices. A guest holding one cannot be live-migrated \u2014 a device's state is in hardware and cannot be transferred.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "placementPolicy.minCpuLevel",
+    "label": "Minimum CPU level",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "",
+      "label": "Any"
+     },
+     {
+      "value": "x86-64-v2",
+      "label": "x86-64-v2"
+     },
+     {
+      "value": "x86-64-v3",
+      "label": "x86-64-v3"
+     },
+     {
+      "value": "x86-64-v4",
+      "label": "x86-64-v4"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "What the image needs to run. RHEL 9 and CentOS Stream 9 need x86-64-v2 or they will not boot.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "status.state",
+    "label": "State",
+    "cell": "text",
+    "width": 96
+   },
+   {
+    "path": "spec.desiredState",
+    "label": "Asked",
+    "cell": "text",
+    "width": 88
+   },
+   {
+    "path": "spec.vcpus",
+    "label": "vCPU",
+    "cell": "number",
+    "unit": "",
+    "width": 64
+   },
+   {
+    "path": "spec.memoryMib",
+    "label": "Memory",
+    "cell": "number",
+    "unit": "MiB",
+    "width": 104
+   },
+   {
+    "path": "status.node",
+    "label": "Node",
+    "cell": "mono",
+    "width": 128
+   },
+   {
+    "path": "status.addresses.0",
+    "label": "Address",
+    "cell": "mono",
+    "width": 136
+   },
+   {
+    "path": "status.pendingChanges.0.field",
+    "label": "Awaiting restart",
+    "cell": "text",
+    "width": 128
+   }
+  ],
+  "agreements": [
+   {
+    "label": "Power",
+    "asked": "desiredState",
+    "is": "state",
+    "note": "The node has not brought the guest to the state that was asked for. Its Ready condition says why."
+   },
+   {
+    "label": "Node",
+    "asked": "node",
+    "is": "node",
+    "note": "The scheduler has picked a node the reporting agent is not; a migration is in flight, or the pin was changed under a running guest."
+   }
+  ],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": true
+ },
+ {
+  "id": "volumes",
+  "title": "Volumes",
+  "singular": "volume",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Storage",
+  "scope": "project",
+  "blurb": "Block devices. A volume knows nothing about who has it open \u2014 that is an attachment.",
+  "fields": [
+   {
+    "key": "sizeGib",
+    "label": "Size",
+    "kind": "number",
+    "unit": "GiB",
+    "min": 1,
+    "max": 262144,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "pool",
+    "label": "Pool",
+    "kind": "ref",
+    "collection": "pools",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Left empty, the cell chooses: the accepting pool with the most room. Naming one is for operators pinning a volume to specific hardware \u2014 a tenant cannot list pools and does not need to.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "sourceImage",
+    "label": "From image",
+    "kind": "ref",
+    "collection": "images",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Left empty the volume comes up blank.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "sourceSnapshot",
+    "label": "From snapshot",
+    "kind": "text",
+    "placeholder": "projects/p1/volumes/data-1/snapshots/nightly",
+    "check": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Restores that snapshot into a new volume. A volume is never restored in place, so this is what restoring means.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "sourceBackup",
+    "label": "From backup",
+    "kind": "ref",
+    "collection": "backups",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "This project has no backups yet. A backup is made from a volume, or on a schedule.",
+    "help": "Restores that copy into a new volume. This is the way back when the pool the volume lived on is gone.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "encryptionKey",
+    "label": "Encryption key",
+    "kind": "text",
+    "placeholder": "projects/p1/keys/data",
+    "check": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Not yet: this cell has no key manager, so a key here is refused and the bytes are stored in the clear. The field is here for when one exists.",
+    "derived": false,
+    "atCreation": true
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.sizeGib",
+    "label": "Size",
+    "cell": "number",
+    "unit": "GiB",
+    "width": 96
+   },
+   {
+    "path": "status.actualSizeGib",
+    "label": "Provisioned",
+    "cell": "number",
+    "unit": "GiB",
+    "width": 112
+   },
+   {
+    "path": "spec.pool",
+    "label": "Pool",
+    "cell": "mono",
+    "width": 112
+   },
+   {
+    "path": "spec.encryptionKey",
+    "label": "Encrypted",
+    "cell": "yes",
+    "yes": "yes",
+    "no": "no",
+    "width": 96
+   }
+  ],
+  "agreements": [
+   {
+    "label": "Size",
+    "asked": "sizeGib",
+    "is": "actualSizeGib",
+    "note": "The pool has not finished growing the device to the size that was asked for."
+   }
+  ],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "attachments",
+  "title": "Attachments",
+  "singular": "attachment",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Storage",
+  "scope": "project",
+  "blurb": "Attaching is its own object, so a crash mid-way leaves a truthful record rather than a volume nobody can reattach.",
+  "fields": [
+   {
+    "key": "volume",
+    "label": "Volume",
+    "kind": "ref",
+    "collection": "volumes",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "instance",
+    "label": "Instance",
+    "kind": "ref",
+    "collection": "instances",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "node",
+    "label": "Node",
+    "kind": "ref",
+    "collection": "nodes",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Where the volume will be opened. Taken from the instance.",
+    "derived": true,
+    "atCreation": false
+   },
+   {
+    "key": "readOnly",
+    "label": "Read only",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.volume",
+    "label": "Volume",
+    "cell": "mono",
+    "width": 168
+   },
+   {
+    "path": "spec.instance",
+    "label": "Instance",
+    "cell": "mono",
+    "width": 168
+   },
+   {
+    "path": "status.attached",
+    "label": "Open",
+    "cell": "yes",
+    "yes": "open",
+    "no": "closed",
+    "width": 88
+   },
+   {
+    "path": "status.device",
+    "label": "Device",
+    "cell": "mono",
+    "width": 96
+   }
+  ],
+  "agreements": [
+   {
+    "label": "Node",
+    "asked": "node",
+    "is": "node",
+    "note": "The node that was asked to open it is not the node that reported. Nothing is attached until they agree."
+   }
+  ],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "networks",
+  "title": "Networks",
+  "singular": "network",
+  "recheck": 0,
+  "condition": "Mirrored",
+  "group": "Network",
+  "scope": "project",
+  "blurb": "One VNI on the fabric. The nodes that have it programmed are on the object.",
+  "fields": [
+   {
+    "key": "hostBridge",
+    "label": "On the machine's own wire",
+    "kind": "text",
+    "placeholder": "br0",
+    "check": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "A bridge that already exists on the nodes \u2014 `br0`, `vmbr0`. Guests on this network go straight onto whatever the machine is on: the house LAN, a VLAN, a lab network. Their addresses come from whatever serves that wire and this platform allocates none, holds no gateway and enforces no security group. Empty is the ordinary case. Only a cell operator may set it \u2014 it is a decision about the machine, not about a project.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "external",
+    "label": "Carries real addresses",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The prefixes on this network's subnets are routed to this cell by whoever is above it, so an address from one is an address the world can reach. Only a cell operator may say so \u2014 a tenant who could would mint themselves a public range by typing a CIDR.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "announce",
+    "label": "Addresses announced by",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "FromGateway",
+      "label": "a gateway node"
+     },
+     {
+      "value": "FromHost",
+      "label": "the machine holding the guest"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "What this cell does by default for addresses from this network. An individual address may say otherwise. Meaningless on a network that carries no real addresses.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "mtu",
+    "label": "MTU",
+    "kind": "number",
+    "unit": "bytes",
+    "min": 1280,
+    "max": 9216,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "1450 when left empty: a VXLAN header is 50 bytes, and a tenant \\\n               network handed the wire's own 1500 black-holes every large packet \\\n               in a way that looks like an application bug for a week.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "vni",
+    "label": "VNI",
+    "kind": "number",
+    "unit": "",
+    "min": 0,
+    "max": 16777215,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "The VXLAN network identifier. Left empty, the cell assigns the \\\n               smallest free one \u2014 which is the only correct answer, and not one \\\n               a tenant can work out.",
+    "derived": true,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.vni",
+    "label": "VNI",
+    "cell": "mono",
+    "width": 96
+   },
+   {
+    "path": "spec.mtu",
+    "label": "MTU",
+    "cell": "number",
+    "unit": "",
+    "width": 80
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "subnets",
+  "title": "Subnets",
+  "singular": "subnet",
+  "recheck": 15,
+  "condition": "",
+  "group": "Network",
+  "scope": "project",
+  "blurb": "A range on a network, and the count of what IPAM has handed out of it.",
+  "fields": [
+   {
+    "key": "network",
+    "label": "Network",
+    "kind": "ref",
+    "collection": "networks",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "No networks in this project yet. A network is the first of the three things a guest needs to be reachable: a network, a subnet on it, then a port.",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "cidr",
+    "label": "Range",
+    "kind": "text",
+    "placeholder": "10.0.0.0/24",
+    "check": "cidr",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "gateway",
+    "label": "Gateway",
+    "kind": "text",
+    "placeholder": "10.0.0.1",
+    "check": "address",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "dns",
+    "label": "Resolvers",
+    "kind": "textList",
+    "placeholder": "10.0.0.2",
+    "check": "address",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Left empty the guests use this cell's own resolver, which names the project's other machines and forwards everything else. Name one here to send them somewhere of your own instead.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "reserved",
+    "label": "Reserved",
+    "kind": "textList",
+    "placeholder": "10.0.0.5",
+    "check": "address",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Addresses the platform will not hand out.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.cidr",
+    "label": "Range",
+    "cell": "mono",
+    "width": 144
+   },
+   {
+    "path": "spec.gateway",
+    "label": "Gateway",
+    "cell": "mono",
+    "width": 128
+   },
+   {
+    "path": "spec.network",
+    "label": "Network",
+    "cell": "mono",
+    "width": 168
+   },
+   {
+    "path": "status.allocated",
+    "label": "In use",
+    "cell": "number",
+    "unit": "",
+    "width": 80
+   },
+   {
+    "path": "status.available",
+    "label": "Free",
+    "cell": "number",
+    "unit": "",
+    "width": 80
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "ports",
+  "title": "Ports",
+  "singular": "port",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Network",
+  "scope": "project",
+  "blurb": "What an instance is attached to the fabric by. Programmed means the agent has it in its maps.",
+  "fields": [
+   {
+    "key": "network",
+    "label": "Network",
+    "kind": "ref",
+    "collection": "networks",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "subnet",
+    "label": "Subnet",
+    "kind": "ref",
+    "collection": "subnets",
+    "filterBy": "network",
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "No subnets on this network yet. A subnet is the range its addresses come from \u2014 make one before a port.",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "securityGroups",
+    "label": "Security groups",
+    "kind": "refList",
+    "collection": "security-groups",
+    "spelling": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Rules only ever add allowances, so ordering does not matter and two groups cannot contradict each other. With none, the port keeps the platform's default: nothing in, everything out, replies always.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "address",
+    "label": "Address",
+    "kind": "text",
+    "placeholder": "allocated by IPAM",
+    "check": "address",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Left empty IPAM allocates one. It never changes afterwards \u2014 an address that moves under a running guest is an outage.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "mac",
+    "label": "MAC",
+    "kind": "text",
+    "placeholder": "generated",
+    "check": "mac",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "rateLimitMbit",
+    "label": "Rate limit",
+    "kind": "number",
+    "unit": "Mbit/s",
+    "min": 0,
+    "max": 400000,
+    "step": 100,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Zero is unlimited. Multi-tenancy without a ceiling is one noisy neighbour away from an incident.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.address",
+    "label": "Address",
+    "cell": "mono",
+    "width": 136
+   },
+   {
+    "path": "spec.mac",
+    "label": "MAC",
+    "cell": "mono",
+    "width": 152
+   },
+   {
+    "path": "spec.subnet",
+    "label": "Subnet",
+    "cell": "mono",
+    "width": 168
+   },
+   {
+    "path": "status.programmed",
+    "label": "Datapath",
+    "cell": "yes",
+    "yes": "programmed",
+    "no": "absent",
+    "width": 112
+   },
+   {
+    "path": "status.node",
+    "label": "Node",
+    "cell": "mono",
+    "width": 120
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "security-groups",
+  "title": "Security groups",
+  "singular": "security group",
+  "recheck": 15,
+  "condition": "Applied",
+  "group": "Network",
+  "scope": "project",
+  "blurb": "What a port is allowed to carry. Rules only add allowances \u2014 ingress is denied, egress is allowed and replies always come back, so a port in no group is not an open one.",
+  "fields": [
+   {
+    "key": "rules",
+    "label": "Rules",
+    "kind": "ruleList",
+    "remoteCollection": "security-groups",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Every rule permits; none of them forbids. A group with no rules is a group that allows nothing extra, which is the platform's default anyway: nothing in, everything out, replies always.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.rules",
+    "label": "Rules",
+    "cell": "count",
+    "width": 96
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "image-sources",
+  "title": "Image sources",
+  "singular": "image source",
+  "recheck": 0,
+  "condition": "Checked",
+  "group": "Compute",
+  "scope": "global",
+  "blurb": "Where a family's images come from. The cell asks the checksums file what the current digest is, over https so the certificate is checked, and publishes an image when the answer is one it does not have. Nothing about a running guest changes: a machine keeps the bytes it was built from, and \"always the newest\" means new machines get it.",
+  "fields": [
+   {
+    "key": "family",
+    "label": "Family",
+    "kind": "text",
+    "placeholder": "debian-13",
+    "check": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Everything this source publishes joins this family, and an instance asking for `families/debian-13` gets the newest of them.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "url",
+    "label": "Image",
+    "kind": "text",
+    "placeholder": "http://cloud.example/debian-13-genericcloud-amd64.qcow2",
+    "check": "url",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Where the bytes are. This may be plain http: the digest below is what makes fetching them safe, and a wrong byte gives a wrong digest and fails the fetch.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "checksums",
+    "label": "Checksums",
+    "kind": "text",
+    "placeholder": "https://cloud.example/SHA256SUMS",
+    "check": "url",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "A `sha256sum`-style file covering the image's filename. **https only**, and refused otherwise \u2014 this is the one value the whole arrangement trusts, and whoever can rewrite it chooses what every new guest in this cell boots.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "paused",
+    "label": "Paused",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Stop looking, without forgetting where this came from.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "everyMs",
+    "label": "Check every",
+    "kind": "number",
+    "unit": "ms",
+    "min": 60000,
+    "max": 2592000000,
+    "step": 60000,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Six hours when left empty. Cloud images are published daily at best, and a cell that asks every minute spends its day fetching a checksums file to learn nothing.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "keep",
+    "label": "Keep",
+    "kind": "number",
+    "unit": "",
+    "min": 1,
+    "max": 50,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "How many of this family to keep. Three when left empty. An image an instance was built from is never taken away, however old \u2014 the guest would be unable to start on its next move.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.family",
+    "label": "Family",
+    "cell": "text",
+    "width": 160
+   },
+   {
+    "path": "status.lastChecked",
+    "label": "Looked",
+    "cell": "ago",
+    "width": 110
+   },
+   {
+    "path": "status.published",
+    "label": "Published",
+    "cell": "text",
+    "width": 220
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "families",
+  "title": "Catalogue",
+  "singular": "family",
+  "recheck": 0,
+  "condition": "",
+  "group": "Compute",
+  "scope": "project",
+  "blurb": "What to boot, by the name that stays right when the bytes change. A machine resolves its family once, when it is made, and keeps the build it got.",
+  "fields": [
+   {
+    "key": "family",
+    "label": "Family",
+    "kind": "text",
+    "placeholder": "",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": true,
+    "atCreation": false
+   },
+   {
+    "key": "version",
+    "label": "Newest version",
+    "kind": "text",
+    "placeholder": "",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": true,
+    "atCreation": false
+   },
+   {
+    "key": "image",
+    "label": "Resolves to",
+    "kind": "ref",
+    "collection": "images",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The bytes a machine made right now would get.",
+    "derived": true,
+    "atCreation": false
+   },
+   {
+    "key": "public",
+    "label": "Everybody may boot it",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Published to the cell rather than kept in one project.",
+    "derived": true,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.family",
+    "label": "Family",
+    "cell": "text",
+    "width": 200
+   },
+   {
+    "path": "spec.version",
+    "label": "Newest",
+    "cell": "text",
+    "width": 160
+   },
+   {
+    "path": "spec.sizeBytes",
+    "label": "Size",
+    "cell": "bytes",
+    "width": 120
+   },
+   {
+    "path": "spec.public",
+    "label": "Who may boot it",
+    "cell": "yes",
+    "yes": "Everybody",
+    "no": "This project",
+    "width": 150
+   }
+  ],
+  "agreements": [],
+  "creatable": false,
+  "editable": false,
+  "deletable": false,
+  "explainable": false
+ },
+ {
+  "id": "images",
+  "title": "Images",
+  "singular": "image",
+  "recheck": 0,
+  "condition": "",
+  "group": "Compute",
+  "scope": "project",
+  "blurb": "Content-addressed and immutable. Cached copies are a placement preference, never a requirement.",
+  "fields": [
+   {
+    "key": "from",
+    "label": "Publish from",
+    "kind": "ref",
+    "collection": "images",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Take the digest, format, size and source from an image that already exists. Nothing is copied \u2014 an image is addressed by its digest, so every node that had the bytes still has them. Anything you fill in below wins over what is taken.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "family",
+    "label": "Family",
+    "kind": "text",
+    "placeholder": "debian-13",
+    "check": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "Without a family this image can only be asked for by its digest, and nothing will ever offer it as \"the newest\".",
+    "help": "What this image is, in the words somebody would use to ask for it. An instance can then name `families/debian-13` and get the newest one there is, resolved when it is created and written down \u2014 so a guest never changes its operating system on a restart.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "version",
+    "label": "Version",
+    "kind": "text",
+    "placeholder": "20260815",
+    "check": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Which one in the family, for a person to read. Newest is decided by when this cell learned of the image, not by comparing this \u2014 every scheme for ordering version strings is wrong for somebody's.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "digest",
+    "label": "Digest",
+    "kind": "text",
+    "placeholder": "sha256:\u2026",
+    "check": "digest",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The bytes are addressed by this, so an image cannot be replaced under an instance that was built from it.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "format",
+    "label": "Format",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Raw",
+      "label": "Raw"
+     },
+     {
+      "value": "Qcow2",
+      "label": "qcow2"
+     }
+    ],
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "sourceUrl",
+    "label": "Source",
+    "kind": "text",
+    "placeholder": "https://\u2026",
+    "check": "url",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "sizeBytes",
+    "label": "Size",
+    "kind": "number",
+    "unit": "bytes",
+    "min": 0,
+    "max": 9223372036854775807,
+    "step": 1,
+    "scale": "bytes",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.family",
+    "label": "Family",
+    "cell": "text",
+    "width": 160
+   },
+   {
+    "path": "spec.version",
+    "label": "Version",
+    "cell": "text",
+    "width": 120
+   },
+   {
+    "path": "spec.format",
+    "label": "Format",
+    "cell": "text",
+    "width": 88
+   },
+   {
+    "path": "spec.sizeBytes",
+    "label": "Size",
+    "cell": "bytes",
+    "width": 104
+   },
+   {
+    "path": "spec.digest",
+    "label": "Digest",
+    "cell": "mono",
+    "width": 220
+   },
+   {
+    "path": "status.fetchingOn",
+    "label": "Arriving",
+    "cell": "count",
+    "width": 100
+   },
+   {
+    "path": "status.cachedOn",
+    "label": "Cached on",
+    "cell": "count",
+    "width": 112
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "migrations",
+  "title": "Migrations",
+  "singular": "migration",
+  "recheck": 15,
+  "condition": "Moved",
+  "group": "Compute",
+  "scope": "project",
+  "blurb": "Moving a running guest to another node. There is no migrating state anywhere: this object is the ask, and whether it is finished is read from where the instance actually runs. Start one from the instance you want to move \u2014 the destination is chosen where the guest is.",
+  "fields": [
+   {
+    "key": "instance",
+    "label": "Instance",
+    "kind": "ref",
+    "collection": "instances",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "fromNode",
+    "label": "From",
+    "kind": "ref",
+    "collection": "nodes",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Where the guest is now. Taken from the instance.",
+    "derived": true,
+    "atCreation": false
+   },
+   {
+    "key": "toNode",
+    "label": "To",
+    "kind": "ref",
+    "collection": "nodes",
+    "filterBy": null,
+    "spelling": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Only the nodes that can receive this guest can be chosen. The rest are shown with the reason they cannot.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "mode",
+    "label": "Mode",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Live",
+      "label": "Live"
+     },
+     {
+      "value": "PostCopy",
+      "label": "Post-copy"
+     },
+     {
+      "value": "Reboot",
+      "label": "Reboot"
+     }
+    ],
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "What a failure costs. Under Live the guest stays where it is; under Post-copy a failure mid-flight loses it.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "downtimeMs",
+    "label": "Downtime budget",
+    "kind": "number",
+    "unit": "ms",
+    "min": 50,
+    "max": 60000,
+    "step": 50,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "The pause the guest may take at the end. A busy guest needs a larger budget or the transfer never converges.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "timeoutS",
+    "label": "Give up after",
+    "kind": "number",
+    "unit": "s",
+    "min": 30,
+    "max": 86400,
+    "step": 30,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "A migration that cannot converge is one that runs until somebody notices.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "connections",
+    "label": "Streams",
+    "kind": "number",
+    "unit": "",
+    "min": 1,
+    "max": 8,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Parallel streams for the transfer. One is the only value a local socket accepts.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.instance",
+    "label": "Instance",
+    "cell": "mono",
+    "width": 168
+   },
+   {
+    "path": "spec.fromNode",
+    "label": "From",
+    "cell": "mono",
+    "width": 112
+   },
+   {
+    "path": "spec.toNode",
+    "label": "To",
+    "cell": "mono",
+    "width": 112
+   },
+   {
+    "path": "spec.mode",
+    "label": "Mode",
+    "cell": "text",
+    "width": 88
+   },
+   {
+    "path": "status.receiverReady",
+    "label": "Receiver",
+    "cell": "yes",
+    "yes": "listening",
+    "no": "not yet",
+    "width": 104
+   },
+   {
+    "path": "status.transferredMib",
+    "label": "Copied",
+    "cell": "number",
+    "unit": "MiB",
+    "width": 112
+   }
+  ],
+  "agreements": [
+   {
+    "label": "Destination",
+    "asked": "toNode",
+    "is": "node",
+    "note": "The node this migration was assigned to is not the one that has reported on it. Nothing is listening for the guest until they agree \u2014 the destination has to act first."
+   }
+  ],
+  "creatable": false,
+  "editable": false,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "nodes",
+  "title": "Nodes",
+  "singular": "node",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Fleet",
+  "scope": "global",
+  "blurb": "Hypervisors. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token \u2014 shown once, because the platform keeps a hash and cannot show it again.",
+  "fields": [
+   {
+    "key": "schedulable",
+    "label": "Accepts work",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Turning this off drains the node: nothing new is placed, what runs keeps running.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "labels",
+    "label": "Labels",
+    "kind": "textList",
+    "placeholder": "gpu",
+    "check": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "What placement policies match on.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "evacuate",
+    "label": "Move its guests away",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Separate from draining. Draining says nothing new comes here; this says none of the old stays either. One migration is started per guest that can move \u2014 a guest holding a passed-through device cannot, and stays with the reason on it.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "fenceAfterS",
+    "label": "Stop own guests after",
+    "kind": "number",
+    "unit": "s",
+    "min": 0,
+    "max": 3600,
+    "step": 10,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "How long this node may fail to report before it stops the guests it holds. Zero means it never does \u2014 and a node that never does is never recovered from, because nothing can tell \"unreachable\" from \"stopped\". Set it and guests marked for restart can be brought up elsewhere.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "gateway",
+    "label": "Carries external traffic",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "A public address whose network says so is announced from here, and packets for it reach the guest over the overlay. Several machines may carry it \u2014 the network above sees them as equal next hops \u2014 and a cell with none simply cannot use that mode.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "vcpuOvercommit",
+    "label": "vCPUs per core",
+    "kind": "number",
+    "unit": "per core",
+    "min": 0,
+    "max": 32,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "How many vCPUs this machine may hand out per real core. Zero or one means one for one. A processor can be shared \u2014 two guests that both want a core get one each in turn, and being wrong costs speed \u2014 which is how nearly every fleet in the world is run. There is deliberately no setting for memory: a guest promised 8 GiB and handed 4 is not slow, it is killed.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "cpuBaseline",
+    "label": "CPU baseline",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "",
+      "label": "The host's own CPU"
+     },
+     {
+      "value": "x86-64-v2",
+      "label": "x86-64-v2"
+     },
+     {
+      "value": "x86-64-v3",
+      "label": "x86-64-v3"
+     },
+     {
+      "value": "x86-64-v4",
+      "label": "x86-64-v4"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Present the same CPU as other nodes so guests can migrate between them. Guests already running keep the CPU they started with and adopt this one when they next restart.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.schedulable",
+    "label": "Accepts work",
+    "cell": "yes",
+    "yes": "yes",
+    "no": "draining",
+    "width": 120
+   },
+   {
+    "path": "status.allocated.vcpus",
+    "label": "vCPU used",
+    "cell": "number",
+    "unit": "",
+    "width": 96
+   },
+   {
+    "path": "status.capacity.vcpus",
+    "label": "vCPU capacity",
+    "cell": "number",
+    "unit": "",
+    "width": 112
+   },
+   {
+    "path": "status.allocated.memoryMib",
+    "label": "Memory used",
+    "cell": "number",
+    "unit": "MiB",
+    "width": 128
+   },
+   {
+    "path": "status.agentVersion",
+    "label": "Agent",
+    "cell": "mono",
+    "width": 96
+   },
+   {
+    "path": "status.lastHeartbeat",
+    "label": "Heard from",
+    "cell": "ago",
+    "width": 112
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": false,
+  "explainable": false
+ },
+ {
+  "id": "maintenance-windows",
+  "title": "Maintenance",
+  "singular": "maintenance window",
+  "recheck": 0,
+  "condition": "",
+  "group": "Cell",
+  "scope": "global",
+  "blurb": "Say in advance that a machine is going out of service, and the cell stops placing work on it when the time comes \u2014 without anybody being awake to flip a switch, and without anything to flip back afterwards. Whether a window is upcoming, open or over is read off the clock, so a window that ends puts everything back by ceasing to be open.",
+  "fields": [
+   {
+    "key": "node",
+    "label": "Node",
+    "kind": "ref",
+    "collection": "nodes",
+    "filterBy": null,
+    "spelling": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The machine going out of service.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "startsAt",
+    "label": "Starts",
+    "kind": "moment",
+    "defaultInMinutes": 60,
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "In your own timezone. A start already past means now \u2014 work that has already begun is a true thing to declare.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "minutes",
+    "label": "For",
+    "kind": "number",
+    "unit": "minutes",
+    "min": 15,
+    "max": 20160,
+    "step": 15,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "How long it stays open. There is no end time to keep in step with this one: two fields that can disagree about the same fact are one field too many.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "drain",
+    "label": "Move the guests off",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Off \u2014 nothing new is placed here and everything already running stays put, which is what a four-minute firmware update wants. On \u2014 the guests are migrated away as well, which is what pulling the machine wants. A guest that cannot move is left where it is, and :explainMaintenance says which.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "note",
+    "label": "What it is for",
+    "kind": "text",
+    "placeholder": "swapping the failed DIMM in slot 3",
+    "check": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Shown wherever this window is the reason something was refused, so \"no capacity\" reads as \"node-b is out until 03:00 for the memory swap\" instead.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.node",
+    "label": "Node",
+    "cell": "mono",
+    "width": 160
+   },
+   {
+    "path": "spec.startsAt",
+    "label": "Starts",
+    "cell": "ago",
+    "width": 128
+   },
+   {
+    "path": "spec.minutes",
+    "label": "For",
+    "cell": "number",
+    "unit": "min",
+    "width": 96
+   },
+   {
+    "path": "spec.drain",
+    "label": "Guests",
+    "cell": "yes",
+    "yes": "moved off",
+    "no": "stay put",
+    "width": 112
+   },
+   {
+    "path": "spec.note",
+    "label": "For",
+    "cell": "text",
+    "width": 260
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "snapshot-schedules",
+  "title": "Snapshot schedules",
+  "singular": "snapshot schedule",
+  "recheck": 0,
+  "condition": "",
+  "group": "Storage",
+  "scope": "project",
+  "blurb": "The cheap half of the pair. A snapshot lives in the volume's own pool \u2014 taken in a moment, costs almost nothing, and lost with the pool it is in. For a copy that survives losing the pool, use a backup schedule.",
+  "fields": [
+   {
+    "key": "volume",
+    "label": "Volume",
+    "kind": "ref",
+    "collection": "volumes",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "What is snapshotted.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "everyHours",
+    "label": "Snapshot every",
+    "kind": "number",
+    "unit": "hours",
+    "min": 1,
+    "max": 168,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Cheap enough to run hourly. A snapshot lives in the volume's own pool: it is the right tool for going back an hour, and it is lost with the pool \u2014 which is what backups are for.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "keep",
+    "label": "Keep",
+    "kind": "number",
+    "unit": "snapshots",
+    "min": 1,
+    "max": 336,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Only finished ones count, so a run of failures never expires the last one that worked. Snapshots taken by hand are never expired.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.volume",
+    "label": "Volume",
+    "cell": "mono",
+    "width": 224
+   },
+   {
+    "path": "spec.everyHours",
+    "label": "Every",
+    "cell": "number",
+    "unit": "h",
+    "width": 96
+   },
+   {
+    "path": "spec.keep",
+    "label": "Keep",
+    "cell": "number",
+    "unit": "",
+    "width": 88
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "captures",
+  "title": "Captures",
+  "singular": "capture",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Storage",
+  "scope": "project",
+  "blurb": "Build a guest by hand, get it right, capture it \u2014 then every guest made from the result starts where that one left off. The guest must be stopped: a disk copied from under a running machine is crash-consistent, and a template is stamped out by people who assume it is clean.",
+  "fields": [
+   {
+    "key": "instance",
+    "label": "Guest",
+    "kind": "ref",
+    "collection": "instances",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "It must be stopped. A disk copied from under a running machine is crash-consistent, which a template stamped out a hundred times must not be \u2014 if you want a copy of a live guest, take a backup instead.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "label",
+    "label": "Name it",
+    "kind": "text",
+    "placeholder": "debian-13-golden",
+    "check": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "What the resulting image is called. Its digest is added to this \u2014 a list of hashes is not something anybody chooses from.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "target",
+    "label": "Keep it on",
+    "kind": "ref",
+    "collection": "backup-targets",
+    "filterBy": null,
+    "spelling": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Where the bytes go. Any node that can reach the same path can then boot guests from the image.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.instance",
+    "label": "Guest",
+    "cell": "mono",
+    "width": 200
+   },
+   {
+    "path": "spec.label",
+    "label": "Name",
+    "cell": "text",
+    "width": 176
+   },
+   {
+    "path": "status.digest",
+    "label": "Digest",
+    "cell": "mono",
+    "width": 200
+   },
+   {
+    "path": "status.finishedAt",
+    "label": "Finished",
+    "cell": "ago",
+    "width": 112
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": false,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "backup-targets",
+  "title": "Backup targets",
+  "singular": "backup target",
+  "recheck": 0,
+  "condition": "",
+  "group": "Storage",
+  "scope": "global",
+  "blurb": "Where backups are kept. Deliberately not a pool: a copy that lives beside the original is a snapshot, and is lost with the pool it is in. A target in a volume's own pool is refused.",
+  "fields": [
+   {
+    "key": "path",
+    "label": "Path",
+    "kind": "text",
+    "placeholder": "/srv/backups",
+    "check": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "An absolute path the agent can already write to. Mounting an NFS or CIFS share is the host's job, not this platform's \u2014 one that managed its own mounts would be a second, worse copy of what init already does.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "accepting",
+    "label": "Accepts backups",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Turning this off stops new copies going here. What is already here stays, and can still be restored from.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "agent",
+    "label": "Reported on by",
+    "kind": "ref",
+    "collection": "pools",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The pool agent that says whether this path is there, whether it can be written, and how much room is left. Named rather than claimed by whoever gets there first \u2014 a target assigned to nobody is one any agent could report on. Leave it empty and nobody looks: copies are still written by the pool holding the volume, and a path it cannot reach fails on the backup instead.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "verifyEveryHours",
+    "label": "Read a copy back every",
+    "kind": "number",
+    "unit": "hours",
+    "min": 0,
+    "max": 8760,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "How often a copy here is read back and checked against what it hashed to when it was written. 0 never checks, which is the default: verification reads every byte of a copy, and that is real I/O somebody has to decide to spend. Without it, 'the backup exists' is the only thing anybody can say about it. One copy per pass, the one whose last check is stalest \u2014 so a target holding more copies checks each of them less often rather than falling behind on the work that is not optional.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.path",
+    "label": "Path",
+    "cell": "mono",
+    "width": 240
+   },
+   {
+    "path": "spec.accepting",
+    "label": "Accepts",
+    "cell": "yes",
+    "yes": "yes",
+    "no": "closed",
+    "width": 96
+   },
+   {
+    "path": "status.writable",
+    "label": "Writable",
+    "cell": "yes",
+    "yes": "yes",
+    "no": "unreachable",
+    "width": 120
+   },
+   {
+    "path": "status.freeGib",
+    "label": "Free",
+    "cell": "number",
+    "unit": "GiB",
+    "width": 112
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "backups",
+  "title": "Backups",
+  "singular": "backup",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Storage",
+  "scope": "project",
+  "blurb": "One copy of one volume, at one moment. Restoring makes a new volume from a copy \u2014 never writing one back over the original, which would be a command living in a spec and carried out again on every resync.",
+  "fields": [
+   {
+    "key": "volume",
+    "label": "Volume",
+    "kind": "ref",
+    "collection": "volumes",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "What is copied.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "target",
+    "label": "Target",
+    "kind": "ref",
+    "collection": "backup-targets",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Where the copy goes. Left empty, the cell's most roomy accepting target answers. A target in the volume's own pool is refused: a copy beside the original is a snapshot, and is lost with the pool it is in.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.volume",
+    "label": "Volume",
+    "cell": "mono",
+    "width": 200
+   },
+   {
+    "path": "spec.target",
+    "label": "Target",
+    "cell": "mono",
+    "width": 152
+   },
+   {
+    "path": "status.taken",
+    "label": "Copied",
+    "cell": "yes",
+    "yes": "yes",
+    "no": "not yet",
+    "width": 96
+   },
+   {
+    "path": "status.sizeGib",
+    "label": "Source size",
+    "cell": "number",
+    "unit": "GiB",
+    "width": 120
+   },
+   {
+    "path": "status.takenAt",
+    "label": "Taken",
+    "cell": "ago",
+    "width": 112
+   },
+   {
+    "path": "status.verifiedAt",
+    "label": "Read back",
+    "cell": "ago",
+    "width": 112
+   },
+   {
+    "path": "status.verifyError",
+    "label": "Trouble",
+    "cell": "text",
+    "width": 240
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": false,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "backup-schedules",
+  "title": "Backup schedules",
+  "singular": "backup schedule",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Storage",
+  "scope": "project",
+  "blurb": "An intention, not a job queue: there should be a copy of this volume no older than the interval, and the last few kept. What exists is what decides \u2014 a copy still being made holds the schedule, and a stuck one holds it for one interval and no longer.",
+  "fields": [
+   {
+    "key": "volume",
+    "label": "Volume",
+    "kind": "ref",
+    "collection": "volumes",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "What is copied.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "target",
+    "label": "Target",
+    "kind": "ref",
+    "collection": "backup-targets",
+    "filterBy": null,
+    "spelling": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Where the copies go.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "everyHours",
+    "label": "Copy every",
+    "kind": "number",
+    "unit": "hours",
+    "min": 1,
+    "max": 8760,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "How stale the newest copy may get before another is made. An interval rather than a cron line, because the only question anybody asks a schedule is when it will next run.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "keep",
+    "label": "Keep",
+    "kind": "number",
+    "unit": "copies",
+    "min": 1,
+    "max": 365,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "How many of this schedule's copies to keep. Only finished copies count, so a run of failures never expires the last one that worked. Copies taken by hand are never expired.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.volume",
+    "label": "Volume",
+    "cell": "mono",
+    "width": 200
+   },
+   {
+    "path": "spec.target",
+    "label": "Target",
+    "cell": "mono",
+    "width": 152
+   },
+   {
+    "path": "spec.everyHours",
+    "label": "Every",
+    "cell": "number",
+    "unit": "h",
+    "width": 96
+   },
+   {
+    "path": "spec.keep",
+    "label": "Keep",
+    "cell": "number",
+    "unit": "",
+    "width": 88
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "audit",
+  "title": "Audit",
+  "singular": "audit record",
+  "recheck": 0,
+  "condition": "",
+  "group": "Fleet",
+  "scope": "global",
+  "blurb": "What was refused, and who signed in. Not a log of everything that happened \u2014 every successful write already leaves an operation carrying its target, its verb and who asked. What no operation exists for is a request that was turned down, and that is the one a multi-tenant cell gets asked about later.",
+  "fields": [],
+  "columns": [
+   {
+    "path": "spec.at",
+    "label": "When",
+    "cell": "ago",
+    "width": 112
+   },
+   {
+    "path": "spec.kind",
+    "label": "What",
+    "cell": "text",
+    "width": 96
+   },
+   {
+    "path": "spec.subject",
+    "label": "Who",
+    "cell": "mono",
+    "width": 200
+   },
+   {
+    "path": "spec.verb",
+    "label": "Verb",
+    "cell": "text",
+    "width": 88
+   },
+   {
+    "path": "spec.target",
+    "label": "Reaching for",
+    "cell": "mono",
+    "width": 240
+   }
+  ],
+  "agreements": [],
+  "creatable": false,
+  "editable": false,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "device-classes",
+  "title": "Device classes",
+  "singular": "device class",
+  "recheck": 0,
+  "condition": "",
+  "group": "Fleet",
+  "scope": "global",
+  "blurb": "Names for interchangeable hardware. An instance asks for a class, never an address: an address belongs to one machine, so an instance naming one could only ever run there. A device is offered only when everything in its IOMMU group is free \u2014 a group is passed through whole or not at all.",
+  "fields": [
+   {
+    "key": "matches",
+    "label": "PCI ids",
+    "kind": "textList",
+    "placeholder": "10de:2204",
+    "check": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "vendor:device, as `lspci -n` prints it. Several, because a fleet buys the same accelerator across board revisions.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "description",
+    "label": "Description",
+    "kind": "text",
+    "placeholder": "NVIDIA A100 80GB",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "What to call it in this console.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.matches",
+    "label": "PCI ids",
+    "cell": "mono",
+    "width": 176
+   },
+   {
+    "path": "spec.description",
+    "label": "Description",
+    "cell": "text",
+    "width": 240
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "flavors",
+  "title": "Flavors",
+  "singular": "flavor",
+  "recheck": 0,
+  "condition": "",
+  "group": "Compute",
+  "scope": "global",
+  "blurb": "Named machine sizes, offered by the cell. A guest is an                 m1-small, not a hand-entered triple of numbers \u2014 the sizes that                 land on the fleet are the shapes it was bought for. Whether a                 project may also size by hand is that project's policy.",
+  "fields": [
+   {
+    "key": "vcpus",
+    "label": "vCPUs",
+    "kind": "number",
+    "unit": "",
+    "min": 1,
+    "max": 256,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "memoryMib",
+    "label": "Memory",
+    "kind": "number",
+    "unit": "MiB",
+    "min": 256,
+    "max": 4194304,
+    "step": 256,
+    "scale": "mib",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "rootDiskGib",
+    "label": "Root disk",
+    "kind": "number",
+    "unit": "GiB",
+    "min": 1,
+    "max": 65536,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "description",
+    "label": "Description",
+    "kind": "text",
+    "placeholder": "burstable, for dev boxes",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "One sentence for the picker. The numbers already say most of it.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.vcpus",
+    "label": "vCPUs",
+    "cell": "text",
+    "width": 72
+   },
+   {
+    "path": "spec.memoryMib",
+    "label": "Memory (MiB)",
+    "cell": "text",
+    "width": 112
+   },
+   {
+    "path": "spec.rootDiskGib",
+    "label": "Root disk (GiB)",
+    "cell": "text",
+    "width": 120
+   },
+   {
+    "path": "spec.description",
+    "label": "Description",
+    "cell": "text",
+    "width": 260
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "bgp-peers",
+  "title": "BGP peers",
+  "singular": "BGP peer",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Network",
+  "scope": "global",
+  "blurb": "Sessions from the cell's gateways to the routers in front of it. What gets announced is derived, never listed: every external subnet, and a host route for each public address that is in front of something \u2014 so the router ahead of the cell and this console cannot disagree about what the cell claims.",
+  "fields": [
+   {
+    "key": "peer",
+    "label": "Peer address",
+    "kind": "text",
+    "placeholder": "10.10.10.1",
+    "check": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The router or firewall in front of the cell.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "peerAs",
+    "label": "Peer AS",
+    "kind": "number",
+    "unit": "",
+    "min": 1,
+    "max": 4294967295,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "localAs",
+    "label": "Local AS",
+    "kind": "number",
+    "unit": "",
+    "min": 1,
+    "max": 4294967295,
+    "step": 1,
+    "scale": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "node",
+    "label": "Speaks from",
+    "kind": "ref",
+    "collection": "nodes",
+    "filterBy": null,
+    "spelling": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The machine that holds the session \u2014 a gateway, with FRR installed. One session is one speaker.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "password",
+    "label": "TCP-MD5 password",
+    "kind": "text",
+    "placeholder": "",
+    "check": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "none \u2014 the session is unauthenticated",
+    "help": "The same string the router has for this session (RFC 2385). Most firewalls will not bring a session up without one.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "multihop",
+    "label": "Hops to the peer",
+    "kind": "number",
+    "unit": "",
+    "min": 1,
+    "max": 255,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "directly connected",
+    "help": "Only when the router is not on the same wire: eBGP refuses a neighbour more than one hop away unless told the distance.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "description",
+    "label": "Description",
+    "kind": "text",
+    "placeholder": "edge firewall, rack 3",
+    "check": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.peer",
+    "label": "Peer",
+    "cell": "mono",
+    "width": 140
+   },
+   {
+    "path": "spec.peerAs",
+    "label": "Peer AS",
+    "cell": "text",
+    "width": 88
+   },
+   {
+    "path": "spec.node",
+    "label": "Speaks from",
+    "cell": "mono",
+    "width": 112
+   },
+   {
+    "path": "status.session",
+    "label": "Session",
+    "cell": "text",
+    "width": 112
+   },
+   {
+    "path": "status.announced",
+    "label": "Announced",
+    "cell": "text",
+    "width": 96
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "routers",
+  "title": "Routers",
+  "singular": "router",
+  "recheck": 0,
+  "condition": "Routed",
+  "group": "Network",
+  "scope": "project",
+  "blurb": "Which of this project's networks reach each other. A membership rather than a box: there is nothing to place and nothing to fail over \u2014 the gateway answers on whichever machine the packet is already on.",
+  "fields": [
+   {
+    "key": "networks",
+    "label": "Networks",
+    "kind": "refList",
+    "collection": "networks",
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The networks whose subnets reach each other. A network belongs to at most one router.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.networks",
+    "label": "Networks",
+    "cell": "mono",
+    "width": 280
+   },
+   {
+    "path": "status.l3Vni",
+    "label": "Routed VNI",
+    "cell": "number",
+    "unit": "",
+    "width": 104
+   },
+   {
+    "path": "status.gatewayMac",
+    "label": "Gateway MAC",
+    "cell": "mono",
+    "width": 152
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "floatingips",
+  "title": "Floating IPs",
+  "singular": "floating IP",
+  "recheck": 0,
+  "condition": "Allocated",
+  "group": "Network",
+  "scope": "project",
+  "blurb": "Addresses that outlive the machine answering on them. The address is held by the declaration, not by the port, so replacing a guest does not change what the outside world reaches.",
+  "fields": [
+   {
+    "key": "instance",
+    "label": "Instance",
+    "kind": "ref",
+    "collection": "instances",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "This project has no guests yet; a public address goes in front of one.",
+    "help": "The guest this address sits in front of. Its interface and the cell's public pool are found for you \u2014 name the subnet under More settings to choose v6, or a particular pool.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "subnet",
+    "label": "Subnet",
+    "kind": "ref",
+    "collection": "subnets",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Where the address comes from. Left empty, the cell's public pool answers \u2014 IPv4 first. Naming a subnet is how you choose v6, or a particular pool.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "address",
+    "label": "Address",
+    "kind": "text",
+    "placeholder": "the lowest free one",
+    "check": "address",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Leave empty to be given the lowest address nothing else holds.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "port",
+    "label": "Forwards to",
+    "kind": "ref",
+    "collection": "ports",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "The port this address reaches. Clearing it holds the address while the machine behind it is replaced.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "delivery",
+    "label": "The guest",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Nat",
+      "label": "never sees it"
+     },
+     {
+      "value": "Routed",
+      "label": "holds it itself"
+     }
+    ],
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Held by the guest means the address is bound to its port and configured inside the machine \u2014 nothing rewrites a packet, and the guest can tell anybody its own address, which SIP, FTP, IPsec and mDNS all need. Translated means the edge answers for it and the guest never knows. A held address has to come from an external network.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "announce",
+    "label": "Announced by",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "",
+      "label": "as the network says"
+     },
+     {
+      "value": "FromHost",
+      "label": "the machine holding the guest"
+     },
+     {
+      "value": "FromGateway",
+      "label": "a gateway node"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "The machine holding the guest is the shortest path: nothing is encapsulated for traffic to and from the world, and the route follows a live migration by itself. It needs every hypervisor to be allowed to peer with the router above it. A gateway node needs only that one machine to peer, and costs a detour in both directions.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.address",
+    "label": "Address",
+    "cell": "mono",
+    "width": 152
+   },
+   {
+    "path": "spec.port",
+    "label": "Forwards to",
+    "cell": "mono",
+    "width": 240
+   },
+   {
+    "path": "status.associated",
+    "label": "Reaching",
+    "cell": "mono",
+    "width": 136
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "load-balancers",
+  "title": "Load balancers",
+  "singular": "load balancer",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Network",
+  "scope": "project",
+  "blurb": "One address in front of many ports. The fabric balances by connection on whichever host traffic arrives at \u2014 there is no appliance to place and nothing to fail over. Nothing here probes a member's health: the pool is what was declared, not a judgement about it.",
+  "fields": [
+   {
+    "key": "network",
+    "label": "Network",
+    "kind": "ref",
+    "collection": "networks",
+    "filterBy": null,
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The network the address lives on. It scopes the service, so two projects may front the same address on different networks.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "subnet",
+    "label": "Subnet",
+    "kind": "ref",
+    "collection": "subnets",
+    "filterBy": "network",
+    "spelling": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Where the address comes from. The same counting as a port's address and a floating IP's, so no two of them are ever the same address.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "listeners",
+    "label": "Listeners",
+    "kind": "listenerList",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The ports the address answers on. Traffic is spread across the pool by connection, so one client's connection stays on one member.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "members",
+    "label": "Members",
+    "kind": "refList",
+    "collection": "ports",
+    "spelling": "name",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The ports behind the address \u2014 ports, not addresses, so a migrated guest stays in the pool. Empty holds the address and forwards to nothing.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "vip",
+    "label": "Address",
+    "kind": "text",
+    "placeholder": "the lowest free one",
+    "check": "address",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Leave empty to be given the lowest address nothing else holds.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.vip",
+    "label": "Address",
+    "cell": "mono",
+    "width": 152
+   },
+   {
+    "path": "spec.listeners",
+    "label": "Listeners",
+    "cell": "count",
+    "width": 96
+   },
+   {
+    "path": "spec.members",
+    "label": "Members",
+    "cell": "count",
+    "width": 96
+   },
+   {
+    "path": "status.vip",
+    "label": "Serving",
+    "cell": "mono",
+    "width": 152
+   }
+  ],
+  "agreements": [
+   {
+    "label": "Address",
+    "asked": "vip",
+    "is": "vip",
+    "note": "The address asked for is not the one the fabric serves yet. Usually the world catching up; if it stays, the Ready condition says what is in the way."
+   }
+  ],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "pools",
+  "title": "Pools",
+  "singular": "pool",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Fleet",
+  "scope": "global",
+  "blurb": "Where volumes live. The spec is what an operator decided about a pool; the backend, the capacity and what is used are what its agent found.",
+  "fields": [
+   {
+    "key": "accepting",
+    "label": "Accepts new volumes",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Turning this off drains the pool: nothing new is provisioned into it, what it holds stays.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "labels",
+    "label": "Labels",
+    "kind": "textList",
+    "placeholder": "ssd",
+    "check": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "What a volume's placement matches on.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.accepting",
+    "label": "Accepts work",
+    "cell": "yes",
+    "yes": "yes",
+    "no": "draining",
+    "width": 120
+   },
+   {
+    "path": "status.backend",
+    "label": "Backend",
+    "cell": "mono",
+    "width": 96
+   },
+   {
+    "path": "status.allocatedGib",
+    "label": "Used",
+    "cell": "number",
+    "unit": "GiB",
+    "width": 104
+   },
+   {
+    "path": "status.capacityGib",
+    "label": "Capacity",
+    "cell": "number",
+    "unit": "GiB",
+    "width": 112
+   },
+   {
+    "path": "status.agentVersion",
+    "label": "Agent",
+    "cell": "mono",
+    "width": 96
+   },
+   {
+    "path": "status.lastHeartbeat",
+    "label": "Heard from",
+    "cell": "ago",
+    "width": 112
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": false,
+  "explainable": false
+ },
+ {
+  "id": "usage",
+  "title": "Usage",
+  "singular": "usage record",
+  "recheck": 0,
+  "condition": "",
+  "group": "Access",
+  "scope": "project",
+  "blurb": "What this project had, read once an hour and kept for ninety days. A reading is a sample, not a total: something created and destroyed between two of them is in neither. Quota says what is in use now; this is the only thing that remembers.",
+  "fields": [],
+  "columns": [
+   {
+    "path": "spec.at",
+    "label": "Taken",
+    "cell": "ago",
+    "width": 120
+   },
+   {
+    "path": "spec.used.instances",
+    "label": "Instances",
+    "cell": "number",
+    "unit": "",
+    "width": 90
+   },
+   {
+    "path": "spec.used.vcpus",
+    "label": "vCPUs",
+    "cell": "number",
+    "unit": "",
+    "width": 80
+   },
+   {
+    "path": "spec.used.memoryMib",
+    "label": "Memory",
+    "cell": "number",
+    "unit": "MiB",
+    "width": 110
+   },
+   {
+    "path": "spec.used.volumeGib",
+    "label": "Storage",
+    "cell": "number",
+    "unit": "GiB",
+    "width": 110
+   },
+   {
+    "path": "spec.used.floatingIps",
+    "label": "Public addresses",
+    "cell": "number",
+    "unit": "",
+    "width": 130
+   }
+  ],
+  "agreements": [],
+  "creatable": false,
+  "editable": false,
+  "deletable": false,
+  "explainable": false
+ },
+ {
+  "id": "operations",
+  "title": "Operations",
+  "singular": "operation",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Fleet",
+  "scope": "project",
+  "blurb": "Something that could not finish inside a request. Done is computed from the target's own convergence, so an operation cannot disagree with the object it describes.",
+  "fields": [
+   {
+    "key": "target",
+    "label": "Target",
+    "kind": "text",
+    "placeholder": "",
+    "check": "name",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": true,
+    "atCreation": false
+   },
+   {
+    "key": "verb",
+    "label": "Verb",
+    "kind": "text",
+    "placeholder": "",
+    "check": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": true,
+    "atCreation": false
+   },
+   {
+    "key": "targetGeneration",
+    "label": "Waiting for generation",
+    "kind": "number",
+    "unit": "",
+    "min": 0,
+    "max": 9223372036854775807,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": true,
+    "atCreation": false
+   },
+   {
+    "key": "requestedBy",
+    "label": "Requested by",
+    "kind": "text",
+    "placeholder": "",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": true,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.verb",
+    "label": "Verb",
+    "cell": "text",
+    "width": 80
+   },
+   {
+    "path": "spec.target",
+    "label": "Target",
+    "cell": "mono",
+    "width": 260
+   },
+   {
+    "path": "status.done",
+    "label": "Finished",
+    "cell": "yes",
+    "yes": "yes",
+    "no": "not yet",
+    "width": 96
+   },
+   {
+    "path": "status.error",
+    "label": "Error",
+    "cell": "text",
+    "width": 200
+   }
+  ],
+  "agreements": [],
+  "creatable": false,
+  "editable": false,
+  "deletable": false,
+  "explainable": false
+ },
+ {
+  "id": "users",
+  "title": "Users",
+  "singular": "user",
+  "recheck": 0,
+  "condition": "",
+  "group": "Access",
+  "scope": "global",
+  "blurb": "Who can sign in. A password is set from the row rather than shown on it \u2014 the platform stores a hash and cannot recover the original, which is the point.",
+  "fields": [
+   {
+    "key": "service",
+    "label": "Service account",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "A program rather than a person: it signs in with no password and carries a token instead, minted by an operator and shown once. It is named in a project's bindings like anybody else and gets the same four roles.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "displayName",
+    "label": "Display name",
+    "kind": "text",
+    "placeholder": "Ada Lovelace",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Shown on screen. Never used to decide anything \u2014 the account's id is its identity.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "email",
+    "label": "Email",
+    "kind": "text",
+    "placeholder": "ada@example.org",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "disabled",
+    "label": "Disabled",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Ends every session this account holds immediately, and refuses new sign-ins. Its roles are kept, so turning it back on restores exactly what it had.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "cellAdmin",
+    "label": "Cell administrator",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "May do anything anywhere in this cell, including inside every project. Grant it to operate the platform, not to use it.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.displayName",
+    "label": "Display name",
+    "cell": "text",
+    "width": 176
+   },
+   {
+    "path": "spec.email",
+    "label": "Email",
+    "cell": "text",
+    "width": 200
+   },
+   {
+    "path": "spec.cellAdmin",
+    "label": "Operator",
+    "cell": "text",
+    "width": 88
+   },
+   {
+    "path": "spec.disabled",
+    "label": "Disabled",
+    "cell": "text",
+    "width": 88
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "ceph-clusters",
+  "title": "Ceph",
+  "singular": "Ceph cluster",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Storage",
+  "scope": "global",
+  "blurb": "Cluster storage every node reaches, instead of a pool per machine. Optional: a cell with directory pools is a working cell, and nothing here turns itself on. Choosing a disk for an OSD erases it.",
+  "fields": [
+   {
+    "key": "publicNetwork",
+    "label": "Network",
+    "kind": "text",
+    "placeholder": "10.0.0.0/24",
+    "check": "cidr",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Where the daemons talk to each other and to clients. A node with several interfaces has several answers, and the wrong one puts replication traffic on the tenant network.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "clusterNetwork",
+    "label": "Replication network",
+    "kind": "text",
+    "placeholder": "10.1.0.0/24",
+    "check": "cidr",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "A separate network for replication. Empty means the one above carries both, which is the ordinary answer for a small cluster.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "monitors",
+    "label": "Monitors",
+    "kind": "refList",
+    "collection": "nodes",
+    "spelling": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Three nodes, or one for a lab. Never two: a quorum of two survives no failures and looks like it would.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "osds",
+    "label": "Disks",
+    "kind": "diskList",
+    "collection": "nodes",
+    "refusals": [
+     {
+      "kind": "Partitioned",
+      "text": "it has a partition table with {partitions} partition(s) on it. Something laid this disk out deliberately; wipe it outside the platform if it really is spare."
+     },
+     {
+      "kind": "Filesystem",
+      "text": "it holds a {fstype} filesystem. Handing it to Ceph erases that, so it is not offered until the filesystem is gone."
+     },
+     {
+      "kind": "Mounted",
+      "text": "it is mounted at {at} right now. Whatever is using it is using it."
+     },
+     {
+      "kind": "System",
+      "text": "it holds swap or the root filesystem \u2014 consuming it takes this node down."
+     },
+     {
+      "kind": "Osd",
+      "text": "it is already OSD {id}."
+     },
+     {
+      "kind": "Volume",
+      "text": "it is a member of {of}. Take it out of that first, if that is really what you want."
+     },
+     {
+      "kind": "Unsuitable",
+      "text": "{why}"
+     }
+    ],
+    "minGib": 20,
+    "tooSmall": "it is {sizeGib} GiB, and an OSD wants at least {minGib}. Below that the OSD's own bookkeeping is a meaningful fraction of the disk.",
+    "unknown": "this node reports it as {kind}, which this console has no answer for. Not offered: a disk whose state cannot be read is not a disk anything here can call empty.",
+    "warning": "Adding a disk here erases it. Everything on that device goes, and nothing in this platform brings it back.",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "One disk, one OSD. Anything that cannot be chosen says why beside it rather than being greyed out \u2014 only a device the node can see is empty is offered, so a disk you really do want to give up has to be wiped outside the platform first.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "pools",
+    "label": "Pools",
+    "kind": "poolList",
+    "defaultSize": 3,
+    "defaultMinSize": 2,
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Where volumes are stored. Copies is how many of every object exist; below the floor the pool refuses writes rather than holding data it cannot protect \u2014 so a floor equal to the copies means one node rebooting stops writing.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "paused",
+    "label": "Paused",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Stops the deployment where it stands. Nothing is torn down, and turning it off carries on from there.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "status.phase",
+    "label": "Phase",
+    "cell": "text",
+    "width": 120
+   },
+   {
+    "path": "status.monitorsUp",
+    "label": "Monitors",
+    "cell": "count",
+    "width": 96
+   },
+   {
+    "path": "status.osdsUp",
+    "label": "OSDs",
+    "cell": "count",
+    "width": 80
+   },
+   {
+    "path": "status.health",
+    "label": "Health",
+    "cell": "text",
+    "width": 120
+   },
+   {
+    "path": "status.usedBytes",
+    "label": "Used",
+    "cell": "bytes",
+    "width": 96
+   }
+  ],
+  "agreements": [
+   {
+    "label": "Monitors",
+    "asked": "monitors",
+    "is": "monitorsUp",
+    "note": "A monitor that was chosen is not running. Until the quorum is what was asked for, the cluster tolerates fewer failures than it looks like it does."
+   }
+  ],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "roles",
+  "title": "Roles",
+  "singular": "role",
+  "recheck": 0,
+  "condition": "",
+  "group": "Access",
+  "scope": "global",
+  "blurb": "The four rungs say how much somebody may do. A role here says *what* \u2014 collection by collection, for the case a rung cannot express: may restart the database machines, may not touch the network.",
+  "fields": [
+   {
+    "key": "displayName",
+    "label": "Name",
+    "kind": "text",
+    "placeholder": "Database operator",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "description",
+    "label": "What it is for",
+    "kind": "text",
+    "placeholder": "Restart the database machines, nothing else",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Somebody granting this will read this line and nothing else.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "grants",
+    "label": "Grants",
+    "kind": "grantList",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "A verb, and the collections it applies to. Being able to act on something carries being able to see it \u2014 anything else is a button that works above a screen that shows nothing.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.displayName",
+    "label": "Name",
+    "cell": "text",
+    "width": 220
+   },
+   {
+    "path": "spec.description",
+    "label": "What it is for",
+    "cell": "text",
+    "width": 320
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "folders",
+  "title": "Folders",
+  "singular": "folder",
+  "recheck": 0,
+  "condition": "",
+  "group": "Access",
+  "scope": "global",
+  "blurb": "A place to put projects, and a place to grant a role once instead of forty times. Roles granted here reach everything below.",
+  "fields": [
+   {
+    "key": "displayName",
+    "label": "Name",
+    "kind": "text",
+    "placeholder": "Engineering",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "parent",
+    "label": "Inside",
+    "kind": "ref",
+    "collection": "folders",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "There are no folders yet. The first one goes at the top.",
+    "help": "Left empty this folder sits at the top. Roles granted above it reach in here too.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.displayName",
+    "label": "Name",
+    "cell": "text",
+    "width": 240
+   },
+   {
+    "path": "spec.parent",
+    "label": "Inside",
+    "cell": "text",
+    "width": 240
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "projects",
+  "title": "Projects",
+  "singular": "project",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Fleet",
+  "scope": "global",
+  "blurb": "The quota and access anchor. Usage is counted from what exists, never decremented by hand.",
+  "fields": [
+   {
+    "key": "policy.hostBridges",
+    "label": "Host bridges this project may use",
+    "kind": "lines",
+    "placeholder": "br0\nvmbr1",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "One bridge per line, as they are named on the nodes. A network put on one takes its guests off this platform's networks and onto whatever the machine is on \u2014 no address from us, no gateway, no security group. Empty means this project gets logical networks only, which is what a new customer should have. Named rather than a yes/no, because what anybody means by a host bridge is a particular wire.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "policy.devicePassthrough",
+    "label": "May pass hardware through",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Whether guests here may be given a GPU or a NIC of their own. A passed-through device is a physical thing one guest holds and no other guest can have, so a project that may ask for them can empty a node of the hardware everybody else was scheduled against.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "policy.floatingIps",
+    "label": "May hold public addresses",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Whether this project may claim addresses the world can reach. They come out of address space the cell was given by whoever is above it, so a project that could mint them could exhaust the pool every other project is waiting on.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "policy.customSizes",
+    "label": "May size guests by hand",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Whether guests here may be sized by typed numbers instead of a flavor. Only asked once the cell has flavors at all: with a menu defined, the closed answer is the sold one, and this is the deliberate exception for the customer whose shapes are their own.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "displayName",
+    "label": "Display name",
+    "kind": "text",
+    "placeholder": "Platform team",
+    "check": "none",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "parent",
+    "label": "Folder",
+    "kind": "ref",
+    "collection": "folders",
+    "filterBy": null,
+    "spelling": "id",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Roles granted on the folder reach every project under it. Quota and policy are this project's own.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "cell",
+    "label": "Cell",
+    "kind": "text",
+    "placeholder": "cell-1",
+    "check": "id",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Which cell this project's resources live in, and where requests for them are routed. Leave empty to use whichever cell answers \u2014 which is what an installation with one cell wants.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.instances",
+    "label": "Instances",
+    "kind": "number",
+    "unit": "",
+    "min": 0,
+    "max": 100000,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.vcpus",
+    "label": "vCPUs",
+    "kind": "number",
+    "unit": "",
+    "min": 0,
+    "max": 1000000,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.memoryMib",
+    "label": "Memory",
+    "kind": "number",
+    "unit": "MiB",
+    "min": 0,
+    "max": 100000000,
+    "step": 1024,
+    "scale": "mib",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.volumeGib",
+    "label": "Volume space",
+    "kind": "number",
+    "unit": "GiB",
+    "min": 0,
+    "max": 10000000,
+    "step": 10,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.volumes",
+    "label": "Volumes",
+    "kind": "number",
+    "unit": "volumes",
+    "min": 0,
+    "max": 100000,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "A count, separate from the space: per-volume overhead is a different worry from capacity, and the two are capped apart.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.floatingIps",
+    "label": "Floating IPs",
+    "kind": "number",
+    "unit": "addresses",
+    "min": 0,
+    "max": 100000,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "An address that outlives the machine answering on it is scarce and externally routable.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.loadBalancers",
+    "label": "Load balancers",
+    "kind": "number",
+    "unit": "balancers",
+    "min": 0,
+    "max": 100000,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Each one takes an address out of a subnet and datapath entries on every ingress host.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.devices",
+    "label": "Passed-through devices",
+    "kind": "number",
+    "unit": "devices",
+    "min": 0,
+    "max": 10000,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Each one is a piece of hardware that exists once and cannot be oversubscribed, so without a cap one project can take every accelerator in the cell.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.displayName",
+    "label": "Name",
+    "cell": "text",
+    "width": 200
+   },
+   {
+    "path": "spec.cell",
+    "label": "Cell",
+    "cell": "text",
+    "width": 96
+   },
+   {
+    "path": "status.used.instances",
+    "label": "Instances",
+    "cell": "number",
+    "unit": "",
+    "width": 96
+   },
+   {
+    "path": "spec.quota.instances",
+    "label": "Instance quota",
+    "cell": "number",
+    "unit": "",
+    "width": 112
+   },
+   {
+    "path": "status.used.vcpus",
+    "label": "vCPUs",
+    "cell": "number",
+    "unit": "",
+    "width": 88
+   },
+   {
+    "path": "status.used.memoryMib",
+    "label": "Memory",
+    "cell": "number",
+    "unit": "MiB",
+    "width": 120
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ }
+]
