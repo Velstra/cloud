@@ -1,0 +1,36 @@
+# cargo-release configuration (https://github.com/crate-ci/cargo-release).
+#
+# Tag-based releases: the whole workspace shares one version and one signed tag;
+# nothing is published to crates.io. Cut a release with, e.g.:
+#
+#   cargo release patch        # 0.1.0 -> 0.1.1   (a bug-fix release)
+#   cargo release minor        # 0.1.x -> 0.2.0   (new features)
+#
+# That bumps every crate, makes ONE GPG-signed commit and a signed `vX.Y.Z` tag,
+# and pushes. Pushing the tag triggers .github/workflows/release.yml, which
+# publishes a GitHub release whose body is that version's CHANGELOG section and
+# attaches the Debian package built from that exact tag.
+#
+# NOTE: this is a *virtual* workspace with a single root CHANGELOG.md, so we do
+# NOT use `[[pre-release-replacements]]` — cargo-release would apply it per crate
+# (`velstra-cloud-<crate>/CHANGELOG.md`, which does not exist). Before releasing,
+# move the notes under a dated `## [x.y.z] — YYYY-MM-DD` heading in CHANGELOG.md
+# yourself (keep an empty `## [Unreleased]` on top for next time), and commit
+# that alongside this config. The same arrangement fabric and wren use.
+#
+# What a released version is *not*: the version apt compares. A .deb built from
+# any commit carries `<version>+<timestamp>.<revision>` so that an operator
+# upgrading a test cell is never told the package is already current — see
+# `debVersion` in flake.nix. A tag makes that string end in a real revision
+# instead of `dirty`, which is the whole difference between a build somebody
+# can point at and one they cannot.
+
+sign-commit = true
+sign-tag = true
+publish = false
+push = true
+shared-version = true
+consolidate-commits = true
+tag-name = "v{{version}}"
+pre-release-commit-message = "release: velstra-cloud {{version}}"
+tag-message = "velstra-cloud {{version}}"
