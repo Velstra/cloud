@@ -3797,6 +3797,69 @@ async fn deleting_an_account_takes_its_grants_with_it() {
 }
 
 /// An image ada shares with bob's project is one bob can read — and nothing
+/// A tenant cannot republish another tenant's image by naming it in `from`.
+///
+/// `spec.from` says "these are the bytes I want, published under my own
+/// object". It is the one reference this platform consumes at create — copied
+/// out and stored empty — so it is not in `refs::fields` and nothing was asking
+/// whether the caller may read what they named.
+///
+/// What that cost: a capture of a running guest is an image object holding that
+/// guest's digest and the path its disk was written to. Naming it in `from`
+/// copied both into an image of one's own, and booting that image is reading
+/// somebody else's machine. The refusal for a name that does not exist was also
+/// an existence oracle over every image name in the cell.
+#[tokio::test]
+async fn publishing_from_another_tenants_image_is_refused() {
+    let api = cell().await;
+    api.create(
+        "projects/p1",
+        "images",
+        &json!({
+            "id": "sha256-secret",
+            "spec": {
+                "digest": "sha256:secret",
+                "format": "Raw",
+                "size_bytes": 1024,
+                "source_url": "file:///var/lib/velstra/backups/sha256-secret"
+            }
+        }),
+        &who(ADA),
+    )
+    .await
+    .expect("ada may publish into her own project");
+
+    let refused = api
+        .create(
+            "projects/p2",
+            "images",
+            &json!({ "id": "mine", "spec": { "from": "projects/p1/images/sha256-secret" } }),
+            &who(BOB),
+        )
+        .await
+        .err()
+        .expect("bob republished another tenant's image");
+    assert_eq!(refused.code, Code::PermissionDenied);
+
+    // And the same answer for one that does not exist, so the refusal says
+    // nothing about which names are taken.
+    let missing = api
+        .create(
+            "projects/p2",
+            "images",
+            &json!({ "id": "mine", "spec": { "from": "projects/p1/images/sha256-nosuch" } }),
+            &who(BOB),
+        )
+        .await
+        .err()
+        .expect("a name bob may not read answered as if it were his to ask about");
+    assert_eq!(
+        missing.code,
+        Code::PermissionDenied,
+        "the refusal told bob whether that image exists"
+    );
+}
+
 /// more.
 ///
 /// Without this an operator building one hardened base image had to copy the
