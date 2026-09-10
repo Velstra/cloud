@@ -115,7 +115,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "This project has no ports yet, and does not need any: name a network above and one is made. A port of your own is for the case where the address has to outlive the machine.",
-    "help": "For a NIC that already exists \u2014 one holding an address you want this guest to keep. To simply put a machine on a network, name the network above and the port is made for you.",
+    "help": "For a NIC that already exists — one holding an address you want this guest to keep. To simply put a machine on a network, name the network above and the port is made for you.",
     "derived": false,
     "atCreation": false
    },
@@ -127,7 +127,7 @@
     "spelling": "name",
     "required": false,
     "advanced": true,
-    "whenEmpty": "This project has no volumes yet. Make one under Volumes and it can be attached here \u2014 the attachment itself is made for you.",
+    "whenEmpty": "This project has no volumes yet. Make one under Volumes and it can be attached here — the attachment itself is made for you.",
     "help": "Attached once the guest is on a node. Take one off the list to detach it.",
     "derived": false,
     "atCreation": false
@@ -142,7 +142,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Left empty, this guest joins your project's default network \u2014 made the first time somebody needs it, so two machines in a project can talk without anybody configuring anything.",
+    "help": "Left empty, this guest joins your project's default network — made the first time somebody needs it, so two machines in a project can talk without anybody configuring anything.",
     "derived": false,
     "atCreation": true
    },
@@ -150,7 +150,7 @@
     "key": "sshKeys",
     "label": "SSH keys",
     "kind": "textList",
-    "placeholder": "ssh-ed25519 AAAA\u2026",
+    "placeholder": "ssh-ed25519 AAAA…",
     "check": "none",
     "required": false,
     "advanced": false,
@@ -194,7 +194,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Instances in one group are kept off the same node \u2014 what keeps a service alive when a machine dies.",
+    "help": "Instances in one group are kept off the same node — what keeps a service alive when a machine dies.",
     "derived": false,
     "atCreation": false
    },
@@ -215,7 +215,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "A rule refuses a node that already runs a member \u2014 three replicas of a database must not share a machine even if that means one stays down. A wish takes a crowded node over not running at all, which is what twelve web servers want.",
+    "help": "A rule refuses a node that already runs a member — three replicas of a database must not share a machine even if that means one stays down. A wish takes a crowded node over not running at all, which is what twelve web servers want.",
     "derived": false,
     "atCreation": false
    },
@@ -228,7 +228,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "The opposite ask: instances in one group are placed together. For a pair that talks constantly \u2014 an application and the cache it reads on every request \u2014 where a hop between machines is the whole latency budget.",
+    "help": "The opposite ask: instances in one group are placed together. For a pair that talks constantly — an application and the cache it reads on every request — where a hop between machines is the whole latency budget.",
     "derived": false,
     "atCreation": false
    },
@@ -294,7 +294,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Measured from the newest start in that group, not each member in turn \u2014 a hundred guests at thirty seconds each would be fifty minutes of nothing happening.",
+    "help": "Measured from the newest start in that group, not each member in turn — a hundred guests at thirty seconds each would be fifty minutes of nothing happening.",
     "derived": false,
     "atCreation": false
    },
@@ -315,7 +315,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Only for a guest whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Nothing is moved until the node has been quiet long enough that its own agent has certainly stopped its guests \u2014 a node with no fencing deadline is never recovered from.",
+    "help": "Only for a guest whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Nothing is moved until the node has been quiet long enough that its own agent has certainly stopped its guests — a node with no fencing deadline is never recovered from.",
     "derived": false,
     "atCreation": false
    },
@@ -339,7 +339,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "A class, not a machine's address. Two of the same class means two devices. A guest holding one cannot be live-migrated \u2014 a device's state is in hardware and cannot be transferred.",
+    "help": "A class, not a machine's address. Two of the same class means two devices. A guest holding one cannot be live-migrated — a device's state is in hardware and cannot be transferred.",
     "derived": false,
     "atCreation": false
    },
@@ -401,6 +401,32 @@
     "width": 104
    },
    {
+    "path": "status.usage.cpuPercent",
+    "label": "CPU used",
+    "cell": "number",
+    "unit": "%",
+    "width": 88
+   },
+   {
+    "path": "status.usage.memoryMib",
+    "label": "Memory used",
+    "cell": "number",
+    "unit": "MiB",
+    "width": 112
+   },
+   {
+    "path": "status.usage.txTotal",
+    "label": "Sent",
+    "cell": "bytes",
+    "width": 96
+   },
+   {
+    "path": "status.usage.diskWriteBytes",
+    "label": "Written",
+    "cell": "bytes",
+    "width": 96
+   },
+   {
     "path": "status.node",
     "label": "Node",
     "cell": "mono",
@@ -446,7 +472,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
-  "blurb": "Block devices. A volume knows nothing about who has it open \u2014 that is an attachment.",
+  "blurb": "Block devices. A volume knows nothing about who has it open — that is an attachment.",
   "fields": [
    {
     "key": "sizeGib",
@@ -474,7 +500,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Left empty, the cell chooses: the accepting pool with the most room. Naming one is for operators pinning a volume to specific hardware \u2014 a tenant cannot list pools and does not need to.",
+    "help": "Left empty, the cell chooses: the accepting pool with the most room. Naming one is for operators pinning a volume to specific hardware — a tenant cannot list pools and does not need to.",
     "derived": false,
     "atCreation": true
    },
@@ -531,6 +557,54 @@
     "help": "Not yet: this cell has no key manager, so a key here is refused and the bytes are stored in the clear. The field is here for when one exists.",
     "derived": false,
     "atCreation": true
+   },
+   {
+    "key": "limits.iops",
+    "label": "IOPS",
+    "kind": "number",
+    "unit": "/s",
+    "min": 0,
+    "max": 10000000,
+    "step": 100,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "unlimited",
+    "help": "What this volume may take. Left at zero it takes the pool's ceiling, if the pool has one — and asking for more than the ceiling gets the ceiling rather than a refusal.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "limits.readMibps",
+    "label": "Read",
+    "kind": "number",
+    "unit": "MiB/s",
+    "min": 0,
+    "max": 1000000,
+    "step": 10,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "unlimited",
+    "help": "Read bandwidth. Zero takes the pool's ceiling.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "limits.writeMibps",
+    "label": "Write",
+    "kind": "number",
+    "unit": "MiB/s",
+    "min": 0,
+    "max": 1000000,
+    "step": 10,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "unlimited",
+    "help": "Write bandwidth. Zero takes the pool's ceiling. Separate from reads because they are not the same cost on any backend here: a write to a replicated Ceph pool is three writes.",
+    "derived": false,
+    "atCreation": false
    }
   ],
   "columns": [
@@ -700,7 +774,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "A bridge that already exists on the nodes \u2014 `br0`, `vmbr0`. Guests on this network go straight onto whatever the machine is on: the house LAN, a VLAN, a lab network. Their addresses come from whatever serves that wire and this platform allocates none, holds no gateway and enforces no security group. Empty is the ordinary case. Only a cell operator may set it \u2014 it is a decision about the machine, not about a project.",
+    "help": "A bridge that already exists on the nodes — `br0`, `vmbr0`. Guests on this network go straight onto whatever the machine is on: the house LAN, a VLAN, a lab network. Their addresses come from whatever serves that wire and this platform allocates none, holds no gateway and enforces no security group. Empty is the ordinary case. Only a cell operator may set it — it is a decision about the machine, not about a project.",
     "derived": false,
     "atCreation": true
    },
@@ -711,7 +785,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "The prefixes on this network's subnets are routed to this cell by whoever is above it, so an address from one is an address the world can reach. Only a cell operator may say so \u2014 a tenant who could would mint themselves a public range by typing a CIDR.",
+    "help": "The prefixes on this network's subnets are routed to this cell by whoever is above it, so an address from one is an address the world can reach. Only a cell operator may say so — a tenant who could would mint themselves a public range by typing a CIDR.",
     "derived": false,
     "atCreation": false
    },
@@ -764,7 +838,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "The VXLAN network identifier. Left empty, the cell assigns the \\\n               smallest free one \u2014 which is the only correct answer, and not one \\\n               a tenant can work out.",
+    "help": "The VXLAN network identifier. Left empty, the cell assigns the \\\n               smallest free one — which is the only correct answer, and not one \\\n               a tenant can work out.",
     "derived": true,
     "atCreation": false
    }
@@ -940,7 +1014,7 @@
     "spelling": "name",
     "required": true,
     "advanced": false,
-    "whenEmpty": "No subnets on this network yet. A subnet is the range its addresses come from \u2014 make one before a port.",
+    "whenEmpty": "No subnets on this network yet. A subnet is the range its addresses come from — make one before a port.",
     "help": "",
     "derived": false,
     "atCreation": false
@@ -967,7 +1041,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Left empty IPAM allocates one. It never changes afterwards \u2014 an address that moves under a running guest is an outage.",
+    "help": "Left empty IPAM allocates one. It never changes afterwards — an address that moves under a running guest is an outage.",
     "derived": false,
     "atCreation": false
    },
@@ -1033,6 +1107,20 @@
     "label": "Node",
     "cell": "mono",
     "width": 120
+   },
+   {
+    "path": "status.dropped.inboundPackets",
+    "label": "Dropped in",
+    "cell": "number",
+    "unit": "",
+    "width": 104
+   },
+   {
+    "path": "status.dropped.outboundPackets",
+    "label": "Dropped out",
+    "cell": "number",
+    "unit": "",
+    "width": 104
    }
   ],
   "agreements": [],
@@ -1049,7 +1137,7 @@
   "condition": "Applied",
   "group": "Network",
   "scope": "project",
-  "blurb": "What a port is allowed to carry. Rules only add allowances \u2014 ingress is denied, egress is allowed and replies always come back, so a port in no group is not an open one.",
+  "blurb": "What a port is allowed to carry. Rules only add allowances — ingress is denied, egress is allowed and replies always come back, so a port in no group is not an open one.",
   "fields": [
    {
     "key": "rules",
@@ -1123,7 +1211,7 @@
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "A `sha256sum`-style file covering the image's filename. **https only**, and refused otherwise \u2014 this is the one value the whole arrangement trusts, and whoever can rewrite it chooses what every new guest in this cell boots.",
+    "help": "A `sha256sum`-style file covering the image's filename. **https only**, and refused otherwise — this is the one value the whole arrangement trusts, and whoever can rewrite it chooses what every new guest in this cell boots.",
     "derived": false,
     "atCreation": false
    },
@@ -1166,7 +1254,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "How many of this family to keep. Three when left empty. An image an instance was built from is never taken away, however old \u2014 the guest would be unable to start on its next move.",
+    "help": "How many of this family to keep. Three when left empty. An image an instance was built from is never taken away, however old — the guest would be unable to start on its next move.",
     "derived": false,
     "atCreation": false
    }
@@ -1313,7 +1401,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Take the digest, format, size and source from an image that already exists. Nothing is copied \u2014 an image is addressed by its digest, so every node that had the bytes still has them. Anything you fill in below wins over what is taken.",
+    "help": "Take the digest, format, size and source from an image that already exists. Nothing is copied — an image is addressed by its digest, so every node that had the bytes still has them. Anything you fill in below wins over what is taken.",
     "derived": false,
     "atCreation": true
    },
@@ -1326,7 +1414,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "Without a family this image can only be asked for by its digest, and nothing will ever offer it as \"the newest\".",
-    "help": "What this image is, in the words somebody would use to ask for it. An instance can then name `families/debian-13` and get the newest one there is, resolved when it is created and written down \u2014 so a guest never changes its operating system on a restart.",
+    "help": "What this image is, in the words somebody would use to ask for it. An instance can then name `families/debian-13` and get the newest one there is, resolved when it is created and written down — so a guest never changes its operating system on a restart.",
     "derived": false,
     "atCreation": false
    },
@@ -1339,7 +1427,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Which one in the family, for a person to read. Newest is decided by when this cell learned of the image, not by comparing this \u2014 every scheme for ordering version strings is wrong for somebody's.",
+    "help": "Which one in the family, for a person to read. Newest is decided by when this cell learned of the image, not by comparing this — every scheme for ordering version strings is wrong for somebody's.",
     "derived": false,
     "atCreation": false
    },
@@ -1347,7 +1435,7 @@
     "key": "digest",
     "label": "Digest",
     "kind": "text",
-    "placeholder": "sha256:\u2026",
+    "placeholder": "sha256:…",
     "check": "digest",
     "required": false,
     "advanced": false,
@@ -1381,7 +1469,7 @@
     "key": "sourceUrl",
     "label": "Source",
     "kind": "text",
-    "placeholder": "https://\u2026",
+    "placeholder": "https://…",
     "check": "url",
     "required": false,
     "advanced": true,
@@ -1405,6 +1493,71 @@
     "help": "",
     "derived": false,
     "atCreation": false
+   },
+   {
+    "key": "signature",
+    "label": "Signature",
+    "kind": "text",
+    "placeholder": "base64 Ed25519 signature over the digest line",
+    "check": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "unsigned",
+    "help": "An Ed25519 signature over `sha256:<digest>`, base64. Accepted only when it verifies under a key the cell was started with; refused otherwise, so a stored signature is a verified one.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "state",
+    "label": "Life stage",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Active",
+      "label": "In service"
+     },
+     {
+      "value": "Deprecated",
+      "label": "Deprecated — still boots, no longer chosen"
+     },
+     {
+      "value": "Obsolete",
+      "label": "Retired — nothing new is built from it"
+     }
+    ],
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "An image is never replaced, only superseded. Deprecating one stops a family choosing it while everything pinned to it keeps working; retiring it refuses anything new. Neither touches a running guest.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "replacement",
+    "label": "Use instead",
+    "kind": "ref",
+    "collection": "images",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Named in the refusal a tenant reads, so they are told where to go rather than only that the door is shut.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "sharedWith",
+    "label": "Shared with",
+    "kind": "textList",
+    "placeholder": "projects/p2",
+    "check": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "this project only",
+    "help": "Projects that may boot from this image besides this one, or `*` for every project in the cell. A one-way grant: whoever receives it can boot and cannot edit, retire or delete.",
+    "derived": false,
+    "atCreation": false
    }
   ],
   "columns": [
@@ -1419,6 +1572,12 @@
     "label": "Version",
     "cell": "text",
     "width": 120
+   },
+   {
+    "path": "spec.state",
+    "label": "Stage",
+    "cell": "text",
+    "width": 104
    },
    {
     "path": "spec.format",
@@ -1449,6 +1608,14 @@
     "label": "Cached on",
     "cell": "count",
     "width": 112
+   },
+   {
+    "path": "spec.signature",
+    "label": "Signature",
+    "cell": "yes",
+    "yes": "verified",
+    "no": "unsigned",
+    "width": 88
    }
   ],
   "agreements": [],
@@ -1465,7 +1632,7 @@
   "condition": "Moved",
   "group": "Compute",
   "scope": "project",
-  "blurb": "Moving a running guest to another node. There is no migrating state anywhere: this object is the ask, and whether it is finished is read from where the instance actually runs. Start one from the instance you want to move \u2014 the destination is chosen where the guest is.",
+  "blurb": "Moving a running guest to another node. There is no migrating state anywhere: this object is the ask, and whether it is finished is read from where the instance actually runs. Start one from the instance you want to move — the destination is chosen where the guest is.",
   "fields": [
    {
     "key": "instance",
@@ -1629,7 +1796,7 @@
     "label": "Destination",
     "asked": "toNode",
     "is": "node",
-    "note": "The node this migration was assigned to is not the one that has reported on it. Nothing is listening for the guest until they agree \u2014 the destination has to act first."
+    "note": "The node this migration was assigned to is not the one that has reported on it. Nothing is listening for the guest until they agree — the destination has to act first."
    }
   ],
   "creatable": false,
@@ -1645,7 +1812,7 @@
   "condition": "Ready",
   "group": "Fleet",
   "scope": "global",
-  "blurb": "Hypervisors. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token \u2014 shown once, because the platform keeps a hash and cannot show it again.",
+  "blurb": "Hypervisors. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token — shown once, because the platform keeps a hash and cannot show it again.",
   "fields": [
    {
     "key": "schedulable",
@@ -1678,7 +1845,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Separate from draining. Draining says nothing new comes here; this says none of the old stays either. One migration is started per guest that can move \u2014 a guest holding a passed-through device cannot, and stays with the reason on it.",
+    "help": "Separate from draining. Draining says nothing new comes here; this says none of the old stays either. One migration is started per guest that can move — a guest holding a passed-through device cannot, and stays with the reason on it.",
     "derived": false,
     "atCreation": false
    },
@@ -1694,7 +1861,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "How long this node may fail to report before it stops the guests it holds. Zero means it never does \u2014 and a node that never does is never recovered from, because nothing can tell \"unreachable\" from \"stopped\". Set it and guests marked for restart can be brought up elsewhere.",
+    "help": "How long this node may fail to report before it stops the guests it holds. Zero means it never does — and a node that never does is never recovered from, because nothing can tell \"unreachable\" from \"stopped\". Set it and guests marked for restart can be brought up elsewhere.",
     "derived": false,
     "atCreation": false
    },
@@ -1705,7 +1872,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "A public address whose network says so is announced from here, and packets for it reach the guest over the overlay. Several machines may carry it \u2014 the network above sees them as equal next hops \u2014 and a cell with none simply cannot use that mode.",
+    "help": "A public address whose network says so is announced from here, and packets for it reach the guest over the overlay. Several machines may carry it — the network above sees them as equal next hops — and a cell with none simply cannot use that mode.",
     "derived": false,
     "atCreation": false
    },
@@ -1721,7 +1888,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "How many vCPUs this machine may hand out per real core. Zero or one means one for one. A processor can be shared \u2014 two guests that both want a core get one each in turn, and being wrong costs speed \u2014 which is how nearly every fleet in the world is run. There is deliberately no setting for memory: a guest promised 8 GiB and handed 4 is not slow, it is killed.",
+    "help": "How many vCPUs this machine may hand out per real core. Zero or one means one for one. A processor can be shared — two guests that both want a core get one each in turn, and being wrong costs speed — which is how nearly every fleet in the world is run. There is deliberately no setting for memory: a guest promised 8 GiB and handed 4 is not slow, it is killed.",
     "derived": false,
     "atCreation": false
    },
@@ -1786,6 +1953,20 @@
     "width": 128
    },
    {
+    "path": "status.datapath",
+    "label": "Wires",
+    "cell": "text",
+    "width": 116
+   },
+   {
+    "path": "status.consoleTls",
+    "label": "Console",
+    "cell": "yes",
+    "yes": "Encrypted",
+    "no": "Cleartext",
+    "width": 108
+   },
+   {
     "path": "status.agentVersion",
     "label": "Agent",
     "cell": "mono",
@@ -1812,7 +1993,7 @@
   "condition": "",
   "group": "Cell",
   "scope": "global",
-  "blurb": "Say in advance that a machine is going out of service, and the cell stops placing work on it when the time comes \u2014 without anybody being awake to flip a switch, and without anything to flip back afterwards. Whether a window is upcoming, open or over is read off the clock, so a window that ends puts everything back by ceasing to be open.",
+  "blurb": "Say in advance that a machine is going out of service, and the cell stops placing work on it when the time comes — without anybody being awake to flip a switch, and without anything to flip back afterwards. Whether a window is upcoming, open or over is read off the clock, so a window that ends puts everything back by ceasing to be open.",
   "fields": [
    {
     "key": "node",
@@ -1836,7 +2017,7 @@
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "In your own timezone. A start already past means now \u2014 work that has already begun is a true thing to declare.",
+    "help": "In your own timezone. A start already past means now — work that has already begun is a true thing to declare.",
     "derived": false,
     "atCreation": false
    },
@@ -1863,7 +2044,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Off \u2014 nothing new is placed here and everything already running stays put, which is what a four-minute firmware update wants. On \u2014 the guests are migrated away as well, which is what pulling the machine wants. A guest that cannot move is left where it is, and :explainMaintenance says which.",
+    "help": "Off — nothing new is placed here and everything already running stays put, which is what a four-minute firmware update wants. On — the guests are migrated away as well, which is what pulling the machine wants. A guest that cannot move is left where it is, and :explainMaintenance says which.",
     "derived": false,
     "atCreation": false
    },
@@ -1930,7 +2111,7 @@
   "condition": "",
   "group": "Storage",
   "scope": "project",
-  "blurb": "The cheap half of the pair. A snapshot lives in the volume's own pool \u2014 taken in a moment, costs almost nothing, and lost with the pool it is in. For a copy that survives losing the pool, use a backup schedule.",
+  "blurb": "The cheap half of the pair. A snapshot lives in the volume's own pool — taken in a moment, costs almost nothing, and lost with the pool it is in. For a copy that survives losing the pool, use a backup schedule.",
   "fields": [
    {
     "key": "volume",
@@ -1958,7 +2139,7 @@
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Cheap enough to run hourly. A snapshot lives in the volume's own pool: it is the right tool for going back an hour, and it is lost with the pool \u2014 which is what backups are for.",
+    "help": "Cheap enough to run hourly. A snapshot lives in the volume's own pool: it is the right tool for going back an hour, and it is lost with the pool — which is what backups are for.",
     "derived": false,
     "atCreation": false
    },
@@ -2015,7 +2196,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
-  "blurb": "Build a guest by hand, get it right, capture it \u2014 then every guest made from the result starts where that one left off. The guest must be stopped: a disk copied from under a running machine is crash-consistent, and a template is stamped out by people who assume it is clean.",
+  "blurb": "Build a guest by hand, get it right, capture it — then every guest made from the result starts where that one left off. The guest must be stopped: a disk copied from under a running machine is crash-consistent, and a template is stamped out by people who assume it is clean.",
   "fields": [
    {
     "key": "instance",
@@ -2027,7 +2208,7 @@
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "It must be stopped. A disk copied from under a running machine is crash-consistent, which a template stamped out a hundred times must not be \u2014 if you want a copy of a live guest, take a backup instead.",
+    "help": "It must be stopped. A disk copied from under a running machine is crash-consistent, which a template stamped out a hundred times must not be — if you want a copy of a live guest, take a backup instead.",
     "derived": false,
     "atCreation": false
    },
@@ -2040,7 +2221,7 @@
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "What the resulting image is called. Its digest is added to this \u2014 a list of hashes is not something anybody chooses from.",
+    "help": "What the resulting image is called. Its digest is added to this — a list of hashes is not something anybody chooses from.",
     "derived": false,
     "atCreation": false
    },
@@ -2110,7 +2291,7 @@
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "An absolute path the agent can already write to. Mounting an NFS or CIFS share is the host's job, not this platform's \u2014 one that managed its own mounts would be a second, worse copy of what init already does.",
+    "help": "An absolute path the agent can already write to. Mounting an NFS or CIFS share is the host's job, not this platform's — one that managed its own mounts would be a second, worse copy of what init already does.",
     "derived": false,
     "atCreation": false
    },
@@ -2135,7 +2316,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "The pool agent that says whether this path is there, whether it can be written, and how much room is left. Named rather than claimed by whoever gets there first \u2014 a target assigned to nobody is one any agent could report on. Leave it empty and nobody looks: copies are still written by the pool holding the volume, and a path it cannot reach fails on the backup instead.",
+    "help": "The pool agent that says whether this path is there, whether it can be written, and how much room is left. Named rather than claimed by whoever gets there first — a target assigned to nobody is one any agent could report on. Leave it empty and nobody looks: copies are still written by the pool holding the volume, and a path it cannot reach fails on the backup instead.",
     "derived": false,
     "atCreation": false
    },
@@ -2151,7 +2332,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "How often a copy here is read back and checked against what it hashed to when it was written. 0 never checks, which is the default: verification reads every byte of a copy, and that is real I/O somebody has to decide to spend. Without it, 'the backup exists' is the only thing anybody can say about it. One copy per pass, the one whose last check is stalest \u2014 so a target holding more copies checks each of them less often rather than falling behind on the work that is not optional.",
+    "help": "How often a copy here is read back and checked against what it hashed to when it was written. 0 never checks, which is the default: verification reads every byte of a copy, and that is real I/O somebody has to decide to spend. Without it, 'the backup exists' is the only thing anybody can say about it. One copy per pass, the one whose last check is stalest — so a target holding more copies checks each of them less often rather than falling behind on the work that is not optional.",
     "derived": false,
     "atCreation": false
    }
@@ -2201,7 +2382,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
-  "blurb": "One copy of one volume, at one moment. Restoring makes a new volume from a copy \u2014 never writing one back over the original, which would be a command living in a spec and carried out again on every resync.",
+  "blurb": "One copy of one volume, at one moment. Restoring makes a new volume from a copy — never writing one back over the original, which would be a command living in a spec and carried out again on every resync.",
   "fields": [
    {
     "key": "volume",
@@ -2293,7 +2474,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
-  "blurb": "An intention, not a job queue: there should be a copy of this volume no older than the interval, and the last few kept. What exists is what decides \u2014 a copy still being made holds the schedule, and a stuck one holds it for one interval and no longer.",
+  "blurb": "An intention, not a job queue: there should be a copy of this volume no older than the interval, and the last few kept. What exists is what decides — a copy still being made holds the schedule, and a stuck one holds it for one interval and no longer.",
   "fields": [
    {
     "key": "volume",
@@ -2398,7 +2579,7 @@
   "condition": "",
   "group": "Fleet",
   "scope": "global",
-  "blurb": "What was refused, and who signed in. Not a log of everything that happened \u2014 every successful write already leaves an operation carrying its target, its verb and who asked. What no operation exists for is a request that was turned down, and that is the one a multi-tenant cell gets asked about later.",
+  "blurb": "What was refused, and who signed in. Not a log of everything that happened — every successful write already leaves an operation carrying its target, its verb and who asked. What no operation exists for is a request that was turned down, and that is the one a multi-tenant cell gets asked about later.",
   "fields": [],
   "columns": [
    {
@@ -2446,7 +2627,7 @@
   "condition": "",
   "group": "Fleet",
   "scope": "global",
-  "blurb": "Names for interchangeable hardware. An instance asks for a class, never an address: an address belongs to one machine, so an instance naming one could only ever run there. A device is offered only when everything in its IOMMU group is free \u2014 a group is passed through whole or not at all.",
+  "blurb": "Names for interchangeable hardware. An instance asks for a class, never an address: an address belongs to one machine, so an instance naming one could only ever run there. A device is offered only when everything in its IOMMU group is free — a group is passed through whole or not at all.",
   "fields": [
    {
     "key": "matches",
@@ -2503,7 +2684,7 @@
   "condition": "",
   "group": "Compute",
   "scope": "global",
-  "blurb": "Named machine sizes, offered by the cell. A guest is an                 m1-small, not a hand-entered triple of numbers \u2014 the sizes that                 land on the fleet are the shapes it was bought for. Whether a                 project may also size by hand is that project's policy.",
+  "blurb": "Named machine sizes, offered by the cell. A guest is an                 m1-small, not a hand-entered triple of numbers — the sizes that                 land on the fleet are the shapes it was bought for. Whether a                 project may also size by hand is that project's policy.",
   "fields": [
    {
     "key": "vcpus",
@@ -2607,7 +2788,7 @@
   "condition": "Ready",
   "group": "Network",
   "scope": "global",
-  "blurb": "Sessions from the cell's gateways to the routers in front of it. What gets announced is derived, never listed: every external subnet, and a host route for each public address that is in front of something \u2014 so the router ahead of the cell and this console cannot disagree about what the cell claims.",
+  "blurb": "Sessions from the cell's gateways to the routers in front of it. What gets announced is derived, never listed: every external subnet, and a host route for each public address that is in front of something — so the router ahead of the cell and this console cannot disagree about what the cell claims.",
   "fields": [
    {
     "key": "peer",
@@ -2664,7 +2845,7 @@
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "The machine that holds the session \u2014 a gateway, with FRR installed. One session is one speaker.",
+    "help": "The machine that holds the session — a gateway, with FRR installed. One session is one speaker.",
     "derived": false,
     "atCreation": false
    },
@@ -2676,7 +2857,7 @@
     "check": "none",
     "required": false,
     "advanced": true,
-    "whenEmpty": "none \u2014 the session is unauthenticated",
+    "whenEmpty": "none — the session is unauthenticated",
     "help": "The same string the router has for this session (RFC 2385). Most firewalls will not bring a session up without one.",
     "derived": false,
     "atCreation": false
@@ -2757,7 +2938,7 @@
   "condition": "Routed",
   "group": "Network",
   "scope": "project",
-  "blurb": "Which of this project's networks reach each other. A membership rather than a box: there is nothing to place and nothing to fail over \u2014 the gateway answers on whichever machine the packet is already on.",
+  "blurb": "Which of this project's networks reach each other. A membership rather than a box: there is nothing to place and nothing to fail over — the gateway answers on whichever machine the packet is already on.",
   "fields": [
    {
     "key": "networks",
@@ -2820,7 +3001,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "This project has no guests yet; a public address goes in front of one.",
-    "help": "The guest this address sits in front of. Its interface and the cell's public pool are found for you \u2014 name the subnet under More settings to choose v6, or a particular pool.",
+    "help": "The guest this address sits in front of. Its interface and the cell's public pool are found for you — name the subnet under More settings to choose v6, or a particular pool.",
     "derived": false,
     "atCreation": true
    },
@@ -2834,7 +3015,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Where the address comes from. Left empty, the cell's public pool answers \u2014 IPv4 first. Naming a subnet is how you choose v6, or a particular pool.",
+    "help": "Where the address comes from. Left empty, the cell's public pool answers — IPv4 first. Naming a subnet is how you choose v6, or a particular pool.",
     "derived": false,
     "atCreation": false
    },
@@ -2882,7 +3063,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Held by the guest means the address is bound to its port and configured inside the machine \u2014 nothing rewrites a packet, and the guest can tell anybody its own address, which SIP, FTP, IPsec and mDNS all need. Translated means the edge answers for it and the guest never knows. A held address has to come from an external network.",
+    "help": "Held by the guest means the address is bound to its port and configured inside the machine — nothing rewrites a packet, and the guest can tell anybody its own address, which SIP, FTP, IPsec and mDNS all need. Translated means the edge answers for it and the guest never knows. A held address has to come from an external network.",
     "derived": false,
     "atCreation": false
    },
@@ -2946,7 +3127,7 @@
   "condition": "Ready",
   "group": "Network",
   "scope": "project",
-  "blurb": "One address in front of many ports. The fabric balances by connection on whichever host traffic arrives at \u2014 there is no appliance to place and nothing to fail over. Nothing here probes a member's health: the pool is what was declared, not a judgement about it.",
+  "blurb": "One address in front of many ports. The fabric balances by connection on whichever host traffic arrives at — there is no appliance to place and nothing to fail over. Nothing here probes a member's health: the pool is what was declared, not a judgement about it.",
   "fields": [
    {
     "key": "network",
@@ -2996,7 +3177,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "The ports behind the address \u2014 ports, not addresses, so a migrated guest stays in the pool. Empty holds the address and forwards to nothing.",
+    "help": "The ports behind the address — ports, not addresses, so a migrated guest stays in the pool. Empty holds the address and forwards to nothing.",
     "derived": false,
     "atCreation": false
    },
@@ -3010,6 +3191,30 @@
     "advanced": true,
     "whenEmpty": "",
     "help": "Leave empty to be given the lowest address nothing else holds.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "sessionAffinity",
+    "label": "Keep a client on one member",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "For a service that keeps something per client between connections — a session in memory, an upload in pieces. The cost: one client is one member, so a pool fronting few busy clients spreads worse, and everyone behind one NAT counts as one client.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "draining",
+    "label": "Draining",
+    "kind": "refList",
+    "collection": "ports",
+    "spelling": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Members being taken out of service: they take no new connections and keep the ones they have until the clients are done. Every name here has to be one of the members. Removing a member outright cuts its connections instead.",
     "derived": false,
     "atCreation": false
    }
@@ -3084,6 +3289,54 @@
     "advanced": false,
     "whenEmpty": "",
     "help": "What a volume's placement matches on.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "volumeCeiling.iops",
+    "label": "Ceiling — IOPS",
+    "kind": "number",
+    "unit": "/s",
+    "min": 0,
+    "max": 10000000,
+    "step": 100,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "no ceiling",
+    "help": "The most any one volume in this pool may take. A volume that names nothing of its own gets this; one that asks for more is brought down to it. Zero is no ceiling.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "volumeCeiling.readMibps",
+    "label": "Ceiling — Read",
+    "kind": "number",
+    "unit": "MiB/s",
+    "min": 0,
+    "max": 1000000,
+    "step": 10,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "no ceiling",
+    "help": "",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "volumeCeiling.writeMibps",
+    "label": "Ceiling — Write",
+    "kind": "number",
+    "unit": "MiB/s",
+    "min": 0,
+    "max": 1000000,
+    "step": 10,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "no ceiling",
+    "help": "",
     "derived": false,
     "atCreation": false
    }
@@ -3303,7 +3556,7 @@
   "condition": "",
   "group": "Access",
   "scope": "global",
-  "blurb": "Who can sign in. A password is set from the row rather than shown on it \u2014 the platform stores a hash and cannot recover the original, which is the point.",
+  "blurb": "Who can sign in. A password is set from the row rather than shown on it — the platform stores a hash and cannot recover the original, which is the point.",
   "fields": [
    {
     "key": "service",
@@ -3325,7 +3578,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Shown on screen. Never used to decide anything \u2014 the account's id is its identity.",
+    "help": "Shown on screen. Never used to decide anything — the account's id is its identity.",
     "derived": false,
     "atCreation": false
    },
@@ -3466,7 +3719,7 @@
      },
      {
       "kind": "System",
-      "text": "it holds swap or the root filesystem \u2014 consuming it takes this node down."
+      "text": "it holds swap or the root filesystem — consuming it takes this node down."
      },
      {
       "kind": "Osd",
@@ -3488,7 +3741,7 @@
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "One disk, one OSD. Anything that cannot be chosen says why beside it rather than being greyed out \u2014 only a device the node can see is empty is offered, so a disk you really do want to give up has to be wiped outside the platform first.",
+    "help": "One disk, one OSD. Anything that cannot be chosen says why beside it rather than being greyed out — only a device the node can see is empty is offered, so a disk you really do want to give up has to be wiped outside the platform first.",
     "derived": false,
     "atCreation": false
    },
@@ -3501,7 +3754,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Where volumes are stored. Copies is how many of every object exist; below the floor the pool refuses writes rather than holding data it cannot protect \u2014 so a floor equal to the copies means one node rebooting stops writing.",
+    "help": "Where volumes are stored. Copies is how many of every object exist; below the floor the pool refuses writes rather than holding data it cannot protect — so a floor equal to the copies means one node rebooting stops writing.",
     "derived": false,
     "atCreation": false
    },
@@ -3570,7 +3823,7 @@
   "condition": "",
   "group": "Access",
   "scope": "global",
-  "blurb": "The four rungs say how much somebody may do. A role here says *what* \u2014 collection by collection, for the case a rung cannot express: may restart the database machines, may not touch the network.",
+  "blurb": "The four rungs say how much somebody may do. A role here says *what* — collection by collection, for the case a rung cannot express: may restart the database machines, may not touch the network.",
   "fields": [
    {
     "key": "displayName",
@@ -3605,7 +3858,7 @@
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "A verb, and the collections it applies to. Being able to act on something carries being able to see it \u2014 anything else is a button that works above a screen that shows nothing.",
+    "help": "A verb, and the collections it applies to. Being able to act on something carries being able to see it — anything else is a button that works above a screen that shows nothing.",
     "derived": false,
     "atCreation": false
    }
@@ -3706,7 +3959,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "One bridge per line, as they are named on the nodes. A network put on one takes its guests off this platform's networks and onto whatever the machine is on \u2014 no address from us, no gateway, no security group. Empty means this project gets logical networks only, which is what a new customer should have. Named rather than a yes/no, because what anybody means by a host bridge is a particular wire.",
+    "help": "One bridge per line, as they are named on the nodes. A network put on one takes its guests off this platform's networks and onto whatever the machine is on — no address from us, no gateway, no security group. Empty means this project gets logical networks only, which is what a new customer should have. Named rather than a yes/no, because what anybody means by a host bridge is a particular wire.",
     "derived": false,
     "atCreation": true
    },
@@ -3779,7 +4032,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Which cell this project's resources live in, and where requests for them are routed. Leave empty to use whichever cell answers \u2014 which is what an installation with one cell wants.",
+    "help": "Which cell this project's resources live in, and where requests for them are routed. Leave empty to use whichever cell answers — which is what an installation with one cell wants.",
     "derived": false,
     "atCreation": false
    },
@@ -3908,6 +4161,70 @@
     "advanced": true,
     "whenEmpty": "",
     "help": "Each one is a piece of hardware that exists once and cannot be oversubscribed, so without a cap one project can take every accelerator in the cell.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.snapshots",
+    "label": "Snapshots",
+    "kind": "number",
+    "unit": "snapshots",
+    "min": 0,
+    "max": 1000000,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Cheap to ask for and occupying a pool for as long as they exist. A schedule nobody is watching is the ordinary way a cell fills up.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.snapshotGib",
+    "label": "Snapshot storage",
+    "kind": "number",
+    "unit": "GiB",
+    "min": 0,
+    "max": 1073741824,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Counted from what each snapshot turned out to occupy, which the pool reports after the fact.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.backups",
+    "label": "Backups",
+    "kind": "number",
+    "unit": "backups",
+    "min": 0,
+    "max": 1000000,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Separate from snapshots because they live on a backup target rather than in the pool.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "quota.backupGib",
+    "label": "Backup storage",
+    "kind": "number",
+    "unit": "GiB",
+    "min": 0,
+    "max": 1073741824,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Counted from what each backup turned out to occupy.",
     "derived": false,
     "atCreation": false
    }

@@ -56,6 +56,39 @@ pub struct Service {
     /// Where a connection may go, in a fixed order so two passes over an
     /// unchanged world plan the same thing.
     pub members: Vec<SocketAddr>,
+    /// Send a client back to the member it reached last time.
+    ///
+    /// The fabric does this by hashing the client's address alone instead of
+    /// address-and-port; this does the same, for the same reason — so a service
+    /// behaves the same on either datapath and an operator learns one rule.
+    pub affinity: bool,
+}
+
+/// Which member a client starts at.
+///
+/// Round robin is the default and is the whole of the algorithm. With affinity
+/// the start is a function of the client's address instead of a counter, so the
+/// same client lands on the same member for as long as the member list holds
+/// still — which is exactly as long as the fabric's hashing holds a client, and
+/// exactly as long as anybody should rely on either.
+///
+/// FNV-1a over the address' octets: the fabric hashes the same bytes the same
+/// way, so a service that moves between datapaths moves its clients once rather
+/// than reshuffling them on every pass.
+fn start_at(service: &Service, from: IpAddr, next: usize) -> usize {
+    if !service.affinity {
+        return next % service.members.len();
+    }
+    let mut hash: u32 = 0x811c_9dc5;
+    let octets: Vec<u8> = match from {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    };
+    for byte in octets {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash as usize % service.members.len()
 }
 
 /// What this node should serve, given the cell's balancers and the ports it
@@ -104,6 +137,13 @@ pub fn plan(
                 .spec
                 .members
                 .iter()
+                // Taken out of service on purpose, so not a candidate for a new
+                // connection. Unlike a member that fails its health check this
+                // is an instruction, not an observation, and `serving`'s rule
+                // about never removing the last member does not apply to it: an
+                // operator draining every member is asking for the service to
+                // stop, and gets that.
+                .filter(|name| !balancer.spec.draining.contains(name))
                 .map(|name| {
                     let up = answering
                         .get(name)
@@ -126,6 +166,7 @@ pub fn plan(
                 balancer: balancer.meta.name.to_string(),
                 at: SocketAddr::new(vip, listener.port),
                 members,
+                affinity: balancer.spec.session_affinity,
             });
         }
     }
@@ -184,12 +225,12 @@ pub async fn start(service: Service) -> Option<Running> {
             let Ok((client, from)) = listener.accept().await else {
                 continue;
             };
-            let start_at = next % members.len();
+            let first = start_at(&listening, from.ip(), next);
             next = next.wrapping_add(1);
             let balancer = listening.balancer.clone();
             let members = members.clone();
             tokio::spawn(async move {
-                match dial(&members, start_at).await {
+                match dial(&members, first).await {
                     Some((mut backend, _member)) => {
                         let mut client = client;
                         // Bytes, both ways, until either end stops. Whatever
@@ -269,6 +310,8 @@ mod tests {
                 vip: Some("10.19.136.9".into()),
                 listeners,
                 members: members.into_iter().map(str::to_string).collect(),
+                session_affinity: false,
+                draining: Default::default(),
             },
             LoadBalancerStatus::default(),
         )
@@ -316,6 +359,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["10.19.136.2:8080", "10.19.136.3:8080"]
         );
+    }
+
+    /// A draining member gets no new connections — and unlike a failed health
+    /// check, draining *can* empty the pool: it is an instruction, and an
+    /// operator draining everything is asking the service to stop.
+    #[test]
+    fn draining_takes_a_member_out_of_the_rotation() {
+        let ports = BTreeMap::from([
+            port("projects/p1/ports/a", "10.19.136.2"),
+            port("projects/p1/ports/b", "10.19.136.3"),
+        ]);
+        let both_up = BTreeMap::from([
+            ("projects/p1/ports/a".to_string(), vec![8080u32]),
+            ("projects/p1/ports/b".to_string(), vec![8080u32]),
+        ]);
+        let members = vec!["projects/p1/ports/a", "projects/p1/ports/b"];
+
+        let mut one_draining = balancer(vec![listener(443, 8080)], members.clone());
+        one_draining.spec.draining = vec!["projects/p1/ports/a".into()];
+        let plan_one = plan(&[one_draining], &ports, &everything, &both_up);
+        assert_eq!(
+            plan_one[0]
+                .members
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["10.19.136.3:8080"],
+            "a draining member was still handed new connections"
+        );
+
+        let mut all_draining = balancer(vec![listener(443, 8080)], members);
+        all_draining.spec.draining =
+            vec!["projects/p1/ports/a".into(), "projects/p1/ports/b".into()];
+        assert!(
+            plan(&[all_draining], &ports, &everything, &both_up).is_empty(),
+            "draining every member left the service listening"
+        );
+    }
+
+    /// Affinity sends a client back where it was. Two connections from one
+    /// address pick the same member; the counter that round robin turns is not
+    /// consulted.
+    #[test]
+    fn affinity_pins_a_client_to_one_member() {
+        let service = Service {
+            balancer: "projects/p1/load-balancers/b".into(),
+            at: "10.19.136.9:443".parse().unwrap(),
+            members: vec![
+                "10.19.136.2:8080".parse().unwrap(),
+                "10.19.136.3:8080".parse().unwrap(),
+            ],
+            affinity: true,
+        };
+        let client: IpAddr = "10.19.136.50".parse().unwrap();
+        let first = start_at(&service, client, 0);
+        assert_eq!(
+            first,
+            start_at(&service, client, 7),
+            "the same client was sent to a different member on its next connection"
+        );
+
+        // And it is a real spread, not everybody on one member: some address
+        // has to land on the other one or affinity is just "member zero".
+        let elsewhere = (1u8..=64)
+            .map(|i| IpAddr::from([10, 19, 136, i]))
+            .any(|a| start_at(&service, a, 0) != first);
+        assert!(elsewhere, "every client hashed to the same member");
+
+        let round_robin = Service {
+            affinity: false,
+            ..service
+        };
+        assert_eq!(start_at(&round_robin, client, 0), 0);
+        assert_eq!(start_at(&round_robin, client, 1), 1);
     }
 
     /// A member that answers nothing is left out — and when *nothing* answers,
@@ -489,6 +606,7 @@ mod tests {
             balancer: "projects/p/load-balancers/b".into(),
             at,
             members: vec![at],
+            affinity: false,
         };
         assert!(start(service).await.is_none());
     }
