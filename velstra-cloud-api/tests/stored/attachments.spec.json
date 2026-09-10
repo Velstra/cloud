@@ -1,0 +1,11 @@
+{
+  "instance": "",
+  "limits": {
+    "iops": 0,
+    "read_mibps": 0,
+    "write_mibps": 0
+  },
+  "node": "",
+  "read_only": false,
+  "volume": ""
+}

@@ -1,0 +1,12 @@
+{
+  "encryption_key": null,
+  "limits": {
+    "iops": 0,
+    "read_mibps": 0,
+    "write_mibps": 0
+  },
+  "pool": "",
+  "size_gib": 0,
+  "source_image": null,
+  "source_snapshot": null
+}

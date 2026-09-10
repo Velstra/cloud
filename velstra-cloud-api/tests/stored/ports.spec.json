@@ -1,0 +1,8 @@
+{
+  "address": null,
+  "mac": null,
+  "network": "",
+  "rate_limit_mbit": null,
+  "security_groups": [],
+  "subnet": ""
+}
