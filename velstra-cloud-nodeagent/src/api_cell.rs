@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use http_body_util::BodyExt;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
+use rustls_pki_types::pem::PemObject;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use velstra_cloud_model::{
@@ -73,7 +74,7 @@ fn tls_config(ca_path: &str) -> Result<std::sync::Arc<tokio_rustls::rustls::Clie
     let pem =
         std::fs::read(ca_path).map_err(|e| HostError::failed(format!("reading {ca_path}: {e}")))?;
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+    for cert in rustls_pki_types::CertificateDer::pem_slice_iter(&pem) {
         let cert = cert.map_err(|e| HostError::failed(format!("{ca_path}: {e}")))?;
         roots
             .add(cert)

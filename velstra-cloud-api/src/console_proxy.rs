@@ -20,6 +20,7 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
+use rustls_pki_types::pem::PemObject;
 
 /// Who to believe when the node's console speaks TLS.
 ///
@@ -38,7 +39,7 @@ pub fn trust(ca: Option<&std::path::Path>) -> Option<tokio_tungstenite::Connecto
         .map_err(|e| tracing::warn!(path = %ca.display(), error = %e, "the console CA could not be read"))
         .ok()?;
     let mut roots = rustls::RootCertStore::empty();
-    for certificate in rustls_pemfile::certs(&mut pem.as_slice()).flatten() {
+    for certificate in rustls_pki_types::CertificateDer::pem_slice_iter(&pem).flatten() {
         let _ = roots.add(certificate);
     }
     if roots.is_empty() {

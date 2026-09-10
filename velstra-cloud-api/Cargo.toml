@@ -13,7 +13,7 @@ path = "src/bin/velstra-cloud-api.rs"
 
 [dependencies]
 # Reading the cell CA the console proxy trusts a node with.
-rustls-pemfile = "2"
+rustls-pki-types = { workspace = true }
 # TLS on the console's own port. Not a proxy's job on a single box: the machine
 # that is the whole cell has nothing in front of it, and "put a reverse proxy
 # here" is advice nobody follows on a laptop.
