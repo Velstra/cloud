@@ -1,0 +1,10 @@
+{
+  "addresses": [],
+  "conditions": [],
+  "console_bytes": 0,
+  "node": null,
+  "observed_generation": 0,
+  "started_at": null,
+  "state": "Unknown",
+  "vmm_pid": null
+}

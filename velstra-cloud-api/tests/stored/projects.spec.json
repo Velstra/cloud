@@ -1,0 +1,24 @@
+{
+  "display_name": "",
+  "parent": "",
+  "policy": {
+    "custom_sizes": false,
+    "device_passthrough": false,
+    "floating_ips": false,
+    "host_bridges": []
+  },
+  "quota": {
+    "backup_gib": 0,
+    "backups": 0,
+    "devices": 0,
+    "floating_ips": 0,
+    "instances": 0,
+    "load_balancers": 0,
+    "memory_mib": 0,
+    "snapshot_gib": 0,
+    "snapshots": 0,
+    "vcpus": 0,
+    "volume_gib": 0,
+    "volumes": 0
+  }
+}

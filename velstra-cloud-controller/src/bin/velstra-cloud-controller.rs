@@ -124,6 +124,12 @@ struct Args {
     /// "stuck".
     #[arg(long, default_value_t = 900)]
     alert_stuck_after: u64,
+
+    /// A pool whose agent has not reported for this many seconds is
+    /// "unwatched" — nothing is provisioned into it and nothing released
+    /// from it.
+    #[arg(long, default_value_t = 600)]
+    alert_pool_silent_after: u64,
 }
 
 #[tokio::main]
@@ -211,6 +217,7 @@ async fn main() {
         rules: velstra_cloud_controller::alerts::Rules {
             pool_full_percent: args.alert_pool_full_percent,
             stuck_after: std::time::Duration::from_secs(args.alert_stuck_after),
+            pool_silent_after: std::time::Duration::from_secs(args.alert_pool_silent_after),
             ..Default::default()
         },
     };

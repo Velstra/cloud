@@ -1,0 +1,21 @@
+{
+  "console": false,
+  "desired_state": "Running",
+  "image": "",
+  "memory_mib": 0,
+  "node": null,
+  "on_node_loss": "leave",
+  "placement_policy": {
+    "affinity": "Required",
+    "anti_affinity_group": null,
+    "required_labels": [],
+    "spread": "Required"
+  },
+  "ports": [],
+  "root_disk_gib": 0,
+  "ssh_keys": [],
+  "start_delay_s": 0,
+  "start_order": 0,
+  "user_data": null,
+  "vcpus": 0
+}
