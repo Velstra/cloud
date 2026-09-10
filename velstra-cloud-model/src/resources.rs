@@ -48,6 +48,24 @@ pub trait Observed {
     /// The rule does not care which — it cares that exactly one party writes.
     fn owner(&self) -> Option<&str>;
 
+    /// True when this object has finished and is not going to change again.
+    ///
+    /// Almost nothing here is like that: a guest, a volume, a network is a
+    /// standing ask, and one that disagrees with itself for an hour is a
+    /// problem. An **operation** is not — it is the record of one request, and
+    /// once it is done it is over, whether it succeeded or not.
+    ///
+    /// The distinction is not decorative. `divergence` reads `Ready=False` as
+    /// "not ready", and the `stuck` alert fires on anything that has been so
+    /// for a quarter of an hour. A create that was refused, or a delete whose
+    /// target has since gone, is `Ready=False` for the whole day it is kept —
+    /// so every failed request on a cell alerted, once, every pass, for
+    /// twenty-four hours. Seen on our own cell: five of them, all from
+    /// deliberately deleting test objects.
+    fn settled(&self) -> bool {
+        false
+    }
+
     /// True when the object *is* the thing that reports on it.
     ///
     /// Two resources are like this, and for the same reason: nothing assigns a
@@ -2687,6 +2705,11 @@ impl Observed for OperationStatus {
     }
     fn owner(&self) -> Option<&str> {
         None
+    }
+    /// `done` is the whole of it: an operation reports it for exactly this
+    /// reason, and it is set once whether the request succeeded or failed.
+    fn settled(&self) -> bool {
+        self.done
     }
 }
 

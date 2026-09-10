@@ -1368,6 +1368,13 @@ pub fn divergence<S, T: Observed>(resource: &Resource<S, T>) -> Option<Divergenc
             since: meta.deleted_at.unwrap_or(meta.created_at),
         });
     }
+    // Finished, so not diverging from anything. An operation that failed is a
+    // request that is over, not an object that is stuck; reading it as stuck
+    // means every refused create on a cell alerts for as long as its record is
+    // kept.
+    if resource.status.settled() {
+        return None;
+    }
     let ready = crate::meta::condition(resource.status.conditions(), "Ready");
     let since = ready.map(|c| c.last_transition).unwrap_or(meta.created_at);
     if !resource.converged() {
@@ -1401,6 +1408,56 @@ mod tests {
             AttachmentStatus, InstanceSpec, InstanceStatus, NodeSpec, NodeStatus, Resource,
         },
     };
+
+    /// A finished request is not an object that is stuck.
+    ///
+    /// This is the difference between an operation and everything else here. A
+    /// guest that says `Ready=False` for an hour is a problem; an operation
+    /// that says it is a record of a request that was refused, and it is kept
+    /// for a day so somebody can read it. Reading the second as the first made
+    /// every refused create on a cell alert for twenty-four hours — five of
+    /// them at once on ours, all from deleting test objects on purpose.
+    #[test]
+    fn a_finished_operation_is_not_divergent_however_it_ended() {
+        use crate::resources::{OperationSpec, OperationStatus};
+
+        let operation = |done: bool, ready: ConditionStatus, reason: &str| {
+            let mut o = Resource::new(
+                Meta::new(
+                    ResourceName::parse("projects/p1/operations/op-1").unwrap(),
+                    Placement::new("eu", "cell-1"),
+                ),
+                OperationSpec::default(),
+                OperationStatus {
+                    done,
+                    ..Default::default()
+                },
+            );
+            set_condition(
+                &mut o.status.conditions,
+                Condition::new("Ready", ready, reason, "", o.meta.generation),
+            );
+            o.status.observed_generation = o.meta.generation;
+            o
+        };
+
+        // Failed and finished: over, not stuck.
+        assert_eq!(
+            divergence(&operation(true, ConditionStatus::False, "Failed")),
+            None
+        );
+        // Succeeded and finished: likewise.
+        assert_eq!(
+            divergence(&operation(true, ConditionStatus::True, "Ready")),
+            None
+        );
+        // Still working is still working, and stays visible — an operation that
+        // never finishes is exactly what this number is for.
+        assert_eq!(
+            divergence(&operation(false, ConditionStatus::Unknown, "Working")).map(|d| d.reason),
+            Some(DivergenceReason::Unreported)
+        );
+    }
 
     pub(super) fn inst(name: &str) -> Instance {
         Resource::new(
