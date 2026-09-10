@@ -373,6 +373,11 @@ function seed() {
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
       allocated: { vcpus: 10, memoryMib: 20480, diskGib: 200, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 4000,
+      // Whether this node's console stream is encrypted. `datapath` and
+      // `balancers` are deliberately absent: the API omits them when empty,
+      // and the fixture answering what the API does not is the same defect in
+      // the other direction.
+      consoleTls: true,
       cpu: cpu("v3"),
       devices: [
         disk("/dev/disk/by-id/nvme-eui.0001", "nvme0n1", 931, false, "Samsung SSD 990", { kind: "Free" }),
@@ -463,14 +468,16 @@ function seed() {
   put("projects/p1/images/debian-13", {
     digest: "sha256:" + "a".repeat(64), format: "Qcow2", sizeBytes: 1_181_116_006,
     family: "debian-13", version: "20260815",
-    sourceUrl: "https://images.invalid/debian-13.qcow2", signature: null },
+    sourceUrl: "https://images.invalid/debian-13.qcow2", signature: null,
+    state: "Active" },
     // node-d too, so nothing but the processor stands between this guest and
     // that machine — which is the one thing the mode changes.
     { observedGeneration: 1, conditions: ready(1), cachedOn: ["node-a", "node-c", "node-d"], fetchingOn: [] });
   put("projects/p1/images/alpine-3", {
     digest: "sha256:" + "b".repeat(64), format: "Raw", sizeBytes: 62_914_560,
     family: "alpine-3", version: "3.20",
-    sourceUrl: "https://images.invalid/alpine-3.raw", signature: null },
+    sourceUrl: "https://images.invalid/alpine-3.raw", signature: null,
+    state: "Active" },
     { observedGeneration: 1, conditions: ready(1), cachedOn: [], fetchingOn: ["node-b"] });
 
   // The catalogue, as the real API derives it: one entry per family, naming the

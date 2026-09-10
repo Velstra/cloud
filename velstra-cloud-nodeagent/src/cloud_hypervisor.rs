@@ -1070,7 +1070,7 @@ fn rate_limiter(limits: velstra_cloud_model::throttle::Limits) -> Option<serde_j
             }),
         );
     }
-    (!config.is_empty()).then(|| serde_json::Value::Object(config))
+    (!config.is_empty()).then_some(serde_json::Value::Object(config))
 }
 
 fn open_volumes(body: &str) -> Vec<(String, String)> {
