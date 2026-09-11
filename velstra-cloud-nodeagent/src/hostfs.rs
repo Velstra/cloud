@@ -725,14 +725,27 @@ pub async fn publish_image(layout: &Layout, image: &str, digest: &str) -> Result
         // One rejected copy per image, overwritten: a node that kept every bad
         // download of a bad mirror would fill the disk the guests live on.
         let rejected = incoming.with_extension("rejected");
-        if let Err(e) = std::fs::rename(&incoming, &rejected) {
-            tracing::warn!(error = %e, image, "could not set the bad copy aside");
-        }
+        // And if it cannot be moved aside, it goes. Leaving it warned and
+        // carried on while the sentence below still promised "the copy is
+        // kept as …" — so the bad bytes stayed under the incoming name, every
+        // later pass re-hashed and re-refused them, and the platform said a
+        // file was somewhere it was not.
+        let aside = match std::fs::rename(&incoming, &rejected) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, image, "could not set the bad copy aside; removing it");
+                let _ = std::fs::remove_file(&incoming);
+                false
+            }
+        };
         return Err(HostError::failed(format!(
-            "{image} hashed to {}:{actual}, not {expected}. The copy is kept as {} and the \
-             next fetch starts again.",
+            "{image} hashed to {}:{actual}, not {expected}. {} and the next fetch starts again.",
             expected.algorithm.as_str(),
-            rejected.display()
+            if aside {
+                format!("The copy is kept as {}", rejected.display())
+            } else {
+                "The copy could not be set aside and was removed".to_string()
+            }
         )));
     }
     std::fs::create_dir_all(&layout.image_dir)?;
@@ -896,6 +909,79 @@ pub fn read_dir_names(dir: &Path) -> Result<BTreeSet<String>> {
         names.insert(name);
     }
     Ok(names)
+}
+
+/// **What is actually arriving**, out of everything under `incoming`.
+///
+/// One door, because there were two — the same block written twice in two
+/// VMM backends, already a suffix behind `read_dir_names`' own skip list. A
+/// `.rejected` copy is not a fetch in progress, and it was reported as one for
+/// as long as the file existed, which was for ever: nothing deleted anything
+/// under `incoming`. The node said it was fetching an image it had refused.
+///
+/// A name is kept only when it is a digest. `host.fetching` is a set of
+/// digests; a name that is not one is not a fetch, whatever it is — which is a
+/// rule rather than a list of suffixes that will be one short again.
+pub fn arriving(incoming_dir: &Path) -> BTreeSet<String> {
+    read_dir_names(incoming_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !name.ends_with(".rejected"))
+        .map(|name| name.strip_suffix(".partial").unwrap_or(&name).to_string())
+        .filter(|name| stored_is_a_digest(name))
+        .collect()
+}
+
+/// Whether a stored name is one `Digest` can read — `sha256-<64 hex>`.
+fn stored_is_a_digest(stored: &str) -> bool {
+    let Some((algorithm, hex)) = stored.split_once('-') else {
+        return false;
+    };
+    velstra_cloud_model::images::Digest::parse(&format!("{algorithm}:{hex}")).is_some()
+}
+
+/// Bytes under `incoming` that nobody is coming back for.
+///
+/// Three kinds, and the age comes off the filesystem rather than off any
+/// bookkeeping — a node that restarted has no memory of what it was fetching.
+///
+/// * `*.rejected` — evidence of a bad mirror, kept so somebody can look, and
+///   kept only as long as this node keeps any bytes nobody needs.
+/// * `*.partial` — a download with no writer. Nothing has touched it in
+///   [`STALLED_AFTER`], so whatever was writing it is gone.
+/// * a bare incoming copy of the same age — a fetch that died between
+///   finishing and verifying.
+///
+/// Returns how many were removed. Run from the sweep that already exists, and
+/// never from the fetch path: a rejection has to survive the pass that made it
+/// or the evidence is gone before anybody can read it.
+pub fn forget_stale_arrivals(incoming_dir: &Path, older_than_seconds: u64) -> usize {
+    let Ok(entries) = std::fs::read_dir(incoming_dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut gone = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or_default();
+        let stale = if name.ends_with(".partial") {
+            age >= STALLED_AFTER
+        } else {
+            age.as_secs() >= older_than_seconds
+        };
+        if !stale {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => gone += 1,
+            Err(e) => tracing::warn!(error = %e, file = %path.display(), "could not reclaim"),
+        }
+    }
+    gone
 }
 
 /// When the guest's directory was created — the closest thing to a start time

@@ -1,6 +1,15 @@
-// Generated from src/openapi.json — one function per operation, so that
+// Generated from ../../docs/openapi.json — one function per operation, so that
 // "every API call reachable from the UI" is a thing a test can check by
 // name rather than a claim. Regenerate with scripts/gen-client.py; do not edit.
+//
+// It used to be generated from a *third* copy of the document, checked in here
+// beside it, which nothing generated and nothing checked. It had drifted: four
+// operations the API serves were absent from it, so they were absent from the
+// operation list too — and `scripts/coverage.mjs` measured "every operation the
+// API documents is reachable from this UI" against that list, which made the
+// claim about a document that was not the API's. The copy is gone; the document
+// in `docs/` is kept honest by `velstra-cloud-api/tests/openapi.rs`, and so is
+// `operations.json`, by the same test.
 
 import { call } from "./transport";
 
