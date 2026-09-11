@@ -7,6 +7,7 @@
   "condition": "Ready",
   "group": "Compute",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "Guests. What was asked for is the spec; what the node reports is the status, and they are shown together.",
   "fields": [
    {
@@ -387,6 +388,12 @@
     "width": 88
    },
    {
+    "path": "status.addresses.0",
+    "label": "Address",
+    "cell": "mono",
+    "width": 136
+   },
+   {
     "path": "spec.vcpus",
     "label": "vCPU",
     "cell": "number",
@@ -433,12 +440,6 @@
     "width": 128
    },
    {
-    "path": "status.addresses.0",
-    "label": "Address",
-    "cell": "mono",
-    "width": 136
-   },
-   {
     "path": "status.pendingChanges.0.field",
     "label": "Awaiting restart",
     "cell": "text",
@@ -472,6 +473,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "Block devices. A volume knows nothing about who has it open — that is an attachment.",
   "fields": [
    {
@@ -658,6 +660,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
+  "audience": "plumbing",
   "blurb": "Attaching is its own object, so a crash mid-way leaves a truthful record rather than a volume nobody can reattach.",
   "fields": [
    {
@@ -763,6 +766,7 @@
   "condition": "Mirrored",
   "group": "Network",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "One VNI on the fabric. The nodes that have it programmed are on the object.",
   "fields": [
    {
@@ -872,6 +876,7 @@
   "condition": "",
   "group": "Network",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "A range on a network, and the count of what IPAM has handed out of it.",
   "fields": [
    {
@@ -989,6 +994,7 @@
   "condition": "Ready",
   "group": "Network",
   "scope": "project",
+  "audience": "plumbing",
   "blurb": "What an instance is attached to the fabric by. Programmed means the agent has it in its maps.",
   "fields": [
    {
@@ -1137,6 +1143,7 @@
   "condition": "Applied",
   "group": "Network",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "What a port is allowed to carry. Rules only add allowances — ingress is denied, egress is allowed and replies always come back, so a port in no group is not an open one.",
   "fields": [
    {
@@ -1174,6 +1181,7 @@
   "condition": "Checked",
   "group": "Compute",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Where a family's images come from. The cell asks the checksums file what the current digest is, over https so the certificate is checked, and publishes an image when the answer is one it does not have. Nothing about a running guest changes: a machine keeps the bytes it was built from, and \"always the newest\" means new machines get it.",
   "fields": [
    {
@@ -1293,6 +1301,7 @@
   "condition": "",
   "group": "Compute",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "What to boot, by the name that stays right when the bytes change. A machine resolves its family once, when it is made, and keeps the build it got.",
   "fields": [
    {
@@ -1389,6 +1398,7 @@
   "condition": "",
   "group": "Compute",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "Content-addressed and immutable. Cached copies are a placement preference, never a requirement.",
   "fields": [
    {
@@ -1632,6 +1642,7 @@
   "condition": "Moved",
   "group": "Compute",
   "scope": "project",
+  "audience": "operator",
   "blurb": "Moving a running guest to another node. There is no migrating state anywhere: this object is the ask, and whether it is finished is read from where the instance actually runs. Start one from the instance you want to move — the destination is chosen where the guest is.",
   "fields": [
    {
@@ -1812,6 +1823,7 @@
   "condition": "Ready",
   "group": "Fleet",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Hypervisors. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token — shown once, because the platform keeps a hash and cannot show it again.",
   "fields": [
    {
@@ -1993,6 +2005,7 @@
   "condition": "",
   "group": "Cell",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Say in advance that a machine is going out of service, and the cell stops placing work on it when the time comes — without anybody being awake to flip a switch, and without anything to flip back afterwards. Whether a window is upcoming, open or over is read off the clock, so a window that ends puts everything back by ceasing to be open.",
   "fields": [
    {
@@ -2111,6 +2124,7 @@
   "condition": "",
   "group": "Storage",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "The cheap half of the pair. A snapshot lives in the volume's own pool — taken in a moment, costs almost nothing, and lost with the pool it is in. For a copy that survives losing the pool, use a backup schedule.",
   "fields": [
    {
@@ -2196,6 +2210,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
+  "audience": "plumbing",
   "blurb": "Build a guest by hand, get it right, capture it — then every guest made from the result starts where that one left off. The guest must be stopped: a disk copied from under a running machine is crash-consistent, and a template is stamped out by people who assume it is clean.",
   "fields": [
    {
@@ -2280,6 +2295,7 @@
   "condition": "",
   "group": "Storage",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Where backups are kept. Deliberately not a pool: a copy that lives beside the original is a snapshot, and is lost with the pool it is in. A target in a volume's own pool is refused.",
   "fields": [
    {
@@ -2382,6 +2398,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "One copy of one volume, at one moment. Restoring makes a new volume from a copy — never writing one back over the original, which would be a command living in a spec and carried out again on every resync.",
   "fields": [
    {
@@ -2474,6 +2491,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "An intention, not a job queue: there should be a copy of this volume no older than the interval, and the last few kept. What exists is what decides — a copy still being made holds the schedule, and a stuck one holds it for one interval and no longer.",
   "fields": [
    {
@@ -2579,6 +2597,7 @@
   "condition": "",
   "group": "Fleet",
   "scope": "global",
+  "audience": "operator",
   "blurb": "What was refused, and who signed in. Not a log of everything that happened — every successful write already leaves an operation carrying its target, its verb and who asked. What no operation exists for is a request that was turned down, and that is the one a multi-tenant cell gets asked about later.",
   "fields": [],
   "columns": [
@@ -2627,6 +2646,7 @@
   "condition": "",
   "group": "Fleet",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Names for interchangeable hardware. An instance asks for a class, never an address: an address belongs to one machine, so an instance naming one could only ever run there. A device is offered only when everything in its IOMMU group is free — a group is passed through whole or not at all.",
   "fields": [
    {
@@ -2684,6 +2704,7 @@
   "condition": "",
   "group": "Compute",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Named machine sizes, offered by the cell. A guest is an                 m1-small, not a hand-entered triple of numbers — the sizes that                 land on the fleet are the shapes it was bought for. Whether a                 project may also size by hand is that project's policy.",
   "fields": [
    {
@@ -2788,6 +2809,7 @@
   "condition": "Ready",
   "group": "Network",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Sessions from the cell's gateways to the routers in front of it. What gets announced is derived, never listed: every external subnet, and a host route for each public address that is in front of something — so the router ahead of the cell and this console cannot disagree about what the cell claims.",
   "fields": [
    {
@@ -2938,6 +2960,7 @@
   "condition": "Routed",
   "group": "Network",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "Which of this project's networks reach each other. A membership rather than a box: there is nothing to place and nothing to fail over — the gateway answers on whichever machine the packet is already on.",
   "fields": [
    {
@@ -2989,6 +3012,7 @@
   "condition": "Allocated",
   "group": "Network",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "Addresses that outlive the machine answering on them. The address is held by the declaration, not by the port, so replacing a guest does not change what the outside world reaches.",
   "fields": [
    {
@@ -3127,6 +3151,7 @@
   "condition": "Ready",
   "group": "Network",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "One address in front of many ports. The fabric balances by connection on whichever host traffic arrives at — there is no appliance to place and nothing to fail over. Nothing here probes a member's health: the pool is what was declared, not a judgement about it.",
   "fields": [
    {
@@ -3266,6 +3291,7 @@
   "condition": "Ready",
   "group": "Fleet",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Where volumes live. The spec is what an operator decided about a pool; the backend, the capacity and what is used are what its agent found.",
   "fields": [
    {
@@ -3397,6 +3423,7 @@
   "condition": "",
   "group": "Access",
   "scope": "project",
+  "audience": "tenant",
   "blurb": "What this project had, read once an hour and kept for ninety days. A reading is a sample, not a total: something created and destroyed between two of them is in neither. Quota says what is in use now; this is the only thing that remembers.",
   "fields": [],
   "columns": [
@@ -3456,6 +3483,7 @@
   "condition": "Ready",
   "group": "Fleet",
   "scope": "project",
+  "audience": "plumbing",
   "blurb": "Something that could not finish inside a request. Done is computed from the target's own convergence, so an operation cannot disagree with the object it describes.",
   "fields": [
    {
@@ -3556,6 +3584,7 @@
   "condition": "",
   "group": "Access",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Who can sign in. A password is set from the row rather than shown on it — the platform stores a hash and cannot recover the original, which is the point.",
   "fields": [
    {
@@ -3658,6 +3687,7 @@
   "condition": "Ready",
   "group": "Storage",
   "scope": "global",
+  "audience": "operator",
   "blurb": "Cluster storage every node reaches, instead of a pool per machine. Optional: a cell with directory pools is a working cell, and nothing here turns itself on. Choosing a disk for an OSD erases it.",
   "fields": [
    {
@@ -3823,6 +3853,7 @@
   "condition": "",
   "group": "Access",
   "scope": "global",
+  "audience": "operator",
   "blurb": "The four rungs say how much somebody may do. A role here says *what* — collection by collection, for the case a rung cannot express: may restart the database machines, may not touch the network.",
   "fields": [
    {
@@ -3891,6 +3922,7 @@
   "condition": "",
   "group": "Access",
   "scope": "global",
+  "audience": "operator",
   "blurb": "A place to put projects, and a place to grant a role once instead of forty times. Roles granted here reach everything below.",
   "fields": [
    {
@@ -3949,6 +3981,7 @@
   "condition": "Ready",
   "group": "Fleet",
   "scope": "global",
+  "audience": "operator",
   "blurb": "The quota and access anchor. Usage is counted from what exists, never decremented by hand.",
   "fields": [
    {

@@ -22,7 +22,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { call, clearToken } from "@/api/transport";
 import { listEvery } from "@/lib/listing";
 import { idOf, nameOf, verdict, VERDICT_ORDER, type Resource, type Verdict } from "@/lib/model";
-import { ALL, SCHEMA, collection, groups, type Collection } from "@/lib/schema";
+import { ALL, SCHEMA, collection, groups, navigable, type Collection } from "@/lib/schema";
 import { go, href, useRoute } from "@/app/router";
 import { setState, useStore } from "@/app/store";
 import { State } from "@/features/State";
@@ -104,7 +104,7 @@ export function Shell({ census, onSweep, children }: {
           <RailLink active={route.view === "overview"} to={href({ view: "overview" })} label="Overview"
             badge={attention.length ? <Badge n={attention.length} tone={failing ? "failing" : "drifting"} /> : null} />
           <RailLink active={route.view === "map"} to={href({ view: "map" })} label="Map" />
-          {groups().filter((g) => who?.cellAdmin || g.items.some((c) => c.scope === "project")).map((g) => {
+          {groups(!!who?.cellAdmin).map((g) => {
             const items = g.items.filter((c) => who?.cellAdmin || c.scope === "project");
             const open = !collapsed[g.name];
             return (
@@ -247,7 +247,7 @@ function Palette({ open, onOpenChange, census }: { open: boolean; onOpenChange: 
   useEffect(() => {
     if (!open || q.trim().length < 2) { setFound([]); return; }
     let live = true;
-    const targets = SCHEMA.filter((c) => c.condition !== "" && (who?.cellAdmin || c.scope === "project")).slice(0, 12);
+    const targets = navigable(!!who?.cellAdmin).filter((c) => c.condition !== "").slice(0, 12);
     Promise.all(targets.map((c) =>
       listEvery(c, project).then((a) =>
         a.rows.filter((r: Resource) => idOf(r).toLowerCase().includes(q.toLowerCase())).slice(0, 4).map((r: Resource) => ({ coll: c, r })))
@@ -295,7 +295,7 @@ function Palette({ open, onOpenChange, census }: { open: boolean; onOpenChange: 
         <CommandGroup heading="Go to">
           <CommandItem value="overview" onSelect={() => run(() => go({ view: "overview" }))}>Overview</CommandItem>
           <CommandItem value="map topology network" onSelect={() => run(() => go({ view: "map" }))}>Map</CommandItem>
-          {SCHEMA.filter((c) => who?.cellAdmin || c.scope === "project").map((c) => (
+          {navigable(!!who?.cellAdmin).map((c) => (
             <CommandItem key={c.id} value={`${c.title} ${c.group}`} onSelect={() => run(() => go({ view: "board", coll: c.id }))}>
               {c.title}<span className="ml-auto text-xs" style={{ color: "var(--text-faint)" }}>{c.group}{census[c.id] ? ` · ${census[c.id].total}` : ""}</span>
             </CommandItem>

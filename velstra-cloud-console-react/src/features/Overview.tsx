@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { call } from "@/api/transport";
 import { listEvery, projectNames } from "@/lib/listing";
 import { ago, idOf, nameOf, verdict, VERDICT_ORDER, type Resource, type Verdict } from "@/lib/model";
-import { ALL, SCHEMA, basePath, type Collection } from "@/lib/schema";
+import { ALL, SCHEMA, basePath, navigable, type Collection } from "@/lib/schema";
 import { useStore } from "@/app/store";
 import { QuotaBars, useQuota } from "./Quota";
 import { State } from "./State";
@@ -20,11 +20,20 @@ export function Overview() {
   const project = useStore((s) => s.project);
   const who = useStore((s) => s.who);
   const [census, setCensus] = useState<Record<string, { rows: Resource[]; error?: string }>>({});
+  // Whether the sweep has finished once. Without it an empty census — nothing
+  // read yet, or every read refused — rendered as the green "Everything has
+  // settled", which is an all-clear over no data and the one sentence on this
+  // screen somebody acts on.
+  const [swept, setSwept] = useState(false);
   const [kind, setKind] = useState<Verdict | null>(null);
   const quota = useQuota(project);
 
   const sweep = async () => {
-    const targets = SCHEMA.filter((c) => c.condition !== "" && c.id !== "audit" && c.id !== "usage" && (who?.cellAdmin || c.scope === "project"));
+    // What this person can actually read. A tenant sweeping `migrations` got a
+    // 403 and a permanent red "unreadable" row on their own landing page, for
+    // a collection the platform never meant them to have.
+    const targets = navigable(!!who?.cellAdmin)
+      .filter((c) => c.condition !== "" && c.id !== "audit" && c.id !== "usage");
     const out: typeof census = {};
     await Promise.all(targets.map(async (c) => {
       try {
@@ -40,8 +49,9 @@ export function Overview() {
       out.audit = { rows: (a.items ?? []).slice(0, 8) };
     } catch { /* the board says why */ }
     setCensus(out);
+    setSwept(true);
   };
-  useEffect(() => { sweep(); }, [project, who?.cellAdmin]);
+  useEffect(() => { setSwept(false); sweep(); }, [project, who?.cellAdmin]);
 
   const attention = useMemo<Row[]>(() => {
     const rows: Row[] = [];
@@ -55,6 +65,12 @@ export function Overview() {
   const shown = kind ? attention.filter((x) => x.kind === kind) : attention;
   const unreadable = Object.entries(census).filter(([, v]) => v.error);
   const nodes = census.nodes?.rows ?? [];
+  const instancesColl = SCHEMA.find((c) => c.id === "instances");
+  // Newest first: the machine somebody just made is the one they came to look
+  // at. Ten of them, and a link for the rest — a landing page is not a board.
+  const machines = [...(census.instances?.rows ?? [])]
+    .sort((a, b) => Number(b.meta.createdAt ?? 0) - Number(a.meta.createdAt ?? 0))
+    .slice(0, 10);
   const audit = (census.audit?.rows ?? []).slice(0, 8);
 
   return (
@@ -94,7 +110,9 @@ export function Overview() {
             ))}
           </>}
         </div>
-        {!attention.length && !unreadable.length ? (
+        {!swept ? (
+          <p className="px-5 py-4 text-sm" style={{ color: "var(--text-muted)" }}>Reading the cell…</p>
+        ) : !attention.length && !unreadable.length ? (
           <p className="px-5 py-4 text-sm"><span style={{ color: "var(--settled)" }}>● Everything has settled.</span> <span style={{ color: "var(--text-muted)" }}>Nothing is drifting or failing.</span></p>
         ) : (
           <ul>
@@ -126,6 +144,58 @@ export function Overview() {
         <h2 className="border-b px-5 py-3 text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)", borderColor: "var(--border-subtle)" }}>Where things stand, by collection</h2>
         <Suspense fallback={<div className="h-[220px]" />}><VerdictChart census={census} /></Suspense>
       </section>
+
+      {/* A customer's own inventory, which is what a cloud's landing page is
+          for. This screen told them what was *wrong* and what their limits
+          were, and never once showed them their machines — so "where is my
+          server and how do I reach it" took a click into a board. Operators
+          get the cell below instead; they have a fleet, not an inventory. */}
+      {!who?.cellAdmin && (
+        <section className="rounded-[6px] border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+          <div className="flex flex-wrap items-center gap-2 border-b px-5 py-3" style={{ borderColor: "var(--border-subtle)" }}>
+            <h2 className="text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)" }}>Your machines</h2>
+            <span className="text-xs" style={{ color: "var(--text-faint)" }}>
+              {machines.length ? `${machines.filter((m) => m.status?.state === "Running").length} of ${machines.length} running` : ""}
+            </span>
+            <a href="#/c/instances" className="ml-auto text-xs hover:underline" style={{ color: "var(--brand)" }}>All machines →</a>
+          </div>
+          {!swept ? (
+            <p className="px-5 py-4 text-sm" style={{ color: "var(--text-muted)" }}>Reading your machines…</p>
+          ) : !machines.length ? (
+            <div className="px-5 py-6">
+              <p className="text-sm" style={{ color: "var(--text-muted)" }}>No machines yet.</p>
+              <a href="#/c/instances/new"
+                className="mt-3 inline-flex h-8 items-center rounded-[4px] px-3 text-sm font-medium"
+                style={{ background: "var(--brand)", color: "var(--on-brand, #08131b)" }}>
+                Start your first one
+              </a>
+            </div>
+          ) : (
+            <ul>
+              {machines.map((m) => {
+                const v = verdict(m, instancesColl!);
+                const address = (m.status as any)?.addresses?.[0];
+                return (
+                  <li key={nameOf(m)}>
+                    <a href={`#/c/instances/${encodeURIComponent(idOf(m))}`}
+                      className="grid grid-cols-[minmax(0,1.4fr)_130px_minmax(0,1fr)_minmax(0,1fr)] items-center gap-4 border-b px-5 py-2.5 text-[13px] hover:bg-[var(--surface-hover)] focus-visible:bg-[var(--surface-hover)] focus-visible:outline-none"
+                      style={{ borderColor: "var(--border-subtle)", boxShadow: v.kind === "settled" ? undefined : `inset 3px 0 0 var(--dot-${v.kind === "unreported" ? "muted" : v.kind})` }}>
+                      <span className="truncate font-medium" style={{ color: "var(--text-strong)" }}>{idOf(m)}</span>
+                      <State of={m} coll={instancesColl} />
+                      <span className="truncate font-mono text-xs" style={{ color: address ? "var(--text-body)" : "var(--text-faint)" }}>
+                        {address ?? "no address yet"}
+                      </span>
+                      <span className="truncate text-xs" style={{ color: "var(--text-muted)" }}>
+                        {(m.spec as any)?.vcpus ?? "?"} vCPU · {Math.round(((m.spec as any)?.memoryMib ?? 0) / 1024)} GiB
+                      </span>
+                    </a>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+      )}
 
       {who?.cellAdmin && nodes.length > 0 && (
         <section className="rounded-[6px] border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
