@@ -27,8 +27,11 @@ import { go } from "@/app/router";
 import { useCollection } from "@/hooks/useCollection";
 import { Pressed } from "./Pressed";
 import { State } from "./State";
+import { Named, useAsk } from "@/features/Ask";
+import type { WatchState } from "@/api/transport";
 
 export function Board({ coll, selectedId, narrow }: { coll: Collection; selectedId?: string; narrow?: boolean }) {
+  const ask = useAsk();
   const project = useStore((s) => s.project);
   const who = useStore((s) => s.who);
   const density = useStore((s) => s.density);
@@ -102,8 +105,9 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
         const v = at(row.original, c.path);
         return (
           <span className={c.cell === "mono" ? "font-mono text-xs" : ""}
+            title={c.cell === "mono" ? String(v ?? "") : undefined}
             style={{ color: c.cell === "number" || c.cell === "count" ? "var(--text-body)" : "var(--text-muted)" }}>
-            {cellText(c.cell, v)}
+            {cellText(c, v)}
           </span>
         );
       },
@@ -153,8 +157,19 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
 
   const picked = Object.keys(selection).filter((k) => selection[k]);
   const bulk = async (label: string, body: unknown | null, destructive = false) => {
-    if (destructive && !confirm(`${label} ${picked.length} ${picked.length === 1 ? coll.singular : coll.title.toLowerCase()}?`)) return;
+    // **Named, not counted.** "Delete 12?" is a number somebody agrees with;
+    // seeing `db-1` in the list is what makes them stop.
+    if (destructive && !(await ask({
+      title: `${label} ${picked.length} ${picked.length === 1 ? coll.singular : coll.title.toLowerCase()}?`,
+      body: <Named ids={picked.map((n) => n.split("/").pop()!)} />,
+      confirmLabel: label,
+      tone: "danger",
+    }))) return;
     let ok = 0; const bad: string[] = [];
+    // What did not work, by name — because a second press should retry the
+    // failures and nothing else. Partial success is the normal case here, not
+    // an error path: half of these refusals are "something still holds it".
+    const refused: Record<string, boolean> = {};
     for (const name of picked) {
       const id = name.split("/").pop()!;
       const base = basePath(coll, projectOf(name) ?? project);
@@ -162,10 +177,10 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
         if (body === null) await call(`delete:${coll.id}`, "DELETE", `${base}/${encodeURIComponent(id)}`);
         else await call(`patch:${coll.id}`, "PATCH", `${base}/${encodeURIComponent(id)}`, undefined, body);
         ok++;
-      } catch (e) { bad.push(`${id}: ${(e as Error).message}`); }
+      } catch (e) { bad.push(`${id}: ${(e as Error).message}`); refused[name] = true; }
     }
     toast(ok ? `${label}: ${ok} done${bad.length ? `, ${bad.length} refused` : ""}` : "Nothing was accepted", { description: bad.slice(0, 3).join("\n") || undefined });
-    setSelection({}); loaded.refresh();
+    setSelection(refused); loaded.refresh();
   };
 
   return (
@@ -291,9 +306,25 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
         )}
       </div>
       <p className="pt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-        {visible.length} of {loaded.rows.length} · revision {loaded.revision || "—"} · j/k move, Enter opens, Space picks, / filters
+        {visible.length} of {loaded.rows.length} · revision {loaded.revision || "—"} · <Live state={loaded.live} /> · j/k move, Enter opens, Space picks, / filters
         {loaded.truncated && <span style={{ color: "var(--drifting)" }}> · this list did not finish — narrow it with a filter or labels</span>}
       </p>
     </div>
   );
+}
+
+/**
+ * Whether this board is keeping itself up to date.
+ *
+ * The third state is not decoration: it is the thing that tells somebody the
+ * screen will not change on its own and they should press Refresh — which
+ * otherwise they find out by waiting.
+ */
+function Live({ state }: { state: WatchState }) {
+  const [label, tone, why] =
+    state === "live" ? ["live", "var(--dot-settled)", "changes arrive as they happen"]
+    : state === "connecting" ? ["connecting…", "var(--text-faint)", "opening the stream"]
+    : state === "dropped" ? ["reconnecting…", "var(--dot-drifting)", "the stream dropped; it is being reopened"]
+    : ["no live updates", "var(--text-faint)", "this board re-reads on its own clock and when you press Refresh"];
+  return <span style={{ color: tone }} title={why}>{label}</span>;
 }
