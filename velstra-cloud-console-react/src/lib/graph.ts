@@ -9,7 +9,7 @@
 // blast-radius question all come from.
 
 import { idOf, nameOf, type Resource } from "./model";
-import { SCHEMA, at, type Collection } from "./schema";
+import { SCHEMA, at, isRef, type Collection } from "./schema";
 
 export type Node = { coll: Collection; r: Resource };
 export type Edge = { from: string; to: string; label: string };   // meta.name → meta.name
@@ -51,7 +51,7 @@ export function buildGraph(census: Record<string, Resource[]>): Graph {
     into.set(e.to, [...(into.get(e.to) ?? []), e]);
   };
   for (const c of SCHEMA) {
-    const refs = c.fields.filter((f) => (f.kind === "ref" || f.kind === "refList") && f.collection);
+    const refs = c.fields.filter(isRef);
     for (const r of census[c.id] ?? []) for (const f of refs) {
       const target = SCHEMA.find((x) => x.id === f.collection);
       if (!target) continue;

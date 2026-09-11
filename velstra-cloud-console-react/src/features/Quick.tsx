@@ -15,6 +15,7 @@ import { SCHEMA, basePath, projectOf, type Collection } from "@/lib/schema";
 import { listEvery } from "@/lib/listing";
 import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
+import { useAsk } from "@/features/Ask";
 
 const coll = (id: string) => SCHEMA.find((c) => c.id === id)!;
 
@@ -59,6 +60,7 @@ const stamp = () => new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "").
 // ---- instances ------------------------------------------------------------
 
 export function InstanceQuick({ r, c, reload }: { r: Resource; c: Collection; reload: () => void }) {
+  const ask = useAsk();
   const project = useProjectOf(r);
   const who = useStore((s) => s.who);
   const state: string = r.status?.state ?? ""; const wanted: string = r.spec?.desiredState ?? "Running";
@@ -84,13 +86,13 @@ export function InstanceQuick({ r, c, reload }: { r: Resource; c: Collection; re
       )}
       {(running || wanted === "Running") && (
         <Pressed size="sm" variant="secondary" title="Ask for it to be shut down; the guest gets an ACPI power button first" onPress={async () => {
-          if (!confirm(`Stop ${idOf(r)}? Anything unsaved inside it is lost.`)) return;
+          if (!(await ask({ title: `Stop ${idOf(r)}?`, body: `Anything unsaved inside it is lost.`, confirmLabel: "Stop", tone: "danger" }))) return;
           await want("Stopped", `${idOf(r)} is being stopped.`);
         }}><Power className="size-3.5" /> Stop</Pressed>
       )}
       {running && (
         <Pressed size="sm" variant="secondary" busyLabel="Rebooting…" title="Stop, wait for it to be down, start again" onPress={async () => {
-          if (!confirm(`Reboot ${idOf(r)}? It is stopped and started again — up to a minute and a half.`)) return;
+          if (!(await ask({ title: `Reboot ${idOf(r)}?`, body: `It is stopped and started again — up to a minute and a half.`, confirmLabel: "Reboot", tone: "danger" }))) return;
           try {
             await patch(project, r, c, { desiredState: "Stopped" });
             toast(`${idOf(r)} is being stopped…`);
@@ -131,6 +133,7 @@ type Destination = { node: string; allowed: boolean; why: string; detail?: strin
  *  or abandon it. The destinations come from `:explainMigration`, so what
  *  cannot receive the guest is listed with the reason rather than left out. */
 function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
+  const ask = useAsk();
   const project = useProjectOf(r);
   // Two answers, one per way of moving: live keeps the guest running and is
   // refused by a machine that cannot present its CPU; a reboot move stops it
@@ -154,9 +157,12 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
   const start = async (to: string, mode: "Live" | "Reboot") => {
     const from = plan?.from ?? r.status?.node ?? "?";
     const said = mode === "Live"
-      ? `Move ${idOf(r)} from ${from} to ${to}, live? Memory is copied while it runs and it pauses only for the last pages. If the move fails it stays on ${from}.`
-      : `Move ${idOf(r)} from ${from} to ${to} with a reboot? It is stopped on ${from} and started on ${to} — a minute or so of downtime, and anything unsaved inside it is lost.`;
-    if (!confirm(said)) return;
+      ? `Memory is copied while it runs and it pauses only for the last pages. If the move fails it stays on ${from}.`
+      : `It is stopped on ${from} and started on ${to} — a minute or so of downtime, and anything unsaved inside it is lost.`;
+    const asked = mode === "Live"
+      ? `Move ${idOf(r)} from ${from} to ${to}, live?`
+      : `Move ${idOf(r)} from ${from} to ${to} with a reboot?`;
+    if (!(await ask({ title: asked, body: said, confirmLabel: "Move", tone: mode === "Live" ? "normal" : "danger" }))) return;
     try {
       const name = await freeName(project, "migrations", `${idOf(r)}-to-${to}`);
       await call("create:migrations", "POST", basePath(migs, project), undefined, { meta: { name }, spec: { instance: nameOf(r), toNode: to, mode } });
@@ -174,7 +180,7 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
     <>
       {moves.map((m) => (
         <Pressed key={nameOf(m)} size="sm" variant="secondary" title={`${idOf(m)} — abandon it; the guest keeps running where it is`} onPress={async () => {
-          if (!confirm(`Abandon the move of ${idOf(r)} to ${m.spec?.toNode}? The guest keeps running on ${m.spec?.fromNode ?? r.status?.node ?? "its node"}; what was copied is thrown away.`)) return;
+          if (!(await ask({ title: `Abandon the move of ${idOf(r)} to ${m.spec?.toNode}?`, body: `The guest keeps running on ${m.spec?.fromNode ?? r.status?.node ?? "its node"}; what was copied is thrown away.`, confirmLabel: "Abandon", tone: "danger" }))) return;
           try { await call("delete:migrations", "DELETE", `${basePath(migs, project)}/${encodeURIComponent(idOf(m))}`); toast("Move abandoned."); look(); }
           catch (e) { toast.error((e as Error).message); }
         }}>
@@ -209,6 +215,7 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
  *  here, and move the ones that are here away. Both are spec edits; both are
  *  reversible from the same button. */
 export function NodeQuick({ r, c, reload }: { r: Resource; c: Collection; reload: () => void }) {
+  const ask = useAsk();
   const project = useStore((s) => s.project);
   const schedulable = r.spec?.schedulable !== false; const evacuating = !!r.spec?.evacuate;
   const flip = async (spec: Record<string, unknown>, said: string) => {
@@ -222,7 +229,7 @@ export function NodeQuick({ r, c, reload }: { r: Resource; c: Collection; reload
       </Pressed>
       <Pressed size="sm" variant={evacuating ? "secondary" : "destructive"} title={evacuating ? "Stop moving guests away" : "Move every guest here to another machine, live where it can be"}
         onPress={async () => {
-          if (!evacuating && !confirm(`Evacuate ${idOf(r)}? Every guest on it is moved to another machine — live where the destination can take it, otherwise stopped and started there.`)) return;
+          if (!evacuating && !(await ask({ title: `Evacuate ${idOf(r)}?`, body: "Every guest on it is moved to another machine — live where the destination can take it, otherwise stopped and started there.", confirmLabel: "Evacuate", tone: "danger" }))) return;
           await flip({ evacuate: !evacuating, ...(evacuating ? {} : { schedulable: false }) }, evacuating ? `${idOf(r)} keeps its guests.` : `${idOf(r)} is being evacuated.`);
         }}>
         {evacuating ? "Stop evacuating" : "Evacuate"}
@@ -233,6 +240,7 @@ export function NodeQuick({ r, c, reload }: { r: Resource; c: Collection; reload
 
 /** Allocate-and-associate, or release: the two things a public address is for. */
 function PublicIp({ r }: { r: Resource }) {
+  const ask = useAsk();
   const project = useProjectOf(r);
   const [mine, setMine] = useState<Resource[] | null>(null);
   const look = () => all(project, "floatingips").then((f) => setMine(f.filter((x) => x.spec?.instance === nameOf(r)))).catch(() => setMine([]));
@@ -252,7 +260,7 @@ function PublicIp({ r }: { r: Resource }) {
     <>
       {mine.map((f) => (
         <Pressed key={nameOf(f)} size="sm" variant="secondary" title={`${f.spec?.address ?? f.status?.address ?? idOf(f)} — release it back to the pool`} onPress={async () => {
-          if (!confirm(`Release ${f.spec?.address ?? idOf(f)}? Anything that reached the guest by it stops doing so.`)) return;
+          if (!(await ask({ title: `Release ${f.spec?.address ?? idOf(f)}?`, body: `Anything that reached the guest by it stops doing so.`, confirmLabel: "Release", tone: "danger" }))) return;
           try { await call("delete:floatingips", "DELETE", `${basePath(fips, project)}/${encodeURIComponent(idOf(f))}`); toast("Address is being released."); look(); }
           catch (e) { toast.error((e as Error).message); }
         }}>Release {f.spec?.address ?? f.status?.address ?? idOf(f)}</Pressed>
@@ -264,6 +272,7 @@ function PublicIp({ r }: { r: Resource }) {
 // ---- volumes --------------------------------------------------------------
 
 export function VolumeQuick({ r, reload }: { r: Resource; c: Collection; reload: () => void }) {
+  const ask = useAsk();
   const project = useProjectOf(r);
   const [guests, setGuests] = useState<Resource[] | null>(null);
   const holder = guests?.find((g) => ((g.spec?.volumes ?? []) as string[]).includes(nameOf(r)));
@@ -288,7 +297,7 @@ export function VolumeQuick({ r, reload }: { r: Resource; c: Collection; reload:
       )}
       {holder && (
         <Pressed size="sm" variant="secondary" title={`Take it off ${idOf(holder)}; unmount it inside first`} onPress={async () => {
-          if (!confirm(`Detach ${idOf(r)} from ${idOf(holder)}? Unmount it inside the guest first, or what is being written is lost.`)) return;
+          if (!(await ask({ title: `Detach ${idOf(r)} from ${idOf(holder)}?`, body: `Unmount it inside the guest first, or what is being written is lost.`, confirmLabel: "Detach", tone: "danger" }))) return;
           try { await patch(project, holder, inst, { volumes: ((holder.spec?.volumes ?? []) as string[]).filter((v) => v !== nameOf(r)) }); toast(`${idOf(r)} is being detached.`); reload(); }
           catch (e) { toast.error((e as Error).message); }
         }}>Detach from {idOf(holder)}</Pressed>

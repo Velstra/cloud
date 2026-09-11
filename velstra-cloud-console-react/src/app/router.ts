@@ -6,6 +6,13 @@ import { useSyncExternalStore } from "react";
 export type Route =
   | { view: "overview" }
   | { view: "map" }
+  // One's own account. Not a board: `users` is the cell's collection of
+  // everybody, which a customer neither sees nor should, and their own account
+  // is not a screenful of other people filtered down to one.
+  | { view: "me" }
+  // What this project used, for a month. Not a board: the readings are the
+  // evidence and have one; this is the sum, which the API computes.
+  | { view: "spend" }
   | { view: "board"; coll: string; id?: string; mode?: "edit" | "new" };
 
 export function parse(hash: string): Route {
@@ -17,11 +24,13 @@ export function parse(hash: string): Route {
     return { view: "board", coll };
   }
   if (parts[0] === "map") return { view: "map" };
+  if (parts[0] === "me") return { view: "me" };
+  if (parts[0] === "spend") return { view: "spend" };
   return { view: "overview" };
 }
 
 export const href = (r: Route) =>
-  r.view === "overview" ? "#/overview" : r.view === "map" ? "#/map"
+  r.view === "overview" ? "#/overview" : r.view === "map" ? "#/map" : r.view === "me" ? "#/me" : r.view === "spend" ? "#/spend"
     : `#/c/${r.coll}${r.mode === "new" ? "/new" : r.id ? "/" + encodeURIComponent(r.id) + (r.mode === "edit" ? "/edit" : "") : ""}`;
 
 /// Move, through a cross-fade where the browser can: the old screen is not
