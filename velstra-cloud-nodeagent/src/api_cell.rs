@@ -45,7 +45,27 @@ use crate::{
 /// How long to wait for one read. Long enough for a busy API, short enough that
 /// a wedged one becomes a counted failure and a retried pass rather than an
 /// agent that has stopped.
+///
+/// **Every await that touches the network is inside one of these**, which it
+/// was not: the bound covered waiting for the response *headers* and nothing
+/// else. Connecting had no bound and reading the body had no bound, so a
+/// connection that opened and then went quiet mid-answer parked the pass for
+/// ever.
+///
+/// Found on a live cell. A node's agent had not reported for fourteen hours:
+/// the process was up, every thread in `futex_wait`, twenty-seven seconds of
+/// CPU across fifteen hours, five established connections to the API with
+/// nothing queued on any of them. Its guests were still running, which is by
+/// design — and that is the whole danger. The agent's loop is serial, so the
+/// pass that was parked was also the pass that reports the heartbeat *and* the
+/// pass that runs `self_fence_pass`. A node in that state is one the control
+/// plane eventually takes for gone while its guests keep writing, which is the
+/// exact failure `velstra_cloud_model::ha` says the self-fence exists to
+/// prevent.
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long to wait for the far end to accept a connection and finish TLS.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ApiCell {
     /// `http://host:port`, no trailing slash.
@@ -208,7 +228,7 @@ impl ApiCell {
     }
 
     async fn get(&self, path: &str) -> Result<Vec<u8>> {
-        let (mut sender, connection) = self.connect().await?;
+        let (mut sender, connection) = self.connect_within().await?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -218,10 +238,13 @@ impl ApiCell {
             .map_err(|_| HostError::failed(format!("{path}: the API did not answer in time")))?
             .map_err(|e| HostError::failed(format!("{path}: {e}")))?;
         let status = response.status();
-        let body = response
-            .into_body()
-            .collect()
+        let body = tokio::time::timeout(READ_TIMEOUT, response.into_body().collect())
             .await
+            .map_err(|_| {
+                HostError::failed(format!(
+                    "{path}: the API began an answer and stopped part way through"
+                ))
+            })?
             .map_err(|e| HostError::failed(format!("{path}: reading the answer: {e}")))?
             .to_bytes();
         if status != StatusCode::OK {
@@ -234,6 +257,25 @@ impl ApiCell {
             )));
         }
         Ok(body.to_vec())
+    }
+
+    /// [`ApiCell::connect`], bounded. Every caller uses this one; the unbounded
+    /// version is the thing that is being wrapped, not an alternative.
+    async fn connect_within(
+        &self,
+    ) -> Result<(
+        hyper::client::conn::http1::SendRequest<String>,
+        hyper::client::conn::http1::Connection<IoStream, String>,
+    )> {
+        tokio::time::timeout(CONNECT_TIMEOUT, self.connect())
+            .await
+            .map_err(|_| {
+                HostError::failed(format!(
+                    "the API at {} did not accept a connection within {} s",
+                    self.base,
+                    CONNECT_TIMEOUT.as_secs()
+                ))
+            })?
     }
 
     async fn connect(
@@ -307,7 +349,7 @@ impl ApiCell {
             .body(body)
             .map_err(|e| HostError::failed(format!("building a request for {path}: {e}")))?;
 
-        let (mut sender, connection) = self.connect().await?;
+        let (mut sender, connection) = self.connect_within().await?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -316,10 +358,13 @@ impl ApiCell {
             .map_err(|_| HostError::failed(format!("{path}: the API did not answer in time")))?
             .map_err(|e| HostError::failed(format!("{path}: {e}")))?;
         let status = response.status();
-        let bytes = response
-            .into_body()
-            .collect()
+        let bytes = tokio::time::timeout(READ_TIMEOUT, response.into_body().collect())
             .await
+            .map_err(|_| {
+                HostError::failed(format!(
+                    "{path}: the API began an answer and stopped part way through"
+                ))
+            })?
             .map_err(|e| HostError::failed(format!("{path}: reading the answer: {e}")))?
             .to_bytes();
         Ok((status, bytes.to_vec()))
@@ -346,8 +391,13 @@ impl ApiCell {
     }
 
     /// One subscription, until it ends.
+    ///
+    /// The body is read without a deadline, and that is right: a subscription
+    /// that says nothing for an hour is a cell where nothing changed. Only the
+    /// connection is bounded — and this runs in its own task, so even a
+    /// subscription that hung could never park a pass.
     async fn stream(&self, path: &str, tx: &tokio::sync::mpsc::Sender<()>) -> Result<()> {
-        let (mut sender, connection) = self.connect().await?;
+        let (mut sender, connection) = self.connect_within().await?;
         let pump = tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -620,5 +670,73 @@ impl crate::cell::PoolReader for ApiCell {
              been given, and nothing else in the cell",
             self.base, self.who
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cell that opens a connection and then says nothing does not stop the
+    /// agent.
+    ///
+    /// This is the failure this file's timeouts exist for, and the one they
+    /// did not cover: the bound was on waiting for the response *headers*, so
+    /// a connection that never completed, or an answer that began and stopped
+    /// part way through, parked the pass with no deadline at all.
+    ///
+    /// Why that is worse than a slow read. The agent's loop is serial: the
+    /// same pass reports the node's heartbeat and runs `self_fence_pass`. A
+    /// parked pass is therefore a node that stops saying it is alive **and**
+    /// never fences itself, while its guests keep running — measured on a live
+    /// cell at fourteen hours, twenty-seven seconds of CPU, every thread
+    /// waiting.
+    ///
+    /// The listener here accepts and then holds the socket open without
+    /// writing a byte, which is exactly that shape.
+    #[tokio::test]
+    async fn a_silent_api_fails_the_read_rather_than_stopping_the_agent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the loopback has ports");
+        let at = listener
+            .local_addr()
+            .expect("a bound listener has an address");
+        // Accept, answer with headers promising a body, and then stop. This is
+        // the shape the old bound missed: the response *arrives*, so the
+        // deadline on waiting for it is satisfied, and the read of the body
+        // that follows had none.
+        let held = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4096\r\n\r\n")
+                    .await;
+                let _ = stream.flush().await;
+                kept.push(stream);
+            }
+        });
+
+        let cell = ApiCell::new(&format!("http://{at}"), "a-token", "node-a")
+            .expect("a plain http endpoint needs no CA");
+
+        // Well inside the test's patience and well outside the timeouts, so a
+        // pass that came back at all came back because of them.
+        let answered = tokio::time::timeout(
+            READ_TIMEOUT + CONNECT_TIMEOUT + Duration::from_secs(10),
+            cell.get("/api/v1/nodes"),
+        )
+        .await;
+        held.abort();
+
+        let answered = answered.expect("the agent parked on a silent API instead of failing");
+        let why = answered
+            .expect_err("a silent API is not an answer")
+            .to_string();
+        assert!(
+            why.contains("did not answer in time") || why.contains("stopped part way through"),
+            "the failure did not say what happened: {why}"
+        );
     }
 }
