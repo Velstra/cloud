@@ -714,7 +714,9 @@ async fn an_instance_keeps_the_image_it_was_built_from() {
             "images",
             &json!({"id": id, "spec": {
                 "source_url": format!("http://x.invalid/{id}.qcow2"),
-                "digest": format!("sha256:{id}"),
+                // The id is `sha256-old`/`sha256-new`, which is a name and not
+                // a digest; the digest is a real one, distinct per image.
+                "digest": format!("sha256:{}", version.repeat(64)),
                 "family": "debian-13", "version": version}}),
             &who(ADA),
         )
@@ -794,7 +796,7 @@ async fn a_tenant_cannot_boot_another_tenants_image() {
     api.create(
         "projects/p1",
         "images",
-        &json!({"id": "sha256-abc", "spec": {"source_url": "http://x.invalid/i.qcow2", "digest": "sha256:abc"}}),
+        &json!({"id": "sha256-abc", "spec": {"source_url": "http://x.invalid/i.qcow2", "digest": "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}}),
         &who(ADA),
     )
     .await
@@ -840,7 +842,7 @@ async fn a_tenant_cannot_boot_another_tenants_image() {
     api.create(
         "projects/p2",
         "images",
-        &json!({"id": "sha256-def", "spec": {"source_url": "http://x.invalid/i.qcow2", "digest": "sha256:def"}}),
+        &json!({"id": "sha256-def", "spec": {"source_url": "http://x.invalid/i.qcow2", "digest": "sha256:cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34"}}),
         &who(BOB),
     )
     .await
@@ -1327,7 +1329,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
         &json!({
             "id": "sha256-3f9a2b",
             "spec": {
-                "digest": "sha256:3f9a2b",
+                "digest": "sha256:42f45608de4d04a573e6b92b790f70cd21b9043cbe340a17d8bb1194fbb71f1f",
                 "format": "Qcow2",
                 "source_url": "https://example.invalid/debian-13.qcow2"
             }
@@ -1371,7 +1373,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
             &json!({
                 "id": "sha256-beef",
                 "spec": {
-                    "digest": "sha256:beef",
+                    "digest": "sha256:aa415c4e8890cf0fec7826aec962ffbcc04534faefd2b3266c54f690d40d6e82",
                     "format": "Qcow2",
                         "source_url": "https://example.invalid/mine.qcow2"
                 }
@@ -1403,7 +1405,7 @@ async fn a_cell_image_is_everybodys_to_boot_and_nobodys_to_write() {
         &json!({
             "id": "sha256-cafe",
             "spec": {
-                "digest": "sha256:cafe",
+                "digest": "sha256:a860b858265b22dad3aaf1165cfc2936daf1d3d86e0b7b77e3cc07f59f96858f",
                 "format": "Qcow2",
                 "source_url": "https://example.invalid/private.qcow2"
             }
@@ -3818,7 +3820,7 @@ async fn publishing_from_another_tenants_image_is_refused() {
         &json!({
             "id": "sha256-secret",
             "spec": {
-                "digest": "sha256:secret",
+                "digest": "sha256:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
                 "format": "Raw",
                 "size_bytes": 1024,
                 "source_url": "file:///var/lib/velstra/backups/sha256-secret"
@@ -3876,7 +3878,7 @@ async fn an_image_shared_with_another_project_is_readable_there_and_not_writable
         &json!({
             "id": "sha256-golden",
             "spec": {
-                "digest": "sha256:golden",
+                "digest": "sha256:dd56de4137951d9c92681b03416ec15f886b4482a27e3a517d32f085244cbe5d",
                 "format": "Raw",
                 "size_bytes": 1024,
                 "source_url": "https://example.invalid/golden.img"
@@ -3909,7 +3911,10 @@ async fn an_image_shared_with_another_project_is_readable_there_and_not_writable
         .get(&image, &who(BOB))
         .await
         .expect("a shared image is readable by the project it was shared with");
-    assert_eq!(seen["spec"]["digest"], "sha256:golden");
+    assert_eq!(
+        seen["spec"]["digest"],
+        "sha256:dd56de4137951d9c92681b03416ec15f886b4482a27e3a517d32f085244cbe5d"
+    );
 
     // And still cannot change it. Sharing is a read grant; editing goes
     // through the ordinary authorisation, which knows nothing about it.
@@ -3960,7 +3965,7 @@ async fn an_image_shared_with_another_project_is_readable_there_and_not_writable
         &json!({
             "id": "sha256-private",
             "spec": {
-                "digest": "sha256:private",
+                "digest": "sha256:715dc8493c36579a5b116995100f635e3572fdf8703e708ef1a08d943b36774e",
                 "format": "Raw",
                 "size_bytes": 1024,
                 "source_url": "https://example.invalid/private.img"

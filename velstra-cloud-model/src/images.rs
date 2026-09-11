@@ -28,7 +28,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::meta::{Condition, Timestamp};
+use crate::{
+    meta::{Condition, Timestamp},
+    resources::ImageFormat,
+};
 
 /// How often a source is looked at when it does not say.
 ///
@@ -67,6 +70,20 @@ pub struct ImageSourceSpec {
     /// Stop looking, without forgetting where this came from.
     #[serde(default)]
     pub paused: bool,
+    /// What the bytes at `url` are.
+    ///
+    /// There is no way to learn this without the bytes — this controller reads
+    /// a checksums file and never the image — and the filename does not say:
+    /// Ubuntu's cloud images are qcow2 under `.img`. It used to be assumed to
+    /// be qcow2, which a node then refused at disk time ("correct spec.format
+    /// on the image rather than have this node decide which of the two to
+    /// believe") — and since every rotation mints a new image, correcting it by
+    /// hand had to be done again on every publish.
+    ///
+    /// Left out where the filename cannot be wrong (`.qcow2`), which is Debian,
+    /// Fedora, Rocky and AlmaLinux; demanded everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<ImageFormat>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -242,6 +259,27 @@ pub enum Unusable {
     NoUrl,
     #[error("the url ends in no filename, so no line of a checksums file can be matched to it")]
     NoFilename,
+    #[error(
+        "this source does not say what its bytes are. A digest says *which* bytes, never what \
+         they are, and this source never fetches them — so `format` has to be stated unless the \
+         filename settles it (`.qcow2`). Ubuntu ships qcow2 under `.img`, which is exactly the \
+         case a guess gets wrong: a node handed a mis-declared image refuses the disk, and every \
+         guest of this family goes without one."
+    )]
+    NoFormat,
+}
+
+/// What the filename says the bytes are, where it cannot be wrong.
+///
+/// `.qcow2` and nothing else. `.img` and `.raw` are both used for qcow2 by
+/// somebody, and a wrong answer here is a node refusing every guest of a
+/// family — so the derivation stops where certainty does.
+pub fn format_from_filename(url: &str) -> Option<ImageFormat> {
+    filename_of(url)
+        .rsplit('.')
+        .next()
+        .filter(|ext| ext.eq_ignore_ascii_case("qcow2"))
+        .map(|_| ImageFormat::Qcow2)
 }
 
 /// Everything that can be judged about a source without going near the network.
@@ -257,6 +295,9 @@ pub fn refuse_an_unusable_source(spec: &ImageSourceSpec) -> Result<(), Unusable>
     }
     if filename_of(&spec.url).is_empty() {
         return Err(Unusable::NoFilename);
+    }
+    if spec.format.is_none() && format_from_filename(&spec.url).is_none() {
+        return Err(Unusable::NoFormat);
     }
     Ok(())
 }
@@ -560,11 +601,28 @@ pub fn judge_signature(
     // verify happily and be shown as `verified` in the console. The message is
     // over the line as written, so the spelling has to be exact: a value that
     // parses only after being normalised is not the line anybody signed.
-    if Digest::parse(digest).map(|d| d.value()).as_deref() != Some(digest) {
-        return SignatureVerdict::Refused(format!(
-            "a signature is over the digest line, and {digest:?} is not one \
-             (`sha256:<64 hex>` or `sha512:<128 hex>`)"
-        ));
+    match Digest::parse(digest) {
+        // Not a digest at all.
+        None => {
+            return SignatureVerdict::Refused(format!(
+                "a signature is over the digest line, and {digest:?} is not one \
+                 (`sha256:<64 hex>` or `sha512:<128 hex>`)"
+            ));
+        }
+        // A digest, in another spelling. Refused on purpose and not normalised
+        // — see above — but the old message said it was "not one", which is
+        // both untrue and the wrong thing to go looking for. The API settles
+        // the spelling at create, so this is reachable only for an object
+        // written around the API or stored before that door existed.
+        Some(canonical) if canonical.value() != digest => {
+            return SignatureVerdict::Refused(format!(
+                "a signature is over the digest line exactly as written, and this platform \
+                 writes it lowercase; {digest:?} is that digest in another spelling — sign \
+                 `{}` instead",
+                canonical.value()
+            ));
+        }
+        Some(_) => {}
     }
     let bytes = match base64::engine::general_purpose::STANDARD.decode(signature) {
         Ok(b) => b,

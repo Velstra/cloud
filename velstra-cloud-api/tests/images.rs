@@ -236,3 +236,148 @@ async fn a_refused_guest_leaves_no_port_behind() {
         ports.items
     );
 }
+
+/// **An image is its bytes, and a patch does not change them.**
+///
+/// Content-addressed and immutable is what the model says, what the console
+/// blurb says and what the Signature column means — and nothing enforced it. A
+/// patch could point a name every guest built from it already carries at
+/// different bytes, and leave `spec.signature` standing over a digest nobody
+/// signed.
+#[tokio::test]
+async fn an_images_digest_cannot_be_changed_once_it_is_stored() {
+    let api = cell().await;
+    let name = ResourceName::parse("images/old").unwrap();
+
+    let refused = api
+        .patch(
+            &name,
+            &json!({"spec": {"digest": format!("sha256:{}", "c".repeat(64))}}),
+            None,
+            &who(),
+        )
+        .await
+        .expect_err("an image's digest was changed by a patch");
+    assert_eq!(refused.field.as_deref(), Some("spec.digest"), "{refused:?}");
+
+    let stored: velstra_cloud_model::resources::Image = api.typed(&name).await.unwrap();
+    assert_eq!(stored.spec.digest, format!("sha256:{}", "a".repeat(64)));
+
+    // Sending back what is already there is not a change: the console's edit
+    // form offers the box, and every save carries it.
+    api.patch(
+        &name,
+        &json!({"spec": {"digest": format!("sha256:{}", "a".repeat(64)), "version": "1b"}}),
+        None,
+        &who(),
+    )
+    .await
+    .expect("restating the digest was refused as a change");
+}
+
+/// A digest that is not one is refused where somebody can still fix it.
+///
+/// The create asked only whether it was a non-empty string. `"hello"` was
+/// accepted, stored, and found out weeks later by a node with nothing to
+/// fetch — in a journal on a machine the tenant has no access to.
+#[tokio::test]
+async fn a_digest_that_is_not_one_is_refused_where_somebody_can_still_fix_it() {
+    let api = cell().await;
+    let refused = api
+        .create(
+            "",
+            "images",
+            &json!({"id": "nonsense", "spec": {
+                "family": "debian-13", "version": "9", "digest": "hello",
+                "source_url": "http://images.invalid/x.qcow2", "format": "Qcow2"}}),
+            &who(),
+        )
+        .await
+        .err()
+        .expect("an image whose digest is not one was accepted");
+    assert_eq!(refused.field.as_deref(), Some("spec.digest"), "{refused:?}");
+}
+
+/// The one spelling a signature is over.
+///
+/// Every other reader lowercases; `judge_signature` deliberately does not,
+/// because the message is the line exactly as written. So an uppercase digest
+/// was accepted everywhere *except* alongside a signature, where it was
+/// refused with a message claiming it was not a digest at all. The spelling is
+/// settled at the door instead.
+#[tokio::test]
+async fn a_digest_is_stored_in_the_one_spelling_a_signature_is_over() {
+    let api = cell().await;
+    api.create(
+        "",
+        "images",
+        &json!({"id": "shouty", "spec": {
+            "family": "debian-13", "version": "9",
+            "digest": format!("sha256:{}", "AB".repeat(32)),
+            "source_url": "http://images.invalid/x.qcow2", "format": "Qcow2"}}),
+        &who(),
+    )
+    .await
+    .expect("an uppercase digest was refused");
+
+    let stored: velstra_cloud_model::resources::Image = api
+        .typed(&ResourceName::parse("images/shouty").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.spec.digest, format!("sha256:{}", "ab".repeat(32)));
+}
+
+/// **A retired image is not published under another name.**
+///
+/// Everything else asks `usable()` before building from an image; this door did
+/// not. So a withdrawn build could come back as an `Active` object with the
+/// same digest, and `families/<name>` would resolve to it.
+#[tokio::test]
+async fn a_retired_image_cannot_be_published_under_a_new_name() {
+    let api = cell().await;
+    set_state(&api, "old", "Obsolete", "images/new").await;
+
+    let refused = api
+        .create(
+            "",
+            "images",
+            &json!({"id": "laundered", "spec": {"from": "images/old"}}),
+            &who(),
+        )
+        .await
+        .err()
+        .expect("a retired image was published under another name");
+    assert_eq!(refused.field.as_deref(), Some("spec.from"), "{refused:?}");
+    assert!(refused.message.contains("retired"), "{refused:?}");
+    assert!(refused.message.contains("images/new"), "{refused:?}");
+}
+
+/// Publishing copies the *format*, which it could not.
+///
+/// The copy read "did the caller say this" off the merged spec, where every
+/// field is present — so absence had to be guessed from the value, and
+/// `ImageFormat`'s default is `Raw`. A published qcow2 image therefore came
+/// out declared `Raw`, and a node handed that refuses the disk.
+#[tokio::test]
+async fn publishing_carries_the_format_the_bytes_actually_are() {
+    let api = cell().await;
+    api.create(
+        "",
+        "images",
+        &json!({"id": "published", "spec": {"from": "images/old"}}),
+        &who(),
+    )
+    .await
+    .expect("publishing from the catalogue");
+
+    let copy: velstra_cloud_model::resources::Image = api
+        .typed(&ResourceName::parse("images/published").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        copy.spec.format,
+        velstra_cloud_model::resources::ImageFormat::Qcow2,
+        "publishing a qcow2 image declared it Raw"
+    );
+    assert_eq!(copy.spec.digest, format!("sha256:{}", "a".repeat(64)));
+}

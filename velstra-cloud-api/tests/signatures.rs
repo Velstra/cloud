@@ -143,8 +143,9 @@ async fn a_patch_that_adds_a_signature_is_judged_over_the_digest_it_carries() {
     let router = api(vec![key]);
     let (status, _) = send(&router, "POST", "images", image("later", None)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    // An image patch restates the digest (the API refuses one that does not),
-    // so the signature is judged over the digest the patch carries.
+    // A patch may restate the digest and may not change it, so the signature
+    // is judged over this image's one digest. (The comment here used to claim
+    // the API refused a patch that did *not* restate it, which nothing did.)
     let mut spec = image("later", Some(&sign(&pair, DIGEST)))["spec"].clone();
     let (status, body) = send(&router, "PATCH", "images/later", json!({ "spec": spec })).await;
     assert!(status.is_success(), "{status} {body}");
@@ -158,4 +159,59 @@ async fn a_patch_that_adds_a_signature_is_judged_over_the_digest_it_carries() {
     let (status, body) = send(&router, "PATCH", "images/later", json!({ "spec": spec })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["field"], "spec.signature");
+}
+
+/// **A signature travels with the digest it is over.**
+///
+/// Publishing copies the digest and dropped the signature, so a signed image
+/// became an unsigned one — and on a node started with
+/// `--require-signed-images` that copy will not boot. The copy is re-judged
+/// like any other create, so this is not a way to smuggle one in.
+#[tokio::test]
+async fn publishing_carries_the_signature_with_the_digest_it_is_over() {
+    let (pair, key) = keypair();
+    let router = api(vec![key]);
+    let (status, body) = send(
+        &router,
+        "POST",
+        "images",
+        image("signed", Some(&sign(&pair, DIGEST))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "images",
+        json!({"id": "published", "spec": {"from": "images/signed"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    let (_, stored) = send(&router, "GET", "images/published", Value::Null).await;
+    assert_eq!(
+        stored["spec"]["signature"],
+        json!(sign(&pair, DIGEST)),
+        "publishing dropped the signature: {stored}"
+    );
+
+    // And somebody who wants an unsigned copy says so, because only what the
+    // caller left out is taken.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "images",
+        json!({"id": "plain", "spec": {"from": "images/signed", "signature": ""}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (_, stored) = send(&router, "GET", "images/plain", Value::Null).await;
+    assert!(
+        stored["spec"]["signature"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "an explicitly unsigned copy came back signed: {stored}"
+    );
 }

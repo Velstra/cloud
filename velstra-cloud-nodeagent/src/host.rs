@@ -309,6 +309,21 @@ pub trait Vmm: Send + Sync + 'static {
         None
     }
 
+    /// Reclaim bytes under `incoming` that nobody is coming back for.
+    ///
+    /// Rejected copies, stalled `.partial` files, and bare copies of a fetch
+    /// that died between finishing and verifying. Nothing under `incoming` was
+    /// ever deleted, so a bad mirror left a file on every node for the life of
+    /// the machine — and, until `arriving` learned to skip it, that node
+    /// reported the image it had refused as one it was fetching.
+    ///
+    /// Default zero, so the fake and anything written later need not pretend.
+    /// Called only from the sweep that already has a retention knob, never from
+    /// the fetch path: a rejection has to outlive the pass that made it.
+    async fn forget_stale_arrivals(&self, _older_than_seconds: u64) -> usize {
+        0
+    }
+
     /// How long ago that image was written, in seconds, or `None` when this
     /// machine does not have it.
     ///

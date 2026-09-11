@@ -2917,7 +2917,7 @@ async fn an_image_carrying_a_signature_nothing_can_check_is_refused() {
             json!({
                 "id": "sha256-abc",
                 "spec": {
-                    "digest": "sha256:abc",
+                    "digest": "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                     "format": "Raw",
                     "sizeBytes": 1024,
                     "sourceUrl": "https://example.invalid/alpine.img",
@@ -2944,7 +2944,7 @@ async fn an_image_carrying_a_signature_nothing_can_check_is_refused() {
             json!({
                 "id": "sha256-abc",
                 "spec": {
-                    "digest": "sha256:abc",
+                    "digest": "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                     "format": "Raw",
                     "sizeBytes": 1024,
                     "sourceUrl": "https://example.invalid/alpine.img"
@@ -2962,7 +2962,7 @@ async fn an_image_carrying_a_signature_nothing_can_check_is_refused() {
             json!({
                 "id": "sha256-def",
                 "spec": {
-                    "digest": "sha256:def",
+                    "digest": "sha256:cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34",
                     "format": "Raw",
                     "sizeBytes": 1024,
                     "sourceUrl": "https://example.invalid/other.img",

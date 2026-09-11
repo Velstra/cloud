@@ -2426,6 +2426,17 @@ pub const NODE_RELEASE_FINALIZER: &str = "node.velstra.io/release";
 /// destructive one. Unmarked attachments are left alone for ever.
 pub const MINTED_FOR: &str = "attachment.velstra.io/for";
 
+/// Which image source published this image.
+///
+/// Provenance is the one thing about an image that cannot be derived from the
+/// object, so it is written down. Retention used to answer "did this source
+/// make this" with `family` plus `source_url` — but a URL is a value an
+/// operator edits when a mirror moves, and one anybody can copy: after an edit
+/// a source stopped owning what it had published, and a tenant registering the
+/// same public URL under the same family had their own image deprecated and
+/// then deleted by the cell's retention.
+pub const PUBLISHED_BY: &str = "image-source.velstra.io/by";
+
 // ---- network -------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
