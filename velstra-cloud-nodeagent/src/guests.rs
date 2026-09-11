@@ -345,10 +345,36 @@ fn interface(
 /// the guest must **not** configure it — a guest that put a NAT address on its
 /// own interface would answer ARP for something the edge is also answering for,
 /// and the two would take turns.
+///
+/// **And only when this node delivers them.** A routed address is configured
+/// by the guest, and the guest is told to default out through a next hop that
+/// is in no subnet and answered for by the host. A node that does not answer
+/// for that next hop must not hand the route out: it would point the guest's
+/// default route at an address nobody answers, which takes the guest off the
+/// network entirely — a worse outcome than the address not working. The
+/// platform must not render a configuration it has not made true.
 pub fn public_addresses(
     floating: &[velstra_cloud_model::resources::FloatingIp],
+    delivers_public: bool,
 ) -> BTreeMap<String, Vec<velstra_cloud_model::public::GuestRoute>> {
     let mut out: BTreeMap<String, Vec<velstra_cloud_model::public::GuestRoute>> = BTreeMap::new();
+    if !delivers_public {
+        let withheld = floating
+            .iter()
+            .filter(|f| {
+                f.spec.delivery == velstra_cloud_model::public::Delivery::Routed
+                    && !f.spec.port.is_empty()
+            })
+            .count();
+        if withheld > 0 {
+            tracing::debug!(
+                withheld,
+                "routed public addresses are allocated but this node answers for no next hop, \
+                 so no guest here is configured with one"
+            );
+        }
+        return out;
+    }
     for fip in floating {
         if fip.spec.delivery != velstra_cloud_model::public::Delivery::Routed {
             continue;

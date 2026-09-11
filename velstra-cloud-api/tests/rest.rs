@@ -5484,3 +5484,44 @@ async fn a_ceiling_that_was_set_can_be_taken_off_again() {
     assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
     assert_eq!(off.body["spec"]["volumeCeiling"]["iops"], 0);
 }
+
+/// **An MTU no wire could carry is refused where somebody can still fix it.**
+///
+/// `mtu: 42` used to be stored and handed to every guest on the network over
+/// DHCP and the metadata service. There is no door for it anywhere else: the
+/// node only ever *reads* the network's MTU. Whether a legal MTU fits a
+/// particular node's wire is a different question, answered on that node.
+#[tokio::test]
+async fn an_mtu_no_wire_could_carry_is_refused() {
+    let h = Harness::new();
+    h.post("projects", json!({ "id": "p1", "spec": {} })).await;
+    for (id, mtu) in [("tiny", 500), ("absurd", 60000)] {
+        let refused = h
+            .post(
+                "projects/p1/networks",
+                json!({ "id": id, "spec": { "mtu": mtu } }),
+            )
+            .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body["error"]["field"], "spec.mtu",
+            "{:?}",
+            refused.body
+        );
+    }
+    // The default, and a jumbo, both go through — the range is about typos.
+    for (id, mtu) in [("dflt", 0), ("jumbo", 9000), ("v6min", 1280)] {
+        let ok = h
+            .post(
+                "projects/p1/networks",
+                json!({ "id": id, "spec": { "mtu": mtu } }),
+            )
+            .await;
+        assert_eq!(ok.status, StatusCode::ACCEPTED, "{:?}", ok.body);
+    }
+}

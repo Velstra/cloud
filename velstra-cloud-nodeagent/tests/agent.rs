@@ -1419,11 +1419,42 @@ async fn a_gateway_announces_what_the_cell_claims_and_a_settled_one_is_quiet() {
         )
         .await
         .unwrap();
+    // The guest holding the address is observed *here*: a host route is
+    // announced from the machine that has the guest, and from no other.
+    let ports: TypedStore<
+        velstra_cloud_model::resources::PortSpec,
+        velstra_cloud_model::resources::PortStatus,
+    > = TypedStore::new(store.clone(), CELL, "ports");
+    let mut port = Resource::new(
+        meta("projects/p1/ports/x"),
+        velstra_cloud_model::resources::PortSpec::default(),
+        velstra_cloud_model::resources::PortStatus::default(),
+    );
+    port.status.node = Some("node-a".into());
+    ports.create(&port, &writer).await.unwrap();
+    // And a guest of this node's on it — otherwise the agent's own port pass
+    // lets the port go (a port no guest here uses is not this node's to speak
+    // for), and an unplaced port is an address nobody announces.
+    create_instance(
+        &store,
+        "projects/p1/instances/web",
+        Some("node-a"),
+        Some("node-a"),
+        &["projects/p1/ports/x"],
+    )
+    .await;
     let floating: TypedStore<FloatingIpSpec, FloatingIpStatus> =
         TypedStore::new(store.clone(), CELL, "floatingips");
+    // Routed, and announced from the host: the delivery whose host route this
+    // node is the one to announce. A `Nat` address is answered for at the edge
+    // and nothing on this datapath translates it, so announcing it would hand
+    // the upstream a route to nowhere.
     let fip = FloatingIpSpec {
+        subnet: "subnets/public-v4".into(),
         address: Some("203.0.113.7".into()),
         port: "projects/p1/ports/x".into(),
+        delivery: velstra_cloud_model::public::Delivery::Routed,
+        announce: Some(velstra_cloud_model::public::Announce::FromHost),
         ..Default::default()
     };
     floating

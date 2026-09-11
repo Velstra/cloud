@@ -44,6 +44,46 @@ use velstra_cloud_model::{
     resources::Port,
 };
 
+/// One member of a service: where it is, and what its own firewall admits.
+///
+/// The rules travel with the member because the balancer is the last thing
+/// that still knows the client. The connection it opens to the member is
+/// sourced from the node and traverses `output`, never `forward` — which is
+/// the only hook the member's own chains are on. So a client the member's
+/// security group denies reached it anyway, through the VIP. The balancer asks
+/// the member's rules itself before handing it the connection.
+///
+/// Compared for equality *without* the rules — see `PartialEq` below — so a
+/// security-group change does not restart a listener and drop its open
+/// connections; the rules are refreshed in place by the next plan.
+#[derive(Clone, Debug)]
+pub struct Member {
+    pub at: SocketAddr,
+    pub rules: Vec<velstra_cloud_model::security::ResolvedRule>,
+}
+
+impl PartialEq for Member {
+    fn eq(&self, other: &Self) -> bool {
+        self.at == other.at
+    }
+}
+impl Eq for Member {}
+
+impl Member {
+    /// Whether this member's own ingress rules admit `client` on `port`.
+    ///
+    /// No rules admits everything — the platform's stance with nothing added.
+    pub fn admits(&self, client: IpAddr, port: u16) -> bool {
+        velstra_cloud_model::security::admits(
+            &self.rules,
+            velstra_cloud_model::security::Direction::Ingress,
+            client,
+            port,
+            velstra_cloud_model::security::Protocol::Tcp,
+        )
+    }
+}
+
 /// One socket this node should be listening on, and where its connections go.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Service {
@@ -55,7 +95,7 @@ pub struct Service {
     pub at: SocketAddr,
     /// Where a connection may go, in a fixed order so two passes over an
     /// unchanged world plan the same thing.
-    pub members: Vec<SocketAddr>,
+    pub members: Vec<Member>,
     /// Send a client back to the member it reached last time.
     ///
     /// The fabric does this by hashing the client's address alone instead of
@@ -109,6 +149,10 @@ pub fn plan(
     ports: &BTreeMap<String, Port>,
     mine: &dyn Fn(&Port) -> bool,
     answering: &BTreeMap<String, Vec<u32>>,
+    // What each port's security groups came to, already resolved. The agent
+    // resolves them once per pass for the firewall; the balancer reads the
+    // same answer so the two cannot disagree about what a member admits.
+    rules_of: &dyn Fn(&Port) -> Vec<velstra_cloud_model::security::ResolvedRule>,
 ) -> Vec<Service> {
     let mut out = Vec::new();
     for balancer in balancers {
@@ -164,12 +208,17 @@ pub fn plan(
                 })
                 .collect();
             let usable = serving(&health);
-            let members: Vec<SocketAddr> = usable
+            let members: Vec<Member> = usable
                 .iter()
                 .filter_map(|name| ports.get(name))
                 .filter(|port| mine(port))
-                .filter_map(|port| port.spec.address.as_ref()?.parse::<IpAddr>().ok())
-                .map(|address| SocketAddr::new(address, member_port))
+                .filter_map(|port| {
+                    let address = port.spec.address.as_ref()?.parse::<IpAddr>().ok()?;
+                    Some(Member {
+                        at: SocketAddr::new(address, member_port),
+                        rules: rules_of(port),
+                    })
+                })
                 .collect();
             if members.is_empty() {
                 continue;
@@ -241,8 +290,9 @@ pub async fn start(service: Service) -> Option<Running> {
             next = next.wrapping_add(1);
             let balancer = listening.balancer.clone();
             let members = members.clone();
+            let from_ip = from.ip();
             tokio::spawn(async move {
-                match dial(&members, first).await {
+                match dial(&members, first, from_ip).await {
                     Some((mut backend, _member)) => {
                         let mut client = client;
                         // Bytes, both ways, until either end stops. Whatever
@@ -271,19 +321,38 @@ pub async fn start(service: Service) -> Option<Running> {
 /// do. Health checking still belongs elsewhere — this is the connect that
 /// happens anyway, and it costs nothing to notice its answer.
 async fn dial(
-    members: &[SocketAddr],
+    members: &[Member],
     start_at: usize,
+    client: IpAddr,
 ) -> Option<(tokio::net::TcpStream, SocketAddr)> {
     for step in 0..members.len() {
-        let member = members[(start_at + step) % members.len()];
-        match tokio::net::TcpStream::connect(member).await {
-            Ok(backend) => return Some((backend, member)),
+        let member = &members[(start_at + step) % members.len()];
+        // The member's own firewall, asked here because the frame this node
+        // sends it never crosses the hook that firewall is on. A member whose
+        // rules do not admit this client is skipped the same way one that
+        // refuses the connection is.
+        if !member.admits(client, member.at.port()) {
+            tracing::debug!(member = %member.at, %client, "the member's rules do not admit this client");
+            continue;
+        }
+        match tokio::net::TcpStream::connect(member.at).await {
+            Ok(backend) => return Some((backend, member.at)),
             Err(e) => {
-                tracing::debug!(%member, error = %e, "a member did not take the connection");
+                tracing::debug!(member = %member.at, error = %e, "a member did not take the connection");
             }
         }
     }
     None
+}
+
+/// A member whose port carries no rules, for the plans that are not about
+/// admission.
+#[cfg(test)]
+fn open(at: SocketAddr) -> Member {
+    Member {
+        at,
+        rules: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +364,64 @@ mod tests {
     };
 
     use super::*;
+
+    fn no_rules(_: &Port) -> Vec<velstra_cloud_model::security::ResolvedRule> {
+        Vec::new()
+    }
+
+    /// **A client the member's rules do not admit is not given the member.**
+    ///
+    /// The connection this node opens to a member is sourced from the node and
+    /// never crosses the `forward` hook the member's own chains are on — so a
+    /// client the member's security group denied reached it anyway, through
+    /// the VIP. The balancer is the last thing that still knows the client,
+    /// and it asks the member's rules before handing it the connection.
+    #[test]
+    fn a_client_the_members_rules_do_not_admit_is_not_given_the_member() {
+        use velstra_cloud_model::security::{Direction, PortRange, Protocol, ResolvedRule};
+        let guarded = Member {
+            at: "10.19.136.2:443".parse().unwrap(),
+            rules: vec![ResolvedRule {
+                direction: Direction::Ingress,
+                protocol: Protocol::Tcp,
+                ports: Some(PortRange { from: 443, to: 443 }),
+                remote: "10.1.0.0/16".into(),
+            }],
+        };
+        let unfiltered = open("10.19.136.3:443".parse().unwrap());
+
+        let stranger: IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(
+            !guarded.admits(stranger, 443),
+            "a client outside the rule was admitted"
+        );
+        assert!(
+            unfiltered.admits(stranger, 443),
+            "no rules used to mean everything"
+        );
+
+        let insider: IpAddr = "10.1.4.4".parse().unwrap();
+        assert!(guarded.admits(insider, 443));
+        assert!(unfiltered.admits(insider, 443));
+
+        // The right address on the wrong port is still refused.
+        assert!(!guarded.admits(insider, 8443));
+    }
+
+    /// A security-group change does not restart a listener: two services that
+    /// differ only in a member's rules are the same service.
+    #[test]
+    fn a_rule_change_is_not_a_different_service() {
+        let a = open("10.19.136.2:443".parse().unwrap());
+        let mut b = a.clone();
+        b.rules.push(velstra_cloud_model::security::ResolvedRule {
+            direction: velstra_cloud_model::security::Direction::Ingress,
+            protocol: velstra_cloud_model::security::Protocol::Tcp,
+            ports: None,
+            remote: "0.0.0.0/0".into(),
+        });
+        assert_eq!(a, b);
+    }
 
     fn port(name: &str, address: &str) -> (String, Port) {
         (
@@ -360,6 +487,7 @@ mod tests {
             &ports,
             &everything,
             &answering,
+            &no_rules,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].at.to_string(), "10.19.136.9:443");
@@ -367,7 +495,7 @@ mod tests {
             plan[0]
                 .members
                 .iter()
-                .map(ToString::to_string)
+                .map(|m| m.at.to_string())
                 .collect::<Vec<_>>(),
             vec!["10.19.136.2:8080", "10.19.136.3:8080"]
         );
@@ -389,7 +517,7 @@ mod tests {
         );
         both.spec.listeners[1].protocol = Protocol::Udp;
 
-        let served = plan(&[both], &ports, &everything, &answering);
+        let served = plan(&[both], &ports, &everything, &answering, &no_rules);
         assert_eq!(
             served.len(),
             1,
@@ -402,7 +530,7 @@ mod tests {
         let mut udp_only = balancer(vec![listener(53, 53)], vec!["projects/p1/ports/a"]);
         udp_only.spec.listeners[0].protocol = Protocol::Udp;
         assert!(
-            plan(&[udp_only], &ports, &everything, &answering).is_empty(),
+            plan(&[udp_only], &ports, &everything, &answering, &no_rules).is_empty(),
             "a UDP-only balancer was served over TCP"
         );
     }
@@ -424,12 +552,12 @@ mod tests {
 
         let mut one_draining = balancer(vec![listener(443, 8080)], members.clone());
         one_draining.spec.draining = vec!["projects/p1/ports/a".into()];
-        let plan_one = plan(&[one_draining], &ports, &everything, &both_up);
+        let plan_one = plan(&[one_draining], &ports, &everything, &both_up, &no_rules);
         assert_eq!(
             plan_one[0]
                 .members
                 .iter()
-                .map(ToString::to_string)
+                .map(|m| m.at.to_string())
                 .collect::<Vec<_>>(),
             vec!["10.19.136.3:8080"],
             "a draining member was still handed new connections"
@@ -439,7 +567,7 @@ mod tests {
         all_draining.spec.draining =
             vec!["projects/p1/ports/a".into(), "projects/p1/ports/b".into()];
         assert!(
-            plan(&[all_draining], &ports, &everything, &both_up).is_empty(),
+            plan(&[all_draining], &ports, &everything, &both_up, &no_rules).is_empty(),
             "draining every member left the service listening"
         );
     }
@@ -453,8 +581,8 @@ mod tests {
             balancer: "projects/p1/load-balancers/b".into(),
             at: "10.19.136.9:443".parse().unwrap(),
             members: vec![
-                "10.19.136.2:8080".parse().unwrap(),
-                "10.19.136.3:8080".parse().unwrap(),
+                open("10.19.136.2:8080".parse().unwrap()),
+                open("10.19.136.3:8080".parse().unwrap()),
             ],
             affinity: true,
         };
@@ -499,12 +627,13 @@ mod tests {
             &ports,
             &everything,
             &one_up,
+            &no_rules,
         );
         assert_eq!(
             plan_one[0]
                 .members
                 .iter()
-                .map(ToString::to_string)
+                .map(|m| m.at.to_string())
                 .collect::<Vec<_>>(),
             vec!["10.19.136.2:8080"],
             "a member that answers nothing was still sent traffic"
@@ -519,6 +648,7 @@ mod tests {
             &ports,
             &everything,
             &none_up,
+            &no_rules,
         );
         assert_eq!(
             plan_none[0].members.len(),
@@ -541,8 +671,9 @@ mod tests {
             &ports,
             &everything,
             &answering,
+            &no_rules,
         );
-        assert_eq!(plan[0].members[0].to_string(), "10.19.136.2:443");
+        assert_eq!(plan[0].members[0].at.to_string(), "10.19.136.2:443");
     }
 
     /// A member this node does not carry is not a member this node can reach:
@@ -568,12 +699,13 @@ mod tests {
             &ports,
             &only_here,
             &answering,
+            &no_rules,
         );
         assert_eq!(
             plan[0]
                 .members
                 .iter()
-                .map(ToString::to_string)
+                .map(|m| m.at.to_string())
                 .collect::<Vec<_>>(),
             vec!["10.19.136.2:8080"]
         );
@@ -593,6 +725,7 @@ mod tests {
             &BTreeMap::new(),
             &everything,
             &BTreeMap::new(),
+            &no_rules,
         );
         assert!(plan.is_empty());
     }
@@ -603,7 +736,7 @@ mod tests {
         let ports = BTreeMap::from([port("projects/p1/ports/a", "10.19.136.2")]);
         let mut going = balancer(vec![listener(443, 8080)], vec!["projects/p1/ports/a"]);
         going.meta.deleted_at = Some(velstra_cloud_model::meta::Timestamp(1));
-        assert!(plan(&[going], &ports, &everything, &BTreeMap::new()).is_empty());
+        assert!(plan(&[going], &ports, &everything, &BTreeMap::new(), &no_rules).is_empty());
     }
 
     /// A member that refuses is skipped, not handed to the caller as an outage.
@@ -621,7 +754,9 @@ mod tests {
             taken.local_addr().expect("a bound listener has an address")
         };
         let members = vec![dead, alive];
-        let (_stream, took) = dial(&members, 0).await.expect("one member is up");
+        let members: Vec<Member> = members.into_iter().map(open).collect();
+        let anyone: IpAddr = "10.0.0.1".parse().unwrap();
+        let (_stream, took) = dial(&members, 0, anyone).await.expect("one member is up");
         assert_eq!(took, alive);
     }
 
@@ -635,7 +770,11 @@ mod tests {
                 .expect("the loopback has ports");
             taken.local_addr().expect("a bound listener has an address")
         };
-        assert!(dial(&[dead], 0).await.is_none());
+        assert!(
+            dial(&[open(dead)], 0, "10.0.0.1".parse().unwrap())
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -651,7 +790,7 @@ mod tests {
         let service = Service {
             balancer: "projects/p/load-balancers/b".into(),
             at,
-            members: vec![at],
+            members: vec![open(at)],
             affinity: false,
         };
         assert!(start(service).await.is_none());
@@ -679,6 +818,7 @@ mod tests {
                 &ports,
                 &everything,
                 &answering,
+                &no_rules,
             )
         };
         assert_eq!(make(), make());

@@ -8980,6 +8980,35 @@ fn check_subnet(spec: &Value, document: Document) -> ApiResult<()> {
     Ok(())
 }
 
+/// Refuse a network MTU no wire could carry.
+///
+/// A shape check, like `check_subnet`'s `/8` rule: it catches the typo, not the
+/// mismatch. Whether a given MTU fits a given node's wire is a fact about that
+/// node and is judged there, on the port. What *is* knowable here is that
+/// nothing below 1280 is an MTU on a network that has or could have a v6
+/// subnet, and nothing above 9000 is one at all — and `mtu: 42` used to be
+/// stored and handed to every guest on the network over DHCP.
+///
+/// Zero is not refused: it means "the default", which `settle_network` fills
+/// in with 1450.
+fn check_network(spec: &Value, document: Document) -> ApiResult<()> {
+    const SMALLEST: u64 = 1280;
+    const LARGEST: u64 = 9000;
+    let _ = document;
+    let Some(mtu) = spec.get("mtu").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    if mtu == 0 || (SMALLEST..=LARGEST).contains(&mtu) {
+        return Ok(());
+    }
+    Err(ApiError::invalid(format!(
+        "{mtu} is not an MTU a wire carries: between {SMALLEST} (IPv6's minimum) and \
+         {LARGEST} (jumbo). Whether it fits *this cell's* wires is judged on each node that \
+         carries a port of this network, and said on the port."
+    ))
+    .at("spec.mtu"))
+}
+
 /// Refuse a port whose pinned address is not an address.
 ///
 /// **A range is not an address.** The node takes `spec.address` almost verbatim
@@ -9040,6 +9069,9 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     }
     if kind == "ports" {
         return check_port(spec, document);
+    }
+    if kind == "networks" {
+        return check_network(spec, document);
     }
     if kind != "security-groups" {
         return Ok(());

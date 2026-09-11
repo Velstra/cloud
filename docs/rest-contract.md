@@ -1731,6 +1731,22 @@ is no path from one machine to a guest on another, so a member elsewhere is one
 that node could not reach — and it is round robin, with no weights and no
 least-connections. Both are real things and neither is worth pretending to have.
 
+**The member sees this node, not the client.** The connection is opened by the
+node agent, so a member reads the node's own address on the segment as its
+peer. The client's address is still what picks the member under
+`sessionAffinity` — the balancer knows it even though the member does not.
+Preserving it means transparent proxying (a routing rule, `IP_TRANSPARENT`, and
+a reply path this process does not own), which is fabric work.
+
+**The member's security group is consulted anyway.** Because the connection is
+node-originated it never crosses the hook a member's own firewall chains are on,
+so a client the member's rules deny would have reached it through the VIP. The
+balancer is the last thing that still knows the client, and it asks the
+member's ingress rules itself before handing over a connection: a member whose
+rules do not admit the client is skipped, exactly as one that refuses the
+connection is. On a fabric cell the fabric enforces the port's group wherever
+the packet arrives, and this does not apply.
+
 ## Long-running operations
 
 Anything that cannot finish inside the request returns an operation, AIP-151:

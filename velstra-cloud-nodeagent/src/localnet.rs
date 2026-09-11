@@ -97,7 +97,23 @@ pub struct Segment {
     /// answers for, not one it hands out. Without them on the bridge the
     /// listener has nothing to bind and the packets never arrive.
     pub vips: Vec<IpAddr>,
+    /// Routed public addresses held by guests on this segment.
+    ///
+    /// A routed address lives *in* the guest — it configures it, and defaults
+    /// out through a next hop that is in no subnet. For that to work on this
+    /// datapath the node has to answer for the next hop on the bridge and hold
+    /// a host route back in for the address, or the guest has an address and
+    /// no way to send from it and the world has no way to reach it. Nothing
+    /// on this datapath did either: the address appeared in the guest's
+    /// netplan and pointed its default route at a next hop nobody answered.
+    pub public: Vec<IpAddr>,
 }
+
+/// The next hop a guest with a routed public address defaults through, held
+/// on every bridge that carries such a guest so the host answers ARP for it.
+/// The same constant the metadata service renders — see
+/// [`velstra_cloud_model::public`].
+const NEXT_HOP_V4: &str = "169.254.1.1/32";
 
 /// One change to the machine: a command and its arguments.
 ///
@@ -111,14 +127,25 @@ pub struct LocalNet {
     prefix: String,
     ip: String,
     nft: String,
-    /// Which bridges already have somebody advertising a route on them.
+    /// Which bridges have somebody advertising a route on them, and the handle
+    /// to stop each.
     ///
     /// One task per segment, started when the segment first appears and left
     /// running: an advertiser is cheap and the alternative — starting one per
-    /// pass — is a guest hearing a hundred routers claim the same link.
-    advertising: std::sync::Mutex<std::collections::BTreeSet<String>>,
-    /// The filter ruleset last written, so an unchanged one is not written
-    /// again.
+    /// pass — is a guest hearing a hundred routers claim the same link. What
+    /// the set alone never said was when one *stops*. It never did: the task
+    /// outlived its bridge, sending into a deleted device for ever, and — the
+    /// sharp half — because the name stayed in the set, a subnet that came
+    /// **back** started no new advertiser. The old socket held the old
+    /// ifindex; the new bridge had a new one; a re-created v6 segment got no
+    /// router advertisements at all, and a v6-only guest booted with no
+    /// address and nothing saying why.
+    ///
+    /// Reconciled every pass now: gone or changed means stopped — with a
+    /// lifetime-zero withdrawal, which is the message the module doc promised
+    /// and nothing sent — and absent means started.
+    advertising: std::sync::Mutex<std::collections::BTreeMap<String, Advertiser>>,
+    /// The filter table as last written **and as the kernel then held it**.
     ///
     /// Every other ruleset here is rewritten whole on every pass, on purpose:
     /// a table assembled by adding and removing rules is one whose state
@@ -129,14 +156,93 @@ pub struct LocalNet {
     /// anything. Found on a live cell, where the drops were real and the
     /// number stayed at nought.
     ///
-    /// A cache, not state that decides anything: if it is wrong the ruleset is
-    /// written again, which is exactly what happens after a restart and costs
-    /// one reset of the counters. What it must never do is *skip* a write that
-    /// was needed, and comparing the whole text is what makes that impossible.
-    filter_in_force: std::sync::Mutex<Option<String>>,
+    /// Keyed on the kernel's own account, not on the text alone. Comparing
+    /// only what was written made the cache blind to the one thing it exists
+    /// beside: a table that is *gone* — a `flush ruleset`, an operator's hand
+    /// — read as "unchanged" for ever, and the firewall was never written
+    /// again. Now the skip needs two things: the intent is unchanged, *and*
+    /// the kernel's current account of the table equals the account taken
+    /// when it was written (handles and counters removed, because those two
+    /// change without anybody having written). Where no account can be taken
+    /// at all it falls back to the intent-only comparison — the conservative
+    /// direction for the counters, and what a machine whose `nft` has no
+    /// `-j` gets.
+    filter_in_force: std::sync::Mutex<Option<InForce>>,
+    /// The same, for the bridge-family half of the filter.
+    bridge_filter_in_force: std::sync::Mutex<Option<InForce>>,
     /// The same, for the anti-spoofing table. Its counters answer "how often
     /// did this guest claim somebody else's address", which a rewrite erases.
-    antispoof_in_force: std::sync::Mutex<Option<String>>,
+    antispoof_in_force: std::sync::Mutex<Option<InForce>>,
+    /// Whether this node can judge a frame between two guests on one bridge.
+    ///
+    /// True only once `nf_conntrack_bridge` has been verified present — see
+    /// [`LocalNet::verify_same_segment_filtering`]. Until then the bridge-family
+    /// filter is not written, because without that module every reply on the
+    /// bridge is untracked and dropped: a whole-cell outage, not a partial
+    /// one. The port says so instead.
+    same_segment: std::sync::atomic::AtomicBool,
+}
+
+/// One running router advertiser, and how to stop it.
+struct Advertiser {
+    stop: tokio::sync::watch::Sender<bool>,
+    gateway: std::net::Ipv6Addr,
+    prefix_len: u8,
+}
+
+/// What was written, and the kernel's own account of it straight afterwards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InForce {
+    wanted: String,
+    /// `None` when no account could be taken — an `nft` without `-j`, or the
+    /// write happened through something a test substituted for it.
+    kernel: Option<String>,
+}
+
+/// Whether `wanted` is already what the kernel holds.
+///
+/// Pure, so the decision that used to be one `==` and is now the whole point
+/// can be tested without a machine: an unchanged intent with a recorded
+/// account and no current one (the table is gone) is **not** in force.
+fn already_in_force(wanted: &str, recorded: Option<&InForce>, current: Option<&str>) -> bool {
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    if recorded.wanted != wanted {
+        return false;
+    }
+    match (&recorded.kernel, current) {
+        // Both accounts exist: the table has to still be the table we wrote.
+        (Some(then), Some(now)) => then == now,
+        // No account either time: fall back to the intent alone.
+        (None, None) => true,
+        // One account and not the other: something changed about what can
+        // be seen, and the safe answer is to write.
+        _ => false,
+    }
+}
+
+/// An `nft -j list table` answer with everything that changes by itself
+/// removed: every `handle`, and every counter's packets and bytes.
+fn settled(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("handle");
+            if let Some(counter) = map.get_mut("counter").and_then(|c| c.as_object_mut()) {
+                counter.insert("packets".into(), serde_json::json!(0));
+                counter.insert("bytes".into(), serde_json::json!(0));
+            }
+            for v in map.values_mut() {
+                settled(v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                settled(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl LocalNet {
@@ -145,10 +251,49 @@ impl LocalNet {
             prefix: prefix.to_string(),
             ip: "ip".to_string(),
             nft: "nft".to_string(),
-            advertising: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            advertising: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             filter_in_force: std::sync::Mutex::new(None),
+            bridge_filter_in_force: std::sync::Mutex::new(None),
             antispoof_in_force: std::sync::Mutex::new(None),
+            same_segment: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether frames between two guests on one bridge are judged here.
+    pub fn filters_same_segment(&self) -> bool {
+        self.same_segment.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Load and verify what the bridge-family filter depends on.
+    ///
+    /// `nf_conntrack_bridge` is what makes `ct state` mean anything on a
+    /// bridged frame. Without it the established/related accept never
+    /// matches and every reply to an allowed request is dropped — so the
+    /// bridge filter is written only once this has said yes. Verified by
+    /// asking the kernel whether the module is present, **not** by a probe
+    /// ruleset: `nft -c` accepts `ct state` in the bridge family whether or
+    /// not the module is loaded (checked on a real Debian 13), so a probe
+    /// would say yes about a machine that would drop every reply.
+    ///
+    /// Best effort on the `modprobe`: a machine without it, or a kernel that
+    /// built the module in, still gets the honest answer from `/sys/module`.
+    pub async fn verify_same_segment_filtering(&self) -> bool {
+        let _ = tokio::process::Command::new("modprobe")
+            .arg("nf_conntrack_bridge")
+            .output()
+            .await;
+        let present = tokio::fs::metadata("/sys/module/nf_conntrack_bridge")
+            .await
+            .is_ok();
+        if !present {
+            tracing::warn!(
+                "nf_conntrack_bridge is not loaded, so frames between two guests on one \
+                 bridge are not judged by their security groups on this node; the ports say so"
+            );
+        }
+        self.same_segment
+            .store(present, std::sync::atomic::Ordering::Relaxed);
+        present
     }
 
     /// The bridge carrying `subnet`.
@@ -210,6 +355,25 @@ impl LocalNet {
                     "addr",
                     "replace",
                     &format!("{vip}/{width}"),
+                    "dev",
+                    &bridge,
+                ]));
+            }
+            if segment.public.iter().any(|a| a.is_ipv4()) {
+                // The next hop, answered for here. `/32` on the bridge is what
+                // makes the host reply to the guest's ARP for it; the address
+                // is in no subnet, which is exactly what lets it be right on
+                // whichever bridge the guest is behind.
+                steps.push(step(["addr", "replace", NEXT_HOP_V4, "dev", &bridge]));
+            }
+            for public in &segment.public {
+                // The way back in. The guest holds the address; the kernel
+                // needs to know which bridge to put a packet for it on.
+                let width = if public.is_ipv4() { 32 } else { 128 };
+                steps.push(step([
+                    "route",
+                    "replace",
+                    &format!("{public}/{width}"),
                     "dev",
                     &bridge,
                 ]));
@@ -360,6 +524,9 @@ impl LocalNet {
                             .iter()
                             .map(|vip| format!("{vip}/{}", if vip.is_ipv4() { 32 } else { 128 })),
                     );
+                    if segment.public.iter().any(|a| a.is_ipv4()) {
+                        keep.push(NEXT_HOP_V4.to_string());
+                    }
                     // Compared as parsed `(IpAddr, prefix)`, not as strings.
                     // `keep` is built with Rust's `Display` and `bridge.addresses`
                     // with iproute2's; for v4 the two always agree, for v6 they
@@ -413,6 +580,11 @@ impl LocalNet {
         // that built the wires first would leave a window in which it could
         // claim anything. See [`crate::antispoof`].
         self.antispoof(guarded).await?;
+        // Advertisers before removals, on both paths: a withdrawal has to go
+        // out on a device that still exists, and the one case the old shape
+        // certainly never stopped was the last v6 segment leaving — the empty
+        // path never reached `advertise` at all.
+        self.advertise(segments);
         if segments.is_empty() {
             // Still swept, and still rewritten: the last guest leaving a node
             // has to take its NAT rule *and* its bridge with it. "Nothing to do"
@@ -454,7 +626,6 @@ impl LocalNet {
         self.nft(&self.ruleset(segments)).await?;
         self.filter(guarded).await?;
         forwarding_on().await?;
-        self.advertise(segments);
         Ok(())
     }
 
@@ -472,20 +643,63 @@ impl LocalNet {
     /// is the fabric it is not, and this function is not called there — a
     /// router claiming a link it does not route is worse than no router.
     fn advertise(&self, segments: &[Segment]) {
-        for segment in segments.iter().filter(|s| s.gateway.is_ipv6()) {
-            let device = self.bridge_for(&segment.subnet);
-            {
-                let mut started = self.advertising.lock().expect("the set is never poisoned");
-                if !started.insert(device.clone()) {
-                    continue;
+        let wanted: std::collections::BTreeMap<String, (std::net::Ipv6Addr, u8)> = segments
+            .iter()
+            .filter_map(|s| match s.gateway {
+                std::net::IpAddr::V6(gateway) => {
+                    Some((self.bridge_for(&s.subnet), (gateway, s.prefix_len)))
                 }
+                std::net::IpAddr::V4(_) => None,
+            })
+            .collect();
+        let mut running = self.advertising.lock().expect("the map is never poisoned");
+        // Stop what nothing wants, or wants differently. A changed gateway or
+        // prefix under the same bridge name is the same as gone: the running
+        // task holds its frame by value.
+        let stale: Vec<String> = running
+            .iter()
+            .filter(|(device, a)| {
+                wanted
+                    .get(*device)
+                    .is_none_or(|(g, l)| *g != a.gateway || *l != a.prefix_len)
+            })
+            .map(|(device, _)| device.clone())
+            .collect();
+        for device in stale {
+            if let Some(a) = running.remove(&device) {
+                // The receiver may already be gone (the socket failed to bind
+                // and the task returned); nothing to withdraw then.
+                let _ = a.stop.send(true);
             }
-            let std::net::IpAddr::V6(gateway) = segment.gateway else {
-                continue;
-            };
-            let prefix_len = segment.prefix_len;
-            tokio::spawn(crate::ra::serve(device, gateway, prefix_len));
         }
+        // Start what is missing.
+        for (device, (gateway, prefix_len)) in wanted {
+            if running.contains_key(&device) {
+                continue;
+            }
+            let (stop, rx) = tokio::sync::watch::channel(false);
+            running.insert(
+                device.clone(),
+                Advertiser {
+                    stop,
+                    gateway,
+                    prefix_len,
+                },
+            );
+            tokio::spawn(crate::ra::serve(device, gateway, prefix_len, rx));
+        }
+    }
+
+    /// Which bridges are being advertised on right now — for a test, since
+    /// the observable effect of `advertise` is the map.
+    #[cfg(test)]
+    fn advertising_on(&self) -> Vec<String> {
+        self.advertising
+            .lock()
+            .expect("the map is never poisoned")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// The same, keeping what it said.
@@ -537,68 +751,136 @@ impl LocalNet {
             })
             .collect();
         let wanted = crate::antispoof::ruleset(&bound);
-        {
-            let in_force = self
-                .antispoof_in_force
-                .lock()
-                .expect("the cache is never poisoned");
-            if in_force.as_deref() == Some(wanted.as_str()) {
-                return Ok(());
-            }
-        }
-        self.nft(&wanted).await?;
-        *self
-            .antispoof_in_force
-            .lock()
-            .expect("the cache is never poisoned") = Some(wanted);
-        Ok(())
+        self.write_once(
+            &self.antispoof_in_force,
+            "bridge",
+            crate::antispoof::TABLE,
+            wanted,
+        )
+        .await
     }
 
     /// Write the per-port firewall, unless it is already what is in force.
     ///
     /// See [`LocalNet::filter_in_force`] for why this one table is not
-    /// rewritten every pass like the others.
+    /// rewritten every pass like the others — and for what "in force" has to
+    /// mean for that to be safe.
+    ///
+    /// Two tables where the module allows: the `inet` one for routed traffic,
+    /// and the `bridge` one for frames between two guests on one bridge — see
+    /// [`crate::nftfilter::BRIDGE_TABLE`]. The second is written only once
+    /// [`LocalNet::verify_same_segment_filtering`] has said the kernel can
+    /// track a bridged flow; without that every reply would be dropped.
     async fn filter(&self, guarded: &[crate::nftfilter::Guarded]) -> Result<()> {
         let wanted = crate::nftfilter::ruleset(guarded);
+        self.write_once(
+            &self.filter_in_force,
+            "inet",
+            crate::nftfilter::TABLE,
+            wanted,
+        )
+        .await?;
+        if self.filters_same_segment() {
+            let bridged = crate::nftfilter::ruleset_bridge(guarded);
+            self.write_once(
+                &self.bridge_filter_in_force,
+                "bridge",
+                crate::nftfilter::BRIDGE_TABLE,
+                bridged,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Write `wanted` unless the kernel still holds exactly what was written
+    /// last time. The one place the three counting tables go through.
+    async fn write_once(
+        &self,
+        cache: &std::sync::Mutex<Option<InForce>>,
+        family: &str,
+        table: &str,
+        wanted: String,
+    ) -> Result<()> {
+        let current = self.as_held(family, table).await;
         {
-            let in_force = self
-                .filter_in_force
-                .lock()
-                .expect("the cache is never poisoned");
-            if in_force.as_deref() == Some(wanted.as_str()) {
+            let recorded = cache.lock().expect("the cache is never poisoned");
+            if already_in_force(&wanted, recorded.as_ref(), current.as_deref()) {
                 return Ok(());
             }
         }
         self.nft(&wanted).await?;
         // Only after it took: a remembered ruleset that was never applied is
-        // the one way this cache could skip a write that mattered.
-        *self
-            .filter_in_force
-            .lock()
-            .expect("the cache is never poisoned") = Some(wanted);
+        // the one way this cache could skip a write that mattered. And the
+        // kernel's account taken straight after, which is what the next pass
+        // compares against.
+        let kernel = self.as_held(family, table).await;
+        *cache.lock().expect("the cache is never poisoned") = Some(InForce { wanted, kernel });
         Ok(())
     }
 
-    /// The firewall table as `nft` reports it, counters and all.
+    /// The table as `nft` holds it, with everything that changes by itself
+    /// removed. `None` when it cannot be read at all — including when the
+    /// table is gone, which is the case this exists for.
+    async fn as_held(&self, family: &str, table: &str) -> Option<String> {
+        let out = tokio::process::Command::new(&self.nft)
+            .args(["-j", "list", "table", family, table])
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        settled(&mut value);
+        Some(value.to_string())
+    }
+
+    /// The firewall tables as `nft` reports them, counters and all — both
+    /// families, folded into one listing so `nftfilter::counters` reads them
+    /// as one.
     ///
     /// JSON because the text form is for people: a counter read out of
     /// `nft list ruleset` by regular expression is a reading that breaks the
     /// day somebody changes a word.
     pub async fn filter_counters(&self) -> Result<serde_json::Value> {
-        let out = tokio::process::Command::new("nft")
-            .args(["-j", "list", "table", "inet", crate::nftfilter::TABLE])
-            .output()
-            .await?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "nft list table: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
-            .into());
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let mut first_error: Option<String> = None;
+        let tables: &[(&str, &str)] = if self.filters_same_segment() {
+            &[
+                ("inet", crate::nftfilter::TABLE),
+                ("bridge", crate::nftfilter::BRIDGE_TABLE),
+            ]
+        } else {
+            &[("inet", crate::nftfilter::TABLE)]
+        };
+        for (family, table) in tables {
+            let out = tokio::process::Command::new(&self.nft)
+                .args(["-j", "list", "table", family, table])
+                .output()
+                .await?;
+            if !out.status.success() {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "nft list table {family} {table}: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )
+                });
+                continue;
+            }
+            let listing: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+                std::io::Error::other(format!("nft answered something that is not JSON: {e}"))
+            })?;
+            if let Some(items) = listing.get("nftables").and_then(|n| n.as_array()) {
+                entries.extend(items.iter().cloned());
+            }
         }
-        serde_json::from_slice(&out.stdout).map_err(|e| {
-            std::io::Error::other(format!("nft answered something that is not JSON: {e}")).into()
-        })
+        if entries.is_empty() {
+            if let Some(why) = first_error {
+                return Err(std::io::Error::other(why).into());
+            }
+        }
+        Ok(serde_json::json!({ "nftables": entries }))
     }
 
     async fn nft(&self, ruleset: &str) -> Result<()> {
@@ -721,6 +1003,9 @@ pub fn segments(
     networks: &BTreeMap<String, velstra_cloud_model::resources::NetworkSpec>,
     taps: &BTreeMap<String, String>,
     balancers: &[velstra_cloud_model::loadbalancer::LoadBalancer],
+    // Routed public addresses, so the segment holding the guest gets the next
+    // hop and the host route. Empty in a cell that hands out none.
+    floating: &[velstra_cloud_model::resources::FloatingIp],
 ) -> Vec<Segment> {
     let mut by_subnet: BTreeMap<String, Segment> = BTreeMap::new();
     for (name, port) in ports {
@@ -761,6 +1046,7 @@ pub fn segments(
                 network: format!("{}/{}", cidr.network(), cidr.prefix_len),
                 taps: Vec::new(),
                 vips: Vec::new(),
+                public: Vec::new(),
             });
         if !segment.taps.iter().any(|t| t == tap) {
             segment.taps.push(tap.clone());
@@ -788,8 +1074,38 @@ pub fn segments(
             segment.vips.push(vip);
         }
     }
+    // Routed public addresses held by a port on one of these segments. Only
+    // routed: a translated address is answered for at the edge and the guest
+    // must not hold it. Keyed by the port the address names, because that is
+    // the guest that holds it and the segment is the port's.
+    for fip in floating {
+        if fip.meta.deleted_at.is_some()
+            || fip.spec.delivery != velstra_cloud_model::public::Delivery::Routed
+            || fip.spec.port.is_empty()
+        {
+            continue;
+        }
+        let Some(port) = ports.get(&fip.spec.port) else {
+            continue;
+        };
+        let Some(segment) = by_subnet.get_mut(&port.spec.subnet) else {
+            continue;
+        };
+        let Some(address) = fip
+            .spec
+            .address
+            .as_deref()
+            .and_then(|a| a.parse::<IpAddr>().ok())
+        else {
+            continue;
+        };
+        if !segment.public.contains(&address) {
+            segment.public.push(address);
+        }
+    }
     for segment in by_subnet.values_mut() {
         segment.vips.sort();
+        segment.public.sort();
     }
     by_subnet.into_values().collect()
 }
@@ -878,7 +1194,7 @@ mod tests {
             ("projects/p/ports/b".to_string(), "vtb".to_string()),
         ]);
 
-        let segments = segments(&ports, &subnets, &logical(), &taps, &[]);
+        let segments = segments(&ports, &subnets, &logical(), &taps, &[], &[]);
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].taps, ["vta", "vtb"]);
         assert_eq!(segments[0].network, "10.42.0.0/24");
@@ -900,7 +1216,7 @@ mod tests {
             ("projects/p/ports/b".to_string(), "vtb".to_string()),
         ]);
 
-        let segments = segments(&ports, &subnets, &logical(), &taps, &[]);
+        let segments = segments(&ports, &subnets, &logical(), &taps, &[], &[]);
         assert_eq!(segments.len(), 2);
         let bridges: Vec<String> = segments
             .iter()
@@ -920,7 +1236,7 @@ mod tests {
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
-        assert!(segments(&ports, &subnets, &logical(), &taps, &[]).is_empty());
+        assert!(segments(&ports, &subnets, &logical(), &taps, &[], &[]).is_empty());
     }
 
     /// A port the fabric carries, or one on another node, has no tap here.
@@ -933,7 +1249,7 @@ mod tests {
             "10.42.0.2",
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
-        assert!(segments(&ports, &subnets, &logical(), &BTreeMap::new(), &[]).is_empty());
+        assert!(segments(&ports, &subnets, &logical(), &BTreeMap::new(), &[], &[]).is_empty());
     }
 
     /// The picture comes from the **ports**, not from running guests — which is
@@ -949,7 +1265,10 @@ mod tests {
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
-        assert_eq!(segments(&ports, &subnets, &logical(), &taps, &[]).len(), 1);
+        assert_eq!(
+            segments(&ports, &subnets, &logical(), &taps, &[], &[]).len(),
+            1
+        );
     }
 
     /// Every step has to survive being run on a machine already in the state it
@@ -963,7 +1282,7 @@ mod tests {
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
-        let segments = segments(&ports, &subnets, &logical(), &taps, &[]);
+        let segments = segments(&ports, &subnets, &logical(), &taps, &[], &[]);
         let net = net();
         assert_eq!(net.plan(&segments), net.plan(&segments));
 
@@ -997,7 +1316,7 @@ mod tests {
         )]);
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s", "10.42.0.0/24", "10.42.0.1")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
-        let full = net.ruleset(&segments(&ports, &subnets, &logical(), &taps, &[]));
+        let full = net.ruleset(&segments(&ports, &subnets, &logical(), &taps, &[], &[]));
         assert!(full.contains("ip saddr 10.42.0.0/24"), "{full}");
         // Added before deleted, or the delete fails on a node where the table
         // was never there.
@@ -1067,12 +1386,15 @@ mod on_the_machines_own_wire {
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
 
         // On an ordinary network this node is the first hop.
-        assert_eq!(segments(&ports, &subnets, &logical(), &taps, &[]).len(), 1);
+        assert_eq!(
+            segments(&ports, &subnets, &logical(), &taps, &[], &[]).len(),
+            1
+        );
 
         // On the machine's own wire it is nothing at all — no bridge of ours, no
         // address on it, and no rule in the NAT table.
         let host = on_a_host_bridge("projects/p/networks/n");
-        let segments = segments(&ports, &subnets, &host, &taps, &[]);
+        let segments = segments(&ports, &subnets, &host, &taps, &[], &[]);
         assert!(segments.is_empty(), "{segments:?}");
         assert!(!net().ruleset(&segments).contains("masquerade"));
     }
@@ -1097,6 +1419,7 @@ mod the_datapath_has_to_take_things_away_too {
             ),
             taps: Vec::new(),
             vips: Vec::new(),
+            public: Vec::new(),
         }
     }
 
@@ -1162,6 +1485,190 @@ mod the_datapath_has_to_take_things_away_too {
     /// balancer's `/128` was never reclaimed. It filters on `scope == "global"`
     /// now, which takes the v6 global and leaves the `fe80::` the kernel puts
     /// on every bridge itself.
+    /// **An advertiser stops when its segment does**, and a segment that comes
+    /// back gets one again. The set used to only ever grow: a re-created v6
+    /// segment started no new advertiser because its bridge name was already
+    /// in it, and a v6-only guest booted with no address and nothing said why.
+    #[tokio::test]
+    async fn an_advertiser_stops_when_its_segment_does_and_a_returning_one_gets_another() {
+        let net = LocalNet::new("vt");
+        let subnet = "projects/p1/subnets/six";
+        let v6 = Segment {
+            subnet: subnet.to_string(),
+            gateway: "fd00:1::1".parse().unwrap(),
+            prefix_len: 64,
+            network: "fd00:1::/64".to_string(),
+            taps: Vec::new(),
+            vips: Vec::new(),
+            public: Vec::new(),
+        };
+        let device = net.bridge_for(subnet);
+        net.advertise(std::slice::from_ref(&v6));
+        assert_eq!(net.advertising_on(), vec![device.clone()]);
+
+        net.advertise(&[]);
+        assert!(
+            net.advertising_on().is_empty(),
+            "the advertiser outlived its segment"
+        );
+
+        net.advertise(std::slice::from_ref(&v6));
+        assert_eq!(
+            net.advertising_on(),
+            vec![device],
+            "a segment that came back got no advertiser"
+        );
+
+        // A changed gateway under the same bridge is stop-and-start, because
+        // the running task holds its frame by value.
+        let moved = Segment {
+            gateway: "fd00:9::1".parse().unwrap(),
+            ..v6.clone()
+        };
+        net.advertise(std::slice::from_ref(&moved));
+        let held = net.advertising.lock().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held.values().next().unwrap().gateway,
+            "fd00:9::1".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+    }
+
+    /// **A firewall somebody flushed is written again.** The cache used to
+    /// compare only the text it had written, so a table that was gone read as
+    /// "unchanged" for ever.
+    #[test]
+    fn a_firewall_somebody_flushed_is_written_again() {
+        let recorded = InForce {
+            wanted: "table inet x {}".into(),
+            kernel: Some("{\"nftables\":[]}".into()),
+        };
+        // Same intent, the table is gone: not in force.
+        assert!(!already_in_force("table inet x {}", Some(&recorded), None));
+        // Same intent, the same table: in force.
+        assert!(already_in_force(
+            "table inet x {}",
+            Some(&recorded),
+            Some("{\"nftables\":[]}")
+        ));
+        // Same intent, a table somebody has since added a rule to: written.
+        assert!(!already_in_force(
+            "table inet x {}",
+            Some(&recorded),
+            Some("{\"nftables\":[{\"rule\":{}}]}")
+        ));
+        // A different intent is never in force.
+        assert!(!already_in_force(
+            "table inet y {}",
+            Some(&recorded),
+            Some("{\"nftables\":[]}")
+        ));
+        // Nothing recorded: written.
+        assert!(!already_in_force("table inet x {}", None, None));
+        // No account either time — an `nft` with no `-j` — falls back to the
+        // intent alone, the conservative direction for the counters.
+        let blind = InForce {
+            wanted: "table inet x {}".into(),
+            kernel: None,
+        };
+        assert!(already_in_force("table inet x {}", Some(&blind), None));
+    }
+
+    /// A table that only counted is still the table we wrote: handles and
+    /// counters are what change without anybody writing, and they are taken
+    /// out before two accounts are compared.
+    #[test]
+    fn a_table_that_only_counted_is_still_the_table_we_wrote() {
+        let mut then = serde_json::json!({"nftables": [
+            {"table": {"family": "inet", "name": "velstra-filter", "handle": 12}},
+            {"rule": {"chain": "vt-in", "handle": 40, "expr": [
+                {"counter": {"packets": 0, "bytes": 0}}, {"drop": null}]}},
+        ]});
+        let mut now = serde_json::json!({"nftables": [
+            {"table": {"family": "inet", "name": "velstra-filter", "handle": 12}},
+            {"rule": {"chain": "vt-in", "handle": 40, "expr": [
+                {"counter": {"packets": 9001, "bytes": 123456}}, {"drop": null}]}},
+        ]});
+        settled(&mut then);
+        settled(&mut now);
+        assert_eq!(
+            then, now,
+            "a firewall that merely worked would be rewritten every pass"
+        );
+    }
+
+    /// **A routed public address gets the next hop on its bridge and a host
+    /// route back in.** Neither existed: the guest was told to default through
+    /// `169.254.1.1` and nothing on this datapath answered for it.
+    #[test]
+    fn a_routed_address_gets_a_host_route_and_the_next_hop_on_the_bridge() {
+        use velstra_cloud_model::resources::{
+            FloatingIpSpec, FloatingIpStatus, Subnet, SubnetSpec,
+        };
+
+        use super::tests::{meta, port};
+        let net = net();
+        let ports = BTreeMap::from([port(
+            "projects/p/ports/a",
+            "projects/p/subnets/s",
+            "10.42.0.5",
+        )]);
+        let subnets = BTreeMap::from([(
+            "projects/p/subnets/s".to_string(),
+            Subnet::new(
+                meta("projects/p/subnets/s"),
+                SubnetSpec {
+                    network: "projects/p/networks/n".into(),
+                    cidr: "10.42.0.0/24".into(),
+                    gateway: "10.42.0.1".into(),
+                    dns: vec![],
+                    reserved: vec![],
+                },
+                Default::default(),
+            ),
+        )]);
+        let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vta".to_string())]);
+        let fip = velstra_cloud_model::resources::FloatingIp::new(
+            meta("projects/p/floatingips/f"),
+            FloatingIpSpec {
+                subnet: "subnets/public".into(),
+                address: Some("203.0.113.7".into()),
+                port: "projects/p/ports/a".into(),
+                delivery: velstra_cloud_model::public::Delivery::Routed,
+                ..Default::default()
+            },
+            FloatingIpStatus::default(),
+        );
+        let segs = segments(&ports, &subnets, &BTreeMap::new(), &taps, &[], &[fip]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(
+            segs[0].public,
+            vec!["203.0.113.7".parse::<IpAddr>().unwrap()]
+        );
+
+        let bridge = net.bridge_for("projects/p/subnets/s");
+        let flat: Vec<String> = net.plan(&segs).iter().map(|s| s.join(" ")).collect();
+        assert!(
+            flat.contains(&format!("addr replace 169.254.1.1/32 dev {bridge}")),
+            "the next hop is not answered for: {flat:?}"
+        );
+        assert!(
+            flat.contains(&format!("route replace 203.0.113.7/32 dev {bridge}")),
+            "no way back in to the address: {flat:?}"
+        );
+        // And the sweep leaves the next hop alone.
+        let held = bridge_with(&bridge, &["10.42.0.1/24", "169.254.1.1/32"], &[]);
+        let removed: Vec<String> = net
+            .removals(&segs, &[held])
+            .iter()
+            .map(|s| s.join(" "))
+            .collect();
+        assert!(
+            !removed.iter().any(|s| s.contains("169.254.1.1")),
+            "the sweep took the next hop off again: {removed:?}"
+        );
+    }
+
     #[test]
     fn a_bridges_link_local_is_not_ours_but_its_globals_are() {
         let link = serde_json::json!({
@@ -1199,6 +1706,7 @@ mod the_datapath_has_to_take_things_away_too {
             network: "fd00:1::/64".to_string(),
             taps: Vec::new(),
             vips: Vec::new(),
+            public: Vec::new(),
         };
         let observed = vec![bridge(&name, &["fd00:1::1/64", "fd00:9::1/64"])];
         let steps: Vec<String> = net
@@ -1332,7 +1840,7 @@ mod v6_tests {
         let subnets = BTreeMap::from([subnet("projects/p/subnets/s6", "fd00:1::/64", "fd00:1::1")]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vtap1".to_string())]);
 
-        let segments = segments(&ports, &subnets, &logical(), &taps, &[]);
+        let segments = segments(&ports, &subnets, &logical(), &taps, &[], &[]);
         assert_eq!(segments.len(), 1, "a v6 subnet was skipped: {segments:?}");
         assert_eq!(segments[0].gateway.to_string(), "fd00:1::1");
         assert_eq!(segments[0].prefix_len, 64);
@@ -1353,6 +1861,7 @@ mod v6_tests {
             network: "fd00:1::/64".into(),
             taps: vec!["vtap1".into()],
             vips: Vec::new(),
+            public: Vec::new(),
         };
         let v4 = Segment {
             subnet: "projects/p/subnets/s4".into(),
@@ -1361,6 +1870,7 @@ mod v6_tests {
             network: "10.19.136.0/24".into(),
             taps: vec!["vtap2".into()],
             vips: Vec::new(),
+            public: Vec::new(),
         };
         let rules = net.ruleset(&[v6, v4]);
         assert!(
@@ -1389,7 +1899,7 @@ mod v6_tests {
             "10.19.136.1",
         )]);
         let taps = BTreeMap::from([("projects/p/ports/a".to_string(), "vtap1".to_string())]);
-        assert!(segments(&ports, &subnets, &logical(), &taps, &[]).is_empty());
+        assert!(segments(&ports, &subnets, &logical(), &taps, &[], &[]).is_empty());
     }
 }
 
@@ -1440,6 +1950,7 @@ mod balancer_addresses {
             &logical(),
             &taps,
             &[a_balancer("projects/p/subnets/s", "10.42.0.9")],
+            &[],
         );
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].vips.len(), 1);
@@ -1500,6 +2011,7 @@ mod balancer_addresses {
             &logical(),
             &taps,
             &[a_balancer("projects/p/subnets/somewhere-else", "10.99.0.9")],
+            &[],
         );
         assert!(segments[0].vips.is_empty());
     }

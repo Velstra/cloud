@@ -226,7 +226,13 @@ was told, never that a session exists.
 2. The external network's subnet carries the real prefix and the real upstream
    gateway.
 
-*The fabric's, and these are the open items:*
+*The datapath's — and until these are true on a node, that node does not
+configure a routed address into its guests at all.* A guest told to default
+through a next hop nobody answers for is a guest off the network, which is
+worse than an address that does not work; the address stays allocated and its
+condition says so. On the local datapath (`--local-network`) the node answers
+for the next hop and routes the address itself; on a fabric cell these are the
+fabric's open items:
 
 3. **Answer for the next hop.** A guest routes through `169.254.1.1` (or
    `fe80::1`), which is in no subnet: the host has to answer ARP/ND for it and
