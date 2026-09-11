@@ -1,4 +1,5 @@
 import { listEvery } from "@/lib/listing";
+import { collectionChanged } from "@/hooks/useCollection";
 // Wiring: sign in, sweep the census the rail and the inbox are drawn from,
 // and route between the overview and a board with its detail pane beside it.
 
@@ -54,7 +55,15 @@ export default function App() {
     // Records — audit entries, usage readings — are facts about the past, not
     // objects anybody manages, and a cell keeps hundreds of thousands of them.
     // The census counts what converges; those two are read where they are shown.
-    await Promise.all(SCHEMA.filter((c) => (who.cellAdmin || c.scope === "project") && c.id !== "audit" && c.id !== "usage").map(async (c) => {
+    // Everything this person can read, including the plumbing: the map and the
+    // relations panel are drawn from it, and a port that is not in the census
+    // is a wire missing from the picture. What it does *not* sweep is what the
+    // API would refuse — a tenant's census used to ask for `migrations` and
+    // `nodes` and count two silent 403s as "nothing there".
+    const mine = SCHEMA.filter((c) =>
+      (who.cellAdmin ? c.audience !== undefined : c.audience !== "operator")
+      && c.id !== "audit" && c.id !== "usage");
+    await Promise.all(mine.map(async (c) => {
       try {
         const items: Resource[] = (await listEvery(c, project)).rows;
         all[c.id] = items;
@@ -101,7 +110,12 @@ export default function App() {
                         </div>
                         <div className="px-5 py-4">
                           <Form coll={coll}
-                            onDone={(r) => { toast(`${r.meta.name.split("/").pop()} created.`); sweep(); go({ view: "board", coll: coll.id, id: r.meta.name.split("/").pop()! }); }}
+                            onDone={(r) => {
+                              const id = r.meta.name.split("/").pop()!;
+                              toast(`${id} created.`, { description: "The platform is making it; this page follows along." });
+                              sweep(); collectionChanged(coll.id);
+                              go({ view: "board", coll: coll.id, id });
+                            }}
                             onCancel={() => go({ view: "board", coll: coll.id })} />
                         </div>
                       </div>

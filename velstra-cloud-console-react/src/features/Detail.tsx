@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { call } from "@/api/transport";
+import { collectionChanged } from "@/hooks/useCollection";
 import { disagreements, humanise, idOf, nameOf, refusals, verdict, type Resource } from "@/lib/model";
 import { pathOf, projectOf, type Collection } from "@/lib/schema";
 import { entry, objectActions } from "@/registry";
@@ -29,6 +30,7 @@ export function Detail({ coll, id, mode, onChanged }: {
   coll: Collection; id: string; mode?: "edit"; onChanged: () => void;
 }) {
   const project = useStore((s) => s.project);
+  const who = useStore((s) => s.who);
   const can = useCan();
   const [r, setR] = useState<Resource | null>(null);
   const [err, setErr] = useState("");
@@ -51,7 +53,7 @@ export function Detail({ coll, id, mode, onChanged }: {
 
   const v = verdict(r, coll);
   const diffs = disagreements(r, coll);
-  const actions = objectActions(coll.id);
+  const actions = objectActions(coll.id, !!who?.cellAdmin);
   const custom = entry(coll.id);
   const here = projectOf(nameOf(r)) ?? project;
   const mayOperate = can("operate", coll, here); const mayWrite = can("write", coll, here);
@@ -60,7 +62,11 @@ export function Detail({ coll, id, mode, onChanged }: {
     return (
       <Pane title={`Edit ${idOf(r)}`} sub={nameOf(r)} onClose={() => go({ view: "board", coll: coll.id, id })}>
         <Form coll={coll} existing={r}
-          onDone={(saved) => { toast(`${idOf(saved)} saved.`); setR(saved); onChanged(); go({ view: "board", coll: coll.id, id }); }}
+          onDone={(saved) => {
+            toast(`${idOf(saved)} saved.`);
+            setR(saved); onChanged(); collectionChanged(coll.id);
+            go({ view: "board", coll: coll.id, id });
+          }}
           onCancel={() => go({ view: "board", coll: coll.id, id })} />
       </Pane>
     );
@@ -88,7 +94,8 @@ export function Detail({ coll, id, mode, onChanged }: {
               if (!confirm(`Delete ${idOf(r)}? It stays visible until its finalizers let go.`)) return;
               try {
                 await call(`delete:${coll.id}`, "DELETE", `${pathOf(coll, r, project)}/${encodeURIComponent(idOf(r))}`);
-                toast("Deletion asked for."); onChanged(); close();
+                toast("Deletion asked for.", { description: "It stays listed until its finalizers let go." });
+                onChanged(); collectionChanged(coll.id); close();
               } catch (e) { toast.error((e as Error).message); }
             }}><Trash2 className="size-3.5" /> Delete</Pressed>
           )}

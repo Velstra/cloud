@@ -30,6 +30,7 @@ import { State } from "./State";
 
 export function Board({ coll, selectedId, narrow }: { coll: Collection; selectedId?: string; narrow?: boolean }) {
   const project = useStore((s) => s.project);
+  const who = useStore((s) => s.who);
   const density = useStore((s) => s.density);
   // How this board was left: sort, columns, filters — kept per collection, so
   // the board you tuned yesterday is the board you get today.
@@ -191,7 +192,7 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
           </div>
         )}
         <div className="ml-auto flex items-center gap-2">
-          {collectionActions(coll.id).map((a) => (
+          {collectionActions(coll.id, !!who?.cellAdmin).map((a) => (
             <Pressed key={a.id} size="sm" title={a.summary} variant="secondary" onPress={async () => {
               try {
                 const r = await call(a.id, a.method, a.path.replace("{project}", project), undefined, a.needsBody ? {} : undefined);

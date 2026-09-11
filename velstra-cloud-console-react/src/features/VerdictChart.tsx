@@ -13,7 +13,13 @@ export function VerdictChart({ census }: { census: Record<string, { rows: Resour
     for (const r of census[c.id].rows) (n[verdict(r, c).kind] as number)++;
     return n;
   });
-  if (!data.length) return <p className="px-5 py-4 text-xs" style={{ color: "var(--text-faint)" }}>Nothing read yet.</p>;
+  if (!data.length) {
+    return (
+      <p className="px-5 py-4 text-xs" style={{ color: "var(--text-faint)" }}>
+        Nothing here yet — this fills in as soon as there is something to draw.
+      </p>
+    );
+  }
   const tone = (k: string) => k === "failing" ? "var(--dot-failing)" : k === "drifting" ? "var(--dot-drifting)" : k === "settled" ? "var(--dot-settled)" : "var(--border-strong)";
   return (
     <div className="h-[220px] px-3 py-3">
