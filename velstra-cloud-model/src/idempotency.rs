@@ -22,10 +22,16 @@
 //! without the check is one object where there should have been fifty, with
 //! forty-nine successful-looking answers.
 //!
-//! **Why it is scoped by caller.** The key is the caller's own invention, so
-//! two tenants will eventually pick the same string. Scoping the record by
-//! subject makes that a non-event instead of one tenant's create answering
-//! another's.
+//! **Why it is scoped by caller — and by what was being made.** The key is the
+//! caller's own invention, so two tenants will eventually pick the same string,
+//! and so will one tenant across two scripts. The record is named by the
+//! subject *and* by the parent and collection the create was aimed at, so both
+//! collisions are non-events rather than one create answering another's.
+//!
+//! The narrower scope is the honest one: a key stands for "this create", and
+//! one volume and one instance asked for under the same string are two creates.
+//! Refusing the second would be the API inventing a conflict out of a client's
+//! naming habit.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,6 +48,22 @@ pub const IDEMPOTENCY_KIND: &str = "idempotency";
 /// retry after an outage still lands, short enough that the store is not an
 /// archive of every create ever made.
 pub const KEY_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// How long an unanswered **claim** is believed.
+///
+/// The claim is written before the create is attempted, so that two attempts
+/// arriving together cannot both do the work — and a process that dies in
+/// between leaves one behind with nobody to finish it. Believed for the day a
+/// finished record is believed, that claim is a key its owner can never spend:
+/// every retry is told the first attempt is still in flight, forever, and the
+/// object they asked for is never made.
+///
+/// Two minutes: longer than any create this platform accepts takes to answer
+/// (it answers with an operation and converges afterwards, so the synchronous
+/// half is a handful of store writes), and short enough that a crash costs a
+/// retry rather than a day. Past it the claim is taken over, which is the
+/// compare-and-set the claim path already does.
+pub const CLAIM_LIFETIME_MS: u64 = 2 * 60 * 1000;
 
 /// The longest key that will be accepted.
 ///
@@ -77,6 +99,13 @@ impl Replay {
     /// Claimed, but not yet answered: a create under this key is in flight.
     pub fn in_flight(&self) -> bool {
         self.operation.is_none()
+    }
+
+    /// A claim nobody came back for. See [`CLAIM_LIFETIME_MS`]: the first
+    /// attempt died between claiming the key and answering, and the claim is
+    /// taken over rather than believed until the key expires.
+    pub fn abandoned(&self, now: Timestamp) -> bool {
+        self.in_flight() && now.0.saturating_sub(self.at.0) >= CLAIM_LIFETIME_MS
     }
 
     /// Past its day. An expired record is treated as absent rather than
