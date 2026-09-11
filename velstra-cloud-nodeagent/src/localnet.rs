@@ -300,19 +300,7 @@ impl LocalNet {
                 if !name.starts_with(&self.prefix) {
                     return None;
                 }
-                let addresses = link
-                    .get("addr_info")?
-                    .as_array()?
-                    .iter()
-                    .filter(|a| a.get("family").and_then(|f| f.as_str()) == Some("inet"))
-                    .filter_map(|a| {
-                        Some(format!(
-                            "{}/{}",
-                            a.get("local")?.as_str()?,
-                            a.get("prefixlen")?.as_u64()?
-                        ))
-                    })
-                    .collect();
+                let addresses = addresses_of_value(link);
                 let members = members.get(&name).cloned().unwrap_or_default();
                 Some(Bridge {
                     name,
@@ -372,8 +360,16 @@ impl LocalNet {
                             .iter()
                             .map(|vip| format!("{vip}/{}", if vip.is_ipv4() { 32 } else { 128 })),
                     );
+                    // Compared as parsed `(IpAddr, prefix)`, not as strings.
+                    // `keep` is built with Rust's `Display` and `bridge.addresses`
+                    // with iproute2's; for v4 the two always agree, for v6 they
+                    // agree in the ordinary case and are not guaranteed to for
+                    // every spelling — and a disagreement here is not cosmetic,
+                    // it deletes the gateway it has just added, every pass.
+                    let kept: Vec<_> = keep.iter().filter_map(|a| parse_cidr(a)).collect();
                     for address in &bridge.addresses {
-                        if !keep.contains(address) {
+                        let mine = parse_cidr(address);
+                        if mine.is_none_or(|m| !kept.contains(&m)) {
                             steps.push(step(["addr", "del", address, "dev", &bridge.name]));
                         }
                     }
@@ -658,6 +654,41 @@ async fn forwarding_on() -> Result<()> {
         tracing::debug!(error = %e, "{v6} could not be written; v6 segments will not forward");
     }
     Ok(())
+}
+
+/// The global addresses on one link, from `ip -j addr show`.
+///
+/// **Filtered by scope, not by family.** It was `family == "inet"`, which meant
+/// `removals` never saw a v6 address at all: a v6 gateway that moved stayed
+/// behind on the old bridge for ever, and a deleted balancer's `/128` VIP was
+/// never taken back. It cannot simply take *every* v6 address either — the
+/// kernel puts an `fe80::/10` link-local on every bridge by itself, and
+/// `removals` would delete it on every pass with the kernel putting it straight
+/// back. `scope == "global"` keeps the reason the family filter existed and
+/// drops the accident. Pure, so it is tested without a machine.
+/// `10.0.0.1/24` as `(IpAddr, prefix)`, or `None` for anything that is not one.
+/// Two renderings of the same address parse to the same pair, which is why the
+/// removal check compares these and not the strings.
+fn parse_cidr(text: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (addr, prefix) = text.split_once('/')?;
+    Some((addr.parse().ok()?, prefix.parse().ok()?))
+}
+
+fn addresses_of_value(link: &serde_json::Value) -> Vec<String> {
+    link.get("addr_info")
+        .and_then(|a| a.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|a| a.get("scope").and_then(|s| s.as_str()) == Some("global"))
+        .filter_map(|a| {
+            Some(format!(
+                "{}/{}",
+                a.get("local")?.as_str()?,
+                a.get("prefixlen")?.as_u64()?
+            ))
+        })
+        .collect()
 }
 
 fn step<const N: usize>(args: [&str; N]) -> Step {
@@ -1121,6 +1152,69 @@ mod the_datapath_has_to_take_things_away_too {
         assert!(
             !flat.iter().any(|s| s.starts_with("link del")),
             "a guest's wire was cut: {flat:?}"
+        );
+    }
+
+    /// **The link-local the kernel adds is not ours to remove; a v6 global is.**
+    ///
+    /// The picker filtered on `family == "inet"`, so `removals` never saw a v6
+    /// address at all — a v6 gateway that moved stayed for ever, and a deleted
+    /// balancer's `/128` was never reclaimed. It filters on `scope == "global"`
+    /// now, which takes the v6 global and leaves the `fe80::` the kernel puts
+    /// on every bridge itself.
+    #[test]
+    fn a_bridges_link_local_is_not_ours_but_its_globals_are() {
+        let link = serde_json::json!({
+            "ifname": "vtbr0",
+            "addr_info": [
+                { "local": "10.19.136.1", "prefixlen": 24, "scope": "global", "family": "inet" },
+                { "local": "fd00:19::1", "prefixlen": 64, "scope": "global", "family": "inet6" },
+                { "local": "fe80::1", "prefixlen": 64, "scope": "link", "family": "inet6" },
+            ]
+        });
+        let got = super::addresses_of_value(&link);
+        assert!(got.contains(&"10.19.136.1/24".to_string()), "{got:?}");
+        assert!(
+            got.contains(&"fd00:19::1/64".to_string()),
+            "the v6 global was dropped: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|a| a.starts_with("fe80")),
+            "the link-local was kept: {got:?}"
+        );
+    }
+
+    /// The v6 mirror of the stale-gateway case: a network remade on a new v6
+    /// range leaves the old gateway behind on the bridge, and nothing takes it
+    /// off because `observed` never reported it.
+    #[test]
+    fn a_v6_gateway_that_moved_does_not_stay_behind() {
+        let net = net();
+        let subnet = "projects/p1/subnets/default";
+        let name = net.bridge_for(subnet);
+        let wanted = Segment {
+            subnet: subnet.to_string(),
+            gateway: "fd00:1::1".parse().unwrap(),
+            prefix_len: 64,
+            network: "fd00:1::/64".to_string(),
+            taps: Vec::new(),
+            vips: Vec::new(),
+        };
+        let observed = vec![bridge(&name, &["fd00:1::1/64", "fd00:9::1/64"])];
+        let steps: Vec<String> = net
+            .removals(&[wanted], &observed)
+            .iter()
+            .map(|s| s.join(" "))
+            .collect();
+        assert!(
+            steps
+                .iter()
+                .any(|s| s == &format!("addr del fd00:9::1/64 dev {name}")),
+            "the stale v6 gateway was left behind: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.contains("fd00:1::1")),
+            "the current v6 gateway was removed: {steps:?}"
         );
     }
 

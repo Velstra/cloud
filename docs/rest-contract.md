@@ -1448,6 +1448,15 @@ Four things a client may rely on:
 - **Naming a group that does not exist is not an error.** Rules only add
   allowances, so a missing group is strictly fewer of them — the safe direction
   — and the port keeps working rather than a typo costing a guest its network.
+
+**On a cell whose datapath is the fabric, egress is closed.** The fabric's
+wire carries one default per group rather than one per direction, so a port
+that names any group is denied outbound except for the egress rules it
+carries, and a port that names no group at all is denied in both directions.
+That is not what the first bullet says, and it is stated here rather than left
+to be discovered: a guest that is reachable and can reach nothing looks like a
+broken image. The local datapath does what the bullet says. Closing the gap
+needs a per-direction default on the fabric's own API.
   It is reported on the node that noticed.
 
 A rule whose port range is set on a protocol that has no ports, or that runs

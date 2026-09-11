@@ -225,12 +225,28 @@ pub enum Unprogrammable {
 /// naming what to write instead costs somebody a minute, and a rule that is
 /// accepted and silently wedges an instance costs an afternoon.
 pub fn programmable(rule: &SecurityRule) -> Result<(), Unprogrammable> {
-    if rule.protocol == Protocol::Any {
+    programmable_shape(rule.protocol, rule.ports)
+}
+
+/// The same question, asked of a rule that has already been resolved.
+///
+/// A [`ResolvedRule`] differs only in carrying its remote as a string, so the
+/// judgement is identical — and it has to be *the same code*, because the two
+/// are asked at two different doors and a second copy would drift. The API asks
+/// [`programmable`] on write; a node asks this of what actually reached it,
+/// which is not the same set: an object written before that door existed, a
+/// restore, or a direct store write all arrive without having passed it.
+pub fn programmable_resolved(rule: &ResolvedRule) -> Result<(), Unprogrammable> {
+    programmable_shape(rule.protocol, rule.ports)
+}
+
+fn programmable_shape(protocol: Protocol, ports: Option<PortRange>) -> Result<(), Unprogrammable> {
+    if protocol == Protocol::Any {
         return Err(Unprogrammable::EveryProtocol);
     }
-    match rule.ports {
-        None if rule.protocol.has_ports() => Err(Unprogrammable::EveryPort {
-            protocol: match rule.protocol {
+    match ports {
+        None if protocol.has_ports() => Err(Unprogrammable::EveryPort {
+            protocol: match protocol {
                 Protocol::Tcp => "tcp",
                 Protocol::Udp => "udp",
                 _ => "",

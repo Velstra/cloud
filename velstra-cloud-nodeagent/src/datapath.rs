@@ -364,6 +364,43 @@ impl Datapath for TapDatapath {
                 unenforceable.join(" and ")
             )));
         }
+        // **A rule this node cannot key stops the port, the way it does on the
+        // fabric.**
+        //
+        // The API refuses such a rule on write, and that is not the same set as
+        // what reaches a node: an object written before that door existed, a
+        // restore, or a direct store write all arrive without having passed it.
+        // The two datapaths then gave opposite answers — the fabric refused the
+        // whole port with a sentence, and here `matcher` dropped the rule while
+        // the port's chains were still written with their terminal drop. A port
+        // whose only rule was `any` therefore got a chain with no accepts in it
+        // at all: the broadest rule an operator can write became total
+        // isolation, silently.
+        //
+        // Refused here rather than filtered out of the resolution, because the
+        // resolution is what *both* datapaths read: dropping the rule there
+        // would hand the fabric a port it would happily program without its
+        // widest rule, which is the exact failure the fabric refuses for.
+        if self.filtered_elsewhere
+            && let Some((rule, why)) = rules.iter().find_map(|r| {
+                velstra_cloud_model::security::programmable_resolved(r)
+                    .err()
+                    .map(|why| (r, why))
+            })
+        {
+            return Err(HostError::failed(format!(
+                "{port} carries a rule this node cannot program: {why}. It names \
+                 {:?} {} from {}. Until it is changed the port is left unprogrammed rather \
+                 than programmed without it — a rule dropped in silence is a port that reports \
+                 its groups in force while the widest of them does nothing.",
+                rule.protocol,
+                match rule.ports {
+                    Some(range) => format!("{}-{}", range.from, range.to),
+                    None => "every port".to_string(),
+                },
+                rule.remote,
+            )));
+        }
         let tap = self.tap_for(port);
         if !self.present(&tap).await {
             let owner = self.owner.map(|uid| uid.to_string());
@@ -551,6 +588,88 @@ mod tests {
         // And where nothing holds them, the disagreement is real — though a
         // port like this is refused in `program` before it gets here.
         assert!(!TapDatapath::new("vt", None).agrees("projects/p1/ports/web", &have, &want));
+    }
+
+    /// **A rule this node cannot key stops the port here too.**
+    ///
+    /// The two datapaths used to give opposite answers to the same object. The
+    /// fabric refused the whole port with a sentence; here `matcher` dropped
+    /// the rule and the port's chains were written anyway, each ending in its
+    /// terminal drop — so a port whose only rule was `any` got a chain that
+    /// accepted nothing at all. The broadest rule an operator can write became
+    /// total isolation, silently.
+    #[tokio::test]
+    async fn a_rule_this_node_cannot_key_stops_the_port_here_too() {
+        use velstra_cloud_model::security::{Direction, Protocol};
+        let mut dp = TapDatapath::new("vt", None).filtered_elsewhere();
+        dp.ip = "/nonexistent/bin/ip".to_string();
+        let refused = dp
+            .program(
+                "projects/p1/ports/web",
+                &PortSpec::default(),
+                &NetworkSpec::default(),
+                &[ResolvedRule {
+                    direction: Direction::Ingress,
+                    protocol: Protocol::Any,
+                    ports: None,
+                    remote: "0.0.0.0/0".into(),
+                }],
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("cannot program"),
+            "a rule nothing here can key was accepted: {refused:?}"
+        );
+        assert!(
+            refused.contains("every protocol"),
+            "the refusal does not say what is wrong with the rule: {refused}"
+        );
+    }
+
+    /// The two doors ask one question. A second copy of the shape test would
+    /// eventually disagree with the first, and the disagreement would be
+    /// invisible: the API would take a rule a node then refuses, or the other
+    /// way round.
+    #[test]
+    fn a_resolved_rule_is_judged_by_the_same_rule_as_a_written_one() {
+        use velstra_cloud_model::security::{
+            Direction, PortRange, Protocol, Remote, SecurityRule, programmable,
+            programmable_resolved,
+        };
+        for (protocol, ports) in [
+            (Protocol::Any, None),
+            (Protocol::Tcp, None),
+            (
+                Protocol::Tcp,
+                Some(PortRange {
+                    from: 1,
+                    to: 40_000,
+                }),
+            ),
+            (Protocol::Tcp, Some(PortRange { from: 443, to: 443 })),
+            (Protocol::Icmp, None),
+        ] {
+            let written = programmable(&SecurityRule {
+                direction: Direction::Ingress,
+                protocol,
+                ports,
+                remote: Remote::Cidr("0.0.0.0/0".into()),
+            });
+            let resolved = programmable_resolved(&ResolvedRule {
+                direction: Direction::Ingress,
+                protocol,
+                ports,
+                remote: "0.0.0.0/0".into(),
+            });
+            assert_eq!(
+                written.as_ref().err().map(ToString::to_string),
+                resolved.as_ref().err().map(ToString::to_string),
+                "the two doors disagree about {protocol:?} {ports:?}"
+            );
+        }
     }
 
     /// The refusal is about *this datapath enforcing nothing*, not about the

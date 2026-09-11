@@ -19,12 +19,26 @@
 //! segment shares it. The address does not: it is the one thing that
 //! identifies a port to the kernel at the layer this hook runs at.
 //!
-//! **Default deny, both directions**, once a port has any rule at all. A port
-//! with no rules is unfiltered, which is what it was before and what a cell
-//! with no security groups expects. The moment a port carries one rule, that
-//! rule is the whole of what is allowed — which is what a security group
-//! means everywhere else, and the only reading under which adding a rule
-//! cannot silently widen anything.
+//! **Deny per direction, once a port has a rule in that direction.** A port
+//! with no rules at all is unfiltered. A port that carries ingress rules is
+//! denied inbound except for those; a port that carries egress rules is denied
+//! outbound except for those. A direction nobody has written a rule for is
+//! open, which is the platform's stated stance — `velstra_cloud_model::security`
+//! says it in as many words, and the REST contract publishes it as something a
+//! client may rely on.
+//!
+//! It used to deny both directions the moment a port carried any rule at all,
+//! which meant a port with one ingress rule got an egress chain whose only
+//! entry was the drop: every guest with a security group could be reached and
+//! could reach nothing. That is the failure the model's own doc argues
+//! against — "a guest that cannot reach anything cannot finish its own boot,
+//! and a platform whose default leaves every new instance broken teaches
+//! people to attach a permit-everything group and stop thinking about it".
+//!
+//! The property that reading was protecting survives intact: adding a rule
+//! still cannot widen anything. An egress rule added to a port that had none
+//! turns egress from open into that-rule-only, which narrows; the same the
+//! other way round.
 //!
 //! Established traffic comes back. A rule saying "TCP 443 from anywhere" is a
 //! rule about who may *start* a conversation; making the answer to an
@@ -110,19 +124,32 @@ pub fn ruleset(guarded: &[Guarded]) -> String {
         // is what a person writing a rule means.
         for address in &g.addresses {
             let family = family_of(address);
-            out.push_str(&format!(
-                "    {family} daddr {address} jump {}\n",
-                chain(&g.tap, Direction::Ingress)
-            ));
-            out.push_str(&format!(
-                "    {family} saddr {address} jump {}\n",
-                chain(&g.tap, Direction::Egress)
-            ));
+            for direction in [Direction::Ingress, Direction::Egress] {
+                // **Only the direction this port actually has rules in.** No
+                // jump means no chain means no drop: the direction is carried
+                // by the `forward` policy above, which accepts. A chain with
+                // nothing in it but its own drop is a closed direction nobody
+                // asked to close.
+                if !has_rules(g, direction) {
+                    continue;
+                }
+                let which = match direction {
+                    Direction::Ingress => "daddr",
+                    Direction::Egress => "saddr",
+                };
+                out.push_str(&format!(
+                    "    {family} {which} {address} jump {}\n",
+                    chain(&g.tap, direction)
+                ));
+            }
         }
     }
     out.push_str("  }\n");
     for g in &filtered {
         for direction in [Direction::Ingress, Direction::Egress] {
+            if !has_rules(g, direction) {
+                continue;
+            }
             out.push_str(&format!("  chain {} {{\n", chain(&g.tap, direction)));
             for rule in g.rules.iter().filter(|r| r.direction == direction) {
                 if let Some(line) = matcher(rule, direction) {
@@ -138,6 +165,15 @@ pub fn ruleset(guarded: &[Guarded]) -> String {
     }
     out.push_str("}\n");
     out
+}
+
+/// Whether this port has anything to say about that direction.
+///
+/// The whole of the per-direction stance: a direction with a rule is denied
+/// except for it, and a direction with none is left to the `forward` policy,
+/// which accepts.
+fn has_rules(g: &Guarded, direction: Direction) -> bool {
+    g.rules.iter().any(|r| r.direction == direction)
 }
 
 /// `ip` or `ip6`, from an address or prefix.
@@ -202,12 +238,24 @@ fn matcher(rule: &ResolvedRule, direction: Direction) -> Option<String> {
             }
         }
         Protocol::Icmp => {
-            // Both families, and named separately because nftables does: a
-            // cell that is dual-stack has guests that are pinged over both.
-            parts.push(if family == "ip6" {
-                "meta l4proto ipv6-icmp".to_string()
-            } else {
-                "meta l4proto icmp".to_string()
+            // **The family follows the rule, not the remote string.**
+            //
+            // Both families are named separately because nftables does: a cell
+            // that is dual-stack has guests that are pinged over both. The
+            // choice used to be made from whether the *remote* contained a
+            // colon — which is the wrong fact. A remote that is a real prefix
+            // does settle it: `10.0.0.0/8` can only be v4. But `0.0.0.0/0` is
+            // how "allow ping from anywhere" is written, and it is deliberately
+            // a statement about both families (the address match above is
+            // dropped for exactly that reason) — so it emitted `icmp` alone,
+            // and every ICMPv6 to that guest fell through to the terminal drop.
+            //
+            // One set rather than two rules, so "what matched" stays one number
+            // per rule and `counters()` keeps its shape.
+            parts.push(match rule.remote.as_str() {
+                "0.0.0.0/0" | "::/0" => "meta l4proto { icmp, ipv6-icmp }".to_string(),
+                _ if family == "ip6" => "meta l4proto ipv6-icmp".to_string(),
+                _ => "meta l4proto icmp".to_string(),
             });
         }
         // Refused where it is written; see the module doc.
@@ -357,12 +405,21 @@ mod tests {
     /// right and blocks everything.
     #[test]
     fn the_directions_are_named_from_the_guests_point_of_view() {
-        let text = ruleset(&[guarded(vec![rule(
-            Direction::Ingress,
-            Protocol::Tcp,
-            Some((22, 22)),
-            "10.0.0.0/8",
-        )])]);
+        // A rule each way, so both chains exist and both jumps can be read.
+        let text = ruleset(&[guarded(vec![
+            rule(
+                Direction::Ingress,
+                Protocol::Tcp,
+                Some((22, 22)),
+                "10.0.0.0/8",
+            ),
+            rule(
+                Direction::Egress,
+                Protocol::Tcp,
+                Some((53, 53)),
+                "0.0.0.0/0",
+            ),
+        ])]);
         assert!(
             text.contains("ip daddr 10.19.136.5 jump vt0web1a2b-in"),
             "{text}"
@@ -372,6 +429,88 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ip saddr 10.0.0.0/8 tcp dport 22"), "{text}");
+    }
+
+    /// **A port with only ingress rules still reaches the world.**
+    ///
+    /// The platform's stance is written down twice — in
+    /// `velstra_cloud_model::security` and in the REST contract, as something a
+    /// client may rely on — and this table said the opposite: any rule at all
+    /// closed *both* directions, so a guest with a security group could be
+    /// reached and could reach nothing. It could not resolve a name, fetch a
+    /// package, or finish its own cloud-init.
+    #[test]
+    fn a_port_with_only_ingress_rules_still_reaches_the_world() {
+        let text = ruleset(&[guarded(vec![rule(
+            Direction::Ingress,
+            Protocol::Tcp,
+            Some((443, 443)),
+            "0.0.0.0/0",
+        )])]);
+        assert!(
+            text.contains("ip daddr 10.19.136.5 jump vt0web1a2b-in"),
+            "the ingress rule was not programmed: {text}"
+        );
+        assert!(
+            !text.contains("jump vt0web1a2b-out"),
+            "a port with no egress rule was sent into an egress chain: {text}"
+        );
+        assert!(
+            !text.contains("chain vt0web1a2b-out"),
+            "an egress chain was written whose only rule is the drop: {text}"
+        );
+    }
+
+    /// And the other way round: an egress-only port is closed outbound except
+    /// for what it names, and left open inbound.
+    #[test]
+    fn a_port_with_only_egress_rules_is_not_closed_inbound() {
+        let text = ruleset(&[guarded(vec![rule(
+            Direction::Egress,
+            Protocol::Udp,
+            Some((53, 53)),
+            "0.0.0.0/0",
+        )])]);
+        assert!(
+            text.contains("chain vt0web1a2b-out"),
+            "the egress rule was not programmed: {text}"
+        );
+        assert!(
+            !text.contains("chain vt0web1a2b-in"),
+            "an ingress chain was written whose only rule is the drop: {text}"
+        );
+    }
+
+    /// Adding a rule still cannot widen anything — the property the
+    /// both-directions reading was protecting.
+    #[test]
+    fn adding_an_egress_rule_narrows_egress_rather_than_widening_it() {
+        let open = ruleset(&[guarded(vec![rule(
+            Direction::Ingress,
+            Protocol::Tcp,
+            Some((443, 443)),
+            "0.0.0.0/0",
+        )])]);
+        let narrowed = ruleset(&[guarded(vec![
+            rule(
+                Direction::Ingress,
+                Protocol::Tcp,
+                Some((443, 443)),
+                "0.0.0.0/0",
+            ),
+            rule(
+                Direction::Egress,
+                Protocol::Tcp,
+                Some((53, 53)),
+                "0.0.0.0/0",
+            ),
+        ])]);
+        assert!(!open.contains("chain vt0web1a2b-out"), "{open}");
+        assert!(narrowed.contains("chain vt0web1a2b-out"), "{narrowed}");
+        assert!(
+            narrowed.contains("counter drop"),
+            "the new egress chain does not end in a drop: {narrowed}"
+        );
     }
 
     #[test]
@@ -413,13 +552,16 @@ mod tests {
 
     #[test]
     fn icmp_is_named_per_family() {
+        // A real prefix settles the family: `10.0.0.0/8` can only be v4.
+        // "Anywhere" does not, and has its own test.
         let v4 = ruleset(&[guarded(vec![rule(
             Direction::Ingress,
             Protocol::Icmp,
             None,
-            "0.0.0.0/0",
+            "10.0.0.0/8",
         )])]);
         assert!(v4.contains("meta l4proto icmp"), "{v4}");
+        assert!(!v4.contains("ipv6-icmp"), "{v4}");
         let v6 = ruleset(&[guarded(vec![rule(
             Direction::Ingress,
             Protocol::Icmp,
@@ -427,6 +569,32 @@ mod tests {
             "fd00::/8",
         )])]);
         assert!(v6.contains("meta l4proto ipv6-icmp"), "{v6}");
+    }
+
+    /// **"Allow ping from anywhere" means from anywhere, on either family.**
+    ///
+    /// The family used to be chosen from whether the *remote* carried a colon,
+    /// which is a fact about the remote and not about the packet. `0.0.0.0/0`
+    /// is how the rule is written, and it emitted `icmp` alone — so on a guest
+    /// with a v6 address every ICMPv6 hit the terminal drop, on a port whose
+    /// operator had asked for ICMP and been told it was in force. Ping,
+    /// traceroute and any Packet Too Big for a flow conntrack does not hold.
+    #[test]
+    fn an_icmp_rule_from_anywhere_reaches_a_guest_on_either_family() {
+        let text = ruleset(&[guarded(vec![rule(
+            Direction::Ingress,
+            Protocol::Icmp,
+            None,
+            "0.0.0.0/0",
+        )])]);
+        assert!(
+            text.contains("ipv6-icmp"),
+            "a rule from anywhere refused ICMPv6: {text}"
+        );
+        assert!(
+            text.contains("icmp"),
+            "a rule from anywhere refused ICMPv4: {text}"
+        );
     }
 
     /// Two passes over an unchanged world write the same bytes, which is what
