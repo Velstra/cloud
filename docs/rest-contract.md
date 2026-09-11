@@ -281,6 +281,10 @@ use rather than an error they have to read.
 The mask is applied to the finished document, so a computed field can be named:
 `status.addresses` is not in the store.
 
+It works on a single object too — `GET /api/v1/projects/p1/instances/i1?fields=status.state`
+— which is the case a dashboard polling one guest wants: the same answer without
+its spec, its conditions and its labels on every pass.
+
 ### What a volume may take from its pool
 
 A pool is shared and its disks are finite. Two places carry a number, and the
@@ -646,9 +650,15 @@ GET /api/v1/audit
 audit line an operator has to correlate by hand against what somebody actually
 saw is one they stop trusting.
 
-Cell-scoped, and readable by cell operators only: a tenant who could read this
-would learn the names of projects and people that are not theirs, which is the
-opposite of what it is for.
+Cell-scoped, and **readable by a cell operator, by the person a record is
+about, and by anybody who may read what it names** — nobody else. The first is
+the fleet's view. The second is a person answering "did I do that?", which they
+can settle without asking an operator. The third is what makes a refusal
+actionable: a tenant whose own guest was touched may read the line about it.
+
+What none of that gives is the shape this collection could otherwise become: a
+tenant reading the log whole would learn the names of projects and people that
+are not theirs, which is the opposite of what it is for.
 
 **It cannot be flooded.** A refusal is something an attacker can cause at will,
 so the record's id is derived from who, what, which verb and which *minute* — a
@@ -1117,10 +1127,19 @@ same create, and:
 - a create that **failed** does not spend the key, so the corrected retry may
   reuse it.
 
-Keys are remembered for a day and are scoped to the caller, so two tenants who
-pick the same string never collide. Registering a node or a pool does not take
-a key: its answer carries a credential shown once, which a replay could not
-return.
+Keys are remembered for a day and are scoped to the caller **and to what was
+being made** — the project and the collection the create was aimed at. Two
+tenants who pick the same string never collide, and neither do one tenant's two
+scripts: a volume and an instance asked for under `nightly-1` are two creates,
+and refusing the second would be the API inventing a conflict out of a naming
+habit.
+
+An attempt that never came back — the API died between accepting the create and
+answering it — holds its key for two minutes, not for the day. Past that the
+next retry takes the key over and does the create, because a key its owner can
+never spend is an object they can never make. Registering a node or a pool does
+not take a key at all: its answer carries a credential shown once, which a
+replay could not return.
 
 ```http
 POST /api/v1/projects/p1/instances
@@ -2384,7 +2403,27 @@ nothing had been written.
 
 An unknown field carrying *nothing* — `null`, `""`, `0`, `[]`, `{}` — is
 accepted in silence. That is somebody echoing back an object or clearing a
-field, and no intention is lost.
+field, and no intention is lost. **`false` is not nothing**: there are two
+values and somebody picked one, so a switch turned off on a field nobody has is
+refused like any other.
+
+### A query parameter this platform does not have
+
+The same rule, through the other door. A name nobody has is refused:
+
+```
+GET /api/v1/projects/p1/instances?label=env=prod
+400 { "error": { "code": "INVALID_ARGUMENT", "field": "label",
+                 "message": "there is no query parameter called `label`; it would have been
+                             ignored, and the answer would have looked like one to the question
+                             you asked. Did you mean `labels`?" } }
+```
+
+`?label=` returned the collection unfiltered, `?pagesize=20` the default page,
+`?Since=1h` everything, and `?watch=1` a page where a stream was asked for —
+each a plausible answer to a question nobody asked, which is the failure this
+document already argues against for a bad *value*. A parameter carrying an
+empty value is still ignored, for the reason an empty field is.
 
 ### The records about one object
 

@@ -506,6 +506,37 @@ where
             // agent has against the store directly.
             return Self::document(&stored);
         }
+        // **A field this API does not have is dropped, and said so.**
+        //
+        // Not refused. The agent and the API ship as one package, but a rolling
+        // upgrade runs them a version apart for a while, and a newer agent
+        // reporting a field an older API has not learned yet must not have its
+        // whole report thrown away — that stops a node converging over a
+        // cosmetic mismatch.
+        //
+        // Silence was the wrong other half, though. Serde drops what it does
+        // not know, so a misspelled `adress` left the object claiming no
+        // address at all, with nothing anywhere saying why. Round-tripped once
+        // per *changed* report — a converged agent returns above and pays
+        // nothing — and only a field that carried a real value is named: a
+        // known field that is empty is skipped on the way out by design.
+        if let (Some(sent), Ok(Value::Object(kept))) =
+            (status.as_object(), serde_json::to_value(&next.status))
+        {
+            let dropped: Vec<&str> = sent
+                .iter()
+                .filter(|(k, v)| !is_nothing(v) && !kept.contains_key(*k))
+                .map(|(k, _)| k.as_str())
+                .collect();
+            if !dropped.is_empty() {
+                tracing::warn!(
+                    object = name,
+                    fields = dropped.join(", "),
+                    "status fields this version does not have were dropped; the agent reporting \
+                     them is newer than this API, or the name is misspelled"
+                );
+            }
+        }
         let revision = self.store.update(&next, writer).await?;
         next.meta.revision = revision;
         Self::document(&next)
@@ -560,8 +591,19 @@ pub(crate) fn overlay(into: &mut Value, patch: &Value) {
 /// The refusal, in one place, so the sentence a nested field gets is the
 /// sentence a top-level one gets.
 fn refuse_unknown(kind: &str, path: &str) -> ApiError {
+    // The wire's own spelling in the sentence, not the model's. `error.field`
+    // is camel-cased at the one door every REST error leaves by, and the
+    // *message* was not — so a client who sent `memoryOvercommit` was told
+    // "there is no field called memory_overcommit", a name they had not typed
+    // and could not find in their own request. The two halves of one refusal
+    // disagreed about what the field was called.
+    let spelled = path
+        .split('.')
+        .map(velstra_cloud_wire::to_camel)
+        .collect::<Vec<_>>()
+        .join(".");
     ApiError::invalid(format!(
-        "there is no field called {path} on a {kind}; nothing would have been done with it"
+        "there is no field called {spelled} on a {kind}; nothing would have been done with it"
     ))
     .at(format!("spec.{path}"))
 }
@@ -617,7 +659,14 @@ fn is_nothing(value: &Value) -> bool {
         Value::String(s) => s.is_empty(),
         Value::Array(a) => a.is_empty(),
         Value::Object(o) => o.is_empty(),
-        Value::Bool(b) => !b,
+        // **`false` is an answer.** It used to count as nothing, alongside the
+        // empty string and the zero — and for a *number* or a *string* that
+        // reading is right, because a client echoing an object back carries
+        // zeroes and blanks it never chose. A boolean is different: there are
+        // two values and somebody picked one. So `{"someBogusFlag": false}`
+        // was accepted in silence, which is the exact case this guard exists
+        // for: a switch that was turned off, on a field nobody has.
+        Value::Bool(_) => false,
         Value::Number(n) => n.as_f64() == Some(0.0),
     }
 }
