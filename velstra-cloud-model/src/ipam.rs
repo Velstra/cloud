@@ -131,7 +131,13 @@ pub fn assign(
 /// somewhere else. None of the parameters is optional for the same reason
 /// `others` is not: a caller that passed an empty slice would be allocating
 /// against a range it had only half looked at.
-fn taken(
+/// Every address this subnet has already promised to something.
+///
+/// Public because the API asks the same question at the door: a pin is only
+/// honest if the subnet can give it, and this is the one count of what is
+/// already given out. Asking it again there rather than re-deriving the set is
+/// what keeps "in use" meaning one thing.
+pub fn taken(
     subnet: &Subnet,
     ports: &[Port],
     floating: &[FloatingIp],

@@ -1710,6 +1710,152 @@ impl Api {
     /// Refused here instead, where the second instance is still a request
     /// somebody is making, and the sentence can name the guest that already has
     /// it. A port with no guest is the ordinary case and costs one list.
+    /// Refuse an address the subnet named cannot give.
+    ///
+    /// **Pinning is real, and unjudged it was a way to take somebody's
+    /// address.** `ipam::assign` returns the moment it sees a pinned address —
+    /// by design, because an address once given is never moved — and nothing
+    /// upstream asked whether the pin was one the subnet could honour. So a
+    /// tenant could write another port's address, a floating IP's, a VIP, the
+    /// gateway itself, or an address from a different range entirely; two
+    /// guests came up on one address with no object anywhere saying so.
+    ///
+    /// Asked of `ipam::taken`, not re-derived: that is the one count of what a
+    /// subnet has already promised, and two counts would eventually disagree.
+    ///
+    /// A pin whose subnet does not exist yet is **not** refused here. Creating
+    /// a port before its subnet is a legal ordering and the controller already
+    /// says so on the object; turning it into an error at the door would break
+    /// a shape somebody is using.
+    async fn refuse_an_address_this_subnet_cannot_give(
+        &self,
+        name: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        use velstra_cloud_model::network::Cidr;
+
+        // Which field carries the pin here — a port's address, a floating IP's,
+        // a balancer's VIP. All three are pinnable and all three are counted by
+        // `taken`, so all three go through this door.
+        let (field, wire) = match name.collection() {
+            "ports" => ("address", "spec.address"),
+            "floatingips" => ("address", "spec.address"),
+            "load-balancers" => ("vip", "spec.vip"),
+            _ => return Ok(()),
+        };
+        let Some(pinned) = spec
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|a| !a.is_empty())
+        else {
+            return Ok(());
+        };
+        let Ok(wanted) = pinned.parse::<std::net::IpAddr>() else {
+            // Not an address at all. `check_port` refuses that for a port with
+            // a better sentence; nothing to add here.
+            return Ok(());
+        };
+        let Some(subnet_name) = spec
+            .get("subnet")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(());
+        };
+        let project = name.parent().map(|p| p.to_string()).unwrap_or_default();
+        let Ok(subnet) = self
+            .typed::<velstra_cloud_model::resources::SubnetSpec,
+                     velstra_cloud_model::resources::SubnetStatus>(
+                &ResourceName::parse(subnet_name).map_err(ApiError::from)?,
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        if let Ok(range) = Cidr::parse(&subnet.spec.cidr)
+            && !range.contains(wanted)
+        {
+            return Err(ApiError::invalid(format!(
+                "{pinned} is not inside {}, which is what {subnet_name} holds. An address from \
+                 another range is one nothing on this segment can reach and nothing here can \
+                 route to.",
+                subnet.spec.cidr
+            ))
+            .at(wire));
+        }
+
+        let ports: Vec<velstra_cloud_model::resources::Port> =
+            self.typed_list(&project, "ports").await?;
+        let floating: Vec<velstra_cloud_model::resources::FloatingIp> =
+            self.typed_list(&project, "floatingips").await?;
+        let balancers: Vec<velstra_cloud_model::loadbalancer::LoadBalancer> =
+            self.typed_list(&project, "load-balancers").await?;
+        // Its own address is not a clash: a client reading an object and
+        // writing part of it back carries the address it already holds.
+        let mine = name.to_string();
+        let holder = ports
+            .iter()
+            .find(|p| {
+                p.meta.name.to_string() != mine
+                    && p.spec.subnet == subnet_name
+                    && p.spec.address.as_deref().and_then(|a| a.parse().ok()) == Some(wanted)
+            })
+            .map(|p| p.meta.name.to_string())
+            .or_else(|| {
+                floating
+                    .iter()
+                    .find(|f| {
+                        f.meta.name.to_string() != mine
+                            && f.spec.subnet == subnet_name
+                            && f.spec.address.as_deref().and_then(|a| a.parse().ok())
+                                == Some(wanted)
+                    })
+                    .map(|f| f.meta.name.to_string())
+            })
+            .or_else(|| {
+                balancers
+                    .iter()
+                    .find(|l| {
+                        l.meta.name.to_string() != mine
+                            && l.spec.subnet == subnet_name
+                            && l.spec.vip.as_deref().and_then(|a| a.parse().ok()) == Some(wanted)
+                    })
+                    .map(|l| l.meta.name.to_string())
+            });
+        if let Some(holder) = holder {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{pinned} is already {holder}'s. One address belongs to one thing on a \
+                     segment — two would answer for each other's traffic, and neither reliably."
+                ),
+            )
+            .at(wire));
+        }
+        // The gateway and whatever the subnet reserved. Counted by `taken`
+        // alongside the three lists above, so the same question answers both.
+        let held = velstra_cloud_model::ipam::taken(&subnet, &ports, &floating, &balancers);
+        if held.contains(&wanted) && subnet.spec.gateway.parse::<std::net::IpAddr>() == Ok(wanted) {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{pinned} is {subnet_name}'s own gateway. A guest holding it is a guest \
+                     answering for the way off the segment, which takes the segment down."
+                ),
+            )
+            .at(wire));
+        }
+        if held.contains(&wanted) && subnet.spec.reserved.iter().any(|r| r == pinned) {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!("{pinned} is one of {subnet_name}'s reserved addresses."),
+            )
+            .at(wire));
+        }
+        Ok(())
+    }
+
     async fn refuse_a_port_two_guests_would_share(
         &self,
         name: &ResourceName,
@@ -2856,6 +3002,12 @@ impl Api {
                 .await?;
             self.settle_floating_ip(parent, &mut spec).await?;
         }
+        // A pinned address is only honest if the subnet can give it. One door
+        // for the three things that may pin one.
+        if matches!(kind, "ports" | "floatingips" | "load-balancers") {
+            self.refuse_an_address_this_subnet_cannot_give(&name, &spec)
+                .await?;
+        }
         if kind == "volumes" || kind == "backups" {
             self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
         }
@@ -3597,6 +3749,19 @@ impl Api {
             // to it at birth.
             if name.collection() == "instances" && spec.get("ports").is_some() {
                 self.refuse_a_port_two_guests_would_share(name, spec)
+                    .await?;
+            }
+            // The same rule on the way in as on creation. Merged onto what is
+            // stored, because a patch that moves only the address still has to
+            // be judged against the subnet the object already names.
+            if matches!(
+                name.collection(),
+                "ports" | "floatingips" | "load-balancers"
+            ) {
+                let stored: Value = self.get(name, who).await?;
+                let mut merged = stored["spec"].clone();
+                merge(&mut merged, spec);
+                self.refuse_an_address_this_subnet_cannot_give(name, &merged)
                     .await?;
             }
             // `cpu_baseline`, not `cpuBaseline`: the body was converted out of
@@ -8815,6 +8980,44 @@ fn check_subnet(spec: &Value, document: Document) -> ApiResult<()> {
     Ok(())
 }
 
+/// Refuse a port whose pinned address is not an address.
+///
+/// **A range is not an address.** The node takes `spec.address` almost verbatim
+/// into two nftables tables: the filter jumps into this port's chains on
+/// `ip daddr <address>` and `ip saddr <address>`, and every one of those chains
+/// ends in a terminal drop — so `10.20.0.0/24` sends every guest on the segment
+/// into one tenant's rules and drops whatever those rules do not name. The
+/// anti-spoof table widens by the same string, and a remote-group expansion
+/// becomes the whole prefix.
+///
+/// Nothing else in the platform agrees about what such a value means, which is
+/// the argument for one door rather than four patches: the balancer parses it
+/// with `parse::<IpAddr>()` and silently drops the member, the metadata service
+/// refuses it, the filter widens. It is refused here instead — and *not*
+/// normalised down to its host part, because a value that quietly means
+/// something other than what was typed is the failure this exists to prevent.
+fn check_port(spec: &Value, document: Document) -> ApiResult<()> {
+    let address = spec
+        .get("address")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // A change carries what it changes, and an empty address is the ordinary
+    // case: the IPAM controller gives one out.
+    if address.is_empty() {
+        return Ok(());
+    }
+    let _ = document;
+    if address.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    Err(ApiError::invalid(format!(
+        "`{address}` is a range, not an address. A port holds one address, and the node's \
+         firewall jumps into this port's own chains on it — a range would send every guest on \
+         the segment into one port's rules, each of which ends in a drop."
+    ))
+    .at("spec.address"))
+}
+
 fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     if kind == "load-balancers" {
         check_listeners(spec)?;
@@ -8834,6 +9037,9 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     }
     if kind == "subnets" {
         return check_subnet(spec, document);
+    }
+    if kind == "ports" {
+        return check_port(spec, document);
     }
     if kind != "security-groups" {
         return Ok(());

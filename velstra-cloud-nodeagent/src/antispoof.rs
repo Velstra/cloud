@@ -76,6 +76,15 @@ pub fn ruleset(bound: &[Bound]) -> String {
         .collect();
 
     let mut out = String::new();
+    // Written whole and replaced atomically — `add` then `delete` then the
+    // body — the idiom the filter and NAT tables both use. `nft -f` is
+    // *additive*: without this prelude the second pass appends its rules to the
+    // first's, so a departed port kept its `claim-<tap>` chain and its
+    // `iifname` jump, a re-addressed port went on accepting its old address,
+    // and every pass duplicated every rule. The steady-state cache hid it; a
+    // real change was where it showed.
+    out.push_str(&format!("add table bridge {TABLE}\n"));
+    out.push_str(&format!("delete table bridge {TABLE}\n"));
     out.push_str(&format!("table bridge {TABLE} {{\n"));
     // Priority below the bridge filter's default so this runs before anything
     // an operator adds there, and on `prerouting` because the question is
@@ -284,6 +293,28 @@ mod tests {
         // whose counters cannot be read, and "nobody has tried" would be
         // indistinguishable from "nothing is guarded".
         assert!(text.contains("table bridge velstra-antispoof"), "{text}");
+    }
+
+    /// **The table is replaced, not added to.**
+    ///
+    /// `nft -f` is additive. Without an `add`/`delete` prelude the second pass
+    /// appended to the first — a port that went away kept its `claim` chain and
+    /// its `iifname` jump, and a spoofer whose old rule still stood went on
+    /// being accepted. The prelude replaces the whole table atomically.
+    #[test]
+    fn the_antispoof_table_is_replaced_and_not_added_to() {
+        let text = ruleset(&[bound("vtb", "10.19.136.3", None)]);
+        assert!(
+            text.contains("delete table bridge velstra-antispoof"),
+            "no delete prelude, so nft appends: {text}"
+        );
+        // The add has to precede the delete, or the delete fails on a table
+        // that is not there yet and the whole file is refused.
+        let add = text.find("add table bridge velstra-antispoof");
+        let del = text.find("delete table bridge velstra-antispoof");
+        assert!(add < del, "the delete comes before the add: {text}");
+        // A port that is gone this pass leaves no chain behind.
+        assert!(!text.contains("claim-vtgone"), "{text}");
     }
 
     /// Both families, each checked in its own terms.
