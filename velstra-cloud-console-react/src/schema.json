@@ -1211,6 +1211,27 @@
     "atCreation": false
    },
    {
+    "key": "format",
+    "label": "What the bytes are",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Qcow2",
+      "label": "qcow2"
+     },
+     {
+      "value": "Raw",
+      "label": "raw"
+     }
+    ],
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Leave it alone for a `.qcow2` file — the name settles it. Everywhere else it has to be said: nothing here ever fetches the bytes, and the filename lies (Ubuntu ships qcow2 under `.img`). A node handed a mis-declared image refuses the disk, and every guest of this family goes without one.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
     "key": "checksums",
     "label": "Checksums",
     "kind": "text",

@@ -875,11 +875,31 @@ POST /api/v1/images
             "family": "debian-13-hardened", "version": "1" } }
 ```
 
-The digest, format, size and source are taken from the image named by `from`;
-anything the caller also sends wins, which is how something called `our-base`
-inside a project becomes something the whole cell recognises. `from` is a request
-and not a record: it comes back empty, because an image that remembered where it
-was published from would be one whose source can be deleted.
+The digest, format, size, source **and signature** are taken from the image
+named by `from`; anything the caller also sends wins, which is how something
+called `our-base` inside a project becomes something the whole cell recognises.
+Saying a field and saying it is *empty* counts as saying it — `"signature": ""`
+publishes an unsigned copy on purpose. `from` is a request and not a record: it
+comes back empty, because an image that remembered where it was published from
+would be one whose source can be deleted.
+
+The signature travels because it is a statement about the digest, and the digest
+is what is copied: a copy that lost it would be an unsigned image, which a node
+started with `--require-signed-images` will not boot. It is judged again like
+any other create, so a signature that no longer verifies is refused here rather
+than stored.
+
+Three things are deliberately not copied. `state` and `replacement`, because a
+published image starts its own life in the catalogue and a judgement about one
+object's place in a family is not a statement about another's. And
+`sharedWith`, because a grant is made by whoever holds an image and publishing
+makes a new holder — copying it would re-grant projects that holder never chose.
+
+**A retired image is not published under another name.** `from` naming an
+`Obsolete` image is refused at `spec.from`, with the replacement read out, the
+same way building a guest or a volume from one is: publishing it would put the
+withdrawn bytes back in the catalogue under a fresh, `Active` name, and
+`families/<name>` would resolve to them.
 
 **Nothing is copied and nothing is fetched.** An image is content-addressed, so a
 cell-wide image with the same digest *is* the same bytes: every node that had
@@ -908,7 +928,22 @@ API judges it at admission under the keys it was started with
 
 So a stored signature **is** a verified one, and the console's *Signature*
 column reads `verified` or `unsigned` and nothing else. A patch that adds a
-signature restates the digest, as every image patch does, and is judged over it.
+signature is judged over this image's one digest — the stored one, or the same
+one restated.
+
+**The digest is the image's identity, and a patch does not change it.** A patch
+naming a different one is refused at `spec.digest`: every guest built from this
+image holds its name, and pointing that name at other bytes would leave
+`spec.signature` standing over a digest nobody signed. Restating what is already
+there is not a change, because the console's edit form carries the field on
+every save. A case-only difference is not a change either, which is how an old
+object's spelling gets corrected.
+
+At create the digest is checked for being one — `sha256:` and 64 hex, or
+`sha512:` and 128 — and stored lowercase. Both matter to the signature: the
+message is the digest line exactly as written, so a platform that files one
+spelling and signs another is one where a signature quietly stops meaning
+anything.
 
 The node agent judges again under its own keys before it fetches, and refuses
 an image whose signature fails — or, with `--require-signed-images`, one that
@@ -2821,6 +2856,21 @@ POST /api/v1/image-sources
 } }
 ```
 
+`format` says what the bytes are, and is required unless the filename settles
+it. Only `.qcow2` settles it: nothing here ever fetches the image — that is the
+whole reason a source costs a few kilobytes a pass — and the name lies, because
+Ubuntu ships qcow2 under `.img`. A source that can say neither reads
+`Checked=False` with `Unusable` and the sentence on its own object, rather than
+publishing an image a node will refuse to make a disk from.
+
+"What this source published" is a fact the source writes down —
+`image-source.velstra.io/by` on every image it makes — not a guess from the
+URL. A URL is a value an operator edits when a mirror moves and one anybody can
+copy: matched on it, a source lost its own back catalogue after an edit, and a
+tenant registering the same public URL under the same family had their image
+deprecated and then deleted by the cell's retention. Images published before the
+label fall back to the URL, so nothing is orphaned.
+
 The cell reads the checksums file, finds the line for the image's filename, and
 publishes an image for that digest if it does not have one. Two different jobs
 with two different trust models, and conflating them is the hazard:
@@ -2832,10 +2882,10 @@ with two different trust models, and conflating them is the hazard:
   including plain `http://`, because a wrong byte gives a wrong digest and fails.
 
 `keep` is retention, and it takes away only what it is safe to take: versions
-this source published (matched by `url`, so a hand-made image sharing the family
-is left alone), past the newest `keep`, that **no instance names**. A guest keeps
-the bytes it was built from for as long as it exists, so its image survives
-whatever `keep` says — and the source says on its own object how many it spared
+this source published, past the newest `keep`, that **nothing names** — no
+instance, and no volume. A guest keeps the bytes it was built from for as long
+as it exists, and a volume resolves its image when the pool opens it, so either
+one keeps its image alive whatever `keep` says — and the source says on its own object how many it spared
 and why, because "why does this family still hold eleven versions" should not
 have to be worked out from a list of guests. Retention runs only after something
 new was published: nothing can fall out of `keep` unless something came in.

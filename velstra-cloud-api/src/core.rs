@@ -2930,7 +2930,8 @@ impl Api {
             self.settle_network(&mut spec).await?;
         }
         if kind == "images" {
-            self.settle_published_image(who, &mut spec).await?;
+            self.settle_published_image(who, body.get("spec"), &mut spec)
+                .await?;
         }
         if kind == "folders" || kind == "projects" {
             self.refuse_a_parent_that_cannot_be_one(kind, &name, &spec)
@@ -2956,10 +2957,43 @@ impl Api {
             self.refuse_a_disk_that_is_not_free(&spec).await?;
         }
         if kind == "images" {
-            let digest = spec
-                .get("digest")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            // **An image says which bytes it is, at the door.**
+            //
+            // The create asked only whether `digest` was a non-empty string, so
+            // `"hello"` was accepted, stored, and found out weeks later by a
+            // node with nothing to fetch — in a journal on a machine the tenant
+            // has no access to. The refusal belongs where somebody still has
+            // the form open.
+            //
+            // Written back in the canonical spelling in the same step. Every
+            // other reader lowercases — `Digest::parse`, `stored_name`,
+            // `hostfs::stored_as`, `answer_image`'s `cachedOn` — and
+            // `judge_signature` deliberately does not, because a signature is
+            // over the line exactly as written. So the one place to settle the
+            // spelling is here, before anything is signed over or filed under
+            // it. Uppercase hex used to be accepted everywhere *except*
+            // alongside a signature, where it was refused with a message
+            // claiming it was not a digest at all.
+            //
+            // Only on create: an object already holding a spelling this cannot
+            // read has to stay editable, or a shape check bricks exactly the
+            // objects somebody is trying to correct.
+            let digest = match spec.get("digest").and_then(Value::as_str) {
+                Some(raw) => {
+                    let parsed =
+                        velstra_cloud_model::images::Digest::parse(raw).ok_or_else(|| {
+                            ApiError::invalid(format!(
+                            "an image says which bytes it is — `sha256:` and 64 hex characters, \
+                             or `sha512:` and 128. `{raw}` is not one, and a node would find \
+                             that out with nothing to fetch."
+                        ))
+                        .at("spec.digest")
+                        })?;
+                    spec["digest"] = json!(parsed.value());
+                    Some(parsed.value())
+                }
+                None => None,
+            };
             self.judge_image_signature(&spec, digest.as_deref())?;
             self.refuse_a_replacement_that_is_not_an_image(&spec)
                 .await?;
@@ -3476,13 +3510,24 @@ impl Api {
                 self.refuse_a_disk_that_is_not_free(spec).await?;
             }
             if name.collection() == "images" {
-                // Every image patch restates the digest — `check_rules` refuses
-                // one that does not, because an image is what its bytes are —
-                // so the signature is judged over the digest the patch carries.
-                let digest = spec
-                    .get("digest")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                // A patch may restate the digest and may not change it, so the
+                // signature is judged over this image's one digest — the stored
+                // one when the patch is silent, which is the ordinary case.
+                //
+                // It used to say "every image patch restates the digest", which
+                // was not true of anything: no rule required it and none
+                // refused a *different* one, so a patch could point a name
+                // every guest already carries at other bytes and leave
+                // `spec.signature` standing over a digest nobody signed.
+                self.refuse_a_new_digest(name, spec).await?;
+                let digest = match spec.get("digest").and_then(Value::as_str) {
+                    Some(d) => Some(d.to_string()),
+                    None => {
+                        let stored: Option<velstra_cloud_model::resources::Image> =
+                            self.typed(name).await.ok();
+                        stored.map(|i| i.spec.digest)
+                    }
+                };
                 self.judge_image_signature(spec, digest.as_deref())?;
                 self.refuse_a_replacement_that_is_not_an_image(spec).await?;
             }
@@ -6123,6 +6168,48 @@ impl Api {
         Ok(())
     }
 
+    /// An image **is** its bytes, and a patch does not change them.
+    ///
+    /// Content-addressed and immutable is what the model says, what the console
+    /// blurb says, and what the Signature column means — and nothing enforced
+    /// it. A patch could point a name every guest built from it already carries
+    /// at different bytes, leaving `spec.signature` standing over a digest
+    /// nobody signed.
+    ///
+    /// Not a blanket refusal of any patch carrying `digest`: the console's edit
+    /// form offers the box, so every save would come back refused and images
+    /// would be uneditable — the scar `Document::Part` records. Sending back
+    /// what is already there is not a change.
+    ///
+    /// Compared **parsed**, so that correcting an old object's spelling —
+    /// `SHA256:AB…` to `sha256:ab…` — is the same digest and goes through. A
+    /// case-only difference is not different bytes.
+    async fn refuse_a_new_digest(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
+        use velstra_cloud_model::images::Digest;
+        let Some(asked) = spec.get("digest").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let stored: velstra_cloud_model::resources::Image = self.typed(name).await?;
+        let same = match (Digest::parse(asked), Digest::parse(&stored.spec.digest)) {
+            (Some(a), Some(b)) => a.value() == b.value(),
+            // One of them is not a digest at all — a legacy object, or a value
+            // this patch is trying to correct. Fall back to the raw comparison
+            // so such an object stays editable.
+            _ => asked == stored.spec.digest,
+        };
+        if same {
+            return Ok(());
+        }
+        Err(ApiError::invalid(format!(
+            "{name} is {}: the digest is this object's identity, and every guest built from it \
+             holds that name. Changing it points a name instances already carry at different \
+             bytes, and leaves spec.signature standing over a digest nobody signed. Publish \
+             another image and retire this one.",
+            stored.spec.digest
+        ))
+        .at("spec.digest"))
+    }
+
     async fn refuse_a_new_source(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
         let asked = |field: &str| -> Option<Option<String>> {
             spec.get(field).map(|value| match value {
@@ -6669,7 +6756,12 @@ impl Api {
     /// image may be given a different family or version, which is exactly what
     /// somebody promoting `our-base` from a project into `debian-13-hardened`
     /// wants. Only what they did not say is taken.
-    async fn settle_published_image(&self, who: &Identity, spec: &mut Value) -> ApiResult<()> {
+    async fn settle_published_image(
+        &self,
+        who: &Identity,
+        sent: Option<&Value>,
+        spec: &mut Value,
+    ) -> ApiResult<()> {
         let Some(from) = spec
             .get("from")
             .and_then(Value::as_str)
@@ -6711,10 +6803,52 @@ impl Api {
             .at("spec.from"));
         };
 
+        // **A retired image is not published under another name.**
+        //
+        // Everything else in the platform asks `usable()` before building from
+        // an image — an instance does, a volume does — and this door did not.
+        // So a withdrawn build could be published under a fresh name, come out
+        // `Active` carrying the same digest, and be resolved by
+        // `families/<name>` as though it had never been taken away.
+        if !source.spec.state.usable() {
+            let instead = if source.spec.replacement.is_empty() {
+                String::from("Nothing was named to replace it; ask whoever retired it what to use.")
+            } else {
+                format!("Use {} instead.", source.spec.replacement)
+            };
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{from} has been retired, so nothing new is built from it — publishing it \
+                     under another name would put the same bytes back in the catalogue as though \
+                     they had never been withdrawn. Guests already running on it are unaffected. \
+                     {instead}"
+                ),
+            )
+            .at("spec.from"));
+        }
+
         // The model's spelling, not the wire's: by the time a spec reaches a
         // settle step the wire layer has already turned `sizeBytes` into
         // `size_bytes`, and a camelCase key here writes a field nothing reads.
         // It fails silently — the image publishes, with a size of zero.
+        //
+        // **The signature travels with the digest it is over.** A signature is
+        // a statement about *these bytes*, and the bytes are what is copied —
+        // dropping it turned a signed image into an unsigned one, which on a
+        // node started with `--require-signed-images` will not boot. The copy is
+        // re-judged below like any other create, so a signature that no longer
+        // verifies is refused at the door rather than stored; somebody who
+        // wants an unsigned copy says `"signature": ""` and gets one, because
+        // only what the caller left out is taken.
+        //
+        // Three fields are deliberately **not** copied. `state` and
+        // `replacement` because a retired image cannot be published at all (see
+        // above) and a published one starts its own life in the catalogue —
+        // carrying a judgement about one object's place in a family onto
+        // another is not the same statement. `shared_with` because a grant is
+        // made by whoever holds an image, and publishing makes a new holder:
+        // copying it would re-grant projects that holder never chose.
         let copied = json!({
             "digest": source.spec.digest,
             "format": source.spec.format,
@@ -6723,16 +6857,37 @@ impl Api {
             "family": source.spec.family,
             "version": source.spec.version,
             "source_instance": source.spec.source_instance,
+            "signature": source.spec.signature,
         });
         for (key, value) in copied.as_object().expect("an object") {
-            // Only what the caller left out. Publishing under a different family
-            // is the point of publishing.
-            let said = spec.get(key.as_str());
+            // **What the caller left out — read off what the caller sent.**
+            //
+            // `spec` here is the default spec with the request merged onto it,
+            // so every field is present and "did they say this" cannot be
+            // asked of it. It was asked of it anyway, by treating a default
+            // value as absence — which works for a string and a zero and does
+            // not work for an enum: `ImageFormat`'s default is `Raw`, so
+            // `format` never looked absent, and every publish of a qcow2 image
+            // came out declared `Raw`. A node handed that refuses the disk.
+            //
+            // Reading the sent body settles it in both directions: a caller who
+            // says nothing gets the source's value, and a caller who says
+            // `"signature": ""` gets the unsigned copy they asked for. Same
+            // lesson as `settle_default_network`, which reads the raw body for
+            // exactly this reason.
+            let said = sent.and_then(|s| {
+                s.get(key.as_str())
+                    .or_else(|| s.get(crate::json::to_camel(key)))
+            });
             let empty = matches!(said, None | Some(Value::Null))
                 || said.and_then(Value::as_str) == Some("")
                 || said.and_then(Value::as_u64) == Some(0);
-            if empty && !value.is_null() {
+            if empty && !value.is_null() && said.is_none() {
                 spec[key.as_str()] = value.clone();
+            } else if empty && said.is_some() {
+                // Said, and said to be nothing: honour it. `"signature": ""`
+                // is a request for an unsigned copy, not a field left blank.
+                spec[key.as_str()] = said.cloned().unwrap_or(Value::Null);
             }
         }
         spec["from"] = Value::String(String::new());
@@ -8837,6 +8992,7 @@ fn refuse_an_unusable_image_source(spec: &Value) -> ApiResult<()> {
             Unusable::ChecksumsNotHttps => "spec.checksums",
             Unusable::NoFamily => "spec.family",
             Unusable::NoUrl | Unusable::NoFilename => "spec.url",
+            Unusable::NoFormat => "spec.format",
         };
         ApiError::invalid(e.to_string()).at(field)
     })

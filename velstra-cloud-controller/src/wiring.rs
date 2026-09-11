@@ -259,6 +259,7 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
                 crate::imagesource::ImageSourceController::new(
                     TypedStore::new(store.clone(), id, "images"),
                     TypedStore::new(store.clone(), id, "instances"),
+                    TypedStore::new(store.clone(), id, "volumes"),
                     StatusWriter::new(store.clone(), id, "image-sources", "images"),
                     Arc::new(fetch),
                     &cell.region,

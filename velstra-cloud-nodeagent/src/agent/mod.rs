@@ -2617,6 +2617,15 @@ impl Agent {
             .filter_map(|i| crate::hostfs::stored_as(&i.digest))
             .collect();
 
+        // The same retention, applied to the half of the image directory
+        // nothing ever swept: bytes under `incoming` that nobody is coming back
+        // for. One knob, one sweep — a second timer would be a second thing to
+        // explain.
+        let reclaimed = self.vmm.forget_stale_arrivals(keep_for).await;
+        if reclaimed > 0 {
+            pass.actions += reclaimed;
+        }
+
         for stored in &host.images {
             if needed.contains(stored) || host.fetching.contains(stored) {
                 continue;
