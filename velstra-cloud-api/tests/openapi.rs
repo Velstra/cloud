@@ -99,3 +99,51 @@ fn every_collection_in_the_contract_is_a_path() {
         );
     }
 }
+
+/// **Every operation the API serves is one the React console has heard of.**
+///
+/// `velstra-cloud-console-react/src/api/operations.json` is what
+/// `scripts/coverage.mjs` measures "every operation the API documents is
+/// reachable from this UI" against — so a stale copy makes that claim about a
+/// document that is not the API's, and an operation the console has never
+/// heard of is a button that cannot exist and a coverage run that cannot see
+/// it missing. It was generated from a *third* copy of the OpenAPI document
+/// checked in beside it, which nothing generated and nothing checked: four
+/// operations the API serves (the node and pool credential paths) were absent
+/// from both.
+///
+/// The third copy is gone; this is what stands in its place.
+#[test]
+fn the_console_knows_every_operation_this_api_serves() {
+    let document = velstra_cloud_api::openapi::document();
+    let mut served: Vec<String> = document["paths"]
+        .as_object()
+        .expect("paths")
+        .values()
+        .flat_map(|path| path.as_object().expect("a path item").values())
+        .filter_map(|op| op.get("operationId")?.as_str().map(str::to_string))
+        .collect();
+    served.sort();
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../velstra-cloud-console-react/src/api/operations.json");
+    let stored = std::fs::read_to_string(&path).expect("the console's operations.json");
+    let listed: serde_json::Value = serde_json::from_str(&stored).expect("valid JSON");
+    let mut known: Vec<String> = listed
+        .as_array()
+        .expect("an array of operations")
+        .iter()
+        .filter_map(|op| op.get("id")?.as_str().map(str::to_string))
+        .collect();
+    known.sort();
+
+    let missing: Vec<&String> = served.iter().filter(|id| !known.contains(id)).collect();
+    let extra: Vec<&String> = known.iter().filter(|id| !served.contains(id)).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "the React console's operations.json is not this API's surface. \n\
+         It has never heard of: {missing:?}\n\
+         It lists what this API does not serve: {extra:?}\n\
+         Regenerate it from docs/openapi.json, which this test keeps honest."
+    );
+}

@@ -370,8 +370,7 @@ impl Vmm for CloudHypervisorVmm {
         // What is on its way in. The incoming directory holds a copy that has
         // not been verified and moved across yet — which is what a fetch in
         // progress *is*, so there is nothing to record and nothing to go stale.
-        for name in hostfs::read_dir_names(&self.layout.incoming_dir).unwrap_or_default() {
-            let name = name.strip_suffix(".partial").unwrap_or(&name).to_string();
+        for name in hostfs::arriving(&self.layout.incoming_dir) {
             if !host.images.contains(&name) {
                 host.fetching.insert(name);
             }
@@ -498,6 +497,10 @@ impl Vmm for CloudHypervisorVmm {
     }
     async fn forget_image(&self, stored_as: &str) -> Result<()> {
         hostfs::forget_image(&self.layout, stored_as)
+    }
+
+    async fn forget_stale_arrivals(&self, older_than_seconds: u64) -> usize {
+        hostfs::forget_stale_arrivals(&self.layout.incoming_dir, older_than_seconds)
     }
 
     async fn image_age_seconds(&self, stored_as: &str) -> Option<u64> {
@@ -1348,6 +1351,71 @@ mod tests {
             arrived.with_extension("rejected").exists(),
             "the evidence was deleted rather than set aside"
         );
+        // And it is not reported as a fetch in progress. It was, for as long
+        // as the file existed — which was for ever, because nothing under
+        // `incoming` was ever deleted. So this node told the cell it was
+        // fetching an image it had already refused.
+        assert!(
+            vmm.observe().await.unwrap().fetching.is_empty(),
+            "a refused copy is reported as an arrival"
+        );
+    }
+
+    /// A bad copy that cannot be set aside is removed rather than blocking the
+    /// name for ever.
+    ///
+    /// The rename used to warn and carry on while the sentence still promised
+    /// "the copy is kept as …". The bytes stayed under the incoming name, every
+    /// later pass re-hashed and re-refused them, and the platform said a file
+    /// was somewhere it was not.
+    #[tokio::test]
+    async fn a_bad_copy_that_cannot_be_set_aside_is_removed_rather_than_blocking_the_name() {
+        let scratch = Scratch::new("badimage-stuck");
+        let vmm = vmm(&scratch);
+        std::fs::create_dir_all(&vmm.layout.incoming_dir).unwrap();
+
+        let digest: String = sha2::Sha256::digest(b"the real thing")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let value = format!("sha256:{digest}");
+        let arrived = vmm.layout.incoming_dir.join(format!("sha256-{digest}"));
+        std::fs::write(&arrived, b"something else entirely").unwrap();
+        // A directory where the rejected copy would go: the rename cannot win.
+        std::fs::create_dir_all(arrived.with_extension("rejected")).unwrap();
+
+        let err = vmm
+            .pull_image("projects/p1/images/x", &value, "file:///nonexistent")
+            .await
+            .unwrap_err();
+        assert!(
+            !arrived.exists(),
+            "a bad copy that could not be set aside still blocks its name"
+        );
+        assert!(
+            !err.to_string().contains("is kept as"),
+            "the refusal claims a copy was kept that was not: {err}"
+        );
+    }
+
+    /// Bytes under `incoming` that nobody is coming back for are reclaimed on
+    /// the sweep that already exists — never inside the fetch, where the
+    /// evidence has to survive the pass that made it.
+    #[tokio::test]
+    async fn what_nobody_is_coming_back_for_is_reclaimed() {
+        let scratch = Scratch::new("reclaim");
+        let vmm = vmm(&scratch);
+        std::fs::create_dir_all(&vmm.layout.incoming_dir).unwrap();
+        let rejected = vmm.layout.incoming_dir.join("sha256-abc.rejected");
+        std::fs::write(&rejected, b"bad").unwrap();
+
+        // Nothing is old enough yet with a long retention.
+        assert_eq!(vmm.forget_stale_arrivals(86_400).await, 0);
+        assert!(rejected.exists());
+
+        // With none, everything under `incoming` has outlived its keep.
+        assert_eq!(vmm.forget_stale_arrivals(0).await, 1);
+        assert!(!rejected.exists());
     }
 
     #[tokio::test]

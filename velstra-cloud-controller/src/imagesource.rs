@@ -55,6 +55,16 @@ pub struct ImageSourceController<F: Fetch> {
         velstra_cloud_model::resources::InstanceSpec,
         velstra_cloud_model::resources::InstanceStatus,
     >,
+    /// And the other half of the same question. A volume made from an image
+    /// resolves the bytes through the image object at open time, so deleting
+    /// one out from under a volume that has not been made yet leaves its pool
+    /// agent answering "there is no image called…" about bytes it was told to
+    /// clone. `refs::fields` lists both `instances.image` and
+    /// `volumes.sourceImage`; this list has to hold every one of them.
+    volumes: TypedStore<
+        velstra_cloud_model::resources::VolumeSpec,
+        velstra_cloud_model::resources::VolumeStatus,
+    >,
     status: StatusWriter<ImageSourceSpec, ImageSourceStatus>,
     fetch: Arc<F>,
     cell: String,
@@ -68,6 +78,10 @@ impl<F: Fetch> ImageSourceController<F> {
             velstra_cloud_model::resources::InstanceSpec,
             velstra_cloud_model::resources::InstanceStatus,
         >,
+        volumes: TypedStore<
+            velstra_cloud_model::resources::VolumeSpec,
+            velstra_cloud_model::resources::VolumeStatus,
+        >,
         status: StatusWriter<ImageSourceSpec, ImageSourceStatus>,
         fetch: Arc<F>,
         region: &str,
@@ -76,6 +90,7 @@ impl<F: Fetch> ImageSourceController<F> {
         Self {
             images,
             instances,
+            volumes,
             status,
             fetch,
             cell: cell.to_string(),
@@ -103,18 +118,26 @@ impl<F: Fetch> ImageSourceController<F> {
     /// refused as already existing, which is the answer and not an error.
     async fn publish(
         &self,
+        source: &ResourceName,
         spec: &ImageSourceSpec,
         digest: &velstra_cloud_model::images::Digest,
         now: Timestamp,
-    ) -> Result<String> {
+    ) -> Result<(String, bool)> {
         let id = digest.stored();
         let name = ResourceName::parse(&format!("images/{id}"))
             .map_err(|e| crate::Error::Refused(e.to_string()))?;
         if self.images.get(&name.to_string()).await?.is_some() {
-            return Ok(name.to_string());
+            return Ok((name.to_string(), false));
         }
+        let mut meta = Meta::new(name.clone(), Placement::new(&self.region, &self.cell));
+        // Who made this. Read back by retention, which otherwise has to guess
+        // from the URL — see [`velstra_cloud_model::resources::PUBLISHED_BY`].
+        meta.labels.insert(
+            velstra_cloud_model::resources::PUBLISHED_BY.to_string(),
+            source.to_string(),
+        );
         let image = Resource::new(
-            Meta::new(name.clone(), Placement::new(&self.region, &self.cell)),
+            meta,
             ImageSpec {
                 from: String::new(),
                 family: spec.family.clone(),
@@ -123,7 +146,13 @@ impl<F: Fetch> ImageSourceController<F> {
                 // this" has to be answerable by a person reading a list.
                 version: iso_day(now),
                 digest: digest.value(),
-                format: ImageFormat::Qcow2,
+                // What the source says, or what the filename settles. Never
+                // assumed: `refuse_an_unusable_source` has already refused a
+                // source that could say neither, so this cannot be a guess.
+                format: spec
+                    .format
+                    .or_else(|| velstra_cloud_model::images::format_from_filename(&spec.url))
+                    .unwrap_or(ImageFormat::Qcow2),
                 size_bytes: 0,
                 source_url: spec.url.clone(),
                 source_instance: None,
@@ -137,8 +166,37 @@ impl<F: Fetch> ImageSourceController<F> {
         self.images
             .create(&image, &velstra_cloud_model::Writer::controller(WRITER))
             .await?;
-        self.retire_what_this_supersedes(spec, &name).await;
-        Ok(name.to_string())
+        self.retire_what_this_supersedes(source, spec, &name).await;
+        Ok((name.to_string(), true))
+    }
+
+    /// Did this source publish this image?
+    ///
+    /// The label is the answer where there is one. `source_url` is kept as a
+    /// second arm so images published before the label are still owned by
+    /// their source rather than orphaned for ever — and it is only consulted
+    /// when there is no label at all, so a source that has moved to a new
+    /// mirror still owns what it made.
+    ///
+    /// Cell-scoped only. A source publishes into the cell's catalogue; a
+    /// tenant's own image of the same family, from the same public URL, in
+    /// their own project, is not this source's to touch.
+    fn published_this(
+        source: &ResourceName,
+        spec: &ImageSourceSpec,
+        image: &Resource<ImageSpec, ImageStatus>,
+    ) -> bool {
+        if !image.meta.name.to_string().starts_with("images/") || image.spec.family != spec.family {
+            return false;
+        }
+        match image
+            .meta
+            .labels
+            .get(velstra_cloud_model::resources::PUBLISHED_BY)
+        {
+            Some(by) => by == &source.to_string(),
+            None => image.spec.source_url == spec.url,
+        }
     }
 
     /// Deprecate the images this one has just replaced.
@@ -157,15 +215,19 @@ impl<F: Fetch> ImageSourceController<F> {
     /// Best effort and never fatal. The new image exists either way, and a
     /// rotation that failed because a *label* could not be written would be a
     /// cell that stops getting security updates over a cosmetic field.
-    async fn retire_what_this_supersedes(&self, spec: &ImageSourceSpec, published: &ResourceName) {
+    async fn retire_what_this_supersedes(
+        &self,
+        source: &ResourceName,
+        spec: &ImageSourceSpec,
+        published: &ResourceName,
+    ) {
         let Ok(images) = self.images.list().await else {
             warn!("could not read the images to deprecate what a new one replaces");
             return;
         };
         for image in images {
             if image.meta.name == *published
-                || image.spec.family != spec.family
-                || image.spec.source_url != spec.url
+                || !Self::published_this(source, spec, &image)
                 || image.meta.deleted_at.is_some()
                 || image.spec.state != ImageState::Active
             {
@@ -194,21 +256,34 @@ impl<F: Fetch> ImageSourceController<F> {
     ///
     /// **Only what this source published.** A family can hold images somebody
     /// made by hand — a patched build, a golden image captured from a guest —
-    /// and a source's retention has no business deleting those. Matched by
-    /// `source_url`, which is the source's own fingerprint on what it made.
+    /// and a source's retention has no business deleting those. Answered by
+    /// the label this source writes, falling back to `source_url` only for
+    /// images published before the label existed. `source_url` alone was never
+    /// a fingerprint: it is a value an operator edits when a mirror moves, and
+    /// one anybody can copy.
     ///
-    /// **Never one an instance names.** A guest keeps the bytes it was built
-    /// from, so an image an instance references is needed for as long as that
-    /// instance can be moved, restarted, or rebuilt on another node — however
-    /// old it is, and whatever `keep` says. The controller writes to the store
-    /// directly, which means the API's reference guard is not in its path: it
-    /// asks the question itself, and a deleted-but-not-yet-gone instance counts,
-    /// because it may still be starting.
+    /// **Never one an instance or a volume names.** A guest keeps the bytes it
+    /// was built from, so an image an instance references is needed for as long
+    /// as that instance can be moved, restarted, or rebuilt on another node —
+    /// however old it is, and whatever `keep` says. A volume made from an image
+    /// is the same question asked by the other half of the platform: the pool
+    /// agent resolves the bytes through the image object when it opens, so a
+    /// volume whose source is gone is one nothing can make.
+    ///
+    /// The controller writes to the store directly, which means the API's
+    /// reference guard is not in its path: it asks the question itself, over
+    /// every field `refs::fields` says can name an image, and a
+    /// deleted-but-not-yet-gone object counts, because it may still be
+    /// starting.
     ///
     /// **Newest first, by when this cell learned of them** — the same ordering
     /// `families/<name>` resolves by, so what a new guest would get is never
     /// what retention takes away.
-    async fn prune(&self, spec: &ImageSourceSpec) -> Result<(Vec<String>, usize)> {
+    async fn prune(
+        &self,
+        source: &ResourceName,
+        spec: &ImageSourceSpec,
+    ) -> Result<(Vec<String>, usize)> {
         let keep = velstra_cloud_model::images::keep(spec) as usize;
         let mut mine: Vec<_> = self
             .images
@@ -216,9 +291,7 @@ impl<F: Fetch> ImageSourceController<F> {
             .await?
             .into_iter()
             .filter(|i: &Resource<ImageSpec, ImageStatus>| {
-                i.spec.family == spec.family
-                    && i.spec.source_url == spec.url
-                    && i.meta.deleted_at.is_none()
+                Self::published_this(source, spec, i) && i.meta.deleted_at.is_none()
             })
             .collect();
         if mine.len() <= keep {
@@ -226,13 +299,20 @@ impl<F: Fetch> ImageSourceController<F> {
         }
         mine.sort_by_key(|i| std::cmp::Reverse(i.meta.created_at.0));
 
-        let in_use: std::collections::BTreeSet<String> = self
+        let mut in_use: std::collections::BTreeSet<String> = self
             .instances
             .list()
             .await?
             .into_iter()
             .map(|i| i.spec.image.clone())
             .collect();
+        in_use.extend(
+            self.volumes
+                .list()
+                .await?
+                .into_iter()
+                .filter_map(|v| v.spec.source_image.clone()),
+        );
 
         let mut removed = Vec::new();
         let mut spared = 0usize;
@@ -371,13 +451,22 @@ impl<F: Fetch> Reconciler for ImageSourceController<F> {
             return self.status.write(source, &next).await.map(|_| ());
         };
 
-        let published = self.publish(&source.spec, &digest, now).await?;
-        // Compared and stored as the tagged value, so a source that moved from
-        // one hash function to the other reads as a change rather than as the
-        // same image under a name nothing files it under.
-        let digest = digest.value();
-        let is_new = source.status.last_digest != digest;
-        next.status.last_digest = digest;
+        // **Whether this published anything is what this pass did, not what a
+        // remembered string says.**
+        //
+        // `last_digest` used to be the answer, and it is a report rather than a
+        // key — its own doc says so. When the stored spelling changed from bare
+        // hex to `sha256:<hex>`, every source's first pass after the upgrade
+        // compared two spellings of one digest, called it new, wrote "…is the
+        // newest debian-13" about a publish that did not happen, and ran
+        // retention off the back of it. `publish` already knows: it returns
+        // early when the object exists.
+        let (published, is_new) = self
+            .publish(&source.meta.name, &source.spec, &digest, now)
+            .await?;
+        // Still written, because an operator reading the object wants to know
+        // which bytes this source last saw. No longer read.
+        next.status.last_digest = digest.value();
         next.status.published = published.clone();
 
         // Only after a publish. Retention that ran on every look would be a loop
@@ -385,7 +474,7 @@ impl<F: Fetch> Reconciler for ImageSourceController<F> {
         // find nothing to do; nothing can fall out of `keep` unless something new
         // came in.
         let (removed, spared) = if is_new {
-            self.prune(&source.spec).await?
+            self.prune(&source.meta.name, &source.spec).await?
         } else {
             (Vec::new(), 0)
         };
@@ -410,7 +499,7 @@ impl<F: Fetch> Reconciler for ImageSourceController<F> {
         // an operator should not have to work it out from a list of guests.
         if spared > 0 {
             message.push_str(&format!(
-                "; {spared} past `keep` kept because instances are built from them"
+                "; {spared} past `keep` kept because guests or volumes are built from them"
             ));
         }
         set_condition(
@@ -499,7 +588,11 @@ mod tests {
     const DIGEST: &str = "cbf3e1f588f02f8d738dbecb32652d07568cc1d56cd60f72dbed54400ba3ae8d";
 
     fn sums(digest: &str) -> String {
-        format!("{digest}  debian-13-genericcloud-amd64.qcow2\n")
+        sums_for(digest, "debian-13-genericcloud-amd64.qcow2")
+    }
+
+    fn sums_for(digest: &str, filename: &str) -> String {
+        format!("{digest}  {filename}\n")
     }
 
     fn a_source() -> Resource<ImageSourceSpec, ImageSourceStatus> {
@@ -537,9 +630,11 @@ mod tests {
             asked: Mutex::new(Vec::new()),
         });
         let instances = TypedStore::new(store.clone(), "cell-1", "instances");
+        let volumes = TypedStore::new(store.clone(), "cell-1", "volumes");
         let c = ImageSourceController::new(
             images,
             instances,
+            volumes,
             StatusWriter::new(store, "cell-1", "image-sources", WRITER),
             says.clone(),
             "eu-central",
@@ -743,18 +838,36 @@ mod tests {
     }
 
     /// Publish `n` versions of the family, oldest first, as the source would.
+    /// Images in the store, as if a source had published them.
+    ///
+    /// `by` is who published them: `Some(source)` writes the provenance label
+    /// the controller writes, which is the path a live cell takes; `None`
+    /// leaves it off, which is both a hand-made image and an image published
+    /// before the label existed — the `source_url` fallback.
     async fn versions(
         images: &TypedStore<ImageSpec, ImageStatus>,
         url: &str,
         family: &str,
         digests: &[&str],
+        by: Option<&str>,
     ) {
         for (n, d) in digests.iter().enumerate() {
+            // Labelled as the controller labels what it publishes, so the path
+            // under test is the one a live cell takes. The `source_url` arm is
+            // the fallback for images published before the label, and it has
+            // its own test.
+            let mut meta = Meta::new(
+                format!("images/sha256-{d}").parse().unwrap(),
+                Placement::new("eu-central", "cell-1"),
+            );
+            if let Some(source) = by {
+                meta.labels.insert(
+                    velstra_cloud_model::resources::PUBLISHED_BY.to_string(),
+                    source.to_string(),
+                );
+            }
             let mut image = Resource::new(
-                Meta::new(
-                    format!("images/sha256-{d}").parse().unwrap(),
-                    Placement::new("eu-central", "cell-1"),
-                ),
+                meta,
                 ImageSpec {
                     from: String::new(),
                     family: family.into(),
@@ -796,6 +909,7 @@ mod tests {
                 &"c".repeat(64),
                 &"d".repeat(64),
             ],
+            Some("image-sources/debian"),
         )
         .await;
 
@@ -850,6 +964,7 @@ mod tests {
             url,
             "debian-13",
             &[&old, &"b".repeat(64), &"c".repeat(64)],
+            Some("image-sources/debian"),
         )
         .await;
 
@@ -897,7 +1012,9 @@ mod tests {
         let stored = sources.get("image-sources/debian").await.unwrap().unwrap();
         let checked = condition(&stored.status.conditions, CHECKED).unwrap();
         assert!(
-            checked.message.contains("instances are built from them"),
+            checked
+                .message
+                .contains("guests or volumes are built from them"),
             "{}",
             checked.message
         );
@@ -917,6 +1034,7 @@ mod tests {
             url,
             "debian-13",
             &[&"b".repeat(64), &"c".repeat(64)],
+            Some("image-sources/debian"),
         )
         .await;
         versions(
@@ -924,6 +1042,7 @@ mod tests {
             "http://elsewhere.example/patched.qcow2",
             "debian-13",
             &[&"e".repeat(64)],
+            None,
         )
         .await;
 
@@ -962,7 +1081,14 @@ mod tests {
         let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store, "cell-1", "images");
         let url = "http://cloud.example/debian-13-genericcloud-amd64.qcow2";
         let old = "b".repeat(64);
-        versions(&images, url, "debian-13", &[&old]).await;
+        versions(
+            &images,
+            url,
+            "debian-13",
+            &[&old],
+            Some("image-sources/debian"),
+        )
+        .await;
 
         let source = a_source();
         sources
@@ -1007,6 +1133,7 @@ mod tests {
             "http://elsewhere.example/patched.qcow2",
             "debian-13",
             &[&mine],
+            None,
         )
         .await;
 
@@ -1029,6 +1156,229 @@ mod tests {
             untouched.spec.state,
             ImageState::Active,
             "a rotation deprecated an image it did not publish"
+        );
+    }
+
+    /// A volume is the other half of "is anything built from this", and it was
+    /// never asked. The pool agent resolves an image's bytes through the image
+    /// object when it opens a volume, so one taken away while a volume is still
+    /// pending leaves that agent answering "there is no image called…" about
+    /// bytes it was told to clone.
+    #[tokio::test]
+    async fn an_image_a_volume_is_being_made_from_is_never_taken_away() {
+        let (raw, _says, c, sources) = fixture(Ok(sums(DIGEST))).await;
+        let store: Arc<dyn Store> = raw.clone();
+        let images: TypedStore<ImageSpec, ImageStatus> =
+            TypedStore::new(store.clone(), "cell-1", "images");
+        let volumes: TypedStore<
+            velstra_cloud_model::resources::VolumeSpec,
+            velstra_cloud_model::resources::VolumeStatus,
+        > = TypedStore::new(store, "cell-1", "volumes");
+        let url = "http://cloud.example/debian-13-genericcloud-amd64.qcow2";
+        let old = "a".repeat(64);
+        versions(
+            &images,
+            url,
+            "debian-13",
+            &[&old],
+            Some("image-sources/debian"),
+        )
+        .await;
+        versions(
+            &images,
+            url,
+            "debian-13",
+            &[&"b".repeat(64)],
+            Some("image-sources/debian"),
+        )
+        .await;
+
+        let mut volume = Resource::new(
+            Meta::new(
+                "projects/p1/volumes/v1".parse().unwrap(),
+                Placement::new("eu-central", "cell-1"),
+            ),
+            velstra_cloud_model::resources::VolumeSpec {
+                size_gib: 10,
+                pool: "pools/pool-a".into(),
+                source_image: Some(format!("images/sha256-{old}")),
+                ..Default::default()
+            },
+            velstra_cloud_model::resources::VolumeStatus::default(),
+        );
+        volume.meta.generation = 1;
+        volumes
+            .create(&volume, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+
+        let mut source = a_source();
+        source.spec.keep = 1;
+        sources
+            .create(&source, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+        let source = sources.get("image-sources/debian").await.unwrap().unwrap();
+        c.reconcile("image-sources/debian", Some(&source))
+            .await
+            .unwrap();
+
+        let left: Vec<String> = images
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.meta.name.id().to_string())
+            .collect();
+        assert!(
+            left.contains(&format!("sha256-{old}")),
+            "an image a volume is being made from was taken away: {left:?}"
+        );
+    }
+
+    /// A mirror moves and the source keeps what it published.
+    ///
+    /// `source_url` was the whole of "did this source make this", and it is a
+    /// value an operator edits. After an edit a source stopped owning its own
+    /// back catalogue, and retention never took anything away again.
+    #[tokio::test]
+    async fn a_source_pointed_at_a_new_mirror_still_owns_what_it_published() {
+        let (raw, _says, c, sources) = fixture(Ok(sums(DIGEST))).await;
+        let store: Arc<dyn Store> = raw.clone();
+        let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store, "cell-1", "images");
+        // Published by this source, from the mirror it used to point at.
+        versions(
+            &images,
+            "http://old-mirror.example/debian-13-genericcloud-amd64.qcow2",
+            "debian-13",
+            &[&"a".repeat(64)],
+            Some("image-sources/debian"),
+        )
+        .await;
+
+        let mut source = a_source();
+        source.spec.keep = 1;
+        sources
+            .create(&source, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+        let source = sources.get("image-sources/debian").await.unwrap().unwrap();
+        c.reconcile("image-sources/debian", Some(&source))
+            .await
+            .unwrap();
+
+        let left: Vec<String> = images
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.meta.name.id().to_string())
+            .collect();
+        assert!(
+            !left.contains(&format!("sha256-{}", "a".repeat(64))),
+            "a source that moved mirror lost track of what it had published: {left:?}"
+        );
+    }
+
+    /// The condition says a publish happened only when one did.
+    ///
+    /// `last_digest` is a report, not a key. When the spelling it is written in
+    /// changed, every source's first pass after the upgrade compared two
+    /// spellings of one digest, called it new, and ran retention off the back
+    /// of a publish that did not happen.
+    #[tokio::test]
+    async fn a_source_says_published_only_when_it_actually_published() {
+        let (raw, _says, c, sources) = fixture(Ok(sums(DIGEST))).await;
+        let store: Arc<dyn Store> = raw.clone();
+        let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store, "cell-1", "images");
+        versions(
+            &images,
+            "http://cloud.example/debian-13-genericcloud-amd64.qcow2",
+            "debian-13",
+            &[DIGEST],
+            Some("image-sources/debian"),
+        )
+        .await;
+
+        let mut source = a_source();
+        // What a source stored before the spelling changed holds: bare hex.
+        source.status.last_digest = DIGEST.to_string();
+        sources
+            .create(&source, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+        let source = sources.get("image-sources/debian").await.unwrap().unwrap();
+        c.reconcile("image-sources/debian", Some(&source))
+            .await
+            .unwrap();
+
+        let stored = sources.get("image-sources/debian").await.unwrap().unwrap();
+        let checked = condition(&stored.status.conditions, CHECKED).unwrap();
+        assert!(
+            checked.message.contains("is still current"),
+            "a pass that published nothing said it had: {}",
+            checked.message
+        );
+    }
+
+    /// The format is what the source says, not what this controller assumes.
+    ///
+    /// Ubuntu ships qcow2 under `.img`, so the assumption was wrong for one of
+    /// the two distributions most cells start from — and since every rotation
+    /// mints a new image, correcting it by hand had to be redone each time.
+    #[tokio::test]
+    async fn a_source_publishes_the_format_it_was_told_rather_than_assuming_qcow2() {
+        let (raw, _says, c, sources) =
+            fixture(Ok(sums_for(DIGEST, "noble-server-cloudimg-amd64.img"))).await;
+        let store: Arc<dyn Store> = raw.clone();
+        let images: TypedStore<ImageSpec, ImageStatus> = TypedStore::new(store, "cell-1", "images");
+
+        let mut source = a_source();
+        source.spec.url = "http://cloud.example/noble-server-cloudimg-amd64.img".into();
+        source.spec.format = Some(velstra_cloud_model::resources::ImageFormat::Raw);
+        sources
+            .create(&source, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+        let source = sources.get("image-sources/debian").await.unwrap().unwrap();
+        c.reconcile("image-sources/debian", Some(&source))
+            .await
+            .unwrap();
+
+        let made = images
+            .get(&format!("images/sha256-{DIGEST}"))
+            .await
+            .unwrap()
+            .expect("the published image");
+        assert_eq!(
+            made.spec.format,
+            velstra_cloud_model::resources::ImageFormat::Raw,
+            "the source said Raw and this published qcow2"
+        );
+    }
+
+    /// A source that cannot say what its bytes are says so on its own object.
+    #[tokio::test]
+    async fn a_source_that_cannot_say_what_its_bytes_are_says_so_on_the_object() {
+        let (_raw, _says, c, sources) = fixture(Ok(sums(DIGEST))).await;
+        let mut source = a_source();
+        source.spec.url = "http://cloud.example/noble-server-cloudimg-amd64.img".into();
+        sources
+            .create(&source, &velstra_cloud_model::Writer::controller("test"))
+            .await
+            .unwrap();
+        let source = sources.get("image-sources/debian").await.unwrap().unwrap();
+        c.reconcile("image-sources/debian", Some(&source))
+            .await
+            .unwrap();
+
+        let stored = sources.get("image-sources/debian").await.unwrap().unwrap();
+        let checked = condition(&stored.status.conditions, CHECKED).unwrap();
+        assert_eq!(checked.status, ConditionStatus::False);
+        assert!(
+            checked.message.contains("format"),
+            "a source that could not say what its bytes are published anyway: {}",
+            checked.message
         );
     }
 }

@@ -351,8 +351,7 @@ impl Vmm for QemuVmm {
         // What is on its way in. The incoming directory holds a copy that has
         // not been verified and moved across yet — which is what a fetch in
         // progress *is*, so there is nothing to record and nothing to go stale.
-        for name in hostfs::read_dir_names(&self.layout.incoming_dir).unwrap_or_default() {
-            let name = name.strip_suffix(".partial").unwrap_or(&name).to_string();
+        for name in hostfs::arriving(&self.layout.incoming_dir) {
             if !host.images.contains(&name) {
                 host.fetching.insert(name);
             }
@@ -580,6 +579,10 @@ impl Vmm for QemuVmm {
     }
     async fn forget_image(&self, stored_as: &str) -> Result<()> {
         hostfs::forget_image(&self.layout, stored_as)
+    }
+
+    async fn forget_stale_arrivals(&self, older_than_seconds: u64) -> usize {
+        hostfs::forget_stale_arrivals(&self.layout.incoming_dir, older_than_seconds)
     }
 
     async fn image_age_seconds(&self, stored_as: &str) -> Option<u64> {

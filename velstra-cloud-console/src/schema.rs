@@ -2448,6 +2448,23 @@ const IMAGE_SOURCE_FIELDS: &[Field] = &[
         at_creation: false,
     },
     Field {
+        key: "format",
+        label: "What the bytes are",
+        kind: Kind::Choice {
+            options: &[choice("Qcow2", "qcow2"), choice("Raw", "raw")],
+        },
+        required: false,
+        advanced: false,
+        help: "Leave it alone for a `.qcow2` file — the name settles it. \
+               Everywhere else it has to be said: nothing here ever fetches the \
+               bytes, and the filename lies (Ubuntu ships qcow2 under `.img`). \
+               A node handed a mis-declared image refuses the disk, and every \
+               guest of this family goes without one.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
         key: "checksums",
         label: "Checksums",
         kind: Kind::Text {

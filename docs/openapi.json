@@ -743,6 +743,14 @@
             "format": "id",
             "type": "string"
           },
+          "format": {
+            "description": "Leave it alone for a `.qcow2` file — the name settles it. Everywhere else it has to be said: nothing here ever fetches the bytes, and the filename lies (Ubuntu ships qcow2 under `.img`). A node handed a mis-declared image refuses the disk, and every guest of this family goes without one.",
+            "enum": [
+              "Qcow2",
+              "Raw"
+            ],
+            "type": "string"
+          },
           "keep": {
             "description": "How many of this family to keep. Three when left empty. An image an instance was built from is never taken away, however old — the guest would be unable to start on its next move.",
             "maximum": 50,
