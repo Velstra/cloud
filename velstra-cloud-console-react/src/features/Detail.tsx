@@ -25,10 +25,12 @@ import { Timeline } from "./Timeline";
 import { History } from "./History";
 import { Pressed } from "./Pressed";
 import { State } from "./State";
+import { useAsk } from "@/features/Ask";
 
 export function Detail({ coll, id, mode, onChanged }: {
   coll: Collection; id: string; mode?: "edit"; onChanged: () => void;
 }) {
+  const ask = useAsk();
   const project = useStore((s) => s.project);
   const who = useStore((s) => s.who);
   const can = useCan();
@@ -80,7 +82,7 @@ export function Detail({ coll, id, mode, onChanged }: {
           {mayOperate && custom.quick?.(r, coll, load)}
           {actions.map((a) => (
             <Pressed key={a.id} size="sm" title={a.summary} variant={a.destructive ? "destructive" : "secondary"} onPress={async () => {
-              if (a.destructive && !confirm(`${a.label} ${idOf(r)}?`)) return;
+              if (a.destructive && !(await ask({ title: `${a.label} ${idOf(r)}?`, confirmLabel: a.label, tone: "danger" }))) return;
               try {
                 const answer = await call(a.id, a.method, a.path.replace("{project}", projectOf(nameOf(r)) ?? project).replace(/\{(name|id)\}/, encodeURIComponent(idOf(r))), undefined, a.needsBody ? {} : undefined);
                 setAnswers((s) => ({ ...s, [a.id]: answer }));
@@ -91,7 +93,7 @@ export function Detail({ coll, id, mode, onChanged }: {
           ))}
           {coll.deletable && mayWrite && (
             <Pressed size="sm" variant="destructive" onPress={async () => {
-              if (!confirm(`Delete ${idOf(r)}? It stays visible until its finalizers let go.`)) return;
+              if (!(await ask({ title: `Delete ${idOf(r)}?`, body: `It stays visible until its finalizers let go.`, confirmLabel: "Delete", tone: "danger" }))) return;
               try {
                 await call(`delete:${coll.id}`, "DELETE", `${pathOf(coll, r, project)}/${encodeURIComponent(idOf(r))}`);
                 toast("Deletion asked for.", { description: "It stays listed until its finalizers let go." });

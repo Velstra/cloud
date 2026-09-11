@@ -15,6 +15,7 @@ import { ago, bytes, idOf, type Resource } from "@/lib/model";
 import { basePath, type Collection } from "@/lib/schema";
 import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
+import { useAsk } from "@/features/Ask";
 
 type Osd = { node: string; device: string; evenIfUnsuitable?: boolean };
 type Seen = { id: number; host?: string; device?: string; up?: boolean; in?: boolean; usedBytes?: number; totalBytes?: number; pgs?: number; class?: string };
@@ -56,6 +57,7 @@ const Th = ({ children, right }: { children?: React.ReactNode; right?: boolean }
 );
 
 export function Ceph({ r, coll, reload }: { r: Resource; coll: Collection; reload: () => void }) {
+  const ask = useAsk();
   const project = useStore((s) => s.project);
   const spec = r.spec ?? {}; const st = r.status ?? {};
   const asked: Osd[] = spec.osds ?? []; const up: Osd[] = st.osdsUp ?? []; const seen: Seen[] = st.osds ?? [];
@@ -173,7 +175,7 @@ export function Ceph({ r, coll, reload }: { r: Resource; coll: Collection; reloa
                       {isAsked ? (
                         <Pressed size="sm" variant="secondary" title="Remove this disk from the cluster's spec; Ceph drains and forgets it"
                           onPress={async () => {
-                            if (!confirm(`Take ${o.node}:${o.device} out of the cluster? Its data is re-placed on the others first; with size 1 pools that is data lost.`)) return;
+                            if (!(await ask({ title: `Take ${o.node}:${o.device} out of the cluster?`, body: `Its data is re-placed on the others first; with size 1 pools that is data lost.`, confirmLabel: "Take it out", tone: "danger" }))) return;
                             setTaken((t) => [...t, o]);
                             await patch({ osds: asked.filter((x) => !same(x, o)) }, `${o.device} on ${o.node} is being taken out.`);
                           }}>Take out</Pressed>

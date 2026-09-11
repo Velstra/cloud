@@ -3,10 +3,10 @@
 // exists to answer.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { call } from "@/api/transport";
+import { call, watch, type WatchEvent, type WatchState } from "@/api/transport";
 import { listEvery } from "@/lib/listing";
 import { nameOf, verdict, type Resource } from "@/lib/model";
-import { basePath, resolveId, type Collection } from "@/lib/schema";
+import { ALL, basePath, resolveId, type Collection } from "@/lib/schema";
 import { useStore } from "@/app/store";
 
 export type Loaded = {
@@ -19,6 +19,9 @@ export type Loaded = {
   truncated: boolean;
   /** Something on this list has not settled, so the list is re-reading itself. */
   busy: boolean;
+  /** What the live stream is doing — the third state is what says the screen
+   *  will not update itself. */
+  live: WatchState;
   refresh: () => Promise<void>;
 };
 
@@ -43,6 +46,7 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
     rows: c ? cache.get(key)?.rows ?? [] : [], revision: "", loading: !!c, error: "",
     changed: new Set<string>(), truncated: false,
   }));
+  const [live, setLive] = useState<WatchState>("connecting");
   const previous = useRef<Map<string, string>>(new Map());
   const run = useRef(0);
 
@@ -83,6 +87,45 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
     return () => { set.delete(mine); };
   }, [c, refresh]);
 
+  // **One stream per open board.**
+  //
+  // The API has served `?watch=true` as SSE all along and the other console
+  // consumes it; this one polled, and only while a row's verdict said it was
+  // busy. What that misses is everything with no verdict to be busy about: a
+  // change somebody else made, a controller minting an attachment, a row
+  // deleted from another tab.
+  //
+  // The stream is deliberately *not* narrowed by the label filter on the
+  // server: an object that loses the label would simply stop producing events,
+  // and its row would sit there for ever saying something that stopped being
+  // true. So a PUT that no longer matches removes the row here instead.
+  //
+  // Only for one project at a time. The ALL board's fan-out would be one
+  // stream per project and cannot show anything the list did not; it stays on
+  // the read, with the indicator saying so.
+  const streamable = !!c && project !== ALL && !!state.revision;
+  useEffect(() => {
+    if (!c || !streamable) { setLive("unsupported"); return; }
+    setLive("connecting");
+    const wants = labelFilter(labels);
+    const stream = watch(basePath(c, project), state.revision, (e: WatchEvent) => {
+      set((s) => {
+        const rows = fold(s.rows, e, wants);
+        if (rows === s.rows) return s;
+        // `previous` is what the changed-row highlight diffs against. Folding
+        // one event has to keep it in step, or the next whole-list read lights
+        // up every row that moved while the stream was carrying it.
+        for (const r of rows) if (c) previous.current.set(nameOf(r), verdict(r, c).kind);
+        cache.set(key, { rows, revision: s.revision });
+        return { ...s, rows };
+      });
+    }, setLive);
+    return () => stream.stop();
+    // The revision is the stream's starting point and must not restart it on
+    // every list read, so it is read once when the stream opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [c, project, labels, streamable]);
+
   // **While anything here is working, read it again.**
   //
   // Every write on this platform is asynchronous — a create answers with an
@@ -101,15 +144,60 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
   // migration past its deadline is decided by the clock. Five seconds for
   // everything else: fast enough that a guest coming up is watched rather than
   // waited for, slow enough that twenty rows are twelve reads a minute.
+  //
+  // **And `recheck` on its own, not only `busy`.** A collection whose
+  // `condition` is empty is settled unconditionally, so `busy` is never true
+  // for it — and `subnets` and `security-groups` carry a `recheck` precisely
+  // because their interesting numbers are computed at read time out of *other*
+  // objects. A subnet's occupancy is derived from the ports, floating IPs and
+  // load balancers that use it; nothing writes to the subnet, so there is no
+  // watch event either. Between the two, that board was frozen from the moment
+  // it loaded.
   const busy = state.rows.some((r) => c && verdict(r, c).busy);
+  const ticking = !!c && (busy || c.recheck > 0);
   useEffect(() => {
-    if (!c || !busy) return;
+    if (!c || !ticking) return;
     const every = Math.max(3, c.recheck || 5) * 1000;
     const t = setInterval(() => { refresh(); }, every);
     return () => clearInterval(t);
-  }, [c, busy, refresh]);
+  }, [c, ticking, refresh]);
 
-  return { ...state, refresh, busy };
+  return { ...state, refresh, busy, live };
+}
+
+/** `env=prod, tier=web` as a map, the same reading the list sends. */
+function labelFilter(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of raw.split(",")) {
+    const [k, ...rest] = part.split("=");
+    if (k.trim() && rest.length) out[k.trim()] = rest.join("=").trim();
+  }
+  return out;
+}
+
+const matches = (r: Resource, wants: Record<string, string>) =>
+  Object.entries(wants).every(([k, v]) => (r.meta.labels ?? {})[k] === v);
+
+/**
+ * One event, folded into the rows — or the same array when nothing changed, so
+ * React does not re-render a board for an event about a row it does not hold.
+ */
+function fold(rows: Resource[], e: WatchEvent, wants: Record<string, string>): Resource[] {
+  if (e.type === "DELETE") {
+    const at = rows.findIndex((r) => nameOf(r) === e.name);
+    return at < 0 ? rows : [...rows.slice(0, at), ...rows.slice(at + 1)];
+  }
+  if (e.type !== "PUT" || !e.resource) return rows;
+  const name = nameOf(e.resource);
+  const at = rows.findIndex((r) => nameOf(r) === name);
+  // An object that has stopped matching the filter leaves the board. The
+  // server does not narrow the stream, on purpose: narrowed, this object would
+  // simply stop sending events and its row would stay.
+  if (!matches(e.resource, wants)) {
+    return at < 0 ? rows : [...rows.slice(0, at), ...rows.slice(at + 1)];
+  }
+  if (at < 0) return [...rows, e.resource];
+  return [...rows.slice(0, at), e.resource, ...rows.slice(at + 1)];
 }
 
 /** One object, fresh. */

@@ -13,14 +13,22 @@ import { listEvery } from "@/lib/listing";
 import { SCHEMA, type Collection } from "@/lib/schema";
 import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
+import { useAsk } from "@/features/Ask";
 
 type Binding = { role: string; members: string[] };
 
 export function Account({ r }: { r: Resource }) {
+  const ask = useAsk();
   const who = useStore((s) => s.who);
   const me = who?.subject === idOf(r);
   const [where, setWhere] = useState<{ project: string; role: string }[] | null>(null);
   const [pw, setPw] = useState(""); const [current, setCurrent] = useState("");
+  // Typed twice, because nobody else can catch a typo in it. The API proves
+  // the *current* password and has no way to know whether the new one is what
+  // was meant — and a mistyped new password, with every other session ended in
+  // the same breath, is a lockout.
+  const [again, setAgain] = useState("");
+  const mismatch = !!again && again !== pw;
   const [purpose, setPurpose] = useState(""); const [minted, setMinted] = useState<{ token: string; purpose?: string } | null>(null);
   const [tokens, setTokens] = useState<{ id: string; purpose?: string; issuedAt?: number }[] | null>(null);
   const listTokens = () => call("list-tokens", "GET", `/api/v1/users/${encodeURIComponent(idOf(r))}/tokens`)
@@ -51,14 +59,24 @@ export function Account({ r }: { r: Resource }) {
           <div className="flex flex-wrap items-center gap-2">
             {me && <Input type="password" value={current} onChange={(e) => setCurrent(e.target.value)} placeholder="current password" className="h-8 w-52 text-xs" autoComplete="current-password" />}
             <Input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="new password" className="h-8 w-52 text-xs" autoComplete="new-password" />
-            <Pressed size="sm" variant="secondary" disabled={pw.length < 8 || (me && !current)} onPress={async () => {
+            <Input type="password" value={again} onChange={(e) => setAgain(e.target.value)} placeholder="again" className="h-8 w-52 text-xs" autoComplete="new-password"
+              aria-invalid={mismatch} style={mismatch ? { borderColor: "var(--failing)" } : undefined} />
+            <Pressed size="sm" variant="secondary" disabled={pw.length < 8 || again !== pw || (me && !current)} onPress={async () => {
               try {
-                await call("setPassword", "PUT", `/api/v1/users/${encodeURIComponent(idOf(r))}/password`, undefined, me ? { current, password: pw } : { password: pw });
-                toast(me ? "Your password is set; every other session of yours is ended." : `${idOf(r)}'s password is set; their other sessions are ended.`); setPw(""); setCurrent("");
+                // `currentPassword` is what the API reads. Spelled `current`,
+                // a self-service change that *did* prove the old password
+                // arrived without one and was refused as wrong — which it was
+                // not. The API's own doc names this failure.
+                await call("setPassword", "PUT", `/api/v1/users/${encodeURIComponent(idOf(r))}/password`, undefined,
+                  me ? { currentPassword: current, password: pw } : { password: pw });
+                toast(me ? "Your password is set; every other session of yours is ended." : `${idOf(r)}'s password is set; their other sessions are ended.`);
+                setPw(""); setCurrent(""); setAgain("");
               } catch (e) { toast.error((e as Error).message); }
             }}>Set password</Pressed>
           </div>
-          <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>At least 8 characters. {me ? "Your current one is needed." : "As a cell operator, no current one is needed."}</p>
+          <p className="text-[11px]" style={{ color: mismatch ? "var(--failing)" : "var(--text-faint)" }}>
+            {mismatch ? "The two do not match." : `At least 8 characters, typed twice. ${me ? "Your current one is needed." : "As a cell operator, no current one is needed."}`}
+          </p>
         </form>
       )}
 
@@ -89,7 +107,7 @@ export function Account({ r }: { r: Resource }) {
                   <td className="py-1.5" style={{ color: "var(--text-muted)" }}>{t.issuedAt ? ago(t.issuedAt) : "—"}</td>
                   <td className="py-1.5 text-right">
                     <Pressed size="sm" variant="destructive" title="This token stops working immediately" onPress={async () => {
-                      if (!confirm(`Revoke this token${t.purpose ? ` (${t.purpose})` : ""}? Whatever is using it stops being able to sign in at once.`)) return;
+                      if (!(await ask({ title: `Revoke this token${t.purpose ? ` (${t.purpose})` : ""}?`, body: `Whatever is using it stops being able to sign in at once.`, confirmLabel: "Revoke", tone: "danger" }))) return;
                       try { await call("revoke-token", "DELETE", `/api/v1/users/${encodeURIComponent(idOf(r))}/tokens/${encodeURIComponent(t.id)}`); toast("Token revoked."); listTokens(); }
                       catch (e) { toast.error((e as Error).message); }
                     }}>Revoke</Pressed>
@@ -108,6 +126,7 @@ export function Account({ r }: { r: Resource }) {
 
 /** Disable or enable, and make or unmake a cell operator. */
 export function UserQuick({ r, c, reload }: { r: Resource; c: Collection; reload: () => void }) {
+  const ask = useAsk();
   const who = useStore((s) => s.who);
   const me = who?.subject === idOf(r);
   const flip = async (spec: Record<string, unknown>, said: string) => {
@@ -120,12 +139,14 @@ export function UserQuick({ r, c, reload }: { r: Resource; c: Collection; reload
     <>
       <Pressed size="sm" variant={r.spec?.disabled ? "secondary" : "destructive"} disabled={me} title={me ? "Not your own account" : r.spec?.disabled ? "Let them sign in again" : "They cannot sign in; bindings stay, live sessions end"}
         onPress={async () => {
-          if (!r.spec?.disabled && !confirm(`Disable ${idOf(r)}? They cannot sign in and their sessions end. Their bindings stay for when they are enabled again.`)) return;
+          if (!r.spec?.disabled && !(await ask({ title: `Disable ${idOf(r)}?`, body: "They cannot sign in and their sessions end. Their bindings stay for when they are enabled again.", confirmLabel: "Disable", tone: "danger" }))) return;
           await flip({ disabled: !r.spec?.disabled }, r.spec?.disabled ? `${idOf(r)} may sign in again.` : `${idOf(r)} is disabled.`);
         }}>{r.spec?.disabled ? "Enable" : "Disable"}</Pressed>
       <Pressed size="sm" variant="secondary" disabled={me} title={r.spec?.cellAdmin ? "Take cell operator away" : "Everything, everywhere — the provider's own role"}
         onPress={async () => {
-          if (!confirm(r.spec?.cellAdmin ? `${idOf(r)} stops being a cell operator?` : `Make ${idOf(r)} a cell operator? That is everything, everywhere, including every tenant's data.`)) return;
+          if (!(await ask(r.spec?.cellAdmin
+                        ? { title: `${idOf(r)} stops being a cell operator?`, confirmLabel: "Take it away", tone: "danger" }
+                        : { title: `Make ${idOf(r)} a cell operator?`, body: "That is everything, everywhere, including every tenant's data.", confirmLabel: "Make them one", tone: "danger" }))) return;
           await flip({ cellAdmin: !r.spec?.cellAdmin }, r.spec?.cellAdmin ? `${idOf(r)} is a tenant account now.` : `${idOf(r)} is a cell operator.`);
         }}>{r.spec?.cellAdmin ? "Revoke cell operator" : "Make cell operator"}</Pressed>
     </>

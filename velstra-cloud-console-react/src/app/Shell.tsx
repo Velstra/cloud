@@ -9,7 +9,7 @@
 // it is a drive to a desk.
 
 import { useEffect, useMemo, useState } from "react";
-import { Bell, ChevronDown, ChevronRight, Command as Cmd, LogOut, Menu, Moon, Rows3, Search, Sun } from "lucide-react";
+import { Bell, ChevronDown, ChevronRight, Command as Cmd, LogOut, Menu, Moon, Rows3, Search, Sun, UserRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator,
@@ -123,6 +123,12 @@ export function Shell({ census, onSweep, children }: {
                           : <span className="font-mono text-[11px]" style={{ color: "var(--text-faint)" }}>{seen ? seen.total : ""}</span>} />
                     );
                   })}
+                  {/* The bill belongs with the readings it is summed from —
+                      one group, evidence and total. It is not a collection, so
+                      the schema cannot put it here and this does. */}
+                  {g.items.some((c) => c.id === "usage") && (
+                    <RailLink active={route.view === "spend"} to={href({ view: "spend" })} label="Spend" />
+                  )}
                 </div></div>
               </div>
             );
@@ -164,7 +170,9 @@ export function Shell({ census, onSweep, children }: {
               </DropdownMenu>
             ) : <span title={who?.projects?.[project] ? `you are ${who.projects[project]} here` : undefined}>{project}</span>}
             <span>/</span>
-            {route.view === "overview" ? <span>overview</span> : route.view === "map" ? <span>map</span> : <>
+            {route.view === "overview" ? <span>overview</span> : route.view === "map" ? <span>map</span>
+              : route.view === "me" ? <span>your account</span>
+              : route.view === "spend" ? <span>spend</span> : <>
               <a href={href({ view: "board", coll: route.coll })} className="hover:underline">{route.coll}</a>
               {route.id && <><span>/</span><span style={{ color: "var(--text-strong)" }}>{route.id}</span></>}
             </>}
@@ -194,6 +202,10 @@ export function Shell({ census, onSweep, children }: {
                 </ul>
               </PopoverContent>
             </Popover>
+            <Tooltip><TooltipTrigger render={<Button size="sm" variant="ghost" aria-label="Your account"
+              onClick={() => go({ view: "me" })} />}>
+              <UserRound className="size-4" />
+            </TooltipTrigger><TooltipContent>Your account</TooltipContent></Tooltip>
             <Tooltip><TooltipTrigger render={<Button size="sm" variant="ghost" aria-label="Sign out" onClick={async () => {
               try { await call("signOut", "DELETE", "/api/v1/sessions/current"); } catch { /* the token is going either way */ }
               clearToken(); setState({ who: null }); location.reload();
@@ -294,6 +306,8 @@ function Palette({ open, onOpenChange, census }: { open: boolean; onOpenChange: 
         <CommandSeparator />
         <CommandGroup heading="Go to">
           <CommandItem value="overview" onSelect={() => run(() => go({ view: "overview" }))}>Overview</CommandItem>
+          <CommandItem value="spend" onSelect={() => run(() => go({ view: "spend" }))}>Spend</CommandItem>
+          <CommandItem value="account" onSelect={() => run(() => go({ view: "me" }))}>Your account</CommandItem>
           <CommandItem value="map topology network" onSelect={() => run(() => go({ view: "map" }))}>Map</CommandItem>
           {navigable(!!who?.cellAdmin).map((c) => (
             <CommandItem key={c.id} value={`${c.title} ${c.group}`} onSelect={() => run(() => go({ view: "board", coll: c.id }))}>

@@ -6,28 +6,25 @@
 
 import raw from "../schema.json";
 
-export type FieldKind =
-  | "text" | "number" | "switch" | "choice" | "ref" | "refList" | "moment"
-  | "lines" | "textList" | "diskList" | "grantList" | "listenerList"
-  | "poolList" | "ruleList";
+// The field and column shapes are **generated** — `src/schema.d.ts`, written
+// from the same document this file reads, and pinned by
+// `velstra-cloud-console/tests/react_schema.rs`. Written by hand they were a
+// second copy of the schema that drifted in silence: eleven keys were
+// serialised and shipped, and naming one of them here was a compile error, so
+// every `check`, every unit and every `min`/`max` sat in the JSON unread.
+export type { Field, Column } from "../schema.d";
+import type { Field, Column } from "../schema.d";
 
-export type Field = {
-  key: string;
-  label: string;
-  kind: FieldKind;
-  required: boolean;
-  advanced: boolean;
-  derived: boolean;
-  atCreation: boolean;
-  help: string;
-  whenEmpty: string;
-  options?: { value: string; label: string }[];
-  collection?: string;
-  filterBy?: string | null;
-  spelling?: "id" | "name";
-};
+export type FieldKind = Field["kind"];
 
-export type Column = { label: string; path: string; cell: string; width: number };
+/** One kind of field, with the keys that kind actually carries. */
+export type FieldOf<K extends FieldKind> = Extract<Field, { kind: K }>;
+/** One kind of column, likewise. */
+export type ColumnOf<K extends Column["cell"]> = Extract<Column, { cell: K }>;
+
+/** Fields that point at another object — the two kinds with a `collection`. */
+export const isRef = (f: Field): f is FieldOf<"ref"> | FieldOf<"refList"> =>
+  f.kind === "ref" || f.kind === "refList";
 
 export type Agreement = { label: string; asked: string; is: string; note: string };
 
