@@ -215,6 +215,7 @@ impl Agent {
         &self,
         balancers: &[velstra_cloud_model::loadbalancer::LoadBalancer],
         ports: &BTreeMap<String, Port>,
+        groups: &BTreeMap<String, SecurityGroup>,
     ) {
         if self.localnet.is_none() {
             return;
@@ -225,7 +226,10 @@ impl Agent {
             .collect();
         let node = self.config.node.clone();
         let mine = |port: &Port| port.status.node.as_deref() == Some(node.as_str());
-        let want = crate::balancer::plan(balancers, ports, &mine, &answering);
+        // The same resolution the firewall gets, so what a member admits
+        // through the VIP and what it admits on the wire are one answer.
+        let rules_of = |port: &Port| self.rules_for(&port.spec, groups, ports);
+        let want = crate::balancer::plan(balancers, ports, &mine, &answering, &rules_of);
 
         let wanted: BTreeMap<std::net::SocketAddr, crate::balancer::Service> =
             want.into_iter().map(|s| (s.at, s)).collect();
@@ -288,7 +292,17 @@ impl Agent {
         let Some(localnet) = &self.localnet else {
             return true;
         };
-        let segments = crate::localnet::segments(ports, subnets, networks, taps, balancers);
+        // Once per process: whether the kernel can track a bridged flow. The
+        // bridge-family filter is written only where the answer is yes, and
+        // the ports say so where it is no.
+        if !self.verified_same_segment.swap(true, Ordering::Relaxed) {
+            localnet.verify_same_segment_filtering().await;
+        }
+        // The routed public addresses this node's guests hold: the segment
+        // holding such a guest answers for its next hop and routes back in.
+        let floating = self.cell.floating_ips().await.unwrap_or_default();
+        let segments =
+            crate::localnet::segments(ports, subnets, networks, taps, balancers, &floating);
         match localnet.apply(&segments, guarded).await {
             Ok(()) => true,
             Err(e) => {
@@ -402,6 +416,10 @@ pub struct Agent {
     /// where the reason a guest on a first-hop-less node cannot be logged into
     /// is written down.
     localnet: Option<crate::localnet::LocalNet>,
+    /// Whether the local datapath has been asked, once, whether it can judge
+    /// frames between two guests on one bridge. See
+    /// [`crate::localnet::LocalNet::verify_same_segment_filtering`].
+    verified_same_segment: AtomicBool,
     guests: GuestRegistry,
     /// How this node runs Ceph's own tools. A field so a test can point it at
     /// something that is not `cephadm`, and so the pass does not construct one
@@ -507,6 +525,7 @@ impl Agent {
             vmm,
             datapath,
             localnet: None,
+            verified_same_segment: AtomicBool::new(false),
             guests: GuestRegistry::new(),
             cephadm: crate::cephadm::CephAdmin::default(),
             warned_about_ceph_reads: AtomicBool::new(false),
@@ -1231,10 +1250,13 @@ impl Agent {
         // pass — after a restart, say — has a tap and no bridge until somebody
         // makes one, and the guest on it is already running.
         let taps_now = taps_of(&programmed);
+        // The cell's public addresses, read once: the firewall guards the ones
+        // this node's guests hold, and the first hop routes them.
+        let floating = self.cell.floating_ips().await.unwrap_or_default();
         // What every port on this node is allowed, resolved once for the pass.
         // On the local datapath this is the firewall; on the fabric it is
         // programmed there instead and this list is unused.
-        let guarded = self.guarded(&ports, &groups, &taps_now);
+        let guarded = self.guarded(&ports, &groups, &taps_now, &floating);
         if !self
             .ensure_first_hop(&ports, &subnets, &networks, &taps_now, &balancers, &guarded)
             .await
@@ -1242,7 +1264,7 @@ impl Agent {
             pass.failures += 1;
         }
         // And the listeners in front of them, once the addresses are held.
-        self.balance(&balancers, &ports).await;
+        self.balance(&balancers, &ports, &groups).await;
 
         let mut mine = Vec::new();
         for instance in &instances {
@@ -1450,7 +1472,15 @@ impl Agent {
         // What each port's firewall turned away, read once for the pass. Empty
         // on a datapath that does not filter here, which is what makes the
         // status absent rather than zero.
-        let turned_away = self.turned_away(&ports, &groups, &taps).await;
+        let turned_away = self.turned_away(&ports, &groups, &taps, &floating).await;
+        // The wire a guest's frame leaves this node on, when this node is its
+        // first hop — for the one check that can only be made here: does the
+        // network's MTU fit it. Read once per pass.
+        let uplink = match &self.localnet {
+            Some(_) => crate::mtu::uplink_mtu("ip").await,
+            None => None,
+        };
+        let same_segment = self.localnet.as_ref().map(|l| l.filters_same_segment());
 
         for port in ports.values() {
             let name = port.meta.name.to_string();
@@ -1465,12 +1495,22 @@ impl Agent {
             let mine_to_report = owner == Some(self.config.node.as_str())
                 || (owner.is_none() && referenced.contains(name.as_str()));
             if mine_to_report {
+                let network_mtu = networks.get(&port.spec.network).map(|n| n.mtu).unwrap_or(0);
+                let has_rules = guarded
+                    .iter()
+                    .any(|g| g.port == name && !g.rules.is_empty());
                 self.port_pass(
                     port,
                     &taps,
                     in_my_share.contains(name.as_str()),
                     answering.get(name.as_str()),
                     turned_away.get(name.as_str()).copied(),
+                    PortFacts {
+                        same_segment,
+                        has_rules,
+                        network_mtu,
+                        uplink: uplink.as_ref(),
+                    },
                     pass,
                 )
                 .await;
@@ -1834,11 +1874,12 @@ impl Agent {
         ports: &BTreeMap<String, Port>,
         groups: &BTreeMap<String, SecurityGroup>,
         taps: &BTreeMap<String, String>,
+        floating: &[velstra_cloud_model::resources::FloatingIp],
     ) -> BTreeMap<String, crate::nftfilter::Dropped> {
         let Some(localnet) = &self.localnet else {
             return BTreeMap::new();
         };
-        let guarded = self.guarded(ports, groups, taps);
+        let guarded = self.guarded(ports, groups, taps, floating);
         if guarded.iter().all(|g| g.rules.is_empty()) {
             return BTreeMap::new();
         }
@@ -1864,21 +1905,33 @@ impl Agent {
         ports: &BTreeMap<String, Port>,
         groups: &BTreeMap<String, SecurityGroup>,
         taps: &BTreeMap<String, String>,
+        floating: &[velstra_cloud_model::resources::FloatingIp],
     ) -> Vec<crate::nftfilter::Guarded> {
         ports
             .iter()
             .filter_map(|(name, port)| {
+                // What the guest actually holds. The firewall matches on the
+                // address rather than the wire — see `crate::nftfilter` —
+                // because a tap enslaved to a bridge is not what the forward
+                // hook sees. One tenant address per port, which is what the
+                // model gives it (a dual-stack guest gets a second port), plus
+                // every routed public address bound to it: the guest holds
+                // those too, so the anti-spoof table has to let it claim them
+                // and the filter has to judge traffic to them.
+                let mut addresses: Vec<String> = port.spec.address.iter().cloned().collect();
+                for fip in floating {
+                    if fip.spec.delivery == velstra_cloud_model::public::Delivery::Routed
+                        && &fip.spec.port == name
+                        && let Some(a) = fip.spec.address.as_deref().filter(|a| !a.is_empty())
+                        && !addresses.iter().any(|held| held == a)
+                    {
+                        addresses.push(a.to_string());
+                    }
+                }
                 Some(crate::nftfilter::Guarded {
                     port: name.clone(),
                     tap: taps.get(name)?.clone(),
-                    // What the guest actually holds. The firewall matches on
-                    // the address rather than the wire — see
-                    // `crate::nftfilter` — because a tap enslaved to a bridge
-                    // is not what the forward hook sees.
-                    // One address per port, which is what the model gives it.
-                    // A dual-stack guest gets a second port, so both are
-                    // guarded, each by its own chain.
-                    addresses: port.spec.address.iter().cloned().collect(),
+                    addresses,
                     mac: port.spec.mac.clone(),
                     rules: self.rules_for(&port.spec, groups, ports),
                 })
@@ -1975,7 +2028,12 @@ impl Agent {
                                     // arm reports on the *port*, and a bridge
                                     // this node could not make is not something
                                     // the port did wrong.
-                                    let guarded = self.guarded(ports, groups, &taps);
+                                    // Read again here rather than threaded through: this
+                                    // is the second, mid-pass call — the instant a port is
+                                    // programmed — and it costs one list.
+                                    let floating =
+                                        self.cell.floating_ips().await.unwrap_or_default();
+                                    let guarded = self.guarded(ports, groups, &taps, &floating);
                                     self.ensure_first_hop(
                                         ports,
                                         cell.subnets,
@@ -2463,7 +2521,7 @@ impl Agent {
                 None => speaker.is_speaking().await,
             };
             if still_speaking {
-                let silence = crate::bgp::desired_for(me, &[], &[], &[], &[]);
+                let silence = crate::bgp::desired_for(me, &[], &[], &[], &[], &[], &[], false);
                 match speaker.apply(&silence).await {
                     Ok(()) => {
                         pass.actions += 1;
@@ -2481,12 +2539,14 @@ impl Agent {
             }
             return;
         }
-        let (networks, subnets, floating) = match (
+        let (networks, subnets, floating, ports, nodes) = match (
             self.cell.networks().await,
             self.cell.subnets().await,
             self.cell.floating_ips().await,
+            self.cell.ports().await,
+            self.cell.nodes().await,
         ) {
-            (Ok(n), Ok(s), Ok(f)) => (n, s, f),
+            (Ok(n), Ok(s), Ok(f), Ok(p), Ok(no)) => (n, s, f, p, no),
             _ => {
                 // A daemon programmed from a half-read cell would announce a
                 // half-truth to the router in front of everything.
@@ -2495,7 +2555,12 @@ impl Agent {
                 return;
             }
         };
-        let desired = crate::bgp::desired_for(me, &peers, &networks, &subnets, &floating);
+        // Whether a `FromGateway` address can reach the guest from here: only
+        // over an overlay. A node that is its guests' first hop has none.
+        let overlay = self.localnet.is_none() && self.datapath.datapath_name() == "fabric";
+        let desired = crate::bgp::desired_for(
+            me, &peers, &networks, &subnets, &floating, &ports, &nodes, overlay,
+        );
         let outcome = {
             let unchanged = self
                 .bgp_applied
@@ -2744,6 +2809,7 @@ impl Agent {
         // is filtering it. `None` is "nothing is judging this port", which is
         // not the same as "nothing was dropped".
         dropped: Option<crate::nftfilter::Dropped>,
+        facts: PortFacts<'_>,
         pass: &mut Pass,
     ) {
         let name = stored.meta.name.to_string();
@@ -2821,6 +2887,53 @@ impl Agent {
             &mut next.status.conditions,
             host_condition(&outcome, stored.meta.generation),
         );
+        // Two things only this node can say, said here rather than shown as a
+        // claim. Both only on the local datapath: a fabric judges elsewhere.
+        if let Some(filters_same_segment) = facts.same_segment {
+            // "This port's rules are in force" is exactly the claim the
+            // console makes, and it was false for the guest next door on a
+            // bare node. Said false here, with the reason, rather than true
+            // by omission.
+            let condition = if !facts.has_rules || filters_same_segment {
+                Condition::new(
+                    "SameSegmentFiltered",
+                    ConditionStatus::True,
+                    if facts.has_rules {
+                        "Filtered"
+                    } else {
+                        "NoRules"
+                    },
+                    "",
+                    stored.meta.generation,
+                )
+            } else {
+                Condition::new(
+                    "SameSegmentFiltered",
+                    ConditionStatus::False,
+                    "ModuleMissing",
+                    "this node cannot track a bridged flow (nf_conntrack_bridge is not loaded), \
+                     so this port's rules are in force against the world and not against a \
+                     guest on the same segment. Load the module on the node and the next pass \
+                     writes the bridge-family filter.",
+                    stored.meta.generation,
+                )
+            };
+            set_condition(&mut next.status.conditions, condition);
+        }
+        if let Some((iface, wire)) = facts.uplink {
+            let condition =
+                crate::mtu::condition(facts.network_mtu, *wire, 0, iface, stored.meta.generation)
+                    .unwrap_or_else(|| {
+                        Condition::new(
+                            "MtuFits",
+                            ConditionStatus::True,
+                            "Fits",
+                            "",
+                            stored.meta.generation,
+                        )
+                    });
+            set_condition(&mut next.status.conditions, condition);
+        }
         // "This node holds nothing of it" — an observation, not an inference
         // from the action list, and the fact the port controller waits for
         // before it drops the release guard. It has to include `outcome`: a
@@ -2838,6 +2951,20 @@ impl Agent {
 
         self.report(&self.ports, stored, next, pass).await;
     }
+}
+
+/// What this node knows about a port that only it can say — see `port_pass`.
+struct PortFacts<'a> {
+    /// `Some` on the local datapath: whether frames between two guests on one
+    /// bridge are judged here. `None` where a fabric judges instead.
+    same_segment: Option<bool>,
+    /// Whether the port carries any security-group rule at all.
+    has_rules: bool,
+    /// The network's declared MTU, or 0 when unknown.
+    network_mtu: u32,
+    /// The interface this node's default route leaves through and its MTU,
+    /// when this node is the guest's first hop.
+    uplink: Option<&'a (String, u32)>,
 }
 
 fn is_release(action: &Action) -> bool {

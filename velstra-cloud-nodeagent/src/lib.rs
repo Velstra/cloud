@@ -81,6 +81,7 @@ pub mod hostfs;
 pub mod localnet;
 pub mod lvm_pool;
 pub mod metadata;
+pub mod mtu;
 pub mod nftfilter;
 pub mod pcidev;
 pub mod pool;

@@ -2444,6 +2444,25 @@ pub struct NetworkSpec {
     /// The VNI on the Velstra fabric. Assigned by the controller from the
     /// cell's range, never chosen by a tenant.
     pub vni: u32,
+    /// What every guest on this network is told its link carries, in bytes.
+    ///
+    /// Reaches the guest and only the guest — DHCP option 26 and the netplan
+    /// the metadata service writes. It is deliberately **not** sent to the
+    /// fabric: the overlay's own sizing comes from the underlay MTU each node
+    /// reads off its interface, which is a fact about a machine and not about
+    /// a network.
+    ///
+    /// The two are related and nothing can join them centrally: the underlay
+    /// is per node and two nodes may differ, so "does this fit" is answered on
+    /// the node that carries the port, as a condition on that port, naming
+    /// both numbers. The API refuses only what no wire could carry — below
+    /// 1280 (IPv6's minimum) or above 9000 — because that much is knowable
+    /// where the form is still open. The default is 1450: a 1500-byte wire
+    /// less the 50 bytes a VXLAN header takes.
+    ///
+    /// Never clamped. Two nodes with different underlays would hand two guests
+    /// on one segment two different MTUs, and an asymmetric MTU on one L2
+    /// domain is a harder failure than the mismatch it hides.
     pub mtu: u32,
     /// This network carries addresses the world can reach.
     ///

@@ -267,6 +267,42 @@ fn programmable_shape(protocol: Protocol, ports: Option<PortRange>) -> Result<()
     }
 }
 
+/// Whether these rules admit a connection from `remote` to `port` over
+/// `protocol`, in `direction`.
+///
+/// **No rules admits everything** — that is the platform's stance with nothing
+/// added, and it is what an unfiltered port means. With rules, the client is
+/// admitted only if some rule in that direction names its protocol (or any),
+/// contains its address, and contains the port (or names no port range).
+///
+/// Asked by the local load balancer, which is the last thing that still knows
+/// the client's address: the connection it opens to a member is sourced from
+/// the node, so the member's own firewall chains — which judge the *forward*
+/// hook — never see it. A client a member's rules deny reached it anyway.
+/// This is the half of that which can be made true in userspace; the half
+/// that cannot (the member seeing the client's address) is written down in
+/// the balancer.
+pub fn admits(
+    rules: &[ResolvedRule],
+    direction: Direction,
+    remote: std::net::IpAddr,
+    port: u16,
+    protocol: Protocol,
+) -> bool {
+    if rules.is_empty() {
+        return true;
+    }
+    rules
+        .iter()
+        .filter(|r| r.direction == direction)
+        .filter(|r| r.protocol == Protocol::Any || r.protocol == protocol)
+        .filter(|r| match r.ports {
+            None => true,
+            Some(range) => range.from <= port && port <= range.to,
+        })
+        .any(|r| crate::network::Cidr::parse(&r.remote).is_ok_and(|prefix| prefix.contains(remote)))
+}
+
 /// Refuse a rule that cannot mean what it appears to mean.
 ///
 /// Deliberately narrow: it rejects rules that are self-contradictory, never

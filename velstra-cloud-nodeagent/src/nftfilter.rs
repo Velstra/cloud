@@ -61,6 +61,30 @@ use velstra_cloud_model::security::{Direction, Protocol, ResolvedRule};
 /// The table this module owns, and nothing else writes.
 pub const TABLE: &str = "velstra-filter";
 
+/// The same rules, in the `bridge` family — where two guests on one bridge
+/// actually meet.
+///
+/// The `inet` table's `forward` hook is traversed only for packets the host
+/// *routes*. Two guests on one segment share a bridge, and a frame from one to
+/// the other is switched, never routed: it goes past that hook without being
+/// judged — unless `br_netfilter` happens to be loaded, which a machine that
+/// also runs Docker has and a bare one does not. A security property that
+/// depends on what else is installed is not a security property, and the
+/// console showed a firewall that did not apply to the guest next door.
+///
+/// So the per-port rules are written a second time here, entered by interface
+/// rather than by address, because the bridge family sees the real ingress
+/// and egress port of a frame. After the anti-spoof table the tap and the
+/// address are bound to each other, so the two tables agree by construction.
+///
+/// **Only written where it is true**, because a bridge-family `ct state` is
+/// tracked only when `nf_conntrack_bridge` is loaded — and without it every
+/// frame is `untracked`, the established/related accept never matches, and
+/// every reply to an allowed request is dropped. That is a whole-cell outage,
+/// not a partial one. `localnet` verifies the module before writing this and
+/// says so on the port when it cannot.
+pub const BRIDGE_TABLE: &str = "velstra-filter-bridge";
+
 /// One port, its addresses, and what it is allowed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Guarded {
@@ -165,6 +189,86 @@ pub fn ruleset(guarded: &[Guarded]) -> String {
     }
     out.push_str("}\n");
     out
+}
+
+/// The bridge-family half of the firewall. See [`BRIDGE_TABLE`].
+///
+/// Same `matcher`, same per-direction chains, same terminal drop — with three
+/// differences that are the whole point: the jump is on `iifname`/`oifname`
+/// rather than on the address; each jump is guarded by `meta protocol` so an
+/// ARP frame is never judged by an IP rule; and the chains carry their own
+/// suffix (`-bin`/`-bout`) so `counters` keeps the two tables' drops apart.
+pub fn ruleset_bridge(guarded: &[Guarded]) -> String {
+    let filtered: Vec<&Guarded> = guarded
+        .iter()
+        .filter(|g| !g.rules.is_empty() && !g.addresses.is_empty() && !g.tap.is_empty())
+        .collect();
+    let mut out = String::new();
+    out.push_str(&format!("add table bridge {BRIDGE_TABLE}\n"));
+    out.push_str(&format!("delete table bridge {BRIDGE_TABLE}\n"));
+    out.push_str(&format!("table bridge {BRIDGE_TABLE} {{\n"));
+    out.push_str(
+        "  chain forward {\n    type filter hook forward priority filter; policy accept;\n",
+    );
+    if filtered.is_empty() {
+        out.push_str("  }\n}\n");
+        return out;
+    }
+    out.push_str("    ct state established,related counter accept\n");
+    for g in &filtered {
+        for direction in [Direction::Ingress, Direction::Egress] {
+            if !has_rules(g, direction) {
+                continue;
+            }
+            // Towards the guest is *out of* the bridge into its tap; away
+            // from it is *in from* its tap.
+            let which = match direction {
+                Direction::Ingress => "oifname",
+                Direction::Egress => "iifname",
+            };
+            for family in ["ip", "ip6"] {
+                // Only the families this port holds an address in, so a
+                // v4-only guest is not sent through a chain that judges
+                // nothing of its own.
+                if !g.addresses.iter().any(|a| family_of(a) == family) {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "    {which} \"{}\" meta protocol {family} jump {}\n",
+                    g.tap,
+                    bridge_chain(&g.tap, direction)
+                ));
+            }
+        }
+    }
+    out.push_str("  }\n");
+    for g in &filtered {
+        for direction in [Direction::Ingress, Direction::Egress] {
+            if !has_rules(g, direction) {
+                continue;
+            }
+            out.push_str(&format!("  chain {} {{\n", bridge_chain(&g.tap, direction)));
+            for rule in g.rules.iter().filter(|r| r.direction == direction) {
+                if let Some(line) = matcher(rule, direction) {
+                    out.push_str(&format!("    {line} counter accept\n"));
+                }
+            }
+            out.push_str("    counter drop\n");
+            out.push_str("  }\n");
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// The bridge-family chain for one tap and one direction. A different suffix
+/// from [`chain`], so a listing of both tables never counts one drop twice.
+pub fn bridge_chain(tap: &str, direction: Direction) -> String {
+    let side = match direction {
+        Direction::Ingress => "bin",
+        Direction::Egress => "bout",
+    };
+    format!("{tap}-{side}")
 }
 
 /// Whether this port has anything to say about that direction.
@@ -302,8 +406,31 @@ pub fn counters(listing: &serde_json::Value, guarded: &[Guarded]) -> BTreeMap<St
         .iter()
         .filter(|g| !g.rules.is_empty() && !g.addresses.is_empty())
     {
-        let inbound = by_chain.get(&chain(&g.tap, Direction::Ingress)).copied();
-        let outbound = by_chain.get(&chain(&g.tap, Direction::Egress)).copied();
+        // Both tables, summed: a drop is a drop whichever hook judged the
+        // frame, and the question this answers — "why can my guest not reach
+        // that" — does not care whether the other end was routed or switched.
+        let sum = |a: Option<(u64, u64)>, b: Option<(u64, u64)>| -> Option<(u64, u64)> {
+            match (a, b) {
+                (None, None) => None,
+                (x, y) => {
+                    let (xp, xb) = x.unwrap_or_default();
+                    let (yp, yb) = y.unwrap_or_default();
+                    Some((xp + yp, xb + yb))
+                }
+            }
+        };
+        let inbound = sum(
+            by_chain.get(&chain(&g.tap, Direction::Ingress)).copied(),
+            by_chain
+                .get(&bridge_chain(&g.tap, Direction::Ingress))
+                .copied(),
+        );
+        let outbound = sum(
+            by_chain.get(&chain(&g.tap, Direction::Egress)).copied(),
+            by_chain
+                .get(&bridge_chain(&g.tap, Direction::Egress))
+                .copied(),
+        );
         if inbound.is_none() && outbound.is_none() {
             continue;
         }
@@ -368,6 +495,67 @@ mod tests {
         let text = ruleset(&[guarded(Vec::new())]);
         assert!(!text.contains("vt0web1a2b"), "{text}");
         assert!(text.contains("policy accept"), "{text}");
+        let bridged = ruleset_bridge(&[guarded(Vec::new())]);
+        assert!(!bridged.contains("vt0web1a2b"), "{bridged}");
+        assert!(bridged.contains("policy accept"), "{bridged}");
+    }
+
+    /// **A guest on the same segment is judged by the same rules as the world.**
+    ///
+    /// The `inet` forward hook sees only what the host routes; two guests on
+    /// one bridge are switched past it. The bridge-family table enters the
+    /// port's chains by interface, where the frame actually is.
+    #[test]
+    fn a_guest_on_the_same_segment_is_judged_by_the_same_rules_as_the_world() {
+        let text = ruleset_bridge(&[guarded(vec![rule(
+            Direction::Ingress,
+            Protocol::Tcp,
+            Some((443, 443)),
+            "0.0.0.0/0",
+        )])]);
+        assert!(
+            text.contains("table bridge velstra-filter-bridge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("oifname \"vt0web1a2b\" meta protocol ip jump vt0web1a2b-bin"),
+            "{text}"
+        );
+        assert!(text.contains("tcp dport 443 counter accept"), "{text}");
+        // No egress rule: no egress chain, no egress jump — the same
+        // per-direction stance the inet table takes.
+        assert!(!text.contains("vt0web1a2b-bout"), "{text}");
+        // And a v4-only guest is not sent through a v6 chain of nothing.
+        assert!(!text.contains("meta protocol ip6"), "{text}");
+        // Replaced whole, like every table here.
+        assert!(
+            text.contains("delete table bridge velstra-filter-bridge"),
+            "{text}"
+        );
+    }
+
+    /// The two tables' drops are read as one number per port and direction:
+    /// the chains carry different suffixes so nothing is counted twice, and the
+    /// sum is what "why can my guest not reach that" wants.
+    #[test]
+    fn drops_from_both_tables_are_read_as_one_per_port() {
+        let listing = serde_json::json!({"nftables": [
+            {"rule": {"chain": "vt0web1a2b-in", "expr": [
+                {"counter": {"packets": 12, "bytes": 800}}, {"drop": null}]}},
+            {"rule": {"chain": "vt0web1a2b-bin", "expr": [
+                {"counter": {"packets": 5, "bytes": 300}}, {"drop": null}]}},
+        ]});
+        let ports = [guarded(vec![rule(
+            Direction::Ingress,
+            Protocol::Tcp,
+            Some((443, 443)),
+            "0.0.0.0/0",
+        )])];
+        let got = counters(&listing, &ports);
+        let d = got.get("projects/p1/ports/web").expect("the port");
+        assert_eq!(d.inbound_packets, 17);
+        assert_eq!(d.inbound_bytes, 1100);
+        assert_eq!(d.outbound_packets, 0);
     }
 
     /// One rule makes that rule the whole of what is allowed. Anything else

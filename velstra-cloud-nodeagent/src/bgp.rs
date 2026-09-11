@@ -97,15 +97,37 @@ pub trait BgpSpeaker: Send + Sync + 'static {
 /// Compute what this node should be announcing.
 ///
 /// From the objects, every pass: the external networks' subnets whole, and a
-/// host route per floating address that names a port — an address in front of
-/// nothing is a reservation, and announcing a reservation blackholes whoever
-/// follows it. Sorted, so equality between passes means what it says.
+/// host route per floating address **this node delivers** — an address in
+/// front of nothing is a reservation, and announcing a reservation blackholes
+/// whoever follows it. Sorted, so equality between passes means what it says.
+///
+/// **Which addresses are this node's to announce is the model's answer, not a
+/// second one worked out here.** It used to push a host route for every bound
+/// floating IP in the cell, reading neither `delivery` nor `announce` nor
+/// where the port was — so every peered node announced every address, a `Nat`
+/// address (which nothing on this datapath translates) was handed to the
+/// upstream as a route to nowhere, and a `Routed` one was announced from
+/// machines that did not hold the guest. `public::announcer` is the one
+/// written-down answer to "who announces this", and it is already what
+/// `:explainReach` shows an operator; having this file answer it a second way
+/// is how the console and the upstream router come to disagree.
+///
+/// `overlay` says whether a `FromGateway` address can actually reach the guest
+/// from here: it is delivered over the overlay, and a cell without one has no
+/// path from a gateway to a guest on another machine.
+// Eight arguments, and deliberately not a struct: this is a pure function of
+// the cell's objects with exactly one caller, and a `CellObjects` bundle would
+// be a type whose only reason to exist is this signature.
+#[allow(clippy::too_many_arguments)]
 pub fn desired_for(
     me: &str,
     peers: &[BgpPeer],
     networks: &[Network],
     subnets: &[Subnet],
     floating: &[FloatingIp],
+    ports: &[velstra_cloud_model::resources::Port],
+    nodes: &[velstra_cloud_model::resources::Node],
+    overlay: bool,
 ) -> BgpDesired {
     let mut desired = BgpDesired {
         router_id: router_id_for(me),
@@ -141,6 +163,11 @@ pub fn desired_for(
             desired.networks_v4.push(s.spec.cidr.clone());
         }
     }
+    let gateways: Vec<String> = nodes
+        .iter()
+        .filter(|n| n.spec.gateway && !n.meta.is_deleting())
+        .map(|n| n.meta.name.id().to_string())
+        .collect();
     for f in floating {
         if f.meta.is_deleting() || f.spec.port.is_empty() {
             continue;
@@ -148,7 +175,52 @@ pub fn desired_for(
         let Some(address) = f.spec.address.as_deref().filter(|a| !a.is_empty()) else {
             continue;
         };
-        if address.contains(':') {
+        let Some(parsed) = address.parse::<std::net::IpAddr>().ok() else {
+            continue;
+        };
+        // The subnet's network says whether it is external and what its
+        // default announcement is.
+        let network_of_subnet = subnets
+            .iter()
+            .find(|s| s.meta.name.to_string() == f.spec.subnet)
+            .map(|s| s.spec.network.clone())
+            .unwrap_or_default();
+        let network = networks
+            .iter()
+            .find(|n| n.meta.name.to_string() == network_of_subnet);
+        let view = velstra_cloud_model::public::AddressView {
+            name: f.meta.name.to_string(),
+            address: Some(parsed),
+            subnet: f.spec.subnet.clone(),
+            subnet_is_external: network.is_some_and(|n| n.spec.external),
+            delivery: f.spec.delivery,
+            announce: f.spec.announce,
+            port: f.spec.port.clone(),
+        };
+        // Where the guest holding the port *is* — the observed node, which is
+        // what `announcer`'s doc insists on: an address is reachable where the
+        // guest is, and announcing from an assignment is how a migration's
+        // last moments become a black hole.
+        let port_node = ports
+            .iter()
+            .find(|p| p.meta.name.to_string() == f.spec.port)
+            .and_then(|p| p.status.node.clone());
+        let who = velstra_cloud_model::public::announcer(
+            &view,
+            network.map(|n| n.spec.announce).unwrap_or_default(),
+            port_node.as_deref(),
+            &gateways,
+        );
+        use velstra_cloud_model::public::Announcer;
+        let mine = match &who {
+            Announcer::Host(node) => node == me,
+            Announcer::Gateways(gs) => overlay && gs.iter().any(|g| g == me),
+            Announcer::Nowhere(_) => false,
+        };
+        if !mine {
+            continue;
+        }
+        if parsed.is_ipv6() {
             desired.hosts_v6.push(format!("{address}/128"));
         } else {
             desired.hosts_v4.push(format!("{address}/32"));
@@ -450,12 +522,38 @@ mod what_the_cell_announces {
     }
 
     fn floating(name: &str, address: &str, port: &str) -> FloatingIp {
+        routed(name, address, port)
+    }
+
+    /// A `Routed`/`FromHost` address on the public subnet — the shape whose
+    /// host route the node holding the guest announces.
+    fn routed(name: &str, address: &str, port: &str) -> FloatingIp {
         let spec = FloatingIpSpec {
+            subnet: "subnets/public-v4".into(),
             address: Some(address.to_string()),
             port: port.to_string(),
+            delivery: velstra_cloud_model::public::Delivery::Routed,
+            announce: Some(velstra_cloud_model::public::Announce::FromHost),
             ..Default::default()
         };
         Resource::new(meta(name), spec, FloatingIpStatus::default())
+    }
+
+    fn translated(name: &str, address: &str, port: &str) -> FloatingIp {
+        let mut f = routed(name, address, port);
+        f.spec.delivery = velstra_cloud_model::public::Delivery::Nat;
+        f
+    }
+
+    /// A port whose guest is observed on `node`.
+    fn port_on(name: &str, node: &str) -> velstra_cloud_model::resources::Port {
+        let mut p = velstra_cloud_model::resources::Port::new(
+            meta(name),
+            velstra_cloud_model::resources::PortSpec::default(),
+            velstra_cloud_model::resources::PortStatus::default(),
+        );
+        p.status.node = Some(node.to_string());
+        p
     }
 
     #[test]
@@ -484,6 +582,9 @@ mod what_the_cell_announces {
                 // In front of nothing: a reservation, not a reachable address.
                 floating("projects/p1/floatingips/b", "203.0.113.8", ""),
             ],
+            &[port_on("projects/p1/ports/x", "gw-1")],
+            &[],
+            false,
         );
         // Only this node's session; the other machine's is not ours to speak.
         assert_eq!(desired.sessions.len(), 1);
@@ -493,6 +594,56 @@ mod what_the_cell_announces {
         assert!(desired.hosts_v6.is_empty());
         // The tenant network stays the cell's own business.
         assert!(!desired.networks_v4.contains(&"10.0.0.0/24".to_string()));
+    }
+
+    /// **Only the addresses this node can deliver are announced.**
+    ///
+    /// Every peered node used to announce every bound floating IP in the cell.
+    /// A `Nat` address is answered for at the edge and translated by nothing
+    /// on this datapath — announcing it hands the upstream a route to an
+    /// address this node will never answer. A `Routed` one whose guest is on
+    /// another machine is a black hole from whichever next hop the upstream
+    /// picks.
+    #[test]
+    fn only_the_addresses_this_node_can_deliver_are_announced() {
+        let desired = desired_for(
+            "gw-1",
+            &[peer("bgp-peers/edge", "gw-1")],
+            &[network("networks/public", true)],
+            &[subnet(
+                "subnets/public-v4",
+                "networks/public",
+                "203.0.113.0/24",
+            )],
+            &[
+                routed(
+                    "projects/p1/floatingips/here",
+                    "203.0.113.7",
+                    "projects/p1/ports/here",
+                ),
+                routed(
+                    "projects/p1/floatingips/elsewhere",
+                    "203.0.113.8",
+                    "projects/p1/ports/elsewhere",
+                ),
+                translated(
+                    "projects/p1/floatingips/nat",
+                    "203.0.113.9",
+                    "projects/p1/ports/here",
+                ),
+            ],
+            &[
+                port_on("projects/p1/ports/here", "gw-1"),
+                port_on("projects/p1/ports/elsewhere", "gw-2"),
+            ],
+            &[],
+            false,
+        );
+        assert_eq!(
+            desired.hosts_v4,
+            vec!["203.0.113.7/32"],
+            "an address this node does not deliver was announced"
+        );
     }
 
     #[test]
@@ -507,6 +658,9 @@ mod what_the_cell_announces {
                 "203.0.113.0/24",
             )],
             &[],
+            &[],
+            &[],
+            false,
         );
         assert!(desired.sessions.is_empty());
         assert!(desired.networks_v4.is_empty() && desired.hosts_v4.is_empty());
@@ -532,6 +686,9 @@ mod what_the_cell_announces {
                 "203.0.113.0/24",
             )],
             &[],
+            &[],
+            &[],
+            false,
         ));
         assert!(conf.contains(&format!(" bgp router-id {a}")), "{conf}");
     }
@@ -541,7 +698,16 @@ mod what_the_cell_announces {
         let mut p = peer("bgp-peers/edge", "gw-1");
         p.spec.password = Some("s3cret".into());
         p.spec.multihop = Some(3);
-        let conf = render_frr(&desired_for("gw-1", &[p.clone()], &[], &[], &[]));
+        let conf = render_frr(&desired_for(
+            "gw-1",
+            &[p.clone()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        ));
         assert!(
             conf.contains(" neighbor 10.10.10.1 password s3cret"),
             "{conf}"
@@ -554,7 +720,7 @@ mod what_the_cell_announces {
         // out, and the defaults render as nothing.
         p.spec.password = Some(String::new());
         p.spec.multihop = Some(1);
-        let conf = render_frr(&desired_for("gw-1", &[p], &[], &[], &[]));
+        let conf = render_frr(&desired_for("gw-1", &[p], &[], &[], &[], &[], &[], false));
         assert!(
             !conf.contains("password") && !conf.contains("multihop"),
             "{conf}"
@@ -576,6 +742,11 @@ mod what_the_cell_announces {
                 "203.0.113.7",
                 "projects/p1/ports/x",
             )],
+            // The guest holding the address is here: only then is the host
+            // route this node's to announce.
+            &[port_on("projects/p1/ports/x", "gw-1")],
+            &[],
+            false,
         );
         let conf = render_frr(&desired);
         assert!(conf.contains("router bgp 65010"), "{conf}");

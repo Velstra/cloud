@@ -312,8 +312,12 @@ impl Agent {
         // none reads an empty list and pays a list call; one that does needs
         // them here, because a routed address is configured *by the guest* and
         // this is where a guest is told what it has.
+        // Only where this node answers for the next hop a routed address is
+        // told to default through: its own bridges, or a fabric. A bare tap
+        // node handing out that route would take the guest off the network.
+        let delivers_public = self.localnet.is_some() || self.datapath.datapath_name() == "fabric";
         let public = match self.cell.floating_ips().await {
-            Ok(floating) => guests::public_addresses(&floating),
+            Ok(floating) => guests::public_addresses(&floating, delivers_public),
             Err(e) => {
                 tracing::warn!(error = %e, "could not read the cell's public addresses");
                 pass.failures += 1;

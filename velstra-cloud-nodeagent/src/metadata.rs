@@ -769,13 +769,56 @@ mod tests {
                 FloatingIpStatus::default(),
             )
         };
-        let held = crate::guests::public_addresses(&[fip("nat", Delivery::Nat)]);
+        let held = crate::guests::public_addresses(&[fip("nat", Delivery::Nat)], true);
         assert!(
             held.is_empty(),
             "a translated address was handed to the guest"
         );
 
-        let routed = crate::guests::public_addresses(&[fip("routed", Delivery::Routed)]);
+        let routed = crate::guests::public_addresses(&[fip("routed", Delivery::Routed)], true);
         assert_eq!(routed["projects/p1/ports/port-a"].len(), 1);
+    }
+
+    /// **A routed address is not configured into a guest a node cannot deliver
+    /// for.** The guest would be told to default through `169.254.1.1`, and a
+    /// node that answers for nothing there has just taken the guest off the
+    /// network — a worse outcome than the address not working.
+    #[test]
+    fn a_routed_address_is_not_configured_into_a_guest_a_node_cannot_deliver_for() {
+        use velstra_cloud_model::{
+            public::Delivery,
+            resources::{FloatingIpSpec, FloatingIpStatus, Resource},
+        };
+        let fip = Resource::new(
+            velstra_cloud_model::meta::Meta::new(
+                "projects/p1/floatingips/f".parse().unwrap(),
+                velstra_cloud_model::meta::Placement::new("eu", "cell-1"),
+            ),
+            FloatingIpSpec {
+                subnet: "subnets/public".into(),
+                address: Some("203.0.113.7".into()),
+                port: "projects/p1/ports/port-a".into(),
+                delivery: Delivery::Routed,
+                ..Default::default()
+            },
+            FloatingIpStatus::default(),
+        );
+        assert!(
+            crate::guests::public_addresses(std::slice::from_ref(&fip), false).is_empty(),
+            "a route was handed out that nothing on this node answers for"
+        );
+        assert_eq!(
+            crate::guests::public_addresses(&[fip], true)["projects/p1/ports/port-a"].len(),
+            1
+        );
+    }
+
+    /// And a guest handed no public address keeps its tenant gateway as its
+    /// way out — never `169.254.1.1`.
+    #[test]
+    fn a_guest_keeps_its_tenant_gateway_when_no_public_address_was_delivered() {
+        let rendered = render_network_config(&guest()).expect("a document");
+        assert!(rendered.contains("via: \"10.20.0.1\""), "{rendered}");
+        assert!(!rendered.contains("169.254.1.1"), "{rendered}");
     }
 }
