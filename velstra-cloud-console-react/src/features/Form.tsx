@@ -3,7 +3,7 @@
 // a row editor over their JSON shape rather than a bespoke mask each, which
 // is honest about what this build knows and keeps them editable.
 
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -13,12 +13,13 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { call, ApiError } from "@/api/transport";
-import { ALL, basePath, collection, projectOf, type Collection, type Field } from "@/lib/schema";
-import { idOf, nameOf, type Resource } from "@/lib/model";
+import { ALL, basePath, collection, projectOf, type Collection, type Field, type FieldOf } from "@/lib/schema";
+import { bytes, idOf, nameOf, number, type Resource } from "@/lib/model";
 import { useStore } from "@/app/store";
 import { projectNames } from "@/lib/listing";
 import { Pressed } from "@/features/Pressed";
 import { z } from "zod";
+import { check, crossCheck } from "@/lib/checks";
 import { entry } from "@/registry";
 
 type Values = Record<string, any>;
@@ -131,7 +132,29 @@ export function Form({ coll, existing, onDone, onCancel }: {
   const basic = fields.filter((f) => !f.advanced);
   const advanced = fields.filter((f) => f.advanced);
 
-  const set = (k: string, v: unknown) => setValues((s) => ({ ...s, [k]: v }));
+  // Checked as it is typed, not on submit. A form that takes six fields and
+  // then objects to the second is one that wasted somebody's time on purpose —
+  // and the check the schema names is the same one the other console runs, so
+  // there is one answer to "is this an address" rather than two dialects.
+  // Which fields a cross-check is currently objecting to, so that when it
+  // stops objecting the sentence goes away again — and nothing else in the map
+  // is touched, because it also holds what the API said about a failed write.
+  const crossed = useRef<Set<string>>(new Set());
+  const set = (k: string, v: unknown) => {
+    setValues((s) => {
+      const next = { ...s, [k]: v };
+      const f = coll.fields.find((x) => x.key === k);
+      const bad = crossCheck(coll.id, next);
+      setErrors((e) => {
+        const out = { ...e, [k]: f && "check" in f ? check(f.check, v) : "" };
+        for (const key of crossed.current) if (!(key in bad)) out[key] = "";
+        for (const [key, said] of Object.entries(bad)) out[key] = said;
+        return out;
+      });
+      crossed.current = new Set(Object.keys(bad));
+      return next;
+    });
+  };
 
   // A flavor is a size. Picking one fills the three numbers it stands for, so
   // the form shows what will be asked for and nobody types a size twice; the
@@ -156,12 +179,31 @@ export function Form({ coll, existing, onDone, onCancel }: {
   // What each field will accept, said once here and checked before the wire
   // is touched. The API still has the last word; this is the first.
   const shape = useMemo(() => z.object(Object.fromEntries(fields.map((f) => {
+    // A number carries its own range. `mtu: 42` used to be accepted here,
+    // stored, and handed to every guest on the network over DHCP and the
+    // metadata service — there is no door for it anywhere else.
+    const bounded = () => {
+      const n = f.kind === "number"
+        ? z.coerce.number({ message: "A number." }).finite().gte(f.min).lte(f.max)
+          .refine((x) => x >= f.min && x <= f.max, {
+            message: `between ${number(f.min)} and ${number(f.max)}${f.unit ? " " + f.unit : ""}`,
+          })
+        : z.coerce.number();
+      // The `""` stays: an optional number nobody touched means "I did not
+      // say", which is not the same as a number out of range.
+      return z.union([z.literal(""), n]);
+    };
     let v: z.ZodTypeAny =
-      f.kind === "number" ? z.union([z.literal(""), z.coerce.number({ message: "A number." }).finite()])
+      f.kind === "number" ? bounded()
       : f.kind === "switch" ? z.boolean()
       : f.kind === "moment" ? z.union([z.literal(""), z.number().int().positive()])
       : /List$/.test(f.kind) ? z.array(z.any())
-      : z.string();
+      : "check" in f
+        ? z.any().superRefine((x, ctx) => {
+            const said = check(f.check, x);
+            if (said) ctx.addIssue({ code: z.ZodIssueCode.custom, message: said });
+          })
+        : z.string();
     if (f.required) v = v.refine((x) => x !== "" && x != null && !(Array.isArray(x) && !x.length), { message: "Still needed." });
     return [f.key, v];
   }))), [fields]);
@@ -170,6 +212,14 @@ export function Form({ coll, existing, onDone, onCancel }: {
     setProblem(""); setErrors({});
     if (!existing && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(id.trim())) { setProblem(id.trim() ? "A name is lowercase letters, digits and dashes, up to 63." : "A name is still needed."); return; }
     if (flavorField && !sized) { setErrors({ [flavorField.key]: "Pick a flavor, or set a custom size under advanced settings." }); setProblem("A size is still needed: pick a flavor, or set vCPUs and memory under advanced settings."); return; }
+    // Two fields that have to agree — a gateway inside its own range. It can
+    // only be asked once both are answered, which is why it is not in `shape`.
+    const disagreeing = crossCheck(coll.id, values);
+    if (Object.keys(disagreeing).length) {
+      setErrors(disagreeing);
+      setProblem("Fix " + Object.keys(disagreeing).map((k) => fields.find((f) => f.key === k)?.label ?? k).join(", ") + " first.");
+      return;
+    }
     const checked = shape.safeParse(values);
     if (!checked.success) {
       const errs: Record<string, string> = {};
@@ -345,7 +395,7 @@ function FieldRow({ f, coll, value, onChange, error, locked }: {
 
   // A field the registry knows better than the schema does.
   const editor = entry(coll.id).fieldEditors?.[f.key];
-  if (editor) return <Row label={label} help={help} error={error}>{editor({ value, onChange, disabled: locked })}</Row>;
+  if (editor) return <Row label={label} help={help} error={error}>{editor({ f, value, onChange, disabled: locked })}</Row>;
 
   switch (f.kind) {
     case "switch":
@@ -371,7 +421,7 @@ function FieldRow({ f, coll, value, onChange, error, locked }: {
     case "number":
       return (
         <Row label={label} help={help} error={error}>
-          <Input {...common} inputMode="numeric" value={value ?? ""} onChange={(e) => onChange(e.target.value)} placeholder={f.whenEmpty} />
+          <Stepper f={f} value={value} onChange={onChange} disabled={locked} />
         </Row>
       );
     case "moment":
@@ -417,15 +467,53 @@ function FieldRow({ f, coll, value, onChange, error, locked }: {
       }
       return (
         <Row label={label} help={help} error={error}>
-          <Input {...common} value={value ?? ""} onChange={(e) => onChange(e.target.value)} placeholder={f.whenEmpty} />
+          <Input {...common} value={value ?? ""} onChange={(e) => onChange(e.target.value)}
+            placeholder={"placeholder" in f ? f.placeholder : f.whenEmpty} />
         </Row>
       );
   }
 }
 
+/**
+ * A size, with its unit and its range on the control.
+ *
+ * Never a plain text box: the schema's own words are "a size typed into one is
+ * a size that can be typed wrong". The bounds are on the element as well as in
+ * the shape, so the arrows and the spinner cannot leave the range at all, and
+ * a value in MiB or bytes carries a second reading underneath — 8192 is never
+ * ambiguous about which unit it is.
+ */
+function Stepper({ f, value, onChange, disabled }: {
+  f: FieldOf<"number">; value: any; onChange: (v: any) => void; disabled: boolean;
+}) {
+  const step = Math.max(1, f.step || 1);
+  const clamp = (n: number) => Math.min(f.max, Math.max(f.min, n));
+  const now = value === "" || value == null ? null : Number(value);
+  const nudge = (by: number) => onChange(String(clamp((now ?? f.min) + by * step)));
+  const second = now == null ? "" : f.scale === "mib" ? `${number(Math.round((now / 1024) * 10) / 10)} GiB`
+    : f.scale === "bytes" ? bytes(now) : "";
+  return (
+    <div>
+      <div className="flex items-center gap-1">
+        <Button type="button" variant="outline" size="sm" disabled={disabled} aria-label="Less"
+          onClick={() => nudge(-1)} className="h-8 w-8 shrink-0 p-0">−</Button>
+        <Input type="number" inputMode="numeric" min={f.min} max={f.max} step={step} disabled={disabled}
+          value={value ?? ""} onChange={(e) => onChange(e.target.value)} className="text-right" />
+        <Button type="button" variant="outline" size="sm" disabled={disabled} aria-label="More"
+          onClick={() => nudge(1)} className="h-8 w-8 shrink-0 p-0">+</Button>
+        {f.unit && <span className="shrink-0 text-xs" style={{ color: "var(--text-muted)" }}>{f.unit}</span>}
+      </div>
+      <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        {second ? `${second} · ` : ""}{number(f.min)}–{number(f.max)}{f.unit ? " " + f.unit : ""}
+      </p>
+    </div>
+  );
+}
+
 /** What already exists is offered rather than typed. */
 function RefPicker({ f, value, onChange, disabled, multiple }: {
-  f: Field; value: any; onChange: (v: any) => void; disabled: boolean; multiple?: boolean;
+  f: FieldOf<"ref"> | FieldOf<"refList">;
+  value: any; onChange: (v: any) => void; disabled: boolean; multiple?: boolean;
 }) {
   const storeProject = useStore((s) => s.project);
   const formProject = useContext(FormProject);
@@ -437,7 +525,11 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
   // `load-balancers.subnet` offered every subnet in the project and a form
   // could be filled in with two halves that do not belong together.
   const narrowedBy = useContext(FormValues);
-  const want = f.filterBy ? narrowedBy?.[f.filterBy] : undefined;
+  // Only a single `ref` carries one — a list of picked objects has no field to
+  // narrow by, and the schema says so. Read through `in` rather than declared
+  // on both, so that stays visible here instead of looking like an oversight.
+  const filterBy = "filterBy" in f ? f.filterBy : null;
+  const want = filterBy ? narrowedBy?.[filterBy] : undefined;
   const [options, setOptions] = useState<{ id: string; name: string; spec: any }[]>([]);
   useEffect(() => {
     if (!target || (target.scope === "project" && (!project || project === ALL))) { setOptions([]); return; }
@@ -450,8 +542,8 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
   // Nothing at all before the other field is chosen, rather than everything:
   // an unnarrowed list is a list of wrong answers, and offering them is how a
   // form gets filled in wrongly with no refusal until the write.
-  const offered = f.filterBy
-    ? (want ? options.filter((o) => readAt(o.spec, f.filterBy!) === want) : [])
+  const offered = filterBy
+    ? (want ? options.filter((o) => readAt(o.spec, filterBy!) === want) : [])
     : options;
 
   if (multiple) {
@@ -471,7 +563,7 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
         })}
         {!offered.length && (
           <span className="text-xs" style={{ color: "var(--text-faint)" }}>
-            {f.filterBy && !want ? `Choose a ${f.filterBy} first.` : "Nothing to pick from yet."}
+            {filterBy && !want ? `Choose a ${filterBy} first.` : "Nothing to pick from yet."}
           </span>
         )}
       </div>
@@ -481,7 +573,7 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
     <Select value={value || ""} onValueChange={onChange} disabled={disabled}>
       <SelectTrigger>
         <SelectValue placeholder={
-          f.filterBy && !want ? `Choose a ${f.filterBy} first…`
+          filterBy && !want ? `Choose a ${filterBy} first…`
             : f.whenEmpty || `Pick a ${target?.singular ?? "value"}…`
         } />
       </SelectTrigger>

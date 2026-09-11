@@ -8,7 +8,7 @@ import { ReactFlow, Background, Controls, MiniMap, type Edge as FlowEdge, type N
 import "@xyflow/react/dist/style.css";
 import { idOf } from "@/lib/model";
 import { buildGraph, networkSlice } from "@/lib/graph";
-import { useCensusRows } from "@/app/census";
+import { useCensus, whole, whyNotWhole } from "@/app/census";
 import { flowNode } from "./Relations";
 
 const LAYER: Record<string, number> = {
@@ -17,9 +17,9 @@ const LAYER: Record<string, number> = {
 };
 
 export function Topology() {
-  const rows = useCensusRows();
+  const census = useCensus();
   const [focus, setFocus] = useState<string | null>(null);
-  const g = useMemo(() => buildGraph(rows), [rows]);
+  const g = useMemo(() => buildGraph(census.rows), [census.rows]);
   const { names, edges } = useMemo(() => networkSlice(g), [g]);
 
   const nodes = useMemo<FlowNode[]>(() => {
@@ -56,6 +56,14 @@ export function Topology() {
         <p className="text-sm" style={{ color: "var(--text-muted)" }}>
           {names.size} things, {edges.length} wires — drawn from the schema's references, top-down the way traffic goes. Click a box to focus it; double-click to open it.
         </p>
+        {/* A map with a hole in it looks exactly like a map of a smaller cell.
+            The relations panel refuses to claim completeness it does not have,
+            and this is drawn from the same sweep, so it says the same thing. */}
+        {!whole(census) && (
+          <p className="mt-1 text-xs" style={{ color: "var(--drifting)" }}>
+            Not the whole cell. {whyNotWhole(census)}
+          </p>
+        )}
       </header>
       <div className="min-h-0 flex-1 px-8 pb-6">
         <div className="h-full overflow-hidden rounded-[6px] border" style={{ borderColor: "var(--border)", background: "var(--surface-sunken)" }}>

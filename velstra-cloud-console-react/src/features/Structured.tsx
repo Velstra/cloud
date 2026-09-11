@@ -110,23 +110,3 @@ export function PoolList({ value, onChange, disabled }: { value: Row[]; onChange
   );
 }
 
-/** The disks an OSD is made of: the node, the device, and the waiver. */
-export function DiskList({ value, onChange, disabled }: { value: Row[]; onChange: (v: unknown) => void; disabled: boolean }) {
-  return (
-    <>
-      <Rows value={value} onChange={onChange} disabled={disabled} addLabel="Add a disk"
-        columns="minmax(0,1fr) minmax(0,1.6fr) minmax(0,1fr) auto"
-        add={() => ({ node: "", device: "" })}
-        render={(row, set) => (
-          <>
-            <Cell label="Node"><Input disabled={disabled} className="font-mono text-sm" placeholder="hv-1" value={row.node ?? ""} onChange={(e) => set({ node: e.target.value })} /></Cell>
-            <Cell label="Device"><Input disabled={disabled} className="font-mono text-sm" placeholder="/dev/disk/by-id/…" value={row.device ?? ""} onChange={(e) => set({ device: e.target.value })} /></Cell>
-            <Cell label="Even if unsuitable">
-              <Select disabled={disabled} value={row.evenIfUnsuitable ? "yes" : "no"} onChange={(v) => set({ evenIfUnsuitable: v === "yes" })} options={[["no", "no"], ["yes", "yes — take it anyway"]]} />
-            </Cell>
-          </>
-        )} />
-      <p className="mt-1 text-[11px]" style={{ color: "var(--drifting)" }}>Choosing a disk for an OSD erases it.</p>
-    </>
-  );
-}

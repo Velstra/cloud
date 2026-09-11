@@ -1,7 +1,7 @@
 // What a verdict is, and how a value reads. Ported from the current console's
 // model.js so the two can never disagree about whether something has settled.
 
-import { at, type Collection } from "./schema";
+import { at, type Collection, type Column } from "./schema";
 
 export type Verdict = "settled" | "drifting" | "failing" | "unreported" | "deleting";
 
@@ -116,15 +116,43 @@ export const bytes = (n?: number) => {
 export const number = (n: unknown) =>
   n == null || n === "" ? "—" : Number(n).toLocaleString("en-US");
 
-/** A cell's text, by the kind the schema gives it. */
-export function cellText(kind: string, v: unknown): string {
+/**
+ * A resource name is long and its tail is what identifies it.
+ *
+ * The tail is what is shown; the whole name goes on the element for a pointer
+ * and a screen reader, so nothing is actually hidden.
+ */
+export const shortName = (value: unknown) => {
+  const s = String(value ?? "");
+  return s.includes("/") ? s.split("/").slice(-2).join("/") : s;
+};
+
+/**
+ * A cell's text — from the **column**, not from its tag alone.
+ *
+ * The tag was all this took, and so seventeen number columns dropped the unit
+ * the schema gives them (a `100` beside another `100` standing for GiB and
+ * MiB), and every boolean column read "yes"/"no" instead of its own words.
+ * Those words are the object's vocabulary and they are not interchangeable
+ * with a verdict: a node taken out of scheduling reads "draining", which is
+ * the single thing somebody scans that board for.
+ *
+ * `yes` and `count` are answered before the blank check, for the same reason
+ * the other console exempts them: `false` and "none" are answers, and an
+ * em-dash in their place says "unknown" about something that is known.
+ */
+export function cellText(col: Column, v: unknown): string {
+  switch (col.cell) {
+    case "yes": return v ? col.yes : col.no;
+    case "count": return String(Array.isArray(v) ? v.length : v == null || v === "" ? 0 : v);
+    default: break;
+  }
   if (v === undefined || v === null || v === "") return "—";
-  switch (kind) {
-    case "yes": return v ? "yes" : "no";
+  switch (col.cell) {
     case "ago": return ago(Number(v));
     case "bytes": return bytes(Number(v));
-    case "count": return Array.isArray(v) ? String(v.length) : number(v);
-    case "number": return number(v);
+    case "number": return number(v) + (col.unit ? " " + col.unit : "");
+    case "mono": return shortName(v);
     default: return Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : String(v);
   }
 }

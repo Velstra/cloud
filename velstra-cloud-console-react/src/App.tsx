@@ -6,23 +6,26 @@ import { collectionChanged } from "@/hooks/useCollection";
 import { useCallback, useEffect, useState } from "react";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { AskProvider } from "@/features/Ask";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { call, setToken, token, whenSessionEnds } from "@/api/transport";
-import { verdict, type Resource } from "@/lib/model";
+import { verdict } from "@/lib/model";
 import { SCHEMA, collection } from "@/lib/schema";
 import { useRoute, go } from "@/app/router";
 import { getState, setState, useStore } from "@/app/store";
 import { Shell, type Census } from "@/app/Shell";
-import { setCensusRows, type CensusRows } from "@/app/census";
+import { setCensus as setCensusStore, type CensusRows } from "@/app/census";
 import { lazy, Suspense } from "react";
 const Topology = lazy(() => import("@/features/Topology").then((m) => ({ default: m.Topology })));
 import { Board } from "@/features/Board";
 import { Detail } from "@/features/Detail";
 import { Form } from "@/features/Form";
 import { Overview } from "@/features/Overview";
+import { Me } from "@/features/Me";
+import { Spend } from "@/features/Spend";
 import { Pressed } from "@/features/Pressed";
 import { toast } from "sonner";
 
@@ -63,14 +66,25 @@ export default function App() {
     const mine = SCHEMA.filter((c) =>
       (who.cellAdmin ? c.audience !== undefined : c.audience !== "operator")
       && c.id !== "audit" && c.id !== "usage");
+    // What could not be read, and what was cut short — kept, not swallowed.
+    // The relations panel puts a claim beside the Delete button that is only
+    // true of a sweep that saw everything, and it cannot tell whether this was
+    // one unless the sweep says so.
+    const missing: Record<string, string> = {};
+    const truncated: string[] = [];
     await Promise.all(mine.map(async (c) => {
       try {
-        const items: Resource[] = (await listEvery(c, project)).rows;
-        all[c.id] = items;
-        out[c.id] = { total: items.length, unsettled: c.condition === "" ? [] : items.filter((r) => verdict(r, c).kind !== "settled") };
-      } catch { /* the board says why when it is opened */ }
+        const page = await listEvery(c, project);
+        all[c.id] = page.rows;
+        if (page.truncated) truncated.push(c.id);
+        out[c.id] = { total: page.rows.length, unsettled: c.condition === "" ? [] : page.rows.filter((r) => verdict(r, c).kind !== "settled") };
+      } catch (e) {
+        // The board says why when it is opened — and until somebody opens it,
+        // this is the only record that the question was asked and not answered.
+        missing[c.id] = (e as Error).message;
+      }
     }));
-    setCensusRows(all);
+    setCensusStore({ rows: all, missing, truncated });
     setCensus(out);
   }, [who, project]);
   useEffect(() => { sweep(); }, [sweep]);
@@ -81,10 +95,15 @@ export default function App() {
 
   return (
     <TooltipProvider>
+      <AskProvider>
       <Shell census={census} onSweep={sweep}>
-        {route.view === "map" ? (
+        {route.view === "spend" ? (
+          <div className="h-full overflow-y-auto px-8 py-6"><Spend /></div>
+        ) : route.view === "me" ? (
+          <div className="h-full overflow-y-auto"><Me /></div>
+        ) : route.view === "map" ? (
           <Suspense fallback={<p className="p-8 text-sm" style={{ color: "var(--text-muted)" }}>Drawing the map…</p>}><Topology /></Suspense>
-        ) : route.view === "overview" || !coll ? (
+        ) : route.view !== "board" || !coll ? (
           <div className="h-full overflow-y-auto px-8 py-6"><Overview /></div>
         ) : (
           <ResizablePanelGroup orientation="horizontal" className="h-full">
@@ -130,6 +149,7 @@ export default function App() {
         )}
       </Shell>
       <Toaster position="bottom-right" />
+      </AskProvider>
     </TooltipProvider>
   );
 }

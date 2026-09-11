@@ -7,7 +7,7 @@
 
 import type { ReactNode } from "react";
 import type { Resource } from "@/lib/model";
-import type { Collection } from "@/lib/schema";
+import type { Collection, Field } from "@/lib/schema";
 import operations from "@/api/operations.json";
 import { lazy, Suspense } from "react";
 const Terminal = lazy(() => import("@/features/Terminal").then((m) => ({ default: m.Terminal })));
@@ -22,7 +22,7 @@ const Members = lazy(() => import("@/features/Members").then((m) => ({ default: 
 const RuleList = lazy(() => import("@/features/Structured").then((m) => ({ default: m.RuleList })));
 const ListenerList = lazy(() => import("@/features/Structured").then((m) => ({ default: m.ListenerList })));
 const PoolList = lazy(() => import("@/features/Structured").then((m) => ({ default: m.PoolList })));
-const DiskList = lazy(() => import("@/features/Structured").then((m) => ({ default: m.DiskList })));
+const DiskList = lazy(() => import("@/features/Disks").then((m) => ({ default: m.DiskList })));
 const GrantsEditor = lazy(() => import("@/features/Members").then((m) => ({ default: m.GrantsEditor })));
 const Quota = lazy(() => import("@/features/Quota").then((m) => ({ default: m.Quota })));
 const Account = lazy(() => import("@/features/Account").then((m) => ({ default: m.Account })));
@@ -45,7 +45,12 @@ export type Panel = {
   render: (r: Resource, c: Collection, reload: () => void) => ReactNode;
 };
 
-export type FieldEditor = (p: { value: any; onChange: (v: any) => void; disabled: boolean }) => ReactNode;
+// The field itself, not just its value. Without it an editor cannot read what
+// the schema says about the field it is drawing — which collection to offer
+// from, which sentences to refuse with — and so the disk picker was two text
+// boxes and one paraphrased warning while the schema carried seven refusals,
+// a minimum size and the wording, all pinned by a test in the API crate.
+export type FieldEditor = (p: { f: Field; value: any; onChange: (v: any) => void; disabled: boolean }) => ReactNode;
 
 type Entry = {
   cells?: Record<string, (r: Resource) => ReactNode>;
@@ -186,7 +191,9 @@ register("load-balancers", {
 register("ceph-clusters", {
   fieldEditors: {
     pools: (p) => <Suspense fallback={loading("the pools")}><PoolList {...p} /></Suspense>,
-    osds: (p) => <Suspense fallback={loading("the disks")}><DiskList {...p} /></Suspense>,
+    osds: (p) => p.f.kind === "diskList"
+      ? <Suspense fallback={loading("the disks")}><DiskList {...p} f={p.f} /></Suspense>
+      : null,
   },
 });
 

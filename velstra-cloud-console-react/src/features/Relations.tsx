@@ -9,24 +9,46 @@ import "@xyflow/react/dist/style.css";
 import { idOf, nameOf, verdict, type Resource } from "@/lib/model";
 import type { Collection } from "@/lib/schema";
 import { buildGraph, neighbourhood, type Graph } from "@/lib/graph";
-import { useCensusRows } from "@/app/census";
+import { useCensus, whole, whyNotWhole } from "@/app/census";
 import { State } from "./State";
 
 export function Relations({ r }: { r: Resource; coll: Collection }) {
-  const rows = useCensusRows();
-  const g = useMemo(() => buildGraph(rows), [rows]);
+  const census = useCensus();
+  const g = useMemo(() => buildGraph(census.rows), [census.rows]);
   const me = nameOf(r);
   const deps = g.out.get(me) ?? [];
   const users = g.into.get(me) ?? [];
+  // **The strong sentence is only true of a complete sweep.**
+  //
+  // Edges are derived from the census, and `buildGraph` drops an edge whose
+  // target it has no row for — so a collection that 403'd, timed out, or was
+  // too long to read whole makes "nothing points here" out of "I could not
+  // look". Beside the one irreversible button, those must not read the same.
+  const complete = whole(census);
+  const why = whyNotWhole(census);
+  const nothingPointsHere = complete
+    ? "Nothing — safe to remove on its own."
+    : `Nothing that could be read points here. ${why}`;
   if (!deps.length && !users.length) {
-    return <p className="text-xs" style={{ color: "var(--text-faint)" }}>Stands alone: nothing here refers to it, and it refers to nothing.</p>;
+    return (
+      <p className="text-xs" style={{ color: "var(--text-faint)" }} title={complete ? undefined : why}>
+        {complete
+          ? "Stands alone: nothing here refers to it, and it refers to nothing."
+          : `Nothing that could be read refers to it, and it refers to nothing that could be read. ${why}`}
+      </p>
+    );
   }
   return (
     <div className="grid gap-4">
       <div className="grid grid-cols-2 gap-4 text-xs">
         <Strip title="Depends on" edges={deps} pick={(e) => e.to} g={g} empty="Nothing." />
-        <Strip title="Used by" edges={users} pick={(e) => e.from} g={g} empty="Nothing — safe to remove on its own." />
+        <Strip title="Used by" edges={users} pick={(e) => e.from} g={g} empty={nothingPointsHere} />
       </div>
+      {!complete && (
+        <p className="text-[11px]" style={{ color: "var(--drifting)" }} title={why}>
+          This neighbourhood is drawn from an incomplete sweep. {why}
+        </p>
+      )}
       {deps.length + users.length >= 2 && <Neighbourhood g={g} name={me} />}
     </div>
   );
