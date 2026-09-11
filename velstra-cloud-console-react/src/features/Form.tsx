@@ -54,6 +54,30 @@ function localMoment(ms: number): string {
     `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+/**
+ * The object a create asked for, once the platform has a record of it.
+ *
+ * A create answers `202 { operation, target }` — the ask, not the thing. The
+ * thing exists by the time the answer arrives (the API writes before it
+ * replies), so one read of `target` turns the envelope into the row the board
+ * is about to show. If that read is refused or the answer carries no target,
+ * enough of a resource is returned to name it: the object *was* made, and
+ * failing here would report a success as a failure, which is the bug this
+ * function exists to end.
+ */
+async function settled(
+  coll: Collection, project: string, answer: any, fallback: string,
+): Promise<Resource> {
+  const target: string = answer?.target ?? fallback;
+  const id = target.split("/").pop()!;
+  try {
+    return await call(`get:${coll.id}`, "GET",
+      `${basePath(coll, projectOf(target) ?? project)}/${encodeURIComponent(id)}`);
+  } catch {
+    return { meta: { name: target } } as Resource;
+  }
+}
+
 /** `{"quota.vcpus": 40}` as `{"quota": {"vcpus": 40}}`. */
 function nest(flat: Values): Values {
   const out: Values = {};
@@ -158,6 +182,18 @@ export function Form({ coll, existing, onDone, onCancel }: {
     for (const f of fields) {
       const v = values[f.key];
       if (v === "" || v == null) continue;
+      // An empty list a person never touched is not an instruction. On a
+      // **create** it is the difference between "I did not say" and "none" —
+      // and the platform reads the second one literally: an instance created
+      // with `networks: []` is an instance the API does not make a port for,
+      // so every guest launched from this console came up with no interface,
+      // no address, and no route to the metadata service. Omitting the key
+      // gets the default port, which is what somebody filling in a form and
+      // leaving a picker alone means.
+      //
+      // On an **edit** an empty list is kept, because there it is the only way
+      // to say "take them all off".
+      if (!existing && Array.isArray(v) && v.length === 0) continue;
       if (existing && f.atCreation && readAt(existing.spec, f.key) !== undefined) continue;
       spec[f.key] = f.kind === "number" ? Number(v) : v;
     }
@@ -170,28 +206,46 @@ export function Form({ coll, existing, onDone, onCancel }: {
     // Flat until here, because that is what the controls and the error mapping
     // below speak; nested exactly once, on the way out.
     const body = nest(spec);
+    // `meta.labels`, which is where the API takes them. Sent at the top level
+    // they were accepted and dropped: the object was made, the form said
+    // "saved", and every label anybody typed into this console went nowhere.
+    const meta = (name?: string) => ({
+      ...(name ? { name } : {}),
+      ...(Object.keys(written).length || existing ? { labels: written } : {}),
+    });
+    let saved: Resource;
     try {
-      let saved: Resource;
       if (existing) {
         // The revision this edit was read at goes in `If-Match`, not in the
         // body — the API refuses `meta.revision` from a client — so a colleague's
         // change in between is refused here rather than overwritten.
         saved = await call(`patch:${coll.id}`, "PATCH",
           `${basePath(coll, project)}/${encodeURIComponent(idOf(existing))}`,
-          undefined, { spec: body, labels: written }, existing.meta.revision ? { "if-match": String(existing.meta.revision) } : undefined);
+          undefined, { spec: body, meta: meta() }, existing.meta.revision ? { "if-match": String(existing.meta.revision) } : undefined);
       } else {
         const name = coll.scope === "project"
           ? `projects/${project}/${coll.id}/${id.trim()}` : `${coll.id}/${id.trim()}`;
-        saved = await call(`create:${coll.id}`, "POST", basePath(coll, project), undefined,
-          { meta: { name }, spec: body, labels: written });
+        // **A create answers 202 with an operation, not with the object.**
+        // `{ operation, target }` — see `docs/rest-contract.md`. Reading it as
+        // a resource threw `Cannot read properties of undefined (reading
+        // 'name')`, and because that throw happened inside this `try`, the
+        // console showed a JavaScript error in the place a refusal goes. The
+        // object had been made. Every create in this console did that.
+        const answer = await call(`create:${coll.id}`, "POST", basePath(coll, project), undefined,
+          { meta: meta(name), spec: body });
+        saved = await settled(coll, project, answer, name);
       }
-      onDone(saved);
     } catch (e) {
       const err = e as ApiError;
       const key = (err.field ?? "").replace(/^spec\./, "");
       if (key && fields.some((f) => f.key === key)) setErrors({ [key]: err.message });
       setProblem(err.message);
+      return;
     }
+    // Outside the try, and deliberately: what the caller does next — a toast, a
+    // route change, a re-read — is not this form's failure to report. That is
+    // how a create came to look refused.
+    onDone(saved);
   };
 
   return (

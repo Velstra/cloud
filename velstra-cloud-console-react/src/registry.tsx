@@ -82,18 +82,44 @@ const collectionOf = (path: string): string | null => {
   return m?.[1] ?? null;
 };
 
-export function objectActions(coll: string): Action[] {
+/**
+ * Verbs that are in the OpenAPI and are not buttons.
+ *
+ * The list is scraped from the document, which is right — a verb the API grows
+ * should reach the console without anybody remembering. What was wrong is that
+ * it was scraped *whole*:
+ *
+ * * `:reportStatus` is how a **node agent** writes what it observed. It refuses
+ *   any token that is not an agent's, so it was a button nobody could ever
+ *   press — drawn on a tenant's own guest, where pressing it gave a 403 about
+ *   an endpoint they had never heard of.
+ * * `:issueCredential` mints a registration token that is shown once and stored
+ *   only as a hash. It belongs behind a deliberate flow that shows the token
+ *   and says so, not on a row of grey buttons beside "Explain placement".
+ */
+const NOT_A_BUTTON = /:(reportStatus|issueCredential)$/;
+
+/** Verbs only a cell operator may ask. The API says so; this keeps the console
+ *  from offering what it would refuse. */
+const OPERATORS_ONLY = /:(explainPlacement|explainMigration|explainRecovery|explainMaintenance|explainCapacity|explainCpu)$/;
+
+const shown = (o: Op, cellAdmin: boolean) =>
+  !NOT_A_BUTTON.test(o.path) && (cellAdmin || !OPERATORS_ONLY.test(o.path));
+
+export function objectActions(coll: string, cellAdmin = true): Action[] {
   return (operations as Op[])
     .filter((o) => o.path.includes(":") && /\{(name|id)\}:/.test(o.path) && collectionOf(o.path) === coll)
+    .filter((o) => shown(o, cellAdmin))
     .map((o) => ({
       id: o.id, label: verb(o.path), summary: o.summary, method: o.method, path: o.path,
       needsBody: o.body, destructive: /delete|revoke|drain|evacuate|reboot/i.test(o.path),
     }));
 }
 
-export function collectionActions(coll: string): Action[] {
+export function collectionActions(coll: string, cellAdmin = true): Action[] {
   return (operations as Op[])
     .filter((o) => /[a-z]:[a-zA-Z]+$/.test(o.path) && !/\{(name|id)\}:/.test(o.path) && collectionOf(o.path) === coll)
+    .filter((o) => shown(o, cellAdmin))
     .map((o) => ({ id: o.id, label: verb(o.path), summary: o.summary, method: o.method, path: o.path, needsBody: o.body }));
 }
 

@@ -31,12 +31,16 @@ export type Column = { label: string; path: string; cell: string; width: number 
 
 export type Agreement = { label: string; asked: string; is: string; note: string };
 
+/** Whose screen a collection is. See `Audience` in the Rust schema. */
+export type Audience = "tenant" | "plumbing" | "operator";
+
 export type Collection = {
   id: string;
   title: string;
   singular: string;
   group: string;
   scope: "project" | "global";
+  audience: Audience;
   blurb: string;
   condition: string;
   recheck: number;
@@ -53,12 +57,41 @@ export const SCHEMA = raw as unknown as Collection[];
 
 export const collection = (id: string) => SCHEMA.find((c) => c.id === id);
 
-/** Rail order: the operator's vocabulary, not the alphabet. */
+/** Rail order. Two vocabularies, because there are two readers. */
 export const GROUP_ORDER = ["Compute", "Storage", "Network", "Fleet", "Access", "Cell"];
 
-export const groups = () =>
-  GROUP_ORDER.map((name) => ({ name, items: SCHEMA.filter((c) => c.group === name) }))
+/**
+ * What this person navigates by.
+ *
+ * A customer gets the fourteen collections they manage. They do not get
+ * `ports`, `attachments`, `captures` or `operations` — those are real, they are
+ * theirs, and they are made and unmade by the thing that needs them; they are
+ * reachable from that thing and from the map, not from the navigation. And they
+ * do not get the cell's fifteen at all, which is not a courtesy: the API refuses
+ * a tenant every read of `migrations`, `nodes`, `pools`, `device-classes` and
+ * `backup-targets`, so a rail entry for one was a link to a red failure.
+ */
+export const navigable = (cellAdmin: boolean) =>
+  SCHEMA.filter((c) => (cellAdmin ? c.audience !== "plumbing" : c.audience === "tenant"));
+
+/**
+ * The rail's groups. An operator's words are not a customer's: "Fleet" and
+ * "Cell" are what somebody who owns the hardware calls it, and for a customer
+ * they held one item each.
+ */
+const TENANT_GROUP: Record<string, string> = {
+  Compute: "Compute", Storage: "Storage", Network: "Networking", Access: "Usage",
+};
+
+export const groups = (cellAdmin = true) => {
+  const items = navigable(cellAdmin);
+  return GROUP_ORDER
+    .map((name) => ({
+      name: cellAdmin ? name : TENANT_GROUP[name] ?? name,
+      items: items.filter((c) => c.group === name),
+    }))
     .filter((g) => g.items.length);
+};
 
 /** Where a collection lives on the wire. */
 export const basePath = (c: Collection, project: string) =>
