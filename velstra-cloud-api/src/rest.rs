@@ -785,6 +785,84 @@ fn target(path: &str) -> ApiResult<Target> {
     })
 }
 
+/// Every query parameter this surface reads.
+///
+/// **A name nobody has is refused, exactly as a field nobody has is.** The
+/// contract argues the case for values — "a `pageSize` of `twenty` silently
+/// answering with the whole cell is the shape where a load test passes and
+/// production does not" — and the same failure is one keystroke away through
+/// the *name*: `?label=env=prod` returned the collection unfiltered,
+/// `?pagesize=20` returned the default page, `?Since=1h` returned everything,
+/// and `?watch=1` returned a list where a stream was asked for. Each of those
+/// is a client that looks like it is working.
+///
+/// Not every parameter is legal on every route; this is the union, and the
+/// route-specific readers still decide what they do with one. That is the
+/// cheap half of the check and it catches every case above.
+const KNOWN_QUERY: &[&str] = &[
+    "fields",
+    "fromRevision",
+    "labels",
+    "mode",
+    "month",
+    "node",
+    "orderBy",
+    "pageSize",
+    "pageToken",
+    "pool",
+    "session",
+    "since",
+    "target",
+    "ticket",
+    "until",
+    "watch",
+];
+
+/// Whether this read is a subscription.
+///
+/// Spelled out rather than `== "true"` for the reason `paging_from` gives
+/// about a page size: a value this surface cannot read is refused, never
+/// quietly taken for the default.
+fn watching(query: &BTreeMap<String, String>) -> ApiResult<bool> {
+    match query.get("watch").map(String::as_str) {
+        None | Some("") => Ok(false),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(ApiError::invalid(format!(
+            "`watch` is `true` or `false`, and `{other}` is neither. Asked as anything else \
+             this answered with a page, which is a plausible answer to a question nobody asked."
+        ))
+        .at("watch")),
+    }
+}
+
+/// Refuse a query parameter nobody has, by name.
+fn check_query(query: &BTreeMap<String, String>) -> ApiResult<()> {
+    for key in query.keys() {
+        if KNOWN_QUERY.contains(&key.as_str()) {
+            continue;
+        }
+        // An empty value is somebody echoing a URL back, or a client that
+        // builds a query string from a struct with a blank field. Nothing was
+        // meant by it, so nothing is lost by ignoring it — the same rule the
+        // unknown-*field* guard follows for the same reason.
+        if query.get(key).is_some_and(|v| v.is_empty()) {
+            continue;
+        }
+        let near = KNOWN_QUERY
+            .iter()
+            .find(|k| k.eq_ignore_ascii_case(key))
+            .map(|k| format!(" Did you mean `{k}`?"))
+            .unwrap_or_default();
+        return Err(ApiError::invalid(format!(
+            "there is no query parameter called `{key}`; it would have been ignored, and the \
+             answer would have looked like one to the question you asked.{near}"
+        ))
+        .at(key.clone()));
+    }
+    Ok(())
+}
+
 /// Read `?pageSize=` and `?pageToken=` off a query string.
 ///
 /// A page size that is not a number is refused rather than ignored: a client
@@ -1016,8 +1094,20 @@ async fn read(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let _ = headers;
+    check_query(&query)?;
     match target(&path)? {
-        Target::Object(name) => Ok(object(StatusCode::OK, api.get(&name, &who).await?)),
+        Target::Object(name) => {
+            let mut document = api.get(&name, &who).await?;
+            // `?fields=` narrows one object as it narrows a list. The parameter
+            // was read in the collection branch and nowhere else, so a masked
+            // single read came back whole, with no error — a client asking for
+            // two fields of a guest was handed the guest, which is the shape
+            // where a mobile client's bill is a surprise.
+            if let Some(fields) = fields_from(&query) {
+                document = only_fields(&document, &fields);
+            }
+            Ok(object(StatusCode::OK, document))
+        }
         // The stream itself. A GET because it is an upgrade, and it carries a
         // ticket rather than resting on the session cookie: the ticket is what
         // the node checks, and a stream that opened on a cookie alone would be
@@ -1207,7 +1297,11 @@ async fn read(
                 until: moment_from(&query, "until", now)?,
                 ..filter
             };
-            if query.get("watch").map(|w| w == "true").unwrap_or(false) {
+            // `true` or `false`, and nothing else. `?watch=1` used to return a
+            // *list* — a plausible answer to a question nobody asked, and the
+            // one shape where a client is written against a stream, tested
+            // against a page, and works until the day the collection is big.
+            if watching(&query)? {
                 return watch(api, &parent, &kind, query.get("fromRevision"), filter, &who).await;
             }
             // `?pageSize=` / `?pageToken=`, spelled the way AIP-158 spells them.

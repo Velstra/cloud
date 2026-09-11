@@ -764,6 +764,76 @@ async fn a_subnet_the_node_could_not_build_is_refused_where_it_is_written() {
     assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
 }
 
+/// A query parameter nobody has is refused, by name.
+///
+/// The contract argues the case for a bad *value* — `pageSize=twenty` silently
+/// answering with the whole cell is the shape where a load test passes and
+/// production does not — and the same failure was one keystroke away through
+/// the *name*. Every one of these returned a plausible answer to a question
+/// nobody asked.
+#[tokio::test]
+async fn a_query_parameter_nobody_has_is_refused_by_name() {
+    let h = Harness::new();
+    h.post("projects", json!({ "id": "p1", "spec": {} })).await;
+    h.instance("p1", "i1", json!({ "vcpus": 1 })).await;
+
+    for bad in [
+        "label=env=prod",
+        "pagesize=20",
+        "Since=1h",
+        "watch=1",
+        "orderby=name",
+    ] {
+        let answer = h.get(&format!("projects/p1/instances?{bad}")).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "`{bad}` was ignored and the answer looked like one to the question asked: {:?}",
+            answer.body
+        );
+    }
+
+    // The near-miss is named, because that is the whole of what somebody needs.
+    let answer = h.get("projects/p1/instances?pagesize=20").await;
+    let message = answer.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("pageSize"), "{message}");
+
+    // A parameter carrying nothing is somebody echoing a URL back, or a client
+    // building a query string from a struct with a blank field. Nothing was
+    // meant by it, so nothing is lost.
+    let fine = h.get("projects/p1/instances?somethingElse=").await;
+    assert_eq!(fine.status, StatusCode::OK, "{:?}", fine.body);
+
+    // And every real one still works.
+    let fine = h.get("projects/p1/instances?pageSize=1&orderBy=name").await;
+    assert_eq!(fine.status, StatusCode::OK, "{:?}", fine.body);
+}
+
+/// `?fields=` narrows one object as it narrows a list.
+///
+/// It was read in the collection branch and nowhere else, so a masked single
+/// read came back whole — no error, just the thing the caller said they did
+/// not want.
+#[tokio::test]
+async fn a_field_mask_narrows_one_object_too() {
+    let h = Harness::new();
+    h.post("projects", json!({ "id": "p1", "spec": {} })).await;
+    let name = h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
+
+    let narrowed = h.get(&format!("{name}?fields=spec.vcpus")).await;
+    assert_eq!(narrowed.status, StatusCode::OK, "{:?}", narrowed.body);
+    assert_eq!(narrowed.body["spec"]["vcpus"], json!(2));
+    assert!(
+        narrowed.body["spec"].get("memoryMib").is_none(),
+        "the mask was ignored on a single read: {}",
+        narrowed.body["spec"]
+    );
+    // The name always survives: a document somebody cannot identify is not an
+    // answer, whatever they asked for.
+    assert_eq!(narrowed.body["meta"]["name"], name);
+    assert!(narrowed.body.get("status").is_none(), "{:?}", narrowed.body);
+}
+
 // ---- explain -------------------------------------------------------------
 
 #[tokio::test]
@@ -5255,6 +5325,72 @@ async fn a_time_range_over_the_audit_finds_what_the_whole_walk_finds() {
         .get_query("audit", &[("pageSize", "1000"), ("until", "1h")])
         .await;
     assert!(names(&none).is_empty(), "{:?}", none.body);
+}
+
+/// **Page two of a ranged audit is the same walk, not a fresh scan.**
+///
+/// The seek used to apply only when there was no page token: a resumed walk
+/// carried a key, the key named its kind, and that was taken as enough. It is
+/// not — the cursor lands correctly inside the kind it stopped in and then
+/// enters every *later* kind at its very front, reading through every record
+/// ever written under it. The filter that exists to avoid a scan of the log
+/// did one on every page after the first.
+///
+/// Checked the way the first page is: against the plain walk. Paged through
+/// two at a time, the range must deliver the whole log, in the same order, with
+/// nothing repeated.
+#[tokio::test]
+async fn a_ranged_audit_pages_through_the_whole_log() {
+    let h = Harness::new();
+    for id in ["pa", "pb", "pc", "pd", "pe"] {
+        let made = h.post("projects", json!({ "id": id, "spec": {} })).await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    }
+    // A refusal and a sign-in too, so the log holds more than one kind and the
+    // walk has to cross a boundary to finish.
+    let _ = h.get("projects/nope").await;
+
+    let names = |answer: &Answer| -> Vec<String> {
+        answer.body["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|i| i["meta"]["name"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let whole = names(&h.get_query("audit", &[("pageSize", "1000")]).await);
+    assert!(whole.len() > 4, "the fixture wrote too little to page");
+
+    let mut paged: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..50 {
+        let mut query: Vec<(&str, &str)> = vec![("pageSize", "2"), ("since", "1h")];
+        if let Some(t) = &token {
+            query.push(("pageToken", t));
+        }
+        let page = h.get_query("audit", &query).await;
+        assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+        paged.extend(names(&page));
+        match page.body["nextPageToken"].as_str() {
+            Some(next) if !next.is_empty() => token = Some(next.to_string()),
+            _ => {
+                token = None;
+                break;
+            }
+        }
+    }
+    assert!(token.is_none(), "the paged range never finished");
+
+    let mut unique = paged.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), paged.len(), "a record came back on two pages");
+    let (mut want, mut got) = (whole, paged);
+    want.sort();
+    got.sort();
+    assert_eq!(got, want, "paging the range lost or invented records");
 }
 
 /// An ordered listing is the first page of the *whole* sorted order, not a

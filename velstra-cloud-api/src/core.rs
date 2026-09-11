@@ -2279,13 +2279,29 @@ impl Api {
         let mut scratch = Scratch::default();
         // Read before the first page, like the ordinary walk: it is the
         // revision this answer is a picture of, and a watch started from it
-        // misses nothing that happened after.
-        let revision = collection.revision().await?;
+        // misses nothing that happened after. A resumed page keeps the
+        // revision the walk started at, so the pages are one picture and not
+        // several.
+        let revision = match &paging.token {
+            Some(token) => Revision(token.revision),
+            None => collection.revision().await?,
+        };
+        let resume = paging.token.as_ref().map(|t| t.after.clone());
         let mut more = false;
         let mut last: Option<String> = None;
 
         'kinds: for prefix in KINDS {
-            let mut after = Some(format!("audit/{}", seek_from(prefix, since)));
+            // The later of the two bounds: where this kind's range begins, and
+            // where the last page stopped. A cursor already past this kind
+            // lands on the next kind's first key, and the walk below sees that
+            // and moves on — three short reads at worst, rather than the scan
+            // through every old record of every later kind that a plain
+            // resume-from-cursor would have done.
+            let start = format!("audit/{}", seek_from(prefix, since));
+            let mut after = Some(match &resume {
+                Some(cursor) if *cursor > start => cursor.clone(),
+                _ => start,
+            });
             loop {
                 let (documents, has_more) = collection
                     .list_page(after.as_deref(), READINGS_PER_PAGE)
@@ -2382,9 +2398,11 @@ impl Api {
         // answer and a timeout, which is the difference between a filter
         // somebody uses and one they read about.
         //
-        // Only without a page token: a token is a walk this already shaped,
-        // and it carries a key that names its own kind.
-        if kind == "audit" && filter.since.is_some() && paging.token.is_none() {
+        // Page two as well as page one. The token carries a key, and the key
+        // names the kind and minute it stopped at — so a resumed walk starts
+        // from the later of that key and each kind's own range, and never
+        // reads through the kinds it has already passed.
+        if kind == "audit" && filter.since.is_some() {
             return self.audit_between(parent, kind, filter, paging, gate).await;
         }
         let collection = self.collection(kind)?;
@@ -2619,10 +2637,22 @@ impl Api {
             .get(&store_key)
             .await
             .map_err(ApiError::from)?;
+        // Expired, or a claim nobody came back for. Both are treated as
+        // absent, and the claim written below takes the record over against
+        // the revision it was read at — so two callers racing to take over one
+        // dead claim still make one object between them.
+        //
+        // A claim that dies *after* the object was made but before the answer
+        // was written is the one case a takeover can duplicate. It cannot
+        // silently: the create names its own object, and a second create under
+        // the same name is refused as already existing. The alternative — the
+        // claim believed for a day — is a key its owner can never spend and an
+        // object they can never make, which is worse in every case rather than
+        // one.
         let fresh = held.as_ref().and_then(|entry| {
             serde_json::from_slice::<Replay>(&entry.value)
                 .ok()
-                .filter(|r| !r.expired(now))
+                .filter(|r| !r.expired(now) && !r.abandoned(now))
         });
         if let Some(record) = fresh {
             if record.fingerprint != asked {
@@ -3891,6 +3921,27 @@ impl Api {
         who: &Identity,
     ) -> ApiResult<impl Stream<Item = WatchEvent> + Send + use<>> {
         let a_machine = crate::sessions::agent_node(who).is_some();
+        // The same refusal the equivalent list gives, and for the same reason.
+        // `GET /api/v1/nodes` answers "these are the cell's own, and reading
+        // them is a cell operator's — this is not an empty list"; the same
+        // request with `?watch=true` answered `200` and a stream that would
+        // never carry anything. Two spellings of one read gave opposite
+        // answers, and the silent one is the one that leaves somebody
+        // debugging their client.
+        let its_own_pass = a_machine && velstra_cloud_model::authz::a_node_reads_the_cells(kind);
+        if parent.is_empty()
+            && !self.is_operator(who)
+            && !its_own_pass
+            && velstra_cloud_model::authz::belongs_to_the_cell(kind)
+        {
+            return Err(ApiError::new(
+                Code::PermissionDenied,
+                format!(
+                    "{kind} are the cell's own, and reading them is a cell operator's. \
+                     This is not an empty stream: there may be plenty, and they are not yours."
+                ),
+            ));
+        }
         let gate = if parent.is_empty() {
             // A cell-wide stream. An operator is asking about the cell on
             // purpose; anybody else is told about what they may read.
@@ -4023,7 +4074,18 @@ impl Api {
                 }
                 if let Gate::Readable(who) = gate {
                     let name = name_of(&document).and_then(|n| ResourceName::parse(&n).ok())?;
-                    self.authorize(who, Verb::Read, &name).await.ok()?;
+                    // `judge`, not `authorize` — the same choice the list path
+                    // makes, for the same reason and with more force here.
+                    //
+                    // `authorize` is the *refusal* path: it records. Narrowing
+                    // a stream is not refusing anybody anything, and a watch
+                    // sees every write in the cell, so this wrote one audit
+                    // record per event another tenant caused. The flood guard
+                    // does not help — a record's id carries its target, so
+                    // distinct objects never collide — and nothing expires an
+                    // audit record. One subscriber, left open, filled the log
+                    // at the rate the rest of the cell was working.
+                    self.judge(who, Verb::Read, &name, kind).await.ok()?;
                 }
                 if !matches!(gate, Gate::Machine) {
                     self.answer(&mut document, &mut Scratch::default())
@@ -4039,7 +4101,8 @@ impl Api {
                 }
                 if let Gate::Readable(who) = gate {
                     let parsed = ResourceName::parse(name).ok()?;
-                    self.authorize(who, Verb::Read, &parsed).await.ok()?;
+                    // The question, not the refusal. See the `Put` arm above.
+                    self.judge(who, Verb::Read, &parsed, kind).await.ok()?;
                 }
                 Some(WatchEvent::Delete {
                     name: name.to_string(),
@@ -5299,12 +5362,20 @@ impl Api {
             .is_some_and(|n| n.status.console_tls);
 
         // A viewer gets a window; somebody who may change the guest gets a
-        // keyboard. Asked as a question rather than taken from the refusal path,
-        // so a viewer is *given a console* rather than told no.
-        // Typing into a guest is operating it, not creating one. Somebody who
-        // may reboot a machine may also fix it from its console; somebody who
-        // may only look at it gets a window.
-        let read_only = self.authorize(who, Verb::Operate, name).await.is_err();
+        // keyboard. Typing into a guest is operating it, not creating one:
+        // somebody who may reboot a machine may also fix it from its console,
+        // and somebody who may only look at it gets a window.
+        //
+        // `judge`, which is the question. The comment here always said "asked
+        // as a question rather than taken from the refusal path" and the code
+        // called `authorize` — which *is* the refusal path, and records. So
+        // every viewer who successfully opened a console wrote an
+        // `AuditKind::Refused` about themselves, carrying a sentence nobody was
+        // ever shown, for a request that was granted.
+        let read_only = self
+            .judge(who, Verb::Operate, name, name.collection())
+            .await
+            .is_err();
         // A read-only screen is not built. The serial relay enforces "may only
         // watch" by dropping what the viewer types; VNC cannot be watched that
         // way — the protocol's own handshake is bytes the client sends, so a
@@ -8068,13 +8139,25 @@ fn without<S, T>(
         .collect()
 }
 
+/// Refuse a dimension that would go over, and say that waiting will not help.
+///
+/// A quota refusal and a rate-limit refusal are both `RESOURCE_EXHAUSTED` and
+/// both arrive as `429`, which is AIP-consistent and is a trap: a client
+/// library that retries a `429` on a backoff retries a full project for ever.
+/// The two are told apart by `Retry-After` — the limiter sets one, this never
+/// will, because there is no moment at which this request starts working on
+/// its own. The sentence says so outright, because a header is not what the
+/// person reading a log sees.
 fn exceeded(limit: u64, wanted: u64, what: &str, field: &str) -> ApiResult<()> {
     if limit == 0 || wanted <= limit {
         return Ok(());
     }
     Err(ApiError::new(
         Code::ResourceExhausted,
-        format!("the project may have {limit} {what}, and this would make {wanted}"),
+        format!(
+            "the project may have {limit} {what}, and this would make {wanted}. Waiting will \
+             not change that: delete something, or ask the cell for a higher limit."
+        ),
     )
     .at(field))
 }
