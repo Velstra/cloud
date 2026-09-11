@@ -3,3 +3,6 @@
 # nix build output symlinks
 /result
 /result-*
+
+# Design-context scratch of a UI tool; not part of the platform.
+.21st/
