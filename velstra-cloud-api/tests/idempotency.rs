@@ -306,3 +306,144 @@ async fn a_spent_key_is_swept_once_it_is_old() {
     // replay between them made nothing, which is the whole point.
     assert_eq!(volumes(&api).await, 2);
 }
+
+/// **A create that died holding the key does not hold it for a day.**
+///
+/// The claim is written before the work, so two attempts racing cannot both do
+/// it — and a process that dies in between leaves one behind. Believed for the
+/// key's whole lifetime, that claim is a key its owner can never spend: every
+/// retry is told the first attempt is still in flight, and the object they
+/// asked for is never made. Past the claim's own short window, the retry takes
+/// it over.
+#[tokio::test]
+async fn a_create_that_died_holding_a_key_lets_the_retry_have_it() {
+    use velstra_cloud_model::{
+        idempotency::{CLAIM_LIFETIME_MS, IDEMPOTENCY_KIND, record_id},
+        meta::Timestamp,
+    };
+    use velstra_cloud_store::Expect;
+
+    let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
+    let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+        .with_cell_admins(vec![OPS.to_string()]);
+    for body in [
+        json!({"id": "p1", "spec": {"quota": {}}}),
+        json!({"id": "pool-a", "spec": {"accepting": true}}),
+    ] {
+        let kind = if body["id"] == json!("p1") {
+            "projects"
+        } else {
+            "pools"
+        };
+        api.create("", kind, &body, &who()).await.unwrap();
+    }
+
+    // What a create that crashed between claiming and answering leaves: a
+    // record with no operation, stamped when it started.
+    let dead = Timestamp(Timestamp::now().0 - CLAIM_LIFETIME_MS - 1_000);
+    let key = velstra_cloud_store::key_for(
+        "cell-1",
+        IDEMPOTENCY_KIND,
+        &record_id(OPS, "projects/p1", "volumes", "k-dead"),
+    );
+    store
+        .put(
+            &key,
+            serde_json::to_vec(&json!({"at": dead.0, "fingerprint": "whatever", "target": ""}))
+                .unwrap(),
+            Expect::Absent,
+        )
+        .await
+        .unwrap();
+
+    let (created, replayed) = api
+        .create_with_key(
+            "projects/p1",
+            "volumes",
+            &a_volume(),
+            &who(),
+            Some("k-dead"),
+        )
+        .await
+        .expect("a retry was refused by a claim nobody was holding");
+    assert!(!replayed, "a claim with no answer was replayed as one");
+    assert!(!created.target.is_empty());
+    assert_eq!(volumes(&api).await, 1);
+
+    // And the key is spent for real now: the next retry is the replay.
+    let (_, replayed) = api
+        .create_with_key(
+            "projects/p1",
+            "volumes",
+            &a_volume(),
+            &who(),
+            Some("k-dead"),
+        )
+        .await
+        .unwrap();
+    assert!(replayed, "the taken-over key did not answer its own retry");
+    assert_eq!(volumes(&api).await, 1);
+}
+
+/// A claim that is merely *young* still means "somebody is doing this".
+#[tokio::test]
+async fn a_create_still_in_flight_is_not_taken_over() {
+    use velstra_cloud_model::{
+        idempotency::{IDEMPOTENCY_KIND, record_id},
+        meta::Timestamp,
+    };
+    use velstra_cloud_store::Expect;
+
+    let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
+    let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+        .with_cell_admins(vec![OPS.to_string()]);
+    api.create(
+        "",
+        "projects",
+        &json!({"id": "p1", "spec": {"quota": {}}}),
+        &who(),
+    )
+    .await
+    .unwrap();
+    api.create(
+        "",
+        "pools",
+        &json!({"id": "pool-a", "spec": {"accepting": true}}),
+        &who(),
+    )
+    .await
+    .unwrap();
+
+    let key = velstra_cloud_store::key_for(
+        "cell-1",
+        IDEMPOTENCY_KIND,
+        &record_id(OPS, "projects/p1", "volumes", "k-live"),
+    );
+    store
+        .put(
+            &key,
+            serde_json::to_vec(
+                &json!({"at": Timestamp::now().0, "fingerprint": "whatever", "target": ""}),
+            )
+            .unwrap(),
+            Expect::Absent,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        api.create_with_key(
+            "projects/p1",
+            "volumes",
+            &a_volume(),
+            &who(),
+            Some("k-live")
+        )
+        .await
+        .is_err(),
+        "a create that is still in flight was done a second time"
+    );
+    assert_eq!(volumes(&api).await, 0);
+}
