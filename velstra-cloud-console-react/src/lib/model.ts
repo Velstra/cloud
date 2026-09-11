@@ -53,10 +53,18 @@ export function verdict(r: Resource, c?: Collection): {
   const decided = ready && ready.status === "False" &&
     Number((ready as any).observedGeneration ?? 0) === gen;
   if (decided) return { kind: "failing", word: "Failing", reason: ready!.reason, detail: ready!.message };
-  // A guest that nothing has reported on yet and that has no state is being
-  // made, and "not reported" reads as a fault to somebody arriving from a
-  // cloud that says "pending". The word says the verb; the kind stays honest.
-  const fresh = !r.status?.state && (Date.now() - Number(r.meta.createdAt ?? 0)) < 15 * 60_000;
+  // A guest that nothing has reported on yet is being made, and "not reported"
+  // reads as a fault to somebody arriving from a cloud that says "pending". The
+  // word says the verb; the kind stays honest.
+  //
+  // **`Unknown` is not a state, it is the absence of one.** `InstanceStatus`
+  // defaults its `state` to the string `"Unknown"`, and a truthiness test on it
+  // is therefore always true — so a guest one second old read as "reported, and
+  // nothing is happening", the screen stopped following it, and a person
+  // watched "Not reported / Unknown" until they reloaded the page. That is the
+  // opposite of what this branch is for.
+  const reported = !!r.status?.state && r.status.state !== "Unknown";
+  const fresh = !reported && (Date.now() - Number(r.meta.createdAt ?? 0)) < 15 * 60_000;
   if (obs === 0) return fresh ? { kind: "unreported", word: "Creating", busy: true } : { kind: "unreported", word: "Not reported" };
   if (obs < gen) return { kind: "drifting", word: underway(r) || "Applying", busy: true, reason: ready?.reason };
   if (!ready) return { kind: "unreported", word: "Not reported" };

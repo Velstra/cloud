@@ -28,6 +28,38 @@ pub enum Scope {
     Global,
 }
 
+/// Whose screen a collection belongs on.
+///
+/// **Not the same question as [`Scope`].** Scope says where a thing lives in
+/// the API — under a project or under the cell. Audience says who should be
+/// *managing* it, and the two differ in exactly the places that matter: a
+/// port, an attachment and a migration all live under a project, and none of
+/// them is a screen a customer should be working from.
+///
+/// The division is the one the big clouds draw and it is not arbitrary. A
+/// customer of EC2 manages instances, volumes, security groups, elastic IPs.
+/// They do not create the network interface before the machine, they do not
+/// make an "attachment" object to hang a disk on, and they never see the
+/// hypervisor the guest landed on. Every one of those is real, and every one
+/// of them is the platform's business.
+///
+/// What this changes: the rail, the palette, the sweep the landing screen
+/// makes, and which pickers a form draws. It changes **nothing** about what
+/// the API allows — the API is still the judge, and a `Plumbing` object is
+/// still readable by a link and still shown on the object it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Audience {
+    /// A customer manages this. It is in their rail.
+    Tenant,
+    /// Theirs, and real, and not a screen to work from: it is made and
+    /// unmade by the thing that needs it. Reachable from that thing, from a
+    /// link, and from the map — not from the navigation.
+    Plumbing,
+    /// The cell's. A customer does not see it at all.
+    Operator,
+}
+
 /// How one value is asked for.
 ///
 /// The kinds are deliberately few and they are all *chosen* except two. A value
@@ -486,6 +518,8 @@ pub struct Collection {
     /// source layout.
     pub group: &'static str,
     pub scope: Scope,
+    /// Whose screen this is. See [`Audience`].
+    pub audience: Audience,
     /// One sentence at the top of the list saying what this collection is for.
     /// It is there because a console is also where somebody learns the system.
     pub blurb: &'static str,
@@ -3845,6 +3879,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Compute",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "Guests. What was asked for is the spec; what the node reports is \
                 the status, and they are shown together.",
         fields: INSTANCE_FIELDS,
@@ -3860,6 +3895,17 @@ pub const COLLECTIONS: &[Collection] = &[
                 label: "Asked",
                 cell: Cell::Text,
                 width: 88,
+            },
+            // Right after what was asked for, and not behind six usage
+            // counters: the address is what somebody came to this list to
+            // read. It was the tenth column, off the right edge of every
+            // screen, so a customer's own machine list did not show how to
+            // reach any of them.
+            Column {
+                path: "status.addresses.0",
+                label: "Address",
+                cell: Cell::Mono,
+                width: 136,
             },
             Column {
                 path: "spec.vcpus",
@@ -3910,12 +3956,6 @@ pub const COLLECTIONS: &[Collection] = &[
                 cell: Cell::Mono,
                 width: 128,
             },
-            Column {
-                path: "status.addresses.0",
-                label: "Address",
-                cell: Cell::Mono,
-                width: 136,
-            },
             // Beside the vCPU and memory columns, deliberately: those two are
             // read off `spec`, and this is the column that says whether the
             // guest is actually running on them. Without it the board showed
@@ -3957,6 +3997,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Storage",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "Block devices. A volume knows nothing about who has it open — \
                 that is an attachment.",
         fields: VOLUME_FIELDS,
@@ -4009,6 +4050,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Storage",
         scope: Scope::Project,
+        audience: Audience::Plumbing,
         blurb: "Attaching is its own object, so a crash mid-way leaves a \
                 truthful record rather than a volume nobody can reattach.",
         fields: ATTACHMENT_FIELDS,
@@ -4065,6 +4107,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Mirrored",
         group: "Network",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "One VNI on the fabric. The nodes that have it programmed are on \
                 the object.",
         fields: NETWORK_FIELDS,
@@ -4105,6 +4148,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "",
         group: "Network",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "A range on a network, and the count of what IPAM has handed out \
                 of it.",
         fields: SUBNET_FIELDS,
@@ -4154,6 +4198,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Network",
         scope: Scope::Project,
+        audience: Audience::Plumbing,
         blurb: "What an instance is attached to the fabric by. Programmed means \
                 the agent has it in its maps.",
         fields: PORT_FIELDS,
@@ -4225,6 +4270,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Applied",
         group: "Network",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "What a port is allowed to carry. Rules only add allowances — \
                 ingress is denied, egress is allowed and replies always come \
                 back, so a port in no group is not an open one.",
@@ -4249,6 +4295,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Checked",
         group: "Compute",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Where a family's images come from. The cell asks the checksums file \
                 what the current digest is, over https so the certificate is \
                 checked, and publishes an image when the answer is one it does not \
@@ -4294,6 +4341,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // comes to exist, and deleting the last of them is how it goes away.
         group: "Compute",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "What to boot, by the name that stays right when the bytes change. \
                 A machine resolves its family once, when it is made, and keeps \
                 the build it got.",
@@ -4342,6 +4390,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: an image is bytes and a digest; which nodes have it cached is counted by the API on the way out, and no agent owns the object.
         group: "Compute",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "Content-addressed and immutable. Cached copies are a placement \
                 preference, never a requirement.",
         fields: IMAGE_FIELDS,
@@ -4433,6 +4482,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Moved",
         group: "Compute",
         scope: Scope::Project,
+        audience: Audience::Operator,
         blurb: "Moving a running guest to another node. There is no migrating \
                 state anywhere: this object is the ask, and whether it is \
                 finished is read from where the instance actually runs. Start \
@@ -4508,6 +4558,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Fleet",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Hypervisors. The spec is what an operator decided about one; \
                 the status is what its agent last reported. Adding one here \
                 creates the object and mints its registration token — shown \
@@ -4598,6 +4649,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: a window is a statement about time, and time needs no agent.
         group: "Cell",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Say in advance that a machine is going out of service, and the \
                 cell stops placing work on it when the time comes — without \
                 anybody being awake to flip a switch, and without anything to \
@@ -4655,6 +4707,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: a schedule is a statement about time — the snapshots it produces report, it does not.
         group: "Storage",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "The cheap half of the pair. A snapshot lives in the volume's \
                 own pool — taken in a moment, costs almost nothing, and lost \
                 with the pool it is in. For a copy that survives losing the \
@@ -4694,6 +4747,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Storage",
         scope: Scope::Project,
+        audience: Audience::Plumbing,
         blurb: "Build a guest by hand, get it right, capture it — then every \
                 guest made from the result starts where that one left off. The \
                 guest must be stopped: a disk copied from under a running \
@@ -4743,6 +4797,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: a target is somewhere to put bytes; the backups that use it report, it does not.
         group: "Storage",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Where backups are kept. Deliberately not a pool: a copy that \
                 lives beside the original is a snapshot, and is lost with the \
                 pool it is in. A target in a volume's own pool is refused.",
@@ -4796,6 +4851,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Storage",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "One copy of one volume, at one moment. Restoring makes a new \
                 volume from a copy — never writing one back over the original, \
                 which would be a command living in a spec and carried out again \
@@ -4870,6 +4926,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Storage",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "An intention, not a job queue: there should be a copy of this \
                 volume no older than the interval, and the last few kept. What \
                 exists is what decides — a copy still being made holds the \
@@ -4917,6 +4974,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: an audit record is a fact about something that already happened.
         group: "Fleet",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "What was refused, and who signed in. Not a log of everything \
                 that happened — every successful write already leaves an \
                 operation carrying its target, its verb and who asked. What no \
@@ -4975,6 +5033,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: a device class is a declaration about hardware, not a thing that converges.
         group: "Fleet",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Names for interchangeable hardware. An instance asks for a \
                 class, never an address: an address belongs to one machine, so \
                 an instance naming one could only ever run there. A device is \
@@ -5010,6 +5069,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: a flavor is a named size, not a thing that converges.
         group: "Compute",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Named machine sizes, offered by the cell. A guest is an                 m1-small, not a hand-entered triple of numbers — the sizes that                 land on the fleet are the shapes it was bought for. Whether a                 project may also size by hand is that project's policy.",
         fields: FLAVOR_FIELDS,
         columns: &[
@@ -5052,6 +5112,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Network",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Sessions from the cell's gateways to the routers in front of \
                 it. What gets announced is derived, never listed: every \
                 external subnet, and a host route for each public address that \
@@ -5104,6 +5165,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Routed",
         group: "Network",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "Which of this project's networks reach each other. A membership \
                 rather than a box: there is nothing to place and nothing to fail \
                 over — the gateway answers on whichever machine the packet is \
@@ -5145,6 +5207,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Allocated",
         group: "Network",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "Addresses that outlive the machine answering on them. The \
                 address is held by the declaration, not by the port, so \
                 replacing a guest does not change what the outside world \
@@ -5187,6 +5250,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Network",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "One address in front of many ports. The fabric balances by \
                 connection on whichever host traffic arrives at — there is no \
                 appliance to place and nothing to fail over. Nothing here \
@@ -5242,6 +5306,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Fleet",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Where volumes live. The spec is what an operator decided about \
                 a pool; the backend, the capacity and what is used are what its \
                 agent found.",
@@ -5320,6 +5385,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: a usage reading is a fact about a moment that has passed.
         group: "Access",
         scope: Scope::Project,
+        audience: Audience::Tenant,
         blurb: "What this project had, read once an hour and kept for ninety \
                 days. A reading is a sample, not a total: something created and \
                 destroyed between two of them is in neither. Quota says what is \
@@ -5377,6 +5443,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Fleet",
         scope: Scope::Project,
+        audience: Audience::Plumbing,
         blurb: "Something that could not finish inside a request. Done is \
                 computed from the target's own convergence, so an operation \
                 cannot disagree with the object it describes.",
@@ -5425,6 +5492,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // Nothing reports on these: an account is a declaration; no agent runs one.
         group: "Access",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Who can sign in. A password is set from the row rather than \
                 shown on it — the platform stores a hash and cannot recover the \
                 original, which is the point.",
@@ -5473,6 +5541,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Storage",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "Cluster storage every node reaches, instead of a pool per \
                 machine. Optional: a cell with directory pools is a working \
                 cell, and nothing here turns itself on. Choosing a disk for an \
@@ -5536,6 +5605,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // runs.
         group: "Access",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "The four rungs say how much somebody may do. A role here says \
                 *what* — collection by collection, for the case a rung cannot \
                 express: may restart the database machines, may not touch the \
@@ -5571,6 +5641,7 @@ pub const COLLECTIONS: &[Collection] = &[
         // agent runs.
         group: "Access",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "A place to put projects, and a place to grant a role once instead \
                 of forty times. Roles granted here reach everything below.",
         fields: FOLDER_FIELDS,
@@ -5602,6 +5673,7 @@ pub const COLLECTIONS: &[Collection] = &[
         condition: "Ready",
         group: "Fleet",
         scope: Scope::Global,
+        audience: Audience::Operator,
         blurb: "The quota and access anchor. Usage is counted from what exists, \
                 never decremented by hand.",
         fields: PROJECT_FIELDS,
