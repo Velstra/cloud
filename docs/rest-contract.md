@@ -1448,6 +1448,15 @@ Four things a client may rely on:
 - **Naming a group that does not exist is not an error.** Rules only add
   allowances, so a missing group is strictly fewer of them — the safe direction
   — and the port keeps working rather than a typo costing a guest its network.
+
+**On a cell whose datapath is the fabric, egress is closed.** The fabric's
+wire carries one default per group rather than one per direction, so a port
+that names any group is denied outbound except for the egress rules it
+carries, and a port that names no group at all is denied in both directions.
+That is not what the first bullet says, and it is stated here rather than left
+to be discovered: a guest that is reachable and can reach nothing looks like a
+broken image. The local datapath does what the bullet says. Closing the gap
+needs a per-direction default on the fabric's own API.
   It is reported on the node that noticed.
 
 A rule whose port range is set on a protocol that has no ports, or that runs
@@ -1721,6 +1730,22 @@ Two more things it does not do, stated so nobody looks for them: it balances
 is no path from one machine to a guest on another, so a member elsewhere is one
 that node could not reach — and it is round robin, with no weights and no
 least-connections. Both are real things and neither is worth pretending to have.
+
+**The member sees this node, not the client.** The connection is opened by the
+node agent, so a member reads the node's own address on the segment as its
+peer. The client's address is still what picks the member under
+`sessionAffinity` — the balancer knows it even though the member does not.
+Preserving it means transparent proxying (a routing rule, `IP_TRANSPARENT`, and
+a reply path this process does not own), which is fabric work.
+
+**The member's security group is consulted anyway.** Because the connection is
+node-originated it never crosses the hook a member's own firewall chains are on,
+so a client the member's rules deny would have reached it through the VIP. The
+balancer is the last thing that still knows the client, and it asks the
+member's ingress rules itself before handing over a connection: a member whose
+rules do not admit the client is skipped, exactly as one that refuses the
+connection is. On a fabric cell the fabric enforces the port's group wherever
+the packet arrives, and this does not apply.
 
 ## Long-running operations
 

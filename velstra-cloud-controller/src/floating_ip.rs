@@ -463,14 +463,24 @@ impl Reconciler for FloatingIpController {
             // — that is this controller's own half, and it is complete. What a
             // fabric would add (the programmed path) is said plainly instead
             // of implied by silence.
+            // What a fabric would add differs by delivery, and the sentence
+            // has to say the right one: a `Nat` address was waiting for a
+            // translation path; a `Routed` one never was — it is waiting for
+            // something to answer for its next hop. Saying "no translation
+            // path" about a routed address sent people looking for NAT.
+            let what = match fip.spec.delivery {
+                velstra_cloud_model::public::Delivery::Routed => {
+                    "the address is allocated; nothing on this cell's datapath answers for \
+                     its next hop yet, so the guest is not configured with it until a node \
+                     that does holds its port"
+                }
+                velstra_cloud_model::public::Delivery::Nat => {
+                    "the address is allocated; this cell runs no fabric, so no translation \
+                     path is programmed for it"
+                }
+            };
             return self
-                .settle(
-                    fip,
-                    ConditionStatus::True,
-                    "Allocated",
-                    "the address is allocated; this cell runs no fabric, so no                      translation path is programmed for it",
-                    None,
-                )
+                .settle(fip, ConditionStatus::True, "Allocated", what, None)
                 .await;
         };
 

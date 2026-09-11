@@ -225,12 +225,28 @@ pub enum Unprogrammable {
 /// naming what to write instead costs somebody a minute, and a rule that is
 /// accepted and silently wedges an instance costs an afternoon.
 pub fn programmable(rule: &SecurityRule) -> Result<(), Unprogrammable> {
-    if rule.protocol == Protocol::Any {
+    programmable_shape(rule.protocol, rule.ports)
+}
+
+/// The same question, asked of a rule that has already been resolved.
+///
+/// A [`ResolvedRule`] differs only in carrying its remote as a string, so the
+/// judgement is identical — and it has to be *the same code*, because the two
+/// are asked at two different doors and a second copy would drift. The API asks
+/// [`programmable`] on write; a node asks this of what actually reached it,
+/// which is not the same set: an object written before that door existed, a
+/// restore, or a direct store write all arrive without having passed it.
+pub fn programmable_resolved(rule: &ResolvedRule) -> Result<(), Unprogrammable> {
+    programmable_shape(rule.protocol, rule.ports)
+}
+
+fn programmable_shape(protocol: Protocol, ports: Option<PortRange>) -> Result<(), Unprogrammable> {
+    if protocol == Protocol::Any {
         return Err(Unprogrammable::EveryProtocol);
     }
-    match rule.ports {
-        None if rule.protocol.has_ports() => Err(Unprogrammable::EveryPort {
-            protocol: match rule.protocol {
+    match ports {
+        None if protocol.has_ports() => Err(Unprogrammable::EveryPort {
+            protocol: match protocol {
                 Protocol::Tcp => "tcp",
                 Protocol::Udp => "udp",
                 _ => "",
@@ -249,6 +265,42 @@ pub fn programmable(rule: &SecurityRule) -> Result<(), Unprogrammable> {
         }
         None => Ok(()),
     }
+}
+
+/// Whether these rules admit a connection from `remote` to `port` over
+/// `protocol`, in `direction`.
+///
+/// **No rules admits everything** — that is the platform's stance with nothing
+/// added, and it is what an unfiltered port means. With rules, the client is
+/// admitted only if some rule in that direction names its protocol (or any),
+/// contains its address, and contains the port (or names no port range).
+///
+/// Asked by the local load balancer, which is the last thing that still knows
+/// the client's address: the connection it opens to a member is sourced from
+/// the node, so the member's own firewall chains — which judge the *forward*
+/// hook — never see it. A client a member's rules deny reached it anyway.
+/// This is the half of that which can be made true in userspace; the half
+/// that cannot (the member seeing the client's address) is written down in
+/// the balancer.
+pub fn admits(
+    rules: &[ResolvedRule],
+    direction: Direction,
+    remote: std::net::IpAddr,
+    port: u16,
+    protocol: Protocol,
+) -> bool {
+    if rules.is_empty() {
+        return true;
+    }
+    rules
+        .iter()
+        .filter(|r| r.direction == direction)
+        .filter(|r| r.protocol == Protocol::Any || r.protocol == protocol)
+        .filter(|r| match r.ports {
+            None => true,
+            Some(range) => range.from <= port && port <= range.to,
+        })
+        .any(|r| crate::network::Cidr::parse(&r.remote).is_ok_and(|prefix| prefix.contains(remote)))
 }
 
 /// Refuse a rule that cannot mean what it appears to mean.

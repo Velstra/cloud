@@ -98,6 +98,42 @@ pub fn parse_query(packet: &[u8]) -> Option<(u16, Question)> {
     ))
 }
 
+/// Whether `reply` is an answer to the question `id` asked.
+///
+/// The header id matches, QR is set, there is exactly one question, and — when
+/// the question is known — it is the same name, type and class. `read_name`
+/// already lowercases, so case differences in the echoed question are not a
+/// mismatch. A question this could not parse (`None`) is checked on the id
+/// alone, which is still what stops a stray datagram being handed to the guest
+/// as its answer.
+pub fn answers(reply: &[u8], id: u16, question: Option<&Question>) -> bool {
+    if reply.len() < 12 {
+        return false;
+    }
+    if u16::from_be_bytes([reply[0], reply[1]]) != id {
+        return false;
+    }
+    let flags = u16::from_be_bytes([reply[2], reply[3]]);
+    if flags & 0x8000 == 0 {
+        return false;
+    }
+    if u16::from_be_bytes([reply[4], reply[5]]) != 1 {
+        return false;
+    }
+    let Some(question) = question else {
+        return true;
+    };
+    let Some((name, at)) = read_name(reply, 12) else {
+        return false;
+    };
+    if reply.len() < at + 4 {
+        return false;
+    }
+    let kind = u16::from_be_bytes([reply[at], reply[at + 1]]);
+    let class = u16::from_be_bytes([reply[at + 2], reply[at + 3]]);
+    name == question.name && kind == question.kind && class == question.class
+}
+
 /// A name in wire format, as dotted text, and where it ended.
 ///
 /// Compression pointers are not followed: a *question* is never compressed —
@@ -401,7 +437,8 @@ impl Responder {
             // Not a shape this understands. Forwarded whole, because a
             // resolver that dropped what it could not parse would be a
             // resolver that broke DNSSEC, EDNS and every future record type.
-            return self.forward(packet).await;
+            // The reply is still checked on its id.
+            return self.forward(packet, None).await;
         };
         for subnet in subnets {
             let zone = self.names.zone(subnet, &self.zone_suffix);
@@ -415,11 +452,34 @@ impl Responder {
                 return Some(answer(id, &question, &[], &[]));
             }
         }
-        self.forward(packet).await
+        self.forward(packet, Some(&question)).await
     }
 
-    /// Ask the node's own resolvers, and hand back whatever they say.
-    async fn forward(&self, packet: &[u8]) -> Option<Vec<u8>> {
+    /// Ask the node's own resolvers, and hand back what they say — **when it
+    /// is an answer to what was asked.**
+    ///
+    /// Three things this used to not do, and each was a way for one guest to
+    /// answer another's lookup. The socket was bound to the wildcard address
+    /// and never connected, so any host that could reach it — a guest on this
+    /// node's own bridges included — could hand it a datagram; nothing checked
+    /// that the reply carried the query's id; nothing checked that it was about
+    /// the question. A neighbour needed only the ephemeral port to have a
+    /// forged answer accepted for a tenant's lookup. That is a cache-poisoning
+    /// primitive against every other tenant on the box.
+    ///
+    /// Now: the socket is connected, so the kernel refuses every other source;
+    /// the reply is checked against the id and the question (`answers`), so an
+    /// on-path sender that can spoof the address still has to guess the id and
+    /// name the question; and the buffer is a whole datagram, so a large reply
+    /// is delivered rather than silently cut mid-record with no TC bit.
+    ///
+    /// One consequence worth knowing when a "DNS stopped working behind my odd
+    /// resolver" report arrives: an upstream that answers from a *different*
+    /// address than it was asked at is refused by the connected socket. That is
+    /// the correct refusal.
+    async fn forward(&self, packet: &[u8], asked: Option<&Question>) -> Option<Vec<u8>> {
+        // The id alone is checkable even for a packet this could not parse.
+        let id = packet.get(0..2).map(|b| u16::from_be_bytes([b[0], b[1]]));
         for upstream in &self.upstreams {
             let bind: SocketAddr = if upstream.is_ipv4() {
                 (Ipv4Addr::UNSPECIFIED, 0).into()
@@ -429,13 +489,27 @@ impl Responder {
             let Ok(socket) = tokio::net::UdpSocket::bind(bind).await else {
                 continue;
             };
-            if socket.send_to(packet, (*upstream, PORT)).await.is_err() {
+            if socket.connect((*upstream, PORT)).await.is_err() {
                 continue;
             }
-            let mut buffer = vec![0u8; 4096];
+            if socket.send(packet).await.is_err() {
+                continue;
+            }
+            // A UDP datagram cannot be longer, so the truncation goes away
+            // rather than being detected.
+            let mut buffer = vec![0u8; 65_535];
             match tokio::time::timeout(Duration::from_secs(3), socket.recv(&mut buffer)).await {
                 Ok(Ok(n)) => {
                     buffer.truncate(n);
+                    let Some(id) = id else {
+                        return Some(buffer);
+                    };
+                    if !answers(&buffer, id, asked) {
+                        // Not an answer to what was asked: a stray, a late
+                        // reply to something else, or a forgery. The same as a
+                        // timeout — the next upstream might do better.
+                        continue;
+                    }
                     return Some(buffer);
                 }
                 // This one did not answer. The next one might, and a guest
@@ -494,7 +568,10 @@ pub async fn serve(
 }
 
 async fn listen(socket: Arc<tokio::net::UdpSocket>, responder: Responder) {
-    let mut buffer = vec![0u8; 4096];
+    // A whole datagram, for the same reason `forward` reads one: a query
+    // larger than the buffer used to be truncated and parsed as something
+    // shorter than what was sent.
+    let mut buffer = vec![0u8; 65_535];
     loop {
         let (n, from) = match socket.recv_from(&mut buffer).await {
             Ok(got) => got,
@@ -526,6 +603,45 @@ mod tests {
         out.extend_from_slice(&kind.to_be_bytes());
         out.extend_from_slice(&IN.to_be_bytes());
         out
+    }
+
+    /// **An answer to a question nobody asked is not an answer.**
+    ///
+    /// The forwarder used to hand the guest the first datagram that arrived on
+    /// its socket. With the id and the question checked, a stray or a forgery
+    /// has to match both — and an on-path sender that can spoof the address
+    /// still has to guess the id.
+    #[test]
+    fn an_answer_to_a_question_nobody_asked_is_not_an_answer() {
+        let question = Question {
+            name: "db-1.velstra.internal".into(),
+            kind: A,
+            class: IN,
+        };
+        let real = answer(0x1234, &question, &["10.0.0.5".parse().unwrap()], &[]);
+        assert!(
+            answers(&real, 0x1234, Some(&question)),
+            "the real reply was refused"
+        );
+
+        // The right question, the wrong id.
+        assert!(!answers(&real, 0x1235, Some(&question)));
+
+        // The right id, a different name.
+        let other = Question {
+            name: "web-1.velstra.internal".into(),
+            ..question.clone()
+        };
+        assert!(!answers(&real, 0x1234, Some(&other)));
+
+        // The right id and question, but QR clear: a query, not a reply.
+        let mut not_a_reply = real.clone();
+        not_a_reply[2] &= !0x80;
+        assert!(!answers(&not_a_reply, 0x1234, Some(&question)));
+
+        // A packet this could not parse: the id alone still guards it.
+        assert!(answers(&real, 0x1234, None));
+        assert!(!answers(&real, 0x9999, None));
     }
 
     #[test]

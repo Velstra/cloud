@@ -165,14 +165,28 @@ pub fn bind(device: &str) -> Result<tokio::net::UdpSocket> {
         .map_err(|e| HostError::failed(format!("the ICMPv6 socket could not be registered: {e}")))
 }
 
-/// Advertise on one device, for ever: unsolicited on a timer, and again
-/// whenever a guest asks.
+/// Advertise on one device until told to stop: unsolicited on a timer, and
+/// again whenever a guest asks.
 ///
 /// A guest that has just booted sends a solicitation rather than waiting up to
 /// five minutes for the next unsolicited one, and answering it is the
 /// difference between a machine that is on the network at boot and one that is
 /// on the network eventually.
-pub async fn serve(device: String, prefix: Ipv6Addr, prefix_len: u8) {
+///
+/// **Stopping is a message, not a silence.** When `stop` turns true — the
+/// segment left this node, or its gateway or prefix changed under the same
+/// bridge — one last advertisement goes out with a router lifetime of zero,
+/// which is how a router says "not me any more": guests drop the default
+/// route at once instead of holding it for fifteen minutes on a router that
+/// is gone. The module doc promised exactly this; until the receiver existed
+/// nothing ever sent it, and the task ran for ever on a device that had been
+/// deleted.
+pub async fn serve(
+    device: String,
+    prefix: Ipv6Addr,
+    prefix_len: u8,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
     let socket = match bind(&device) {
         Ok(socket) => socket,
         Err(e) => {
@@ -187,6 +201,19 @@ pub async fn serve(device: String, prefix: Ipv6Addr, prefix_len: u8) {
     tracing::info!(%device, prefix = %masked(prefix, prefix_len), prefix_len, "advertising a route");
     loop {
         tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    // Withdraw, then go. A send that fails here is a device
+                    // already gone, and a device already gone has nobody on it
+                    // to tell.
+                    let withdrawal = advertisement(prefix, prefix_len, 0);
+                    if let Err(e) = socket.send_to(&withdrawal, to).await {
+                        tracing::debug!(%device, error = %e, "the withdrawal did not go out");
+                    }
+                    tracing::info!(%device, prefix = %masked(prefix, prefix_len), "withdrew the route");
+                    return;
+                }
+            }
             _ = ticker.tick() => {
                 if let Err(e) = socket.send_to(&frame, to).await {
                     tracing::debug!(%device, error = %e, "an advertisement did not go out");
