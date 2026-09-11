@@ -1503,9 +1503,9 @@ impl Agent {
                     port,
                     &taps,
                     in_my_share.contains(name.as_str()),
-                    answering.get(name.as_str()),
-                    turned_away.get(name.as_str()).copied(),
                     PortFacts {
+                        answering: answering.get(name.as_str()),
+                        dropped: turned_away.get(name.as_str()).copied(),
                         same_segment,
                         has_rules,
                         network_mtu,
@@ -2801,14 +2801,6 @@ impl Agent {
         stored: &Port,
         taps: &BTreeMap<String, String>,
         in_my_share: bool,
-        // Which of this port's listener ports answered, when something is
-        // sending traffic to it. `None` is "nobody asked", which is not the
-        // same as "nothing answered" — see `PortStatus::answering`.
-        answering: Option<&Vec<u32>>,
-        // What this port's firewall turned away, when something on this node
-        // is filtering it. `None` is "nothing is judging this port", which is
-        // not the same as "nothing was dropped".
-        dropped: Option<crate::nftfilter::Dropped>,
         facts: PortFacts<'_>,
         pass: &mut Pass,
     ) {
@@ -2858,12 +2850,12 @@ impl Agent {
         // removed leaves the last reading behind, and the next pass that cares
         // replaces it. The balancer fails open either way, so a stale reading
         // costs nothing — and it is still the truest thing this node knows.
-        if let Some(up) = answering {
+        if let Some(up) = facts.answering {
             next.status.answering = up.clone();
         }
         // Same rule as `answering`, and for the same reason: a reading that
         // stops arriving is not a reading of zero.
-        if let Some(d) = dropped {
+        if let Some(d) = facts.dropped {
             next.status.dropped = Some(velstra_cloud_model::resources::Dropped {
                 inbound_packets: d.inbound_packets,
                 inbound_bytes: d.inbound_bytes,
@@ -2953,8 +2945,17 @@ impl Agent {
     }
 }
 
-/// What this node knows about a port that only it can say — see `port_pass`.
+/// What this pass knows about a port, gathered once and handed to
+/// `port_pass` as one thing rather than as a growing list of arguments.
 struct PortFacts<'a> {
+    /// Which of this port's listener ports answered, when something is
+    /// sending traffic to it. `None` is "nobody asked", which is not the
+    /// same as "nothing answered" — see `PortStatus::answering`.
+    answering: Option<&'a Vec<u32>>,
+    /// What this port's firewall turned away, when something on this node
+    /// is filtering it. `None` is "nothing is judging this port", which is
+    /// not the same as "nothing was dropped".
+    dropped: Option<crate::nftfilter::Dropped>,
     /// `Some` on the local datapath: whether frames between two guests on one
     /// bridge are judged here. `None` where a fabric judges instead.
     same_segment: Option<bool>,
