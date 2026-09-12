@@ -3989,3 +3989,97 @@ async fn an_image_shared_with_another_project_is_readable_there_and_not_writable
         .expect("an unshared image was bootable from another project");
     assert_eq!(refused.code, Code::PermissionDenied);
 }
+
+/// The records about an object can be older than the object, so its own
+/// `created_at` is not a lower bound for them.
+///
+/// A refusal is recorded against the name that was *asked for*, which for a
+/// refused create is a name nothing of that kind holds yet — and the retry
+/// that succeeds is later. Taking the object's creation as the earliest
+/// record about it would therefore hide the one sentence the question "I
+/// clicked create and nothing happened" is asked to find.
+///
+/// Written down because the speed of `?target=` invites exactly that bound:
+/// without one the filter costs a scan of the whole log, and the object's own
+/// timestamp is the obvious thing to reach for.
+#[tokio::test]
+async fn a_refusal_older_than_the_object_is_still_one_of_its_records() {
+    let (api, store) = cell_and_store().await;
+    let target = "projects/p1/instances/late";
+
+    // Bob may not write in ada's project. The refusal is recorded against a
+    // name that does not exist.
+    let refused = api
+        .create(
+            "projects/p1",
+            "instances",
+            &json!({ "id": "late", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+            &who(BOB),
+        )
+        .await;
+    assert_eq!(
+        refused.map(|_| ()).unwrap_err().code,
+        Code::PermissionDenied,
+        "the fixture needs a refused create"
+    );
+
+    // Then the same name, made by somebody who may.
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "late", "spec": { "vcpus": 1, "memory_mib": 512 } }),
+        &who(ADA),
+    )
+    .await
+    .expect("ada admins p1");
+
+    // Back a quarter of an hour, which is what makes this the real case: the
+    // audit is keyed by the minute, so a refusal in the same minute as the
+    // create is inside any range starting at the object. A person who is
+    // refused, asks somebody for the rights and comes back is not.
+    let prefix = velstra_cloud_store::prefix_for("cell-1", "audit");
+    let older = {
+        let entries = store.list(&prefix).await.expect("the audit is readable");
+        let mut moved = None;
+        for entry in entries {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&entry.value).expect("an audit record");
+            if document["spec"]["target"] != json!(target) {
+                continue;
+            }
+            let was = document["meta"]["created_at"].as_u64().unwrap_or_default();
+            let then = was.saturating_sub(15 * 60 * 1000);
+            document["meta"]["created_at"] = json!(then);
+            document["spec"]["at"] = json!(then);
+            store
+                .put(
+                    &entry.key,
+                    serde_json::to_vec(&document).unwrap(),
+                    velstra_cloud_store::Expect::Revision(entry.revision),
+                )
+                .await
+                .expect("moving a record back in time");
+            moved = Some(then);
+            break;
+        }
+        moved.expect("no record about the refused create was written")
+    };
+    assert!(older > 0, "the fixture produced no timestamp to move");
+
+    let about = Filter {
+        target: Some(target.to_string()),
+        ..Filter::none()
+    };
+    let records = api
+        .list_for("", "audit", &about, &who(OPERATOR))
+        .await
+        .expect("an operator reads the audit");
+    assert!(
+        records
+            .items
+            .iter()
+            .any(|r| r["spec"]["target"] == json!(target)),
+        "the refusal that predates the object was not among its records: {:?}",
+        records.items
+    );
+}

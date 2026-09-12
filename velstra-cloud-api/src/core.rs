@@ -2407,26 +2407,6 @@ impl Api {
     /// The page token it hands back is an ordinary one: it names a key, a key
     /// names its kind, and a caller resuming with it lands back here only if
     /// they still ask for a range — which they will, because the console does.
-    /// When the object a `?target=` names was made, if it is still there.
-    ///
-    /// A lower bound for the records about it, and nothing else: every failure
-    /// here — an unparseable name, a collection this build does not serve, an
-    /// object already deleted, a document with no `created_at` — answers `None`
-    /// and leaves the caller's filter exactly as it was. A bound that is
-    /// guessed wrong would hide records, so the only bound taken is the one the
-    /// object itself states.
-    async fn target_born_at(&self, target: Option<&str>) -> Option<Timestamp> {
-        let target = target?;
-        let name = ResourceName::parse(target).ok()?;
-        let collection = self.collection(name.collection()).ok()?;
-        let document = collection.get(target).await.ok()??;
-        document
-            .get("meta")
-            .and_then(|m| m.get("created_at"))
-            .and_then(Value::as_u64)
-            .map(Timestamp)
-    }
-
     async fn audit_between(
         &self,
         parent: &str,
@@ -2570,31 +2550,6 @@ impl Api {
         // reads through the kinds it has already passed.
         if kind == "audit" && filter.since.is_some() {
             return self.audit_between(parent, kind, filter, paging, gate).await;
-        }
-        // The records about one object cannot predate the object.
-        //
-        // `?target=` was the one filter with no lower bound, so it scanned the
-        // whole log per question — and it is on the path of every detail page
-        // a console opens, which measured at twenty-five seconds against two
-        // hundred thousand records, to answer with one line. The target names a
-        // resource, the resource carries the moment it was made, and that is a
-        // bound the caller should not have to know to send: one read buys the
-        // key range the scan was missing.
-        //
-        // Only when the caller named no `since` of their own, and only when the
-        // object is still there to ask — a record about something already
-        // deleted still costs the old walk, which is the honest answer rather
-        // than a cheap wrong one.
-        if kind == "audit" && filter.target.is_some() {
-            if let Some(born) = self.target_born_at(filter.target.as_deref()).await {
-                let bounded = Filter {
-                    since: Some(born),
-                    ..filter.clone()
-                };
-                return self
-                    .audit_between(parent, kind, &bounded, paging, gate)
-                    .await;
-            }
         }
         let collection = self.collection(kind)?;
         let unpaged = !paging.is_paged();
