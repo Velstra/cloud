@@ -1339,8 +1339,14 @@ impl Agent {
             if known.contains(name) || !host.disks.contains(name) {
                 continue;
             }
+            // Said once, now that a kill is terminal: the guest stops being
+            // observed, so this line stops repeating. It used to be every pass
+            // for as long as the node ran — 1055 an hour for twelve days on a
+            // live node — which is the shape of a warning nobody can act on and
+            // everybody learns to scroll past.
             tracing::warn!(instance = %name,
-                "stopping a guest of mine whose instance is gone from my share of the cell");
+                "stopping a guest of mine whose instance is gone from my share of the cell; \
+                 its disk is left behind and is an operator's to reclaim");
             // `kill`, not `stop`: the graceful path asks over the monitor, and
             // an orphan whose directory was deleted has no monitor left to ask
             // — its unit is the only handle that still works.
