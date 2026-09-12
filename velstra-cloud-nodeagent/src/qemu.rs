@@ -635,6 +635,23 @@ impl Vmm for QemuVmm {
         // because this is a stop and not a delete.
         let _ = self.qmp(instance, "quit", json!({})).await;
         hostfs::stop_unit(self.layout.scope, &self.unit(instance)).await;
+        // And the sockets go, because a socket file outlives the process
+        // listening on it and `observe` reads its presence as "a VMM was asked
+        // for here".
+        //
+        // Without this a kill was not terminal. The orphan sweep in the agent
+        // kills a guest whose instance has gone from the cell, observed it
+        // again on the next pass through the same stale `qmp.sock`, and killed
+        // it again — on a live node that ran for twelve days and 1055 warnings
+        // an hour, about a guest whose VMM had been dead since August. Nothing
+        // here is data: a monitor socket is recreated when a VMM starts, so
+        // removing it costs a stopped guest nothing and is what makes stopping
+        // one mean something.
+        for socket in [self.monitor(instance), self.incoming_monitor(instance)] {
+            if socket.exists() {
+                let _ = std::fs::remove_file(&socket);
+            }
+        }
         Ok(())
     }
 
@@ -1653,6 +1670,53 @@ mod tests {
                 .to_string()
                 .contains("stop here and a start there")
         );
+    }
+
+    /// A kill leaves nothing for the next observation to find.
+    ///
+    /// `observe` reads the presence of `qmp.sock` as "a VMM was asked for
+    /// here", and a socket file outlives the process that listened on it. So a
+    /// kill that stopped the process and left the socket was not terminal: the
+    /// agent's orphan sweep saw the guest again on the next pass, killed it
+    /// again, and said so in the log — 1055 times an hour for twelve days on a
+    /// live node, about a VMM that had been dead since August.
+    ///
+    /// The disk and the console log stay. This is a stop, not a delete, and
+    /// what is removed is the one thing that is not data.
+    #[tokio::test]
+    async fn a_kill_takes_the_monitor_socket_with_it() {
+        let run = std::env::temp_dir().join(format!("velstra-kill-{}", std::process::id()));
+        let vmm = QemuVmm::new(Layout {
+            run_dir: run.clone(),
+            binary: "qemu-system-x86_64".to_string(),
+            // The user manager, so the `systemctl stop` inside `kill` answers
+            // at once. Asked of the system manager as an ordinary user it waits
+            // on a polkit prompt nobody is there to answer, which is twenty-five
+            // seconds of a test suite spent proving nothing.
+            scope: crate::hostfs::Scope::User,
+            ..Default::default()
+        });
+        let instance = "projects/p1/instances/orphan";
+        let dir = vmm.layout.dir(instance);
+        std::fs::create_dir_all(&dir).expect("a guest directory");
+        // A plain file: `observe` asks whether the path exists, which is
+        // exactly the mistake a dead VMM's leftovers make.
+        std::fs::write(vmm.monitor(instance), b"").expect("a stale monitor");
+        std::fs::write(vmm.incoming_monitor(instance), b"").expect("a stale incoming monitor");
+        std::fs::write(dir.join("root.raw"), b"disk").expect("a root disk");
+        std::fs::write(dir.join("console.log"), b"last words").expect("a console log");
+
+        vmm.kill(instance).await.expect("killing an orphan");
+
+        assert!(
+            !vmm.monitor(instance).exists() && !vmm.incoming_monitor(instance).exists(),
+            "the sockets outlived the kill, so the next pass observes the guest again"
+        );
+        assert!(
+            dir.join("root.raw").exists() && dir.join("console.log").exists(),
+            "a stop is not a delete: the disk and what it last said have to stay"
+        );
+        let _ = std::fs::remove_dir_all(&run);
     }
 }
 

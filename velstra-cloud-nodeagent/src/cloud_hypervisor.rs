@@ -569,6 +569,17 @@ impl Vmm for CloudHypervisorVmm {
         // is the ACPI press that `stop` already made and this guest ignored.
         let _ = self.api(instance, "PUT", "/api/v1/vm.shutdown", "").await;
         hostfs::stop_unit(self.layout.scope, &self.unit(instance)).await;
+        // And the sockets go, for the same reason they do in the QEMU backend:
+        // `observe` reads a socket file's presence as "a VMM was asked for
+        // here", and a socket outlives the process that listened on it. A kill
+        // that leaves one behind is not terminal — the orphan sweep sees the
+        // guest again on the next pass and kills it again, for ever. Nothing
+        // here is data; a socket is recreated when a VMM starts.
+        for socket in [self.socket(instance), self.incoming_socket(instance)] {
+            if socket.exists() {
+                let _ = std::fs::remove_file(&socket);
+            }
+        }
         Ok(())
     }
 
