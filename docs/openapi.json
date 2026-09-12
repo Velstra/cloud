@@ -301,10 +301,10 @@
       },
       "CaptureSpec": {
         "additionalProperties": true,
-        "description": "Build a guest by hand, get it right, capture it — then every guest made from the result starts where that one left off. The guest must be stopped: a disk copied from under a running machine is crash-consistent, and a template is stamped out by people who assume it is clean.",
+        "description": "Build an instance by hand, get it right, capture it — then every instance made from the result starts where that one left off. It has to be stopped first: a disk copied from under a running machine is crash-consistent, and a template is stamped out by people who assume it is clean.",
         "properties": {
           "instance": {
-            "description": "The name of a `instances` object. It must be stopped. A disk copied from under a running machine is crash-consistent, which a template stamped out a hundred times must not be — if you want a copy of a live guest, take a backup instead.",
+            "description": "The name of a `instances` object. It must be stopped. A disk copied from under a running machine is crash-consistent, which a template stamped out a hundred times must not be — if you want a copy of a running instance, take a backup instead.",
             "type": "string"
           },
           "label": {
@@ -313,7 +313,7 @@
             "type": "string"
           },
           "target": {
-            "description": "The name of a `backup-targets` object. Where the bytes go. Any node that can reach the same path can then boot guests from the image.",
+            "description": "The name of a `backup-targets` object. Where the bytes go. Any node that can reach the same path can then boot instances from the image.",
             "type": "string"
           }
         },
@@ -555,7 +555,7 @@
       },
       "FlavorSpec": {
         "additionalProperties": true,
-        "description": "Named machine sizes, offered by the cell. A guest is an                 m1-small, not a hand-entered triple of numbers — the sizes that                 land on the fleet are the shapes it was bought for. Whether a                 project may also size by hand is that project's policy.",
+        "description": "Named machine sizes, offered by the cell. An instance is an m1-small, not a hand-entered triple of numbers — the sizes that land on the fleet are the shapes it was bought for. Whether a project may also size by hand is that project's policy.",
         "properties": {
           "description": {
             "description": "One sentence for the picker. The numbers already say most of it.",
@@ -608,7 +608,7 @@
       },
       "FloatingIPSpec": {
         "additionalProperties": true,
-        "description": "Addresses that outlive the machine answering on them. The address is held by the declaration, not by the port, so replacing a guest does not change what the outside world reaches.",
+        "description": "Addresses that outlive the machine answering on them. The address is held by the declaration, not by the port, so replacing an instance does not change what the outside world reaches.",
         "properties": {
           "address": {
             "description": "Leave empty to be given the lowest address nothing else holds.",
@@ -616,7 +616,7 @@
             "type": "string"
           },
           "announce": {
-            "description": "The machine holding the guest is the shortest path: nothing is encapsulated for traffic to and from the world, and the route follows a live migration by itself. It needs every hypervisor to be allowed to peer with the router above it. A gateway node needs only that one machine to peer, and costs a detour in both directions.",
+            "description": "The machine holding the instance is the shortest path: nothing is encapsulated for traffic to and from the world, and the route follows a live migration by itself. It needs every hypervisor to be allowed to peer with the router above it. A gateway node needs only that one machine to peer, and costs a detour in both directions.",
             "enum": [
               "",
               "FromHost",
@@ -625,7 +625,7 @@
             "type": "string"
           },
           "delivery": {
-            "description": "Held by the guest means the address is bound to its port and configured inside the machine — nothing rewrites a packet, and the guest can tell anybody its own address, which SIP, FTP, IPsec and mDNS all need. Translated means the edge answers for it and the guest never knows. A held address has to come from an external network.",
+            "description": "Held by the instance means the address is bound to its port and configured inside the machine — nothing rewrites a packet, and the machine can tell anybody its own address, which SIP, FTP, IPsec and mDNS all need. Translated means the edge answers for it and the machine never knows. A held address has to come from an external network.",
             "enum": [
               "Nat",
               "Routed"
@@ -633,7 +633,7 @@
             "type": "string"
           },
           "instance": {
-            "description": "The name of a `instances` object. The guest this address sits in front of. Its interface and the cell's public pool are found for you — name the subnet under More settings to choose v6, or a particular pool. Settable at creation only.",
+            "description": "The name of a `instances` object. The instance this address sits in front of. Its interface and the cell's public pool are found for you — name the subnet under More settings to choose v6, or a particular pool. Settable at creation only.",
             "type": "string",
             "x-at-creation": true
           },
@@ -724,10 +724,10 @@
       },
       "ImageSourceSpec": {
         "additionalProperties": true,
-        "description": "Where a family's images come from. The cell asks the checksums file what the current digest is, over https so the certificate is checked, and publishes an image when the answer is one it does not have. Nothing about a running guest changes: a machine keeps the bytes it was built from, and \"always the newest\" means new machines get it.",
+        "description": "Where a family's images come from. The cell asks the checksums file what the current digest is, over https so the certificate is checked, and publishes an image when the answer is one it does not have. Nothing about a running instance changes: a machine keeps the bytes it was built from, and \"always the newest\" means new machines get it.",
         "properties": {
           "checksums": {
-            "description": "A `sha256sum`- or `sha512sum`-style file covering the image's filename — Debian publishes only the latter for its cloud images, and either is read. **https only**, and refused otherwise: this is the one value the whole arrangement trusts, and whoever can rewrite it chooses what every new guest in this cell boots.",
+            "description": "A `sha256sum`- or `sha512sum`-style file covering the image's filename — Debian publishes only the latter for its cloud images, and either is read. **https only**, and refused otherwise: this is the one value the whole arrangement trusts, and whoever can rewrite it chooses what every new instance in this cell boots.",
             "format": "uri",
             "type": "string"
           },
@@ -744,7 +744,7 @@
             "type": "string"
           },
           "format": {
-            "description": "Leave it alone for a `.qcow2` file — the name settles it. Everywhere else it has to be said: nothing here ever fetches the bytes, and the filename lies (Ubuntu ships qcow2 under `.img`). A node handed a mis-declared image refuses the disk, and every guest of this family goes without one.",
+            "description": "Leave it alone for a `.qcow2` file — the name settles it. Everywhere else it has to be said: nothing here ever fetches the bytes, and the filename lies (Ubuntu ships qcow2 under `.img`). A node handed a mis-declared image refuses the disk, and every instance of this family goes without one.",
             "enum": [
               "Qcow2",
               "Raw"
@@ -752,7 +752,7 @@
             "type": "string"
           },
           "keep": {
-            "description": "How many of this family to keep. Three when left empty. An image an instance was built from is never taken away, however old — the guest would be unable to start on its next move.",
+            "description": "How many of this family to keep. Three when left empty. An image an instance was built from is never taken away, however old — the instance would be unable to start on its next move.",
             "maximum": 50,
             "minimum": 1,
             "type": "integer"
@@ -784,7 +784,7 @@
             "type": "string"
           },
           "family": {
-            "description": "What this image is, in the words somebody would use to ask for it. An instance can then name `families/debian-13` and get the newest one there is, resolved when it is created and written down — so a guest never changes its operating system on a restart.",
+            "description": "What this image is, in the words somebody would use to ask for it. An instance can then name `families/debian-13` and get the newest one there is, resolved when it is created and written down — so an instance never changes its operating system on a restart.",
             "format": "id",
             "type": "string"
           },
@@ -826,7 +826,7 @@
             "type": "string"
           },
           "state": {
-            "description": "An image is never replaced, only superseded. Deprecating one stops a family choosing it while everything pinned to it keeps working; retiring it refuses anything new. Neither touches a running guest.",
+            "description": "An image is never replaced, only superseded. Deprecating one stops a family choosing it while everything pinned to it keeps working; retiring it refuses anything new. Neither touches a running instance.",
             "enum": [
               "Active",
               "Deprecated",
@@ -863,10 +863,10 @@
       },
       "InstanceSpec": {
         "additionalProperties": true,
-        "description": "Guests. What was asked for is the spec; what the node reports is the status, and they are shown together.",
+        "description": "Virtual machines. What was asked for is the spec; what the node reports is the status, and they are shown together.",
         "properties": {
           "console": {
-            "description": "Publishes what the guest writes to its serial console, so it can be read here. Off by default because it costs a report every time the guest logs a line. A guest that is not running shows its last output whether this is on or not.",
+            "description": "Publishes what the operating system inside writes to its serial console, so it can be read here. Off by default because it costs a report every time it logs a line. An instance that is not running shows its last output whether this is on or not.",
             "type": "boolean"
           },
           "desiredState": {
@@ -878,7 +878,7 @@
             "type": "string"
           },
           "devices": {
-            "description": "A class, not a machine's address. Two of the same class means two devices. A guest holding one cannot be live-migrated — a device's state is in hardware and cannot be transferred.",
+            "description": "A class, not a machine's address. Two of the same class means two devices. An instance holding one cannot be live-migrated — a device's state is in hardware and cannot be transferred.",
             "items": {
               "description": "The name of a `device-classes` object.",
               "type": "string"
@@ -886,11 +886,11 @@
             "type": "array"
           },
           "flavor": {
-            "description": "The name of a `flavors` object. A named size from the cell's menu. Picking one sets the vCPUs,                memory and root disk below; typing sizes instead needs the                project's leave.",
+            "description": "The name of a `flavors` object. A named size from the cell's menu. Picking one sets the vCPUs, memory and root disk below; typing sizes instead needs the project's leave.",
             "type": "string"
           },
           "image": {
-            "description": "The name of a `families` object. The newest of the family, resolved once when the machine is made. An existing machine keeps the bytes it was built from. Settable at creation only.",
+            "description": "The name of a `families` object. A family is a name for a line of builds — `debian-13`, not one digest. It resolves to the newest image in it at the moment this instance is created, and the instance keeps that image for life: a family publishing a new build never changes what is already running. Settable at creation only.",
             "type": "string",
             "x-at-creation": true
           },
@@ -901,7 +901,7 @@
             "x-unit": "MiB"
           },
           "networks": {
-            "description": "Left empty, this guest joins your project's default network — made the first time somebody needs it, so two machines in a project can talk without anybody configuring anything. Settable at creation only.",
+            "description": "Left empty, this instance joins your project's default network — made the first time somebody needs it, so two machines in a project can talk without anybody configuring anything. Settable at creation only.",
             "items": {
               "description": "The name of a `networks` object.",
               "type": "string"
@@ -914,7 +914,7 @@
             "type": "string"
           },
           "onNodeLoss": {
-            "description": "Only for a guest whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Nothing is moved until the node has been quiet long enough that its own agent has certainly stopped its guests — a node with no fencing deadline is never recovered from.",
+            "description": "Only for an instance whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Nothing is moved until the node has been quiet long enough that its own agent has certainly stopped what it was running — a node with no fencing deadline is never recovered from.",
             "enum": [
               "leave",
               "restart"
@@ -966,7 +966,7 @@
             "type": "string"
           },
           "ports": {
-            "description": "For a NIC that already exists — one holding an address you want this guest to keep. To simply put a machine on a network, name the network above and the port is made for you.",
+            "description": "For a NIC that already exists — one holding an address you want this instance to keep. To simply put a machine on a network, name the network above and the port is made for you.",
             "items": {
               "description": "The name of a `ports` object.",
               "type": "string"
@@ -981,14 +981,14 @@
             "x-unit": "GiB"
           },
           "sshKeys": {
-            "description": "Read by cloud-init on the guest's **first** boot and never again, so adding one to a machine that has already started does nothing to that machine. Without a key and without a password set in user-data, the console is the only way in.",
+            "description": "Read by cloud-init inside the instance on its **first** boot and never again, so adding one to a machine that has already started does nothing to that machine. Without a key and without a password set in user-data, the console is the only way in.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "startDelayS": {
-            "description": "Measured from the newest start in that group, not each member in turn — a hundred guests at thirty seconds each would be fifty minutes of nothing happening.",
+            "description": "Measured from the newest start in that group, not each member in turn — a hundred instances at thirty seconds each would be fifty minutes of nothing happening.",
             "maximum": 3600,
             "minimum": 0,
             "type": "integer",
@@ -1001,7 +1001,7 @@
             "type": "integer"
           },
           "userData": {
-            "description": "Handed to the guest on first boot.",
+            "description": "Handed to the instance on first boot.",
             "type": "string"
           },
           "vcpus": {
@@ -1010,7 +1010,7 @@
             "type": "integer"
           },
           "volumes": {
-            "description": "Attached once the guest is on a node. Take one off the list to detach it.",
+            "description": "Attached once the instance is on a node. Take one off the list to detach it.",
             "items": {
               "description": "The name of a `volumes` object.",
               "type": "string"
@@ -1045,7 +1045,7 @@
       },
       "LoadBalancerSpec": {
         "additionalProperties": true,
-        "description": "One address in front of many ports. The fabric balances by connection on whichever host traffic arrives at — there is no appliance to place and nothing to fail over. Nothing here probes a member's health: the pool is what was declared, not a judgement about it.",
+        "description": "One address in front of many ports. The network itself balances by connection, on whichever machine the traffic arrives at — there is no appliance to place and nothing to fail over. Nothing here probes a member's health: the pool is what was declared, not a judgement about it.",
         "properties": {
           "draining": {
             "description": "Members being taken out of service: they take no new connections and keep the ones they have until the clients are done. Every name here has to be one of the members. Removing a member outright cuts its connections instead.",
@@ -1064,7 +1064,7 @@
             "type": "array"
           },
           "members": {
-            "description": "The ports behind the address — ports, not addresses, so a migrated guest stays in the pool. Empty holds the address and forwards to nothing.",
+            "description": "The ports behind the address — ports, not addresses, so an instance that moves stays in the pool. Empty holds the address and forwards to nothing.",
             "items": {
               "description": "The name of a `ports` object.",
               "type": "string"
@@ -1121,7 +1121,7 @@
         "description": "Say in advance that a machine is going out of service, and the cell stops placing work on it when the time comes — without anybody being awake to flip a switch, and without anything to flip back afterwards. Whether a window is upcoming, open or over is read off the clock, so a window that ends puts everything back by ceasing to be open.",
         "properties": {
           "drain": {
-            "description": "Off — nothing new is placed here and everything already running stays put, which is what a four-minute firmware update wants. On — the guests are migrated away as well, which is what pulling the machine wants. A guest that cannot move is left where it is, and :explainMaintenance says which.",
+            "description": "Off — nothing new is placed here and everything already running stays put, which is what a four-minute firmware update wants. On — the instances are migrated away as well, which is what pulling the machine wants. One that cannot move is left where it is, and :explainMaintenance says which.",
             "type": "boolean"
           },
           "minutes": {
@@ -1238,7 +1238,7 @@
       },
       "MigrationSpec": {
         "additionalProperties": true,
-        "description": "Moving a running guest to another node. There is no migrating state anywhere: this object is the ask, and whether it is finished is read from where the instance actually runs. Start one from the instance you want to move — the destination is chosen where the guest is.",
+        "description": "Moving a running instance to another node. There is no migrating state anywhere: this object is the ask, and whether it is finished is read from where the instance actually runs. Start one from the instance you want to move — the destination is chosen where it is.",
         "properties": {
           "connections": {
             "description": "Parallel streams for the transfer. One is the only value a local socket accepts.",
@@ -1247,14 +1247,14 @@
             "type": "integer"
           },
           "downtimeMs": {
-            "description": "The pause the guest may take at the end. A busy guest needs a larger budget or the transfer never converges.",
+            "description": "The pause the instance may take at the end. A busy one needs a larger budget or the transfer never converges.",
             "maximum": 60000,
             "minimum": 50,
             "type": "integer",
             "x-unit": "ms"
           },
           "fromNode": {
-            "description": "The name of a `nodes` object. Where the guest is now. Taken from the instance. Derived: omitted, the API fills it in; stated, it must agree.",
+            "description": "The name of a `nodes` object. Where it is now. Taken from the instance above. Derived: omitted, the API fills it in; stated, it must agree.",
             "type": "string"
           },
           "instance": {
@@ -1262,7 +1262,7 @@
             "type": "string"
           },
           "mode": {
-            "description": "What a failure costs. Under Live the guest stays where it is; under Post-copy a failure mid-flight loses it.",
+            "description": "What a failure costs. Under Live the instance stays where it is; under Post-copy a failure mid-flight loses it.",
             "enum": [
               "Live",
               "PostCopy",
@@ -1278,7 +1278,7 @@
             "x-unit": "s"
           },
           "toNode": {
-            "description": "The name of a `nodes` object. Only the nodes that can receive this guest can be chosen. The rest are shown with the reason they cannot.",
+            "description": "The name of a `nodes` object. Only the nodes that can receive this instance can be chosen. The rest are shown with the reason they cannot.",
             "type": "string"
           }
         },
@@ -1310,7 +1310,7 @@
       },
       "NetworkSpec": {
         "additionalProperties": true,
-        "description": "One VNI on the fabric. The nodes that have it programmed are on the object.",
+        "description": "A private network of this project's own. Instances on one reach each other wherever they are placed, and nothing outside the project can join. Its VNI is the tag this cell puts on the network's packets to keep them apart from every other network's on the same wire.",
         "properties": {
           "announce": {
             "description": "What this cell does by default for addresses from this network. An individual address may say otherwise. Meaningless on a network that carries no real addresses.",
@@ -1325,19 +1325,19 @@
             "type": "boolean"
           },
           "hostBridge": {
-            "description": "A bridge that already exists on the nodes — `br0`, `vmbr0`. Guests on this network go straight onto whatever the machine is on: the house LAN, a VLAN, a lab network. Their addresses come from whatever serves that wire and this platform allocates none, holds no gateway and enforces no security group. Empty is the ordinary case. Only a cell operator may set it — it is a decision about the machine, not about a project. Settable at creation only.",
+            "description": "A bridge that already exists on the nodes — `br0`, `vmbr0`. Instances on this network go straight onto whatever the machine is on: the house LAN, a VLAN, a lab network. Their addresses come from whatever serves that wire and this platform allocates none, holds no gateway and enforces no security group. Empty is the ordinary case. Only a cell operator may set it — it is a decision about the machine, not about a project. Settable at creation only.",
             "type": "string",
             "x-at-creation": true
           },
           "mtu": {
-            "description": "1450 when left empty: a VXLAN header is 50 bytes, and a tenant \\\n               network handed the wire's own 1500 black-holes every large packet \\\n               in a way that looks like an application bug for a week.",
+            "description": "1450 when left empty. Everything a machine sends is carried across the cell's own network inside another 50 bytes of headers, so a network told to use the wire's own 1500 loses every large packet — which looks like an application bug for a week.",
             "maximum": 9216,
             "minimum": 1280,
             "type": "integer",
             "x-unit": "bytes"
           },
           "vni": {
-            "description": "The VXLAN network identifier. Left empty, the cell assigns the \\\n               smallest free one — which is the only correct answer, and not one \\\n               a tenant can work out. Derived: omitted, the API fills it in; stated, it must agree.",
+            "description": "The number this cell tags the network's traffic with, so two projects that both use 10.0.0.0/24 never see each other's packets. Left empty, the cell assigns the smallest free one — which is the only correct answer, and not one a tenant can work out. Derived: omitted, the API fills it in; stated, it must agree.",
             "maximum": 16777215,
             "minimum": 0,
             "type": "integer"
@@ -1370,7 +1370,7 @@
         "description": "Hypervisors. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token — shown once, because the platform keeps a hash and cannot show it again.",
         "properties": {
           "cpuBaseline": {
-            "description": "Present the same CPU as other nodes so guests can migrate between them. Guests already running keep the CPU they started with and adopt this one when they next restart.",
+            "description": "Present the same CPU as other nodes so instances can migrate between them. Those already running keep the CPU they started with and adopt this one when they next restart.",
             "enum": [
               "",
               "x86-64-v2",
@@ -1380,18 +1380,18 @@
             "type": "string"
           },
           "evacuate": {
-            "description": "Separate from draining. Draining says nothing new comes here; this says none of the old stays either. One migration is started per guest that can move — a guest holding a passed-through device cannot, and stays with the reason on it.",
+            "description": "Separate from draining. Draining says nothing new comes here; this says none of the old stays either. One migration is started per instance that can move — one holding a passed-through device cannot, and stays with the reason on it.",
             "type": "boolean"
           },
           "fenceAfterS": {
-            "description": "How long this node may fail to report before it stops the guests it holds. Zero means it never does — and a node that never does is never recovered from, because nothing can tell \"unreachable\" from \"stopped\". Set it and guests marked for restart can be brought up elsewhere.",
+            "description": "How long this node may fail to report before it stops the instances it holds. Left empty it never does — and a node that never does is never recovered from, because nothing can tell unreachable from stopped. Set it and instances marked for restart can be brought up elsewhere.",
             "maximum": 3600,
             "minimum": 0,
             "type": "integer",
             "x-unit": "s"
           },
           "gateway": {
-            "description": "A public address whose network says so is announced from here, and packets for it reach the guest over the overlay. Several machines may carry it — the network above sees them as equal next hops — and a cell with none simply cannot use that mode.",
+            "description": "A public address whose network says so is announced from here, and packets for it reach the instance over the overlay. Several machines may carry it — the network above sees them as equal next hops — and a cell with none simply cannot use that mode.",
             "type": "boolean"
           },
           "labels": {
@@ -1407,7 +1407,7 @@
             "type": "boolean"
           },
           "vcpuOvercommit": {
-            "description": "How many vCPUs this machine may hand out per real core. Zero or one means one for one. A processor can be shared — two guests that both want a core get one each in turn, and being wrong costs speed — which is how nearly every fleet in the world is run. There is deliberately no setting for memory: a guest promised 8 GiB and handed 4 is not slow, it is killed.",
+            "description": "How many vCPUs this machine may hand out per real core. Zero or one means one for one. A processor can be shared — two instances that both want a core get one each in turn, and being wrong costs speed — which is how nearly every fleet in the world is run. There is deliberately no setting for memory: an instance promised 8 GiB and handed 4 is not slow, it is killed.",
             "maximum": 32,
             "minimum": 0,
             "type": "integer",
@@ -1438,7 +1438,7 @@
       },
       "OperationSpec": {
         "additionalProperties": true,
-        "description": "Something that could not finish inside a request. Done is computed from the target's own convergence, so an operation cannot disagree with the object it describes.",
+        "description": "Something that could not finish inside a request. Finished is computed from the target itself — whether the object has caught up with what was asked of it — so an operation cannot disagree with the thing it describes.",
         "properties": {
           "requestedBy": {
             "description": "Derived: omitted, the API fills it in; stated, it must agree.",
@@ -1449,7 +1449,7 @@
             "type": "string"
           },
           "targetGeneration": {
-            "description": "Derived: omitted, the API fills it in; stated, it must agree.",
+            "description": "Which version of the target's spec this was asked against. The operation is finished when the target reports having caught up with that version — which is why it cannot disagree with the object it describes. Derived: omitted, the API fills it in; stated, it must agree.",
             "maximum": 9223372036854775807,
             "minimum": 0,
             "type": "integer"
@@ -1501,8 +1501,12 @@
             },
             "type": "array"
           },
+          "node": {
+            "description": "The name of a `nodes` object. The machine this pool's bytes are on, where that is one machine. Leave it empty for storage every node can reach — a Ceph pool, an NFS mount — which is what the platform assumes when nothing is said. A directory or an LVM group is on one host, and until the object said so the platform would put a volume there, schedule the guest that needs it somewhere else, and let the attach fail with a path the tenant cannot act on.",
+            "type": "string"
+          },
           "volumeCeiling.iops": {
-            "description": "The most any one volume in this pool may take. A volume that names nothing of its own gets this; one that asks for more is brought down to it. Zero is no ceiling.",
+            "description": "The most any one volume in this pool may take. A volume that names nothing of its own gets this; one that asks for more is brought down to it. Left empty there is no ceiling.",
             "maximum": 10000000,
             "minimum": 0,
             "type": "integer",
@@ -1548,7 +1552,7 @@
         "description": "What an instance is attached to the fabric by. Programmed means the agent has it in its maps.",
         "properties": {
           "address": {
-            "description": "Left empty IPAM allocates one. It never changes afterwards — an address that moves under a running guest is an outage.",
+            "description": "Left empty IPAM allocates one. It never changes afterwards — an address that moves under a running instance is an outage.",
             "format": "ip",
             "type": "string"
           },
@@ -1611,7 +1615,7 @@
         "description": "The quota and access anchor. Usage is counted from what exists, never decremented by hand.",
         "properties": {
           "cell": {
-            "description": "Which cell this project's resources live in, and where requests for them are routed. Leave empty to use whichever cell answers — which is what an installation with one cell wants.",
+            "description": "A cell is one installation of this platform — its own machines, its own network and its own address space, administered as one thing. This says which of them holds this project's resources and where requests for them are routed. Leave empty to use whichever cell answers, which is what an installation with one cell wants.",
             "format": "id",
             "type": "string"
           },
@@ -1623,12 +1627,12 @@
             "type": "string"
           },
           "policy.customSizes": {
-            "description": "Whether guests here may be sized by typed numbers instead of a flavor. Only asked once the cell has flavors at all: with a menu defined, the closed answer is the sold one, and this is the deliberate exception for the customer whose shapes are their own. Settable at creation only.",
+            "description": "Whether instances here may be sized by typed numbers instead of a flavor. Only asked once the cell has flavors at all: with a menu defined, the closed answer is the sold one, and this is the deliberate exception for the customer whose shapes are their own. Settable at creation only.",
             "type": "boolean",
             "x-at-creation": true
           },
           "policy.devicePassthrough": {
-            "description": "Whether guests here may be given a GPU or a NIC of their own. A passed-through device is a physical thing one guest holds and no other guest can have, so a project that may ask for them can empty a node of the hardware everybody else was scheduled against. Settable at creation only.",
+            "description": "Whether instances here may be given a GPU or a NIC of their own. A passed-through device is a physical thing one instance holds and no other can have, so a project that may ask for them can empty a node of the hardware everybody else was scheduled against. Settable at creation only.",
             "type": "boolean",
             "x-at-creation": true
           },
@@ -1638,83 +1642,87 @@
             "x-at-creation": true
           },
           "policy.hostBridges": {
-            "description": "One bridge per line, as they are named on the nodes. A network put on one takes its guests off this platform's networks and onto whatever the machine is on — no address from us, no gateway, no security group. Empty means this project gets logical networks only, which is what a new customer should have. Named rather than a yes/no, because what anybody means by a host bridge is a particular wire. Settable at creation only.",
+            "description": "One bridge per line, as they are named on the nodes. A network put on one takes its instances off this platform's networks and onto whatever the machine is on — no address from us, no gateway, no security group. Empty means this project gets logical networks only, which is what a new customer should have. Named rather than a yes/no, because what anybody means by a host bridge is a particular wire. Settable at creation only.",
             "type": "string",
             "x-at-creation": true
           },
           "quota.backupGib": {
-            "description": "Counted from what each backup turned out to occupy.",
+            "description": "Counted from what each backup turned out to occupy. Left empty there is no limit.",
             "maximum": 1073741824,
             "minimum": 0,
             "type": "integer",
             "x-unit": "GiB"
           },
           "quota.backups": {
-            "description": "Separate from snapshots because they live on a backup target rather than in the pool.",
+            "description": "Separate from snapshots because they live on a backup target rather than in the pool. Left empty there is no limit.",
             "maximum": 1000000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "backups"
           },
           "quota.devices": {
-            "description": "Each one is a piece of hardware that exists once and cannot be oversubscribed, so without a cap one project can take every accelerator in the cell.",
+            "description": "Each one is a piece of hardware that exists once and cannot be oversubscribed, so without a cap one project can take every accelerator in the cell. Left empty there is no limit.",
             "maximum": 10000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "devices"
           },
           "quota.floatingIps": {
-            "description": "An address that outlives the machine answering on it is scarce and externally routable.",
+            "description": "An address that outlives the machine answering on it is scarce and externally routable. Left empty there is no limit.",
             "maximum": 100000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "addresses"
           },
           "quota.instances": {
+            "description": "How many instances may exist here at once, running or not. Left empty there is no limit — an empty box is stored as a zero, and the platform reads a zero quota as no cap rather than as none allowed.",
             "maximum": 100000,
             "minimum": 0,
             "type": "integer"
           },
           "quota.loadBalancers": {
-            "description": "Each one takes an address out of a subnet and datapath entries on every ingress host.",
+            "description": "Each one takes an address out of a subnet and an entry on every host that traffic arrives at. Left empty there is no limit.",
             "maximum": 100000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "balancers"
           },
           "quota.memoryMib": {
+            "description": "Counted across every instance that exists, whether or not it is running. Left empty there is no limit.",
             "maximum": 100000000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "MiB"
           },
           "quota.snapshotGib": {
-            "description": "Counted from what each snapshot turned out to occupy, which the pool reports after the fact.",
+            "description": "Counted from what each snapshot turned out to occupy, which the pool reports after the fact. Left empty there is no limit.",
             "maximum": 1073741824,
             "minimum": 0,
             "type": "integer",
             "x-unit": "GiB"
           },
           "quota.snapshots": {
-            "description": "Cheap to ask for and occupying a pool for as long as they exist. A schedule nobody is watching is the ordinary way a cell fills up.",
+            "description": "Cheap to ask for and occupying a pool for as long as they exist. A schedule nobody is watching is the ordinary way a cell fills up. Left empty there is no limit.",
             "maximum": 1000000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "snapshots"
           },
           "quota.vcpus": {
+            "description": "Counted across every instance that exists, whether or not it is running. Left empty there is no limit.",
             "maximum": 1000000,
             "minimum": 0,
             "type": "integer"
           },
           "quota.volumeGib": {
+            "description": "The sizes of this project's volumes added up. Left empty there is no limit.",
             "maximum": 10000000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "GiB"
           },
           "quota.volumes": {
-            "description": "A count, separate from the space: per-volume overhead is a different worry from capacity, and the two are capped apart.",
+            "description": "A count, separate from the space: per-volume overhead is a different worry from capacity, and the two are capped apart. Left empty there is no limit.",
             "maximum": 100000,
             "minimum": 0,
             "type": "integer",
@@ -1793,7 +1801,7 @@
       },
       "RouterSpec": {
         "additionalProperties": true,
-        "description": "Which of this project's networks reach each other. A membership rather than a box: there is nothing to place and nothing to fail over — the gateway answers on whichever machine the packet is already on.",
+        "description": "Which of this project's networks reach each other. A membership rather than a box: there is nothing to place and nothing to fail over — the gateway answers on whichever machine the packet is already on. The routed VNI and gateway MAC are what the cell tags and addresses that traffic with; nothing inside a machine has to know either.",
         "properties": {
           "networks": {
             "description": "The networks whose subnets reach each other. A network belongs to at most one router.",
@@ -1964,7 +1972,7 @@
             "type": "string"
           },
           "dns": {
-            "description": "Left empty the guests use this cell's own resolver, which names the project's other machines and forwards everything else. Name one here to send them somewhere of your own instead.",
+            "description": "Left empty the instances use this cell's own resolver, which names the project's other machines and forwards everything else. Name one here to send them somewhere of your own instead.",
             "items": {
               "format": "ip",
               "type": "string"
@@ -2097,21 +2105,21 @@
             "x-at-creation": true
           },
           "limits.iops": {
-            "description": "What this volume may take. Left at zero it takes the pool's ceiling, if the pool has one — and asking for more than the ceiling gets the ceiling rather than a refusal.",
+            "description": "What this volume may take. Left empty — which is stored as a zero — it takes the pool's ceiling, if the pool has one, and asking for more than the ceiling gets the ceiling rather than a refusal.",
             "maximum": 10000000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "/s"
           },
           "limits.readMibps": {
-            "description": "Read bandwidth. Zero takes the pool's ceiling.",
+            "description": "Read bandwidth. Left empty it takes the pool's ceiling, if the pool has one.",
             "maximum": 1000000,
             "minimum": 0,
             "type": "integer",
             "x-unit": "MiB/s"
           },
           "limits.writeMibps": {
-            "description": "Write bandwidth. Zero takes the pool's ceiling. Separate from reads because they are not the same cost on any backend here: a write to a replicated Ceph pool is three writes.",
+            "description": "Write bandwidth. Left empty it takes the pool's ceiling. Separate from reads because they are not the same cost on any backend here: a write to a replicated Ceph pool is three writes.",
             "maximum": 1000000,
             "minimum": 0,
             "type": "integer",

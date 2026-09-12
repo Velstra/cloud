@@ -2287,6 +2287,22 @@ pub struct PoolSpec {
     /// half way.
     pub accepting: bool,
     pub labels: Vec<String>,
+    /// The machine this pool's bytes are on, where that is one machine.
+    ///
+    /// Empty means every node can reach it, which is true of a network pool and
+    /// is the safe reading for a pool nobody has said anything about. A
+    /// directory or an LVM volume group is on **one** host, and nothing in this
+    /// model said so: a tenant made a volume, the platform put it in the pool
+    /// with the most room, the scheduler put their guest on the other machine,
+    /// and the attachment failed with `Could not open '…qcow2': No such file or
+    /// directory` — a sentence about a path, addressed to somebody who may not
+    /// list pools or nodes and could not have chosen differently.
+    ///
+    /// Declared by the operator rather than reported by the agent, for the same
+    /// reason `accepting` is: the agent knows which directory it is serving,
+    /// not whether that directory is shared storage mounted on every host.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node: String,
     /// The most any one volume in this pool may take.
     ///
     /// The operator's lever, and the reason there is one: without it a single

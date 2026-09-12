@@ -2407,6 +2407,26 @@ impl Api {
     /// The page token it hands back is an ordinary one: it names a key, a key
     /// names its kind, and a caller resuming with it lands back here only if
     /// they still ask for a range — which they will, because the console does.
+    /// When the object a `?target=` names was made, if it is still there.
+    ///
+    /// A lower bound for the records about it, and nothing else: every failure
+    /// here — an unparseable name, a collection this build does not serve, an
+    /// object already deleted, a document with no `created_at` — answers `None`
+    /// and leaves the caller's filter exactly as it was. A bound that is
+    /// guessed wrong would hide records, so the only bound taken is the one the
+    /// object itself states.
+    async fn target_born_at(&self, target: Option<&str>) -> Option<Timestamp> {
+        let target = target?;
+        let name = ResourceName::parse(target).ok()?;
+        let collection = self.collection(name.collection()).ok()?;
+        let document = collection.get(target).await.ok()??;
+        document
+            .get("meta")
+            .and_then(|m| m.get("created_at"))
+            .and_then(Value::as_u64)
+            .map(Timestamp)
+    }
+
     async fn audit_between(
         &self,
         parent: &str,
@@ -2550,6 +2570,31 @@ impl Api {
         // reads through the kinds it has already passed.
         if kind == "audit" && filter.since.is_some() {
             return self.audit_between(parent, kind, filter, paging, gate).await;
+        }
+        // The records about one object cannot predate the object.
+        //
+        // `?target=` was the one filter with no lower bound, so it scanned the
+        // whole log per question — and it is on the path of every detail page
+        // a console opens, which measured at twenty-five seconds against two
+        // hundred thousand records, to answer with one line. The target names a
+        // resource, the resource carries the moment it was made, and that is a
+        // bound the caller should not have to know to send: one read buys the
+        // key range the scan was missing.
+        //
+        // Only when the caller named no `since` of their own, and only when the
+        // object is still there to ask — a record about something already
+        // deleted still costs the old walk, which is the honest answer rather
+        // than a cheap wrong one.
+        if kind == "audit" && filter.target.is_some() {
+            if let Some(born) = self.target_born_at(filter.target.as_deref()).await {
+                let bounded = Filter {
+                    since: Some(born),
+                    ..filter.clone()
+                };
+                return self
+                    .audit_between(parent, kind, &bounded, paging, gate)
+                    .await;
+            }
         }
         let collection = self.collection(kind)?;
         let unpaged = !paging.is_paged();
@@ -3090,6 +3135,7 @@ impl Api {
                 .await?;
         }
         self.refuse_a_role_nobody_defined(&spec).await?;
+        self.refuse_a_member_nobody_knows(None, &spec).await?;
         if kind == "instances" {
             self.settle_default_network(&name, parent, body.get("spec"), &mut spec)
                 .await?;
@@ -3107,6 +3153,10 @@ impl Api {
         if kind == "ceph-clusters" {
             self.refuse_a_second_ceph_cluster(&name).await?;
             self.refuse_a_disk_that_is_not_free(&spec).await?;
+        }
+        if kind == "attachments" {
+            self.refuse_a_disk_the_guest_cannot_reach(parent, &spec)
+                .await?;
         }
         if kind == "images" {
             // **An image says which bytes it is, at the door.**
@@ -3649,6 +3699,13 @@ impl Api {
                     .await?;
             }
             self.refuse_a_role_nobody_defined(spec).await?;
+            if spec.get("bindings").is_some() {
+                // Against what is stored, so a save is judged on the members it
+                // adds and not on the ones it inherited.
+                let stored: Value = self.get(name, who).await?;
+                self.refuse_a_member_nobody_knows(Some(&stored["spec"]), spec)
+                    .await?;
+            }
             check_rules(name.collection(), spec, Document::Part)?;
             if name.collection() == "load-balancers" {
                 self.refuse_draining_that_is_not_a_member(name, spec)
@@ -6333,6 +6390,104 @@ impl Api {
         Ok(())
     }
 
+    /// A disk on one machine cannot be opened by a guest on another.
+    ///
+    /// The volume names a pool, the pool may name the machine its bytes are on,
+    /// and the instance names the machine it runs on. When those two machines
+    /// are different the attachment can never succeed, and until this refusal
+    /// existed the platform accepted it, wrote it down, and let the node answer
+    /// `Could not open '/var/lib/velstra/pool/…qcow2': No such file or
+    /// directory` — the only sentence anybody ever saw, addressed to a tenant
+    /// who may list neither pools nor nodes and so could not have chosen
+    /// differently. The way out was to delete the guest and make another until
+    /// the scheduler happened to agree with the storage.
+    ///
+    /// Said at the door, naming both machines, because that is the one fact
+    /// that makes the next attempt work.
+    async fn refuse_a_disk_the_guest_cannot_reach(
+        &self,
+        parent: &str,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let (Some(volume), Some(instance)) = (
+            spec.get("volume").and_then(Value::as_str),
+            spec.get("instance").and_then(Value::as_str),
+        ) else {
+            return Ok(());
+        };
+        let Ok(volumes) = self.collection("volumes") else {
+            return Ok(());
+        };
+        let Ok(Some(volume_doc)) = volumes.get(volume).await else {
+            return Ok(());
+        };
+        // The pool the volume actually landed in, which the platform chooses
+        // when the tenant names none — so this is read from the object rather
+        // than from what was asked for.
+        let pool = volume_doc
+            .get("spec")
+            .and_then(|s| s.get("pool"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if pool.is_empty() {
+            return Ok(());
+        }
+        let Ok(pools) = self.collection("pools") else {
+            return Ok(());
+        };
+        let full = if pool.contains('/') {
+            pool.to_string()
+        } else {
+            format!("pools/{pool}")
+        };
+        let Ok(Some(pool_doc)) = pools.get(&full).await else {
+            return Ok(());
+        };
+        let holds = pool_doc
+            .get("spec")
+            .and_then(|s| s.get("node"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // A pool that has not said where it is is taken to be reachable
+        // everywhere. Guessing the other way would refuse every attachment on
+        // every cell that has not been told, which is every cell today.
+        if holds.is_empty() {
+            return Ok(());
+        }
+        let Ok(instances) = self.collection("instances") else {
+            return Ok(());
+        };
+        let Ok(Some(instance_doc)) = instances.get(instance).await else {
+            return Ok(());
+        };
+        // Where it *is*, then where it was asked to be: a guest that has not
+        // started yet has only the second, and a pinned guest has both.
+        let runs_on = instance_doc
+            .get("status")
+            .and_then(|s| s.get("node"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                instance_doc
+                    .get("spec")
+                    .and_then(|s| s.get("node"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default();
+        if runs_on.is_empty() || runs_on == holds {
+            return Ok(());
+        }
+        let _ = parent;
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            format!(
+                "{volume} is on {holds} and {instance} runs on {runs_on}, \
+                 so {runs_on} cannot open it. Put the guest on {holds}, \
+                 or make the volume in a pool both machines can reach."
+            ),
+        )
+        .at("spec.volume"))
+    }
+
     /// An image **is** its bytes, and a patch does not change them.
     ///
     /// Content-addressed and immutable is what the model says, what the console
@@ -6825,6 +6980,72 @@ impl Api {
                 )
                 .at(format!("spec.bindings[{i}].role")));
             }
+        }
+        Ok(())
+    }
+
+    /// A grant has to be able to reach somebody.
+    ///
+    /// The sibling of [`Self::refuse_a_role_nobody_defined`], and the same
+    /// failure from the other end — but a narrower refusal, because an identity
+    /// does not have to be a `users/` object: a cell may authenticate against
+    /// something else, the authorisation tests grant to identities that were
+    /// never written down, and a live cell was found carrying a binding to a
+    /// name with no object behind it. Refusing every member the `users`
+    /// collection does not know would make those cells unsaveable.
+    ///
+    /// What **can** be refused with certainty is a member shaped like an email
+    /// address. Accounts are named by id here — `dba`, never
+    /// `dba@example.com` — so an address can never name one, and it is exactly
+    /// what the console's own field induced: its placeholder read
+    /// `ada@example.com` while the platform wanted an id, so typing what the
+    /// form asked for stored access for nobody, in silence, and the
+    /// administrator went away believing the customer could sign in.
+    ///
+    /// A plain id the console cannot resolve is left to the console, which can
+    /// see the account list and say so beside the box, where it is still a
+    /// question rather than a refusal.
+    ///
+    /// **Only what this change adds.** A cell already carrying such a binding
+    /// must stay editable: refusing the whole save because of a member nobody
+    /// is touching would make the panel that fixes it the one thing that cannot
+    /// be used.
+    async fn refuse_a_member_nobody_knows(
+        &self,
+        stored: Option<&Value>,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let members_of = |v: &Value| -> Vec<String> {
+            v.get("bindings")
+                .and_then(Value::as_array)
+                .map(|bs| {
+                    bs.iter()
+                        .filter_map(|b| b.get("members").and_then(Value::as_array))
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let asked = members_of(spec);
+        if asked.is_empty() {
+            return Ok(());
+        }
+        let already: Vec<String> = stored.map(members_of).unwrap_or_default();
+        for member in asked {
+            if already.contains(&member) || !member.contains('@') {
+                continue;
+            }
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "there is no account called `{member}`. Accounts are named by id here, \
+                     not by address — `dba`, not `dba@example.com` — and a binding naming \
+                     nobody grants nothing at all."
+                ),
+            )
+            .at("spec.bindings"));
         }
         Ok(())
     }

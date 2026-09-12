@@ -19,9 +19,18 @@ color-scheme: light;
    sunken panel, a hovered row and the rail: faint read 3.17:1 at its worst,
    under AA. These clear 4.5:1 on all five and keep the two levels apart. */
 --text-muted: #535f70; --text-faint: #5f6c7e;
---border: #dde3ec; --border-strong: #c6cfdc;
+--border: #dde3ec;
+/* 1.6:1 against a white field: the edge of an input drawn as the rumour of one.
+   An interface border owes 3:1, and this clears it on all five light grounds —
+   the page, a card, a sunken field, the rail and a hovered row — which is one
+   ground more than a first guess at it cleared. */
+--border-strong: #7a8899;
 --border-subtle: #e8edf4;
---brand: var(--signal-600); --brand-hover: var(--signal-500);
+/* Hover goes *darker* on a light page. Pointing it at `--signal-500` was the
+   dark ramp's habit — one step lighter — and white on that reads 3.35:1: the
+   one filled button on the page lost its own label to the pointer aiming at
+   it. */
+--brand: var(--signal-600); --brand-hover: #1b6a8d;
 --brand-active: #2d5cc4; --focus-ring: var(--signal-600);
 --link: var(--signal-600);
 --on-brand: #ffffff;
@@ -40,11 +49,14 @@ color-scheme: light;
    dark ramp's cyan reads 4.24:1 here. */
 --product: #1b6c8e;
 
-/* The same two materials, re-pointed. Light chrome is more opaque than dark:
-   dark text over a blurred light background loses contrast far faster than
-   light text over a blurred dark one. */
---material-chrome: color-mix(in srgb, var(--bg-app) 78%, transparent);
---material-panel: color-mix(in srgb, var(--surface) 90%, transparent);
+/* The same two materials, re-pointed — and opaque, as the dark ramp's already
+   are. These stayed translucent after the blur behind them was switched off,
+   which is not a softer material but no material at all: a board's rows read
+   straight *through* the sticky header, the sheet, the create drawer, the jump
+   palette and the toast. Light is where it showed worst — dark text over dark
+   text at 78% has nothing to hide behind. */
+--material-chrome: var(--bg-app);
+--material-panel: var(--surface);
 --material-edge: inset 0 1px 0 rgba(255,255,255,.9);
 
 --scrim: rgba(16,24,40,.32);

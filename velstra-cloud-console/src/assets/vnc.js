@@ -329,6 +329,10 @@ async function showScreen(name) {
   const canvas = el("canvas", { class: "vncscreen", tabindex: "0",
     "aria-label": "the guest's display; focus and type" });
   const back = btn("Back to instances", { onclick: () => { closeScreen(); show("instances"); } });
+  // Disabled until the guest is actually on the other end of it. The salute is
+  // four key events and nothing else — `send` drops them on a socket that is
+  // not open yet, so a live button here is one that swallows the press and
+  // reports nothing, and the operator presses it again.
   const salute = btn("Ctrl+Alt+Del", { id: "ctrlaltdel", disabled: "" });
   box.appendChild(el("div.screenacts", back, salute, status));
   box.appendChild(canvas);
@@ -350,11 +354,23 @@ async function showScreen(name) {
   const ws = new WebSocket(url);
   const client = rfbClient(ws, canvas, (t) => {
     status.textContent = t || "connected — click the screen and type";
+    // The empty sentence is the one that means *connected*: `serverinit` says
+    // it once the framebuffer is up, and every other call carries a sentence
+    // about something that went wrong. Freeing the button here rather than the
+    // moment the `WebSocket` object exists — which is what this did, and what
+    // no longer works now that `btn` disables what it is asked to — means it is
+    // live exactly while there is something to send to.
+    salute.disabled = !!t;
   });
-  salute.removeAttribute("disabled");
   salute.onclick = () => { saluteWith(client); canvas.focus(); };
-  ws.onclose = () => { if (screenOpen) status.textContent = "the screen closed"; };
-  ws.onerror = () => { status.textContent = "the screen could not be reached"; };
+  ws.onclose = () => {
+    salute.disabled = true;
+    if (screenOpen) status.textContent = "the screen closed";
+  };
+  ws.onerror = () => {
+    salute.disabled = true;
+    status.textContent = "the screen could not be reached";
+  };
 
   // Input. Scaled coordinates: CSS may shrink the canvas to fit, and the guest
   // needs framebuffer positions, not page pixels.

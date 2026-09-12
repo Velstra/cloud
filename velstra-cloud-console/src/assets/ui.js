@@ -38,7 +38,13 @@ function btn(label, opts) {
     if (OPTIONS.includes(k) || v === null || v === undefined || v === false) continue;
     attrs[k] = v;
   }
-  if (o.disabled) attrs.disabled = "";
+  // `!= null && !== false`, not truthiness. Every call site in this console
+  // spells a disabled button `disabled: cond ? "" : null`, which is the right
+  // shape for `el()` — and an empty string is falsy, so for as long as this read
+  // `if (o.disabled)` **no button was ever disabled**: the greyed-out "Nothing
+  // to attach yet" added a row, the first row's "move up" swapped with index
+  // -1, and Ctrl+Alt+Del was live before the screen had connected.
+  if (o.disabled != null && o.disabled !== false) attrs.disabled = "";
 
   const node = el("button." + classes.join("."), attrs, label);
   node.dataset.label = label;

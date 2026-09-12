@@ -360,7 +360,20 @@ function drawGraph(f, index) {
   const PAD = 12;
   const svg = svgEl("svg", { viewBox: (-PAD) + " " + (-PAD) + " " + (width + 2 * PAD) + " " + (H + 2 * PAD),
     class: "mapgraph", role: "img",
-    "aria-label": "The project drawn as nodes and edges; the text below says the same." });
+    "aria-labelledby": "mapgraphname", "aria-describedby": "mapgraphwhat" });
+  // Named by a `<title>` and described by a `<desc>` rather than by an
+  // `aria-label` alone: the label reaches some readers and not others, and an
+  // `img` with no name that survives is announced as "graphic", full stop —
+  // over the one element on this page that is nothing but shapes. First
+  // children, because that is where a reader looks for them.
+  const name = svgEl("title", { id: "mapgraphname" });
+  name.textContent = "Network map" + (session.project ? " of " + session.project : "");
+  const what = svgEl("desc", { id: "mapgraphwhat" });
+  what.textContent = nodes.length + " boxes — the internet, routers, networks and what "
+    + "sits on them — joined by a line wherever an object says they are joined. "
+    + "Every line of it is repeated in words below the drawing.";
+  svg.appendChild(name);
+  svg.appendChild(what);
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const NH = 56;
   const centre = (n) => n.x + n.w / 2;

@@ -56,7 +56,15 @@ function spread(label, body, sub) {
 let toastTimer = null;
 function toast(message, tone) {
   let box = $("toast");
-  if (!box) { box = el("div", { id: "toast" }); document.body.appendChild(box); }
+  if (!box) {
+    // A live region, so the sentence reaches somebody who is not looking at the
+    // corner it appears in. `assertive` for a refusal, because that is a press
+    // that did not do what was asked and the reader is waiting on it; `polite`
+    // for everything else, so a run of watch updates does not talk over them.
+    box = el("div", { id: "toast", role: "status", "aria-live": "polite", "aria-atomic": "true" });
+    document.body.appendChild(box);
+  }
+  box.setAttribute("aria-live", tone === "bad" ? "assertive" : "polite");
   fill(box, el("span" + (tone === "bad" ? ".err" : ""), message));
   box.classList.remove("hidden");
   clearTimeout(toastTimer);

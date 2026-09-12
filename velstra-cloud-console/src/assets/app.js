@@ -12,6 +12,11 @@
 function signedOut(why) {
   session.token = "";
   sessionStorage.removeItem(TOKEN_KEY);
+  // The expiry warning belongs to the session that is ending. Left running, a
+  // second sign-in in the same tab would inherit the first one's clock and be
+  // told it is about to end when it has just begun.
+  clearTimeout(expiryTimer);
+  expiryTimer = null;
   if (view.watcher) { view.watcher.stop(); view.watcher = null; }
   stopRecheck();
   closeSheet(); closeDialog();
@@ -21,6 +26,11 @@ function signedOut(why) {
   const chip = $("whoami");
   chip.textContent = "";
   chip.classList.add("hidden");
+  // Removed rather than recomputed: with no session at all every account looks
+  // like one whose permissions could not be read, and a sign-in screen wearing
+  // that sentence would be saying it about nobody.
+  const doubt = $("permissiondoubt");
+  if (doubt) doubt.remove();
   $("app").classList.add("hidden");
   $("signin").classList.remove("hidden");
   const box = $("loginerr");
@@ -54,6 +64,10 @@ async function enter() {
   $("app").classList.remove("hidden");
   await loadIdentity();
   await loadProjects();
+  // Both are about the project, and the project is only known once the switcher
+  // has been filled — said at sign-in the rung read "viewer in " and nothing.
+  renderWhoami();
+  renderPermissionDoubt();
   const wanted = location.hash.replace(/^#/, "");
   // The overview, unless a link asked for something else. Landing on a board
   // was landing on one collection's answer to a question nobody had asked yet.
@@ -81,10 +95,52 @@ async function loadIdentity() {
     // to name and nothing to sign out of.
     session.who = { subject: "", cellAdmin: false, session: false };
   }
+  renderWhoami();
+}
+
+/// The name in the header, and what that account is allowed to be.
+///
+/// The rung, not just the name. A cell operator has always been marked as one;
+/// everybody else got a bare name and had to work out from the buttons that are
+/// not there why nothing can be pressed — and "viewer" is a fact about this
+/// account that nothing else on the page ever says out loud.
+///
+/// Redrawn on a project switch as well as at sign-in, because the rung is per
+/// project: the same person is admin of one and a viewer of the next.
+function renderWhoami() {
+  const who = session.who || {};
   const chip = $("whoami");
-  const name = session.who.displayName || session.who.subject;
-  chip.textContent = name ? (session.who.cellAdmin ? name + " · operator" : name) : "";
+  const name = who.displayName || who.subject;
+  chip.textContent = name ? name + " · " + rungWord() : "";
   chip.classList.toggle("hidden", !name);
+}
+
+/// What this account is, in as few words as are true.
+function rungWord() {
+  const who = session.who || {};
+  // "cell administrator", not "operator". The header has said operator since
+  // before there were project rungs, and one of those rungs is *also* called
+  // operator — a different thing entirely, one that "cannot create anything or
+  // take anything away". The same word in the same bar for the account that may
+  // do everything and for the account that may do least is the collision worth
+  // spending four syllables on.
+  if (who.cellAdmin) return "cell administrator";
+  if (!who.projects) return "permissions unknown";
+  const rung = roleHere();
+  if (rung === "custom") return "custom role";
+  return session.project ? rung + " in " + session.project : rung;
+}
+
+/// One line above the board when the console cannot say what this account may
+/// do — see `permissionDoubt`. Placed in `#content` rather than in a board, so
+/// it survives every navigation and is removed when it stops being true.
+function renderPermissionDoubt() {
+  const said = permissionDoubt();
+  const there = $("permissiondoubt");
+  if (!said) { if (there) there.remove(); return; }
+  if (there) { there.textContent = said; return; }
+  const line = el("p.warn", { id: "permissiondoubt" }, said);
+  $("content").insertBefore(line, $("listtitle"));
 }
 
 /// Exchange a username and password for a session token.
@@ -100,7 +156,38 @@ async function signInWithPassword(username, password) {
   if (!res.ok) throw new ApiError(res.status, body);
   session.token = body.token;
   sessionStorage.setItem(TOKEN_KEY, body.token);
+  // The answer says when this session stops being accepted, and nothing read
+  // it: a session lasts eight hours, and the way anybody found out was a form
+  // they had filled in answering "The token was refused." A warning a few
+  // minutes out costs one timer and turns that into something somebody can act
+  // on while they still have what they typed.
+  watchForExpiry(Number(body.expiresAt) || 0);
   return body;
+}
+
+/// Say, once, that this session is about to end.
+///
+/// Only for a password sign-in: a static token has no expiry to read, and
+/// inventing one would be a warning about something that is not going to
+/// happen. Cleared on sign-out so a second sign-in in the same tab does not
+/// inherit the first one's clock.
+let expiryTimer = null;
+const EXPIRY_WARNING_MS = 10 * 60 * 1000;
+
+function watchForExpiry(expiresAt) {
+  clearTimeout(expiryTimer);
+  expiryTimer = null;
+  if (!expiresAt) return;
+  const wait = expiresAt - Date.now() - EXPIRY_WARNING_MS;
+  // Already inside the window — or past it, which a token restored from this
+  // tab's storage can be. Said now rather than not at all.
+  expiryTimer = setTimeout(() => {
+    const left = Math.max(0, Math.round((expiresAt - Date.now()) / 60000));
+    toast(left
+      ? "This session ends in about " + left + " minutes. Save anything you have open, "
+        + "then sign in again."
+      : "This session has ended. Sign in again — anything unsaved is still on screen.", "bad");
+  }, Math.max(0, wait));
 }
 
 /// Sign in with a static token — a service account, or an automation.
@@ -171,11 +258,15 @@ $("signout").addEventListener("click", () => {
   }).catch(() => {});
 });
 
-$("project").addEventListener("change", async () => {
+async function switchedProject() {
   session.project = $("project").value;
   sessionStorage.setItem(PROJECT_KEY, session.project);
   forgetOptions();
   closeSheet();
+  // The rung is per project, and so is the doubt about it: the same account is
+  // admin of one project and a viewer of the next.
+  renderWhoami();
+  renderPermissionDoubt();
   // Where you were, about the project you have just picked. Switching used to
   // land on Instances from anything that was not a board — so choosing another
   // project from the overview, or from the map, answered a question nobody
@@ -184,7 +275,41 @@ $("project").addEventListener("change", async () => {
   else if (view.home) await showOverview();
   else await show(view.coll ? view.coll.id : "instances");
   sweep();
-});
+}
+
+$("project").addEventListener("change", switchedProject);
+
+// The switcher was filled once, on the way in, and never again — so a cell
+// operator who created a project could not switch to it until they signed in
+// again, and a project somebody else made never appeared at all.
+//
+// Refilled when it is opened, which is the moment before it is read and the
+// only moment its contents matter. Not on the create: that form lives on the
+// projects board and this control lives in the header, and a watch of its own
+// would be a second stream held open for the life of the session to keep one
+// `<select>` honest. `pointerdown` and `focus` because either can be the way
+// in — a pointer, or a tab — and the guard stops the two of them asking twice.
+//
+// A failure keeps whatever the switcher already had: the boards say what is
+// unreachable, and a list that emptied itself while somebody was reaching for
+// it would be the worse answer.
+let refillingProjects = null;
+function refillProjects() {
+  if (refillingProjects) return;
+  const before = session.project;
+  refillingProjects = loadProjects()
+    .then(() => {
+      // The project this session was on has gone — deleted by somebody else,
+      // or never visible to this token. `loadProjects` has already moved the
+      // session to the first one that is left; the screen has to follow it,
+      // or the header names one project over another one's rows.
+      if (session.project !== before) return switchedProject();
+    })
+    .catch(() => {})
+    .then(() => { refillingProjects = null; });
+}
+$("project").addEventListener("pointerdown", refillProjects);
+$("project").addEventListener("focus", refillProjects);
 
 // Dark is the system's identity and the default; an operator working in
 // daylight beside other documents can say otherwise, and the choice sticks.

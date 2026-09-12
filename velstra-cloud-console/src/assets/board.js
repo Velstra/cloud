@@ -15,6 +15,20 @@ const view = {
   // row count because the whole hazard is that a short list looks exactly like a
   // small collection.
   complete: true,
+  /// Which board opening the answers on the wire belong to.
+  ///
+  /// `show()` stops the old watcher, then **awaits** the listing, and only
+  /// assigns the new watcher after it. Leave a slow board mid-listing and the
+  /// late answer arrived into whatever was on screen by then: it wrote the old
+  /// collection's rows and count into the new board — the rail once reported
+  /// seven guests in an empty project, which was the number of audit records —
+  /// and it overwrote `watcher`, orphaning a live stream that nothing could
+  /// close. Sixteen of them survived one pass along the rail, and the tab ran
+  /// out of connections.
+  ///
+  /// Every answer now carries the number of the opening that asked for it, and
+  /// anything from an older one is dropped on arrival.
+  opening: 0,
   watcher: null,
   revision: null,
   rechecker: null,     // see startRecheck
@@ -47,6 +61,27 @@ const census = {};
 // platform, and a board of them is plumbing a customer never asked to see.
 const OPERATOR_ONLY = ["migrations", "ports"];
 
+/// Whether the rail keeps this collection from a customer.
+///
+/// Three tests rather than one because they are three different facts, and the
+/// list above was the only one anybody kept up to date. `CELL_ONLY` is kept in
+/// step with what the API *refuses*; `OPERATOR_ONLY` is the two project
+/// collections that are nonetheless the cell's business; and the schema's own
+/// `audience` is the declaration on every collection — which nothing read, so
+/// Roles and Folders sat in a tenant's rail as empty boards with a New button
+/// that answered 403, exactly what those lists exist to prevent.
+///
+/// `Plumbing` is deliberately not swept up here. It means "reachable from the
+/// thing that needs it rather than from the navigation", and for attachments,
+/// captures and operations this console has no other door yet — hiding them
+/// would take a customer's only way to attach a disk away to make a point
+/// about navigation. Ports, which do have another door, are in the list above.
+function keptFromTenants(coll) {
+  return CELL_ONLY.includes(coll.id)
+    || OPERATOR_ONLY.includes(coll.id)
+    || coll.audience === "operator";
+}
+
 /// The columns a board shows this account.
 ///
 /// One filter, one reason: machine names are not part of a tenant's view. The
@@ -74,16 +109,20 @@ const CELL_ONLY = [
 
 function groups() {
   const out = [];
+  const admin = session.who && session.who.cellAdmin;
   for (const c of collections()) {
-    const admin = session.who && session.who.cellAdmin;
-    if ((CELL_ONLY.includes(c.id) || OPERATOR_ONLY.includes(c.id)) && !admin) continue;
-    // "Fleet" is the operator's word for the machine room. What survives the
-    // filter above for a tenant — operations, audit — is their own activity,
-    // and the heading says so instead of borrowing the operator's map.
-    const name = c.group === "Fleet" && !admin ? "Activity" : c.group;
-    let g = out.find((x) => x.name === name);
-    if (!g) { g = { name, items: [] }; out.push(g); }
+    if (keptFromTenants(c) && !admin) continue;
+    let g = out.find((x) => x.name === c.group);
+    if (!g) { g = { name: c.group, items: [] }; out.push(g); }
     g.items.push(c);
+  }
+  // Access holds nothing a customer may read — users, roles, folders and the
+  // other projects are all the cell's — but it is where the Members door hangs,
+  // and a group with no items is not emitted. Without this the one panel a
+  // project admin needs, the one that says who may do what in their own
+  // project, had no way in at all.
+  if (!admin && !out.some((g) => g.name === "Access")) {
+    out.push({ name: "Access", items: [] });
   }
   return out;
 }
@@ -199,13 +238,15 @@ async function sweep() {
     // The same rule the rail draws by. Sweeping a collection the rail hides
     // from this account is ten requests whose answers are known — and, until
     // the 403 handling below existed, ten red rows on a tenant's overview.
-    if ((CELL_ONLY.includes(c.id) || OPERATOR_ONLY.includes(c.id))
-        && !(session.who && session.who.cellAdmin)) {
+    if (keptFromTenants(c) && !(session.who && session.who.cellAdmin)) {
       census[c.id] = { ok: true, denied: true, total: 0, unsettled: 0 };
       return;
     }
     try {
-      const r = await list(c);
+      // One page, never a walk. See `listPage`: the rail wants a number, and a
+      // number with a `+` on it is worth more than a console that spends two
+      // minutes and every connection it has earning the exact one.
+      const r = await listPage(c);
       const unsettled = r.items.filter((x) => verdict(x, c.condition).kind !== "settled");
       census[c.id] = {
         ok: true,
@@ -313,12 +354,23 @@ function forgetBoard() {
   view.map = false;
 }
 
+/// The cell kinds that hold a figure.
+///
+/// One list, read by the header, by the blank branch and by the switch below,
+/// because the three of them disagreeing is exactly how a column came to be
+/// right-aligned in its values, left-aligned in its heading and left-aligned
+/// again wherever a row had nothing to report.
+const NUMERIC_CELLS = ["number", "bytes", "count"];
+
 function cell(r, col) {
   const raw = at(r, col.path);
   const blank = raw === null || raw === undefined || raw === "";
   const td = el("td");
   if (blank && col.cell !== "yes" && col.cell !== "count") {
-    td.className = "blank";
+    // Still the column it is in. A blank that forgot it was numeric put its em
+    // dash at the left edge of a column whose figures are at the right, so a
+    // board with one unreported row had a dash sitting under nothing.
+    td.className = NUMERIC_CELLS.includes(col.cell) ? "blank num" : "blank";
     td.appendChild(document.createTextNode("—"));
     return td;
   }
@@ -371,7 +423,12 @@ function renderBoard() {
     })) : null,
     el("th", { style: "width:220px" }, coll.singular === "project" ? "Project" : "Name"),
     el("th", { style: "width:150px" }, "Convergence"),
-    columnsFor(coll).map((c) => el("th", { style: "width:" + c.width + "px" }, c.label)));
+    // `num` on the header too, where the cells under it are numbers. Right-
+    // aligned figures under a left-aligned heading are a column that lines up
+    // with nothing, which is most of what tabular numerals were switched on to
+    // achieve.
+    columnsFor(coll).map((c) => el("th" + (NUMERIC_CELLS.includes(c.cell) ? ".num" : ""),
+      { style: "width:" + c.width + "px" }, c.label)));
 
   const body = $("boardbody");
   // The verdicts as they stood a moment ago, read off the rows about to be
@@ -414,9 +471,18 @@ function renderBoard() {
   }
 
   const empty = $("listempty");
-  empty.classList.toggle("hidden", rows.length > 0);
-  empty.textContent = rows.length ? "" :
-    "No " + coll.title.toLowerCase() + " here yet." +
+  // A list that was refused is not a collection with nothing in it. Showing
+  // both the red sentence and "No volumes here yet. Create the first one
+  // above." told somebody to make a second volume because the first could not
+  // be read.
+  const emptyShown = rows.length === 0 && !view.listFailed;
+  empty.classList.toggle("hidden", !emptyShown);
+  // `coll.empty` where the schema wrote one, because the sentence derived from
+  // the title reads as machine output — "No catalogue here yet", "No ceph here
+  // yet", "No floating ips here yet" — and the one place it matters most is a
+  // board somebody has reached on their first day.
+  empty.textContent = !emptyShown ? "" :
+    (coll.empty || "No " + coll.title.toLowerCase() + " here yet.") +
     (coll.creatable && allows("create") ? " Create the first one above." : "");
   $("board").classList.toggle("hidden", rows.length === 0);
   renderPicked();
@@ -434,15 +500,29 @@ function renderBoard() {
 /// them badly wrong.
 function bulkActions(coll) {
   const out = [];
-  if (coll.id === "instances") {
+  // The rung this account holds, the same one the sheet already draws by. The
+  // sheet hid Edit and Delete from a viewer and this bar went on offering
+  // Start, Stop and Delete over the same rows — three presses whose only
+  // outcome was "0 done, 1 refused". The session says the rung outright; there
+  // was never a reason to ask the API by pressing.
+  if (coll.id === "instances" && allows("edit")) {
     out.push({ id: "start", label: "Start", body: { spec: { desiredState: "Running" } } });
-    out.push({ id: "stop", label: "Stop", body: { spec: { desiredState: "Stopped" } } });
+    // Stopping is not a change of shape, it is the machine going away for a
+    // while, and forty of them go away together. It asks, like Delete.
+    out.push({ id: "stop", label: "Stop", body: { spec: { desiredState: "Stopped" } }, asks: true });
   }
   // Deleting an audit record is reading-room housekeeping, and the API keeps
   // it for the cell operator — a tenant would get a column of checkboxes whose
   // one action answers 403. Everything else deletable is the owner's own.
   const mayDelete = coll.id !== "audit" || (session.who && session.who.cellAdmin);
-  if (coll.deletable && mayDelete) out.push({ id: "delete", label: "Delete", destroys: true });
+  // A migration is not deletable in bulk, whatever the schema says about the
+  // collection. Abandoning one that is still copying can lose the guest — the
+  // sheet says so in as many words before it lets anybody do it — and a bar
+  // that prints "Delete m1, m2?" over a mixture of finished and in-flight
+  // records is the same command with the warning taken off.
+  if (coll.deletable && mayDelete && coll.id !== "migrations" && allows("create")) {
+    out.push({ id: "delete", label: "Delete", destroys: true, asks: true });
+  }
   return out;
 }
 
@@ -468,6 +548,12 @@ let bulkOutcome = null;
 function renderPicked() {
   const bar = $("picked");
   if (!bar) return;
+  // A board under a watch re-renders whenever anything lands, and this bar was
+  // rebuilt with it — which wiped the delete confirmation somebody was reading
+  // and the "Working… 3 of 12" of a run still going, and handed back enabled
+  // buttons in the middle of it. A question that is being asked, and a run that
+  // has not finished, outlive an event about one row.
+  if (bar.dataset.busy === "yes" || $("bulkyes")) return;
   clear(bar);
   const coll = view.coll;
   const n = view.picked.size;
@@ -498,18 +584,25 @@ function renderPicked() {
 /// Naming the objects rather than counting them is the difference between
 /// "delete 12?" and seeing `db-1` in the list and stopping.
 function askBulk(coll, action) {
-  if (!action.destroys) return runBulk(coll, action);
+  if (!action.asks) return runBulk(coll, action);
   const host = $("bulkresult");
   const names = [...view.picked].map(shortName);
+  const listed = names.slice(0, 5).join(", ") +
+    (names.length > 5 ? " and " + (names.length - 5) + " more" : "");
+  // What it will do, not only what it is called. A stop is a machine going off
+  // — everything on it stops answering — and saying so is the difference
+  // between a question and a formality.
+  const sentence = action.destroys
+    ? "Delete " + listed + "? Their disks and addresses go with them, and nothing here brings them back."
+    : "Stop " + listed + "? Whatever they are serving stops answering until they are started again.";
   fill(host,
-    el("span.err", "Delete " + names.slice(0, 5).join(", ") +
-      (names.length > 5 ? " and " + (names.length - 5) + " more" : "") + "? "),
-    btn("Delete " + names.length, {
+    el("span.err", sentence + " "),
+    btn((action.destroys ? "Delete " : "Stop ") + names.length, {
     danger: true,
     id: "bulkyes",
     onclick: () => runBulk(coll, action),
   }),
-    btn("Keep them", { id: "bulkno", onclick: () => clear(host) }));
+    btn(action.destroys ? "Keep them" : "Leave them running", { id: "bulkno", onclick: () => clear(host) }));
 }
 
 /// Do it, one at a time, and report every outcome.
@@ -525,19 +618,22 @@ function askBulk(coll, action) {
 /// did not work — so a second press retries the failures and nothing else.
 async function runBulk(coll, action) {
   bulkOutcome = null;
+  const bar = $("picked");
+  if (bar) bar.dataset.busy = "yes";
   const host = $("bulkresult");
   const names = [...view.picked];
   fill(host, el("span.muted", "Working… 0 of " + names.length));
   const failed = [];
   let done = 0;
   for (const name of names) {
-    // The bare id, which is what every write path takes. `shortName` is for
-    // reading — it keeps the collection in front of the id — and sending that
-    // asks the API about an object called `instances/db-1`.
+    // The object's own name. `pathFor` takes it as it is, so a board that
+    // merges two scopes — the catalogue's cell-wide images beside the
+    // project's — addresses each row where it actually lives instead of
+    // rebuilding a path out of the project currently selected.
     const id = name.split("/").pop();
     try {
-      if (action.destroys) await remove(coll, id);
-      else await patch(coll, id, action.body);
+      if (action.destroys) await remove(coll, name);
+      else await patch(coll, name, action.body);
       done++;
       view.picked.delete(name);
     } catch (e) {
@@ -556,6 +652,7 @@ async function runBulk(coll, action) {
           el("div", el("span.mono", f.id), el("span.muted", " — " + f.why)))),
       ]
     : [el("span.state.settled", mark("settled"), done + " done")];
+  if (bar) delete bar.dataset.busy;
   renderBoard();
 }
 
@@ -1113,7 +1210,11 @@ async function machinesInto(host) {
   if (!got) return;
   const guests = got.items || [];
   const floating = (fips && fips.items) || [];
-  host.appendChild(el("h2", "Your machines"));
+  // "Your instances", not "Your machines". The object is an instance
+  // everywhere else in this console — in the rail, on the board, in the form —
+  // and the overview calling the same thing a machine was the third word for
+  // it on a page a customer reads before any other.
+  host.appendChild(el("h2", "Your instances"));
   if (!guests.length) {
     host.appendChild(el("p.muted",
       "None yet. “New instance” on the Instances board starts one."));
@@ -1156,10 +1257,16 @@ async function machinesInto(host) {
 async function renderOverviewReports() {
   const host = $("overviewreports");
   if (!host) return;
+  // Three of these are the cell's own, and a tenant is refused all three. They
+  // were asked anyway and the refusals swallowed, so every customer's sign-in
+  // put three 403s in the log and three round trips on the wire to build a
+  // panel the next eight lines then decline to draw. Not asking is the same
+  // screen and none of the noise.
+  const ours = !!(session.who && session.who.cellAdmin);
   const [room, cpu, windows, allowance, consumption] = await Promise.all([
-    explainCapacity().catch(() => null),
-    explainCpu().catch(() => null),
-    windowsNow().catch(() => []),
+    ours ? explainCapacity().catch(() => null) : Promise.resolve(null),
+    ours ? explainCpu().catch(() => null) : Promise.resolve(null),
+    ours ? windowsNow().catch(() => []) : Promise.resolve([]),
     session.project ? explainQuota(session.project).catch(() => null) : Promise.resolve(null),
     // The month so far, because this is the only page a tenant has that is
     // *about their project* — they cannot open the projects board, so a
@@ -1246,13 +1353,13 @@ async function show(id) {
   // deep link, a stale bookmark, another account's copied URL. Without this a
   // tenant landed on a board whose every button answers 403 — a "New project"
   // over a list they may not read.
-  if ((CELL_ONLY.includes(id) || OPERATOR_ONLY.includes(id))
-      && !(session.who && session.who.cellAdmin)) {
+  if (keptFromTenants(coll) && !(session.who && session.who.cellAdmin)) {
     await showOverview();
     return;
   }
   if (view.watcher) { view.watcher.stop(); view.watcher = null; }
   stopRecheck();
+  const opening = ++view.opening;
   // A filter belongs to the board it was typed on. Carrying it across would
   // show somebody a short list of volumes because of something they typed
   // about guests.
@@ -1276,8 +1383,13 @@ async function show(id) {
   // report should never be what they are waiting on.
   renderCpuAdvisory();
   $("listerr").classList.add("hidden");
+  view.listFailed = false;
   try {
     const r = await list(coll, session.labels);
+    // Somebody has moved on. These rows belong to a board nobody is looking at,
+    // and writing them anywhere — items, the rail's count, a watcher handle —
+    // is how the console came to report another collection's numbers.
+    if (opening !== view.opening) return;
     view.items = r.items;
     view.revision = r.revision;
     view.complete = r.complete !== false;
@@ -1291,10 +1403,16 @@ async function show(id) {
         .classList.remove("hidden");
     }
   } catch (e) {
+    if (opening !== view.opening) return;
     view.items = [];
     view.complete = true;
+    // The empty state and the error are two different answers and only one of
+    // them is true here. "No volumes here yet. Create the first one above." over
+    // a list that was refused sends somebody to create a second one.
+    view.listFailed = true;
     fill($("listerr"), e.message).classList.remove("hidden");
   }
+  if (opening !== view.opening) return;
   renderBoard();
   recount();
   view.watcher = watch(coll, view.revision, (ev) => applyEvent(coll, ev), setWatchState);
