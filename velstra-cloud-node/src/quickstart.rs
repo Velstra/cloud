@@ -337,7 +337,7 @@ fn enable(units: &[&str]) -> Result<()> {
 /// `curl`, for the same reason every other outside tool here is a command: this
 /// binary is the installer, and giving it an HTTP stack would give the installer
 /// a TLS stack, a certificate store, and their upgrades.
-fn curl(args: &[&str]) -> Result<String> {
+pub(crate) fn curl(args: &[&str]) -> Result<String> {
     let mut base: Vec<String> = vec!["-sS".into(), "--max-time".into(), "20".into()];
     // Against the cell's own certificate, when there is one. `-k` would also
     // work and would also teach every reader of this script that verification
@@ -381,7 +381,7 @@ fn wait_for(api: &str) -> Result<()> {
 /// Deliberately crude and deliberately narrow: these are two responses this
 /// same codebase produces, the fields are flat strings, and a dependency added
 /// for six characters of parsing is a dependency in every future audit.
-fn field(body: &str, key: &str) -> Option<String> {
+pub(crate) fn field(body: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let start = body.find(&needle)? + needle.len();
     let rest = &body[start..];

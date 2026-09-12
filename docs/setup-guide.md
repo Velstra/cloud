@@ -181,14 +181,39 @@ itself.
 On the machine:
 
 ```
-sudo velstra-cloud-node setup
+sudo VELSTRA_TOKEN=<the token> velstra-cloud-node setup
 ```
 
-Answer: region, cell, roles (`2` for a hypervisor), the control-plane URL, the
-node id you just chose, and the token. Then enable what it names.
+Four answers: roles (`2` for a hypervisor, `2 3` if it also holds volumes), the
+control-plane URL, where the cell's certificate is, and — for a pool — its id
+and backend. The token can be typed at the prompt instead; it is 64 hex
+characters, which is why the environment is offered.
 
-Within a pass the node appears on the board with its capacity — that first
-status report *is* the registration working.
+**The region, the cell and the node id are not questions.** The wizard presents
+the token to the control plane, which answers which node it was issued for and
+which cell this is, and says so:
+
+```
+The cell answered: this token is node hv-2 in cell cell-1, region eu-central.
+```
+
+A typo there used to be a machine that came up, registered nowhere and was
+found weeks later; now there is nothing to mistype. If the cell cannot be
+reached — not up yet, air-gapped — it says why and asks the three questions
+instead.
+
+**Use a name the certificate carries.** A cell's own certificate names its
+hostname, `localhost` and `127.0.0.1`, so `https://<the IP>:8443` fails
+verification. The wizard tries the URL while you are still looking at it and
+says exactly that, rather than leaving it for an agent to discover later.
+
+The certificate itself is `/var/lib/velstra/tls/cert.pem` on the control plane.
+Copy it across — it is a certificate, not a secret — and the wizard writes its
+path into the seed as `VELSTRA_API_CA`, which is what the agents verify
+against. Without it they refuse an `https` cell outright.
+
+Then enable what it names. Within a pass the node appears on the board with its
+capacity — that first status report *is* the registration working.
 
 ### Then give it its role in the cell
 

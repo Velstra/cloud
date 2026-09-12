@@ -1743,10 +1743,17 @@
         setup =
           pkgs.runCommand "velstra-cloud-setup-check" { } ''
             mkdir -p seed
-            # region, cell, roles (control-plane + hypervisor + pool), API url,
-            # node id, token, hypervisor, pool id, backend, store, other cells,
-            # reachable-from, admin + password twice, fabric (no), gateway
-            # (yes), confirm.
+            # roles (control-plane + hypervisor + pool), API url, token, then —
+            # because nothing answers in the sandbox — region, cell, node id,
+            # hypervisor, pool id, backend, store, other cells, reachable-from,
+            # admin + password twice, fabric (no), gateway (yes), confirm.
+            #
+            # The URL and the token come first now, and region, cell and the
+            # node id after them: the cell can say all three, so the wizard
+            # asks it and only falls back to asking here. This run *is* the
+            # fallback — there is no control plane in a sandbox — which is the
+            # half worth pinning, because it is the half that still has to work
+            # on an air-gapped machine.
             #
             # Positional, so a question added anywhere above shifts every answer
             # below it — which is exactly what happened when the fabric question
@@ -1756,12 +1763,12 @@
             # cheapest check in the tree and it is the one that catches a
             # question nobody meant to add.
             ${velstra-cloud}/bin/velstra-cloud-node setup --dir "$PWD/seed" --nixos false <<'ANSWERS' > out 2>&1
-            eu-north
-            cell-7
             1 2 3
             https://cell-7.example:8443
-            node-a
             ${lib.concatStrings (lib.replicate 32 "ab")}
+            eu-north
+            cell-7
+            node-a
             2
             nvme
             1
@@ -1843,12 +1850,13 @@
             # one is what a *declined* fabric leaves out.
             mkdir -p fabric-seed
             ${velstra-cloud}/bin/velstra-cloud-node setup --dir "$PWD/fabric-seed" --nixos false <<'ANSWERS' > fabout 2>&1
-            eu-north
-            cell-7
             2
             https://cell-7.example:8443
-            node-b
+            /var/lib/velstra/tls/cert.pem
             ${lib.concatStrings (lib.replicate 32 "cd")}
+            eu-north
+            cell-7
+            node-b
             1
             y
             http://fab.example:50052
@@ -1860,6 +1868,14 @@
             ANSWERS
             cat fabric-seed/node.env
 
+            # The root the agents verify the API against. A machine joined
+            # interactively used to get no such line at all — the wizard never
+            # asked — so its seed was one an https cell's own agents refuse,
+            # and the operator found out from a unit that would not start
+            # rather than from the wizard that wrote it. Named whether or not
+            # the file has been copied yet, because the alternative is a wizard
+            # that cannot be finished on the machine it is being run on.
+            grep -qx "VELSTRA_API_CA=/var/lib/velstra/tls/cert.pem" fabric-seed/node.env
             grep -qx "VELSTRA_FABRIC=http://fab.example:50052" fabric-seed/node.env
             # The orchestrator and the agent-facing service are different
             # endpoints with different amounts of trust. A seed that carried one
