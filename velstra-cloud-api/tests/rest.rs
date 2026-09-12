@@ -3666,6 +3666,7 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
         ),
         velstra_cloud_model::resources::PoolSpec {
             accepting: true,
+            node: String::new(),
             labels: vec![],
             volume_ceiling: Default::default(),
         },
@@ -4705,6 +4706,7 @@ async fn a_volume_with_no_pool_named_is_put_somewhere_rather_than_nowhere() {
             ),
             velstra_cloud_model::resources::PoolSpec {
                 accepting,
+                node: String::new(),
                 labels: Vec::new(),
                 volume_ceiling: Default::default(),
             },
@@ -5524,4 +5526,182 @@ async fn an_mtu_no_wire_could_carry_is_refused() {
             .await;
         assert_eq!(ok.status, StatusCode::ACCEPTED, "{:?}", ok.body);
     }
+}
+
+// ---- storage a guest can actually reach -----------------------------------
+
+/// A disk on one machine cannot be opened by a guest on another, and the
+/// refusal names both machines.
+///
+/// Found on a live cell: a tenant made a volume, the platform put it in the
+/// pool with the most room — a directory on one host — the scheduler put their
+/// guest on the other host, and the attachment was accepted and written down.
+/// The only sign of it was the node answering `Could not open
+/// '/var/lib/velstra/pool/…qcow2': No such file or directory`, a sentence about
+/// a path addressed to somebody who may list neither pools nor nodes.
+#[tokio::test]
+async fn a_disk_on_another_machine_is_refused_with_both_machines_named() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+    let mut pool = velstra_cloud_model::resources::Pool::new(
+        velstra_cloud_model::meta::Meta::new(
+            "pools/local".parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: true,
+            // The whole point of the fixture: this pool's bytes are on one host.
+            node: "node-a".into(),
+            labels: Vec::new(),
+            volume_ceiling: Default::default(),
+        },
+        velstra_cloud_model::resources::PoolStatus {
+            backend: "directory".into(),
+            capacity_gib: 1000,
+            ..Default::default()
+        },
+    );
+    pool.meta.generation = 1;
+    h.pools().create(&pool, &writer).await.unwrap();
+
+    let made = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data", "spec": { "sizeGib": 5, "pool": "local" } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    // Placed on the other machine, which is the fact the refusal is about.
+    // `spec.node` and not `status.node`: that is where the scheduler writes a
+    // placement, and where the attachment takes its own node from.
+    let guest = h
+        .instance(
+            "p1",
+            "web",
+            json!({ "vcpus": 1, "memoryMib": 512, "node": "node-b" }),
+        )
+        .await;
+
+    let refused = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "mount", "spec": {
+                "volume": "projects/p1/volumes/data",
+                "instance": guest,
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("node-a") && message.contains("node-b"),
+        "the refusal has to name both machines, not a path: {message}"
+    );
+}
+
+/// A pool that has not said where it is is reachable from everywhere, because
+/// that is true of shared storage and is the only safe reading for a cell
+/// nobody has told.
+#[tokio::test]
+async fn a_disk_in_a_pool_with_no_machine_named_is_attachable_anywhere() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    h.pool("pool-a").await;
+    let volume = h.volume("data", 5).await;
+    let guest = h
+        .instance(
+            "p1",
+            "web",
+            json!({ "vcpus": 1, "memoryMib": 512, "node": "node-b" }),
+        )
+        .await;
+    let ok = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "mount", "spec": { "volume": volume, "instance": guest }}),
+        )
+        .await;
+    assert_eq!(ok.status, StatusCode::ACCEPTED, "{:?}", ok.body);
+}
+
+// ---- a grant has to reach somebody ----------------------------------------
+
+/// A binding naming an account nobody has is refused, and the refusal says so
+/// in the spelling the person used.
+///
+/// The console's own field asked for an email address while this platform
+/// names accounts by id, so typing exactly what the form asked for stored
+/// access for nobody — silently, which is the part that mattered: the
+/// administrator went away believing the customer could sign in.
+#[tokio::test]
+async fn a_grant_to_an_account_nobody_has_is_refused() {
+    let h = Harness::new();
+    let refused = h
+        .post(
+            "projects",
+            json!({ "id": "p9", "spec": { "displayName": "Nine", "bindings": [
+                { "role": "editor", "members": ["ada@example.com"] }
+            ]}}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("ada@example.com") && message.contains("id"),
+        "say which name reached nobody, and how accounts are named here: {message}"
+    );
+}
+
+/// A binding that is already stored keeps the object editable.
+///
+/// The panel that fixes a stale grant must not be the one thing a stale grant
+/// makes impossible: a save is judged on the members it adds.
+#[tokio::test]
+async fn a_grant_already_stored_does_not_block_the_next_save() {
+    let h = Harness::new();
+    h.post("projects", json!({ "id": "p1", "spec": {} })).await;
+    let projects: TypedStore<
+        velstra_cloud_model::resources::ProjectSpec,
+        velstra_cloud_model::resources::ProjectStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "projects");
+    let mut p = projects.get("projects/p1").await.unwrap().unwrap();
+    p.spec.bindings = vec![velstra_cloud_model::authz::Binding {
+        role: "viewer".into(),
+        members: vec!["long-gone".into()],
+    }];
+    p.meta.generation += 1;
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "projects", "projects/p1"),
+            serde_json::to_vec(&p).unwrap(),
+            velstra_cloud_store::Expect::Revision(p.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    let ok = h
+        .patch(
+            "projects/p1",
+            json!({ "spec": { "bindings": [
+                { "role": "viewer", "members": ["long-gone"] }
+            ]}}),
+        )
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
 }

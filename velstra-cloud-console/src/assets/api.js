@@ -97,7 +97,16 @@ async function request(method, path, opts = {}) {
 
   if (res.status === 401) { signedOut("The token was refused."); throw new ApiError(401, body); }
   if (!res.ok) throw new ApiError(res.status, body);
-  return { body, revision: res.headers.get("X-Velstra-Revision") };
+  // `velstra-operation` as well as the revision. A create says which operation
+  // is following it in the body; a patch and a delete say it **only** in this
+  // header, and nothing here read it — so the one case worth following was the
+  // one the console could not see: a delete held by a finalizer, which reads
+  // "Deleting" on the board for as long as the tab is open and never says why.
+  return {
+    body,
+    revision: res.headers.get("X-Velstra-Revision"),
+    operation: res.headers.get("velstra-operation") || null,
+  };
 }
 
 /// The contract fixes the resource body but not the envelope a listing arrives
@@ -227,7 +236,7 @@ async function firstPage(coll, scope, narrow) {
 /// `projects/p1/images/…` is this project's.
 const BOTH_SCOPES = ["images"];
 
-async function listBoth(coll, narrow) {
+async function listBoth(coll, narrow, opts) {
   const seen = new Set();
   const items = [];
   let complete = true;
@@ -236,7 +245,9 @@ async function listBoth(coll, narrow) {
     if (scope === "project" && !session.project) continue;
     try {
       const first = await firstPage(coll, scope, narrow);
-      const all = await walk(coll, scope, first, narrow);
+      const all = opts && opts.onePage
+        ? { items: first.items, revision: first.revision, complete: !first.next }
+        : await walk(coll, scope, first, narrow);
       if (all.complete === false) complete = false;
       if (all.revision) revision = all.revision;
       for (const r of all.items) {
@@ -262,6 +273,29 @@ async function listBoth(coll, narrow) {
     }
   }
   return { items, revision, complete };
+}
+
+/// One page and no walk: what a **count** costs.
+///
+/// The sign-in census used the same `list` the boards use, which walks a
+/// collection to its end. On a cell that had been running for a fortnight the
+/// audit collection was past two hundred thousand records, so opening the
+/// console meant roughly two hundred serial requests before the rail could
+/// draw a number — measured at 380 requests and 117 seconds, after which the
+/// tab had no connections left and could not even reload itself.
+///
+/// A badge does not need the collection. It needs a number, and "1000+" is a
+/// true number. The boards still walk, because a board that sorts and counts
+/// and folds watch events into what it holds genuinely needs the whole thing.
+async function listPage(coll, narrow) {
+  if (BOTH_SCOPES.includes(coll.id)) {
+    const both = await listBoth(coll, narrow, { onePage: true });
+    return both;
+  }
+  const scope = scopeFound[coll.id] || coll.scope;
+  if (scope === "project" && !session.project) return { items: [], revision: null, complete: true };
+  const first = await firstPage(coll, scope, narrow);
+  return { items: first.items, revision: first.revision, complete: !first.next };
 }
 
 async function list(coll, narrow) {
@@ -364,16 +398,52 @@ const explainMaintenance = (id) =>
   request("GET", basePath(collection("nodes")) + "/" + encodeURIComponent(id) + ":explainMaintenance")
     .then((r) => r.body);
 
-const get = (coll, id) => request("GET", basePath(coll) + "/" + encodeURIComponent(id)).then((r) => r.body);
+/// Where one object is addressed.
+///
+/// Takes the object's **own name** when it has one — `images/debian-13`,
+/// `projects/p1/volumes/data` — and only falls back to building a path out of
+/// the collection's scope for a bare id.
+///
+/// The fallback was the only behaviour, and on the one board that merges two
+/// scopes it was wrong half the time: the catalogue lists the cell's images
+/// beside the project's, and every edit and delete went to
+/// `projects/<current>/images/<id>` regardless, so retiring a published image
+/// answered "projects/p1/images/debian-13 does not exist" — about an object
+/// nobody had named. A name that already says where it lives is not a thing to
+/// re-derive.
+function pathFor(coll, idOrName) {
+  const s = String(idOrName || "");
+  if (s.includes("/")) return "/api/v1/" + s.split("/").map(encodeURIComponent).join("/");
+  return basePath(coll) + "/" + encodeURIComponent(s);
+}
+
+const get = (coll, id) => request("GET", pathFor(coll, id)).then((r) => r.body);
 
 const create = (coll, body, scope) =>
   request("POST", writePath(coll, scope), { body }).then((r) => r.body);
 
+/// The answer, with the operation following it kept on the side.
+///
+/// A create carries `{operation, target}` in its body and a patch and a delete
+/// do not — theirs is in the `velstra-operation` header. Callers that want to
+/// follow one should not have to know which of the three they made, so the
+/// name is put where the body already puts it. Written non-enumerably so that
+/// nothing which renders an object, diffs one or sends one back sees a field
+/// the API never returned.
+function withOperation(body, operation) {
+  if (!operation || !body || typeof body !== "object") return body;
+  if (body.operation) return body;
+  Object.defineProperty(body, "operation", { value: operation, enumerable: false });
+  return body;
+}
+
 const patch = (coll, id, body, ifMatch) =>
-  request("PATCH", writePath(coll) + "/" + encodeURIComponent(id), { body, ifMatch }).then((r) => r.body);
+  request("PATCH", pathFor(coll, id), { body, ifMatch })
+    .then((r) => withOperation(r.body, r.operation));
 
 const remove = (coll, id, ifMatch) =>
-  request("DELETE", writePath(coll) + "/" + encodeURIComponent(id), { ifMatch }).then((r) => r.body);
+  request("DELETE", pathFor(coll, id), { ifMatch })
+    .then((r) => withOperation(r.body, r.operation));
 
 /// Ask for a way into a guest.
 ///

@@ -143,9 +143,24 @@ struct PeekSpec {
     node: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct PeekStatus {
+    /// Both defaulted, and for the reason the note on [`PeekSpec::node`] gives
+    /// one field above: a peek that fails to deserialise is read as "the object
+    /// is gone", so a missing field is not a blank — it is an operation
+    /// reporting that a perfectly healthy object no longer exists.
+    ///
+    /// A freshly made user is the case. Its status is `{"lastLogin": 0,
+    /// "observedGeneration": 0}` and carries no `conditions` at all, because
+    /// nothing reports on a user and nothing ever will — so the very first
+    /// thing an administrator saw after creating an account was its own
+    /// history saying `create … users/x no longer exists`. With the field
+    /// defaulted the peek succeeds, the target reads as present, and
+    /// `operation_progress` reaches the branch that has always known what to
+    /// do with a kind nobody reports on.
+    #[serde(default)]
     observed_generation: u64,
+    #[serde(default)]
     conditions: Vec<Condition>,
 }
 

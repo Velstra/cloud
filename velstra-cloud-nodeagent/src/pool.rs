@@ -2267,6 +2267,7 @@ mod tests {
                 ),
                 PoolSpec {
                     accepting: true,
+                    node: String::new(),
                     labels: vec![],
                     volume_ceiling: Default::default(),
                 },

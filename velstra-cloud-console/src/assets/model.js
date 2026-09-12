@@ -152,10 +152,23 @@ function verdict(r, kind) {
   // object at all, which is a different thing to say and a different thing to
   // do about it.
   if (obs === 0) {
+    // Freshly asked for is not the same as nobody is coming, and for the first
+    // minute of an object's life the two look identical from here. A tenant
+    // made a volume, waited the fifty seconds its pool takes to grow the
+    // device, and read "Not reported" the whole way — which is the word this
+    // console uses for an object nothing owns, so it reads as a fault rather
+    // than as work in progress. Inside the grace below it says what is
+    // actually happening; after it, the original word, which by then is true.
+    const age = Date.now() - Number(pick(meta(r), "createdAt") || 0);
+    const fresh = age >= 0 && age < FIRST_REPORT_GRACE_MS;
     return {
       kind: "unreported",
-      word: "Not reported",
-      why: "Asked for at generation " + gen + ". Nothing has reported on it yet.",
+      word: fresh ? "Being made" : "Not reported",
+      busy: fresh,
+      why: fresh
+        ? "Asked for at generation " + gen + ". Whatever owns it has not reported yet, \
+which is the ordinary first moment of an object's life."
+        : "Asked for at generation " + gen + ". Nothing has reported on it yet.",
       since: ready ? pick(ready, "lastTransition") : null,
       ready,
     };
@@ -229,6 +242,13 @@ function underway(r) {
   return "";
 }
 
+/// How long an object is "being made" rather than "not reported".
+///
+/// Two minutes: longer than any provision this platform does — a volume on a
+/// directory pool took fifty seconds, a guest a few — and short enough that an
+/// object nothing will ever own stops making excuses for itself.
+const FIRST_REPORT_GRACE_MS = 2 * 60 * 1000;
+
 function conditionStale(r, c) {
   return Number(pick(c, "observedGeneration") || 0) < generation(r);
 }
@@ -244,7 +264,8 @@ function mark(kind) { return el("span.mark." + kind); }
 // leaves the refusal to the API for the rest. A cell operator may do
 // everything; an account the API says nothing about (a static token from
 // before `projects` existed, a custom role the console cannot evaluate) is
-// drawn everything, so nothing that used to work goes missing.
+// drawn everything, so nothing that used to work goes missing — and is told
+// that is what happened, which is `permissionDoubt` below.
 function roleHere() {
   const who = session.who || {};
   if (who.cellAdmin) return "admin";
@@ -261,6 +282,30 @@ function allows(verb) {
   if (rung === "custom" || rung === "admin" || rung === "editor") return true;
   if (rung === "operator") return verb === "edit";
   return false;
+}
+
+/// Why the console is drawing controls it cannot vouch for, or "" when it can.
+///
+/// The permissive fallback above stays, and is deliberate: a console that hid
+/// every button from an account it could not read would turn a working static
+/// token into a read-only session overnight. What it must not do is *promise*.
+/// Drawn every button and told nothing, an account presses one, gets a refusal
+/// it has no way to place, and presses the next one to see whether that works
+/// either.
+///
+/// So the fallback says so, in one sentence — `app.js` keeps it above the board
+/// for as long as it is true.
+function permissionDoubt() {
+  const who = session.who || {};
+  if (who.cellAdmin) return "";
+  if (!who.projects) {
+    return "This account's permissions could not be read, so every control is shown. "
+      + "Whether a press is allowed is decided by the API, not here.";
+  }
+  if (roleHere() !== "custom") return "";
+  return "This account holds " + who.projects[session.project] + " in " + session.project
+    + ", which this console has no rung for, so every control is shown. Whether a press "
+    + "is allowed is decided by the API, not here.";
 }
 
 function stateOf(r, kind) {

@@ -282,6 +282,7 @@ async fn a_cluster_that_cannot_be_reached_is_reported_rather_than_read_as_empty(
         meta(&format!("pools/{POOL}")),
         velstra_cloud_model::resources::PoolSpec {
             accepting: true,
+            node: String::new(),
             labels: Vec::new(),
             volume_ceiling: Default::default(),
         },

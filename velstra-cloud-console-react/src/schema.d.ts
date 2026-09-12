@@ -8,7 +8,7 @@
 
 export type Field =
   | { kind: "ref"; advanced: boolean; atCreation: boolean; collection: string; derived: boolean; filterBy: null | string; help: string; key: string; label: string; required: boolean; spelling: string; whenEmpty: string }
-  | { kind: "number"; advanced: boolean; atCreation: boolean; derived: boolean; help: string; key: string; label: string; max: number; min: number; required: boolean; scale: string; step: number; unit: string; whenEmpty: string }
+  | { kind: "number"; advanced: boolean; atCreation: boolean; derived: boolean; help: string; key: string; label: string; max: number; min: number; required: boolean; scale: string; step: number; unit: string; whenEmpty: string; zero?: string }
   | { kind: "choice"; advanced: boolean; atCreation: boolean; derived: boolean; help: string; key: string; label: string; options: { label: string; value: string }[]; required: boolean; whenEmpty: string }
   | { kind: "refList"; advanced: boolean; also?: string; atCreation: boolean; collection: string; derived: boolean; help: string; key: string; label: string; required: boolean; spelling: string; whenEmpty: string }
   | { kind: "textList"; advanced: boolean; atCreation: boolean; check: string; derived: boolean; help: string; key: string; label: string; placeholder: string; required: boolean; whenEmpty: string }

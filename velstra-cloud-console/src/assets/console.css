@@ -47,7 +47,7 @@ body {
    chevron so it says "there are others" without a word beside it. */
 #top #project {
   width: auto; min-width: 0; padding: 6px var(--space-6) 6px var(--space-3);
-  background: var(--surface-raised); border-color: var(--border);
+  background: var(--surface-raised); border-color: var(--border-strong);
   border-radius: var(--radius-sm); font-weight: var(--fw-medium);
   background-image: linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
                     linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
@@ -102,6 +102,18 @@ aside#rail {
   color: var(--text-faint); font-variant-numeric: tabular-nums; font-size: var(--text-xs);
 }
 .railitem.on .n { color: var(--text-muted); }
+/* Two different numbers stand in the same place on the rail: how many objects a
+   collection holds, and how many of them are unsettled. The difference was the
+   tint and a 9px ring, so a rail read at a glance said "14 machines" where it
+   meant "14 of these are drifting" — and read with the colour taken away it
+   said nothing at all. The plain census stays bare digits; the unsettled count
+   is boxed, which is a different shape before it is a different colour, and
+   keeps the amber and the mark it already had. */
+#rail .state.drifting {
+  padding: 0 5px; line-height: 1.35;
+  border: 1px solid var(--drifting); border-radius: var(--radius-xs);
+  font-variant-numeric: tabular-nums;
+}
 
 #content { padding: var(--space-7) var(--space-7) var(--space-9); min-width: 0; }
 /* A subtitle, not another paragraph. One size up from the table, lighter than
@@ -187,6 +199,19 @@ button, input, select, textarea { font: inherit; color: inherit; }
    alarm, and the colour arrives when the pointer does. */
 .btn.quiet { color: var(--text-muted); background: none; border-color: var(--border); }
 .btn.quiet:hover { color: var(--failing); border-color: var(--failing); background: none; }
+/* A press that destroys something says so before it is pressed. `btn()` has
+   marked every one of them `.danger` for as long as it has existed and nothing
+   here answered to the class, so in the selection bar "Delete 3" and
+   "Clear" were the same grey button standing next to each other — the one pair
+   on this page where picking the wrong one cannot be taken back. An outline and
+   not a fill: the filled button is the primary action, and a bar that turns red
+   because somebody ticked three rows is a bar that shouts before anything has
+   happened. */
+.btn.danger { color: var(--red-300); border-color: var(--failing); }
+.btn.danger:hover {
+  color: var(--red-300); border-color: var(--failing);
+  background: color-mix(in srgb, var(--failing) 14%, var(--surface-raised));
+}
 
 input[type=text], input[type=password], input[type=number], select, textarea {
   width: 100%; padding: 8px var(--space-3);
@@ -198,7 +223,19 @@ input[type=text], input[type=password], input[type=number], select, textarea {
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--brand); box-shadow: var(--glow-focus); }
 input.bad, select.bad { border-color: var(--failing); }
 textarea { min-height: 96px; font-family: var(--font-mono); font-size: var(--text-sm); resize: vertical; }
-select { appearance: none; padding-right: var(--space-6); background-image: none; }
+/* A select says what it is by carrying a chevron. Without one it is a box with
+   a word in it, which beside a text field is a box with a word in it: "Choose…"
+   read as something to type. Two gradients rather than an image, for the same
+   reason nothing else on this page is fetched, and drawn in `--text-muted` so
+   it follows both appearances — the same mark the tenancy switch wears. */
+select {
+  appearance: none; padding-right: var(--space-6);
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+                    linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+  background-position: right 14px center, right 9px center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
 
 /* A stepper, because a size typed into a text box is a size that can be
    typed wrong. The unit is part of the control, not a hint beside it. */
@@ -377,6 +414,12 @@ table.board td { color: var(--text-muted); }
 table.board td.name { color: var(--text-strong); font-weight: var(--fw-semibold); }
 table.board td.name .id { font-size: var(--text-base); letter-spacing: var(--tracking-tight); }
 table.board td.blank { color: var(--text-faint); }
+/* Figures compare on their last digit or they do not compare at all. Tabular
+   numerals were already on, which only promises that 8 and 16,384 are drawn in
+   the same *widths* — left-aligned they still end in two different places. The
+   board classes the cells it knows are numbers; the head above them is built
+   without a class and stays where it is. */
+table.board td.num, table.board th.num { text-align: right; }
 .boardwrap { overflow-x: auto; }
 
 /* ---- the convergence mark ----------------------------------------------- */
@@ -699,6 +742,23 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
   from { transform: translateX(-50%) translateY(8px); opacity: 0; }
   to { transform: translateX(-50%); opacity: 1; }
 }
+/* Neither of these travels for somebody who asked that nothing does. It is a
+   second block rather than a line in the one above, and that is the whole
+   point: both of these elements are declared *below* that block and an id
+   weighs the same in a media query as it does out of one, so the entrance
+   written here would simply have been re-declared underneath it.
+   `fade` and not a no-op, and `fade` rather than a keyframe of its own: both
+   sit centred by a standing `translateX(-50%)`, and an animation that mentions
+   `transform` owns it for the whole run — which is how the palette used to
+   spend its entrance off to one side. Touching opacity alone leaves the
+   centring where it was put. */
+@media (prefers-reduced-motion: reduce) {
+  /* `#dialog` here rather than only in the block above: its own
+     `animation: dialogin` is declared *after* that one, so the earlier
+     reduced-motion rule never won and the create drawer travelled whatever the
+     reader had asked for. This block is declared after it and does. */
+  #palette, #toast, #dialog { animation: fade var(--dur-base) ease; }
+}
 #watchstate { font-size: var(--text-xs); color: var(--text-faint); white-space: nowrap; }
 #watchstate.live { color: var(--text-muted); }
 #watchstate .mark { margin-right: var(--space-2); }
@@ -717,12 +777,21 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
 .who {
   color: var(--text-muted);
   font-size: var(--text-xs);
-  white-space: nowrap;
   /* An operator's name is the one thing here that can be arbitrarily long, and
-     a header that reflows because of it moves every control beside it. */
+     a header that reflows because of it moves every control beside it. So the
+     width is capped — but capped on a single unwrapped line it took the end off
+     the chip, and the end is where " · operator" is: past about fourteen
+     characters the name was complete and the half saying what this account may
+     do had silently gone. It wraps to a second line instead, and only a name
+     too long for two of them is cut. */
   max-width: 22ch;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 /* The token alternative on the sign-in form. Present, and second: a person
@@ -828,7 +897,7 @@ table.conds .stale { color: var(--drifting); font-size: var(--text-xs); }
   min-width: 12rem;
   padding: var(--space-2) var(--space-3);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   color: var(--text-body);
   font-family: var(--font-mono);
@@ -1220,4 +1289,41 @@ pre.terminal:focus {
      its title flush against the glass. The tokens jump from 7 to 9 on purpose;
      so does this. */
   #content { padding: var(--space-5) var(--space-4) var(--space-9); }
+}
+/* Below this the header cannot hold one row honestly: the controls alone are
+   wider than the viewport, so the tenancy switch — the control on this page
+   where a wrong guess costs the most — was squeezed to a few pixels and the
+   whole page panned sideways anyway. On a phone a sideways pan is how somebody
+   finds out a control exists. It folds into two rows instead, and the break is
+   taken at the spacer that already separates who-and-where from what-to-do.
+   The folded height is a constant rather than `auto` because four fixed layers
+   are positioned under this bar — the rail drawer, its scrim, the create drawer
+   and its scrim — and a header that grew without telling them would be covered
+   by every one of them. */
+@media (max-width: 400px) {
+  :root { --top-h: 104px; }
+  #top {
+    flex-wrap: wrap; align-content: center; row-gap: var(--space-1);
+    height: var(--top-h); padding: var(--space-1) var(--space-3);
+  }
+  /* The spacer stops pushing and starts breaking: full width, no height. */
+  #top .grow { flex-basis: 100%; height: 0; }
+  /* And the switch takes the room the fold just freed, rather than shrinking to
+     a chevron with nothing beside it. */
+  #top #project { flex: 1 1 auto; min-width: 6rem; }
+  #railscrim { inset: var(--top-h) 0 0 0; }
+  aside#rail {
+    top: var(--top-h);
+    height: calc(100vh - var(--top-h));
+    height: calc(100dvh - var(--top-h));
+  }
+  #dialogscrim { inset: var(--top-h) 0 0 0; }
+  #dialog { top: var(--top-h); }
+}
+/* The drawer arrives without travelling. It sits here rather than in the
+   reduced-motion block above because the transition it has to undo is set
+   inside the breakpoint, and two selectors of the same weight are decided by
+   which comes last. */
+@media (max-width: 820px) and (prefers-reduced-motion: reduce) {
+  aside#rail { transition: none; }
 }

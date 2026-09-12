@@ -239,6 +239,7 @@ async fn register_pool(store: Arc<dyn Store>, id: &str) {
         ),
         PoolSpec {
             accepting: true,
+            node: String::new(),
             labels: vec!["dev".to_string()],
             volume_ceiling: Default::default(),
         },

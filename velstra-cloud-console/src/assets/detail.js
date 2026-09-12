@@ -5,7 +5,7 @@
 // spec alone is a wish. So the sheet leads with the verdict, then puts the two
 // halves in the same table, and only then lists the object's own detail.
 
-const sheet = { open: false, name: null, coll: null, timer: null, closers: [] };
+const sheet = { open: false, name: null, coll: null, timer: null, closers: [], opener: null };
 
 /// Something to undo when the sheet closes.
 ///
@@ -34,16 +34,83 @@ function closeSheet() {
   const s = $("sheet"), sc = $("scrim");
   if (s) s.remove();
   if (sc) sc.remove();
+  // The keyboard goes back where it came from. A panel that takes focus and
+  // then drops it on the body leaves whoever closed it at the top of the page:
+  // somebody who opened row forty with the keyboard had to tab past thirty-nine
+  // rows to get back to it, every time.
+  const back = sheet.opener;
+  sheet.opener = null;
+  if (back && back.isConnected) { try { back.focus(); } catch (e) {} }
+}
+
+/// What the tab key can land on inside one element, in the order it would.
+///
+/// A control inside a folded disclosure is left out: focus that lands on
+/// something nobody can see is the same trap one level down.
+const REACHABLE = "a[href], button:not([disabled]), input:not([disabled]), " +
+  "select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex=\"-1\"])";
+function reachable(root) {
+  return [...root.querySelectorAll(REACHABLE)].filter((n) => n.offsetParent !== null);
+}
+
+/// The keyboard while the sheet is up.
+///
+/// The sheet has always covered the page and taken the pointer, and until now
+/// it took nothing else: tab walked straight out of it and into the board
+/// behind the scrim, where every row is focusable and none of it can be seen or
+/// clicked. There was no way back but the mouse, and nothing on screen said
+/// where the focus had gone.
+function sheetKey(e, panel) {
+  // A form opened *from* the sheet sits on top of it and owns the keyboard.
+  // Escape is handled once, innermost first, in `app.js`.
+  if ($("dialog")) return;
+  if (e.key === "Escape") { e.stopPropagation(); closeSheet(); return; }
+  if (e.key !== "Tab") return;
+  const stops = reachable(panel);
+  if (!stops.length) { e.preventDefault(); return; }
+  // `-1` is the heading the sheet opens on, which is focusable but not a tab
+  // stop: forwards from there the browser lands on the first control by itself,
+  // and backwards it would leave, so that is the case the wrap has to catch.
+  const here = stops.indexOf(document.activeElement);
+  if (e.shiftKey && here <= 0) { e.preventDefault(); stops[stops.length - 1].focus(); }
+  else if (!e.shiftKey && here === stops.length - 1) { e.preventDefault(); stops[0].focus(); }
 }
 
 function openSheet(coll, r) {
+  // Whoever pressed, read before the old sheet is torn down: closing one hands
+  // focus back itself, so asking afterwards would name the previous sheet's
+  // opener rather than the row that was just clicked.
+  //
+  // A sheet drawn again over itself keeps the opener it already has. By the
+  // time a power press, a saved edit or an operation that ended re-opens one,
+  // the button that started it has been disabled or has gone with the panel it
+  // was in — so what this reads is `document.body`, and the keyboard would go
+  // back to the top of the page, which is the walk back through forty rows
+  // that remembering the opener exists to save.
+  const pressed = document.activeElement;
+  const opener = sheet.open || !pressed || pressed === document.body
+    ? sheet.opener
+    : pressed;
   closeSheet();
   const scrim = el("div", { id: "scrim", onclick: closeSheet });
-  const panel = el("aside", { id: "sheet", role: "dialog", "aria-label": nameOf(r) });
+  // A modal, and said so. `role="dialog"` on its own tells a screen reader what
+  // this is and not that everything behind it is out of reach — so the board
+  // under the scrim, which cannot be clicked and cannot be seen, was still
+  // there to be read line by line. `aria-modal` is what closes it off, and the
+  // label names the object rather than leaving "dialog" to stand for it.
+  const panel = el("aside", {
+    id: "sheet", role: "dialog", "aria-modal": "true", tabindex: "-1",
+    "aria-label": coll.singular + " " + idOf(r),
+    onkeydown: (e) => sheetKey(e, panel),
+  });
   document.body.appendChild(scrim);
   document.body.appendChild(panel);
-  sheet.open = true; sheet.coll = coll; sheet.name = nameOf(r);
+  sheet.open = true; sheet.coll = coll; sheet.name = nameOf(r); sheet.opener = opener;
   renderSheet(coll, r);
+  // Into the sheet, at the heading: it is the one line that says which object
+  // this is about, and starting at the first control skips it.
+  const head = panel.querySelector("h2") || panel;
+  try { head.focus(); } catch (e) {}
 }
 
 /// A second reading where the unit is one people mis-key. `65536` and `64 GiB`
@@ -128,6 +195,39 @@ async function goTo(name) {
   else toast("There is no " + coll.singular + " called " + shortName(name) + " any more.", "bad");
 }
 
+/// The disclosure the create form uses, around anything.
+///
+/// One level deeper, one click away, with its own inset surface — the same
+/// wording and the same aria wiring wherever it is used, so a reader who has
+/// opened one has opened all of them. `shut` carries the count, always: a fold
+/// that does not say how much is behind it is a fold nobody opens.
+///
+/// `id` where something needs to address it; otherwise one is minted, because
+/// the button and the region it controls have to be tied together by id and
+/// two of these can be on screen at once.
+let foldsMade = 0;
+function folded(id, shut, open, body) {
+  const key = id || "fold" + ++foldsMade;
+  const deeper = el("div.deeper.hidden", { id: key + "fields" }, body);
+  const toggle = el("button.disclose", { type: "button", id: key,
+    "aria-expanded": "false", "aria-controls": key + "fields" }, shut);
+  toggle.addEventListener("click", () => {
+    const shown = !deeper.classList.toggle("hidden");
+    toggle.setAttribute("aria-expanded", String(shown));
+    toggle.classList.toggle("open", shown);
+    toggle.textContent = shown ? open : shut;
+  });
+  return el("div.specfold", toggle, deeper);
+}
+
+/// How many entries a list may have before it is folded.
+///
+/// A node reports about a hundred CPU flags, and printed in full they *are* the
+/// Observation panel: everything the machine actually said about itself sits
+/// below them, off the bottom of the sheet. Twelve is about a screen of a
+/// narrow column, which is the most a value should cost the panel around it.
+const LONG_LIST = 12;
+
 /// Free text is free, but a value that is a resource name or a digest is read
 /// down a column of others like it, so it gets the mono face.
 function valueNode(v, kindHint) {
@@ -139,10 +239,15 @@ function valueNode(v, kindHint) {
     // (listeners, security-group rules, ceph disks and pools) hold objects.
     // Stringifying one of those printed "[object Object]" — the configuration
     // the sheet exists to show, hidden behind a JavaScript default.
-    return el("div", v.map((x) =>
+    const list = el("div", v.map((x) =>
       el("div", x !== null && typeof x === "object"
         ? valueNode(x)
         : nameLink(x) || el("span.mono", { title: String(x) }, shortName(x)))));
+    // Nothing is dropped, only folded — with the count on the button, so the
+    // length is readable without reading the list.
+    return v.length > LONG_LIST
+      ? folded(null, "Show all " + v.length, "Show fewer", list)
+      : list;
   }
   if (typeof v === "object") {
     return el("div", Object.entries(v).map(([k, sub]) =>
@@ -179,13 +284,23 @@ function pendingChanges(r) {
   // read, and this renders the answer.
   const answered = at(statusOf(r), "pendingChanges");
   if (!Array.isArray(answered)) return [];
-  const labels = { vcpus: "vCPU", memoryMib: "Memory", rootDiskGib: "Root disk" };
-  return answered.map((c) => ({
-    label: labels[pick(c, "field")] || pick(c, "field"),
-    from: pick(c, "from"),
-    to: pick(c, "to"),
-  }));
+  // The unit travels with the label. `4096 → 8192` and `5 → 20` are read off
+  // the same column one under the other, and the wire spells the field
+  // `memoryMib` — which is the unit, in a name nobody reads as one.
+  const named = {
+    vcpus: { label: "vCPUs", unit: "" },
+    memoryMib: { label: "Memory", unit: "MiB" },
+    rootDiskGib: { label: "Root disk", unit: "GiB" },
+  };
+  return answered.map((c) => {
+    const field = pick(c, "field");
+    const said = named[field] || { label: label(String(field)), unit: "" };
+    return { label: said.label, unit: said.unit, from: pick(c, "from"), to: pick(c, "to") };
+  });
 }
+
+/// One side of a pending change, with its unit where there is one.
+const withUnit = (c, v) => String(v) + (c.unit ? " " + c.unit : "");
 
 /// A node's PCI devices, each with what it drags along.
 function passableBlock(r) {
@@ -221,7 +336,7 @@ function pendingBlock(r) {
       "nothing here changes a machine that is already up."),
     el("div", changes.map((c) => el("div.cpuline",
       el("span.cpukey", c.label),
-      el("span.cpuval.mono", c.from + " \u2192 " + c.to)))));
+      el("span.cpuval.mono", withUnit(c, c.from) + " \u2192 " + withUnit(c, c.to))))));
 }
 
 function verdictBlock(coll, r) {
@@ -278,8 +393,85 @@ function agreementTable(coll, r) {
       body.appendChild(el("tr", el("td", { colspan: "4" }, el("div.note", a.note))));
     }
   }
+  // And the sizes, which are the same question and were not in this table.
+  //
+  // The schema pairs a spec field with a status field, and a guest's size has
+  // no status field to pair with: what it is running on is `status.runningSize`
+  // as a whole, and the difference is `status.pendingChanges`. So a guest
+  // resized from one vCPU to two while it ran showed two rows — power and node
+  // — both saying "agrees", on an object that was carrying the disagreement in
+  // a field this panel never read.
+  //
+  // Not called a disagreement and not tinted like one: nothing has failed here,
+  // and the platform is never going to resize a machine that is up. The mark
+  // says something is outstanding; the word says what it is waiting for.
+  const waiting = pendingChanges(r);
+  for (const c of waiting) {
+    any = true;
+    body.appendChild(el("tr",
+      el("td.muted", c.label),
+      el("td", withUnit(c, c.to)),
+      el("td", withUnit(c, c.from)),
+      el("td", el("span.state.drifting", mark("drifting"), "at next start"))));
+  }
+  if (waiting.length) {
+    body.appendChild(el("tr", el("td", { colspan: "4" }, el("div.note",
+      "The guest is running on what is under “Is”. It gets what was asked for when it next " +
+      "starts — nothing here changes a machine that is already up."))));
+  }
   table.appendChild(body);
   return any ? table : null;
+}
+
+/// Which network a guest is on, by way of the ports it holds.
+///
+/// `spec.networks` is *consumed* on create: the API mints a port per network —
+/// or one on the project's default network when nothing was named — stores the
+/// ports and empties the field, because two fields describing one set of
+/// interfaces are two fields that drift. So the field is empty on every guest
+/// that exists, and the row that renders it verbatim said "Networks: none"
+/// about a running machine with an address on a network.
+///
+/// The ports are named and followable straight away, so the row is right before
+/// anything has been asked. The network is a fact about the port and takes a
+/// read per port to get; the names replace the sentence when they arrive, the
+/// way an image's do, and what is on screen is true either way.
+function throughPorts(r) {
+  const ports = at(spec(r), "ports");
+  if (!Array.isArray(ports) || !ports.length) return null;
+  const mono = (v) => el("span.mono", { title: String(v) }, shortName(String(v)));
+  // The answer when there is one, and the ports underneath either way — so the
+  // line still says how the guest is attached once the network has replaced the
+  // sentence above it.
+  const found = el("div", el("span.faint", "through its ports"));
+  const box = el("div", found,
+    el("div", el("span.faint", "by way of "),
+      ports.map((p, i) => el("span", i ? ", " : "", nameLink(p) || mono(p)))));
+  const coll = collection("ports");
+  if (!coll) return box;
+  Promise.all(ports.map((p) => get(coll, String(p)).catch(() => null)))
+    .then((answers) => {
+      const lines = [];
+      const seen = new Set();
+      for (const port of answers) {
+        const network = port ? at(spec(port), "network") : null;
+        if (!network) continue;
+        const subnet = at(spec(port), "subnet");
+        // Two ports on one network are one answer. A guest with a second NIC on
+        // the same network is ordinary, and a row that named it twice would
+        // read as two networks.
+        const key = String(network) + "|" + String(subnet || "");
+        if (seen.has(key)) continue;
+        seen.add(key);
+        lines.push(el("div",
+          nameLink(network) || mono(network),
+          subnet ? el("span.faint", " · ") : null,
+          subnet ? (nameLink(subnet) || mono(subnet)) : null));
+      }
+      if (lines.length) fill(found, lines);
+    })
+    .catch(() => {});
+  return box;
 }
 
 function fieldValue(r, f) {
@@ -300,10 +492,14 @@ function fieldValue(r, f) {
     }
     case "ref":
       return refValue(f, v);
-    case "refList":
+    case "refList": {
+      // "none" is the wrong answer for a guest's networks — see `throughPorts`.
+      const through = f.key === "networks" && (!v || !v.length) ? throughPorts(r) : null;
+      if (through) return through;
       return !v || !v.length
         ? el("span.blank.faint", "none")
         : el("div", v.map((x) => el("div", refValue(f, x))));
+    }
     default:
       return valueNode(v);
   }
@@ -358,22 +554,28 @@ function specTable(coll, r) {
   // the form uses — same wording, same aria wiring, its own inset surface — so
   // the two views open the deeper level identically.
   const n = deep.childElementCount;
-  const deeper = el("div.deeper.hidden", { id: "specmorefields" }, el("table.kv", deep));
-  const toggle = el("button.disclose", { type: "button", id: "specmore",
-    "aria-expanded": "false", "aria-controls": "specmorefields" },
-    "More settings (" + n + ")");
-  toggle.addEventListener("click", () => {
-    const open = !deeper.classList.toggle("hidden");
-    toggle.setAttribute("aria-expanded", String(open));
-    toggle.classList.toggle("open", open);
-    toggle.textContent = open ? "Fewer settings" : "More settings (" + n + ")";
-  });
-  return el("div.specfold", table, toggle, deeper);
+  return el("div.specfold", table,
+    folded("specmore", "More settings (" + n + ")", "Fewer settings", el("table.kv", deep)));
 }
+
+/// Whoever is signed in runs this cell, so nothing on these pages is an
+/// implementation detail to them.
+const runsTheCell = () => !!(session.who && session.who.cellAdmin);
+
+/// Reported fields that are about how the platform is built rather than about
+/// the customer's machine.
+///
+/// The VMM's process id is the case: the pid of a process on a host the tenant
+/// cannot log into, on a machine the API does not even tell them the name of,
+/// sitting in the middle of the facts about their own guest. It is genuinely
+/// useful to whoever operates the cell, so it is not removed — it is one level
+/// down for everybody else.
+const HOST_SIDE = new Set(["vmmPid", "vmm_pid"]);
 
 function statusTable(r) {
   const table = el("table.kv");
   const body = el("tbody");
+  const deep = el("tbody");   // host-side detail, for an account that is not the cell's
   for (const [k, v] of Object.entries(statusOf(r))) {
     if (k === "conditions" || k === "observedGeneration" || k === "observed_generation") continue;
     // A millisecond timestamp reads as one wherever the name says "when":
@@ -381,16 +583,19 @@ function statusTable(r) {
     // a thirteen-digit number until "login" was on this list.
     const isTime = /(at|heartbeat|transition|login|seen|expires|since|until)$/i.test(k)
       && typeof v === "number" && v > 1e12;
-    body.appendChild(el("tr",
+    (HOST_SIDE.has(k) && !runsTheCell() ? deep : body).appendChild(el("tr",
       el("td", label(k)),
       el("td", isTime ? el("span", { title: stamp(v) }, ago(v)) : valueNode(v), isTime ? null : alsoIn(k, v))));
   }
-  if (!body.childElementCount) {
+  if (!body.childElementCount && !deep.childElementCount) {
     body.appendChild(el("tr", el("td", { colspan: "2" },
       el("span.faint", "Nothing has been reported about this object yet."))));
   }
   table.appendChild(body);
-  return table;
+  if (!deep.childElementCount) return table;
+  const n = deep.childElementCount;
+  return el("div.specfold", table,
+    folded("hostside", "Host-side detail (" + n + ")", "Fewer details", el("table.kv", deep)));
 }
 
 /// Conditions the API computes on every read instead of storing them. See
@@ -438,6 +643,17 @@ function conditionsTable(r) {
   return table;
 }
 
+/// The object itself: what it is called, when it arrived — and, for whoever
+/// operates the cell, how the platform holds it.
+///
+/// The third element of a row marks it as the platform's own bookkeeping: a uid
+/// nobody addresses anything by, the revision an `If-Match` carries, the
+/// generation counter the Convergence panel above already gives twice in words,
+/// which region and cell hold the row, and the names of the controllers keeping
+/// a deletion open. An operator reads all of it — it is how a support call gets
+/// answered — and a customer got five rows of somebody else's implementation
+/// above the two facts they came for. Folded, not dropped: it is one click away
+/// for them too, and the order an operator sees is unchanged.
 function metaTable(r) {
   const m = meta(r);
   const p = pick(m, "placement") || {};
@@ -445,18 +661,24 @@ function metaTable(r) {
   const finalizers = pick(m, "finalizers") || [];
   const rows = [
     ["Name", el("span.mono", nameOf(r))],
-    ["UID", el("span.mono", String(pick(m, "uid") || "—"))],
-    ["Placement", el("span.mono", (p.region || "?") + " · " + (p.cell || "?"))],
-    ["Generation", el("span.num", String(generation(r)))],
-    ["Revision", el("span.mono", revision(r) === null ? "—" : revision(r))],
+    ["UID", el("span.mono", String(pick(m, "uid") || "—")), true],
+    ["Placement", el("span.mono", (p.region || "?") + " · " + (p.cell || "?")), true],
+    ["Generation", el("span.num", String(generation(r))), true],
+    ["Revision", el("span.mono", revision(r) === null ? "—" : revision(r)), true],
     ["Created", el("span", { title: stamp(pick(m, "createdAt")) }, ago(pick(m, "createdAt")))],
   ];
   if (deletedAt(r)) rows.push(["Deletion asked",
     el("span", { title: stamp(deletedAt(r)) }, ago(deletedAt(r)))]);
-  if (finalizers.length) rows.push(["Held by", valueNode(finalizers)]);
+  if (finalizers.length) rows.push(["Held by", valueNode(finalizers), true]);
   if (Object.keys(labels).length) rows.push(["Labels", valueNode(labels)]);
-  const body = el("tbody", rows.map(([k, v]) => el("tr", el("td", k), el("td", v))));
-  return el("table.kv", body);
+  const line = ([k, v]) => el("tr", el("td", k), el("td", v));
+  const cell = runsTheCell();
+  const table = el("table.kv", el("tbody", rows.filter((x) => cell || !x[2]).map(line)));
+  const deep = cell ? [] : rows.filter((x) => x[2]);
+  if (!deep.length) return table;
+  return el("div.specfold", table,
+    folded("objectmore", "Platform detail (" + deep.length + ")", "Fewer details",
+      el("table.kv", el("tbody", deep.map(line)))));
 }
 
 /// Why a thing was not placed, as the answer rather than as a spinner.
@@ -494,14 +716,19 @@ async function explainInto(host, coll, r) {
 
 /// Everything that has happened to one object, newest first.
 ///
-/// Two sources, deliberately in one list: the changes that were **accepted**
-/// (operations) and the ones that were **refused** (audit). Reading only the
-/// first is how somebody concludes their click did nothing — the refusal is
-/// the answer, and it lives in a collection they would otherwise never open.
+/// Two sources, deliberately in one list: the operations, which are the
+/// receipts for what the platform was asked to converge, and the audit records,
+/// which are what the API itself did — every change it accepted and everybody
+/// it told no. Reading only the first is how somebody concludes their click did
+/// nothing — the refusal is the answer, and it lives in a collection they would
+/// otherwise never open.
 async function historyInto(host, name) {
   fill(host, el("p.faint", "Asking…"));
   try {
-    const { operations, refusals } = await historyOf(name);
+    // `refusals` as the API hands it over, `audit` here: the collection holds
+    // every kind of record, and reading it as a list of refusals is exactly the
+    // mistake the loop below used to make.
+    const { operations, refusals: audit } = await historyOf(name);
     const lines = [];
     for (const o of operations) {
       const s = statusOf(o);
@@ -514,11 +741,20 @@ async function historyInto(host, name) {
         detail: String(pick(s, "error") || (pick(s, "done") ? "" : "still running")),
       });
     }
-    for (const a of refusals) {
+    for (const a of audit) {
+      // `spec.kind` says which of the two this is, and until it was read every
+      // record in this panel was painted red and had " refused" put after its
+      // verb — including the `changed` ones, which are the record of a write
+      // that *worked*. Creating a user read "create refused by admin — created
+      // it" on the account sitting there, made; editing a project read "update
+      // refused by admin — changed it". A change gets the verb alone and the
+      // settled mark; only `refused` keeps the word and the failing one.
+      const refused = String(pick(spec(a), "kind") || "").toLowerCase() === "refused";
+      const verb = String(pick(spec(a), "verb") || "?");
       lines.push({
         at: Number(pick(meta(a), "createdAt") || 0),
-        kind: "failing",
-        what: String(pick(spec(a), "verb") || "?") + " refused",
+        kind: refused ? "failing" : "settled",
+        what: refused ? verb + " refused" : verb,
         who: String(pick(spec(a), "subject") || "—"),
         // `detail`, which is the field an audit record actually has — and it
         // holds the *same sentence* the person was given, not a paraphrase of
@@ -676,6 +912,25 @@ async function maintenanceInto(host, r) {
   }
 }
 
+/// What goes with the object, per collection, in one sentence.
+///
+/// The question was "Delete <id>?" for everything — the same words over a
+/// throwaway port and over the volume somebody's database is on. What a person
+/// is actually deciding is not whether to delete a row, it is whether they are
+/// ready to lose what the row stands for, and that differs enough between these
+/// four that saying it is the difference between a question and a formality.
+///
+/// Only the four where the answer is bytes or an address. Everything else is a
+/// declaration the platform can be told again, and a sentence on each of those
+/// would train people to click through this one.
+const DELETE_COSTS = {
+  instances: "Its root disk goes with it and the addresses it holds are released.",
+  volumes: "The data on it goes with it, and the platform keeps no copy to restore from.",
+  backups: "This is the copy itself, not a reference to one: the bytes go with it.",
+  captures: "This is the image itself, not a reference to one: the bytes go with it, " +
+    "and nothing made from it afterwards.",
+};
+
 /// `opts.verb` renames the action where "delete" is the wrong word for it, and
 /// `opts.warning` is what the operator is actually deciding — used where that
 /// differs from object to object, which is exactly one place: abandoning a
@@ -685,12 +940,15 @@ function deleteControl(coll, r, opts = {}) {
   const host = el("span.confirm");
   const ask = () => {
     // Deleting a guest is destructive and cannot be undone, so it asks — once,
-    // in place, naming what it is about to delete. Everything else on this page
-    // is done without a confirmation, which is what keeps this one meaningful.
+    // in place, naming what it is about to delete and what goes with it. This
+    // and the two power presses that take a machine away are the only things on
+    // this page that ask, which is what keeps the question meaningful.
+    const costs = DELETE_COSTS[coll.id];
     fill(host,
       opts.warning
         ? el("p" + (opts.grave ? ".err" : ".muted"), { id: "deletewarning" }, opts.warning)
-        : el("span.muted", verb + " " + idOf(r) + "? "),
+        : el("span.muted", { id: costs ? "deletewarning" : null },
+            verb + " " + idOf(r) + "? " + (costs ? costs + " " : "")),
       el("span.btns",
         btn(verb, { quiet: true, id: "confirmdelete", onclick: go }),
         btn("Keep", { onclick: rest })));
@@ -702,7 +960,12 @@ function deleteControl(coll, r, opts = {}) {
     // that did nothing until the row is gone.
     working(host.querySelector("#confirmdelete"));
     try {
-      await remove(coll, idOf(r), revision(r));
+      // Its own name, which `pathFor` takes as it is. `idOf` rebuilt the path
+      // out of the project currently selected, and on the one board that merges
+      // two scopes — the catalogue's cell-wide images beside the project's —
+      // that addressed an object nobody had named: retiring a published image
+      // answered "projects/p1/images/debian-13 does not exist".
+      await remove(coll, nameOf(r), revision(r));
       toast(opts.done || "Deletion asked for. It stays visible until its finalizers let go.");
       forgetOptions(coll.id);
       show(coll.id);
@@ -748,6 +1011,171 @@ function credentialControl(coll, r) {
   return host;
 }
 
+/// Ask again, a few seconds apart, until there is an answer or the time is up.
+///
+/// Bounded, and deliberately not by much: this is a courtesy on top of the
+/// object, which is still where the truth is written, and a console that kept
+/// asking all afternoon would be a tab that never goes quiet on a screen people
+/// leave open for days.
+const ASK_AGAIN_MS = 3000;
+const ASK_FOR_MS = 30000;
+
+/// `{ answer }`, `{ timedOut }` or `{ gone }`.
+///
+/// `about` ties the asking to a sheet: when that sheet is closed, or has moved
+/// to another object, there is nobody left to tell and the asking stops. A
+/// caller in the middle of a change of its own passes nothing and is left to
+/// finish it — a guest stopped for a restart has to be started again whether or
+/// not anybody is still watching the panel that asked.
+async function askAgainUntil(ask, about) {
+  const until = Date.now() + ASK_FOR_MS;
+  for (;;) {
+    await new Promise((go) => setTimeout(go, ASK_AGAIN_MS));
+    if (about && (!sheet.open || sheet.name !== about)) return { gone: true };
+    const answer = await ask().catch(() => null);
+    if (answer !== null && answer !== undefined) return { answer };
+    if (Date.now() >= until) return { timedOut: true };
+  }
+}
+
+/// Follow the operation a write minted, and say so if it ends badly.
+///
+/// A write answers the moment the API has *recorded* it, which is not the
+/// moment it happened: the object is accepted, an operation is minted, and
+/// anything that goes wrong afterwards is written there. Nothing on this page
+/// was looking, so a change a controller refused a second later reported
+/// nothing at all and the sheet went on showing the ask.
+///
+/// Only for an answer that names one. A create answers `202` with
+/// `{operation, target}`; a change and a delete answer with the object and name
+/// the operation in a header, which `request` does not hand on — so those are
+/// followed the day it does, and nothing is inferred here from the shape of a
+/// body.
+async function followOperation(answer, coll, r) {
+  const operations = collection("operations");
+  const name = answer && typeof answer === "object" ? pick(answer, "operation") : null;
+  if (!operations || !name || typeof name !== "string") return;
+  const about = nameOf(r);
+  const ended = await askAgainUntil(
+    () => get(operations, name).then((op) => (pick(statusOf(op), "done") === true ? op : null)),
+    about);
+  const failed = ended.answer ? pick(statusOf(ended.answer), "error") : null;
+  if (!failed) return;
+  toast(String(failed), "bad");
+  // And the object as it is now, because the sentence is about it: a guest
+  // whose change was refused is not the guest this sheet was drawn from.
+  const fresh = await get(coll, about).catch(() => null);
+  if (fresh && sheet.open && sheet.name === about) openSheet(coll, fresh);
+}
+
+/// Power, on the machine itself.
+///
+/// Start and Stop lived on the board's bulk bar and nowhere else, so stopping
+/// one guest meant leaving its sheet, finding its row among forty, ticking a
+/// box and using a control written for doing one thing to many. Restart did not
+/// exist in the product at all.
+///
+/// There is no restart verb, and there must not be one: a spec says what a
+/// guest should be doing, and "off, then on" is not a state a machine can be
+/// in. So it is two asks with a wait between them, done here — where a failure
+/// at either step is said out loud, and the guest is left somewhere this sheet
+/// can describe truthfully rather than half way through something invisible.
+function powerControl(coll, r) {
+  const name = nameOf(r);
+  const guest = idOf(r);
+  const host = el("span.confirm");
+  // What was *asked* for, not what is reported. This control changes the ask,
+  // and a guest already asked to stop must not be offered Stop a second time
+  // while the node works on it. Nothing set means Running: a guest somebody
+  // asked to exist runs.
+  const wants = String(pick(spec(r), "desiredState") || "Running");
+
+  // The object as it is now, drawn again. Whatever happened, the sheet is what
+  // says which state the guest is in, so it is what is brought up to date.
+  const again = async () => {
+    const fresh = await get(coll, name).catch(() => null);
+    if (fresh && sheet.open && sheet.name === name) openSheet(coll, fresh);
+    // Only the board this guest is on. A restart waits for the machine to go
+    // down before it asks for it to come back, which is half a minute somebody
+    // spends elsewhere — and a list that replaces itself with instances because
+    // a press finished behind them is a console that navigates on its own.
+    if (view.coll && view.coll.id === coll.id) show(coll.id);
+  };
+
+  // One ask, either way: what changes between Start and Stop is the word in the
+  // spec, and a refusal lands the same way for both.
+  const goPower = async (state) => {
+    try {
+      const answer = await patch(coll, name, { spec: { desiredState: state } }, revision(r));
+      toast("Asked for. The node reports the state; watch the observation catch up.");
+      followOperation(answer, coll, r);
+      await again();
+    } catch (e) { toast(e.message, "bad"); rest(); }
+  };
+
+  const goRestart = async () => {
+    try {
+      const stopping = await patch(coll, name, { spec: { desiredState: "Stopped" } }, revision(r));
+      followOperation(stopping, coll, r);
+      // Read back until the node says it is off. Asking for Running while the
+      // guest is still up is the spec it already has — not a write, and not a
+      // restart: the platform would accept it, change nothing, and this control
+      // would have reported a bounce that never happened.
+      const off = await askAgainUntil(() =>
+        get(coll, name).then((fresh) => (at(statusOf(fresh), "state") === "Stopped" ? fresh : null)));
+      if (!off.answer) {
+        toast(guest + " has not stopped, so it was not started again. It is asked to be stopped; " +
+          "starting it is one press once it is.", "bad");
+        await again();
+        return;
+      }
+      // The revision the wait ended on, not the one this sheet was drawn with:
+      // the stop moved it, and an If-Match carrying the old one is refused.
+      await patch(coll, name, { spec: { desiredState: "Running" } }, revision(off.answer));
+      toast("Stopped, and asked to start again.");
+      await again();
+    } catch (e) {
+      toast(e.message, "bad");
+      await again();
+    }
+  };
+
+  // Stopping a machine is the machine going away for a while, so it asks and
+  // names what goes with it — the same rule the bulk bar and the delete follow.
+  // Starting one asks nothing: it is the press that undoes the other two.
+  const askFirst = (which) => {
+    const stopping = which === "stop";
+    fill(host,
+      el("p.muted", { id: which + "warning" }, stopping
+        ? "Stop " + guest + "? Whatever it is serving stops answering until it is started again."
+        : "Restart " + guest + "? It is stopped and started again, and whatever it is serving " +
+          "stops answering until it is back up."),
+      el("span.btns",
+        // The word while it runs is spelled out rather than derived: a restart
+        // waits for the guest to go down before it asks for it to come back, so
+        // this is the press on this sheet that most needs to say it is working.
+        btn(stopping ? "Stop" : "Restart",
+          { quiet: true, id: "confirm" + which,
+            busy: stopping ? "Stopping…" : "Restarting…",
+            onclick: stopping ? () => goPower("Stopped") : goRestart }),
+        btn(stopping ? "Leave it running" : "Leave it as it is", { onclick: rest })));
+  };
+
+  function rest() {
+    fill(host,
+      wants === "Stopped"
+        ? btn("Start", { id: "startbtn", busy: "Starting…", onclick: () => goPower("Running") })
+        : btn("Stop", { id: "stopbtn", onclick: () => askFirst("stop") }),
+      // Offered whichever way the guest is asked to be: the machine somebody
+      // most wants to bounce is the one that is up and wrong, and a restart of
+      // a stopped guest is a start that does not need talking out of.
+      btn("Restart", { id: "restartbtn", onclick: () => askFirst("restart") }));
+  }
+
+  rest();
+  return host;
+}
+
 function renderSheet(coll, r) {
   const panel = $("sheet");
   if (!panel) return;
@@ -756,7 +1184,10 @@ function renderSheet(coll, r) {
 
   panel.appendChild(el("div", { id: "sheethead" },
     el("div.grow",
-      el("h2", idOf(r)),
+      // `tabindex="-1"` so the sheet can put the keyboard here when it opens.
+      // Not reachable by tab: a heading in the tab order is a stop that does
+      // nothing on every pass after the first.
+      el("h2", { tabindex: "-1" }, idOf(r)),
       el("p.faint.mono", { title: nameOf(r) }, coll.singular + " · " + nameOf(r))),
     btn("Close", { id: "closesheet", onclick: closeSheet })));
 
@@ -774,6 +1205,13 @@ function renderSheet(coll, r) {
   // that will be accepted.
   if (coll.editable && holdsThePen && allows("edit")) {
     acts.appendChild(btn("Edit", { primary: true, id: "editbtn", onclick: () => openEdit(coll, r) }));
+  }
+  // Power, beside the rest, on the machine it is about. The same rung as Edit,
+  // and for the same reason: the API treats a change of desired state as one of
+  // the things an operator may do, so the button that appears is one that will
+  // be accepted.
+  if (coll.id === "instances" && allows("edit")) {
+    acts.appendChild(powerControl(coll, r));
   }
   // Placement is a statement about the machine room, and the API refuses the
   // verb to anybody who cannot see machines — so the button only exists where

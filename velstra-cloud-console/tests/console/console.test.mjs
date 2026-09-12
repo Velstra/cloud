@@ -155,7 +155,11 @@ await test("the console says who is signed in", async () => {
   // Name and standing both: an operator who cannot tell which account they are
   // using eventually does something as the wrong one.
   check(/Test Operator/.test(chip), `the header said "${chip}"`);
-  check(/operator/.test(chip), `the header did not say this account holds the cell: "${chip}"`);
+  // "cell administrator", not "operator": one of the four project rungs is
+  // also called operator, and it is the rung that may least — so the same word
+  // in the same bar meant both "may do everything here" and "may do least".
+  check(/cell administrator/.test(chip),
+    `the header did not say this account holds the cell: "${chip}"`);
 });
 
 await test("the password field does not keep the password", async () => {
@@ -2657,11 +2661,27 @@ await test("several guests can be stopped at once, and every refusal is named", 
   check(picked.count.includes("2 selected"), `the bar does not say what is selected: ${picked.count}`);
   check(!picked.sheet, "ticking a row opened its sheet over the board");
 
+  // Stopping asks first now, and names what goes quiet. Forty machines going
+  // off together is the press on this bar that most needs a question, and it
+  // had none: one mis-click took every ticked row down without a word.
   await page.evaluate(`document.querySelector('[data-bulk="stop"]').click()`);
+  const question = await waitFor(page, `(() => {
+    const box = document.getElementById("bulkresult");
+    const t = box ? box.textContent : "";
+    return t.includes("Stop ") ? t : null;
+  })()`, { timeout: 15000 });
+  check(/db-1/.test(question) && /web-1/.test(question),
+    `the question does not name the guests: ${question}`);
+  check(/stops answering/.test(question),
+    `the question does not say what stopping costs: ${question}`);
+  check(!!(await page.evaluate(`!!document.getElementById("bulkno")`)),
+    "there is no way out of the question");
+
+  await page.evaluate(`document.getElementById("bulkyes").click()`);
   const outcome = await waitFor(page, `(() => {
     const box = document.getElementById("bulkresult");
     const t = box ? box.textContent : "";
-    return t && !t.includes("Working") ? t : null;
+    return t && !t.includes("Working") && !t.includes("Leave them running") ? t : null;
   })()`, { timeout: 15000 });
   check(/\d+ done/.test(outcome), `the result does not say what happened: ${outcome}`);
   // Partial success is the normal case, so the panel must say which is which —

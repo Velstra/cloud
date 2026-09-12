@@ -45,6 +45,22 @@ const check = (kind, value) => {
   return (CHECKS[kind] || CHECKS.none)(String(value));
 };
 
+/// A number outside the range its own control declares.
+///
+/// The stepper says "between 1 and 256" while somebody types, and then submit
+/// recomputed every field's error from `CHECKS` alone — which knows nothing
+/// about ranges — wiped the sentence and posted the value anyway. A bound that
+/// is claimed on the way in and not enforced on the way out is worse than no
+/// bound: it is the form telling somebody the platform will stop them.
+function outOfRange(f, value) {
+  if (!f || f.kind !== "number") return "";
+  if (value === "" || value === null || value === undefined) return "";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "not a number";
+  return n < f.min || n > f.max
+    ? "between " + f.min.toLocaleString() + " and " + f.max.toLocaleString() : "";
+}
+
 /// Checks that need two fields at once. Kept apart from the per-field ones
 /// because they can only run when both have been answered, and complaining
 /// about a gateway before the range exists is nagging, not validating.
@@ -164,6 +180,25 @@ const DERIVE = {
         " has not been placed on a node yet, so there is nothing to attach it to.",
     },
   },
+  // A flavor *is* the size, and the field's own help has always said so:
+  // "picking one sets the vCPUs, memory and root disk below". It did not.
+  // Choosing `m1-small` left the three controls at 2 / 2048 / 20 and the
+  // request carried the flavor and those numbers together; the API applied the
+  // flavor, so the guest came up at 1 / 1024 / 5 — a quarter of what the form
+  // was showing while somebody pressed Create.
+  instances: {
+    flavor: {
+      values: (obj) => ({
+        vcpus: Number(pick(spec(obj), "vcpus")) || "",
+        memoryMib: Number(pick(spec(obj), "memoryMib")) || "",
+        rootDiskGib: Number(pick(spec(obj), "rootDiskGib")) || "",
+      }),
+      // A flavor is three numbers and a sentence; one that carries no numbers
+      // is not a size this form can apply, and leaving the previous ones on
+      // screen under its name is the defect this rule exists to remove.
+      missing: (obj) => idOf(obj) + " does not say what size it is.",
+    },
+  },
 };
 
 function fieldControl(form, f) {
@@ -171,9 +206,30 @@ function fieldControl(form, f) {
   const box = el("div.field" + (WIDE.includes(f.kind) ? ".wide" : ""));
   const id = "f-" + f.key.replace(/\./g, "-");
   form.boxes[f.key] = box;
-  box.appendChild(el("label", { for: id }, f.label, f.required ? el("span.req", " ·") : null));
-  const err = el("div.err.hidden");
-  const setErr = (m) => { err.textContent = m || ""; err.classList.toggle("hidden", !m); };
+  // The marker said "required" in colour and in nothing else — no `required` on
+  // the control, no `aria-required`, and no legend anywhere saying what a
+  // coloured middle dot means. The dot is hidden from a reader and the word is
+  // put beside it, so the field is announced as required once rather than as
+  // "dot".
+  box.appendChild(el("label", { for: id }, f.label, f.required
+    ? el("span.req", el("span", { "aria-hidden": "true" }, " ·"),
+      el("span.visually-hidden", " required"))
+    : null));
+  const hintId = id + "-hint";
+  const errId = id + "-err";
+  const err = el("div.err.hidden", { id: errId });
+  // The sentence is attached to the control, not merely placed beside it. A
+  // reader that is told "vCPUs, edit, 2" and nothing more has no way to reach
+  // the message explaining what was refused, which is the one thing on this
+  // page written for the moment something goes wrong. `aria-invalid` says
+  // *that* it is wrong; `aria-describedby`, set below, says what.
+  const setErr = (m) => {
+    err.textContent = m || "";
+    err.classList.toggle("hidden", !m);
+    const c = box.querySelector("[id='" + id + "']");
+    if (!c) return;
+    if (m) c.setAttribute("aria-invalid", "true"); else c.removeAttribute("aria-invalid");
+  };
   form.errs[f.key] = setErr;
 
   const commit = (value, control) => {
@@ -215,10 +271,16 @@ function fieldControl(form, f) {
       input.addEventListener("input", () => {
         const n = Number(input.value);
         commit(input.value === "" ? "" : n, input);
-        setErr(input.value !== "" && (n < f.min || n > f.max)
-          ? "between " + f.min.toLocaleString() + " and " + f.max.toLocaleString() : "");
+        setErr(outOfRange(f, input.value));
         reread();
       });
+      // How another answer writes into this control. A flavor decides the three
+      // sizes, and setting only `form.values` would leave the stepper — and the
+      // GiB reading under it — showing the number it had before.
+      form.shows[f.key] = (v) => {
+        input.value = v === undefined || v === null ? "" : String(v);
+        reread();
+      };
       box.appendChild(el("div.stepper",
         el("button", { type: "button", tabindex: "-1", "aria-label": "less", onclick: () => nudge(-f.step) }, "−"),
         input,
@@ -301,7 +363,17 @@ function fieldControl(form, f) {
       s.addEventListener("change", () => {
         commit(s.value, s);
         const derive = (DERIVE[form.coll.id] || {})[f.key];
-        const chosen = derive && (form.refs[f.collection] || []).find((o) => nameOf(o) === s.value);
+        // Matched by either spelling, because this picker produces both. A
+        // flavor's option carries the bare `m1-small` the field is spelled
+        // with, so looking it up by `nameOf` alone found nothing and the
+        // derivation silently did not happen — which is exactly how the sizes
+        // stayed where they were. The other spelling is the kept option: the
+        // API stores `spec.flavor` as the full `flavors/m1-small`, so an edit
+        // offers that one value under the name that arrived, and a form that
+        // only knew the field's own spelling went quiet again the moment
+        // somebody picked another size and then picked the original back.
+        const chosen = derive && (form.refs[f.collection] || [])
+          .find((o) => idOf(o) === s.value || nameOf(o) === s.value);
         if (chosen) {
           for (const [key, value] of Object.entries(derive.values(chosen))) {
             form.setValue(key, value);
@@ -380,8 +452,24 @@ function fieldControl(form, f) {
     }
   }
 
-  if (f.help) box.appendChild(el("div.hint", f.help));
+  if (f.help) box.appendChild(el("div.hint", { id: hintId }, f.help));
   box.appendChild(err);
+  // The hint that explains the control and the error that refuses it, named
+  // rather than merely adjacent. The error node is there from the start — empty
+  // and hidden until something is wrong — so it is pointed at once, here,
+  // rather than being a description that comes and goes under the reader.
+  const main = box.querySelector("[id='" + id + "']");
+  if (main) {
+    main.setAttribute("aria-describedby", (f.help ? hintId + " " : "") + errId);
+    if (f.required && !f.derived) {
+      if (/^(INPUT|SELECT|TEXTAREA)$/.test(main.tagName)) {
+        main.setAttribute("required", "");
+        main.setAttribute("aria-required", "true");
+      } else if (main.getAttribute("role")) {
+        main.setAttribute("aria-required", "true");
+      }
+    }
+  }
   // Derived: computed by the platform, shown but never asked. Locked: decided
   // before this dialog opened — the guest a migration moves is the object it was
   // started from, and letting it be changed here would leave every answer the
@@ -950,11 +1038,19 @@ function renderRefList(form, f, host) {
         form.revalidate();
       },
   }));
-  // "Nothing to attach yet" is true and useless on its own. A project that has
-  // never had a network reaches this on its very first guest, and what it needs
-  // is the order to do things in — not a disabled button.
-  if (!offered.length && f.whenEmpty) {
-    host.appendChild(el("p.muted", f.whenEmpty));
+  // "Nothing to attach yet" is true and useless on its own, and now that the
+  // button it sits on is genuinely disabled it is a dead end. A project that
+  // has never had a network reaches this on its very first guest, and what it
+  // needs is the order to do things in.
+  //
+  // The schema's own sentence where the field carries one. Where it does not —
+  // `networks` carries none, because the field was written for a platform where
+  // it could not be empty — the collection's own title is at least where to go.
+  if (!offered.length) {
+    const from = collection(f.collection);
+    host.appendChild(el("p.muted", f.whenEmpty ||
+      "Nothing under " + ((from && from.title) || f.collection) +
+      " to attach yet. Make one there first."));
   }
 }
 
@@ -966,15 +1062,57 @@ function closeDialog() {
   if (s) s.remove();
 }
 
-function nest(flat) {
+/// The flat answers as the spec's own shape, dropping what was never answered.
+///
+/// `clear` is the set of keys the operator **emptied**, and it is only ever
+/// non-empty on an edit. Both halves are load-bearing:
+///
+///  * On a **create**, an empty list has to be left out. This API reads
+///    `ports: []` as "a guest on no network" — a different request from saying
+///    nothing, which gets the project's default network. Sending the form's
+///    untouched empty list would quietly make every new guest unreachable.
+///  * On an **edit**, leaving it out is the bug. Taking the last volume off the
+///    list, or emptying a text field, sent nothing at all; a patch is an RFC
+///    7386 merge, so a key that is absent is a key that keeps the value it had
+///    — and the toast said the change had been asked for.
+///
+/// A cleared scalar goes as `null`, which is how that merge spells "remove
+/// this": `""` would be *a value*, and this platform has been bitten by one
+/// already — an empty pool on a volume matched no pool agent's filter and left
+/// the volume unprovisioned for ever with nothing saying why. A cleared list
+/// goes as `[]`, because the merge replaces an array whole.
+function nest(flat, clear) {
   const out = {};
   for (const [path, value] of Object.entries(flat)) {
-    if (value === "" || value === undefined || value === null) continue;
-    if (Array.isArray(value) && !value.length) continue;
+    const blank = value === "" || value === undefined || value === null ||
+      (Array.isArray(value) && !value.length);
+    if (blank && !(clear && clear.has(path))) continue;
+    const send = blank ? (Array.isArray(value) ? [] : null) : value;
     const segs = path.split(".");
     let here = out;
     for (const seg of segs.slice(0, -1)) here = here[seg] || (here[seg] = {});
-    here[segs[segs.length - 1]] = value;
+    here[segs[segs.length - 1]] = send;
+  }
+  return out;
+}
+
+/// The keys this edit **unset**: they arrived with a value and have none now.
+///
+/// "Cleared" and "never filled in" look identical in `form.values` — both are
+/// `""` or `[]` — so the difference is the object the form opened on. Only that
+/// comparison can tell a removal from an unanswered question.
+///
+/// Numbers, switches and moments are left out on purpose. An empty stepper is
+/// an unanswered stepper, not a request to unset a size — nobody clears the
+/// vCPUs of a machine — and a switch and a moment are never empty in the first
+/// place. Asking to remove `vcpus` from a spec that has to have one would be a
+/// refusal earned by the form rather than by the operator.
+function cleared(coll, before, values) {
+  const held = (v) => (Array.isArray(v) ? v.length > 0 : v !== "" && v !== undefined && v !== null);
+  const out = new Set();
+  for (const f of coll.fields) {
+    if (f.derived || f.kind === "number" || f.kind === "switch" || f.kind === "moment") continue;
+    if (held(before[f.key]) && !held(values[f.key])) out.add(f.key);
   }
   return out;
 }
@@ -988,16 +1126,72 @@ function flatten(obj, fields) {
   return out;
 }
 
+/// The same, with the lists copied.
+///
+/// `flatten` hands back the very array that is on the resource, and every list
+/// control edits its array in place — so removing a row removed it from the
+/// object the sheet was still showing, and there was nothing left to compare an
+/// edit against. `cleared` needs a copy of what *arrived* to tell a removal
+/// from a question nobody answered.
+function arrived(obj, fields) {
+  const out = flatten(obj, fields);
+  for (const [key, v] of Object.entries(out)) if (Array.isArray(v)) out[key] = v.slice();
+  return out;
+}
+
 /// The body a create takes. The contract says "id in the body" and no more, so
 /// the exact shape is decided in one place — if the API wants another, this is
 /// the function that changes and nothing else does.
 const createBody = (id, specValues) => ({ id, spec: specValues });
 
+/// Whether this account could answer this question at all.
+///
+/// A picker over a collection the API refuses this account can only ever say
+/// "none exist yet". A tenant was offered "Pinned to node" — nodes are the
+/// cell's, and 403 to them — and "Passed-through devices", and both were empty
+/// controls with no way to find out why. An empty control is not neutral: it
+/// reads as "this cell has none", which is a claim about the platform rather
+/// than about what this token may see.
+///
+/// Only where the field is optional. A **required** one nobody can fill is a
+/// form that cannot be submitted, and hiding it would turn a dead end somebody
+/// can read into one they cannot. Derived fields stay for the same reason they
+/// are rendered at all: they are shown, not asked — an attachment's node is the
+/// answer the platform is going to give, said where the choice that decides it
+/// is being made.
+function askable(f, candidates) {
+  if (f.required || f.derived) return true;
+  // A field the platform answers for is answerable whatever the collection
+  // behind it may be listed by: `:explainMigration` names the destinations and
+  // the picker never lists `nodes` at all.
+  if ((candidates || {})[f.key]) return true;
+  const of = f.kind === "ref" || f.kind === "refList" ? f.collection : null;
+  if (!of || !CELL_ONLY.includes(of)) return true;
+  return !!(session.who && session.who.cellAdmin);
+}
+
+/// Fields that come out from behind the disclosure for one collection.
+///
+/// The size of the machine is the machine. vCPUs, memory and root disk sat
+/// behind "More settings (18)", pre-seeded to 2 / 2048 / 20 — so the single
+/// most important fact about the thing being made was off screen, and a flavor
+/// that rewrites all three rewrote nothing anybody could see.
+///
+/// The schema still calls them `advanced`, and that is right where it is read
+/// from: on the sheet they are three details of a machine somebody is looking
+/// over. On the form they are the subject — of the create, and of the resize
+/// that is the commonest edit an instance ever gets.
+const BROUGHT_UP = { instances: ["vcpus", "memoryMib", "rootDiskGib"] };
+
+const deeper = (coll, f) => f.advanced && !(BROUGHT_UP[coll.id] || []).includes(f.key);
+
 function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidates, locked }) {
   closeDialog();
   const form = {
     coll, values: { ...values },
-    errs: {}, inputs: {}, pickers: [], refs: {}, boxes: {},
+    errs: {}, inputs: {}, shows: {}, pickers: [], refs: {}, boxes: {},
+    // Collections this form has already asked twice for. See `fillPicker`.
+    reasked: new Set(),
     // A picker the platform answers for, and the fields this dialog was opened
     // about rather than opened to ask.
     candidates: candidates || null, locked: locked || [],
@@ -1005,6 +1199,10 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
       form.values[key] = value;
       const input = form.inputs[key];
       if (input) input.value = value ?? "";
+      // A control that draws more than an input's value — a stepper and the
+      // second reading under it — redraws itself from the value it was handed.
+      const show = form.shows[key];
+      if (show) show(value);
       // A picker is set through the same path that fills it, so a value derived
       // from another object is matched exactly as one read off the wire is.
       // Assigning straight to the select silently clears anything it has no
@@ -1033,7 +1231,7 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
       const f = coll.fields.find((x) => x.key === key);
       if (!f) continue;
       const own = check(f.check || "none", form.values[key] ?? "");
-      setErr(own || bad[key] || "");
+      setErr(own || outOfRange(f, form.values[key]) || bad[key] || "");
     }
     clear(notes);
     for (const line of consequences(coll, form.values)) {
@@ -1057,13 +1255,17 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
     // Derived fields are rendered, never asked: a value the platform computes
     // is worth showing before the request — which node will open the volume,
     // which VNI was assigned — and the control is disabled below.
-    (f.advanced ? advanced : common).appendChild(fieldControl(form, f));
+    if (!askable(f, form.candidates)) continue;
+    (deeper(coll, f) ? advanced : common).appendChild(fieldControl(form, f));
   }
 
   dialog.appendChild(el("h2", title));
   dialog.appendChild(el("p.prose", blurb || coll.blurb));
   dialog.appendChild(el("div", { style: "height:var(--space-6)" }));
   dialog.appendChild(common);
+  // Replaced below where there is a deeper level to open. A form with none is
+  // a form where nothing can be hidden, and this stays the no-op it looks like.
+  let reveal = () => {};
   if (advanced.childElementCount) {
     // The common path first, the rest one level deeper. Not hidden — one click
     // away, and the click says how many are behind it.
@@ -1084,22 +1286,47 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
       toggle.classList.toggle("open", shown);
       toggle.textContent = (shown ? "Fewer settings" : "More settings (" + n + ")");
     });
+    // Through the button rather than past it, so the label and `aria-expanded`
+    // say the same thing afterwards as they would have if it had been pressed.
+    reveal = () => { if (advanced.classList.contains("hidden")) toggle.click(); };
     dialog.appendChild(toggle);
     dialog.appendChild(advanced);
   }
   dialog.appendChild(notes);
   dialog.appendChild(problems);
 
+  // Put the field that stopped the form in front of whoever has to fix it.
+  //
+  // A refusal or a failed check on a field behind "More settings" was written
+  // into a hidden container, and the banner said "Fix Memory first." about a
+  // control that was not on the screen — the one sentence explaining what
+  // happened, written where nobody could read it. The disclosure opens itself
+  // when what failed is inside it.
+  const point = (key) => {
+    const box = form.boxes[key];
+    if (!box) return;
+    if (advanced.contains(box)) reveal();
+    // Guarded: this is the one call here that depends on the view rather than
+    // on the document, and a form that cannot scroll must still report.
+    try { box.scrollIntoView({ block: "center" }); } catch (e) { /* not scrollable */ }
+  };
+
   const submit = btn(submitLabel, { primary: true, id: "submitform" });
   submit.addEventListener("click", async () => {
     form.revalidate();
     const missing = coll.fields.filter((f) => f.required && !f.derived &&
       (form.values[f.key] === undefined || form.values[f.key] === ""));
+    // The same three judgements the field controls make, in the same order, so
+    // submit cannot pass something a control has already refused. `outOfRange`
+    // is here because it was the one that got away: the stepper said "between
+    // 1 and 256" and the post went out with 300 in it.
     const bad = Object.entries(form.errs).find(([key]) => {
       const f = coll.fields.find((x) => x.key === key);
-      return f && (check(f.check || "none", form.values[key] ?? "") || crossCheck(coll, form.values)[key]);
+      return f && (check(f.check || "none", form.values[key] ?? "") ||
+        outOfRange(f, form.values[key]) || crossCheck(coll, form.values)[key]);
     });
     if (missing.length || bad) {
+      point(missing.length ? missing[0].key : bad[0]);
       fill(problems, missing.length
         ? "Still needed: " + missing.map((f) => f.label).join(", ")
         : "Fix " + (coll.fields.find((f) => f.key === bad[0]) || {}).label + " first.");
@@ -1121,6 +1348,7 @@ function openForm({ coll, title, blurb, values, submitLabel, onSubmit, candidate
       const key = named.replace(/^spec\./, "");
       if (key && form.errs[key]) {
         form.errs[key](e.message);
+        point(key);
         fill(problems, "The API refused " + key + ".");
       } else {
         fill(problems, e.message);
@@ -1157,6 +1385,20 @@ async function fillPicker(form, p) {
   const ask = (form.candidates || {})[f.key];
   if (ask) return fillFromAnswer(form, p, await ask(form));
   let offered = await options(f.collection);
+  // Nothing on offer is the one answer worth asking for twice.
+  //
+  // The picker cache is filled by whichever screen needed a collection first
+  // and kept until a write or a project switch clears it, so an answer that
+  // was empty when it was taken is still the answer this form gets. On a board
+  // that reads as "nothing here yet"; on a form it reads as "this project has
+  // none", which is how the new-instance Networks list offered nothing to a
+  // project that had a network. Asked once more, past the cache, and only where
+  // there was nothing to show anyway — so the healthy path costs nothing.
+  if (!offered.length && form.reasked && !form.reasked.has(f.collection)) {
+    form.reasked.add(f.collection);
+    forgetOptions(f.collection);
+    offered = await options(f.collection);
+  }
   // The cell's public pools, beside the project's own ranges. A floating IP
   // draws from an external network the operator declared at cell scope; a
   // picker that only knew the project's subnets could never offer the one
@@ -1192,6 +1434,11 @@ async function fillPicker(form, p) {
   s.appendChild(el("option", { value: "" },
     f.filterBy && !form.values[f.filterBy] ? "Choose a " + f.filterBy + " first" :
       offered.length ? (f.required ? "Choose…" : "— none —") : "none exist yet"));
+  // One sentence, not one per fill. A narrowed picker is refilled every time
+  // the field it follows changes, and each empty answer appended another copy
+  // of the same paragraph under the control.
+  const already = form.boxes[f.key] && form.boxes[f.key].querySelector("p.muted");
+  if (already) already.remove();
   if (!offered.length && f.whenEmpty && form.boxes[f.key]) {
     form.boxes[f.key].appendChild(el("p.muted", f.whenEmpty));
   }
@@ -1211,11 +1458,17 @@ async function fillPicker(form, p) {
     }
   }
   for (const o of offered) {
-    // An image leads with what it *is*; everything else leads with its name,
-    // which for everything else is already the readable thing.
+    // An image leads with what it *is*; a flavor leads with the name it is
+    // chosen by, which is the bare id the form sends — `shortName` of a
+    // cell-wide object keeps the collection in front of it, so the menu read
+    // `flavors/m1-small` and `flavors/m1-medium` and said nothing at all about
+    // the two sizes. Everything else leads with its name, which for everything
+    // else is already the readable thing.
     const label = f.collection === "images"
       ? imageTitle(o) + optionNote(f.collection, o)
-      : shortName(nameOf(o)) + optionNote(f.collection, o);
+      : f.collection === "flavors"
+        ? idOf(o) + optionNote(f.collection, o)
+        : shortName(nameOf(o)) + optionNote(f.collection, o);
     s.appendChild(el("option", { value: wire(o) }, label));
   }
   if (offered.some((o) => wire(o) === keep)) { s.value = keep; return; }
@@ -1227,6 +1480,19 @@ async function fillPicker(form, p) {
   const same = offered.find((o) => nameOf(o) === keep || idOf(o) === keep);
   const option = same && [...s.options].find((o) => o.value === wire(same));
   if (option) { option.value = keep; s.value = keep; return; }
+  // Narrowed by another field, and what is kept is not among what that field's
+  // *current* answer admits: it belongs to the one before it. Choosing network
+  // A, then a subnet of A, then network B left A's subnet selected and
+  // labelled "— as it is", and the create was refused, because a port's subnet
+  // has to be on the port's network. The question has been asked again, so the
+  // previous answer goes rather than being carried over as something the
+  // object says.
+  if (f.filterBy) {
+    form.values[f.key] = "";
+    s.value = "";
+    form.revalidate();
+    return;
+  }
   // Not offered at all — and still what the object says. A guest's image is
   // the case: the picker offers families, the object carries the build the
   // family resolved to when it was made, and the two never match. Clearing
@@ -1358,12 +1624,40 @@ function optionNote(collectionId, o) {
       Number(pick(pick(st, "allocated") || {}, "vcpus") || 0);
     return "  " + (pick(sp, "schedulable") === false ? "draining" : free + " vCPU free");
   }
+  if (collectionId === "flavors") {
+    // What a flavor *is*, because the name is a code. `m1-small` is not an
+    // answer to "how big a machine do I want" — the three numbers are, and the
+    // sentence an operator wrote beside them says which job it was bought for.
+    const vcpus = Number(pick(sp, "vcpus")) || 0;
+    const memory = Number(pick(sp, "memoryMib")) || 0;
+    const said = String(pick(sp, "description") || "").trim();
+    return " — " + [
+      vcpus + (vcpus === 1 ? " vCPU" : " vCPUs"),
+      mibAlso(memory) || memory + " MiB",
+      (Number(pick(sp, "rootDiskGib")) || 0) + " GiB disk",
+      said || null,
+    ].filter(Boolean).join(" · ");
+  }
   if (collectionId === "volumes") return "  " + (pick(sp, "sizeGib") || 0) + " GiB";
   if (collectionId === "subnets") return "  " + (pick(sp, "cidr") || "");
   if (collectionId === "instances") return "  " + (pick(st, "state") || "Unknown");
   return "";
 }
 
+/// What a create starts with.
+///
+/// One rule, and the seed that broke it is gone: a default belongs here only if
+/// it is **visible in a control** and does not contradict what the platform
+/// would have done on its own. `out.mtu = 1500` was neither. The field is one
+/// disclosure deeper, so nobody saw it, and its own help says the opposite —
+/// "1450 when left empty: a VXLAN header is 50 bytes, and a tenant network
+/// handed the wire's own 1500 black-holes every large packet in a way that
+/// looks like an application bug for a week". The form was quietly asking for
+/// the one number the documentation warns against.
+///
+/// What is left is seeded into a control somebody can see and change before
+/// pressing Create: a switch shows its position, a segmented choice shows which
+/// option is chosen, a stepper shows its number.
 function defaults(coll) {
   const out = {};
   for (const f of coll.fields) {
@@ -1371,8 +1665,10 @@ function defaults(coll) {
     else if (f.kind === "choice" && f.options.length) out[f.key] = f.options[0].value;
     else if (f.kind === "number" && !f.advanced) out[f.key] = f.min;
   }
-  if (coll.id === "networks") out.mtu = 1500;
   if (coll.id === "volumes") out.sizeGib = 10;
+  // On the common path now — see `BROUGHT_UP` — so these are three numbers on
+  // the screen rather than three behind a disclosure, and a flavor that
+  // rewrites them rewrites something visible.
   if (coll.id === "instances") { out.vcpus = 2; out.memoryMib = 2048; out.rootDiskGib = 20; }
   return out;
 }
@@ -1433,10 +1729,19 @@ function openCreate(coll, opts = {}) {
   // The id is asked for first and separately: it is the one thing that cannot
   // be changed afterwards, and it is not part of the spec.
   const dialog = $("dialog");
+  // No required marker: the id is **optional**, and it was carrying the same
+  // coloured dot as a field the form will refuse to submit without. Left empty
+  // the API mints a readable one — `project-85ad6cd4` — so the dot was telling
+  // everybody who meets this platform that they have to invent an identifier
+  // before they may have anything, which is the one thing the minting exists to
+  // avoid.
   const idField = el("div.field",
-    el("label", { for: "f-id" }, "Id", el("span.req", " ·")),
-    el("input", { id: "f-id", type: "text", spellcheck: "false", placeholder: coll.singular + "-1" }),
-    el("div.hint", "Lowercase, and permanent — it is how everything else will refer to this " + coll.singular + "."),
+    el("label", { for: "f-id" }, "Id"),
+    el("input", { id: "f-id", type: "text", spellcheck: "false",
+      placeholder: coll.singular + "-1", "aria-describedby": "f-id-hint f-id-err" }),
+    el("div.hint", { id: "f-id-hint" },
+      "Lowercase, and permanent — it is how everything else will refer to this "
+      + coll.singular + ". Left empty, the platform names it."),
     el("div.err.hidden", { id: "f-id-err" }));
   const input = idField.querySelector("input");
   // Suggested, not imposed: a migration proposed from an instance can name
@@ -1448,6 +1753,7 @@ function openCreate(coll, opts = {}) {
     const box = $("f-id-err");
     box.textContent = m; box.classList.toggle("hidden", !m);
     input.classList.toggle("bad", !!m);
+    if (m) input.setAttribute("aria-invalid", "true"); else input.removeAttribute("aria-invalid");
   });
   // Under both names: the form knows it as `__id` because it is not part of the
   // spec, and the API refuses it as `id`. A refusal that cannot find its
@@ -1456,6 +1762,7 @@ function openCreate(coll, opts = {}) {
     const box = $("f-id-err");
     box.textContent = m || ""; box.classList.toggle("hidden", !m);
     input.classList.toggle("bad", !!m);
+    if (m) input.setAttribute("aria-invalid", "true"); else input.removeAttribute("aria-invalid");
   };
   // Where it goes, before what it is: an image published to the cell and one
   // published to a project are different offers, and the second question reads
@@ -1545,10 +1852,15 @@ const settable = (coll, values) => {
 };
 
 function openEdit(coll, r) {
+  // What the object said when this form opened, as this form's own copy. Read
+  // once here rather than again at submit: by then the list controls have
+  // edited their arrays and `spec(r)` is the answer being proposed, not the one
+  // that arrived.
+  const before = arrived(spec(r), coll.fields);
   return openForm({
     coll,
     title: "Edit " + idOf(r),
-    values: flatten(spec(r), coll.fields),
+    values: arrived(spec(r), coll.fields),
     submitLabel: "Save",
     // Answered once, when the object was made. Offering a control here would
     // be offering an edit whose only outcome is a refusal — or, before the API
@@ -1558,12 +1870,21 @@ function openEdit(coll, r) {
     locked: coll.fields.filter((f) => f.atCreation).map((f) => f.key),
     async onSubmit(f) {
       // The whole spec, merged over what was read, so a field this console does
-      // not know about is not dropped by an edit that never touched it.
-      const merged = { ...spec(r), ...nest(settable(coll, f.values)) };
-      await patch(coll, idOf(r), { spec: merged }, revision(r));
+      // not know about is not dropped by an edit that never touched it. The
+      // clear set is this edit's answer to the other half of that: a field the
+      // operator emptied has to be *sent* empty, or the merge quietly puts the
+      // old value back while the toast says the change was asked for.
+      const merged = {
+        ...spec(r),
+        ...nest(settable(coll, f.values), cleared(coll, before, f.values)),
+      };
+      // By its own name: `pathFor` takes one as it is, and an edit built out
+      // of the project currently selected addressed the wrong object on the one
+      // board that merges the cell's images with a project's.
+      await patch(coll, nameOf(r), { spec: merged }, revision(r));
       forgetOptions(coll.id);
       toast("Asked for. The generation moves; watch the observation catch up.");
-      const fresh = await get(coll, idOf(r)).catch(() => null);
+      const fresh = await get(coll, nameOf(r)).catch(() => null);
       if (fresh) { openSheet(coll, fresh); }
       show(coll.id);
     },
