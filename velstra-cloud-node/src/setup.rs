@@ -587,6 +587,144 @@ fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
         .with_context(|| format!("setting the mode on {}", path.display()))
 }
 
+/// What the cell says about the machine holding this token.
+///
+/// Three answers an operator would otherwise give twice: once when they created
+/// the node object, and again — identically, by hand, on a console — when they
+/// typed the region, the cell and the node id into this wizard. The token was
+/// issued *for* one node object in one cell, so the cell can simply say which,
+/// and a typo stops being a machine that comes up, registers nowhere and is
+/// found weeks later.
+///
+/// `None` when the cell cannot be reached or will not have the token, and that
+/// is not an error: a control plane that is not up yet, an air-gapped install
+/// and a seed written ahead of time are all real, so the questions are still
+/// there to fall back on. What is *not* done is guessing.
+#[derive(Debug)]
+struct CellSays {
+    node: String,
+    region: String,
+    cell: String,
+}
+
+fn ask_the_cell(api_url: &str, token: &str, ca: &str) -> Result<CellSays, String> {
+    let url = format!("{}/api/v1/sessions/current", api_url.trim_end_matches('/'));
+    let auth = format!("Authorization: Bearer {token}");
+    // Against the cell's own certificate, which is the one the seed is about to
+    // name and the agents are about to verify. Not `-k`: a lookup that trusted
+    // anything would be a lookup that can be answered by anything, and this one
+    // decides which cell the machine joins.
+    let mut args: Vec<&str> = vec!["-H", &auth];
+    if !ca.is_empty() {
+        args.extend(["--cacert", ca]);
+    }
+    args.push(&url);
+    // The reason is carried out rather than swallowed. The failure that
+    // actually happens is a certificate that does not name the address typed a
+    // moment ago — a cell's own certificate names its hostname, `localhost` and
+    // `127.0.0.1`, so an operator who reaches for the IP gets a machine whose
+    // agents refuse the API hours later, with nothing connecting the two
+    // events. Said here, it is one line and a second attempt.
+    let body = fetch(&args).map_err(|e| {
+        // The first line of what curl said, which is the sentence. The rest is
+        // its standing advice about certificates, and five lines of it in the
+        // middle of a wizard buries the one line that names the problem.
+        let said = e.to_string();
+        let first = said
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(&said)
+            .trim();
+        // Without the helper's own prefix: "curl failed: curl: (6) …" says
+        // curl twice and the reader only needs the half that names the problem.
+        first
+            .strip_prefix("curl failed: ")
+            .unwrap_or(first)
+            .to_string()
+    })?;
+    cell_from_body(&body)
+}
+
+fn fetch(args: &[&str]) -> Result<String> {
+    crate::quickstart::curl(args)
+}
+
+/// What `sessions/current` said, read into the three answers it settles.
+///
+/// Split from the request so the reading can be tested against bodies this
+/// same API produces — including the one an older control plane produces, which
+/// accepts the token and does not name the cell.
+fn cell_from_body(body: &str) -> Result<CellSays, String> {
+    // `subject` is the node the credential was minted for — see
+    // `IdentityStore::identify_node`, which spells it `node:<id>`; the seed and
+    // every object want the bare id.
+    let subject = crate::quickstart::field(body, "subject")
+        .ok_or_else(|| format!("the answer named no subject: {}", body.trim()))?;
+    let node = node_from_subject(&subject).to_string();
+    // An older control plane answers this route without naming the cell. That
+    // is not a refusal and not worth a complaint — it is the one case where the
+    // questions below are the only way to know.
+    let (Some(region), Some(cell)) = (
+        crate::quickstart::field(body, "region"),
+        crate::quickstart::field(body, "cell"),
+    ) else {
+        return Err(format!(
+            "the cell accepted the token for node {node} but did not say which cell it is — \
+             an older control plane"
+        ));
+    };
+    if node.is_empty() || region.is_empty() || cell.is_empty() {
+        return Err(format!("the answer was incomplete: {}", body.trim()));
+    }
+    Ok(CellSays { node, region, cell })
+}
+
+/// The node id inside the subject the API answers with.
+///
+/// `identify_node` spells an agent `node:<id>`, and everything this wizard
+/// writes — the seed, the node object, the units' filter — wants the bare id.
+/// Taken as-is when there is no prefix, so an older or a different control
+/// plane is not made to fit a shape it never promised.
+fn node_from_subject(subject: &str) -> &str {
+    subject.strip_prefix("node:").unwrap_or(subject)
+}
+
+/// The registration token, from the environment when it is there.
+///
+/// 64 hex characters is not something anybody types correctly at a console, and
+/// a fresh machine is exactly where somebody is at a console. So the same
+/// `VELSTRA_TOKEN` the unattended path uses is honoured here too, and a pasted
+/// answer is taken with whatever whitespace and capitals came with it.
+fn ask_for_the_token() -> Result<String> {
+    if let Ok(from_env) = std::env::var("VELSTRA_TOKEN") {
+        let tidy = tidy_token(&from_env);
+        if validate_token(&tidy).is_ok() {
+            println!("Registration token: taken from VELSTRA_TOKEN.");
+            return Ok(tidy);
+        }
+        if !from_env.trim().is_empty() {
+            println!("  VELSTRA_TOKEN is set but is not a registration token; asking instead.");
+        }
+    }
+    loop {
+        let raw = prompt("Registration token: ")?;
+        let tidy = tidy_token(&raw);
+        match validate_token(&tidy) {
+            Ok(()) => return Ok(tidy),
+            Err(e) => println!("  {e} — expected 64 lowercase hex characters."),
+        }
+    }
+}
+
+/// A pasted token, as the paste arrives: outer whitespace gone, inner
+/// whitespace gone (a terminal wraps), capitals folded down.
+fn tidy_token(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 /// Ask everything. `None` when the operator declines the final confirmation —
 /// nothing has been written at that point.
 fn collect() -> Result<Option<Machine>> {
@@ -594,23 +732,6 @@ fn collect() -> Result<Option<Machine>> {
     println!("This writes {IDENTITY_DIR}/node.env and nothing else: no disks, no bootloader,");
     println!("no packages. The machine is already installed; what is missing is the answer");
     println!("to which cell it belongs to, as what, and with which credential.\n");
-
-    let region = ask_valid(
-        "Region [eu-central]: ",
-        validate_node_name,
-        "lowercase letters, digits and '-'",
-    )
-    .map(|s| if s.is_empty() { "eu-central".into() } else { s })?;
-    let cell = ask_valid(
-        "Cell [cell-1]: ",
-        validate_node_name,
-        "lowercase letters, digits and '-'",
-    )
-    .map(|s| if s.is_empty() { "cell-1".into() } else { s })?;
-
-    println!("\nA cell is the failure domain: a machine belongs to exactly one.");
-    println!("Working across cells is several cells, each with its own control plane —");
-    println!("and one of them told where the others are, so a client reaches one address.\n");
 
     println!("What does this machine do? Several are fine — the smallest real cell is one");
     println!("box that is all of them.\n");
@@ -635,8 +756,115 @@ fn collect() -> Result<Option<Machine>> {
         }
     };
 
+    // The address and the credential, before the facts they can settle.
+    //
+    // This used to open with "Region" and "Cell", which are two answers the
+    // control plane already holds — and a machine being joined is holding the
+    // one thing that can ask it. So the order is now what the operator was
+    // handed: what this machine does, where the cell is, and the token. What
+    // the cell can say, it says.
+    let needs_api = roles.iter().any(|r| *r != Role::ControlPlane);
+    let api_url = if needs_api {
+        ask_valid(
+            "\nControl-plane URL (https://host:8443): ",
+            validate_url,
+            "a URL with a scheme and a host",
+        )?
+    } else {
+        String::new()
+    };
+    // The certificate, when the address is https.
+    //
+    // The agents refuse https without one — `api_cell` says so in as many words
+    // — and this wizard never asked, so a machine joined interactively wrote a
+    // seed its own agents would not accept, and the operator found out when a
+    // unit failed to start. `migrate-seed` had the fix-up; the first install did
+    // not. The default is where the control plane writes it and therefore where
+    // it is copied to.
+    //
+    // Not for the control plane: that machine *is* the API and makes its own
+    // certificate, so the cell's root is a file it will write rather than one
+    // it has to be given.
+    let api_ca = if api_url.starts_with("https://") && !roles.contains(&Role::ControlPlane) {
+        println!("\nThe agents verify the API against the cell's own certificate. Copy");
+        println!("/var/lib/velstra/tls/cert.pem from the control plane to this machine —");
+        println!("it is a certificate, not a secret — and name it here.");
+        let raw = prompt("Certificate [/var/lib/velstra/tls/cert.pem]: ")?;
+        let path = match raw.trim() {
+            "" => "/var/lib/velstra/tls/cert.pem".to_string(),
+            other => other.to_string(),
+        };
+        // Taken whether or not it is there yet. An operator who runs this
+        // before copying the file gets a sentence and a finished seed; a loop
+        // would get them a wizard they cannot leave, on a machine where the
+        // only other terminal is the one they are already in.
+        if !std::path::Path::new(&path).exists() {
+            println!("  {path} is not there yet — the seed will name it anyway.");
+            println!("  Copy it from the control plane before starting the agents; until then");
+            println!("  they will not talk to an https cell at all, and will say so.");
+        }
+        path
+    } else {
+        String::new()
+    };
+
+    let wants_token = roles.contains(&Role::Hypervisor) || roles.contains(&Role::Pool);
+    let token = if wants_token {
+        println!("\nThe token is the one an operator was shown once, when they created this");
+        println!("machine's node object. It is what says which node this is.");
+        ask_for_the_token()?
+    } else {
+        String::new()
+    };
+
+    let said = if api_url.is_empty() || token.is_empty() {
+        Err(String::new())
+    } else {
+        ask_the_cell(&api_url, &token, &api_ca)
+    };
+
+    let (region, cell, node_from_cell) = match &said {
+        Ok(c) => {
+            println!(
+                "\nThe cell answered: this token is node {} in cell {}, region {}.",
+                c.node, c.cell, c.region
+            );
+            println!("Those three are taken from the cell rather than asked.");
+            (c.region.clone(), c.cell.clone(), c.node.clone())
+        }
+        Err(why) => {
+            if needs_api {
+                if !why.is_empty() {
+                    println!("\nThe cell did not answer: {why}");
+                }
+                println!("\nSo the next three are");
+                println!("questions rather than facts. A control plane that is not up yet and an");
+                println!("air-gapped install both land here; a wrong answer makes a machine that");
+                println!("comes up and registers nowhere, so they are worth reading twice.");
+            }
+            println!("\nA cell is the failure domain: a machine belongs to exactly one.");
+            println!("Working across cells is several cells, each with its own control plane —");
+            println!(
+                "and one of them told where the others are, so a client reaches one address.\n"
+            );
+            let region = ask_valid(
+                "Region [eu-central]: ",
+                validate_node_name,
+                "lowercase letters, digits and '-'",
+            )
+            .map(|s| if s.is_empty() { "eu-central".into() } else { s })?;
+            let cell = ask_valid(
+                "Cell [cell-1]: ",
+                validate_node_name,
+                "lowercase letters, digits and '-'",
+            )
+            .map(|s| if s.is_empty() { "cell-1".into() } else { s })?;
+            (region, cell, String::new())
+        }
+    };
+
     let mut m = Machine {
-        api_ca: String::new(),
+        api_ca: api_ca.clone(),
         tls_cert: String::new(),
         tls_key: String::new(),
         lvm_group: String::new(),
@@ -664,30 +892,26 @@ fn collect() -> Result<Option<Machine>> {
         admin_password: String::new(),
     };
 
-    // Everything that is not the control plane has to be told where the API is.
-    // The control plane *is* the API, and a URL pointing at itself would be a
-    // fact with two owners.
-    if roles.iter().any(|r| *r != Role::ControlPlane) {
-        m.api_url = ask_valid(
-            "\nControl-plane URL (https://host:8443): ",
-            validate_url,
-            "a URL with a scheme and a host",
-        )?;
-    }
+    // Asked above, before anything the cell could settle.
+    m.api_url = api_url.clone();
+    m.token = token.clone();
 
     if roles.contains(&Role::Hypervisor) {
-        println!("\nThe node id has to match the node object an operator created — that object");
-        println!("is where the one-time token came from.");
-        m.node = ask_valid(
-            "Node id: ",
-            validate_node_name,
-            "lowercase letters, digits and '-'",
-        )?;
-        m.token = ask_valid(
-            "Registration token: ",
-            validate_token,
-            "64 lowercase hex characters",
-        )?;
+        if node_from_cell.is_empty() {
+            println!(
+                "\nThe node id has to match the node object an operator created — that object"
+            );
+            println!("is where the one-time token came from.");
+            m.node = ask_valid(
+                "Node id: ",
+                validate_node_name,
+                "lowercase letters, digits and '-'",
+            )?;
+        } else {
+            // The token named it. Asking anyway would be asking somebody to
+            // retype an answer that is already in hand, and to get it wrong.
+            m.node = node_from_cell.clone();
+        }
         m.vmm = loop {
             match prompt("Hypervisor [1] qemu  [2] cloud-hypervisor: ")?.trim() {
                 "" | "1" => break "qemu".to_string(),
@@ -939,6 +1163,64 @@ fn resolve_roles(raw: &str) -> Result<Vec<Role>, String> {
 
 #[cfg(test)]
 mod tests {
+    /// A pasted token is taken as the paste arrives.
+    ///
+    /// 64 hex characters is not something anybody types correctly, and a fresh
+    /// machine is exactly where somebody is at a console with no clipboard. So
+    /// what arrives is what a terminal does to a paste: a trailing newline, a
+    /// line break in the middle, and whatever case the thing was displayed in.
+    #[test]
+    fn a_pasted_token_is_taken_as_it_arrives() {
+        let real = "ab".repeat(32);
+        assert_eq!(super::tidy_token(&format!("  {real}\n")), real);
+        assert_eq!(super::tidy_token(&real.to_uppercase()), real);
+        let split = format!("{} {}", &real[..32], &real[32..]);
+        assert_eq!(super::tidy_token(&split), real);
+        assert!(crate::wizard::validate_token(&super::tidy_token(&format!("{real}\r\n"))).is_ok());
+    }
+
+    /// The cell's answer, read into the three facts it settles.
+    ///
+    /// The bodies are the ones this API serves: the first was taken off a live
+    /// cell, the second is the same route on a control plane old enough not to
+    /// name the cell — which accepts the token and therefore must not be read
+    /// as a refusal.
+    #[test]
+    fn the_cells_answer_settles_the_node_the_region_and_the_cell() {
+        let full = r#"{"cellAdmin":false,"displayName":"","projects":{},"session":false,"subject":"node:qa-join","region":"eu-central","cell":"cell-1"}"#;
+        let said = super::cell_from_body(full).expect("a complete answer");
+        assert_eq!(said.node, "qa-join");
+        assert_eq!(said.region, "eu-central");
+        assert_eq!(said.cell, "cell-1");
+
+        // Taken off the live cell before it carried the cell's name. The token
+        // was accepted — the subject proves it — so what comes back says which
+        // node it is and that the cell is the one thing still to ask.
+        let older = r#"{"cellAdmin":false,"displayName":"","projects":{},"session":false,"subject":"node:qa-join"}"#;
+        let why = super::cell_from_body(older).expect_err("no cell named");
+        assert!(
+            why.contains("qa-join") && why.contains("older"),
+            "the reason has to name the node it did accept: {why}"
+        );
+
+        // A refusal names no subject at all, and saying which body came back is
+        // the whole of what a reader can act on.
+        let refused =
+            r#"{"error":{"code":"UNAUTHENTICATED","message":"the bearer token was not accepted"}}"#;
+        let why = super::cell_from_body(refused).expect_err("a refusal");
+        assert!(why.contains("not accepted"), "{why}");
+    }
+
+    /// The cell names an agent `node:<id>`; the seed wants the id.
+    #[test]
+    fn the_subject_the_cell_answers_with_names_the_node() {
+        assert_eq!(super::node_from_subject("node:peter"), "peter");
+        // No prefix, no change: a different control plane is not reshaped to
+        // fit a spelling it never promised.
+        assert_eq!(super::node_from_subject("peter"), "peter");
+        assert_eq!(super::node_from_subject(""), "");
+    }
+
     use super::*;
 
     fn hypervisor() -> Machine {

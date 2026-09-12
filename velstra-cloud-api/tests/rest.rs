@@ -5705,3 +5705,24 @@ async fn a_grant_already_stored_does_not_block_the_next_save() {
         .await;
     assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
 }
+
+/// Who am I *and* which cell is this.
+///
+/// A machine being joined holds an address and a registration token and has
+/// read nothing else — so the region and the cell are two answers it would
+/// otherwise be told twice: once by whoever created its node object, and again,
+/// identically and by hand, by whoever typed them into its seed. A wrong answer
+/// there is a machine that comes up, registers nowhere, and is found weeks
+/// later, so the one thing that knows says so.
+#[tokio::test]
+async fn whoami_names_the_cell_that_answered() {
+    let h = Harness::new();
+    let answer = h.get("sessions/current").await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+    assert_eq!(answer.body["region"], json!("eu-central"));
+    assert_eq!(answer.body["cell"], json!("cell-1"));
+    // And still everything it answered before, because a console reads this on
+    // every sign-in to decide which buttons exist.
+    assert!(answer.body["subject"].is_string(), "{:?}", answer.body);
+    assert!(answer.body["projects"].is_object(), "{:?}", answer.body);
+}

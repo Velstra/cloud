@@ -822,6 +822,19 @@ impl Api {
 
     /// Whether `who` may administer the cell — either from the started-with
     /// operator list or from their own user record.
+    /// Which cell this is, for a client that has only a token and an address.
+    ///
+    /// The cell's own name and region, which every object carries in
+    /// `meta.placement` and which a caller therefore already sees on anything
+    /// it reads — but a machine being joined has read nothing yet. It has an
+    /// address and a registration token, and asking it to *type* the region and
+    /// the cell as well is asking it to repeat two facts the answer to this
+    /// question already contains. A wrong answer there produces a machine that
+    /// comes up, registers nowhere, and is found weeks later.
+    pub fn placement(&self) -> &Placement {
+        &self.inner.placement
+    }
+
     pub fn is_operator(&self, who: &Identity) -> bool {
         self.inner.cell_admins.contains(&who.subject) || crate::sessions::is_cell_admin(who)
     }

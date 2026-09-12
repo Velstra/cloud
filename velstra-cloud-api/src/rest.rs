@@ -350,6 +350,13 @@ async fn whoami(
         // The strongest rung held in each project, by id — so a console draws
         // the buttons an account can use and not every button plus a refusal.
         "projects": api.project_roles(&who).await,
+        // Which cell answered. A node being joined holds an address and a
+        // registration token and has read nothing else, so the region and the
+        // cell are two answers it would otherwise have to be told twice — once
+        // by whoever set it up and once, identically, by whoever typed them
+        // into its seed. See `Api::placement`.
+        "region": api.placement().region,
+        "cell": api.placement().cell,
     })))
 }
 
