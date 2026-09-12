@@ -897,11 +897,21 @@ impl LocalNet {
                      Install it, or turn --local-network off and let a fabric carry the segment."
                 ))
             })?;
+        // The write is not the verdict; `nft`'s exit status is.
+        //
+        // A failed write used to return here, and the one that happens in
+        // practice is `EPIPE`: the child has already gone, which says nothing
+        // about whether it did the job. A process that read the ruleset and
+        // exited 0 succeeded whatever happened to the last bytes of the pipe,
+        // and one that did not is caught by the status and its stderr below —
+        // a truncated ruleset is a parse error, not a silent accept. So the
+        // error is remembered and only spoken if the status gives it weight.
+        let mut wrote = Ok(());
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(ruleset.as_bytes())
-                .await
-                .map_err(|e| HostError::failed(format!("writing the ruleset to nft: {e}")))?;
+            wrote = stdin.write_all(ruleset.as_bytes()).await;
+            // Dropped before the wait, so the child sees end-of-input rather
+            // than blocking on a pipe this side is still holding open.
+            drop(stdin);
         }
         let output = child
             .wait_with_output()
@@ -909,6 +919,12 @@ impl LocalNet {
             .map_err(|e| HostError::failed(format!("waiting for nft: {e}")))?;
         if output.status.success() {
             return Ok(());
+        }
+        if let Err(e) = wrote {
+            return Err(HostError::failed(format!(
+                "writing the ruleset to nft: {e} — and it exited {}",
+                output.status
+            )));
         }
         Err(HostError::failed(format!(
             "nft refused the ruleset: {}",
@@ -2045,6 +2061,14 @@ mod balancer_addresses {
 
         // And a write that took is remembered, so the same ruleset costs
         // nothing on the next pass.
+        //
+        // `true` reads none of the ruleset piped to it, so whether the write
+        // lands or gets `EPIPE` is a race with the child's teardown. That is
+        // deliberate here: it is the same race a real `nft` can lose, and this
+        // asserts that the outcome is decided by the exit status rather than by
+        // who won it. Before that, this test failed on a loaded CI runner with
+        // "writing the ruleset to nft: Broken pipe (os error 32)" against a
+        // tree that had not touched this file.
         net.nft = "true".to_string();
         net.filter(&guarded).await.expect("this one takes");
         net.nft = "/nonexistent/bin/nft".to_string();
