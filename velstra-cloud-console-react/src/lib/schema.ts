@@ -85,8 +85,13 @@ export const navigable = (cellAdmin: boolean) =>
  * customer they hold nothing they may read at all.
  */
 const TENANT_GROUP: Record<string, string> = {
-  Compute: "Compute", Storage: "Storage", Network: "Networking", Access: "Usage",
+  Compute: "Compute", Storage: "Storage", Network: "Networking", Records: "Usage",
 };
+// `Access` used to be here, mapped to "Usage", and it named nothing: every
+// collection in that group — users, roles, folders, projects — is an
+// operator's, so the group is empty for a customer and dropped before it is
+// drawn. What a customer does get is `Records`, which holds their readings and
+// their bill, and it was showing them the operator's word for it.
 
 export const groups = (cellAdmin = true) => {
   const items = navigable(cellAdmin);
