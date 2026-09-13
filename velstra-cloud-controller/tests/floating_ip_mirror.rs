@@ -64,8 +64,8 @@ impl Drop for Fabric {
 /// fixture whose port is taken does not fail to start — it connects to
 /// whatever *is* there and tests against somebody else's state.
 ///
-/// **50950–50999 belongs to `velstra-cloud-controller`**; the node agent crate
-/// has 50900–50949. `cargo test` runs test binaries concurrently, and when the
+/// **20950–20999 belongs to `velstra-cloud-controller`**; the node agent crate
+/// has 20900–20949. `cargo test` runs test binaries concurrently, and when the
 /// two ranges overlapped this produced three different intermittent failures
 /// in three different files, each looking like a bug in whatever it hit.
 fn port_is_free(port: u16) -> bool {
@@ -136,7 +136,7 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
         eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
         return;
     };
-    let Some(fabric) = Fabric::start(&binary, 50981).await else {
+    let Some(fabric) = Fabric::start(&binary, 20981).await else {
         eprintln!("skipped: the fabric controller would not start here");
         return;
     };
@@ -454,7 +454,7 @@ async fn a_routed_address_is_bound_to_the_port_rather_than_translated() {
         eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
         return;
     };
-    let Some(fabric) = Fabric::start(&binary, 50985).await else {
+    let Some(fabric) = Fabric::start(&binary, 20985).await else {
         eprintln!("skipped: the fabric controller would not start here");
         return;
     };

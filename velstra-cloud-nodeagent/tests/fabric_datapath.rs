@@ -111,8 +111,19 @@ fn port_is_free(port: u16) -> bool {
 impl Fabric {
     /// The ports this crate's fabric fixtures use.
     ///
-    /// **50900–50949 belongs to `velstra-cloud-nodeagent`.** The controller
-    /// crate has 50950–50999, and the two must not overlap: `cargo test`
+    /// **Below 32768, deliberately.** These numbers used to be 50900–50999,
+    /// which sits *inside* the range the kernel hands out on its own
+    /// (`net.ipv4.ip_local_port_range`, 32768–60999 on a stock Linux). So any
+    /// other process on the machine that opened an outbound connection — or
+    /// any of the many fixtures in this workspace that bind port 0 — could be
+    /// given one of these by the kernel, and then this fixture failed. It
+    /// failed *loudly*, which is what `port_is_free` is for, but the collision
+    /// was self-inflicted: a range nothing auto-assigns cannot be taken from
+    /// under a fixture. Seen in CI on a run that changed nothing near the
+    /// fabric.
+    ///
+    /// **20900–20949 belongs to `velstra-cloud-nodeagent`.** The controller
+    /// crate has 20950–20999, and the two must not overlap: `cargo test`
     /// runs test *binaries* concurrently, so a fixture here and one there can
     /// be starting at the same moment. When they picked the same port, the
     /// second one did not fail — it connected to the first one's controller and
@@ -126,7 +137,7 @@ impl Fabric {
     ///
     /// `port_is_free` below is what makes a future collision loud instead.
     async fn start(binary: &PathBuf) -> Option<Self> {
-        Self::start_on(binary, 50901).await
+        Self::start_on(binary, 20901).await
     }
 
     /// Its own three ports, so two fixtures in one test binary do not race for
@@ -555,7 +566,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
         eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
         return;
     };
-    let Some(fabric) = Fabric::start_on(&binary, 50911).await else {
+    let Some(fabric) = Fabric::start_on(&binary, 20911).await else {
         eprintln!("skipped: the fabric controller would not start on its ports");
         return;
     };
@@ -688,7 +699,7 @@ async fn a_node_that_states_a_locator_is_served_an_srv6_overlay() {
         eprintln!("skipped: build the fabric controller first (cargo build in ../fabric)");
         return;
     };
-    let Some(fabric) = Fabric::start_on(&binary, 50921).await else {
+    let Some(fabric) = Fabric::start_on(&binary, 20921).await else {
         eprintln!("skipped: the fabric controller did not come up");
         return;
     };

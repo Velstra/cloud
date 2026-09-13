@@ -65,8 +65,8 @@ impl Drop for Fabric {
 /// fixture whose port is taken does not fail to start — it connects to
 /// whatever *is* there and tests against somebody else's state.
 ///
-/// **50950–50999 belongs to `velstra-cloud-controller`**; the node agent crate
-/// has 50900–50949. `cargo test` runs test binaries concurrently, and when the
+/// **20950–20999 belongs to `velstra-cloud-controller`**; the node agent crate
+/// has 20900–20949. `cargo test` runs test binaries concurrently, and when the
 /// two ranges overlapped this produced three different intermittent failures
 /// in three different files, each looking like a bug in whatever it hit.
 fn port_is_free(port: u16) -> bool {
@@ -75,7 +75,7 @@ fn port_is_free(port: u16) -> bool {
 
 impl Fabric {
     async fn start(binary: &PathBuf) -> Option<Self> {
-        let (listen, admin, raft) = (50991, 50992, 50993);
+        let (listen, admin, raft) = (20991, 20992, 20993);
         for port in [listen, admin, raft] {
             assert!(
                 port_is_free(port),
