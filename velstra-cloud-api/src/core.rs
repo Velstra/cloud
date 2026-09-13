@@ -904,6 +904,20 @@ impl Api {
         Ok(document)
     }
 
+    /// Whether this caller is one of the parties the cell's machine names are
+    /// for: an operator, or an agent reporting on its own work.
+    ///
+    /// One predicate, because the rule has two halves that drifted apart. The
+    /// read side ([`Api::redact_for`]) takes the names off every answer a
+    /// tenant gets, and shut six doors doing it — and then two *refusals* put
+    /// a name straight back into a sentence, which no amount of trimming the
+    /// documents can catch. A tenant told "runs on peter" in an error has
+    /// learned precisely what the redaction exists to withhold, so the two
+    /// halves now ask the same question in the same place.
+    fn may_see_machines(&self, who: &Identity) -> bool {
+        self.is_operator(who) || crate::sessions::agent_node(who).is_some()
+    }
+
     /// Take the cell's machine names off an answer that is leaving for a tenant.
     ///
     /// Hosts are not part of a project's view — a tenant cannot list them, and a
@@ -917,7 +931,7 @@ impl Api {
     /// absent), on the way *out* only: agents and operators read the same
     /// objects unredacted, and nothing stored changes.
     fn redact_for(&self, who: &Identity, kind: &str, document: &mut Value) {
-        if self.is_operator(who) || crate::sessions::agent_node(who).is_some() {
+        if self.may_see_machines(who) {
             return;
         }
         // `captures` is the sixth door: the API itself writes the guest's
@@ -3123,7 +3137,7 @@ impl Api {
             self.refuse_a_disk_that_is_not_free(&spec).await?;
         }
         if kind == "attachments" {
-            self.refuse_a_disk_the_guest_cannot_reach(parent, &spec)
+            self.refuse_a_disk_the_guest_cannot_reach(parent, &spec, who)
                 .await?;
         }
         if kind == "images" {
@@ -4923,6 +4937,13 @@ impl Api {
             .at("spec.node")),
             // Said, and wrong. Refused rather than corrected: rewriting what
             // somebody typed changes what the object says without them asking.
+            //
+            // Naming the machine is safe here, and only because of what stands
+            // in front of it: both the create and the patch path refuse a
+            // non-operator who writes `spec.node` at all, so the only readers
+            // who reach this sentence are the two [`Api::may_see_machines`]
+            // admits anyway. A branch for tenants here would be dead code
+            // pretending to guard something.
             (said, Some(node)) if said != node => Err(ApiError::invalid(format!(
                 "{instance} is on {node}, not on {said}; an attachment is opened by the node that \
                  has the guest"
@@ -6370,12 +6391,17 @@ impl Api {
     /// differently. The way out was to delete the guest and make another until
     /// the scheduler happened to agree with the storage.
     ///
-    /// Said at the door, naming both machines, because that is the one fact
-    /// that makes the next attempt work.
+    /// Said at the door, and said differently to each reader. To an operator,
+    /// naming both machines, because pinning the guest is the fix and the names
+    /// are the fact that makes it work. To a tenant, naming neither: the
+    /// sentence this refusal replaced told a customer which hypervisor runs
+    /// their guest — the leak [`Api::redact_for`] exists to prevent — and then
+    /// advised them to move it, which a tenant may not do.
     async fn refuse_a_disk_the_guest_cannot_reach(
         &self,
         parent: &str,
         spec: &Value,
+        who: &Identity,
     ) -> ApiResult<()> {
         let (Some(volume), Some(instance)) = (
             spec.get("volume").and_then(Value::as_str),
@@ -6445,15 +6471,24 @@ impl Api {
             return Ok(());
         }
         let _ = parent;
-        Err(ApiError::new(
-            Code::FailedPrecondition,
+        // What each reader can act on is what each reader is told. An operator
+        // pins the guest, so the machines are the useful half. A tenant can do
+        // neither of those things, but the pool *is* theirs — a field they
+        // filled in on their own volume — so that is the half they get.
+        let why = if self.may_see_machines(who) {
             format!(
                 "{volume} is on {holds} and {instance} runs on {runs_on}, \
                  so {runs_on} cannot open it. Put the guest on {holds}, \
                  or make the volume in a pool both machines can reach."
-            ),
-        )
-        .at("spec.volume"))
+            )
+        } else {
+            format!(
+                "{volume} is in pool {pool}, which only one machine can reach, and \
+                 {instance} does not run on that machine — so it cannot open the disk. \
+                 Make the disk in a different pool, or ask an operator to move the guest."
+            )
+        };
+        Err(ApiError::new(Code::FailedPrecondition, why).at("spec.volume"))
     }
 
     /// An image **is** its bytes, and a patch does not change them.

@@ -4083,3 +4083,178 @@ async fn a_refusal_older_than_the_object_is_still_one_of_its_records() {
         records.items
     );
 }
+
+/// **A refusal must not say what every read of the same fact withholds.**
+///
+/// Found walking the platform as a customer, one commit after the refusal
+/// itself was written. `Api::redact_for` takes the machine's name off every
+/// instance, attachment, port, console session and capture a tenant reads —
+/// six doors, each found and shut in turn — and then this refusal handed the
+/// name back in a sentence: *"… is on horst and … runs on peter, so peter
+/// cannot open it. Put the guest on horst."* Two machine names, plus advice
+/// to do the one thing a tenant is explicitly forbidden from doing: pinning a
+/// guest is refused to them at the door.
+///
+/// So the sentence is chosen by who is reading it. What a tenant is told names
+/// their own pool and their own two objects, and nothing of the cell's.
+#[tokio::test]
+async fn a_tenant_is_refused_a_cross_machine_disk_without_being_told_which_machines() {
+    let api = cell().await;
+
+    // The cell's own shape: two machines, and a pool whose bytes sit on one of
+    // them. All three are the operator's to make and none is a tenant's to see.
+    for id in ["node-a", "node-b"] {
+        api.create(
+            "",
+            "nodes",
+            &json!({ "id": id, "spec": {} }),
+            &who(OPERATOR),
+        )
+        .await
+        .expect("an operator registers a machine");
+    }
+    api.create(
+        "",
+        "pools",
+        &json!({ "id": "pool-c", "spec": { "node": "node-a" } }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator says which machine holds a pool");
+
+    // The guest is pinned to the *other* machine by the operator, because a
+    // tenant asking for that is refused before this refusal could be reached.
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "web", "spec": {
+            "vcpus": 1, "memory_mib": 512, "node": "node-b",
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator places a guest");
+
+    api.create(
+        "projects/p1",
+        "volumes",
+        &json!({ "id": "data", "spec": { "size_gib": 1, "pool": "pool-c" } }),
+        &who(ADA),
+    )
+    .await
+    .expect("a tenant makes a disk");
+
+    let refused = api
+        .create(
+            "projects/p1",
+            "attachments",
+            &json!({ "id": "mount", "spec": {
+                "volume": "projects/p1/volumes/data",
+                "instance": "projects/p1/instances/web",
+            }}),
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a disk on another machine cannot be opened");
+
+    let why = refused.to_string();
+    assert_eq!(refused.code, Code::FailedPrecondition, "{why}");
+    for machine in ["node-a", "node-b"] {
+        assert!(
+            !why.contains(machine),
+            "the tenant was told a machine's name: {why}"
+        );
+    }
+    // And it is still a sentence they can act on: their pool, their two
+    // objects, and the two things a tenant may actually do about it.
+    assert!(why.contains("pool-c"), "{why}");
+    assert!(why.contains("projects/p1/volumes/data"), "{why}");
+    assert!(why.contains("projects/p1/instances/web"), "{why}");
+    assert!(why.contains("different pool"), "{why}");
+    assert!(why.contains("operator"), "{why}");
+}
+
+/// The door in front of the other machine-naming refusal, on both paths.
+///
+/// [`Api::settle_node`] answers a wrong `spec.node` with *"… is on node-a, not
+/// on somewhere"*, and that names a machine. It is allowed to, but only
+/// because a tenant never reaches it: writing `node` on an instance or an
+/// attachment is refused outright, at create and at edit alike. That guard is
+/// what makes the sentence behind it safe, so it is tested as such — including
+/// that the refusal itself names no machine, which is the mistake it would be
+/// easiest to make while writing it.
+#[tokio::test]
+async fn a_tenant_may_not_write_a_machine_on_an_attachment_by_either_path() {
+    let api = cell().await;
+    api.create(
+        "",
+        "nodes",
+        &json!({ "id": "node-a", "spec": {} }),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator registers a machine");
+    api.create(
+        "projects/p1",
+        "instances",
+        &json!({ "id": "web", "spec": {
+            "vcpus": 1, "memory_mib": 512, "node": "node-a",
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .expect("an operator places a guest");
+    api.create(
+        "projects/p1",
+        "volumes",
+        &json!({ "id": "data", "spec": { "size_gib": 1, "pool": "pool-a" } }),
+        &who(ADA),
+    )
+    .await
+    .expect("a tenant makes a disk");
+
+    // At birth.
+    let refused = api
+        .create(
+            "projects/p1",
+            "attachments",
+            &json!({ "id": "mount", "spec": {
+                "volume": "projects/p1/volumes/data",
+                "instance": "projects/p1/instances/web",
+                "node": "somewhere",
+            }}),
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a tenant cannot name the machine that opens a disk");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+    assert!(!refused.to_string().contains("node-a"), "{refused}");
+
+    // And on the way in afterwards, on an attachment the platform made itself.
+    api.create(
+        "projects/p1",
+        "attachments",
+        &json!({ "id": "mount", "spec": {
+            "volume": "projects/p1/volumes/data",
+            "instance": "projects/p1/instances/web",
+        }}),
+        &who(ADA),
+    )
+    .await
+    .expect("a tenant attaches their disk and the cell fills the machine in");
+
+    let refused = api
+        .patch(
+            &name("projects/p1/attachments/mount"),
+            &json!({ "spec": { "node": "somewhere" } }),
+            None,
+            &who(ADA),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a tenant cannot move an attachment to a machine they picked");
+    assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
+    assert!(!refused.to_string().contains("node-a"), "{refused}");
+}
