@@ -129,7 +129,7 @@ impl Default for Rules {
             backup_target_free_gib: 32,
             stuck_after: Duration::from_secs(15 * 60),
             silence_margin: Duration::from_secs(60),
-            pool_silent_after: Duration::from_secs(10 * 60),
+            pool_silent_after: velstra_cloud_model::resources::POOL_SILENT_AFTER,
         }
     }
 }

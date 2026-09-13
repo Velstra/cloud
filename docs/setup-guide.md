@@ -174,20 +174,43 @@ says otherwise, which is the question the wizard asks just before the password.
 to, and it cannot be changed afterwards.
 
 The response carries a **registration token, shown once**. The platform keeps a
-hash of it and cannot show it again — if it is lost, delete the node and add it
-back. The panel carries the command to run on the machine and will not close by
-itself.
+hash of it and cannot show it again. If it is lost, ask the machine for another
+one rather than deleting it:
+
+```
+POST /api/v1/nodes/<id>:issueCredential
+POST /api/v1/pools/<id>:issueCredential
+```
+
+The body is optional; `purpose` and `expiresAt` are accepted. Issuing is
+additive: the credential the machine already holds keeps working until it is
+revoked, so a mistyped token does not take the agent down while it is being
+fixed. `GET .../credentials` lists what a machine holds and
+`DELETE .../credentials/<id>` takes one out of use.
+
+This page used to say to delete the node and add it back. That costs the
+object's labels, its taints and its schedulability, and there has been no
+reason to pay it since `:issueCredential` existed.
+
+**A machine that holds volumes needs two tokens.** A pool is a separate agent
+with a separate identity — it speaks as `pool:<id>` where the node agent speaks
+as `node:<id>` — so create the pool object as well and keep both tokens. One
+presented for the other is answered `401 the bearer token was not accepted`,
+on every pass, for ever.
 
 On the machine:
 
 ```
-sudo VELSTRA_TOKEN=<the token> velstra-cloud-node setup
+sudo VELSTRA_TOKEN=<the node's token> \
+     VELSTRA_POOL_TOKEN=<the pool's token> \
+     velstra-cloud-node setup
 ```
 
-Four answers: roles (`2` for a hypervisor, `2 3` if it also holds volumes), the
-control-plane URL, where the cell's certificate is, and — for a pool — its id
-and backend. The token can be typed at the prompt instead; it is 64 hex
-characters, which is why the environment is offered.
+The answers: roles (`hypervisor`, or `hypervisor pool` if it also holds
+volumes — the numbers from the list work too), the control-plane URL, where the
+cell's certificate is, and, for a pool, its id and backend. Either token can be
+typed at its prompt instead; they are 64 hex characters each, which is why the
+environment is offered.
 
 **The region, the cell and the node id are not questions.** The wizard presents
 the token to the control plane, which answers which node it was issued for and

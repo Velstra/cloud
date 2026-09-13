@@ -904,6 +904,20 @@ impl Api {
         Ok(document)
     }
 
+    /// Whether this caller is one of the parties the cell's machine names are
+    /// for: an operator, or an agent reporting on its own work.
+    ///
+    /// One predicate, because the rule has two halves that drifted apart. The
+    /// read side ([`Api::redact_for`]) takes the names off every answer a
+    /// tenant gets, and shut six doors doing it — and then two *refusals* put
+    /// a name straight back into a sentence, which no amount of trimming the
+    /// documents can catch. A tenant told "runs on peter" in an error has
+    /// learned precisely what the redaction exists to withhold, so the two
+    /// halves now ask the same question in the same place.
+    fn may_see_machines(&self, who: &Identity) -> bool {
+        self.is_operator(who) || crate::sessions::agent_node(who).is_some()
+    }
+
     /// Take the cell's machine names off an answer that is leaving for a tenant.
     ///
     /// Hosts are not part of a project's view — a tenant cannot list them, and a
@@ -917,7 +931,7 @@ impl Api {
     /// absent), on the way *out* only: agents and operators read the same
     /// objects unredacted, and nothing stored changes.
     fn redact_for(&self, who: &Identity, kind: &str, document: &mut Value) {
-        if self.is_operator(who) || crate::sessions::agent_node(who).is_some() {
+        if self.may_see_machines(who) {
             return;
         }
         // `captures` is the sixth door: the API itself writes the guest's
@@ -3039,6 +3053,8 @@ impl Api {
             .at("spec.node"));
         }
         if kind == "attachments" {
+            self.refuse_an_attachment_to_something_that_is_not_there(&spec)
+                .await?;
             self.settle_node(&mut spec, None).await?;
             self.refuse_a_second_holder(parent, &spec).await?;
         }
@@ -3123,7 +3139,7 @@ impl Api {
             self.refuse_a_disk_that_is_not_free(&spec).await?;
         }
         if kind == "attachments" {
-            self.refuse_a_disk_the_guest_cannot_reach(parent, &spec)
+            self.refuse_a_disk_the_guest_cannot_reach(parent, &spec, who)
                 .await?;
         }
         if kind == "images" {
@@ -3174,6 +3190,28 @@ impl Api {
 
         if kind == "nodes" {
             refuse_an_unusable_overcommit(&spec)?;
+        }
+        if kind == "pools" {
+            // A pool created without an opinion takes work.
+            //
+            // `accepting` is a bare `bool`, so "not said" and "drained" were
+            // the same value, and a pool made with an empty spec came out
+            // draining. Nothing noticed while nothing read the flag; now that a
+            // volume is refused into a pool that is not accepting, a default of
+            // false would mean every pool an operator creates without finding
+            // the switch is a pool that refuses everything, in the name of a
+            // drain nobody asked for. Only at creation — a change that does not
+            // mention the field leaves it exactly as it was, or an edit to a
+            // label would quietly undo a drain.
+            //
+            // Asked of the **body**, not of `spec`: `spec` starts life as
+            // `empty_spec()` with every default already in it, so by the time
+            // it is merged there is no difference left between a field nobody
+            // mentioned and one somebody set to false.
+            let said = body.get("spec").and_then(|s| s.get("accepting")).is_some();
+            if !said {
+                spec["accepting"] = Value::Bool(true);
+            }
         }
         if kind == "floatingips" {
             self.refuse_an_address_that_reaches_nothing(&name, &spec)
@@ -4923,6 +4961,13 @@ impl Api {
             .at("spec.node")),
             // Said, and wrong. Refused rather than corrected: rewriting what
             // somebody typed changes what the object says without them asking.
+            //
+            // Naming the machine is safe here, and only because of what stands
+            // in front of it: both the create and the patch path refuse a
+            // non-operator who writes `spec.node` at all, so the only readers
+            // who reach this sentence are the two [`Api::may_see_machines`]
+            // admits anyway. A branch for tenants here would be dead code
+            // pretending to guard something.
             (said, Some(node)) if said != node => Err(ApiError::invalid(format!(
                 "{instance} is on {node}, not on {said}; an attachment is opened by the node that \
                  has the guest"
@@ -6358,6 +6403,66 @@ impl Api {
         Ok(())
     }
 
+    /// An attachment names two objects that are there.
+    ///
+    /// Found by walking the platform as a customer: an attachment whose
+    /// `spec.volume` named a volume that had never been created was accepted,
+    /// written down, and left for a node to act on — which it cannot. It joins
+    /// nothing to nothing, for ever, and says so nowhere.
+    ///
+    /// The other end was refused already, by accident rather than on purpose:
+    /// [`Api::settle_node`] needs the guest's machine and turns away what it
+    /// cannot find, so a mistyped guest was answered *"… is not on a node yet,
+    /// so there is no node to open the volume"* — a sentence about placement,
+    /// addressed to somebody who got a name wrong. Asking here, first, leaves
+    /// that sentence for the case it was written for: a guest that really does
+    /// exist and has not been placed yet.
+    ///
+    /// Only ever reached for references the caller may already read:
+    /// `authorize_references` runs before this and refuses anything belonging
+    /// to a project that is not theirs, so "there is no such volume" can only
+    /// ever be said about a name that is theirs to ask about.
+    async fn refuse_an_attachment_to_something_that_is_not_there(
+        &self,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        for (field, kind, what) in [
+            ("volume", "volumes", "disk"),
+            ("instance", "instances", "guest"),
+        ] {
+            let Some(named) = spec.get(field).and_then(Value::as_str) else {
+                continue;
+            };
+            if named.is_empty() {
+                continue;
+            }
+            let Ok(collection) = self.collection(kind) else {
+                continue;
+            };
+            // A name that does not parse is somebody's typo too, and is refused
+            // by the same sentence rather than waved through as "not a name I
+            // can look up".
+            let there = match ResourceName::parse(named) {
+                Ok(name) if name.collection() == kind => {
+                    matches!(collection.get(&name.to_string()).await, Ok(Some(_)))
+                }
+                _ => false,
+            };
+            if !there {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "there is no {what} called `{named}`. An attachment joins a disk to a \
+                         guest, and one naming something that is not there would be opened by \
+                         nobody, for ever."
+                    ),
+                )
+                .at(format!("spec.{field}")));
+            }
+        }
+        Ok(())
+    }
+
     /// A disk on one machine cannot be opened by a guest on another.
     ///
     /// The volume names a pool, the pool may name the machine its bytes are on,
@@ -6370,12 +6475,17 @@ impl Api {
     /// differently. The way out was to delete the guest and make another until
     /// the scheduler happened to agree with the storage.
     ///
-    /// Said at the door, naming both machines, because that is the one fact
-    /// that makes the next attempt work.
+    /// Said at the door, and said differently to each reader. To an operator,
+    /// naming both machines, because pinning the guest is the fix and the names
+    /// are the fact that makes it work. To a tenant, naming neither: the
+    /// sentence this refusal replaced told a customer which hypervisor runs
+    /// their guest — the leak [`Api::redact_for`] exists to prevent — and then
+    /// advised them to move it, which a tenant may not do.
     async fn refuse_a_disk_the_guest_cannot_reach(
         &self,
         parent: &str,
         spec: &Value,
+        who: &Identity,
     ) -> ApiResult<()> {
         let (Some(volume), Some(instance)) = (
             spec.get("volume").and_then(Value::as_str),
@@ -6445,15 +6555,24 @@ impl Api {
             return Ok(());
         }
         let _ = parent;
-        Err(ApiError::new(
-            Code::FailedPrecondition,
+        // What each reader can act on is what each reader is told. An operator
+        // pins the guest, so the machines are the useful half. A tenant can do
+        // neither of those things, but the pool *is* theirs — a field they
+        // filled in on their own volume — so that is the half they get.
+        let why = if self.may_see_machines(who) {
             format!(
                 "{volume} is on {holds} and {instance} runs on {runs_on}, \
                  so {runs_on} cannot open it. Put the guest on {holds}, \
                  or make the volume in a pool both machines can reach."
-            ),
-        )
-        .at("spec.volume"))
+            )
+        } else {
+            format!(
+                "{volume} is in pool {pool}, which only one machine can reach, and \
+                 {instance} does not run on that machine — so it cannot open the disk. \
+                 Make the disk in a different pool, or ask an operator to move the guest."
+            )
+        };
+        Err(ApiError::new(Code::FailedPrecondition, why).at("spec.volume"))
     }
 
     /// An image **is** its bytes, and a patch does not change them.
@@ -7436,6 +7555,55 @@ impl Api {
             // spoken yet has capacity 0 because nothing is known, and refusing
             // every volume until the first heartbeat would make a freshly
             // registered pool unusable for no stated reason.
+            // **Will this pool take it at all**, before asking whether it has
+            // the room. Two ways it will not, and the platform knew both.
+            //
+            // The first is the operator's own switch. `accepting` is described
+            // in the model as draining — "nothing new is provisioned into it,
+            // what exists stays" — and on the pools form as whether the pool
+            // "takes new work". [`Api::settle_volume_pool`] already obeys it
+            // when the *platform* chooses a pool. It was ignored the moment
+            // somebody named one themselves, which is the asymmetry: the same
+            // flag decided for the cell and meant nothing for the customer.
+            if !pool.spec.accepting {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "`{asked}` is not taking new volumes — it is being drained, so what \
+                         is in it stays and nothing new goes there. Nothing was created: \
+                         name another pool, or leave the pool out and the cell picks one \
+                         that is taking work."
+                    ),
+                )
+                .at("spec.pool"));
+            }
+            // The second is that nobody is watching it. Found on a live cell: a
+            // pool object left behind by an earlier install, its agent long
+            // gone, its Ready condition still reading "the pool agent is
+            // running and answering" from four months ago. A volume put there
+            // was accepted, never claimed, never provisioned — and then could
+            // not be deleted, because release waits for the pool that never
+            // took it. The project could not be deleted either.
+            //
+            // A pool that has *never* reported is still allowed: that is a pool
+            // being registered, and refusing it would make a fresh cell
+            // unusable for no stated reason.
+            let quiet = pool.status.last_heartbeat;
+            if quiet != velstra_cloud_model::meta::Timestamp(0) {
+                let silence = quiet.age(velstra_cloud_model::meta::Timestamp::now());
+                if silence > velstra_cloud_model::resources::POOL_SILENT_AFTER {
+                    return Err(ApiError::new(
+                        Code::FailedPrecondition,
+                        format!(
+                            "no agent has reported on `{asked}` for {} s, so a volume put \
+                             there would sit unprovisioned. Nothing was created: the pool's \
+                             agent has to be running, or name a pool that is being watched.",
+                            silence.as_secs()
+                        ),
+                    )
+                    .at("spec.pool"));
+                }
+            }
             let asked_gib = spec.get("size_gib").and_then(Value::as_u64).unwrap_or(0);
             let has_reported = !pool.status.backend.is_empty();
             let free = pool

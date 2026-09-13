@@ -1690,6 +1690,34 @@
                 cat ctl/postinst >&2
                 exit 1
               }
+              # An upgrade has to run what was upgraded. Measured on a live
+              # cell: a new package unpacked, said "Setting up", and left every
+              # unit running the previous binary — two fixes verified as absent
+              # against an API four hours older than its own files, with
+              # nothing anywhere saying so.
+              grep -q "try-restart" ctl/postinst || {
+                echo "postinst does not restart running units on an upgrade:" >&2
+                cat ctl/postinst >&2
+                exit 1
+              }
+              # And only the running ones. `restart` here would start an API on
+              # every machine that has the package, including the ones whose
+              # role is a hypervisor and nothing else.
+              if grep -qE "systemctl restart" ctl/postinst; then
+                echo "postinst starts units that were not running:" >&2
+                cat ctl/postinst >&2
+                exit 1
+              fi
+              # And it does not wait for them. Measured: the API alone took
+              # twenty seconds to stop, six units in series make a postinst
+              # that runs for a minute, and an upgrade over ssh whose
+              # connection drops inside that minute leaves the package
+              # `half-configured` with some units on each binary.
+              grep -q "try-restart --no-block" ctl/postinst || {
+                echo "postinst waits for the restarts it asked for:" >&2
+                cat ctl/postinst >&2
+                exit 1
+              }
 
               # The licence travels with the software or it has not been
               # conveyed. Debian Policy §12.5 makes this file mandatory and
@@ -1909,6 +1937,58 @@
             grep -q "velstra-cloud-poolagent" out
             grep -q "did not start" out
             grep -q "cannot mark itself a gateway" out
+
+            # And a third run: the machine that carries guests *and* volumes,
+            # joining a cell it is not the control plane of.
+            #
+            # This is the shape that was broken. A pool is a second agent with a
+            # second identity — it authenticates as `pool:<id>` where the node
+            # agent is `node:<id>` — and the API mints the two separately. The
+            # wizard only ever knew about the node's, so the seed looked
+            # complete, both units started, and the pool agent answered
+            # `401 the bearer token was not accepted` on every pass for ever:
+            # no claim, no capacity reported, and a cell that went on accepting
+            # volumes into a pool nothing was watching. Measured on a live box.
+            mkdir -p pool-seed
+            ${velstra-cloud}/bin/velstra-cloud-node setup --dir "$PWD/pool-seed" --nixos false <<'ANSWERS' > poolout 2>&1
+            2 3
+            https://cell-7.example:8443
+            /var/lib/velstra/tls/cert.pem
+            ${lib.concatStrings (lib.replicate 32 "ef")}
+            eu-north
+            cell-7
+            node-c
+            1
+            bulk
+            ${lib.concatStrings (lib.replicate 32 "12")}
+            1
+            n
+            y
+            y
+            ANSWERS
+            cat pool-seed/node.env
+
+            grep -qx "VELSTRA_ROLES=hypervisor,pool" pool-seed/node.env
+            grep -qx "VELSTRA_POOL=bulk" pool-seed/node.env
+            # Two credentials, two files, neither of them in the file every unit
+            # reads. The pool agent's unit reads exactly this path.
+            grep -q "${lib.concatStrings (lib.replicate 32 "ef")}" pool-seed/node-token
+            grep -q "${lib.concatStrings (lib.replicate 32 "12")}" pool-seed/pool-token
+            test "$(stat -c %a pool-seed/pool-token)" = 600
+            if grep -qE "${lib.concatStrings (lib.replicate 32 "ef")}|${lib.concatStrings (lib.replicate 32 "12")}" pool-seed/node.env; then
+              echo "a token is in the world-readable seed" >&2
+              exit 1
+            fi
+            # The two are not the same token. One file holding both would be the
+            # same defect with an extra step.
+            if cmp -s pool-seed/node-token pool-seed/pool-token; then
+              echo "the pool was given the node's token" >&2
+              exit 1
+            fi
+            # And the control-plane run above is not asked for one at all: its
+            # pool agent reaches the store directly and is given no token on
+            # purpose.
+            test ! -e seed/pool-token
 
             touch $out
           '';

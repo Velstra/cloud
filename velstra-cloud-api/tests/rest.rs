@@ -216,7 +216,16 @@ impl Harness {
                 format!("pools/{id}").parse().unwrap(),
                 velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
             ),
-            Default::default(),
+            // Said out loud, because `accepting` is a bare bool and its default
+            // is the drained one. A fixture that took the default was a pool
+            // being drained, and every volume in these tests went into it — the
+            // flag meant nothing until a volume was refused into a pool that is
+            // not taking work, and then the fixture was the first thing to say
+            // so.
+            velstra_cloud_model::resources::PoolSpec {
+                accepting: true,
+                ..Default::default()
+            },
             Default::default(),
         );
         let _ = self
@@ -226,6 +235,23 @@ impl Harness {
                 &velstra_cloud_model::access::Writer::controller("test"),
             )
             .await;
+    }
+
+    /// A disk that really is there, to attach something to.
+    ///
+    /// An attachment names two objects and both have to exist, so a fixture
+    /// that only wanted to watch the node being copied cannot go on naming a
+    /// volume nothing backs. It used to be accepted.
+    async fn disk(&self, project: &str, id: &str) -> String {
+        self.pool("local").await;
+        let made = self
+            .post(
+                &format!("projects/{project}/volumes"),
+                json!({ "id": id, "spec": { "sizeGib": 1, "pool": "local" } }),
+            )
+            .await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+        format!("projects/{project}/volumes/{id}")
     }
 
     fn nodes(&self) -> TypedStore<NodeSpec, NodeStatus> {
@@ -1179,6 +1205,7 @@ async fn an_attachment_takes_its_node_from_the_instance() {
     // sentence true — and it means an attachment whose node disagrees with its
     // instance's cannot be written down at all.
     let h = Harness::new();
+    h.disk("p1", "v1").await;
     h.instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
         .await;
     let created = h
@@ -1206,6 +1233,7 @@ async fn an_attachment_may_not_name_a_node_the_instance_is_not_on() {
     // what the object says without the caller asking, and they may have meant
     // the instance rather than the node.
     let h = Harness::new();
+    h.disk("p1", "v1").await;
     h.instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
         .await;
     let refused = h
@@ -1232,6 +1260,7 @@ async fn an_unplaced_instance_has_no_node_to_lend() {
     // The honest answer, rather than an attachment carrying an empty node that
     // no agent's watch will ever match.
     let h = Harness::new();
+    h.disk("p1", "v1").await;
     h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
     let refused = h
         .post(
@@ -1250,6 +1279,7 @@ async fn an_unplaced_instance_has_no_node_to_lend() {
 #[tokio::test]
 async fn an_attachment_may_follow_a_migration_but_not_wander_off() {
     let h = Harness::new();
+    h.disk("p1", "v1").await;
     let instance = h
         .instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
         .await;
@@ -4304,7 +4334,10 @@ async fn a_volume_naming_a_pool_that_is_not_there_is_refused_while_somebody_is_a
                     "pools/local".parse().unwrap(),
                     velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
                 ),
-                Default::default(),
+                velstra_cloud_model::resources::PoolSpec {
+                    accepting: true,
+                    ..Default::default()
+                },
                 Default::default(),
             ),
             &velstra_cloud_model::access::Writer::controller("test"),
@@ -5725,4 +5758,244 @@ async fn whoami_names_the_cell_that_answered() {
     // every sign-in to decide which buttons exist.
     assert!(answer.body["subject"].is_string(), "{:?}", answer.body);
     assert!(answer.body["projects"].is_object(), "{:?}", answer.body);
+}
+
+/// **A pool that is not taking work does not get a volume.**
+///
+/// `accepting` is described in the model as a drain — "nothing new is
+/// provisioned into it, what exists stays" — and on the pools form as whether
+/// the pool takes new work. The platform already obeyed it when *it* chose a
+/// pool for a volume that named none, and ignored it the moment somebody named
+/// one themselves: the same flag decided for the cell and meant nothing for
+/// the customer.
+#[tokio::test]
+async fn a_volume_is_refused_into_a_pool_that_is_being_drained() {
+    let h = Harness::new();
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+    let draining = velstra_cloud_model::resources::Resource::new(
+        velstra_cloud_model::meta::Meta::new(
+            "pools/old".parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: false,
+            ..Default::default()
+        },
+        velstra_cloud_model::resources::PoolStatus {
+            backend: "directory".into(),
+            capacity_gib: 1000,
+            last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
+            ..Default::default()
+        },
+    );
+    h.pools().create(&draining, &writer).await.unwrap();
+
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data", "spec": { "sizeGib": 1, "pool": "old" } }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("drained"), "{message}");
+    assert!(message.contains("`old`"), "{message}");
+}
+
+/// **A pool nobody is watching does not get one either.**
+///
+/// Found on a live cell: a `pools/ceph` object left behind by an earlier
+/// install, its agent not started since April, its Ready condition still
+/// reading "the pool agent is running and answering" from then. A volume was
+/// accepted into it on four-month-old capacity numbers, never claimed, never
+/// provisioned — and then could not be deleted, because release waits for the
+/// pool that never took it. The project holding it could not be deleted
+/// either. The alert `pool-unwatched` had been saying so the whole time.
+#[tokio::test]
+async fn a_volume_is_refused_into_a_pool_no_agent_has_reported_on_lately() {
+    let h = Harness::new();
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+    let long_ago = velstra_cloud_model::meta::Timestamp(
+        velstra_cloud_model::meta::Timestamp::now().0
+            - (velstra_cloud_model::resources::POOL_SILENT_AFTER.as_millis() as u64 + 60_000),
+    );
+    let abandoned = velstra_cloud_model::resources::Resource::new(
+        velstra_cloud_model::meta::Meta::new(
+            "pools/ghost".parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: true,
+            ..Default::default()
+        },
+        velstra_cloud_model::resources::PoolStatus {
+            backend: "ceph".into(),
+            capacity_gib: 1000,
+            last_heartbeat: long_ago,
+            ..Default::default()
+        },
+    );
+    h.pools().create(&abandoned, &writer).await.unwrap();
+
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data", "spec": { "sizeGib": 1, "pool": "ghost" } }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("no agent has reported"), "{message}");
+    assert!(message.contains("`ghost`"), "{message}");
+
+    // And a pool that has never reported at all is still fine: that is a pool
+    // being registered, not one that was abandoned. Refusing it would make a
+    // cell unusable between its first pool and its first heartbeat.
+    h.pool("fresh").await;
+    let made = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "new", "spec": { "sizeGib": 1, "pool": "fresh" } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+}
+
+/// A pool created without an opinion takes work.
+///
+/// `accepting` is a bare bool, so "not said" and "drained" were one value and a
+/// pool made with an empty spec came out draining. That was harmless while
+/// nothing read the flag. Now that a volume is refused into a pool that is not
+/// taking work, it would mean every pool an operator creates without finding
+/// the switch refuses everything, in the name of a drain nobody asked for.
+#[tokio::test]
+async fn a_pool_created_without_an_opinion_takes_work_and_one_with_one_keeps_it() {
+    let h = Harness::new();
+
+    let made = h.post("pools", json!({ "id": "quiet", "spec": {} })).await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    let back = h.get("pools/quiet").await;
+    assert_eq!(
+        back.body["spec"]["accepting"],
+        json!(true),
+        "{:?}",
+        back.body
+    );
+
+    // And saying it outright is still honoured, in both directions.
+    let made = h
+        .post(
+            "pools",
+            json!({ "id": "draining", "spec": { "accepting": false } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    let back = h.get("pools/draining").await;
+    assert_eq!(
+        back.body["spec"]["accepting"],
+        json!(false),
+        "{:?}",
+        back.body
+    );
+}
+
+/// **An attachment that joins nothing to nothing is refused at the door.**
+///
+/// Found walking the platform as a customer. An attachment naming a volume
+/// that had never been created came back `202 Accepted` with an operation id,
+/// and then sat there: no node can open a disk that does not exist, nothing
+/// retries into existence, and no answer anywhere says why. The guest end was
+/// refused already, but by accident — `settle_node` wants the guest's machine
+/// and could not find one, so a mistyped name was answered with a sentence
+/// about placement.
+#[tokio::test]
+async fn an_attachment_naming_something_that_is_not_there_is_refused() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    h.pool("local").await;
+    let guest = h
+        .instance(
+            "p1",
+            "web",
+            json!({ "vcpus": 1, "memoryMib": 512, "node": "node-a" }),
+        )
+        .await;
+    let made = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data", "spec": { "sizeGib": 1, "pool": "local" } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    // The disk that is not there.
+    let refused = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "m1", "spec": {
+                "volume": "projects/p1/volumes/never-made",
+                "instance": guest,
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("no disk called"), "{message}");
+    assert_eq!(refused.body["error"]["field"], json!("spec.volume"));
+
+    // And the guest that is not there, said as a missing guest rather than as
+    // a placement that has not happened.
+    let refused = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "m2", "spec": {
+                "volume": "projects/p1/volumes/data",
+                "instance": "projects/p1/instances/never-made",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("no guest called"), "{message}");
+    assert_eq!(refused.body["error"]["field"], json!("spec.instance"));
+
+    // Both ends real, and it goes through.
+    let made = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "m3", "spec": {
+                "volume": "projects/p1/volumes/data",
+                "instance": guest,
+            }}),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
 }
