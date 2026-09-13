@@ -3189,6 +3189,28 @@ impl Api {
         if kind == "nodes" {
             refuse_an_unusable_overcommit(&spec)?;
         }
+        if kind == "pools" {
+            // A pool created without an opinion takes work.
+            //
+            // `accepting` is a bare `bool`, so "not said" and "drained" were
+            // the same value, and a pool made with an empty spec came out
+            // draining. Nothing noticed while nothing read the flag; now that a
+            // volume is refused into a pool that is not accepting, a default of
+            // false would mean every pool an operator creates without finding
+            // the switch is a pool that refuses everything, in the name of a
+            // drain nobody asked for. Only at creation — a change that does not
+            // mention the field leaves it exactly as it was, or an edit to a
+            // label would quietly undo a drain.
+            //
+            // Asked of the **body**, not of `spec`: `spec` starts life as
+            // `empty_spec()` with every default already in it, so by the time
+            // it is merged there is no difference left between a field nobody
+            // mentioned and one somebody set to false.
+            let said = body.get("spec").and_then(|s| s.get("accepting")).is_some();
+            if !said {
+                spec["accepting"] = Value::Bool(true);
+            }
+        }
         if kind == "floatingips" {
             self.refuse_an_address_that_reaches_nothing(&name, &spec)
                 .await?;
@@ -7471,6 +7493,55 @@ impl Api {
             // spoken yet has capacity 0 because nothing is known, and refusing
             // every volume until the first heartbeat would make a freshly
             // registered pool unusable for no stated reason.
+            // **Will this pool take it at all**, before asking whether it has
+            // the room. Two ways it will not, and the platform knew both.
+            //
+            // The first is the operator's own switch. `accepting` is described
+            // in the model as draining — "nothing new is provisioned into it,
+            // what exists stays" — and on the pools form as whether the pool
+            // "takes new work". [`Api::settle_volume_pool`] already obeys it
+            // when the *platform* chooses a pool. It was ignored the moment
+            // somebody named one themselves, which is the asymmetry: the same
+            // flag decided for the cell and meant nothing for the customer.
+            if !pool.spec.accepting {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "`{asked}` is not taking new volumes — it is being drained, so what \
+                         is in it stays and nothing new goes there. Nothing was created: \
+                         name another pool, or leave the pool out and the cell picks one \
+                         that is taking work."
+                    ),
+                )
+                .at("spec.pool"));
+            }
+            // The second is that nobody is watching it. Found on a live cell: a
+            // pool object left behind by an earlier install, its agent long
+            // gone, its Ready condition still reading "the pool agent is
+            // running and answering" from four months ago. A volume put there
+            // was accepted, never claimed, never provisioned — and then could
+            // not be deleted, because release waits for the pool that never
+            // took it. The project could not be deleted either.
+            //
+            // A pool that has *never* reported is still allowed: that is a pool
+            // being registered, and refusing it would make a fresh cell
+            // unusable for no stated reason.
+            let quiet = pool.status.last_heartbeat;
+            if quiet != velstra_cloud_model::meta::Timestamp(0) {
+                let silence = quiet.age(velstra_cloud_model::meta::Timestamp::now());
+                if silence > velstra_cloud_model::resources::POOL_SILENT_AFTER {
+                    return Err(ApiError::new(
+                        Code::FailedPrecondition,
+                        format!(
+                            "no agent has reported on `{asked}` for {} s, so a volume put \
+                             there would sit unprovisioned. Nothing was created: the pool's \
+                             agent has to be running, or name a pool that is being watched.",
+                            silence.as_secs()
+                        ),
+                    )
+                    .at("spec.pool"));
+                }
+            }
             let asked_gib = spec.get("size_gib").and_then(Value::as_u64).unwrap_or(0);
             let has_reported = !pool.status.backend.is_empty();
             let free = pool

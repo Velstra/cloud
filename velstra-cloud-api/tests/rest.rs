@@ -216,7 +216,16 @@ impl Harness {
                 format!("pools/{id}").parse().unwrap(),
                 velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
             ),
-            Default::default(),
+            // Said out loud, because `accepting` is a bare bool and its default
+            // is the drained one. A fixture that took the default was a pool
+            // being drained, and every volume in these tests went into it — the
+            // flag meant nothing until a volume was refused into a pool that is
+            // not taking work, and then the fixture was the first thing to say
+            // so.
+            velstra_cloud_model::resources::PoolSpec {
+                accepting: true,
+                ..Default::default()
+            },
             Default::default(),
         );
         let _ = self
@@ -4304,7 +4313,10 @@ async fn a_volume_naming_a_pool_that_is_not_there_is_refused_while_somebody_is_a
                     "pools/local".parse().unwrap(),
                     velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
                 ),
-                Default::default(),
+                velstra_cloud_model::resources::PoolSpec {
+                    accepting: true,
+                    ..Default::default()
+                },
                 Default::default(),
             ),
             &velstra_cloud_model::access::Writer::controller("test"),
@@ -5725,4 +5737,157 @@ async fn whoami_names_the_cell_that_answered() {
     // every sign-in to decide which buttons exist.
     assert!(answer.body["subject"].is_string(), "{:?}", answer.body);
     assert!(answer.body["projects"].is_object(), "{:?}", answer.body);
+}
+
+/// **A pool that is not taking work does not get a volume.**
+///
+/// `accepting` is described in the model as a drain — "nothing new is
+/// provisioned into it, what exists stays" — and on the pools form as whether
+/// the pool takes new work. The platform already obeyed it when *it* chose a
+/// pool for a volume that named none, and ignored it the moment somebody named
+/// one themselves: the same flag decided for the cell and meant nothing for
+/// the customer.
+#[tokio::test]
+async fn a_volume_is_refused_into_a_pool_that_is_being_drained() {
+    let h = Harness::new();
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+    let draining = velstra_cloud_model::resources::Resource::new(
+        velstra_cloud_model::meta::Meta::new(
+            "pools/old".parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: false,
+            ..Default::default()
+        },
+        velstra_cloud_model::resources::PoolStatus {
+            backend: "directory".into(),
+            capacity_gib: 1000,
+            last_heartbeat: velstra_cloud_model::meta::Timestamp::now(),
+            ..Default::default()
+        },
+    );
+    h.pools().create(&draining, &writer).await.unwrap();
+
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data", "spec": { "sizeGib": 1, "pool": "old" } }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("drained"), "{message}");
+    assert!(message.contains("`old`"), "{message}");
+}
+
+/// **A pool nobody is watching does not get one either.**
+///
+/// Found on a live cell: a `pools/ceph` object left behind by an earlier
+/// install, its agent not started since April, its Ready condition still
+/// reading "the pool agent is running and answering" from then. A volume was
+/// accepted into it on four-month-old capacity numbers, never claimed, never
+/// provisioned — and then could not be deleted, because release waits for the
+/// pool that never took it. The project holding it could not be deleted
+/// either. The alert `pool-unwatched` had been saying so the whole time.
+#[tokio::test]
+async fn a_volume_is_refused_into_a_pool_no_agent_has_reported_on_lately() {
+    let h = Harness::new();
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+    let long_ago = velstra_cloud_model::meta::Timestamp(
+        velstra_cloud_model::meta::Timestamp::now().0
+            - (velstra_cloud_model::resources::POOL_SILENT_AFTER.as_millis() as u64 + 60_000),
+    );
+    let abandoned = velstra_cloud_model::resources::Resource::new(
+        velstra_cloud_model::meta::Meta::new(
+            "pools/ghost".parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: true,
+            ..Default::default()
+        },
+        velstra_cloud_model::resources::PoolStatus {
+            backend: "ceph".into(),
+            capacity_gib: 1000,
+            last_heartbeat: long_ago,
+            ..Default::default()
+        },
+    );
+    h.pools().create(&abandoned, &writer).await.unwrap();
+
+    let refused = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data", "spec": { "sizeGib": 1, "pool": "ghost" } }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("no agent has reported"), "{message}");
+    assert!(message.contains("`ghost`"), "{message}");
+
+    // And a pool that has never reported at all is still fine: that is a pool
+    // being registered, not one that was abandoned. Refusing it would make a
+    // cell unusable between its first pool and its first heartbeat.
+    h.pool("fresh").await;
+    let made = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "new", "spec": { "sizeGib": 1, "pool": "fresh" } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+}
+
+/// A pool created without an opinion takes work.
+///
+/// `accepting` is a bare bool, so "not said" and "drained" were one value and a
+/// pool made with an empty spec came out draining. That was harmless while
+/// nothing read the flag. Now that a volume is refused into a pool that is not
+/// taking work, it would mean every pool an operator creates without finding
+/// the switch refuses everything, in the name of a drain nobody asked for.
+#[tokio::test]
+async fn a_pool_created_without_an_opinion_takes_work_and_one_with_one_keeps_it() {
+    let h = Harness::new();
+
+    let made = h.post("pools", json!({ "id": "quiet", "spec": {} })).await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    let back = h.get("pools/quiet").await;
+    assert_eq!(
+        back.body["spec"]["accepting"],
+        json!(true),
+        "{:?}",
+        back.body
+    );
+
+    // And saying it outright is still honoured, in both directions.
+    let made = h
+        .post(
+            "pools",
+            json!({ "id": "draining", "spec": { "accepting": false } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    let back = h.get("pools/draining").await;
+    assert_eq!(
+        back.body["spec"]["accepting"],
+        json!(false),
+        "{:?}",
+        back.body
+    );
 }

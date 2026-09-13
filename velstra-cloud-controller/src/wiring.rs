@@ -289,12 +289,7 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
     );
     spawn!(
         "volume",
-        VolumeController::new(
-            volumes.clone(),
-            snapshots.clone(),
-            TypedStore::new(store.clone(), id, "pools"),
-            id,
-        ),
+        VolumeController::new(volumes.clone(), snapshots.clone(), id),
         volumes.clone()
     );
     spawn!(

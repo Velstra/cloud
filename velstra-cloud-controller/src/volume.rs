@@ -50,12 +50,6 @@ const WHO: &str = "volume";
 pub struct VolumeController {
     volumes: TypedStore<VolumeSpec, VolumeStatus>,
     snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
-    /// The cell's pools, read to answer one question: is there anybody who
-    /// could ever let go of this volume? See `nobody_will_ever_let_go`.
-    pools: TypedStore<
-        velstra_cloud_model::resources::PoolSpec,
-        velstra_cloud_model::resources::PoolStatus,
-    >,
     cell: String,
 }
 
@@ -63,14 +57,9 @@ impl VolumeController {
     pub fn new(
         volumes: TypedStore<VolumeSpec, VolumeStatus>,
         snapshots: TypedStore<SnapshotSpec, SnapshotStatus>,
-        pools: TypedStore<
-            velstra_cloud_model::resources::PoolSpec,
-            velstra_cloud_model::resources::PoolStatus,
-        >,
         cell: &str,
     ) -> Self {
         Self {
-            pools,
             volumes,
             snapshots,
             cell: cell.to_string(),
@@ -130,29 +119,31 @@ impl VolumeController {
     /// Whether this volume is waiting for a pool that will never answer.
     ///
     ///  The release guard exists so a record cannot disappear while its bytes
-    ///  remain. That reasoning needs a pool: if the one named does not exist in this
-    ///  cell, and no pool ever claimed the volume, then nothing was ever
-    ///  provisioned — there are no bytes to leave behind, and the guard is waiting
-    ///  for a party that cannot arrive.
+    ///  remain. The question it really asks is whether any bytes were ever put
+    ///  anywhere, and the pool agent answers that itself: *claim first, act
+    ///  never before.* An agent writes `status.pool` and returns; only on a
+    ///  later pass, once that field names it, does it touch a backend. So a
+    ///  volume no pool has claimed has no bytes behind it, anywhere, and there
+    ///  is nothing for anybody to release.
     ///
-    ///  Found on a real cell: a volume created with a mistyped pool sat `deleting`
-    ///  for hours, undeletable by any means the API offers, because the only thing
-    ///  that could release it was a pool called `pools/local` that does not and will
-    ///  never exist. A cell that can be put into a corner it cannot be got out of is
-    ///  the wrong shape.
+    ///  This used to ask a narrower question — whether the pool *named* exists
+    ///  — and caught only the mistyped-pool case that prompted it: a volume in
+    ///  `pools/local` on a cell with no such pool, sitting `deleting` for hours,
+    ///  undeletable by any means the API offers.
     ///
-    ///  Deliberately **not** "the pool's agent is quiet". A pool that exists and is
-    ///  down may well be holding real bytes, and waiting is exactly right there.
-    async fn nobody_will_ever_let_go(&self, volume: &Volume) -> Result<bool> {
-        if volume.status.pool.is_some() {
-            return Ok(false);
-        }
-        let asked = volume.spec.pool.trim();
-        if asked.is_empty() {
-            return Ok(true);
-        }
-        let pools = self.pools.list().await?;
-        Ok(!pools.iter().any(|p| p.meta.name.id() == asked))
+    ///  Found on a live cell, one corner over: a pool that does exist, left
+    ///  behind by an earlier install, whose agent has not run since April. The
+    ///  volume was accepted into it, never claimed, never provisioned — and
+    ///  never deletable, because the only party that could release it was an
+    ///  agent that had never taken it. The project holding it could not be
+    ///  deleted either. Same corner, a different way in.
+    ///
+    ///  Still deliberately **not** "the pool's agent is quiet". A pool that
+    ///  claimed this volume may well be holding real bytes while its agent is
+    ///  down, and waiting is exactly right there — which is why the claim, and
+    ///  not the pool's health, is what this reads.
+    fn nobody_will_ever_let_go(volume: &Volume) -> bool {
+        volume.status.pool.is_none()
     }
 }
 
@@ -220,7 +211,7 @@ impl Reconciler for VolumeController {
                     // naming a pool this cell does not have, that no pool ever
                     // claimed, has no bytes anywhere — and waiting for its
                     // release is waiting for a party that cannot arrive.
-                    if !self.nobody_will_ever_let_go(volume).await? {
+                    if !Self::nobody_will_ever_let_go(volume) {
                         return Ok(());
                     }
                     warn!(
@@ -333,11 +324,96 @@ mod tests {
         );
     }
 
-    /// And a volume whose pool **does** exist keeps waiting, however quiet that
-    /// pool is. A pool that is down may be holding real bytes, and letting the
-    /// record go there would be losing them silently.
+    /// And a volume a pool **claimed** keeps waiting, however quiet that pool
+    /// has gone. An agent that claimed may have provisioned; letting the record
+    /// go would be losing the bytes silently, and the claim is the only honest
+    /// signal that there might be any.
+    ///
+    /// This test used to say "whose pool exists", and that was the rule that
+    /// put a live cell in a corner: a pool object left over from an earlier
+    /// install, no agent since April, a volume accepted into it, never claimed
+    /// — and never deletable, because release waited for a party that had never
+    /// taken it. The pool's existence says nothing about whether bytes were
+    /// written. The claim does.
     #[tokio::test]
-    async fn a_volume_whose_pool_exists_keeps_waiting_for_it() {
+    async fn a_volume_a_pool_claimed_keeps_waiting_for_it_to_let_go() {
+        let (cell, controller) = fixture().await;
+        let mut v = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        v.spec.pool = "local".into();
+        v.meta.generation += 1;
+        v.meta.add_finalizer(POOL_RELEASE_FINALIZER);
+        cell.volumes
+            .update(&v, &Writer::controller("volume"))
+            .await
+            .unwrap();
+
+        // The claim, written by the party that may write it — a status is the
+        // agent's, and the controller asking for this one is refused.
+        let mut v = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        v.status.pool = Some("local".into());
+        cell.volumes
+            .update(&v, &Writer::agent("local"))
+            .await
+            .unwrap();
+
+        // And then the delete. No `Released` condition ever follows, because
+        // the agent has gone quiet — which is the case that must keep waiting.
+        let mut v = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        v.meta.deleted_at = Some(velstra_cloud_model::meta::Timestamp::now());
+        cell.volumes
+            .update(&v, &Writer::controller("volume"))
+            .await
+            .unwrap();
+
+        let stored = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        controller
+            .reconcile("projects/p1/volumes/data-1", Some(&stored))
+            .await
+            .expect("the pass runs");
+
+        let after = cell
+            .volumes
+            .get("projects/p1/volumes/data-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.meta.has_finalizer(POOL_RELEASE_FINALIZER),
+            "a volume a pool claimed was let go without the pool saying so"
+        );
+    }
+
+    /// A volume no pool ever claimed goes, even though the pool it names is
+    /// right there in the cell.
+    ///
+    /// The agent's own order is what makes this safe: it claims by writing
+    /// `status.pool` and returns, and only touches a backend on a later pass,
+    /// once that field names it. No claim, no bytes — so there is nothing for
+    /// anybody to release, and holding the record hostage to an agent that
+    /// never arrived leaves an object, and the project holding it, undeletable
+    /// for ever.
+    #[tokio::test]
+    async fn a_volume_no_pool_ever_claimed_goes_even_though_its_pool_is_there() {
         let (cell, controller) = fixture().await;
         let pools: TypedStore<
             velstra_cloud_model::resources::PoolSpec,
@@ -392,8 +468,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            after.meta.has_finalizer(POOL_RELEASE_FINALIZER),
-            "a volume whose pool exists was let go without the pool saying so"
+            !after.meta.has_finalizer(POOL_RELEASE_FINALIZER),
+            "a volume no pool ever took is still held by a release that cannot come"
         );
     }
 
@@ -427,12 +503,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let controller = VolumeController::new(
-            cell.volumes.clone(),
-            cell.snapshots.clone(),
-            TypedStore::new(cell.raw.clone(), "cell-1", "pools"),
-            "cell-1",
-        );
+        let controller =
+            VolumeController::new(cell.volumes.clone(), cell.snapshots.clone(), "cell-1");
         (cell, controller)
     }
 

@@ -2280,6 +2280,19 @@ pub const SNAPSHOT_SOURCE_FINALIZER: &str = "snapshot.velstra.io/source";
 /// agent reports. Nothing here describes *how* to talk to the backend, because
 /// that is not an operator's statement about the world: the agent knows what it
 /// is running and reports it.
+/// How long a pool's agent may say nothing before the pool counts as unwatched.
+///
+/// One definition, two readers. The alert `pool-unwatched` has fired on this
+/// for as long as it has existed — *"no agent has reported on a pool, ever or
+/// lately, so nothing is provisioned into it and nothing is released from it"*
+/// — while the API went on accepting volumes into exactly such a pool, on
+/// capacity numbers from the last time an agent spoke. A cell that pages an
+/// operator about a condition and then walks into it is holding two opinions.
+///
+/// Generous on purpose: a pool agent reports on its own resync and there is no
+/// promise about how often. What this catches is a pool with *no* agent at all.
+pub const POOL_SILENT_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PoolSpec {
     /// False drains the pool: nothing new is provisioned into it, what exists
