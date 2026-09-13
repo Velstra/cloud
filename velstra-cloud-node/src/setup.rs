@@ -88,6 +88,19 @@ pub struct Machine {
     pub vmm: String,
     /// The pool's id and backend, for a pool.
     pub pool: String,
+    /// The pool's own one-time token.
+    ///
+    /// A second credential, because a pool is a second agent. The pool agent
+    /// authenticates as `pool:<id>` and the node agent as `node:<id>`, and the
+    /// API issues them separately — `poolToken` when the pool object is made,
+    /// `nodeToken` when the node object is. One token cannot be both: a node
+    /// token presented by a pool agent is answered `401 the bearer token was
+    /// not accepted`, which is what a machine joined as hypervisor **and** pool
+    /// used to get, for ever, with the seed looking complete.
+    ///
+    /// Empty on a control plane, whose pool agent reaches the store directly
+    /// and is given no token at all.
+    pub pool_token: String,
     /// The certificate and key the API serves TLS with. Empty means plaintext,
     /// which the API says out loud at startup.
     /// The certificate the agents verify the API against, when it is https.
@@ -336,6 +349,7 @@ pub fn parse(text: &str) -> Result<Machine> {
         token: or("VELSTRA_TOKEN", ""),
         vmm: or("VELSTRA_VMM", "qemu"),
         pool: String::new(),
+        pool_token: or("VELSTRA_POOL_TOKEN", ""),
         pool_backend: or("VELSTRA_POOL_BACKEND", "directory"),
         store: or("VELSTRA_STORE", "127.0.0.1:2379"),
         listen: or("VELSTRA_LISTEN", ""),
@@ -561,6 +575,20 @@ pub(crate) fn write_seed(dir: &Path, m: &Machine) -> Result<()> {
         // that read it do not all run as root.
         write_with_mode(&dir.join("node-token"), &format!("{}\n", m.token), 0o600)?;
     }
+    // The pool's own credential, on the same terms. The unit reads
+    // `/etc/velstra/pool-token` and falls back to the shared state directory;
+    // writing it here is what makes a pool agent on any machine but the
+    // control plane able to speak at all.
+    if m.roles.contains(&Role::Pool)
+        && !m.roles.contains(&Role::ControlPlane)
+        && !m.pool_token.is_empty()
+    {
+        write_with_mode(
+            &dir.join("pool-token"),
+            &format!("{}\n", m.pool_token),
+            0o600,
+        )?;
+    }
     if m.roles.contains(&Role::ControlPlane) && !m.admin_password.is_empty() {
         // Its own file, its own mode, for the same reason the token has one.
         // The API unit reads it into the environment at start rather than
@@ -696,18 +724,28 @@ fn node_from_subject(subject: &str) -> &str {
 /// `VELSTRA_TOKEN` the unattended path uses is honoured here too, and a pasted
 /// answer is taken with whatever whitespace and capitals came with it.
 fn ask_for_the_token() -> Result<String> {
-    if let Ok(from_env) = std::env::var("VELSTRA_TOKEN") {
+    ask_for_a_token("Registration token", "VELSTRA_TOKEN")
+}
+
+/// One token, asked for by the name it goes by and honoured from the
+/// environment under the variable the unattended path uses.
+///
+/// Shared, because there are two of them now — a node's and a pool's — and two
+/// copies of "paste 64 hex characters, and take it from the environment if it
+/// is there" is two places for them to drift.
+fn ask_for_a_token(label: &str, env: &str) -> Result<String> {
+    if let Ok(from_env) = std::env::var(env) {
         let tidy = tidy_token(&from_env);
         if validate_token(&tidy).is_ok() {
-            println!("Registration token: taken from VELSTRA_TOKEN.");
+            println!("{label}: taken from {env}.");
             return Ok(tidy);
         }
         if !from_env.trim().is_empty() {
-            println!("  VELSTRA_TOKEN is set but is not a registration token; asking instead.");
+            println!("  {env} is set but is not a token; asking instead.");
         }
     }
     loop {
-        let raw = prompt("Registration token: ")?;
+        let raw = prompt(&format!("{label}: "))?;
         let tidy = tidy_token(&raw);
         match validate_token(&tidy) {
             Ok(()) => return Ok(tidy),
@@ -864,6 +902,7 @@ fn collect() -> Result<Option<Machine>> {
     };
 
     let mut m = Machine {
+        pool_token: String::new(),
         api_ca: api_ca.clone(),
         tls_cert: String::new(),
         tls_key: String::new(),
@@ -928,6 +967,23 @@ fn collect() -> Result<Option<Machine>> {
             validate_node_name,
             "lowercase letters, digits and '-'",
         )?;
+        // And the pool's own token, for the same reason the node has one: a
+        // pool is a separate agent with a separate identity, and the API mints
+        // it separately when the pool object is created.
+        //
+        // Never asked until now. A machine joined as hypervisor **and** pool
+        // wrote a seed that looked complete, started both agents, and the pool
+        // one answered `401 the bearer token was not accepted` on every pass —
+        // because it was reading the node's token, the only one the wizard
+        // knew about. The pool then never claimed a volume, never reported
+        // capacity, and the cell went on accepting volumes into it.
+        //
+        // Not asked of a control plane: that machine's pool agent goes straight
+        // to the store and is given no token on purpose.
+        if !roles.contains(&Role::ControlPlane) {
+            println!("The pool has its own token, shown once when its pool object was created.");
+            m.pool_token = ask_for_a_token("Pool token", "VELSTRA_POOL_TOKEN")?;
+        }
         m.pool_backend = loop {
             match prompt("Backend [1] directory  [2] lvm  [3] ceph: ")?.trim() {
                 "" | "1" => break "directory".to_string(),
@@ -1223,8 +1279,9 @@ mod tests {
 
     use super::*;
 
-    fn hypervisor() -> Machine {
+    pub(super) fn hypervisor() -> Machine {
         Machine {
+            pool_token: String::new(),
             api_ca: String::new(),
             tls_cert: String::new(),
             tls_key: String::new(),
@@ -1939,5 +1996,51 @@ mod giving_the_store_room {
         assert!(settle_etcd_at(&path).unwrap());
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\nETCD_QUOTA_BACKEND_BYTES=8589934592"));
+    }
+}
+
+#[cfg(test)]
+mod pool_token_tests {
+    use super::*;
+
+    /// A machine that holds volumes gets the pool's own credential, in its own
+    /// file, and not the node's.
+    ///
+    /// The two are different identities — `pool:<id>` against `node:<id>` — and
+    /// the API mints them separately. A machine joined as hypervisor and pool
+    /// used to be given only the node's, and its pool agent answered
+    /// `401 the bearer token was not accepted` on every pass, for ever, with
+    /// the seed looking complete.
+    #[test]
+    fn a_pool_gets_its_own_token_file() {
+        let dir = std::env::temp_dir().join(format!("velstra-pool-token-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut m = tests::hypervisor();
+        m.roles = vec![Role::Hypervisor, Role::Pool];
+        m.pool = "bulk".into();
+        m.token = "a".repeat(64);
+        m.pool_token = "b".repeat(64);
+        write_seed(&dir, &m).expect("the seed is written");
+
+        let node = fs::read_to_string(dir.join("node-token")).expect("a node token");
+        let pool = fs::read_to_string(dir.join("pool-token")).expect("a pool token");
+        assert_eq!(node.trim(), "a".repeat(64));
+        assert_eq!(pool.trim(), "b".repeat(64));
+        assert_ne!(node, pool, "the pool was given the node's token");
+
+        // Neither is in the file every unit reads.
+        let seed = fs::read_to_string(dir.join("node.env")).expect("a seed");
+        assert!(!seed.contains(&"a".repeat(64)), "{seed}");
+        assert!(!seed.contains(&"b".repeat(64)), "{seed}");
+
+        // And the control plane is given none: its pool agent reaches the store
+        // directly, and a token there would be one nothing reads.
+        let mut cp = m.clone();
+        cp.roles = vec![Role::ControlPlane, Role::Hypervisor, Role::Pool];
+        let cp_dir = dir.join("cp");
+        write_seed(&cp_dir, &cp).expect("the seed is written");
+        assert!(!cp_dir.join("pool-token").exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -152,6 +152,9 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     }
 
     let machine = Machine {
+        // One machine that is the whole cell: its pool agent reaches the store
+        // directly, and is deliberately given no token.
+        pool_token: String::new(),
         lvm_group: String::new(),
         lvm_thin_pool: String::new(),
         ceph_conf: String::new(),
