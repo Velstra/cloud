@@ -1708,6 +1708,16 @@
                 cat ctl/postinst >&2
                 exit 1
               fi
+              # And it does not wait for them. Measured: the API alone took
+              # twenty seconds to stop, six units in series make a postinst
+              # that runs for a minute, and an upgrade over ssh whose
+              # connection drops inside that minute leaves the package
+              # `half-configured` with some units on each binary.
+              grep -q "try-restart --no-block" ctl/postinst || {
+                echo "postinst waits for the restarts it asked for:" >&2
+                cat ctl/postinst >&2
+                exit 1
+              }
 
               # The licence travels with the software or it has not been
               # conveyed. Debian Policy §12.5 makes this file mandatory and

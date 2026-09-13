@@ -1201,13 +1201,34 @@ fn collect() -> Result<Option<Machine>> {
 fn resolve_roles(raw: &str) -> Result<Vec<Role>, String> {
     let mut out = Vec::new();
     for token in raw.split_whitespace() {
-        let index: usize = token
-            .parse()
-            .map_err(|_| format!("{token:?} is not a number from 1 to {}", Role::ALL.len()))?;
-        let role = Role::ALL
-            .get(index.wrapping_sub(1))
-            .ok_or_else(|| format!("there is no role {index}"))?;
-        out.push(*role);
+        // The number or the name. The prompt prints both — `[2] hypervisor` —
+        // and typing the word it just showed you was answered "hypervisor" is
+        // not a number from 1 to 3, three times over, because the answers
+        // afterwards go on being read as roles. Nothing is ambiguous between
+        // the two spellings, so there is no reason to accept only one.
+        let role = match token.parse::<usize>() {
+            Ok(index) => *Role::ALL
+                .get(index.wrapping_sub(1))
+                .ok_or_else(|| format!("there is no role {index}"))?,
+            Err(_) => {
+                let want = token.to_ascii_lowercase();
+                *Role::ALL
+                    .iter()
+                    .find(|r| r.as_str() == want)
+                    .ok_or_else(|| {
+                        format!(
+                            "{token:?} is neither a number from 1 to {} nor one of {}",
+                            Role::ALL.len(),
+                            Role::ALL
+                                .iter()
+                                .map(|r| r.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?
+            }
+        };
+        out.push(role);
     }
     if out.is_empty() {
         return Err("pick at least one — a machine with no role runs nothing".into());
@@ -2042,5 +2063,37 @@ mod pool_token_tests {
         assert!(!cp_dir.join("pool-token").exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod role_spelling_tests {
+    use super::*;
+
+    /// The roles question takes the word it printed, not only the number.
+    ///
+    /// Measured: the prompt lists `[2] hypervisor` and `[3] pool`, and
+    /// answering `hypervisor pool` was refused with "not a number from 1 to 3"
+    /// — after which the URL and the certificate were read as roles too, and
+    /// the wizard derailed three questions deep. Typing the name it just showed
+    /// is the obvious thing to do.
+    #[test]
+    fn the_roles_question_takes_a_name_as_well_as_a_number() {
+        let by_number = resolve_roles("2 3").expect("numbers");
+        let by_name = resolve_roles("hypervisor pool").expect("names");
+        let mixed = resolve_roles("2 pool").expect("both");
+        assert_eq!(by_number, by_name);
+        assert_eq!(by_number, mixed);
+        assert_eq!(by_number, vec![Role::Hypervisor, Role::Pool]);
+        assert_eq!(
+            resolve_roles("CONTROL-PLANE").expect("case is not the point"),
+            vec![Role::ControlPlane]
+        );
+
+        // And a word that is not a role says so, with the words that are.
+        let why = resolve_roles("storage").expect_err("not a role");
+        assert!(why.contains("control-plane"), "{why}");
+        assert!(why.contains("hypervisor"), "{why}");
+        assert!(why.contains("pool"), "{why}");
     }
 }

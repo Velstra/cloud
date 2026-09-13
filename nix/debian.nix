@@ -409,6 +409,15 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
       # a fresh install with no seed starts nothing. Guests are their own
       # `velstra-vm-*` units and are not restarted by an agent restarting.
       #
+      # `--no-block`, because the alternative was measured too: the API alone
+      # took twenty seconds to stop, and six units restarted in series make a
+      # postinst that runs for a minute. An upgrade over ssh whose connection
+      # drops in that minute leaves dpkg killed mid-loop and the package
+      # `half-configured`, with some units on the new binary and some on the
+      # old — which is a worse place than where this started. Handing the
+      # restarts to systemd and returning keeps the postinst short enough that
+      # there is no window to be interrupted in.
+      #
       # `$2` is the version being replaced, so this is an upgrade and not a
       # first install — there is nothing to restart on a machine that has never
       # had this package.
@@ -416,7 +425,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
         for unit in velstra-cloud-api velstra-cloud-controller \
                     velstra-cloud-nodeagent velstra-cloud-poolagent \
                     velstra-cloud-poolagent-ceph velstra-fabric-agent; do
-          systemctl try-restart "$unit.service" >/dev/null 2>&1 || true
+          systemctl try-restart --no-block "$unit.service" >/dev/null 2>&1 || true
         done
       fi
       if [ ! -f /etc/velstra/node.env ]; then
