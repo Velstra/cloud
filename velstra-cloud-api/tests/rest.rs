@@ -42,6 +42,31 @@ struct Answer {
     headers: Vec<(String, String)>,
 }
 
+/// An answer that is not JSON: the console, and the files it asks for.
+struct Raw {
+    status: StatusCode,
+    headers: Vec<(String, String)>,
+    bytes: Vec<u8>,
+}
+
+impl Raw {
+    fn header(&self, name: &str) -> String {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    fn content_type(&self) -> String {
+        self.header("content-type")
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
 impl Answer {
     fn error_code(&self) -> &str {
         self.body["error"]["code"].as_str().unwrap_or("")
@@ -73,6 +98,65 @@ impl Harness {
             router: velstra_cloud_api::server(api.clone()),
             store,
             api,
+        }
+    }
+
+    /// The same cell, having shipped a built console in `dir`.
+    ///
+    /// Named here rather than read from the environment inside the handler, so
+    /// two tests in one process cannot disagree about which console this is.
+    fn with_console(dir: &std::path::Path) -> Self {
+        let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single(TOKEN));
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+            .with_cell_admins(vec!["dev".into()])
+            .with_console_dir(dir);
+        Self {
+            router: velstra_cloud_api::server(api.clone()),
+            store,
+            api,
+        }
+    }
+
+    /// A request at an absolute path, answered as bytes.
+    ///
+    /// The console is not under `/api/v1` and does not answer JSON, so neither
+    /// `send` nor `Answer` fits: a page, a bundle and a stylesheet have to be
+    /// read as what they are.
+    async fn raw(&self, method: &str, path: &str) -> Raw {
+        self.raw_with(method, path, true).await
+    }
+
+    /// The same with no `Authorization` header, which is every request a
+    /// browser makes before anybody has signed in.
+    async fn anonymous(&self, method: &str, path: &str) -> Raw {
+        self.raw_with(method, path, false).await
+    }
+
+    async fn raw_with(&self, method: &str, path: &str, token: bool) -> Raw {
+        let mut request = Request::builder().method(method).uri(path);
+        if token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        }
+        let response = self
+            .router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+            .collect();
+        let bytes = axum::body::to_bytes(response.into_body(), 8 << 20)
+            .await
+            .unwrap();
+        Raw {
+            status,
+            headers,
+            bytes: bytes.to_vec(),
         }
     }
 
@@ -5998,4 +6082,191 @@ async fn an_attachment_naming_something_that_is_not_there_is_refused() {
         )
         .await;
     assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+}
+
+// ---- the console this cell serves ----------------------------------------
+
+/// A cell that shipped a built console, for the tests below.
+///
+/// Written to a directory rather than mocked: the thing worth testing is that
+/// a tree on disk becomes the right answers over HTTP, and a fake in the
+/// middle would test the fake.
+fn a_built_console(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("velstra-served-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    std::fs::write(
+        dir.join("index.html"),
+        "<!doctype html><div id=\"root\"></div>",
+    )
+    .unwrap();
+    std::fs::write(dir.join("favicon.svg"), "<svg/>").unwrap();
+    std::fs::write(dir.join("assets/index-abc.js"), "export const a = 1").unwrap();
+    std::fs::write(dir.join("assets/index-abc.css"), "body{color:red}").unwrap();
+    dir
+}
+
+/// **The built console is what `/` answers with, and its files come back as
+/// what they are.**
+///
+/// A bundle answered as `text/html` is a console that loads nothing: a browser
+/// refuses a module script and a stylesheet served under the wrong type, and
+/// says so only in a place nobody has open. The catch-all that makes deep
+/// links work is exactly what would have done that, which is why the assets
+/// have a route of their own in front of it.
+#[tokio::test]
+async fn a_shipped_console_is_served_with_the_types_a_browser_needs() {
+    let dir = a_built_console("types");
+    let h = Harness::with_console(&dir);
+
+    let page = h.raw("GET", "/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(page.content_type(), "text/html; charset=utf-8");
+    assert!(page.text().contains("id=\"root\""), "{}", page.text());
+
+    let js = h.raw("GET", "/assets/index-abc.js").await;
+    assert_eq!(js.status, StatusCode::OK);
+    assert_eq!(js.content_type(), "text/javascript; charset=utf-8");
+    assert_eq!(js.text(), "export const a = 1");
+
+    let css = h.raw("GET", "/assets/index-abc.css").await;
+    assert_eq!(css.content_type(), "text/css; charset=utf-8");
+
+    let svg = h.raw("GET", "/favicon.svg").await;
+    assert_eq!(svg.status, StatusCode::OK);
+    assert_eq!(svg.content_type(), "image/svg+xml");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hashed file may be kept for ever; the page that names it may not.
+///
+/// The failure this prevents shows up on the *second* deploy: a cached
+/// `index.html` naming the previous build's assets, none of which are on the
+/// cell any more, so the console is a blank page with four 404s behind it.
+#[tokio::test]
+async fn the_page_is_never_cached_and_the_hashed_files_always_are() {
+    let dir = a_built_console("cache");
+    let h = Harness::with_console(&dir);
+
+    assert_eq!(h.raw("GET", "/").await.header("cache-control"), "no-cache");
+    assert_eq!(
+        h.raw("GET", "/assets/index-abc.js")
+            .await
+            .header("cache-control"),
+        "public, max-age=31536000, immutable"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An asset that is not there is a 404, not the page.
+///
+/// Answering a missing bundle with HTML turns a broken build into a syntax
+/// error reported against a line of someone else's minified JavaScript.
+#[tokio::test]
+async fn an_asset_that_is_not_there_says_so_rather_than_returning_the_page() {
+    let dir = a_built_console("missing");
+    let h = Harness::with_console(&dir);
+
+    let gone = h.raw("GET", "/assets/index-nosuch.js").await;
+    assert_eq!(gone.status, StatusCode::NOT_FOUND);
+    assert!(!gone.text().contains("<!doctype"), "{}", gone.text());
+
+    // And a request cannot walk out of the tree: the map is keyed by what was
+    // found on disk, so there is no path to traverse.
+    for asked in [
+        "/assets/../../../etc/passwd",
+        "/assets/..%2f..%2fetc%2fpasswd",
+    ] {
+        assert_ne!(h.raw("GET", asked).await.status, StatusCode::OK, "{asked}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A deep link still returns a console rather than a 404.
+///
+/// The React console routes in the hash, so the server sees `/` for
+/// `#/c/instances`. This is for the other kind: a path somebody typed, or an
+/// old link from when the console routed in the path.
+#[tokio::test]
+async fn a_deep_link_returns_the_console() {
+    let dir = a_built_console("deep");
+    let h = Harness::with_console(&dir);
+    let deep = h.raw("GET", "/instances/i1").await;
+    assert_eq!(deep.status, StatusCode::OK);
+    assert!(deep.text().contains("id=\"root\""), "{}", deep.text());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A cell with no built console is not broken.**
+///
+/// `cargo run` in a checkout, and every machine installed before the package
+/// carried one, serve the page compiled into the binary. That page is the one
+/// with no build step between its source and the screen, so it is also the
+/// answer when the other console is the thing that is wrong.
+#[tokio::test]
+async fn a_cell_with_no_built_console_serves_the_one_compiled_in() {
+    let h = Harness::new();
+    let page = h.raw("GET", "/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(page.content_type(), "text/html; charset=utf-8");
+    assert_eq!(page.text(), velstra_cloud_console::page_ref());
+
+    // And there are no assets to serve, so asking for one is a 404 rather than
+    // a page pretending to be JavaScript.
+    assert_eq!(
+        h.raw("GET", "/assets/index-abc.js").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// `/classic` is the console this binary carries, whatever `/` is serving.
+///
+/// A way back that does not depend on the thing it is a way back from, and one
+/// somebody can remember without undoing an install.
+#[tokio::test]
+async fn the_classic_console_is_reachable_whichever_one_is_the_default() {
+    let dir = a_built_console("classic");
+    let h = Harness::with_console(&dir);
+
+    let classic = h.raw("GET", "/classic").await;
+    assert_eq!(classic.status, StatusCode::OK);
+    assert_eq!(classic.text(), velstra_cloud_console::page_ref());
+
+    // Still there on a cell that has no built console — it is the same page
+    // `/` is already serving, and a fallback that disappears with the thing it
+    // backs up is not one.
+    let plain = Harness::new();
+    assert_eq!(
+        plain.raw("GET", "/classic").await.text(),
+        velstra_cloud_console::page_ref()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The console is reachable without a token, built or not.
+///
+/// Demanding one to fetch the form that asks for it is a locked door with the
+/// key inside. The existing console route is outside the auth layer on
+/// purpose; the assets have to be too, or the page loads and renders nothing.
+#[tokio::test]
+async fn the_console_and_its_files_are_reachable_before_anyone_has_signed_in() {
+    let dir = a_built_console("anon");
+    let h = Harness::with_console(&dir);
+    for path in [
+        "/",
+        "/classic",
+        "/assets/index-abc.js",
+        "/assets/index-abc.css",
+        "/favicon.svg",
+    ] {
+        let answer = h.anonymous("GET", path).await;
+        assert_eq!(answer.status, StatusCode::OK, "{path} needed a token");
+    }
+    // The API behind it still does not answer without one.
+    assert_eq!(
+        h.anonymous("GET", "/api/v1/projects").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

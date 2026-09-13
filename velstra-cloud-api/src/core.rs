@@ -468,6 +468,12 @@ struct Inner {
     /// Whose certificates to believe when a node serves its console over TLS.
     /// See [`Api::with_console_ca`].
     console_ca: Option<std::path::PathBuf>,
+    /// The built console this cell serves, read from disk at startup.
+    ///
+    /// `None` means there is not one on this machine, and the cell answers
+    /// with the page compiled into the binary instead. See
+    /// [`crate::console_files`] and [`Api::with_console_dir`].
+    console: Option<Arc<crate::console_files::Console>>,
     collections: BTreeMap<&'static str, Arc<dyn Collection>>,
     /// Subjects that may do anything, anywhere in this cell.
     ///
@@ -736,6 +742,9 @@ impl Api {
         ]);
         Self {
             inner: Arc::new(Inner {
+                // Named afterwards with `with_console_dir`, if this machine
+                // has one. A cell with none serves its built-in page.
+                console: None,
                 requests: Requests::default(),
                 store: store.clone(),
                 store_backup_dir: None,
@@ -990,6 +999,24 @@ impl Api {
     /// the bindings on the project it touches. What it cannot do is register a
     /// node or create a project, which is the honest consequence of nobody
     /// having been made responsible for the cell.
+    /// Read the built console out of a directory, if there is one there.
+    ///
+    /// Named by the caller rather than read from the environment inside the
+    /// handler, so a test can serve a console it wrote itself and two tests in
+    /// the same process cannot disagree about which one this is.
+    pub fn with_console_dir(mut self, dir: &std::path::Path) -> Self {
+        let read = crate::console_files::Console::read(dir).map(Arc::new);
+        let inner =
+            Arc::get_mut(&mut self.inner).expect("the console is named before the API is shared");
+        inner.console = read;
+        self
+    }
+
+    /// The built console, or `None` when this machine has none.
+    pub fn console(&self) -> Option<&crate::console_files::Console> {
+        self.inner.console.as_deref()
+    }
+
     pub fn with_cell_admins(mut self, admins: Vec<String>) -> Self {
         let inner =
             Arc::get_mut(&mut self.inner).expect("cell admins are named before the API is shared");

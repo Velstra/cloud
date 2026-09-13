@@ -95,7 +95,13 @@ export function Detail({ coll, id, mode, onChanged }: {
             <Pressed size="sm" variant="destructive" onPress={async () => {
               if (!(await ask({ title: `Delete ${idOf(r)}?`, body: `It stays visible until its finalizers let go.`, confirmLabel: "Delete", tone: "danger" }))) return;
               try {
-                await call(`delete:${coll.id}`, "DELETE", `${pathOf(coll, r, project)}/${encodeURIComponent(idOf(r))}`);
+                // The revision this screen is showing, so a delete cannot
+                // land on a version somebody else changed while the dialog was
+                // open. Every PATCH in this console already says it; a DELETE
+                // that did not was the one write that raced.
+                await call(`delete:${coll.id}`, "DELETE", `${pathOf(coll, r, project)}/${encodeURIComponent(idOf(r))}`,
+                  undefined, undefined,
+                  r.meta.revision ? { "if-match": String(r.meta.revision) } : undefined);
                 toast("Deletion asked for.", { description: "It stays listed until its finalizers let go." });
                 onChanged(); collectionChanged(coll.id); close();
               } catch (e) { toast.error((e as Error).message); }

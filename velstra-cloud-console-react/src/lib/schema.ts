@@ -54,8 +54,16 @@ export const SCHEMA = raw as unknown as Collection[];
 
 export const collection = (id: string) => SCHEMA.find((c) => c.id === id);
 
-/** Rail order. Two vocabularies, because there are two readers. */
-export const GROUP_ORDER = ["Compute", "Storage", "Network", "Fleet", "Access", "Cell"];
+/** Rail order. Two vocabularies, because there are two readers.
+ *
+ *  Every name here has to be a group the schema actually uses: `groups()`
+ *  filters by exact match, so a name nothing carries is a heading that never
+ *  appears and takes its collections with it. This list said "Fleet" and
+ *  "Cell" long after the schema had renamed them to "Hardware" and "Records",
+ *  and the result was an operator console with no Nodes, no Pools and no
+ *  device classes in the rail at all. `react_schema.rs` now refuses the drift.
+ */
+export const GROUP_ORDER = ["Compute", "Storage", "Network", "Hardware", "Records", "Access"];
 
 /**
  * What this person navigates by.
@@ -72,9 +80,9 @@ export const navigable = (cellAdmin: boolean) =>
   SCHEMA.filter((c) => (cellAdmin ? c.audience !== "plumbing" : c.audience === "tenant"));
 
 /**
- * The rail's groups. An operator's words are not a customer's: "Fleet" and
- * "Cell" are what somebody who owns the hardware calls it, and for a customer
- * they held one item each.
+ * The rail's groups. An operator's words are not a customer's: "Hardware" and
+ * "Records" are what somebody who owns the machines calls it, and for a
+ * customer they hold nothing they may read at all.
  */
 const TENANT_GROUP: Record<string, string> = {
   Compute: "Compute", Storage: "Storage", Network: "Networking", Access: "Usage",

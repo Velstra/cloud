@@ -99,6 +99,13 @@
         doCheck = false;
       };
 
+      # --- the operator's console -------------------------------------------
+      # Built from its own lockfile, offline, and shipped as files. See the
+      # long note in nix/console.nix for why it is not compiled in.
+      consoleReact = import ./nix/console.nix {
+        inherit pkgs lib version;
+      };
+
       # The fabric eBPF/XDP agent that runs on a compute node, built by the
       # Sentinel flake (which pins the fabric revision and the nightly
       # toolchain its eBPF needs). Reusing that build is the point: one pinned
@@ -272,8 +279,17 @@
         # seed — for a fleet that already runs Debian and is not going to be
         # told to install NixOS first.
         #   nix build .#deb
+        # The built console on its own, so it can be looked at without building
+        # a package around it:  nix build .#console-react
+        #
+        # Not `console`: there is already a *check* by that name, over the
+        # framework-free one, and two different things under one word in two
+        # namespaces is how somebody builds the wrong one and believes the
+        # answer.
+        console-react = consoleReact;
+
         deb = import ./nix/debian.nix {
-          inherit pkgs lib velstra-cloud;
+          inherit pkgs lib velstra-cloud consoleReact;
           # `debVersion`, not `version`: the package's own name for itself has
           # to move between builds or apt refuses every upgrade. See the long
           # note where it is computed.
@@ -1499,6 +1515,7 @@
               contents=$(dpkg-deb --contents "$deb")
 
               for want in \
+                ./usr/share/velstra-cloud/console/index.html \
                 ./usr/bin/velstra-cloud-api \
                 ./usr/bin/velstra-cloud-controller \
                 ./usr/bin/velstra-cloud-nodeagent \
@@ -1718,6 +1735,26 @@
                 cat ctl/postinst >&2
                 exit 1
               }
+
+              # The console is a tree, not a file, and the page alone proves
+              # nothing: an `index.html` whose bundles did not ship is a blank
+              # screen with four 404s behind it. So the assets it names are
+              # checked against what the package actually carries.
+              dpkg-deb --fsys-tarfile "$deb" \
+                | tar -xO ./usr/share/velstra-cloud/console/index.html > page.html
+              grep -oE '/assets/[A-Za-z0-9._-]+' page.html | sort -u > named
+              test -s named || {
+                echo "the console page names no assets at all:" >&2
+                cat page.html >&2
+                exit 1
+              }
+              while read -r asset; do
+                echo "$contents" | grep -q " \./usr/share/velstra-cloud/console$asset\$" || {
+                  echo "the console page names $asset and the package does not carry it" >&2
+                  exit 1
+                }
+              done < named
+              echo "console: $(wc -l < named) assets named and shipped"
 
               # The licence travels with the software or it has not been
               # conveyed. Debian Policy §12.5 makes this file mandatory and
