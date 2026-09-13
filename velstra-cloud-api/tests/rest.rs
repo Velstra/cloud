@@ -237,6 +237,23 @@ impl Harness {
             .await;
     }
 
+    /// A disk that really is there, to attach something to.
+    ///
+    /// An attachment names two objects and both have to exist, so a fixture
+    /// that only wanted to watch the node being copied cannot go on naming a
+    /// volume nothing backs. It used to be accepted.
+    async fn disk(&self, project: &str, id: &str) -> String {
+        self.pool("local").await;
+        let made = self
+            .post(
+                &format!("projects/{project}/volumes"),
+                json!({ "id": id, "spec": { "sizeGib": 1, "pool": "local" } }),
+            )
+            .await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+        format!("projects/{project}/volumes/{id}")
+    }
+
     fn nodes(&self) -> TypedStore<NodeSpec, NodeStatus> {
         TypedStore::new(self.store.clone(), "cell-1", "nodes")
     }
@@ -1188,6 +1205,7 @@ async fn an_attachment_takes_its_node_from_the_instance() {
     // sentence true — and it means an attachment whose node disagrees with its
     // instance's cannot be written down at all.
     let h = Harness::new();
+    h.disk("p1", "v1").await;
     h.instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
         .await;
     let created = h
@@ -1215,6 +1233,7 @@ async fn an_attachment_may_not_name_a_node_the_instance_is_not_on() {
     // what the object says without the caller asking, and they may have meant
     // the instance rather than the node.
     let h = Harness::new();
+    h.disk("p1", "v1").await;
     h.instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
         .await;
     let refused = h
@@ -1241,6 +1260,7 @@ async fn an_unplaced_instance_has_no_node_to_lend() {
     // The honest answer, rather than an attachment carrying an empty node that
     // no agent's watch will ever match.
     let h = Harness::new();
+    h.disk("p1", "v1").await;
     h.instance("p1", "i1", json!({ "vcpus": 2 })).await;
     let refused = h
         .post(
@@ -1259,6 +1279,7 @@ async fn an_unplaced_instance_has_no_node_to_lend() {
 #[tokio::test]
 async fn an_attachment_may_follow_a_migration_but_not_wander_off() {
     let h = Harness::new();
+    h.disk("p1", "v1").await;
     let instance = h
         .instance("p1", "i1", json!({ "vcpus": 2, "node": "node-a" }))
         .await;
@@ -5890,4 +5911,91 @@ async fn a_pool_created_without_an_opinion_takes_work_and_one_with_one_keeps_it(
         "{:?}",
         back.body
     );
+}
+
+/// **An attachment that joins nothing to nothing is refused at the door.**
+///
+/// Found walking the platform as a customer. An attachment naming a volume
+/// that had never been created came back `202 Accepted` with an operation id,
+/// and then sat there: no node can open a disk that does not exist, nothing
+/// retries into existence, and no answer anywhere says why. The guest end was
+/// refused already, but by accident — `settle_node` wants the guest's machine
+/// and could not find one, so a mistyped name was answered with a sentence
+/// about placement.
+#[tokio::test]
+async fn an_attachment_naming_something_that_is_not_there_is_refused() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    h.pool("local").await;
+    let guest = h
+        .instance(
+            "p1",
+            "web",
+            json!({ "vcpus": 1, "memoryMib": 512, "node": "node-a" }),
+        )
+        .await;
+    let made = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "data", "spec": { "sizeGib": 1, "pool": "local" } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    // The disk that is not there.
+    let refused = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "m1", "spec": {
+                "volume": "projects/p1/volumes/never-made",
+                "instance": guest,
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("no disk called"), "{message}");
+    assert_eq!(refused.body["error"]["field"], json!("spec.volume"));
+
+    // And the guest that is not there, said as a missing guest rather than as
+    // a placement that has not happened.
+    let refused = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "m2", "spec": {
+                "volume": "projects/p1/volumes/data",
+                "instance": "projects/p1/instances/never-made",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("no guest called"), "{message}");
+    assert_eq!(refused.body["error"]["field"], json!("spec.instance"));
+
+    // Both ends real, and it goes through.
+    let made = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "m3", "spec": {
+                "volume": "projects/p1/volumes/data",
+                "instance": guest,
+            }}),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
 }

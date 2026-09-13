@@ -394,6 +394,22 @@ async fn a_derived_field_is_derived_on_both_transports() {
         .await
         .expect("the instance was refused");
 
+    // Both ends of an attachment have to be there, so the disk is made first.
+    // It used to be a name nothing backed, which the API accepted — a hole
+    // this fixture was quietly standing in.
+    let (status, body) = both
+        .http("POST", "pools", Some(json!({ "id": "local", "spec": {} })))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body:?}");
+    let (status, body) = both
+        .http(
+            "POST",
+            "projects/p1/volumes",
+            Some(json!({ "id": "v1", "spec": { "sizeGib": 1, "pool": "local" } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body:?}");
+
     both.grpc
         .create_attachment(signed(v1::CreateAttachmentRequest {
             parent: "projects/p1".into(),

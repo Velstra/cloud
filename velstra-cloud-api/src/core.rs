@@ -3053,6 +3053,8 @@ impl Api {
             .at("spec.node"));
         }
         if kind == "attachments" {
+            self.refuse_an_attachment_to_something_that_is_not_there(&spec)
+                .await?;
             self.settle_node(&mut spec, None).await?;
             self.refuse_a_second_holder(parent, &spec).await?;
         }
@@ -6396,6 +6398,66 @@ impl Api {
                     ApiError::invalid(format!("{node} will not give up {device}: {why}"))
                         .at(format!("spec.osds[{at}].device")),
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// An attachment names two objects that are there.
+    ///
+    /// Found by walking the platform as a customer: an attachment whose
+    /// `spec.volume` named a volume that had never been created was accepted,
+    /// written down, and left for a node to act on — which it cannot. It joins
+    /// nothing to nothing, for ever, and says so nowhere.
+    ///
+    /// The other end was refused already, by accident rather than on purpose:
+    /// [`Api::settle_node`] needs the guest's machine and turns away what it
+    /// cannot find, so a mistyped guest was answered *"… is not on a node yet,
+    /// so there is no node to open the volume"* — a sentence about placement,
+    /// addressed to somebody who got a name wrong. Asking here, first, leaves
+    /// that sentence for the case it was written for: a guest that really does
+    /// exist and has not been placed yet.
+    ///
+    /// Only ever reached for references the caller may already read:
+    /// `authorize_references` runs before this and refuses anything belonging
+    /// to a project that is not theirs, so "there is no such volume" can only
+    /// ever be said about a name that is theirs to ask about.
+    async fn refuse_an_attachment_to_something_that_is_not_there(
+        &self,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        for (field, kind, what) in [
+            ("volume", "volumes", "disk"),
+            ("instance", "instances", "guest"),
+        ] {
+            let Some(named) = spec.get(field).and_then(Value::as_str) else {
+                continue;
+            };
+            if named.is_empty() {
+                continue;
+            }
+            let Ok(collection) = self.collection(kind) else {
+                continue;
+            };
+            // A name that does not parse is somebody's typo too, and is refused
+            // by the same sentence rather than waved through as "not a name I
+            // can look up".
+            let there = match ResourceName::parse(named) {
+                Ok(name) if name.collection() == kind => {
+                    matches!(collection.get(&name.to_string()).await, Ok(Some(_)))
+                }
+                _ => false,
+            };
+            if !there {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "there is no {what} called `{named}`. An attachment joins a disk to a \
+                         guest, and one naming something that is not there would be opened by \
+                         nobody, for ever."
+                    ),
+                )
+                .at(format!("spec.{field}")));
             }
         }
         Ok(())
