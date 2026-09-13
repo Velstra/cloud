@@ -395,6 +395,30 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
       # Also moves an older machine's seed out of the shared state directory
       # and into /etc, where it belongs to this machine and no other.
       velstra-cloud-node migrate-seed 2>/dev/null || true
+      # An upgrade runs what was upgraded.
+      #
+      # Measured on the live cell: `dpkg -i` unpacked a new package, said
+      # "Setting up", and left every unit running the binary from the previous
+      # one. Two fixes were installed and verified as absent, because the API
+      # answering was four hours older than the files on disk, and nothing in
+      # the output or the journal said so. An operator has no way to tell from
+      # outside which of the two is answering.
+      #
+      # `try-restart`, so this only touches units that are already running: a
+      # machine whose role does not include the API keeps not running one, and
+      # a fresh install with no seed starts nothing. Guests are their own
+      # `velstra-vm-*` units and are not restarted by an agent restarting.
+      #
+      # `$2` is the version being replaced, so this is an upgrade and not a
+      # first install — there is nothing to restart on a machine that has never
+      # had this package.
+      if [ -n "$2" ]; then
+        for unit in velstra-cloud-api velstra-cloud-controller \
+                    velstra-cloud-nodeagent velstra-cloud-poolagent \
+                    velstra-cloud-poolagent-ceph velstra-fabric-agent; do
+          systemctl try-restart "$unit.service" >/dev/null 2>&1 || true
+        done
+      fi
       if [ ! -f /etc/velstra/node.env ]; then
         echo ""
         echo "velstra-cloud is installed and nothing is running."

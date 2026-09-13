@@ -1690,6 +1690,24 @@
                 cat ctl/postinst >&2
                 exit 1
               }
+              # An upgrade has to run what was upgraded. Measured on a live
+              # cell: a new package unpacked, said "Setting up", and left every
+              # unit running the previous binary — two fixes verified as absent
+              # against an API four hours older than its own files, with
+              # nothing anywhere saying so.
+              grep -q "try-restart" ctl/postinst || {
+                echo "postinst does not restart running units on an upgrade:" >&2
+                cat ctl/postinst >&2
+                exit 1
+              }
+              # And only the running ones. `restart` here would start an API on
+              # every machine that has the package, including the ones whose
+              # role is a hypervisor and nothing else.
+              if grep -qE "systemctl restart" ctl/postinst; then
+                echo "postinst starts units that were not running:" >&2
+                cat ctl/postinst >&2
+                exit 1
+              fi
 
               # The licence travels with the software or it has not been
               # conveyed. Debian Policy §12.5 makes this file mandatory and
