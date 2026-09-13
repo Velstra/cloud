@@ -146,6 +146,19 @@ pub fn router(api: Api) -> Router {
         .route("/readyz", get(readyz))
         .route("/", get(console))
         .route("/favicon.ico", get(favicon))
+        // The built console's own files. A static first segment beats the
+        // catch-all below it in axum's router, so `/assets/index-abc.js` comes
+        // back as JavaScript and `/instances/i1` still comes back as the page.
+        //
+        // Their own route rather than the catch-all because a bundle answered
+        // as `text/html` is a console that loads nothing and explains nothing:
+        // a browser refuses a stylesheet and a module script served under the
+        // wrong type, and says so only in a place nobody has open.
+        .route("/assets/*file", get(asset))
+        .route("/favicon.svg", get(asset))
+        // The console this cell shipped with, always, whatever `/` is serving.
+        // A way back that does not depend on the thing it is a way back from.
+        .route("/classic", get(classic))
         // A deep link into the console is a path this API does not serve and
         // the page does: reloading `/instances/i1` has to return the console
         // rather than a 404, because a single-page console routes it itself.
@@ -661,8 +674,52 @@ async fn openapi() -> Response {
         .into_response()
 }
 
-async fn console() -> Response {
+/// The console, whichever one this machine has.
+///
+/// The built React console when the package shipped one and it was read at
+/// startup; otherwise the page compiled into this binary. A cell installed
+/// before the React console existed, and a `cargo run` in a checkout, both
+/// take the second path and are not broken — they are simply older.
+async fn console(State(api): State<Api>) -> Response {
+    match api.console() {
+        Some(console) => answer(console.index()),
+        None => axum::response::Html(velstra_cloud_console::page_ref()).into_response(),
+    }
+}
+
+/// `GET /classic` — the framework-free console, always.
+///
+/// One page, nothing fetched, no build step between the source and what is on
+/// the screen. It is the console to open when the other one is the thing that
+/// is wrong, which is exactly when a fallback has to be reachable by a path
+/// somebody can remember rather than by undoing an install.
+async fn classic() -> Response {
     axum::response::Html(velstra_cloud_console::page_ref()).into_response()
+}
+
+/// One of the built console's own files, by the path the page asked for.
+///
+/// 404 rather than the page: an asset that is not there is a broken build, and
+/// answering it with HTML turns a missing file into a parse error somewhere
+/// else. A cell with no built console has no assets to serve and says so the
+/// same way.
+async fn asset(State(api): State<Api>, uri: axum::http::Uri) -> Response {
+    match api.console().and_then(|c| c.get(uri.path())) {
+        Some(file) => answer(file),
+        None => (StatusCode::NOT_FOUND, "no such file").into_response(),
+    }
+}
+
+/// A file, with the type a browser must be told and the lifetime it may keep.
+fn answer(file: &crate::console_files::File) -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, file.content_type),
+            (axum::http::header::CACHE_CONTROL, file.cache_control),
+        ],
+        file.bytes.clone(),
+    )
+        .into_response()
 }
 
 /// `GET /favicon.ico` — the tab icon (see `velstra_cloud_console::FAVICON_PNG`).

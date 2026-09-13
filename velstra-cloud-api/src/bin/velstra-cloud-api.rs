@@ -56,6 +56,19 @@ struct Args {
     #[arg(long, env = "VELSTRA_CONSOLE_CA", default_value = "")]
     console_ca: String,
 
+    /// Where the built console's files are.
+    ///
+    /// The Debian package puts them there. A machine without them — a checkout
+    /// running `cargo run`, or a cell installed before the package carried a
+    /// built console — serves the page compiled into this binary instead, and
+    /// is not broken by their absence.
+    #[arg(
+        long,
+        env = "VELSTRA_CONSOLE_DIR",
+        default_value = velstra_cloud_api::console_files::SHIPPED_AT
+    )]
+    console_dir: String,
+
     /// Print the REST surface as OpenAPI 3.1 and exit, serving nothing.
     ///
     /// The same document `GET /api/v1/openapi.json` answers with, for a client
@@ -274,6 +287,19 @@ async fn main() -> anyhow::Result<()> {
     let mut api = velstra_cloud_api::Api::new(store, &args.region, &args.cell, verifier)
         .with_cell_admins(args.cell_admin.clone())
         .with_image_signing_keys(signing_keys);
+    // Read once, here, so a request never touches the disk and the log says
+    // at startup which console this cell is serving rather than leaving it to
+    // be discovered in a browser.
+    if !args.console_dir.is_empty() {
+        api = api.with_console_dir(std::path::Path::new(&args.console_dir));
+        match api.console() {
+            Some(_) => tracing::info!(dir = %args.console_dir, "serving the built console"),
+            None => tracing::info!(
+                dir = %args.console_dir,
+                "no built console there; serving the one compiled in"
+            ),
+        }
+    }
     if !args.store_backup_dir.is_empty() {
         api = api.with_store_backups(std::path::PathBuf::from(&args.store_backup_dir));
     }

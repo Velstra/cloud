@@ -1,4 +1,4 @@
-import { listEvery } from "@/lib/listing";
+import { listEvery, projectNames } from "@/lib/listing";
 import { collectionChanged } from "@/hooks/useCollection";
 // Wiring: sign in, sweep the census the rail and the inbox are drawn from,
 // and route between the overview and a board with its detail pane beside it.
@@ -13,7 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { call, setToken, token, whenSessionEnds } from "@/api/transport";
 import { verdict } from "@/lib/model";
-import { SCHEMA, collection } from "@/lib/schema";
+import { ALL, SCHEMA, collection } from "@/lib/schema";
 import { useRoute, go } from "@/app/router";
 import { getState, setState, useStore } from "@/app/store";
 import { Shell, type Census } from "@/app/Shell";
@@ -44,6 +44,29 @@ export default function App() {
       // last person on this browser had picked.
       const mine = Object.keys(projects);
       if (!w.cellAdmin && mine.length && !projects[getState().project]) setState({ project: mine[0] });
+      // And an operator lands somewhere that exists. Their `projects` map is
+      // empty — being an operator is not a binding — so the check above can
+      // never help them, and whatever this browser had stored was kept even
+      // when this cell has no such project. On a cell whose projects are not
+      // named like the contract server's, that is every project-scoped board
+      // reading zero while the cell is full. `ALL` is the operator's view and
+      // is true of any cell; a deliberate pick that still exists is kept.
+      if (w.cellAdmin) {
+        const picked = getState().project;
+        projectNames()
+          .then((names) => {
+            // One project is the whole cell, so land in it: `ALL` fans the
+            // list out per project and cannot hold a watch, so a board there
+            // says "no live updates" — which is the honest answer for a cell
+            // with several and a needless one for a cell with one.
+            if (names.length === 1) {
+              if (picked !== names[0]) setState({ project: names[0] });
+              return;
+            }
+            if (picked !== ALL && !names.includes(picked)) setState({ project: ALL });
+          })
+          .catch(() => { if (picked !== ALL) setState({ project: ALL }); });
+      }
     }).catch(() => setToken(""));
   }, []);
 

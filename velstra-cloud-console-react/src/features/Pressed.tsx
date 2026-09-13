@@ -6,8 +6,23 @@ import { useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 
 const VERB = /^(Create|Save|Add|Refresh|Delete|Remove|Start|Stop|Attach|Detach|Migrate|Explain|Issue|Report|Drain|Reboot|Apply)\b/;
-export const presentTense = (label: string) =>
-  (VERB.exec(label)?.[0] ?? "Working").replace(/e?$/, "") + "ing…";
+
+/// The two verbs the `-e` rule gets wrong on its own.
+///
+/// `Stop` doubles its consonant. Everything else in the list above is either
+/// "drop a trailing e" (Save, Create, Migrate, Delete, Remove, Issue) or "add
+/// nothing" (Start, Add, Drain, Apply), which the rule already does.
+const IRREGULAR: Record<string, string> = { Stop: "Stopping" };
+
+export const presentTense = (label: string) => {
+  const verb = VERB.exec(label)?.[0];
+  // The fallback is already a present participle and must not be put through
+  // the rule: doing so produced "Workinging…", which is what the sign-in
+  // button said while it was signing somebody in — the first words anybody
+  // reads in this console.
+  if (!verb) return "Working…";
+  return (IRREGULAR[verb] ?? verb.replace(/e?$/, "") + "ing") + "…";
+};
 
 export function Pressed({ children, onPress, busyLabel, ...rest }:
   React.ComponentProps<typeof Button> & { onPress: () => Promise<unknown> | unknown; busyLabel?: string }) {

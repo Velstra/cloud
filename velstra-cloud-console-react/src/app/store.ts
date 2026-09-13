@@ -19,6 +19,8 @@ type State = {
   railCollapsed: Record<string, boolean>;
 };
 
+import { ALL } from "@/lib/schema";
+
 const KEY = "velstra-react-prefs";
 
 const load = (): Partial<State> => {
@@ -27,7 +29,11 @@ const load = (): Partial<State> => {
 
 let state: State = {
   who: null,
-  project: "p1",
+  // Every project at once, which is true of any cell. The default used to be
+  // `"p1"` — the contract server's own project — so a console opened on a real
+  // cell asked every project-scoped board about a project that does not exist,
+  // and answered with zeros. An operator saw an empty platform.
+  project: ALL,
   theme: "system",
   density: "comfortable",
   motion: "auto",

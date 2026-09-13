@@ -199,3 +199,77 @@ fn the_checked_in_schema_is_the_generated_one() {
          VELSTRA_WRITE_SCHEMA=1 cargo test -p velstra-cloud-console --test react_schema"
     );
 }
+
+/// **The React rail's group names are group names this schema uses.**
+///
+/// `groups()` in the React console builds the navigation by filtering
+/// collections on an exact group-name match against a hand-written order. A
+/// name in that list which nothing carries is not a warning and not an empty
+/// heading — the heading is dropped, and every collection in the *real* group
+/// it was supposed to name goes with it.
+///
+/// Found by opening the console: the list still said "Fleet" and "Cell" long
+/// after the schema renamed those groups to "Hardware" and "Records", so an
+/// operator's rail had no Nodes, no Pools, no device classes and no audit at
+/// all. Nothing anywhere said so; the sidebar simply had six entries fewer
+/// than the platform has collections.
+///
+/// Read out of the TypeScript as text, the way
+/// `console_covers_the_model.rs` reads `CELL_ONLY` out of the served page.
+/// There is no TypeScript test runner in this repository, and the fact worth
+/// checking belongs to the generator rather than to the consumer.
+#[test]
+fn the_react_rail_names_groups_this_schema_has() {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../velstra-cloud-console-react/src/lib/schema.ts"),
+    )
+    .expect("the React console's schema.ts");
+
+    let listed = source
+        .split_once("GROUP_ORDER = [")
+        .expect("GROUP_ORDER is declared as a literal array")
+        .1
+        .split_once(']')
+        .expect("and closed")
+        .0;
+    let rail: Vec<String> = listed
+        .split(',')
+        .map(|part| part.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|part| !part.is_empty())
+        .collect();
+    assert!(
+        !rail.is_empty(),
+        "GROUP_ORDER was read as empty: {listed:?}"
+    );
+
+    let mut real: Vec<&str> = velstra_cloud_console::COLLECTIONS
+        .iter()
+        .map(|c| c.group)
+        .filter(|g| !g.is_empty())
+        .collect();
+    real.sort_unstable();
+    real.dedup();
+
+    let named_nothing: Vec<&String> = rail
+        .iter()
+        .filter(|g| !real.contains(&g.as_str()))
+        .collect();
+    assert!(
+        named_nothing.is_empty(),
+        "the React rail names groups this schema does not have: {named_nothing:?}. \
+         Those headings never appear, and every collection in the group they were \
+         meant to name is unreachable from the navigation. This schema's groups \
+         are {real:?}."
+    );
+
+    let unreachable: Vec<&&str> = real
+        .iter()
+        .filter(|g| !rail.contains(&g.to_string()))
+        .collect();
+    assert!(
+        unreachable.is_empty(),
+        "these groups exist in the schema and are in no rail group, so nothing \
+         in them can be navigated to: {unreachable:?}"
+    );
+}

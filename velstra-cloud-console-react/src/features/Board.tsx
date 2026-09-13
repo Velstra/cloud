@@ -165,6 +165,14 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
       confirmLabel: label,
       tone: "danger",
     }))) return;
+    // The revision each row is showing, so a bulk write cannot land on a
+    // version that moved while the confirmation was open. Every PATCH
+    // elsewhere in this console says it; these two did not, and a bulk delete
+    // is the worst place to lose that check.
+    const revision: Record<string, string> = {};
+    for (const r of loaded.rows) {
+      if (r.meta?.revision) revision[nameOf(r)] = String(r.meta.revision);
+    }
     let ok = 0; const bad: string[] = [];
     // What did not work, by name — because a second press should retry the
     // failures and nothing else. Partial success is the normal case here, not
@@ -174,8 +182,13 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
       const id = name.split("/").pop()!;
       const base = basePath(coll, projectOf(name) ?? project);
       try {
-        if (body === null) await call(`delete:${coll.id}`, "DELETE", `${base}/${encodeURIComponent(id)}`);
-        else await call(`patch:${coll.id}`, "PATCH", `${base}/${encodeURIComponent(id)}`, undefined, body);
+        const ifMatch = revision[name] ? { "if-match": revision[name] } : undefined;
+        if (body === null)
+          await call(`delete:${coll.id}`, "DELETE", `${base}/${encodeURIComponent(id)}`,
+            undefined, undefined, ifMatch);
+        else
+          await call(`patch:${coll.id}`, "PATCH", `${base}/${encodeURIComponent(id)}`,
+            undefined, body, ifMatch);
         ok++;
       } catch (e) { bad.push(`${id}: ${(e as Error).message}`); refused[name] = true; }
     }

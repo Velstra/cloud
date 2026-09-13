@@ -31,6 +31,7 @@
   pkgs,
   lib,
   velstra-cloud,
+  consoleReact,
   version,
 }:
 let
@@ -313,7 +314,8 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
   ''
     root=$PWD/pkg
     mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/lib/systemd/system" \
-             "$root/var/lib/velstra" "$root/usr/share/doc/velstra-cloud"
+             "$root/var/lib/velstra" "$root/usr/share/doc/velstra-cloud" \
+             "$root/usr/share/velstra-cloud/console"
     # Where a machine keeps who it is: its seed and its agent tokens. Shipped
     # so that the wizard, the postinst migration and an operator dropping a
     # pool token in all find it there, on a fresh install too. 0700 because a
@@ -461,6 +463,15 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     fi
     PRERM
     chmod 0755 "$root/DEBIAN/prerm"
+
+    # The console, as files the API reads at startup. Not compiled in: `dist/`
+    # is built by npm and is not in git, so a Rust crate that embedded it would
+    # make `cargo build` need node and a network — including in CI, whose gate
+    # is exactly that command. The API falls back to its own built-in page when
+    # this directory is not there, so a machine without it still has a console.
+    cp -r ${consoleReact}/. "$root/usr/share/velstra-cloud/console/"
+    chmod -R u+w "$root/usr/share/velstra-cloud/console"
+    test -f "$root/usr/share/velstra-cloud/console/index.html"
 
     cp ${../docs/install.md} "$root/usr/share/doc/velstra-cloud/install.md"
 
