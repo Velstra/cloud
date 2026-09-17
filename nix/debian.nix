@@ -183,14 +183,22 @@ let
       # Then the cards this machine holds back for guests, which the image does
       # in a unit of its own — here it is an ExecStartPre, because it has to run
       # before the agent reports what it sees and there is nothing else to order
-      # it against. `modprobe` is best-effort: a kernel with vfio-pci built in
-      # needs none, and one that has it nowhere is a machine the line after says
-      # so about, by name, rather than a unit that refuses to start.
+      # it against. `modprobe` is best-effort and only runs when the seed names
+      # a card: a kernel with vfio-pci built in needs none, and one that has it
+      # nowhere is a machine the line after says so about, by name, rather than
+      # a unit that refuses to start.
+      #
+      # Through `sh`, not as /usr/sbin/modprobe. A Debian container built from
+      # debian:13 without `kmod` has modprobe at no path at all, and systemd
+      # answered an absolute ExecStartPre with 203/EXEC — harmless because of
+      # the `-`, and a line that then never loads the module on the machines
+      # that do have it somewhere else. Found by installing the package in a
+      # systemd container and reading the unit's own journal.
       pre = ''
         ExecStartPre=-/usr/sbin/ip link add vmeta0 type dummy
         ExecStartPre=-/usr/sbin/ip addr add 169.254.169.254/32 dev vmeta0
         ExecStartPre=-/usr/sbin/ip link set vmeta0 up
-        ExecStartPre=-/usr/sbin/modprobe vfio-pci
+        ExecStartPre=-/bin/sh -c '[ -n "''${VELSTRA_PASSTHROUGH:-}" ] && modprobe vfio-pci || true'
         ExecStartPre=${bin "velstra-cloud-passthrough"}
       '';
       exec = ''
