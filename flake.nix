@@ -627,13 +627,25 @@
               # the network: the API was active, listening on 0.0.0.0:8443 and
               # unreachable, and nothing in `systemctl status` said so.
               with subtest("and from another machine on the network"):
+                  # NIX_DISK_IMAGE is global to the driver and points at the
+                  # appliance's overlay, so the client would try to open the
+                  # same qcow2 and be refused the write lock. Taken away for
+                  # the length of its boot and put back, because `machine` is
+                  # rebooted from that same variable.
+                  overlay = os.environ.pop("NIX_DISK_IMAGE")
                   client.start()
                   client.wait_for_unit("multi-user.target")
+                  os.environ["NIX_DISK_IMAGE"] = overlay
+                  # The address on the test network, not the first one listed:
+                  # 10.0.2.x is QEMU's user-mode NAT, which this machine can
+                  # reach out through and nobody can reach in on — asking there
+                  # would prove nothing about a firewall.
                   address = machine.succeed(
                       "ip -4 -brief addr show scope global"
-                      " | awk '{print $3}' | cut -d/ -f1 | head -n1"
+                      " | awk '{print $3}' | cut -d/ -f1"
+                      " | grep -v '^10[.]0[.]2[.]' | head -n1"
                   ).strip()
-                  assert address, "the appliance has no address to be reached at"
+                  assert address, "the appliance has no address on the test network"
                   client.wait_until_succeeds(
                       f"curl -sS -k --max-time 5 https://{address}:8443/healthz"
                   )
