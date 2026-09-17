@@ -326,6 +326,27 @@ in
     # What the screen says before anybody signs in. Every machine: a hypervisor
     # that shows nothing leaves whoever is standing at it with no way to learn
     # the address they need.
+    # Tell agetty to read the drop-in directories, because the nixpkgs this
+    # image is pinned to does not.
+    #
+    # `services.getty` gained `--issue-file` upstream later than the revision
+    # in `flake.lock`; here agetty is started without it and therefore reads
+    # only `/etc/issue`, which NixOS owns and builds from a static greeting.
+    # So the banner below was written to /run/issue.d/50-velstra.issue every
+    # boot and nothing ever read it — the addresses an operator came to the
+    # machine for were in a file, and the screen said `login:`. Found by a VM
+    # check that looked at the console instead of at a unit's exit status.
+    #
+    # Passed as an extra argument rather than by writing /etc/issue ourselves:
+    # /etc/issue is a store-backed symlink on this image and fighting the
+    # operating system for it would be a rule to maintain for ever. When
+    # nixpkgs moves, its own copy of this flag carries the same value and the
+    # duplicate is harmless.
+    services.getty.extraArgs = [
+      "--issue-file"
+      "/etc/issue:/etc/issue.d:/run/issue:/run/issue.d"
+    ];
+
     systemd.services.velstra-node-banner = {
       description = "Write the console banner (name, addresses, roles)";
       wantedBy = [ "multi-user.target" ];

@@ -673,19 +673,16 @@
                       "certificate:  sha256 ",
                   ]:
                       assert want in issue, f"the banner does not say {want}:\n{issue}"
-                  # agetty has to be told to read that directory, or the file
-                  # is written and never seen. NixOS passes --issue-file, but
-                  # not in the unit text: ExecStart points at a wrapper script
-                  # in the store and the flags are inside it, so the unit is
-                  # read for the path and the path is read for the flag.
-                  exec_start = machine.succeed(
-                      "systemctl show getty@tty1.service -p ExecStart"
-                      " | grep -o '/nix/store/[^ ;]*' | head -n1"
-                  ).strip()
-                  assert exec_start, "getty@tty1 has no ExecStart to read"
-                  assert "/run/issue.d" in machine.succeed(f"cat {exec_start}"), (
-                      f"agetty is never told to read /run/issue.d: {exec_start}"
-                  )
+                  # And it is on the screen. Everything above is a file and a
+                  # unit state; this is the only assertion that says an
+                  # operator standing at the machine can read it — which is
+                  # the entire point, and which a check that asked units
+                  # instead of the console could not have caught. The nixpkgs
+                  # this image is pinned to does not pass agetty
+                  # `--issue-file`, so the banner was written every boot into
+                  # a directory nothing read, and the screen said `login:`.
+                  screen = machine.get_tty_text(1)
+                  assert "node-1" in screen, f"the console does not show it:\n{screen}"
                   # And it has to be there *before* the prompt is drawn. The
                   # banner unit and getty@tty1 are both Before=getty.target,
                   # which orders neither against the other — so the ordering
