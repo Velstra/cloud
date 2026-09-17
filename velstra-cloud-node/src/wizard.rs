@@ -90,8 +90,14 @@ pub struct Answers {
 /// Run the wizard. Returns `None` when the operator declines the final YES —
 /// nothing has been written at that point.
 pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
-    list_disks(disks);
-
+    // The mode first, then the disks — and the disks are listed *after* the
+    // mode is known, so the list is read with its question already in mind.
+    //
+    // It ran the other way round: a table of disks, then a mode, then "select
+    // disk number(s)" about a table that had scrolled past. Somebody reading
+    // top to bottom met a list before there was anything to do with it, and a
+    // plural prompt whether or not the mode they had just picked takes more
+    // than one disk.
     println!("\nInstall mode:");
     println!("  [1] single disk");
     println!("  [2] RAID1  (mirror — redundancy, 2+ disks)");
@@ -107,10 +113,21 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
         }
     };
 
+    println!();
+    list_disks(disks);
+
     // Picks are validated against the full plan (count, size, removable) here,
     // so a refused disk costs a re-ask and not a restart of the wizard.
+    let disk_prompt = match raid {
+        Raid::None => "Disk number: ".to_string(),
+        _ => format!(
+            "Disk numbers for {:?}, space-separated (at least {}): ",
+            raid,
+            raid.min_disks()
+        ),
+    };
     let (picks, chosen) = loop {
-        let raw = prompt("Select disk number(s), space-separated: ")?;
+        let raw = prompt(&disk_prompt)?;
         match resolve_picks(disks, raw.trim()) {
             Ok(picks) => {
                 let targets: Vec<String> = picks
