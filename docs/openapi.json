@@ -1470,6 +1470,60 @@
         ],
         "type": "object"
       },
+      "PendingMachine": {
+        "description": "What was asked for (`spec`), what is (`status`), and how far the second is behind the first (`meta.generation` against `status.observedGeneration`).",
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/PendingMachineSpec"
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          }
+        },
+        "required": [
+          "meta",
+          "spec",
+          "status"
+        ],
+        "type": "object"
+      },
+      "PendingMachineSpec": {
+        "additionalProperties": true,
+        "description": "Machines that have announced themselves and are waiting to be let in. Compare the fingerprint on a row with the one on that machine's own screen, say what it is for, and approve — that comparison is the authentication, in both directions, and nothing secret is typed either way.",
+        "properties": {
+          "approved": {
+            "description": "Turn on once the fingerprint on this row matches the one on the machine's own screen. That comparison is the whole authentication: nothing secret is typed in either direction, so a row you approve without looking is a machine you have not checked.",
+            "type": "boolean"
+          },
+          "node": {
+            "description": "What the whole cell will call this machine, for ever. It cannot be changed afterwards, and it is the name on every guest, volume and alert that mentions the machine.",
+            "type": "string"
+          },
+          "pool": {
+            "description": "Which storage pool it serves, when `pool` is one of the roles.",
+            "type": "string"
+          },
+          "refused": {
+            "description": "Say no rather than nothing. The machine stops asking, and the row stays so somebody wondering what happened to that box can see. Leaving it alone means \"not yet\", which is a different answer.",
+            "type": "boolean"
+          },
+          "roles": {
+            "description": "hypervisor runs guests, pool serves storage, control-plane is the cell's API. A machine may be more than one. This is your answer and not the machine's: a box that could make itself a control plane could make itself the cell.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "node",
+          "roles"
+        ],
+        "type": "object"
+      },
       "Pool": {
         "description": "What was asked for (`spec`), what is (`status`), and how far the second is behind the first (`meta.generation` against `status.observedGeneration`).",
         "properties": {
@@ -3862,6 +3916,242 @@
         "summary": "Change the spec of one of Device classes",
         "tags": [
           "Device classes"
+        ]
+      }
+    },
+    "/api/v1/enrollments": {
+      "get": {
+        "operationId": "list-enrollments",
+        "parameters": [
+          {
+            "description": "How many to return; the response carries `nextPageToken` when there are more.",
+            "in": "query",
+            "name": "pageSize",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Where the previous page ended.",
+            "in": "query",
+            "name": "pageToken",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects carrying these labels, as `key=value,key2=value2`.",
+            "in": "query",
+            "name": "labels",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`true` streams changes as server-sent events instead of listing.",
+            "in": "query",
+            "name": "watch",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With `watch`: the revision a list reported, so nothing between the list and the watch is lost.",
+            "in": "query",
+            "name": "fromRevision",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created at or after this moment: milliseconds since the epoch, or a span back from now like `30m`, `6h`, `7d`.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created before this moment, same spellings as `since`. Exclusive, so two adjacent ranges neither overlap nor skip.",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`name` or `createdAt`, optionally followed by ` desc`. An ordered listing is a top-N: everything the filter admits is read and sorted, and the first `pageSize` of the sorted order is returned with no `nextPageToken` (and `\"truncated\": true` when the answer was cut). Refused together with `pageToken`.",
+            "in": "query",
+            "name": "orderBy",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A read mask: comma-separated dotted paths, as `meta.name,status.conditions`. `meta.name` is always returned.",
+            "in": "query",
+            "name": "fields",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "items": {
+                      "items": {
+                        "$ref": "#/components/schemas/PendingMachine"
+                      },
+                      "type": "array"
+                    },
+                    "nextPageToken": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "revision"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A page of objects. `X-Velstra-Revision` is the revision the list is consistent at."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "List Pending machines",
+        "tags": [
+          "Pending machines"
+        ]
+      }
+    },
+    "/api/v1/enrollments/{name}": {
+      "get": {
+        "operationId": "get-enrollments",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingMachine"
+                }
+              }
+            },
+            "description": "The object."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Read one of Pending machines",
+        "tags": [
+          "Pending machines"
+        ]
+      },
+      "patch": {
+        "description": "Only `spec` and `labels` are writable here; `status` is the owning agent's, written through `:reportStatus`. Send `If-Match` with the revision read to make the write a compare-and-swap.",
+        "operationId": "patch-enrollments",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "labels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "spec": {
+                    "$ref": "#/components/schemas/PendingMachineSpec"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingMachine"
+                }
+              }
+            },
+            "description": "The object as stored."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Change the spec of one of Pending machines",
+        "tags": [
+          "Pending machines"
         ]
       }
     },

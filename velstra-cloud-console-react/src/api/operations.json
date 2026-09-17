@@ -1696,6 +1696,56 @@
   ]
  },
  {
+  "id": "get-enrollments",
+  "method": "GET",
+  "path": "/api/v1/enrollments/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Pending machines",
+  "tags": [
+   "Pending machines"
+  ]
+ },
+ {
+  "id": "list-enrollments",
+  "method": "GET",
+  "path": "/api/v1/enrollments",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision",
+   "since",
+   "until",
+   "orderBy",
+   "fields"
+  ],
+  "body": false,
+  "summary": "List Pending machines",
+  "tags": [
+   "Pending machines"
+  ]
+ },
+ {
+  "id": "patch-enrollments",
+  "method": "PATCH",
+  "path": "/api/v1/enrollments/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Pending machines",
+  "tags": [
+   "Pending machines"
+  ]
+ },
+ {
   "id": "reportStatus-nodes",
   "method": "POST",
   "path": "/api/v1/nodes/{name}:reportStatus",

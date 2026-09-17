@@ -105,6 +105,11 @@ fn cases() -> &'static [Case] {
             velstra_cloud_model::ceph::CephClusterStatus
         ),
         (
+            "enrollments",
+            velstra_cloud_model::enrollment::EnrollmentSpec,
+            velstra_cloud_model::enrollment::EnrollmentStatus
+        ),
+        (
             "console-sessions",
             velstra_cloud_model::console::ConsoleSessionSpec,
             velstra_cloud_model::console::ConsoleSessionStatus

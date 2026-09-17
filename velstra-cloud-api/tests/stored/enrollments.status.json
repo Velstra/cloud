@@ -1,0 +1,9 @@
+{
+  "expiresAt": 0,
+  "observedGeneration": 0,
+  "phase": "Pending",
+  "reported": {
+    "memoryMib": 0,
+    "vcpus": 0
+  }
+}

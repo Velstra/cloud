@@ -50,7 +50,7 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 34] = [
+pub const COLLECTIONS: [&str; 35] = [
     "projects",
     "flavors",
     "bgp-peers",
@@ -72,6 +72,10 @@ pub const COLLECTIONS: [&str; 34] = [
     "security-groups",
     "images",
     "nodes",
+    // Beside `nodes`, because an enrolment becomes one. Served rather than
+    // hidden like `credentials`: the whole point is a list an operator reads
+    // and acts on.
+    "enrollments",
     "pools",
     "device-classes",
     "backup-targets",
@@ -728,6 +732,11 @@ impl Api {
             // cluster or none. Not enforced by the type — the refusal belongs
             // where it can say why, which is `create` below.
             collection!("ceph-clusters", CephClusterSpec, CephClusterStatus),
+            collection!(
+                "enrollments",
+                velstra_cloud_model::enrollment::EnrollmentSpec,
+                velstra_cloud_model::enrollment::EnrollmentStatus
+            ),
             collection!("instances", InstanceSpec, InstanceStatus),
             collection!("volumes", VolumeSpec, VolumeStatus),
             collection!("snapshots", SnapshotSpec, SnapshotStatus),

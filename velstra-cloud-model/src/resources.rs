@@ -345,6 +345,33 @@ impl Assigned for crate::backup::BackupScheduleSpec {}
 /// hold ([`Quota::devices`]), not what they are called.
 pub type DeviceClass = Resource<crate::pci::DeviceClassSpec, DeviceClassStatus>;
 
+/// A machine that has announced itself to a cell and is waiting to be let in.
+///
+/// Cell-scoped, like the node it becomes. Not project-scoped and never will
+/// be: hardware belongs to the cell, and a tenant who could approve a machine
+/// into it would be a tenant who could add themselves a hypervisor.
+pub type Enrollment =
+    Resource<crate::enrollment::EnrollmentSpec, crate::enrollment::EnrollmentStatus>;
+
+impl Observed for crate::enrollment::EnrollmentStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        // Nobody, and this is the unusual one: the *machine* wrote this
+        // status, at the announce, before it had any credential at all. There
+        // is no agent to name as its owner because the thing that reported it
+        // is not yet part of the cell — which is the whole point of the
+        // object. Nothing may write it again; see `enrollment`.
+        None
+    }
+}
+
+impl Assigned for crate::enrollment::EnrollmentSpec {}
+
 /// A stretch of time in which one node is out of service.
 ///
 /// Cell-scoped, like the node it is about. Nothing writes its status: whether
