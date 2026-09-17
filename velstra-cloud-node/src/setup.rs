@@ -300,7 +300,12 @@ pub fn render(m: &Machine) -> String {
         }
     }
     if m.roles.contains(&Role::ControlPlane) {
-        out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
+        // Named or absent, never empty: `VELSTRA_STORE=` sets the variable to
+        // the empty string, and the API reads its own `env =` fallback as
+        // present-and-empty rather than falling back at all.
+        if !m.store.is_empty() {
+            out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
+        }
         // Both or neither: the API refuses one without the other rather than
         // serving plaintext on a port somebody believes is encrypted.
         if !m.tls_cert.is_empty() && !m.tls_key.is_empty() {
@@ -461,13 +466,30 @@ pub fn parse(text: &str) -> Result<Machine> {
         );
     }
     let mut m = Machine {
-        // Not a question this wizard asks: the machine is already installed
-        // and already named.
-        hostname: String::new(),
-        tls_cert: String::new(),
-        tls_key: String::new(),
-        lvm_group: String::new(),
-        lvm_thin_pool: String::new(),
+        // Read back, every one of them, because `render` writes every one of
+        // them — and this is where that stopped being true.
+        //
+        // A seed goes through parse→render whenever anything rewrites it:
+        // `ensure-tls` on a control plane's first boot, `migrate-seed` on an
+        // upgrade, `setup --config`. Five keys were written and not read, so
+        // every rewrite silently dropped them. `VELSTRA_TLS_CERT` cost the
+        // most: `bootstrap-cell` decides whether the cell speaks TLS by
+        // whether that field is set, read it back as empty, and spent ninety
+        // seconds asking an https port over http before giving up — so the
+        // first machine of a cell got a certificate and an API, and no Node,
+        // no Pool and no token. `VELSTRA_HOSTNAME` cost the quietest: a
+        // machine installed under a name lost it on the first rewrite and
+        // answered to the image's default from the next boot on.
+        //
+        // `seed_survives_a_round_trip` is what keeps this honest now: it
+        // populates every field, renders, parses, and compares — so a key
+        // added to one side and not the other fails a test rather than a
+        // fleet.
+        hostname: or("VELSTRA_HOSTNAME", ""),
+        tls_cert: or("VELSTRA_TLS_CERT", ""),
+        tls_key: or("VELSTRA_TLS_KEY", ""),
+        lvm_group: or("VELSTRA_LVM_GROUP", ""),
+        lvm_thin_pool: or("VELSTRA_LVM_THIN_POOL", ""),
         // Read from the seed like everything else, which they were not: an
         // unattended install could name a Ceph backend and had no way to say
         // which cluster, which pools or which client — so `--config` could
@@ -1436,6 +1458,129 @@ fn resolve_roles(raw: &str) -> Result<Vec<Role>, String> {
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// The one test that makes "render writes it, parse reads it" structural.
+///
+/// Three keys had drifted apart before this existed — `VELSTRA_API_URL` (a
+/// control plane's seed could not be read back at all), `VELSTRA_TLS_CERT`
+/// and `VELSTRA_TLS_KEY` (so `bootstrap-cell` thought its own cell spoke
+/// plain HTTP), `VELSTRA_HOSTNAME` and the two LVM keys (dropped on every
+/// rewrite). Each side had tests. Nothing ran a value through both.
+///
+/// So: populate every field, render, parse, compare. A key added to one side
+/// and not the other fails here, by name, the first time somebody runs the
+/// suite.
+#[cfg(test)]
+mod round_trip {
+    use super::*;
+
+    #[test]
+    fn seed_survives_a_round_trip() {
+        let m = Machine {
+            region: "eu-west".into(),
+            cell: "cell-9".into(),
+            roles: vec![Role::ControlPlane, Role::Hypervisor, Role::Pool],
+            hostname: "horst".into(),
+            advertise: "https://horst:8443,https://10.0.0.8:8443".into(),
+            bootstrap_ceph_osds: vec!["/dev/disk/by-id/a".into(), "/dev/disk/by-id/b".into()],
+            ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA nobody@example".into(),
+            passthrough: "10de:2204,10de:1aef".into(),
+            api_url: "https://localhost:8443".into(),
+            node: "horst".into(),
+            vmm: "qemu".into(),
+            pool: "local".into(),
+            api_ca: "/var/lib/velstra/tls/cert.pem".into(),
+            tls_cert: "/var/lib/velstra/tls/cert.pem".into(),
+            tls_key: "/var/lib/velstra/tls/key.pem".into(),
+            pool_backend: "lvm-thin".into(),
+            lvm_group: "vg0".into(),
+            lvm_thin_pool: "thin".into(),
+            ceph_conf: "/var/lib/velstra/ceph/ceph.conf".into(),
+            ceph_user: "velstra".into(),
+            ceph_pool: "rbd".into(),
+            ceph_image_pool: "images".into(),
+            ceph_pool_id: "ceph".into(),
+            store: "127.0.0.1:2379".into(),
+            cells: vec!["cell-2=https://cell-2:8443".into()],
+            local_network: true,
+            listen: "0.0.0.0:8443".into(),
+            admin: "admin".into(),
+            fabric: Some(Fabric {
+                orchestrator: "https://fabric:9443".into(),
+                control: "10.0.0.8:4789".into(),
+                vtep: "10.0.0.8".into(),
+                underlay: "eth0".into(),
+                srv6_locator: String::new(),
+            }),
+            // Deliberately not in the file, each for a stated reason, so each
+            // is compared against what it *should* come back as rather than
+            // against itself.
+            token: "ab".repeat(32),
+            pool_token: "cd".repeat(32),
+            admin_password: "correcthorsebattery".into(),
+            root_password: "hunter2hunter2".into(),
+            api_ca_pem: "-----BEGIN CERTIFICATE-----\n".into(),
+        };
+
+        let rendered = render(&m);
+        let back = parse(&rendered).expect("a rendered seed parses");
+
+        // Everything the file is allowed to carry comes back unchanged.
+        assert_eq!(back.region, m.region, "{rendered}");
+        assert_eq!(back.cell, m.cell, "{rendered}");
+        assert_eq!(back.roles, m.roles, "{rendered}");
+        assert_eq!(back.hostname, m.hostname, "{rendered}");
+        assert_eq!(back.advertise, m.advertise, "{rendered}");
+        assert_eq!(
+            back.bootstrap_ceph_osds, m.bootstrap_ceph_osds,
+            "{rendered}"
+        );
+        assert_eq!(back.ssh_key, m.ssh_key, "{rendered}");
+        assert_eq!(back.passthrough, m.passthrough, "{rendered}");
+        assert_eq!(back.api_url, m.api_url, "{rendered}");
+        assert_eq!(back.node, m.node, "{rendered}");
+        assert_eq!(back.vmm, m.vmm, "{rendered}");
+        assert_eq!(back.pool, m.pool, "{rendered}");
+        assert_eq!(back.api_ca, m.api_ca, "{rendered}");
+        assert_eq!(back.tls_cert, m.tls_cert, "{rendered}");
+        assert_eq!(back.tls_key, m.tls_key, "{rendered}");
+        assert_eq!(back.pool_backend, m.pool_backend, "{rendered}");
+        assert_eq!(back.lvm_group, m.lvm_group, "{rendered}");
+        assert_eq!(back.lvm_thin_pool, m.lvm_thin_pool, "{rendered}");
+        assert_eq!(back.ceph_conf, m.ceph_conf, "{rendered}");
+        assert_eq!(back.ceph_user, m.ceph_user, "{rendered}");
+        assert_eq!(back.ceph_pool, m.ceph_pool, "{rendered}");
+        assert_eq!(back.ceph_image_pool, m.ceph_image_pool, "{rendered}");
+        assert_eq!(back.ceph_pool_id, m.ceph_pool_id, "{rendered}");
+        assert_eq!(back.store, m.store, "{rendered}");
+        assert_eq!(back.cells, m.cells, "{rendered}");
+        assert_eq!(back.local_network, m.local_network, "{rendered}");
+        assert_eq!(back.listen, m.listen, "{rendered}");
+        assert_eq!(back.admin, m.admin, "{rendered}");
+        assert_eq!(back.fabric, m.fabric, "{rendered}");
+
+        // And the secrets are not in it. Each of these lives in its own 0600
+        // file beside the seed; `node.env` is world-readable.
+        for secret in [
+            &m.token,
+            &m.pool_token,
+            &m.admin_password,
+            &m.root_password,
+            &m.api_ca_pem,
+        ] {
+            assert!(
+                !rendered.contains(secret.trim()),
+                "a secret reached node.env: {rendered}"
+            );
+        }
+        assert!(back.token.is_empty(), "{:?}", back.token);
+        assert!(back.pool_token.is_empty(), "{:?}", back.pool_token);
+        assert!(back.api_ca_pem.is_empty(), "{:?}", back.api_ca_pem);
+        // The console password is a marker in the file and the secret in a
+        // file of its own, so what comes back is "there is one", not the one.
+        assert!(!back.root_password.is_empty(), "the marker is lost");
+    }
 }
 
 #[cfg(test)]

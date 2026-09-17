@@ -167,6 +167,21 @@ fn machine_from(a: &Answers) -> crate::setup::Machine {
         listen: a.listen.clone(),
         admin: a.admin.clone(),
         admin_password: a.admin_password.clone(),
+        // The cell's store, named because the alternative is silent and
+        // costly: `velstra-cloud-api` defaults `--store` to `memory`, and the
+        // appliance's unit is bare — everything reaches the binary through the
+        // seed. A control plane whose seed does not name a store therefore
+        // came up on an in-memory one, alongside the etcd the image runs and
+        // does not use, and lost the whole cell on every restart of the API.
+        //
+        // `parse` has always defaulted this to the bundled etcd, so a seed
+        // written by `setup --config` carried it and one written here did not:
+        // the two writers again, disagreeing about a key only one of them knew.
+        store: if a.roles.contains(&crate::roles::Role::ControlPlane) {
+            "127.0.0.1:2379".into()
+        } else {
+            String::new()
+        },
         api_ca_pem: a.api_ca_pem.clone(),
         bootstrap_ceph_osds: a.ceph_osds.clone(),
         ssh_key: a.ssh_key.clone(),
@@ -433,6 +448,14 @@ mod door_tests {
         });
         assert_eq!(back.node, "horst");
         assert!(back.roles.contains(&crate::roles::Role::ControlPlane));
+        // Named, not defaulted. The binary's own default for `--store` is
+        // `memory`, the appliance's unit passes no flags, and a cell that runs
+        // in memory loses everything the first time its API restarts — with
+        // etcd running beside it, unused, and nothing saying so.
+        assert!(
+            env.contains("VELSTRA_STORE=127.0.0.1:2379\n"),
+            "the first machine's seed does not name a store: {env}"
+        );
         assert!(
             back.api_url.is_empty(),
             "a control plane is the API; ensure-tls fills this in at first boot: {:?}",
