@@ -660,7 +660,18 @@
               with subtest("the console says where this machine is"):
                   machine.wait_for_unit("velstra-node-banner.service")
                   issue = machine.succeed("cat /run/issue.d/50-velstra.issue")
-                  for want in ["node-1", "control-plane", "https://"]:
+                  for want in [
+                      # The name the cell knows it by, which is what somebody
+                      # standing here is about to look for in the console.
+                      "node-1",
+                      "control-plane",
+                      "https://",
+                      # And the fingerprint of the certificate the browser is
+                      # about to warn about. The banner ran before
+                      # `velstra-cell-tls` had made one, so this line — the
+                      # reason the banner exists — was simply absent.
+                      "certificate:  sha256 ",
+                  ]:
                       assert want in issue, f"the banner does not say {want}:\n{issue}"
                   # agetty has to be told to read that directory, or the file
                   # is written and never seen. NixOS passes --issue-file; this

@@ -194,7 +194,20 @@ fn issue_text(
     seed: Option<&setup::Machine>,
     fingerprint: &str,
 ) -> String {
-    let mut out = format!("\nVelstra Cloud — {hostname}\n");
+    // Named the way the cell names it, because that is the name somebody
+    // standing here is about to look for in the console — `spec.node`, the
+    // node page, every API call. The hostname is what the machine calls
+    // itself; it gets its own line when the two differ, so whoever is about to
+    // ssh in is not looking at a name that will not resolve. A machine with no
+    // seed has only the hostname, which is the honest answer there.
+    let title = match seed.map(|m| m.node.as_str()).filter(|n| !n.is_empty()) {
+        Some(node) => node,
+        None => hostname,
+    };
+    let mut out = format!("\nVelstra Cloud — {title}\n");
+    if title != hostname && !hostname.is_empty() {
+        out.push_str(&format!("  hostname:     {hostname}\n"));
+    }
     if addresses.is_empty() {
         out.push_str("  address:      (none yet — no link, or no lease)\n");
     } else {
@@ -631,6 +644,32 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("sha256 AB:CD"), "{text}");
+    }
+
+    /// The name the cell knows it by, not the one it calls itself.
+    ///
+    /// Somebody standing at this machine is about to look for it in the
+    /// console, where it is `node-1` — a banner titled with the image's
+    /// default hostname sends them looking for a machine that is not listed.
+    /// The hostname is still said, because it is what will resolve when they
+    /// go to ssh in.
+    #[test]
+    fn the_banner_is_titled_the_way_the_cell_names_this_machine() {
+        let mut m = machine(vec![crate::roles::Role::ControlPlane]);
+        m.node = "node-1".into();
+        let text = issue_text("nixos", &["10.10.10.8".into()], Some(&m), "AB:CD");
+        assert!(text.contains("Velstra Cloud — node-1\n"), "{text}");
+        assert!(text.contains("hostname:     nixos\n"), "{text}");
+    }
+
+    /// And when they agree, it is said once.
+    #[test]
+    fn a_machine_whose_two_names_agree_says_it_once() {
+        let mut m = machine(vec![crate::roles::Role::ControlPlane]);
+        m.node = "horst".into();
+        let text = issue_text("horst", &["10.10.10.8".into()], Some(&m), "AB:CD");
+        assert!(text.contains("Velstra Cloud — horst\n"), "{text}");
+        assert!(!text.contains("hostname:"), "{text}");
     }
 
     /// A hypervisor has no console of its own, so it names the cell it joined

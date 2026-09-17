@@ -333,6 +333,14 @@ in
       after = [
         "network-online.target"
         "velstra-node-boot.service"
+        # After the certificate, or the banner has no fingerprint to print —
+        # which is most of the reason it exists. A self-signed certificate
+        # makes the browser warn, correctly, and the warning is worth
+        # something only to somebody who can check what they are agreeing to;
+        # this is the one screen that can tell them. On a machine that is not
+        # a control plane the unit is skipped by its own ExecCondition, so
+        # this costs nothing there.
+        "velstra-cell-tls.service"
       ];
       # Before the getty **instance**, not before `getty.target`.
       #
