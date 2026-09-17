@@ -17,6 +17,7 @@ pub mod capture;
 pub mod ceph;
 pub mod console;
 pub mod cpu;
+pub mod enrollment;
 pub mod ha;
 pub mod hierarchy;
 pub mod idempotency;
