@@ -753,6 +753,27 @@ async fn authenticate(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // The two doors a machine that has just booted an installer knocks on. It
+    // holds no token and never will: `enrollments:announce` makes a request an
+    // operator has to answer, and `enrollments:claim` is authorised by a
+    // signature under the key that was announced plus the recorded approval of
+    // a person — neither reads this identity for anything.
+    //
+    // Let through *here* rather than routed outside the layer, which is where
+    // this started and cost two mistakes: a path segment in this router is
+    // either a literal or a parameter and never both, so `:` in a route is the
+    // start of a parameter and `enrollments:announce` was never the literal
+    // path it looked like — two such routes collide. And a route registered
+    // for one method shadows that path for every other method, so a `post`
+    // route under this collection answered 405 to the PATCH an operator makes
+    // to approve. Both were found by the end-to-end test rather than by
+    // reading, which is the only reason neither shipped.
+    if is_enrolment_door(&request) {
+        request
+            .extensions_mut()
+            .insert(crate::auth::Identity::new("enrollment:anonymous"));
+        return Ok(next.run(request).await);
+    }
     let identity = match (header.as_deref(), console_ticket(&request)) {
         // The header wins where there is one, so nothing about an ordinary
         // request changes and a ticket cannot be used to *widen* a session.
@@ -765,6 +786,20 @@ async fn authenticate(
     };
     request.extensions_mut().insert(identity);
     Ok(next.run(request).await)
+}
+
+/// Whether this is one of the two enrolment doors a tokenless machine uses.
+///
+/// Narrow by spelling and by method: a POST to exactly one of two paths.
+/// Anything else about an enrolment — reading the list, approving a row,
+/// turning one away — takes the ordinary door and needs a token, because those
+/// are an operator's acts.
+fn is_enrolment_door(request: &axum::extract::Request) -> bool {
+    request.method() == axum::http::Method::POST
+        && matches!(
+            request.uri().path(),
+            "/api/v1/enrollments:announce" | "/api/v1/enrollments:claim"
+        )
 }
 
 /// The session and ticket a console stream carries, and only a console stream.
@@ -1520,6 +1555,24 @@ async fn create(
                     .insert(axum::http::header::CONTENT_DISPOSITION, value);
             }
             return Ok(answer);
+        }
+        Target::CollectionVerb { verb, .. } if verb == "announce" => {
+            let announced = api
+                .announce(&document(&body).unwrap_or(serde_json::json!({})))
+                .await?;
+            return Ok((StatusCode::CREATED, Json(announced)).into_response());
+        }
+        Target::CollectionVerb { verb, .. } if verb == "claim" => {
+            let body = document(&body).unwrap_or(serde_json::json!({}));
+            let id = body
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            let name = ResourceName::parse(&format!("enrollments/{id}"))
+                .map_err(|e| ApiError::invalid(format!("that is not an enrolment id: {e}")))?;
+            let claimed = api.claim(&name, &body).await?;
+            return Ok((StatusCode::OK, Json(claimed)).into_response());
         }
         Target::Verb { name, verb } if verb == "reportStatus" => {
             let reported = api

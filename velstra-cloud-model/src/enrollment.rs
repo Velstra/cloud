@@ -137,6 +137,16 @@ pub struct EnrollmentStatus {
     /// When an unapproved announcement stops standing.
     #[serde(default)]
     pub expires_at: Timestamp,
+    /// Who approved this machine, recorded by the API the moment somebody did.
+    ///
+    /// In the **status** and not the spec, because the status is the
+    /// platform's to write and nothing an operator sends can set it. The claim
+    /// mints the node's credential as this person, so this field is what makes
+    /// "a machine registered itself" untrue: it registered on the recorded
+    /// authority of somebody who may already create nodes, once, for the one
+    /// node they named. The audit line then carries a human.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub approved_by: String,
     /// When the credential was collected, if it has been.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<Timestamp>,
@@ -236,6 +246,125 @@ impl EnrollmentPhase {
     }
 }
 
+/// The length of an Ed25519 public key, in bytes.
+const KEY_BYTES: usize = 32;
+
+/// Why a key or a claim was not acceptable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BadKey {
+    /// Not base64 at all, in any of the four spellings.
+    NotBase64,
+    /// Base64 of the wrong length to be an Ed25519 key.
+    WrongLength(usize),
+    /// A signature of the wrong length to be Ed25519.
+    NotASignature(usize),
+    /// It decoded and did not verify. Either another key made it, or it was
+    /// made over something other than the message this cell asks for.
+    DoesNotVerify,
+}
+
+impl std::fmt::Display for BadKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotBase64 => f.write_str("that is not base64"),
+            Self::WrongLength(n) => write!(
+                f,
+                "an Ed25519 public key is {KEY_BYTES} bytes, this decodes to {n}"
+            ),
+            Self::NotASignature(n) => {
+                write!(f, "an Ed25519 signature is 64 bytes, this decodes to {n}")
+            }
+            Self::DoesNotVerify => f.write_str(
+                "the signature does not verify under the key this machine announced — either \
+                 another key made it, or it was made over something other than the claim \
+                 message",
+            ),
+        }
+    }
+}
+
+/// One spelling for one key.
+///
+/// Base64 has four spellings of the same bytes — standard and url-safe,
+/// padded and not — and the id a machine's row lives at is derived from the
+/// *string*. Without this, a client that padded differently on its second
+/// announce would land on a second row, and an operator would be looking at
+/// two pending machines that are one machine. So every key is decoded at the
+/// door and re-encoded one way, and everything downstream is a function of
+/// that one spelling.
+///
+/// Standard base64 with padding, which is what `images.rs` already uses for
+/// signing keys — two encodings in one codebase is one more than anybody can
+/// keep straight.
+pub fn canonical_key(offered: &str) -> Result<String, BadKey> {
+    let raw = decode_any(offered)?;
+    if raw.len() != KEY_BYTES {
+        return Err(BadKey::WrongLength(raw.len()));
+    }
+    Ok(encode_standard(&raw))
+}
+
+/// Base64 in any of its four spellings.
+///
+/// Tried in turn rather than sniffed: the alphabets overlap, so a string that
+/// is valid under two of them decodes to the same bytes under both, and one
+/// that is valid under none is not base64. Cheap — this runs once per
+/// announcement, over at most 512 characters.
+fn decode_any(text: &str) -> Result<Vec<u8>, BadKey> {
+    use base64::{Engine, engine::general_purpose as b64};
+    let text = text.trim();
+    if let Ok(raw) = b64::STANDARD.decode(text) {
+        return Ok(raw);
+    }
+    if let Ok(raw) = b64::STANDARD_NO_PAD.decode(text) {
+        return Ok(raw);
+    }
+    if let Ok(raw) = b64::URL_SAFE.decode(text) {
+        return Ok(raw);
+    }
+    if let Ok(raw) = b64::URL_SAFE_NO_PAD.decode(text) {
+        return Ok(raw);
+    }
+    Err(BadKey::NotBase64)
+}
+
+fn encode_standard(raw: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(raw)
+}
+
+/// What a machine signs to prove it holds the key it announced.
+///
+/// The enrolment's own id and nothing else. A nonce would be better against
+/// replay and is not needed here: a claim succeeds once — the second is
+/// [`NotClaimable::AlreadyClaimed`] — so a replayed signature buys an attacker
+/// a refusal. Versioned, so a future message shape cannot be confused with
+/// this one by a machine running older code.
+pub fn claim_message(id: &str) -> Vec<u8> {
+    format!("velstra-enrollment-claim:v1:{id}").into_bytes()
+}
+
+/// Whether this signature was made by the key that announced, over this
+/// enrolment.
+///
+/// Pure, so the one piece of cryptography in this feature is tested against
+/// real keys without a store or a network — see the tests below, which sign
+/// with `ring` and check that the right signature passes, a signature over
+/// another enrolment's id does not, and another key's does not.
+pub fn verify_claim(public_key: &str, id: &str, signature: &str) -> Result<(), BadKey> {
+    let key = decode_any(public_key)?;
+    if key.len() != KEY_BYTES {
+        return Err(BadKey::WrongLength(key.len()));
+    }
+    let sig = decode_any(signature)?;
+    if sig.len() != 64 {
+        return Err(BadKey::NotASignature(sig.len()));
+    }
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
+        .verify(&claim_message(id), &sig)
+        .map_err(|_| BadKey::DoesNotVerify)
+}
+
 /// The fingerprint of a public key, as a person compares it.
 ///
 /// Eight bytes of SHA-256 over the key, in the colon-separated hex this
@@ -276,6 +405,7 @@ pub fn announced(
         reported,
         phase: EnrollmentPhase::Pending,
         expires_at: Timestamp(now + DEFAULT_TTL_SECS * 1000),
+        approved_by: String::new(),
         claimed_at: None,
         observed_generation: 0,
         conditions: Vec::new(),
@@ -540,5 +670,98 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(one.summary(), "1 disk");
+    }
+}
+
+/// The one piece of cryptography in this feature, against real keys.
+#[cfg(test)]
+mod claims {
+    use ring::signature::KeyPair;
+
+    use super::*;
+
+    fn keypair() -> (ring::signature::Ed25519KeyPair, String) {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public = encode_standard(pair.public_key().as_ref());
+        (pair, public)
+    }
+
+    fn sign(pair: &ring::signature::Ed25519KeyPair, id: &str) -> String {
+        encode_standard(pair.sign(&claim_message(id)).as_ref())
+    }
+
+    /// The machine that announced can claim.
+    #[test]
+    fn the_key_that_announced_may_claim() {
+        let (pair, public) = keypair();
+        let id = "m-1a2b3c4d5e6f";
+        assert_eq!(verify_claim(&public, id, &sign(&pair, id)), Ok(()));
+    }
+
+    /// A signature over a different enrolment does not open this one. Without
+    /// the id in the message, one machine's claim would open every row.
+    #[test]
+    fn a_signature_for_another_machine_does_not_open_this_one() {
+        let (pair, public) = keypair();
+        let theirs = sign(&pair, "m-aaaaaaaaaaaa");
+        assert_eq!(
+            verify_claim(&public, "m-bbbbbbbbbbbb", &theirs),
+            Err(BadKey::DoesNotVerify)
+        );
+    }
+
+    /// Somebody else's key does not open it either — which is the whole
+    /// property, and the reason the row is addressed by the key's own hash.
+    #[test]
+    fn another_key_does_not_open_it() {
+        let (_, mine) = keypair();
+        let (other, _) = keypair();
+        let id = "m-1a2b3c4d5e6f";
+        assert_eq!(
+            verify_claim(&mine, id, &sign(&other, id)),
+            Err(BadKey::DoesNotVerify)
+        );
+    }
+
+    /// Four spellings of base64, one key. Without this a client that padded
+    /// differently on its second announce would land on a second row, and an
+    /// operator would see two pending machines that are one machine.
+    #[test]
+    fn every_spelling_of_one_key_is_one_key() {
+        use base64::Engine;
+        let (pair, standard) = keypair();
+        let raw = pair.public_key().as_ref();
+        for spelling in [
+            base64::engine::general_purpose::STANDARD.encode(raw),
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(raw),
+            base64::engine::general_purpose::URL_SAFE.encode(raw),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw),
+        ] {
+            assert_eq!(
+                canonical_key(&spelling).expect("a key"),
+                standard,
+                "{spelling} is the same key"
+            );
+        }
+        // And with the whitespace a paste carries.
+        assert_eq!(
+            canonical_key(&format!("  {standard}\n")).expect("a key"),
+            standard
+        );
+    }
+
+    /// Rubbish is refused by name, on a door anybody can knock on.
+    #[test]
+    fn what_is_not_a_key_is_said_to_not_be_one() {
+        assert_eq!(canonical_key("not base64 at all!!"), Err(BadKey::NotBase64));
+        // Valid base64, wrong length: an RSA key, a truncated paste, a typo.
+        assert_eq!(canonical_key("AAAA"), Err(BadKey::WrongLength(3)));
+        let (_, public) = keypair();
+        assert_eq!(
+            verify_claim(&public, "m-1", "AAAA"),
+            Err(BadKey::NotASignature(3))
+        );
     }
 }

@@ -2868,6 +2868,71 @@ answer is the file and not JSON wrapping it. Four things are deliberate:
   package from is the fleet's decision; a cloud-config that pulled a binary
   from an address this platform chose would be one nobody could audit.
 
+### Enrolment: the two doors with no token
+
+Everything else in this contract needs a bearer token. Two things do not, and
+cannot: a machine that has just booted an installer holds none.
+
+```
+POST /api/v1/enrollments:announce → 201
+{ "publicKey": "…Ed25519, base64…",
+  "seenCertificate": "9F:2C:…",
+  "reported": { "hostname": "nixos", "addresses": ["10.10.10.47"],
+                "vcpus": 16, "memoryMib": 65536,
+                "disks": ["nvme0n1"], "serial": "PT-0042" } }
+→ { "enrollment": "enrollments/m-5691f8f2b609", "id": "m-5691f8f2b609",
+    "fingerprint": "1A:2B:3C:4D:5E:6F:70:81",
+    "seenCertificate": "9F:2C:…", "phase": "Pending", "expiresAt": … }
+```
+
+The machine prints that fingerprint on its screen. The same value is on the
+enrolment's row in the console, beside what the machine said about itself. An
+operator compares the two, sets `spec.node` and `spec.roles`, and sets
+`spec.approved` — an ordinary PATCH, which needs a token like every other
+change. Then:
+
+```
+POST /api/v1/enrollments:claim → 200
+{ "id": "m-5691f8f2b609", "signature": "…Ed25519 over the claim message…" }
+→ { "target": "nodes/peter", "nodeToken": "…", "joinToken": "velstra1.…" }
+```
+
+Seven things about these two are deliberate.
+
+- **Neither grants anything by itself.** `announce` makes a *request*. Until
+  somebody names the machine and says what it is for, there is nothing to
+  claim, and `claim` says which of the two is missing rather than "no".
+- **The comparison is the authentication, both ways.** The fingerprint is
+  eight bytes of SHA-256 over the public key: only the holder of the private
+  key can produce it, and nothing on the wire can change it without changing
+  the fingerprint. The machine also reports the fingerprint of the certificate
+  it was served, and a control plane's console banner prints that same value
+  for itself — so a man in the middle has to show a certificate it holds the
+  key for, which is a different fingerprint, on the machine's own screen.
+- **The claim is signed over the enrolment's id**, as
+  `velstra-enrollment-claim:v1:<id>`. Without the id in the message one
+  machine's signature would open every row.
+- **Nobody registers themselves.** The API records *who approved* on the
+  enrolment's status — a field the platform writes and no caller can send —
+  and mints the node's credential as that person. A machine cannot create a
+  node, and the API does not act on its own behalf; it acts on the recorded
+  authority of somebody who may already create nodes, once, for the one node
+  they named. The audit line carries a human.
+- **Once.** A second claim is refused as already claimed, whether it is a
+  retry that lost its answer or somebody else holding the key. A machine that
+  lost its credential announces again.
+- **An unknown id and a wrong key answer identically** (`404`). A door open to
+  anybody must not let a stranger enumerate which machines are waiting.
+- **The open door is capped and idempotent.** The id is derived from the key,
+  so a machine that announces again lands on its own row rather than adding
+  one; past 512 unsettled rows an announcement is refused by name. This is the
+  one place in this API where a stranger can make the store grow.
+
+They are collection verbs — `enrollments:claim` with the id in the body, not
+`enrollments/<id>:claim` — because a path segment in this router is either a
+literal or a parameter and never both. The id is not a secret: the machine
+announced it and was told it, and the signature is what authorises.
+
 **A node reports status with a custom method**, AIP-136's `:reportStatus`, which
 is the one write outside the `spec`-only PATCH surface because it is a different
 caller doing a different thing:

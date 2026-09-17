@@ -361,12 +361,21 @@ impl Observed for crate::enrollment::EnrollmentStatus {
         &self.conditions
     }
     fn owner(&self) -> Option<&str> {
-        // Nobody, and this is the unusual one: the *machine* wrote this
-        // status, at the announce, before it had any credential at all. There
-        // is no agent to name as its owner because the thing that reported it
-        // is not yet part of the cell — which is the whole point of the
-        // object. Nothing may write it again; see `enrollment`.
+        // Nobody, and this is the unusual one: what is on this status came
+        // from the *machine*, at the announce, before it had any credential at
+        // all. There is no agent to name as its owner because the thing it
+        // describes is not yet part of the cell — which is the whole point of
+        // the object.
         None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        // So the API may write it, which is the only way this object can
+        // exist. An announcement arrives from something with no credential, so
+        // the API records it on the machine's behalf; the access rule refuses
+        // every controller's status write unless the kind says no agent will
+        // ever make one. Nothing does here — an enrolment is over before there
+        // is an agent to assign.
+        true
     }
 }
 

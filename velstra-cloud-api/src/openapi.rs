@@ -581,6 +581,22 @@ const VERBS: &[Verb] = &[
         query: &[],
     },
     Verb {
+        collection: "enrollments",
+        verb: "announce",
+        method: "post",
+        on_collection: true,
+        summary: "A machine announcing itself to this cell, with no token — it has just booted an installer and holds none. Carries `publicKey` (Ed25519, base64), optionally `seenCertificate` and `reported`. Answers the enrolment's id and the fingerprint of the key, which the machine prints on its screen for an operator to compare. Grants nothing: an operator has to name the machine and say what it is for before anything can be claimed. Idempotent in the key, so a machine that announces again lands on its own row; capped, because it is the one door a stranger can write through.",
+        query: &[],
+    },
+    Verb {
+        collection: "enrollments",
+        verb: "claim",
+        method: "post",
+        on_collection: true,
+        summary: "A machine collecting the credential an operator approved for it, with no token. Carries `id` and `signature` — an Ed25519 signature over `velstra-enrollment-claim:v1:<id>`, made with the key the machine announced — and answers `nodeToken` and `joinToken`, once. Authorised by that signature and by the recorded approval of a person. A collection verb rather than `enrollments/<id>:claim` because a path segment in this router is either a literal or a parameter and never both; the id is not a secret.",
+        query: &[],
+    },
+    Verb {
         collection: "pools",
         verb: "issueCredential",
         method: "post",

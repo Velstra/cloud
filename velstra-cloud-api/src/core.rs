@@ -638,6 +638,42 @@ fn strongest(a: Role, b: Role) -> Role {
     if rank(&b) > rank(&a) { b } else { a }
 }
 
+/// The id of the row a public key gets.
+///
+/// Derived from the key rather than random, so a machine that re-announces —
+/// after a reboot, or because its answer was lost — lands on its own row
+/// instead of adding a second one to a list somebody has to read. Announcing
+/// in a loop costs one row.
+///
+/// Truncated to twelve hex characters: this is a name in a URL an operator
+/// sometimes types, and collision resistance is not what it is for — the key
+/// itself is stored and the signature is checked against that, so two keys
+/// landing on one id would be caught as a mismatched signature rather than as
+/// a machine let in by accident.
+fn enrollment_id(public_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(public_key.trim().as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("m-{hex}")
+}
+
+/// What an announcing machine is told.
+///
+/// Its own id, so it knows what to claim, and the two fingerprints it is about
+/// to print on its screen: its own, which an operator compares, and the one it
+/// saw on the certificate, which the operator compares against the cell's. No
+/// credential and no secret — there is nothing here worth keeping from anyone.
+fn announced_body(id: &str, status: &velstra_cloud_model::enrollment::EnrollmentStatus) -> Value {
+    serde_json::json!({
+        "enrollment": format!("enrollments/{id}"),
+        "id": id,
+        "fingerprint": status.fingerprint,
+        "seenCertificate": status.seen_certificate,
+        "phase": status.phase,
+        "expiresAt": status.expires_at.0,
+    })
+}
+
 /// Which shape of join artefact a caller asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinArtifact {
@@ -3711,6 +3747,314 @@ impl Api {
     /// into a file would otherwise take the agent down while fixing it — and it
     /// is why this is `issueCredential` rather than `rotateCredential`, which
     /// would be a name promising the other thing.
+    /// A machine announcing itself to this cell.
+    ///
+    /// ## The one unauthenticated write
+    ///
+    /// Every other write here demands a token. This one cannot: the caller is
+    /// a machine that has just booted an installer and holds nothing. So it is
+    /// bounded rather than trusted, in four ways, and each bound is the reason
+    /// the door can exist at all:
+    ///
+    /// * **It grants nothing.** The object it makes is a request. It carries
+    ///   no credential, and an operator has to name the machine and say what
+    ///   it is for before anything can be claimed.
+    /// * **It is idempotent in the machine's own key.** The id is derived from
+    ///   the public key, so a machine that reboots, or whose answer was lost,
+    ///   lands on its own row again instead of adding a second. Announcing in
+    ///   a loop costs one row.
+    /// * **It is capped.** Past
+    ///   [`velstra_cloud_model::enrollment::MAX_PENDING`] unsettled rows the
+    ///   door closes, by name. A stranger can make this collection grow, and
+    ///   this is where that stops.
+    /// * **What it says about itself decides nothing.** The reported hardware
+    ///   is shown to a person and matched against no policy.
+    ///
+    /// The authentication happens afterwards and is a person: the fingerprint
+    /// of the key is on the machine's screen and on the operator's, and the
+    /// comparison is the whole of it. See
+    /// [`velstra_cloud_model::enrollment`].
+    pub async fn announce(&self, body: &Value) -> ApiResult<Value> {
+        use velstra_cloud_model::enrollment as en;
+
+        // Snake-cased: every body reaching this crate has been through
+        // `from_wire`, which is what turns the `publicKey` a client sends into
+        // the spelling the stored form uses. Reading the camel spelling here
+        // would be reading a key that is never present.
+        let public_key = body
+            .get("public_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if public_key.is_empty() {
+            return Err(ApiError::invalid(
+                "an announcement carries the machine's public key; the fingerprint of it is what \
+                 an operator compares against the machine's own screen",
+            )
+            .at("publicKey"));
+        }
+        // A length bound before anything is decoded. This is a stranger's
+        // string on an unauthenticated door.
+        if public_key.len() > 512 {
+            return Err(ApiError::invalid(
+                "that is not a public key: one line of base64, at most 512 characters",
+            )
+            .at("publicKey"));
+        }
+        // One spelling, so a client that pads differently on its second
+        // announce lands on its own row rather than a second one. Everything
+        // below — the id, the fingerprint, the signature check — is a function
+        // of this string.
+        let public_key = en::canonical_key(public_key)
+            .map_err(|e| ApiError::invalid(e.to_string()).at("publicKey"))?;
+        let public_key = public_key.as_str();
+        let reported: en::Reported = match body.get("reported") {
+            None | Some(Value::Null) => en::Reported::default(),
+            Some(raw) => serde_json::from_value(raw.clone()).map_err(|e| {
+                ApiError::invalid(format!("reported is not what a machine reports: {e}"))
+                    .at("reported")
+            })?,
+        };
+        let seen = body
+            .get("seen_certificate")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+
+        let collection = self.collection("enrollments")?;
+        let id = enrollment_id(public_key);
+        let name = format!("enrollments/{id}");
+        let now = Timestamp::now().0;
+
+        // Its own row, if it has one. A machine that re-announces is the
+        // ordinary case — it polls, it reboots, its answer is lost — and every
+        // one of those must land here rather than on a new row.
+        if let Some(existing) = collection.get(&name).await? {
+            let spec: en::EnrollmentSpec =
+                serde_json::from_value(existing.get("spec").cloned().unwrap_or(Value::Null))
+                    .unwrap_or_default();
+            let status: en::EnrollmentStatus =
+                serde_json::from_value(existing.get("status").cloned().unwrap_or(Value::Null))
+                    .unwrap_or_default();
+            // Already through the door: say so rather than reopening it. A
+            // claimed row is a machine that is now a node, and a refused one is
+            // an answer somebody gave.
+            if status.phase == en::EnrollmentPhase::Claimed || spec.refused {
+                return Ok(announced_body(&id, &status));
+            }
+            // Otherwise this is the same machine saying it is still here: the
+            // facts it reports are refreshed and the clock is wound back on.
+            let mut fresh = en::announced(public_key, seen, reported, now);
+            fresh.phase = if spec.approved {
+                en::EnrollmentPhase::Approved
+            } else {
+                en::EnrollmentPhase::Pending
+            };
+            let written = collection
+                .report_status(
+                    &name,
+                    &serde_json::to_value(&fresh).expect("a status serialises"),
+                    None,
+                    &velstra_cloud_model::access::Writer::controller("enrollment"),
+                )
+                .await?;
+            let status: en::EnrollmentStatus =
+                serde_json::from_value(written.get("status").cloned().unwrap_or(Value::Null))
+                    .unwrap_or_default();
+            return Ok(announced_body(&id, &status));
+        }
+
+        // A new row, and the only place the cap applies: a machine that
+        // already has one is not making the collection grow.
+        let unsettled = collection
+            .list()
+            .await?
+            .iter()
+            .filter(|row| {
+                serde_json::from_value::<en::EnrollmentStatus>(
+                    row.get("status").cloned().unwrap_or(Value::Null),
+                )
+                .map(|s| !s.phase.settled())
+                .unwrap_or(false)
+            })
+            .count();
+        if unsettled >= en::MAX_PENDING {
+            return Err(ApiError::new(
+                Code::ResourceExhausted,
+                format!(
+                    "this cell is already holding {} machines waiting to be let in, which is \
+                     the most it keeps. Approve or turn away what is there; an unanswered \
+                     announcement expires by itself within the hour.",
+                    en::MAX_PENDING
+                ),
+            ));
+        }
+
+        // Built through `Meta::new`, not hand-written JSON: the name is a
+        // structured `ResourceName` in the stored form, and a bare string
+        // there is refused with a message about `spec.approved` that has
+        // nothing to do with the mistake.
+        let resource = ResourceName::parse(&name)
+            .map_err(|e| ApiError::invalid(format!("the enrolment id is not a name: {e}")))?;
+        let meta = velstra_cloud_model::meta::Meta::new(resource, self.inner.placement.clone());
+        let meta = serde_json::to_value(&meta).map_err(|e| {
+            ApiError::invalid(format!("the enrolment's metadata will not serialise: {e}"))
+        })?;
+        collection
+            .create(
+                meta,
+                serde_json::to_value(en::EnrollmentSpec::default()).expect("a spec"),
+            )
+            .await?;
+        let status = en::announced(public_key, seen, reported, now);
+        let written = collection
+            .report_status(
+                &name,
+                &serde_json::to_value(&status).expect("a status serialises"),
+                None,
+                &velstra_cloud_model::access::Writer::controller("enrollment"),
+            )
+            .await?;
+        let status: en::EnrollmentStatus =
+            serde_json::from_value(written.get("status").cloned().unwrap_or(Value::Null))
+                .unwrap_or_default();
+        Ok(announced_body(&id, &status))
+    }
+
+    /// A machine collecting the credential an operator approved for it.
+    ///
+    /// ## What authorises this
+    ///
+    /// Not a token — the machine still has none. Two things, both recorded
+    /// before this is called:
+    ///
+    /// * **A signature** over this enrolment's id, under the key the machine
+    ///   announced. That proves the caller is the machine whose fingerprint an
+    ///   operator compared, and not somebody who read the id off a list.
+    /// * **An operator's approval**, which carries *who* approved it. The
+    ///   credential is minted as that person, so the audit line names the
+    ///   human who made the decision rather than a service identity nobody
+    ///   can ask about.
+    ///
+    /// The second is why there is no new privilege here. A machine cannot
+    /// register itself and the API does not act on its own behalf: it acts on
+    /// the recorded authority of somebody who may already create nodes, once,
+    /// for the one node they named.
+    pub async fn claim(&self, name: &ResourceName, body: &Value) -> ApiResult<Value> {
+        use velstra_cloud_model::enrollment as en;
+
+        if name.collection() != "enrollments" {
+            return Err(ApiError::invalid(format!(
+                "a claim is made against an enrolment, and {name} is a {}",
+                name.collection()
+            )));
+        }
+        let signature = body
+            .get("signature")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if signature.is_empty() {
+            return Err(ApiError::invalid(
+                "a claim carries a signature over this enrolment's id, made with the key the \
+                 machine announced",
+            )
+            .at("signature"));
+        }
+        if signature.len() > 256 {
+            return Err(ApiError::invalid("that is not an Ed25519 signature").at("signature"));
+        }
+
+        let collection = self.collection("enrollments")?;
+        // Not found and not-yours are the same answer here, deliberately: this
+        // door is open to anybody, and one that distinguished them would let a
+        // stranger enumerate which machines have announced.
+        let unknown = || {
+            ApiError::new(
+                Code::NotFound,
+                "no machine has announced itself under that id, or this signature was not made \
+                 by the one that did",
+            )
+        };
+        let stored = collection
+            .get(&name.to_string())
+            .await?
+            .ok_or_else(unknown)?;
+        let spec: en::EnrollmentSpec =
+            serde_json::from_value(stored.get("spec").cloned().unwrap_or(Value::Null))
+                .unwrap_or_default();
+        let status: en::EnrollmentStatus =
+            serde_json::from_value(stored.get("status").cloned().unwrap_or(Value::Null))
+                .unwrap_or_default();
+
+        // The signature first, before any of the state is described back. A
+        // caller who cannot prove it holds the key learns nothing about
+        // whether the machine was approved, named, or turned away.
+        en::verify_claim(&status.public_key, name.id(), signature).map_err(|_| unknown())?;
+
+        let now = Timestamp::now().0;
+        en::claimable(&spec, &status, now).map_err(|why| match why {
+            en::NotClaimable::NotApproved => {
+                ApiError::new(Code::FailedPrecondition, why.to_string())
+            }
+            en::NotClaimable::Refused => ApiError::forbidden(why.to_string()),
+            _ => ApiError::new(Code::FailedPrecondition, why.to_string()),
+        })?;
+
+        // Whoever approved it. The credential is minted as them, so the audit
+        // trail names a person; an enrolment approved by nobody cannot be
+        // claimed, which `claimable` has already refused above.
+        if status.approved_by.trim().is_empty() {
+            // Approved with nobody recorded. That is not a state this API
+            // produces — `patch` records the approver as it writes the flag —
+            // so it means the row was written by something else, and minting a
+            // credential on an authority nobody can name is the one thing this
+            // door must not do.
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                "this enrolment is approved and carries no record of who approved it, so there \
+                 is no authority to register the node under. Turn it away and let the machine \
+                 announce again.",
+            ));
+        }
+        let approver = Identity::new(status.approved_by.trim().to_string());
+
+        let node = ResourceName::parse(&format!("nodes/{}", spec.node.trim()))
+            .map_err(|e| ApiError::invalid(format!("the approved node name is not one: {e}")))?;
+        // Created if absent, kept if not. An operator who made the Node first
+        // and then approved the machine meant one machine, not two.
+        if self.get(&node, &approver).await.is_err() {
+            let asked = serde_json::json!({
+                "id": spec.node.trim(),
+                "spec": { "schedulable": true },
+            });
+            self.create("", "nodes", &asked, &approver).await?;
+        }
+        let issued = self
+            .issue_credential(
+                &node,
+                &serde_json::json!({ "purpose": "enrolment" }),
+                &approver,
+            )
+            .await?;
+
+        // Claimed, once. Written before the answer goes out: a claim whose
+        // answer is lost must not mint a second credential, and the machine
+        // that lost it announces again rather than asking twice.
+        let mut settled = status.clone();
+        settled.phase = en::EnrollmentPhase::Claimed;
+        settled.claimed_at = Some(velstra_cloud_model::meta::Timestamp(now));
+        collection
+            .report_status(
+                &name.to_string(),
+                &serde_json::to_value(&settled).expect("a status serialises"),
+                None,
+                &velstra_cloud_model::access::Writer::controller("enrollment"),
+            )
+            .await?;
+        Ok(issued)
+    }
+
     /// What the platform hands somebody who is about to install a machine.
     ///
     /// ## Why a file and not a seed
@@ -3811,7 +4155,15 @@ impl Api {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let expires_at = match ask.get("expiresAt") {
+        // `expires_at`, not `expiresAt`. Every body reaching this crate has been
+        // through `from_wire`, which is what turns the spelling a client sends
+        // into the spelling the stored form uses — so the camel read here was a
+        // read of a key that is never present. An `expiresAt` a caller sent was
+        // accepted, ignored, and the credential issued with no end at all,
+        // including the end date already in the past that the contract promises
+        // to refuse by name. Found while wiring enrolment, which reads a body
+        // the same way.
+        let expires_at = match ask.get("expires_at") {
             None | Some(Value::Null) => None,
             Some(raw) => Some(velstra_cloud_model::meta::Timestamp(
                 raw.as_u64().ok_or_else(|| {
@@ -4142,6 +4494,21 @@ impl Api {
             .at("spec"));
         }
         let mut document = collection.patch(&name.to_string(), &patch, expect).await?;
+        // Approving a machine records who did it, here, where the identity is
+        // in hand and the write has just succeeded.
+        //
+        // In the status rather than the spec: the status is the platform's to
+        // write, so nothing a caller sends can set this, and `claim` mints the
+        // node's credential as this person. That is what makes "the machine
+        // registered itself" untrue — it registered on the recorded authority
+        // of somebody who may already create nodes, once, for the node they
+        // named. Without it the claim would need either a privilege of its own
+        // or a service identity, and both are new trust nobody would ever
+        // question again.
+        if name.collection() == "enrollments" {
+            self.remember_approver(name, &document, who).await;
+            document = collection.get(&name.to_string()).await?.unwrap_or(document);
+        }
         self.answer(&mut document, &mut Scratch::default()).await?;
         self.record_change(who, "update", name).await;
         // A change to the spec is work somebody has asked for and nobody has
@@ -4166,6 +4533,48 @@ impl Api {
             resource: document,
             operation,
         })
+    }
+
+    /// Write who approved an enrolment, the moment somebody does.
+    ///
+    /// Best-effort on purpose: an approval that worked must not be reported as
+    /// failed because the record of it could not be written — the same rule
+    /// sign-in follows for `users.status.lastLogin`. A claim against a row with
+    /// no approver recorded is refused by name, so the cost of losing this
+    /// write is that the operator approves again, not that a machine is let in
+    /// on an authority nobody can name.
+    async fn remember_approver(&self, name: &ResourceName, document: &Value, who: &Identity) {
+        use velstra_cloud_model::enrollment as en;
+        let approved = document["spec"]["approved"].as_bool().unwrap_or(false);
+        if !approved {
+            return;
+        }
+        let Ok(mut status) = serde_json::from_value::<en::EnrollmentStatus>(
+            document.get("status").cloned().unwrap_or(Value::Null),
+        ) else {
+            return;
+        };
+        // Written once. A second approval by somebody else does not rewrite
+        // the authority the machine will register under — the first person to
+        // say yes is who said it.
+        if !status.approved_by.trim().is_empty() {
+            return;
+        }
+        status.approved_by = who.subject.clone();
+        status.phase = en::EnrollmentPhase::Approved;
+        let Ok(body) = serde_json::to_value(&status) else {
+            return;
+        };
+        if let Ok(collection) = self.collection("enrollments") {
+            let _ = collection
+                .report_status(
+                    &name.to_string(),
+                    &body,
+                    None,
+                    &velstra_cloud_model::access::Writer::controller("enrollment"),
+                )
+                .await;
+        }
     }
 
     /// Report the status of an object, as the node agent that owns it.

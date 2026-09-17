@@ -12,6 +12,9 @@ name = "velstra-cloud-api"
 path = "src/bin/velstra-cloud-api.rs"
 
 [dependencies]
+# SHA-256 for the id an announcing machine's key lands on. The same hash the
+# model uses for its fingerprint, from the same workspace pin.
+sha2 = { workspace = true }
 # Reading the cell CA the console proxy trusts a node with.
 rustls-pki-types = { workspace = true }
 # TLS on the console's own port. Not a proxy's job on a single box: the machine
