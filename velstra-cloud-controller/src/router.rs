@@ -187,7 +187,36 @@ impl Reconciler for RouterController {
             return Ok(());
         };
         let Some(endpoint) = self.fabric.clone() else {
-            return Ok(());
+            // A cell with no fabric is a supported configuration, not an
+            // unfinished one — and this controller is a router's *only*
+            // possible reporter, so saying nothing here left every router in
+            // such a cell at `observedGeneration: 0` for ever.
+            //
+            // Which is not a quiet state. The console has exactly two facts to
+            // work from, generation and observedGeneration, and renders that
+            // pair as "Creating" for fifteen minutes and "Not reported"
+            // afterwards — words for work in progress, on an object no process
+            // in the cell was ever going to touch. Measured live: a router
+            // polled every two seconds for ninety seconds, forty-six identical
+            // samples, not one byte of status written, while the console
+            // counted the minutes.
+            //
+            // `network.rs` had the same defect and the same fix, and its
+            // comment describes this symptom word for word; the router was
+            // simply never given it. `True`, because nothing is outstanding
+            // and nothing is broken — and the message carries what a green
+            // tick would otherwise hide.
+            return self
+                .say(
+                    router,
+                    ConditionStatus::True,
+                    "NoFabric",
+                    "this cell has no fabric, so there is no routed context to program for this \
+                     router — it routes nothing between networks. The node carries each segment \
+                     itself; see --local-network.",
+                    None,
+                )
+                .await;
         };
 
         let vnis = match self.vnis_for(router).await? {
@@ -477,10 +506,23 @@ mod tests {
         assert!(why.contains("nothing to route"), "{why}");
     }
 
-    /// With no fabric configured, a reconcile is a no-op — and nothing claims to
-    /// be routed.
+    /// **With no fabric, a router says so — it does not fall silent.**
+    ///
+    /// This controller is a router's only possible reporter, so saying nothing
+    /// left the object at `observedGeneration: 0` for ever. That is not a quiet
+    /// state: the console has two facts to work from, generation and
+    /// observedGeneration, and renders that pair as "Creating" for fifteen
+    /// minutes and "Not reported" afterwards — words for work in progress, on
+    /// an object no process in the cell was ever going to touch. Measured on a
+    /// live cell: forty-six samples over ninety seconds, every one identical,
+    /// not one byte of status written.
+    ///
+    /// This test used to pin the silence. It now pins the answer: `True`,
+    /// because nothing is outstanding and nothing is broken, with a message
+    /// that carries what a green tick would otherwise hide — and still no VNI,
+    /// because nothing was routed.
     #[tokio::test]
-    async fn with_no_fabric_nothing_is_routed_and_nothing_claims_to_be() {
+    async fn with_no_fabric_a_router_says_there_is_nothing_to_route_to() {
         let (raw, routers, nets) = stores();
         add_network(&nets, "n1", 5001).await;
         let r = router(&["projects/p1/networks/n1"]);
@@ -491,9 +533,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // As the watch would hand it over: the stored object, with the
+        // revision the store actually holds.
+        let stored = routers
+            .get("projects/p1/routers/r1")
+            .await
+            .unwrap()
+            .unwrap();
         let c = RouterController::new(raw, CELL, nets, None);
 
-        c.reconcile("projects/p1/routers/r1", Some(&r))
+        c.reconcile("projects/p1/routers/r1", Some(&stored))
             .await
             .expect("a cell with no fabric must still reconcile");
 
@@ -502,9 +551,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            condition(&after.status.conditions, ROUTED).is_none(),
-            "a router claimed a routing state with no fabric to route on"
+        let said = condition(&after.status.conditions, ROUTED)
+            .expect("a router with no fabric said nothing at all");
+        assert_eq!(said.status, ConditionStatus::True, "{said:?}");
+        assert_eq!(said.reason, "NoFabric", "{said:?}");
+        assert!(said.message.contains("no fabric"), "{said:?}");
+        assert_eq!(
+            after.status.observed_generation, after.meta.generation,
+            "a router that has been answered still reads as waiting"
         );
         assert_eq!(
             after.status.l3_vni, 0,
