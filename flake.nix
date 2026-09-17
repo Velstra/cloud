@@ -674,10 +674,18 @@
                   ]:
                       assert want in issue, f"the banner does not say {want}:\n{issue}"
                   # agetty has to be told to read that directory, or the file
-                  # is written and never seen. NixOS passes --issue-file; this
-                  # asserts it rather than trusting it.
-                  getty = machine.succeed("systemctl cat getty@tty1.service")
-                  assert "/run/issue.d" in getty, getty
+                  # is written and never seen. NixOS passes --issue-file, but
+                  # not in the unit text: ExecStart points at a wrapper script
+                  # in the store and the flags are inside it, so the unit is
+                  # read for the path and the path is read for the flag.
+                  exec_start = machine.succeed(
+                      "systemctl show getty@tty1.service -p ExecStart"
+                      " | grep -o '/nix/store/[^ ;]*' | head -n1"
+                  ).strip()
+                  assert exec_start, "getty@tty1 has no ExecStart to read"
+                  assert "/run/issue.d" in machine.succeed(f"cat {exec_start}"), (
+                      f"agetty is never told to read /run/issue.d: {exec_start}"
+                  )
                   # And it has to be there *before* the prompt is drawn. The
                   # banner unit and getty@tty1 are both Before=getty.target,
                   # which orders neither against the other — so the ordering
