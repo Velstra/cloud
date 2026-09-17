@@ -130,6 +130,18 @@ choosing.
 Nothing. No VFIO, no PCI concept, no device field on an instance or flavor. This
 is a green field, which means it can be modelled properly the first time.
 
+> **Since then (2026-09-17).** Phase one below is built: a node reports every
+> PCI device with its IOMMU group (`pcidev.rs`), `offerable` refuses a device
+> whose group is not free, `DeviceClass` names a set across the fleet, the
+> scheduler places on it, and HA refuses to move a guest that holds one. The
+> one thing the model above did not anticipate is *when* a device is taken from
+> the host: the usual `vfio-pci.ids=` on the kernel command line cannot work on
+> the appliance, whose command line is sealed into a signed UKI — so which cards
+> a machine reserves is a line in its seed, `VELSTRA_PASSTHROUGH`, and
+> `velstra-cloud-passthrough` binds them through sysfs at boot. The installer
+> asks, because it is the one thing standing on the hardware and can offer the
+> cards by name.
+
 ### The physics, so the model does not fight it
 
 Passthrough is a kernel capability, not a distribution one: IOMMU enabled,

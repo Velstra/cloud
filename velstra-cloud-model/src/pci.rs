@@ -187,6 +187,84 @@ pub fn offerable(device: &PciDevice, all: &[PciDevice]) -> Result<(), NotOfferab
     Ok(())
 }
 
+/// What has to be bound to `vfio-pci` for `wanted` to be passable, and what
+/// stands in the way.
+///
+/// `wanted` is what an operator wrote: a PCI address (`0000:41:00.0`) or a
+/// vendor:device pair (`10de:2204`, which matches every card of that model in
+/// the machine). The pair is the useful spelling — an address is a fact about
+/// one slot in one box, and a fleet is installed from one answer.
+///
+/// **The IOMMU group is the unit, not the device.** A group holding a GPU, its
+/// audio function and a bridge is bound whole or not at all, so every member
+/// comes back in `bind` — that is the hardware's rule and not a choice this
+/// platform gets to make. A member already held by a guest makes the whole
+/// group unbindable, and is reported rather than taken: unbinding a card out
+/// from under a running guest is not a thing to do quietly.
+///
+/// Pure, so the group arithmetic is tested without a machine.
+pub fn to_bind(wanted: &[String], all: &[PciDevice]) -> BindPlan {
+    let mut plan = BindPlan::default();
+    for want in wanted {
+        let want = want.trim();
+        if want.is_empty() {
+            continue;
+        }
+        let matched: Vec<&PciDevice> = all
+            .iter()
+            .filter(|d| d.address == want || d.vendor_device.eq_ignore_ascii_case(want))
+            .collect();
+        if matched.is_empty() {
+            plan.unknown.push(want.to_string());
+            continue;
+        }
+        for device in matched {
+            if device.iommu_group.is_none() {
+                plan.refused
+                    .push((device.address.clone(), NotOfferable::NoIommu));
+                continue;
+            }
+            // A guest holding any member means the group is off limits. A
+            // *host driver* is not a refusal: taking the card away from it is
+            // exactly what binding does.
+            if let Some(held) = all.iter().find(|d| {
+                d.iommu_group == device.iommu_group && matches!(d.state, DeviceUse::Guest { .. })
+            }) {
+                plan.refused.push((
+                    device.address.clone(),
+                    NotOfferable::GroupInUse {
+                        group: device.iommu_group.unwrap_or_default(),
+                        other: held.address.clone(),
+                        by: held.state.clone(),
+                    },
+                ));
+                continue;
+            }
+            for member in group_members(device, all) {
+                if !plan.bind.contains(&member) {
+                    plan.bind.push(member);
+                }
+            }
+        }
+    }
+    plan.bind.sort();
+    plan.bind.dedup();
+    plan
+}
+
+/// What [`to_bind`] worked out: what to bind, what it could not find, and what
+/// it will not touch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BindPlan {
+    /// Every address to hand to `vfio-pci`, whole IOMMU groups.
+    pub bind: Vec<String>,
+    /// Asked for and not present on this machine — a card that was moved, a
+    /// typo, or an answer seeded for a different model of box.
+    pub unknown: Vec<String>,
+    /// Present and not bindable, with the reason.
+    pub refused: Vec<(String, NotOfferable)>,
+}
+
 /// Every device in one IOMMU group, by address, sorted.
 ///
 /// What a console shows beside a device before anybody claims it: passing one
@@ -579,5 +657,101 @@ mod tests {
         assert_eq!(here.blocked.len(), 1);
         assert_eq!(here.blocked[0].0, "0000:81:00.0");
         assert!(here.any_free());
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    fn device(address: &str, id: &str, group: u32, state: DeviceUse) -> PciDevice {
+        PciDevice {
+            address: address.into(),
+            vendor_device: id.into(),
+            description: String::new(),
+            kind: DeviceKind::Gpu,
+            iommu_group: Some(group),
+            state,
+        }
+    }
+
+    fn machine() -> Vec<PciDevice> {
+        vec![
+            // A card and its audio function share a group — the ordinary case,
+            // and the reason the group is the unit.
+            device("0000:41:00.0", "10de:2204", 17, DeviceUse::Free),
+            device("0000:41:00.1", "10de:1aef", 17, DeviceUse::Free),
+            // A second card of the same model, on its own.
+            device("0000:42:00.0", "10de:2204", 18, DeviceUse::Free),
+            // Something else entirely.
+            device("0000:03:00.0", "8086:1521", 5, DeviceUse::Free),
+        ]
+    }
+
+    /// A vendor:device pair takes every card of that model, and each one drags
+    /// its whole IOMMU group along.
+    #[test]
+    fn a_model_takes_every_card_of_it_and_the_whole_group_each_time() {
+        let plan = to_bind(&["10de:2204".into()], &machine());
+        assert_eq!(
+            plan.bind,
+            vec!["0000:41:00.0", "0000:41:00.1", "0000:42:00.0"]
+        );
+        assert!(plan.unknown.is_empty());
+        assert!(plan.refused.is_empty());
+    }
+
+    /// An address names one slot, and still brings its group.
+    #[test]
+    fn an_address_brings_its_group_too() {
+        let plan = to_bind(&["0000:41:00.0".into()], &machine());
+        assert_eq!(plan.bind, vec!["0000:41:00.0", "0000:41:00.1"]);
+    }
+
+    /// A host driver is not a refusal — taking the card away from it is the
+    /// whole point. A guest is: unbinding a card out from under a running
+    /// guest is not something to do quietly.
+    #[test]
+    fn a_host_driver_is_taken_and_a_guest_is_not() {
+        let mut all = machine();
+        all[0].state = DeviceUse::HostDriver {
+            driver: "nouveau".into(),
+        };
+        assert_eq!(
+            to_bind(&["0000:41:00.0".into()], &all).bind,
+            vec!["0000:41:00.0", "0000:41:00.1"]
+        );
+
+        all[1].state = DeviceUse::Guest {
+            instance: "projects/p1/instances/render".into(),
+        };
+        let plan = to_bind(&["0000:41:00.0".into()], &all);
+        assert!(plan.bind.is_empty(), "{plan:?}");
+        assert_eq!(plan.refused.len(), 1);
+        assert!(matches!(
+            plan.refused[0].1,
+            NotOfferable::GroupInUse { group: 17, .. }
+        ));
+    }
+
+    /// Asked for and not here: named, not silently skipped. A seed written for
+    /// one model of box and flashed onto another is the ordinary way this
+    /// happens, and it has to be visible.
+    #[test]
+    fn a_card_that_is_not_in_this_machine_is_named() {
+        let plan = to_bind(&["1002:744c".into(), "0000:99:00.0".into()], &machine());
+        assert!(plan.bind.is_empty());
+        assert_eq!(plan.unknown, vec!["1002:744c", "0000:99:00.0"]);
+    }
+
+    /// No IOMMU group is refused with the reason, because the fix is in the
+    /// firmware and not in this seed.
+    #[test]
+    fn a_device_with_no_iommu_group_is_refused_by_reason() {
+        let mut all = machine();
+        all[2].iommu_group = None;
+        let plan = to_bind(&["0000:42:00.0".into()], &all);
+        assert!(plan.bind.is_empty());
+        assert!(matches!(plan.refused[0].1, NotOfferable::NoIommu));
     }
 }

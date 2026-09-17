@@ -39,25 +39,29 @@ answer "Disk number"        "$env(PICK)"
 # sealed default, which is what ships unless somebody says otherwise.
 answer "Access "            "1"
 
-# Plaintext data partition here; the encrypted flow shares the LUKS code the
-# unlock unit exercises.
-answer "Encrypt the data partition" "n"
+# Cards held back for guests — asked only when this machine has a display
+# controller, which a QEMU VM does and a headless server may not. One expect
+# for both: answer it if it comes, and fall through to the next question if it
+# does not, rather than two patterns that each assume the other did not match.
+expect {
+    "Hold back for guests"       { send -- "\r"; exp_continue }
+    "Encrypt the data partition" { send -- "n\r" }
+    timeout { puts "\nSTALLED — no prompt matching: Encrypt the data partition"; exit 3 }
+    eof     { puts "\nEXITED — while waiting for: Encrypt the data partition"; exit 4 }
+}
 
 answer "Hostname"  "node-t1"
 answer "Use DHCP"  "y"
 
-# What this box is for. `$ROLES` rather than a fixed answer, so the same script
-# can drive the hypervisor install this check makes today and a control-plane or
+# The three doors. `$DOOR` picks. Door 1 is the first machine of a cell; door 2
+# is the join token and asks nothing else; door 3 is the wizard as it was, every
+# question still asked — and the check runs all three, because door 2 is the one
+# an operator takes and door 3 is the one that proves every question still
+# exists. Behind door 3, `$ROLES` says what this box is for, so the same script
+# drives the hypervisor install this check makes today and a control-plane or
 # pool install without a second copy of the whole flow.
-# The three doors. `$DOOR` picks. Door 2 is the join token and asks nothing
-# else; door 3 is the wizard as it was, every question still asked — and the
-# check runs both, because the second door is the one an operator takes and
-# the third is the one that proves every question still exists.
 answer "Install as"        "$env(DOOR)"
 
-# Access to the machine itself, asked at every door. `1` is "none", the sealed
-# default — the check installs a machine nobody can log in to, which is what
-# ships unless somebody says otherwise.
 if {$env(DOOR) == 2} {
     answer "Join token"    "$env(JOIN)"
 } elseif {$env(DOOR) == 1} {

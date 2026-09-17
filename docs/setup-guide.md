@@ -328,6 +328,16 @@ registers nowhere, and is found weeks later.
 Only what the named roles need is required. A pool file that had to carry a node
 id would be a file with a value nobody reads.
 
+One optional key is worth knowing here, because the usual recipe for it does not
+work on a sealed machine: `VELSTRA_PASSTHROUGH=10de:2204,10de:1aef` names the
+cards this machine holds back for its guests, as `vendor:device` pairs or PCI
+addresses. `velstra-cloud-passthrough` binds each one — and everything else in
+its IOMMU group, which is the unit whether you asked for it or not — to
+`vfio-pci` before the node agent starts. The pair is the spelling to prefer: an
+address is a fact about one slot in one box, and this file is meant to install
+the next machine too. The installer offers the same thing as a question, by card
+name, because it is standing on the hardware.
+
 ### On NixOS
 
 The seed is the same; the units are a declaration rather than something a wizard

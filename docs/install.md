@@ -62,20 +62,25 @@ an `rbd:` disk is refused there by name.
    carries `nodeToken` — a one-time credential, shown exactly once, that lets
    this node read its cell and write only its own status.
 2. Boot the installer ISO. It drops straight into the wizard
-   (`velstra-cloud-node install`): target disk or RAID set, optional LUKS2
-   encryption of the data partition, DHCP or a static uplink, **what this
-   machine is for**, and then the hand-off that matters — the control-plane URL
-   and the node token.
+   (`velstra-cloud-node install`): what it is about to do and to which disk or
+   RAID set, then two questions about the machine itself — **who may log in**
+   (an SSH key, a console password, or neither, which is the sealed default)
+   and **which cards it holds back for guests** (asked only when it has one;
+   see [`deployment-and-devices.md`](deployment-and-devices.md)) — then optional
+   LUKS2 encryption of the data partition, the hostname, DHCP or a static
+   uplink, and finally **what this machine is for**: the first machine of a new
+   cell, a machine joining one with a join token, or the questions one by one.
+   [`joining.md`](joining.md) has the three doors and the token.
 
-   Roles are a set, not a choice, and the rest of the questions follow the
-   answer. A control plane is asked what its API binds rather than where the
-   control plane is: it *is* the API, and a URL pointing at itself would be a
-   fact with two owners. A pool is asked for its id, its backend and its **own**
-   one-time token — a second credential, because the API authenticates a pool
-   agent as `pool:<id>` and a node agent as `node:<id>`, and a node token
-   presented by a pool agent is answered `401` for ever with the seed looking
-   complete. A pool on the control plane's own machine gets no token at all: its
-   agent reaches the store directly.
+   Behind the third door, roles are a set, not a choice, and the rest of the
+   questions follow the answer. A control plane is asked what its API binds
+   rather than where the control plane is: it *is* the API, and a URL pointing
+   at itself would be a fact with two owners. A pool is asked for its id, its
+   backend and its **own** one-time token — a second credential, because the API
+   authenticates a pool agent as `pool:<id>` and a node agent as `node:<id>`, and
+   a node token presented by a pool agent is answered `401` for ever with the
+   seed looking complete. A pool on the control plane's own machine gets no token
+   at all: its agent reaches the store directly.
 3. The wizard clones the sealed image onto the disk(s) and seeds the data
    partition (`node.env`, `node-token`, optional `network/`). Nothing needs to
    be reachable during the install; the wizard records.

@@ -294,6 +294,11 @@
           pkgs.mdadm
           pkgs.cryptsetup
           pkgs.e2fsprogs
+          # `lspci`, so the installer can offer the cards this machine actually
+          # has. Without it the passthrough question finds nothing and is
+          # skipped — silently, on the one medium that is standing on the
+          # hardware and could answer it.
+          pkgs.pciutils
         ];
       };
 
@@ -1685,6 +1690,7 @@
                 ./usr/bin/velstra-cloud-nodeagent \
                 ./usr/bin/velstra-cloud-poolagent \
                 ./usr/bin/velstra-cloud-node \
+                ./usr/bin/velstra-cloud-passthrough \
                 ./lib/systemd/system/velstra-cloud-api.service \
                 ./lib/systemd/system/velstra-cloud-controller.service \
                 ./lib/systemd/system/velstra-cloud-nodeagent.service \
@@ -1724,6 +1730,18 @@
                   exit 1
                 }
               done
+
+              # The same shape of mistake, one program along: shipping
+              # `velstra-cloud-passthrough` and never starting it would give a
+              # Debian machine a seed that names cards, a binary that can take
+              # them, and nothing to introduce the two — so the guest that was
+              # promised a GPU would simply never get one.
+              agent=units/lib/systemd/system/velstra-cloud-nodeagent.service
+              grep -q "velstra-cloud-passthrough" "$agent" || {
+                echo "nothing on a Debian machine ever runs velstra-cloud-passthrough:" >&2
+                cat "$agent" >&2
+                exit 1
+              }
 
               # Real files, not symlinks into a /nix that is not on the target.
               # A .deb that depended on the store existing would be a Nix

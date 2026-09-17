@@ -123,6 +123,10 @@ in
         pkgs.cryptsetup
         pkgs.e2fsprogs
         pkgs.mdadm
+        # `lspci`, for the installed system too: the passthrough binary reads
+        # sysfs and needs none of it, but an operator on the console asking
+        # "what card is in this box" should not have to.
+        pkgs.pciutils
         # `cephadm` and the `ceph` CLI, so an operator can add a Ceph cluster
         # to a cell of flashed machines afterwards. The platform still installs
         # nothing on its own — cephadm pulls the daemon containers only once
@@ -141,6 +145,11 @@ in
     boot.kernelModules = [
       "kvm-intel"
       "kvm-amd"
+      # What a held-back card is bound to. Present always: which cards a
+      # machine reserves is read from its seed at boot, and cannot be a kernel
+      # parameter here — this image's command line is sealed into a signed UKI,
+      # which would make it a fact about the image instead of the machine.
+      "vfio-pci"
     ];
     boot.kernelParams = [
       "intel_iommu=on"
@@ -213,6 +222,26 @@ in
           fi
         fi
       '';
+    };
+
+    # Take the reserved cards away from the host, before anything can use them
+    # and before the agent reports what it sees. A seed that reserves nothing
+    # makes this a no-op that says so.
+    systemd.services.velstra-node-passthrough = {
+      description = "Bind the PCI devices this node reserves to vfio-pci";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "velstra-node-boot.service" ];
+      before = [ "velstra-cloud-nodeagent.service" ];
+      unitConfig = {
+        ConditionPathExists = "${cfg.stateDir}/node.env";
+        RequiresMountsFor = [ cfg.stateDir ];
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        EnvironmentFile = "${cfg.stateDir}/node.env";
+        ExecStart = "${cfg.package}/bin/velstra-cloud-passthrough";
+      };
     };
 
     # SSH, present but not started. The seed decides: `velstra-node-access`

@@ -121,6 +121,16 @@ pub struct Machine {
     /// seed. Never rendered into `node.env`, which is world-readable — the
     /// same split the tokens and the bootstrap password already make.
     pub root_password: String,
+    /// PCI devices this machine holds back for guests: addresses
+    /// (`0000:41:00.0`) or vendor:device pairs (`10de:2204`), comma
+    /// separated. Empty is the default and means the host keeps every card.
+    ///
+    /// In the seed rather than on the kernel command line, which is where the
+    /// usual `vfio-pci.ids=` recipe puts it: this image's command line is
+    /// sealed into a signed UKI, so a device id there would be a fact about
+    /// the image — and an image is built once for a fleet of boxes with
+    /// different cards in them.
+    pub passthrough: String,
     /// Where the API is. Empty on a control-plane-only machine, which *is* the
     /// API — a URL pointing at itself would be a fact with two owners.
     pub api_url: String,
@@ -322,6 +332,9 @@ pub fn render(m: &Machine) -> String {
     if !m.root_password.is_empty() {
         out.push_str("VELSTRA_CONSOLE_LOGIN=1\n");
     }
+    if !m.passthrough.is_empty() {
+        out.push_str(&format!("VELSTRA_PASSTHROUGH={}\n", m.passthrough));
+    }
     if m.local_network {
         out.push_str("VELSTRA_LOCAL_NETWORK=1\n");
     }
@@ -476,6 +489,7 @@ pub fn parse(text: &str) -> Result<Machine> {
         listen: or("VELSTRA_LISTEN", ""),
         advertise: or("VELSTRA_ADVERTISE", ""),
         ssh_key: or("VELSTRA_SSH_KEY", ""),
+        passthrough: or("VELSTRA_PASSTHROUGH", ""),
         // Read back as a marker only: the password itself lives in its own
         // file, and a seed that carried it would be a secret in a
         // world-readable file.
@@ -1068,6 +1082,7 @@ fn collect() -> Result<Option<Machine>> {
         bootstrap_ceph_osds: Vec::new(),
         ssh_key: String::new(),
         root_password: String::new(),
+        passthrough: String::new(),
         pool_token: String::new(),
         api_ca: api_ca.clone(),
         tls_cert: String::new(),
@@ -1474,6 +1489,7 @@ mod tests {
             bootstrap_ceph_osds: Vec::new(),
             ssh_key: String::new(),
             root_password: String::new(),
+            passthrough: String::new(),
             pool_token: String::new(),
             api_ca: String::new(),
             tls_cert: String::new(),

@@ -170,6 +170,7 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         // this command does not reach into either.
         ssh_key: String::new(),
         root_password: String::new(),
+        passthrough: String::new(),
         // One machine that is the whole cell: its pool agent reaches the store
         // directly, and is deliberately given no token.
         pool_token: String::new(),

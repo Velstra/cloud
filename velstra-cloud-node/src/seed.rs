@@ -171,6 +171,7 @@ fn machine_from(a: &Answers) -> crate::setup::Machine {
         bootstrap_ceph_osds: a.ceph_osds.clone(),
         ssh_key: a.ssh_key.clone(),
         root_password: a.root_password.clone(),
+        passthrough: a.passthrough.join(","),
         // A machine born with Ceph opens the cluster with the files the node
         // agent writes from the cell — the same files every hypervisor gets —
         // as the client the cell minted for them.
@@ -247,6 +248,7 @@ mod tests {
             ceph_osds: Vec::new(),
             ssh_key: String::new(),
             root_password: String::new(),
+            passthrough: Vec::new(),
         }
     }
 
@@ -346,6 +348,7 @@ mod door_tests {
             ceph_osds: Vec::new(),
             ssh_key: String::new(),
             root_password: String::new(),
+            passthrough: Vec::new(),
         }
     }
 
@@ -382,6 +385,40 @@ mod door_tests {
             !env.contains("VELSTRA_API_URL="),
             "a control plane is the API: {env}"
         );
+    }
+
+    /// Held-back cards travel in the seed and come back out of it the same.
+    ///
+    /// The whole round trip in one test on purpose: the wizard's answer, the
+    /// renderer and the parser are three places that have to agree about one
+    /// key, and an answer that renders to nothing is a machine whose guest is
+    /// promised a card the host quietly kept.
+    #[test]
+    fn the_cards_a_machine_holds_back_survive_the_seed() {
+        let mut a = base();
+        a.roles = vec![crate::roles::Role::Hypervisor];
+        a.api_url = "https://10.10.10.8:8443".into();
+        a.passthrough = vec!["10de:2204".into(), "10de:1aef".into()];
+        let env = render_node_env(&a);
+        assert!(
+            env.contains(
+                "VELSTRA_PASSTHROUGH=10de:2204,10de:1aef
+"
+            ),
+            "{env}"
+        );
+        let back = crate::setup::parse(&env).expect("the seed parses");
+        assert_eq!(back.passthrough, "10de:2204,10de:1aef");
+    }
+
+    /// And a machine that holds nothing back says nothing, rather than an
+    /// empty key the passthrough binary would have to read as "none".
+    #[test]
+    fn a_machine_that_keeps_its_cards_has_no_passthrough_key() {
+        let mut a = base();
+        a.roles = vec![crate::roles::Role::Hypervisor];
+        let env = render_node_env(&a);
+        assert!(!env.contains("VELSTRA_PASSTHROUGH"), "{env}");
     }
 
     /// A joiner: the certificate rides in, and the seed names where it lands.
@@ -441,6 +478,7 @@ mod born_with_ceph {
             ceph_osds: vec!["sdb".into(), "sdc".into()],
             ssh_key: String::new(),
             root_password: String::new(),
+            passthrough: Vec::new(),
         };
         let env = render_node_env(&a);
         assert!(

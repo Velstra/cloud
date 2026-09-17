@@ -179,10 +179,19 @@ let
       #
       # `-` on each line: re-running is normal (a restart, a second start after
       # a crash) and an interface that already exists is success, not failure.
+      #
+      # Then the cards this machine holds back for guests, which the image does
+      # in a unit of its own — here it is an ExecStartPre, because it has to run
+      # before the agent reports what it sees and there is nothing else to order
+      # it against. `modprobe` is best-effort: a kernel with vfio-pci built in
+      # needs none, and one that has it nowhere is a machine the line after says
+      # so about, by name, rather than a unit that refuses to start.
       pre = ''
         ExecStartPre=-/usr/sbin/ip link add vmeta0 type dummy
         ExecStartPre=-/usr/sbin/ip addr add 169.254.169.254/32 dev vmeta0
         ExecStartPre=-/usr/sbin/ip link set vmeta0 up
+        ExecStartPre=-/usr/sbin/modprobe vfio-pci
+        ExecStartPre=${bin "velstra-cloud-passthrough"}
       '';
       exec = ''
         /bin/sh -c 'case "''${VELSTRA_VMM:-}" in \
@@ -358,7 +367,8 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     # sends the loader to the system paths, which is where Debian's libraries
     # are.
     for b in velstra-cloud-api velstra-cloud-controller velstra-cloud-nodeagent \
-             velstra-cloud-poolagent velstra-cloud-node velstra; do
+             velstra-cloud-poolagent velstra-cloud-node velstra-cloud-passthrough \
+             velstra; do
       cp ${velstra-cloud}/bin/$b "$root/usr/bin/$b"
       chmod 0755 "$root/usr/bin/$b"
       patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 \
