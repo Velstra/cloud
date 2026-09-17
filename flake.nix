@@ -294,11 +294,6 @@
           pkgs.mdadm
           pkgs.cryptsetup
           pkgs.e2fsprogs
-          # `lspci`, so the installer can offer the cards this machine actually
-          # has. Without it the passthrough question finds nothing and is
-          # skipped — silently, on the one medium that is standing on the
-          # hardware and could answer it.
-          pkgs.pciutils
         ];
       };
 

@@ -89,9 +89,6 @@ pub struct Answers {
     /// console. Both empty is the sealed default; see `ask_for_access`.
     pub ssh_key: String,
     pub root_password: String,
-    /// PCI devices held back for guests, as `vendor:device` pairs. Empty is
-    /// the default: the host keeps every card.
-    pub passthrough: Vec<String>,
 }
 
 /// Run the wizard. Returns `None` when the operator declines the final YES —
@@ -152,7 +149,6 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
     };
 
     let (ssh_key, root_password) = ask_for_access()?;
-    let passthrough = ask_for_passthrough()?;
 
     let passphrase = if ask_yes("Encrypt the data partition with LUKS2?", false)? {
         Some(resolve_passphrase()?)
@@ -232,7 +228,6 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
             network,
             ssh_key,
             root_password,
-            passthrough,
         );
     }
 
@@ -564,7 +559,6 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
         println!("  node token:    (64 hex chars — not echoed)");
     }
     print_access(&ssh_key, &root_password);
-    print_passthrough(&passthrough);
     if is_pool {
         println!("  pool:          {pool} ({pool_backend})");
         if !ceph_osds.is_empty() {
@@ -606,7 +600,6 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
         ceph_osds,
         ssh_key,
         root_password,
-        passthrough,
     }))
 }
 
@@ -673,84 +666,6 @@ fn ask_for_access() -> Result<(String, String)> {
     Ok((ssh_key, root_password))
 }
 
-/// Which cards this machine holds back for its guests.
-///
-/// Asked here because the installer is standing on the hardware — it can read
-/// the cards out of `lspci` and offer them by name, where a seed written
-/// elsewhere has to carry an id somebody looked up. The answer is stored as
-/// `vendor:device` and not as an address: an address is a fact about one slot
-/// in one box, and a seed taken off a working machine is how the next one is
-/// installed.
-///
-/// Passthrough only. Slicing a card between guests (NVIDIA vGPU, AMD MxGPU)
-/// needs a vendor host driver this image does not carry and cannot, so it is
-/// not offered rather than offered and then refused at first boot.
-fn ask_for_passthrough() -> Result<Vec<String>> {
-    let cards = graphics_cards();
-    if cards.is_empty() {
-        return Ok(Vec::new());
-    }
-    println!("\nGraphics cards in this machine:");
-    for (i, (id, description)) in cards.iter().enumerate() {
-        println!("  [{}] {id}  {description}", i + 1);
-    }
-    println!("\nA card held back here is taken from the host at every boot and can be given");
-    println!("to one guest at a time. Whole cards only — slicing one between guests needs a");
-    println!("vendor driver this image does not carry.");
-    loop {
-        let got = prompt("Hold back for guests (numbers, comma-separated; Enter for none): ")?;
-        let got = got.trim();
-        if got.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        let mut bad = false;
-        for part in got.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            match part.parse::<usize>() {
-                Ok(n) if n >= 1 && n <= cards.len() => {
-                    let id = cards[n - 1].0.clone();
-                    if !out.contains(&id) {
-                        out.push(id);
-                    }
-                }
-                _ => {
-                    println!("  {part:?} is not one of the cards above");
-                    bad = true;
-                }
-            }
-        }
-        if !bad {
-            return Ok(out);
-        }
-    }
-}
-
-/// The display controllers this machine has, as `(vendor:device, description)`.
-///
-/// `lspci -Dnn` because it prints both spellings on one line — the ids this
-/// answer is stored as, and the human name an operator recognises. Class `03`
-/// is a display controller; nothing else is offered, because a wizard that
-/// listed every PCI function would be a wizard nobody reads.
-fn graphics_cards() -> Vec<(String, String)> {
-    let Ok(out) = Command::new("lspci").args(["-Dnn"]).output() else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.contains("[0300]") || l.contains("[0302]"))
-        .filter_map(|line| {
-            // `0000:41:00.0 VGA compatible controller [0300]: NVIDIA … [10de:2204] (rev a1)`
-            let id = line.rsplit_once('[')?.1.split_once(']')?.0.to_string();
-            let description = line.split_once(": ")?.1;
-            let description = description
-                .rsplit_once(" [")
-                .map(|(before, _)| before)
-                .unwrap_or(description);
-            (id.len() == 9 && id.contains(':')).then_some((id, description.trim().to_string()))
-        })
-        .collect()
-}
-
 /// What the review says about access, in both doors.
 fn print_access(ssh_key: &str, root_password: &str) {
     match (ssh_key.is_empty(), root_password.is_empty()) {
@@ -759,17 +674,6 @@ fn print_access(ssh_key: &str, root_password: &str) {
         (true, false) => println!("  access:        console password (not echoed)"),
         (false, false) => println!("  access:        SSH key and console password"),
     }
-}
-
-/// What the review says about held-back cards.
-fn print_passthrough(passthrough: &[String]) {
-    if passthrough.is_empty() {
-        return;
-    }
-    println!(
-        "  for guests:    {} — taken from the host at boot",
-        passthrough.join(", ")
-    );
 }
 
 /// One line, as `ssh-keygen` writes it. Checked here rather than at first
@@ -812,7 +716,6 @@ fn join(
     // asked again, which is what door 2 did the first time round.
     ssh_key: String,
     root_password: String,
-    passthrough: Vec<String>,
 ) -> Result<Option<Answers>> {
     println!("\nPaste the join token the console showed when this node was created.");
     println!("It starts with `velstra1.` and is one line; a wrapped paste is fine.");
@@ -861,7 +764,6 @@ fn join(
     println!("  vmm:           qemu");
     println!("  credentials:   (from the token — not echoed)");
     print_access(&ssh_key, &root_password);
-    print_passthrough(&passthrough);
 
     let confirm = prompt("\nThis ERASES the selected disk(s). Type YES to proceed: ")?;
     if confirm.trim() != "YES" {
@@ -896,7 +798,6 @@ fn join(
         ceph_osds: Vec::new(),
         ssh_key,
         root_password,
-        passthrough,
     }))
 }
 

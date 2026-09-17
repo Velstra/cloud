@@ -63,14 +63,17 @@ an `rbd:` disk is refused there by name.
    this node read its cell and write only its own status.
 2. Boot the installer ISO. It drops straight into the wizard
    (`velstra-cloud-node install`): what it is about to do and to which disk or
-   RAID set, then two questions about the machine itself — **who may log in**
-   (an SSH key, a console password, or neither, which is the sealed default)
-   and **which cards it holds back for guests** (asked only when it has one;
-   see [`deployment-and-devices.md`](deployment-and-devices.md)) — then optional
-   LUKS2 encryption of the data partition, the hostname, DHCP or a static
-   uplink, and finally **what this machine is for**: the first machine of a new
-   cell, a machine joining one with a join token, or the questions one by one.
-   [`joining.md`](joining.md) has the three doors and the token.
+   RAID set, then **who may log in** (an SSH key, a console password, or
+   neither, which is the sealed default), then optional LUKS2 encryption of the
+   data partition, the hostname, DHCP or a static uplink, and finally **what
+   this machine is for**: the first machine of a new cell, a machine joining one
+   with a join token, or the questions one by one. [`joining.md`](joining.md)
+   has the three doors and the token.
+
+   Passing a card into guests is deliberately **not** asked here: it is a
+   decision about what the machine will run, which nobody has made yet while
+   standing in front of a disk that is about to be erased, and it is one line
+   in the seed afterwards — see [`setup-guide.md`](setup-guide.md).
 
    Behind the third door, roles are a set, not a choice, and the rest of the
    questions follow the answer. A control plane is asked what its API binds

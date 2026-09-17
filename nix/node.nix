@@ -123,9 +123,10 @@ in
         pkgs.cryptsetup
         pkgs.e2fsprogs
         pkgs.mdadm
-        # `lspci`, for the installed system too: the passthrough binary reads
-        # sysfs and needs none of it, but an operator on the console asking
-        # "what card is in this box" should not have to.
+        # `lspci`. The passthrough binary reads sysfs and needs none of it;
+        # this is for the person who has installed the machine and now wants to
+        # hold a card back — they need the `vendor:device` pair to put in the
+        # seed, and the machine itself is the only place that knows it.
         pkgs.pciutils
         # `cephadm` and the `ceph` CLI, so an operator can add a Ceph cluster
         # to a cell of flashed machines afterwards. The platform still installs

@@ -39,16 +39,9 @@ answer "Disk number"        "$env(PICK)"
 # sealed default, which is what ships unless somebody says otherwise.
 answer "Access "            "1"
 
-# Cards held back for guests — asked only when this machine has a display
-# controller, which a QEMU VM does and a headless server may not. One expect
-# for both: answer it if it comes, and fall through to the next question if it
-# does not, rather than two patterns that each assume the other did not match.
-expect {
-    "Hold back for guests"       { send -- "\r"; exp_continue }
-    "Encrypt the data partition" { send -- "n\r" }
-    timeout { puts "\nSTALLED — no prompt matching: Encrypt the data partition"; exit 3 }
-    eof     { puts "\nEXITED — while waiting for: Encrypt the data partition"; exit 4 }
-}
+# Plaintext data partition here; the encrypted flow shares the LUKS code the
+# unlock unit exercises.
+answer "Encrypt the data partition" "n"
 
 answer "Hostname"  "node-t1"
 answer "Use DHCP"  "y"

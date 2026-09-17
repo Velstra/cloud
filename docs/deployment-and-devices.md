@@ -138,9 +138,11 @@ is a green field, which means it can be modelled properly the first time.
 > the host: the usual `vfio-pci.ids=` on the kernel command line cannot work on
 > the appliance, whose command line is sealed into a signed UKI — so which cards
 > a machine reserves is a line in its seed, `VELSTRA_PASSTHROUGH`, and
-> `velstra-cloud-passthrough` binds them through sysfs at boot. The installer
-> asks, because it is the one thing standing on the hardware and can offer the
-> cards by name.
+> `velstra-cloud-passthrough` binds them through sysfs at boot. It is added
+> after the install and not during it: a card is a decision about what the
+> machine will run, which nobody has made while a disk is about to be erased,
+> and a line in a seed is reversible where an answer to a wizard is not.
+> `lspci` ships on the machine so the pair can be read off it.
 
 ### The physics, so the model does not fight it
 

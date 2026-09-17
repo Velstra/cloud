@@ -130,6 +130,13 @@ pub struct Machine {
     /// sealed into a signed UKI, so a device id there would be a fact about
     /// the image — and an image is built once for a fleet of boxes with
     /// different cards in them.
+    ///
+    /// **No wizard asks for this.** Which cards a machine holds back is a
+    /// decision about what it will run, and nobody has made it while they are
+    /// standing in front of a disk that is about to be erased. It is one line
+    /// added to the seed afterwards, and a restart of the node agent — which
+    /// is also how it is taken back, where an answer given at install time
+    /// would have meant a reinstall.
     pub passthrough: String,
     /// Where the API is. Empty on a control-plane-only machine, which *is* the
     /// API — a URL pointing at itself would be a fact with two owners.

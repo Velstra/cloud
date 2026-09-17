@@ -335,8 +335,10 @@ addresses. `velstra-cloud-passthrough` binds each one — and everything else in
 its IOMMU group, which is the unit whether you asked for it or not — to
 `vfio-pci` before the node agent starts. The pair is the spelling to prefer: an
 address is a fact about one slot in one box, and this file is meant to install
-the next machine too. The installer offers the same thing as a question, by card
-name, because it is standing on the hardware.
+the next machine too. `lspci -Dnn` on the machine prints both spellings on one
+line. Adding this to an installed machine is the same two steps — the line, then
+`systemctl restart velstra-cloud-nodeagent` — and removing it again is deleting
+the line, which is why it is not one of the installer's questions.
 
 ### On NixOS
 
