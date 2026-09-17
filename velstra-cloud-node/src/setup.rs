@@ -622,7 +622,28 @@ pub fn run_with(
     assume_nixos: Option<bool>,
     config: Option<PathBuf>,
     join: Option<String>,
+    join_file: Option<PathBuf>,
 ) -> Result<()> {
+    // A token from a file is the same token. Read here rather than threaded
+    // through: a token on a command line is in `ps` for every user on the
+    // machine and in the shell's history afterwards, and configuration
+    // management would rather write a file than quote a kilobyte.
+    let join = match (join, join_file) {
+        (Some(t), _) => Some(t),
+        (None, Some(path)) => {
+            let text =
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            let token = crate::joinfile::token_in(&text).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} holds no join token — one line starting `velstra1.`, \
+                     with or without a comment above it",
+                    path.display()
+                )
+            })?;
+            Some(token.encode())
+        }
+        (None, None) => None,
+    };
     let nixos = assume_nixos.unwrap_or_else(|| Path::new("/etc/NIXOS").exists());
     // Where the seed goes is decided by which machine this is, not by taste.
     //

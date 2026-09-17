@@ -59,8 +59,10 @@ What to take from that:
 * Per-node tokens are the right security shape, and this platform already had
   them — a token is issued *for* one Node object, can be re-issued additively,
   and cannot promote its holder to a gateway.
-* One pasteable blob is the right UX shape. Proxmox and Incus both arrived at
-  it; the six-facts table above is what it replaces.
+* One pasteable blob is the right UX shape **where there is a paste buffer**.
+  Proxmox and Incus both arrived at it, and both hand it to a *browser*. An
+  installer on bare metal has a console and a keyboard; see "Getting the token
+  onto the machine".
 * Create-or-join at first boot is the right installer shape.
 * Ceph as a later, UI-driven step is right — and it is only honest if the
   platform hands every hypervisor the client configuration it needs, or the
@@ -85,8 +87,11 @@ reachable during the install*, and that promise is worth more than a shorter
 string. So the token carries the certificate itself rather than a fingerprint
 to check it against — no unverified first contact, no extra endpoint, and a
 seed that is correct before the cable is plugged in. A P-256 self-signed
-certificate makes the whole thing about 1.3 KB, which a serial console takes
-in one line.
+certificate makes the whole thing about 1.3 KB.
+
+That size is also the token's one real weakness, and the next section is about
+it: a thousand characters is nothing to move between programs and impossible
+to move through a keyboard.
 
 **Minted where the facts live.** `POST /api/v1/nodes` and
 `POST /api/v1/nodes/<id>:issueCredential` answer `joinToken` beside
@@ -167,6 +172,65 @@ nothing on its own — cephadm pulls the Ceph containers only when an operator
 has asked for a cluster — but a flashed machine has no package manager to get
 cephadm from, and *the image has to carry what it cannot fetch*.
 
+## Getting the token onto the machine
+
+The token removes every hand-copied fact between the control plane and the
+installer, and then asks somebody standing at a machine to type a little over
+a thousand characters of base64. That is not a hand-off; it is the same work
+in a worse place. Proxmox is not a counter-example — its blob goes into a
+browser, which has a paste buffer. A console does not.
+
+There are exactly three honest answers, and they are for three different
+situations rather than three sizes of fleet.
+
+**A file on anything plugged in** — shipping, `joinfile.rs`. The wizard looks
+at every partition the kernel knows, mounts it read-only for as long as it
+takes to read one small file, and offers what it found by the *machine the
+token is for*: `velstra/join for peter in cell cell-1 (on /dev/sdb1)`. So the
+ISO is written once and the per-machine part is one text file — on a second
+stick, or in the space after the image on the same one. `velstra-cloud-node
+setup --join-file` is the same thing for a machine that already runs Debian,
+and it keeps the token out of `ps` and out of the shell history. Nothing about
+the protocol or the secret changes: a token is exactly as secret on a stick as
+it is in a terminal's scrollback, and the install still needs nothing to be
+reachable.
+
+Mounted with `noload` first and the plain form as the fallback: `mount -o ro`
+is not "do not write" — on a dirty ext4 the kernel replays the journal, and
+writing to a disk somebody else's operating system owns, before this installer
+has asked anybody anything, is not a thing to do. `noload` says do not, and
+vfat rejects it, which is why there are two attempts and not one.
+
+**The platform serves the medium** — for when nobody is watching. The seed for
+a node is a small document the API already holds every fact for, so
+`nodes/<id>` can answer it directly, and for Debian and Ubuntu the useful
+artefact is not an image at all but the little thing each of them already
+wants: a cloud-init NoCloud seed, a preseed or autoinstall file, or one
+`setup --config <url>` line on a box that already boots. This is the PXE,
+Terraform and configuration-management door, and the one that works on a
+network that is not up yet, because the seed travels with the medium.
+
+What not to build: a 2 GB image per node with the token baked in. The
+appliance image is signed and A/B-sealed, so baking anything per-machine into
+it changes its hash and destroys the property that makes it worth having — one
+artefact for a whole fleet. Image plus a few kilobytes of seed is the same
+convenience without either cost.
+
+**Approval in the console** — for when somebody is. The machine boots, takes a
+lease, generates a keypair, announces itself to a cell address (the one short
+thing anybody types, and a DHCP option can carry it), and shows a short
+fingerprint on its screen. A `Pending` row appears in the console with the
+same fingerprint and what the machine reported about its hardware; the
+operator compares, picks the roles, and approves. Nothing secret is typed —
+the comparison *is* the authentication, in both directions, because the
+machine also shows the fingerprint of the certificate it was served and the
+banner on the control plane prints that cell's own. This is MAAS's enlistment
+and Proxmox's join in one gesture, and it scales to a rack: twenty machines
+from one ISO are twenty rows to approve.
+
+It needs the network at install time, which the token deliberately does not,
+so it is a door beside the others and not a replacement for them.
+
 ## What this does not do
 
 * **No attestation.** Introduction is a shared secret, moved once. A machine
@@ -176,3 +240,7 @@ cephadm from, and *the image has to carry what it cannot fetch*.
   key do not (see `install.md`). A fleet update is still images by hand.
 * **No push.** Talos's direction — an operator pushing configuration at a
   listening machine — is a different platform. This one pulls, from a seed.
+* **No enrolment yet.** The approval flow above is designed and not built:
+  there is no `Enrollment` resource, no unauthenticated announce, and no
+  pending list in the console. Until there is, a token on a medium is the way
+  to avoid typing one.

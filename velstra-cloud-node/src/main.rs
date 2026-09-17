@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 mod cell;
 mod disks;
 mod install;
+mod joinfile;
 mod product;
 mod quickstart;
 mod roles;
@@ -90,6 +91,14 @@ enum Cmd {
         /// credential. Nothing else is asked. See docs/joining.md.
         #[arg(long, conflicts_with = "config")]
         join: Option<String>,
+        /// Read the join token from this file instead of the command line.
+        ///
+        /// A token on a command line is in `ps` for every user on the machine
+        /// and in the shell's history afterwards. This is also the shape
+        /// configuration management wants: write the file, run the command.
+        /// The file may hold a comment above the token.
+        #[arg(long, conflicts_with = "join")]
+        join_file: Option<PathBuf>,
     },
     /// One box, one command: seed, units, and the two objects a cell needs.
     ///
@@ -177,7 +186,8 @@ fn main() -> Result<()> {
             nixos,
             config,
             join,
-        } => setup::run_with(dir, nixos, config, join),
+            join_file,
+        } => setup::run_with(dir, nixos, config, join, join_file),
         Cmd::Quickstart { dir, listen, node } => quickstart::run(dir, listen, node),
         Cmd::HasRole { role } => roles::has_role_or_exit(&role),
         Cmd::EnsureTls { dir } => cell::ensure_tls(&dir),

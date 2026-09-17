@@ -666,6 +666,45 @@ fn ask_for_access() -> Result<(String, String)> {
     Ok((ssh_key, root_password))
 }
 
+/// Offer the join tokens found on attached media, if any.
+///
+/// `Ok(None)` means nothing was found or the operator declined all of them,
+/// and the caller asks. One token is a yes/no question — the common case, and
+/// the answer is almost always yes; several is a choice, because a stick that
+/// has been round a fleet can carry more than one and installing the wrong
+/// machine is the expensive mistake here.
+fn offer_found_tokens() -> Result<Option<velstra_cloud_wire::join::JoinToken>> {
+    let found = crate::joinfile::find();
+    match found.len() {
+        0 => Ok(None),
+        1 => {
+            println!("\nFound a join token on this machine:");
+            println!("  {}", found[0].describe());
+            if ask_yes("Use it?", true)? {
+                return Ok(Some(found[0].token.clone()));
+            }
+            Ok(None)
+        }
+        _ => {
+            println!("\nFound more than one join token:");
+            for (i, f) in found.iter().enumerate() {
+                println!("  [{}] {}", i + 1, f.describe());
+            }
+            println!("  [0] none of them — paste one instead");
+            loop {
+                let got = prompt(&format!("Which one [1-{}]: ", found.len()))?;
+                match got.trim().parse::<usize>() {
+                    Ok(0) => return Ok(None),
+                    Ok(n) if n <= found.len() => {
+                        return Ok(Some(found[n - 1].token.clone()));
+                    }
+                    _ => println!("  not one of the above"),
+                }
+            }
+        }
+    }
+}
+
 /// What the review says about access, in both doors.
 fn print_access(ssh_key: &str, root_password: &str) {
     match (ssh_key.is_empty(), root_password.is_empty()) {
@@ -717,13 +756,26 @@ fn join(
     ssh_key: String,
     root_password: String,
 ) -> Result<Option<Answers>> {
-    println!("\nPaste the join token the console showed when this node was created.");
-    println!("It starts with `velstra1.` and is one line; a wrapped paste is fine.");
-    let token = loop {
-        let pasted = prompt("Join token: ")?;
-        match velstra_cloud_wire::join::JoinToken::decode(&pasted) {
-            Ok(t) => break t,
-            Err(e) => println!("  {e}"),
+    // Anything plugged in first. A join token is a little over a thousand
+    // characters of base64: it carries six facts from the control plane so
+    // nothing has to be copied by hand, and then asks somebody to type it at a
+    // console, where there is no paste. Write the ISO once, drop one text file
+    // on a second stick — or in the space after the image on the same stick —
+    // and this finds it. See `joinfile`.
+    let token = match offer_found_tokens()? {
+        Some(t) => t,
+        None => {
+            println!("\nPaste the join token the console showed when this node was created.");
+            println!("It starts with `velstra1.` and is one line; a wrapped paste is fine.");
+            println!("Typing it is not the intended way: put it in a file called");
+            println!("`velstra/join` on any stick you plug in, and this finds it by itself.");
+            loop {
+                let pasted = prompt("Join token: ")?;
+                match velstra_cloud_wire::join::JoinToken::decode(&pasted) {
+                    Ok(t) => break t,
+                    Err(e) => println!("  {e}"),
+                }
+            }
         }
     };
     let mut roles = Vec::new();
