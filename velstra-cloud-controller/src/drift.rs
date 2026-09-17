@@ -33,6 +33,10 @@ pub struct Divergent {
     pub name: String,
     pub reason: DivergenceReason,
     pub age_seconds: u64,
+    /// Whether the object carries any condition at all. See
+    /// [`velstra_cloud_model::reconcile::Divergence::explained`] — an alert
+    /// that tells somebody to read an explanation has to know there is one.
+    pub explained: bool,
 }
 
 pub const MISMATCH: &str = "objects_with_spec_status_mismatch";
@@ -60,6 +64,7 @@ where
                 name: object.meta.name.to_string(),
                 reason: d.reason,
                 age_seconds: d.since.age(now).as_secs(),
+                explained: d.explained,
             });
         }
     }
