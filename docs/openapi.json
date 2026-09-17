@@ -5785,6 +5785,59 @@
         ]
       }
     },
+    "/api/v1/nodes/{name}:cloudInit": {
+      "post": {
+        "operationId": "cloudInit-nodes",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "The same token as a `#cloud-config` for a machine that boots Debian or Ubuntu: it writes the join file 0600, runs `velstra-cloud-node setup --join-file` against it, and shreds it. It installs no package — which repository a fleet takes one from is the fleet's decision. Answers `text/plain`.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/api/v1/nodes/{name}:explainMaintenance": {
       "get": {
         "operationId": "explainMaintenance-nodes",
@@ -5876,6 +5929,59 @@
           }
         },
         "summary": "Mint a fresh credential for a machine that already exists; shown once, as `nodeToken` and — when this API advertises an address — as `joinToken`, the whole hand-off in one string. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/api/v1/nodes/{name}:joinFile": {
+      "post": {
+        "operationId": "joinFile-nodes",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "The same credential as `:issueCredential`, formatted as the file the installer looks for on anything plugged into a machine. Answers `text/plain`, not JSON: `curl -X POST … -o /mnt/velstra/join` is the intended use. A comment above the token names the node and the cell, because the file will be found by somebody who did not write it. POST and not GET because it mints a credential.",
         "tags": [
           "Nodes"
         ]

@@ -2821,6 +2821,52 @@ Three things about it are deliberate:
   speaks with is not part of running the estate. It is also refused for a name
   nobody registered, and for any kind that has no agent.
 
+**The same credential, as a file somebody can carry**, with `:joinFile` and
+`:cloudInit`. A join token is about 1.3 KB of base64; it removes every
+hand-copied fact between the control plane and an installer, and then asks
+whoever is standing at a machine to type it, at a console, where there is no
+paste buffer. These two answer with the artefact instead:
+
+```
+POST /api/v1/nodes/peter:joinFile → 200
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="peter.join"
+
+# Velstra Cloud join token for node peter in cell cell-1.
+# Drop this file at velstra/join on any medium you plug into the
+# machine; the installer offers it by name. It is a credential:
+# anything holding it can register as peter.
+velstra1.…
+```
+
+```
+POST /api/v1/nodes/peter:cloudInit → 200   # a #cloud-config, filename peter-cloud-init.yaml
+```
+
+`curl -X POST … -o /mnt/velstra/join` is the intended use, which is why the
+answer is the file and not JSON wrapping it. Four things are deliberate:
+
+- **POST, not GET.** Each call mints a machine credential, and a GET that
+  minted one is a GET a browser can be made to issue from somebody else's
+  page. Same rule, same reason, as `:issueCredential` — and the same `Write`
+  permission.
+- **The file names the machine.** It will be found by somebody who did not
+  write it, possibly a year later, possibly on a stick carrying three others.
+  A naked kilobyte of base64 says nothing about which node it belongs to, and
+  installing the wrong machine is the expensive mistake here. The installer
+  reads past comment lines for exactly this reason.
+- **It is the token, not a second rendering of the seed.** The obvious
+  endpoint is "give me this node's `node.env`", and it is the wrong one:
+  `velstra-cloud-node setup --join` already turns a token into a seed, and a
+  renderer here would be a second place that has to agree about the same keys.
+  This platform has paid for that mistake four times (two seed renderers where
+  only one knew `VELSTRA_ROLES`; a bootstrap password written to one directory
+  and read from another; five keys rendered and never parsed back).
+- **cloud-init installs no package.** It writes the file 0600, runs
+  `setup --join-file`, and shreds it. Which repository a fleet takes the
+  package from is the fleet's decision; a cloud-config that pulled a binary
+  from an address this platform chose would be one nobody could audit.
+
 **A node reports status with a custom method**, AIP-136's `:reportStatus`, which
 is the one write outside the `spec`-only PATCH surface because it is a different
 caller doing a different thing:

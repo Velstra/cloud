@@ -1662,7 +1662,35 @@
   ],
   "query": [],
   "body": true,
-  "summary": "Mint a fresh credential for a machine that already exists; shown once. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+  "summary": "Mint a fresh credential for a machine that already exists; shown once, as `nodeToken` and \u2014 when this API advertises an address \u2014 as `joinToken`, the whole hand-off in one string. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "joinFile-nodes",
+  "method": "POST",
+  "path": "/api/v1/nodes/{name}:joinFile",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "The same credential as `:issueCredential`, formatted as the file the installer looks for on anything plugged into a machine. Answers `text/plain`, not JSON: `curl -X POST \u2026 -o /mnt/velstra/join` is the intended use. A comment above the token names the node and the cell, because the file will be found by somebody who did not write it. POST and not GET because it mints a credential.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "cloudInit-nodes",
+  "method": "POST",
+  "path": "/api/v1/nodes/{name}:cloudInit",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "The same token as a `#cloud-config` for a machine that boots Debian or Ubuntu: it writes the join file 0600, runs `velstra-cloud-node setup --join-file` against it, and shreds it. It installs no package \u2014 which repository a fleet takes one from is the fleet's decision. Answers `text/plain`.",
   "tags": [
    "Nodes"
   ]
@@ -1818,7 +1846,7 @@
   ],
   "query": [],
   "body": true,
-  "summary": "Mint a fresh credential for a pool that already exists; shown once. The body may carry `purpose` and `expiresAt`.",
+  "summary": "Mint a fresh credential for a pool that already exists; shown once, as `poolToken` and \u2014 when this API advertises an address \u2014 as `joinToken`. The body may carry `purpose` and `expiresAt`.",
   "tags": [
    "Pools"
   ]

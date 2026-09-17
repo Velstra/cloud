@@ -1487,6 +1487,40 @@ async fn create(
             let issued = api.issue_credential(&name, &ask, &identity).await?;
             return Ok((StatusCode::OK, Json(issued)).into_response());
         }
+        // The join artefacts. POST and not GET for the same reason
+        // `:issueCredential` is: each of these mints a machine credential, and
+        // a GET that minted one is a GET a browser can be made to issue from
+        // somebody else's page. `curl -X POST … -o /mnt/velstra/join` is the
+        // intended use, which is why the answer is the file and not JSON
+        // wrapping it.
+        Target::Verb { name, verb } if verb == "joinFile" || verb == "cloudInit" => {
+            let flavour = if verb == "joinFile" {
+                crate::core::JoinArtifact::File
+            } else {
+                crate::core::JoinArtifact::CloudInit
+            };
+            let text = api.join_artifact(&name, flavour, &identity).await?;
+            let mut answer = (StatusCode::OK, text).into_response();
+            answer.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            // Named, so a browser and `curl -O` both land on something an
+            // operator recognises rather than on `peter:joinFile`.
+            let filename = if verb == "joinFile" {
+                format!("{}.join", name.id())
+            } else {
+                format!("{}-cloud-init.yaml", name.id())
+            };
+            if let Ok(value) =
+                axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            {
+                answer
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_DISPOSITION, value);
+            }
+            return Ok(answer);
+        }
         Target::Verb { name, verb } if verb == "reportStatus" => {
             let reported = api
                 .report_status(&name, &document(&body)?, if_match(&headers)?, &identity)

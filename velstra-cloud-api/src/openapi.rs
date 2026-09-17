@@ -565,6 +565,22 @@ const VERBS: &[Verb] = &[
         query: &[],
     },
     Verb {
+        collection: "nodes",
+        verb: "joinFile",
+        method: "post",
+        on_collection: false,
+        summary: "The same credential as `:issueCredential`, formatted as the file the installer looks for on anything plugged into a machine. Answers `text/plain`, not JSON: `curl -X POST … -o /mnt/velstra/join` is the intended use. A comment above the token names the node and the cell, because the file will be found by somebody who did not write it. POST and not GET because it mints a credential.",
+        query: &[],
+    },
+    Verb {
+        collection: "nodes",
+        verb: "cloudInit",
+        method: "post",
+        on_collection: false,
+        summary: "The same token as a `#cloud-config` for a machine that boots Debian or Ubuntu: it writes the join file 0600, runs `velstra-cloud-node setup --join-file` against it, and shreds it. It installs no package — which repository a fleet takes one from is the fleet's decision. Answers `text/plain`.",
+        query: &[],
+    },
+    Verb {
         collection: "pools",
         verb: "issueCredential",
         method: "post",

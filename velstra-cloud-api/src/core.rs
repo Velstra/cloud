@@ -634,6 +634,60 @@ fn strongest(a: Role, b: Role) -> Role {
     if rank(&b) > rank(&a) { b } else { a }
 }
 
+/// Which shape of join artefact a caller asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinArtifact {
+    /// The file the installer looks for on anything plugged in.
+    File,
+    /// A `#cloud-config` that writes that file and installs against it.
+    CloudInit,
+}
+
+/// The file to drop at `velstra/join` on a stick.
+///
+/// A comment line above the token, because the file will be found by somebody
+/// who did not write it — possibly a year later, possibly on a stick with
+/// three others on it — and a naked kilobyte of base64 says nothing about
+/// which machine it belongs to. The installer reads past comments for exactly
+/// this reason.
+fn join_file(node: &str, cell: &str, join: &str) -> String {
+    format!(
+        "# Velstra Cloud join token for node {node} in cell {cell}.\n\
+         # Drop this file at velstra/join on any medium you plug into the\n\
+         # machine; the installer offers it by name. It is a credential:\n\
+         # anything holding it can register as {node}.\n\
+         {join}\n"
+    )
+}
+
+/// The same token, for a machine that boots Debian or Ubuntu and runs
+/// cloud-init.
+///
+/// `write_files` and then the installer against that file — never the token on
+/// the command line, which would put it in `ps` for every user on the machine
+/// and in cloud-init's own logs. 0600 and owned by root for the same reason.
+fn cloud_config(node: &str, join: &str) -> String {
+    format!(
+        "#cloud-config\n\
+         # Velstra Cloud: make this machine node {node}.\n\
+         #\n\
+         # The package is not installed from here: which repository a fleet\n\
+         # takes it from is the fleet's decision, and a cloud-config that\n\
+         # pulled a binary from an address this platform chose would be one\n\
+         # nobody could audit. Install velstra-cloud first, by whatever means\n\
+         # you install packages, then this seeds it.\n\
+         write_files:\n\
+         \x20 - path: /etc/velstra/join\n\
+         \x20   permissions: '0600'\n\
+         \x20   owner: root:root\n\
+         \x20   content: |\n\
+         \x20     {join}\n\
+         runcmd:\n\
+         \x20 - [ velstra-cloud-node, setup, --join-file, /etc/velstra/join ]\n\
+         \x20 - [ shred, -u, /etc/velstra/join ]\n"
+    )
+}
+
 impl Api {
     pub fn new(
         store: Arc<dyn Store>,
@@ -3648,6 +3702,74 @@ impl Api {
     /// into a file would otherwise take the agent down while fixing it — and it
     /// is why this is `issueCredential` rather than `rotateCredential`, which
     /// would be a name promising the other thing.
+    /// What the platform hands somebody who is about to install a machine.
+    ///
+    /// ## Why a file and not a seed
+    ///
+    /// The obvious endpoint here is "give me this node's `node.env`", and it
+    /// is the wrong one: the join token already carries every fact the cell
+    /// knows, and `velstra-cloud-node setup --join` already turns it into a
+    /// seed. A second renderer would be a second place that has to agree
+    /// about the same keys — which is the mistake this codebase has now paid
+    /// for four times over (two seed renderers and only one knowing
+    /// `VELSTRA_ROLES`; a bootstrap password written to one directory and read
+    /// from another; five keys rendered and never parsed back). So this mints
+    /// the token and formats it, and the machine's own installer is the only
+    /// thing that turns facts into a seed.
+    ///
+    /// ## What the two flavours are for
+    ///
+    /// `JoinArtifact::File` is exactly the file the installer looks for on
+    /// anything plugged in: drop it at `velstra/join` on a stick and the
+    /// wizard offers it by name. `JoinArtifact::CloudInit` is the same token
+    /// wrapped in a `#cloud-config` that writes the file and runs the
+    /// installer against it — the Debian and Ubuntu door, where the useful
+    /// artefact was never an image but the small thing cloud-init already
+    /// wants.
+    pub async fn join_artifact(
+        &self,
+        name: &ResourceName,
+        flavour: JoinArtifact,
+        who: &Identity,
+    ) -> ApiResult<String> {
+        if name.collection() != "nodes" {
+            return Err(ApiError::invalid(format!(
+                "a join file is for a node, and {name} is a {}",
+                name.collection()
+            )));
+        }
+        // The same permission as `:issueCredential`, because this *is* that —
+        // a machine credential, formatted for a stick. Somebody who may run
+        // the estate may not hand out the credential a machine speaks with.
+        self.authorize_for(who, Verb::Write, name, "nodes").await?;
+        self.get(name, who).await?;
+        let token = self
+            .inner
+            .identity
+            .mint_agent_credential_for(
+                name.id(),
+                velstra_cloud_model::identity::AgentKind::Node,
+                None,
+                // Said in the credential list, so an operator looking at three
+                // of them can tell which one went out on a stick.
+                "join file",
+            )
+            .await?;
+        let join = self
+            .join_token(name.id(), Some(&token), None)
+            .ok_or_else(|| {
+                ApiError::invalid(
+                    "this API was not told what to advertise, so a join token would name no \
+                 address a machine could reach. Start it with --advertise (or \
+                 VELSTRA_ADVERTISE); on the appliance `velstra-cell-tls` writes it.",
+                )
+            })?;
+        Ok(match flavour {
+            JoinArtifact::File => join_file(name.id(), &self.inner.placement.cell, &join),
+            JoinArtifact::CloudInit => cloud_config(name.id(), &join),
+        })
+    }
+
     pub async fn issue_credential(
         &self,
         name: &ResourceName,
@@ -9826,4 +9948,82 @@ fn refuse_an_unusable_image_source(spec: &Value) -> ApiResult<()> {
         };
         ApiError::invalid(e.to_string()).at(field)
     })
+}
+
+/// The two artefacts are formatting, and formatting is where a file nobody can
+/// use comes from.
+#[cfg(test)]
+mod join_artifacts {
+    use super::*;
+
+    const TOKEN: &str = "velstra1.eyJ2IjoxfQ";
+
+    /// The installer reads past comments, so the file says which machine it is
+    /// for — it will be found by somebody who did not write it, possibly on a
+    /// stick with three others.
+    #[test]
+    fn the_file_says_which_machine_it_is_for() {
+        let text = join_file("peter", "cell-1", TOKEN);
+        assert!(text.contains("node peter"), "{text}");
+        assert!(text.contains("cell cell-1"), "{text}");
+        assert!(text.contains(TOKEN), "{text}");
+        // And that it is one, because a kilobyte of base64 on a stick in a
+        // drawer is otherwise indistinguishable from junk.
+        assert!(text.to_lowercase().contains("credential"), "{text}");
+        // On a line of its own: the installer tries each line before it tries
+        // the whole tail, and a token sharing a line with a comment marker
+        // would only ever be found by the slow path.
+        assert!(
+            text.lines().any(|l| l.trim() == TOKEN),
+            "the token shares its line: {text}"
+        );
+    }
+
+    /// cloud-init never sees the token on a command line: an argument is in
+    /// `ps` for every user on the machine, and this one registers a node.
+    #[test]
+    fn cloud_init_writes_a_file_and_never_an_argument() {
+        let text = cloud_config("peter", TOKEN);
+        assert!(text.starts_with("#cloud-config\n"), "{text}");
+        assert!(text.contains("write_files:"), "{text}");
+        assert!(text.contains("--join-file"), "{text}");
+        assert!(
+            !text.contains(&format!("--join, {TOKEN}")),
+            "the token reached a command line: {text}"
+        );
+        // 0600 and root, and gone afterwards: the file exists for the length
+        // of one boot, and in between it is a credential.
+        assert!(text.contains("'0600'"), "{text}");
+        assert!(text.contains("owner: root:root"), "{text}");
+        assert!(text.contains("shred"), "{text}");
+    }
+
+    /// Byte for byte, because cloud-init failing to parse this is a machine
+    /// that boots, does nothing, and says so only in its own log — and because
+    /// this exact text was checked through a YAML parser once, which is a thing
+    /// a test cannot do without taking a dependency for it. Pinning the output
+    /// is how that one check keeps counting.
+    #[test]
+    fn the_cloud_config_is_the_yaml_that_was_checked() {
+        let want = concat!(
+            "#cloud-config\n",
+            "# Velstra Cloud: make this machine node peter.\n",
+            "#\n",
+            "# The package is not installed from here: which repository a fleet\n",
+            "# takes it from is the fleet's decision, and a cloud-config that\n",
+            "# pulled a binary from an address this platform chose would be one\n",
+            "# nobody could audit. Install velstra-cloud first, by whatever means\n",
+            "# you install packages, then this seeds it.\n",
+            "write_files:\n",
+            "  - path: /etc/velstra/join\n",
+            "    permissions: '0600'\n",
+            "    owner: root:root\n",
+            "    content: |\n",
+            "      velstra1.eyJ2IjoxfQ\n",
+            "runcmd:\n",
+            "  - [ velstra-cloud-node, setup, --join-file, /etc/velstra/join ]\n",
+            "  - [ shred, -u, /etc/velstra/join ]\n",
+        );
+        assert_eq!(cloud_config("peter", TOKEN), want);
+    }
 }
