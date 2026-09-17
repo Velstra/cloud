@@ -85,6 +85,10 @@ pub struct Answers {
     /// Disks the first machine gives to Ceph, as kernel names (`sdb`). Empty
     /// is "no Ceph now" — it can still be added from the console later.
     pub ceph_osds: Vec<String>,
+    /// An SSH public key that may log in as root, and a root password for the
+    /// console. Both empty is the sealed default; see `ask_for_access`.
+    pub ssh_key: String,
+    pub root_password: String,
 }
 
 /// Run the wizard. Returns `None` when the operator declines the final YES —
@@ -143,6 +147,8 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
             Err(e) => println!("  {e:#}"),
         }
     };
+
+    let (ssh_key, root_password) = ask_for_access()?;
 
     let passphrase = if ask_yes("Encrypt the data partition with LUKS2?", false)? {
         Some(resolve_passphrase()?)
@@ -213,7 +219,16 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
     };
 
     if door == 2 {
-        return join(chosen, raid, picks, passphrase, hostname, network);
+        return join(
+            chosen,
+            raid,
+            picks,
+            passphrase,
+            hostname,
+            network,
+            ssh_key,
+            root_password,
+        );
     }
 
     let (admin, admin_password) = if door == 1 {
@@ -543,6 +558,7 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
         println!("  vmm:           {vmm}");
         println!("  node token:    (64 hex chars — not echoed)");
     }
+    print_access(&ssh_key, &root_password);
     if is_pool {
         println!("  pool:          {pool} ({pool_backend})");
         if !ceph_osds.is_empty() {
@@ -582,12 +598,112 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
         admin_password,
         api_ca_pem: String::new(),
         ceph_osds,
+        ssh_key,
+        root_password,
     }))
+}
+
+/// Whether anybody may log in to this machine, and how.
+///
+/// The image has no accounts: `root` exists with no password and
+/// `allowNoPasswordLogin` off, so the `login:` prompt on the screen is a dead
+/// end by construction. Fleet access is the control plane, and break-glass is
+/// booting the installer medium — which is a defensible default and a
+/// genuinely awkward one the first time something is wrong at three in the
+/// morning.
+///
+/// So it is offered rather than decided. Nothing is the default, and the
+/// question says what nothing means, because an operator who does not know
+/// the machine has no accounts cannot know to ask for one.
+fn ask_for_access() -> Result<(String, String)> {
+    println!("\nAccess to this machine itself:");
+    println!("  [1] none (default) — the console and SSH are closed. Manage it");
+    println!("      through the cell; to get a shell, boot this installer again.");
+    println!("  [2] an SSH key");
+    println!("  [3] a console password");
+    println!("  [4] both");
+    let (want_key, want_password) = loop {
+        match prompt("Access [1]: ")?.trim() {
+            "" | "1" => break (false, false),
+            "2" => break (true, false),
+            "3" => break (false, true),
+            "4" => break (true, true),
+            other => println!("  {other:?} is not an option — pick 1 to 4."),
+        }
+    };
+
+    let ssh_key = if want_key {
+        loop {
+            let got = prompt("Public key (ssh-ed25519 … / ssh-rsa …): ")?;
+            let got = got.trim().to_string();
+            match validate_ssh_key(&got) {
+                Ok(()) => break got,
+                Err(e) => println!("  {e:#}"),
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let root_password = if want_password {
+        loop {
+            let first = prompt_secret("Root password (not echoed): ")?;
+            if first.len() < 12 {
+                println!(
+                    "  at least 12 characters — this is a console anybody standing at the machine can reach"
+                );
+                continue;
+            }
+            let again = prompt_secret("Again: ")?;
+            if first == again {
+                break first;
+            }
+            println!("  they differ — once more");
+        }
+    } else {
+        String::new()
+    };
+    Ok((ssh_key, root_password))
+}
+
+/// What the review says about access, in both doors.
+fn print_access(ssh_key: &str, root_password: &str) {
+    match (ssh_key.is_empty(), root_password.is_empty()) {
+        (true, true) => println!("  access:        none — console and SSH closed"),
+        (false, true) => println!("  access:        SSH key only"),
+        (true, false) => println!("  access:        console password (not echoed)"),
+        (false, false) => println!("  access:        SSH key and console password"),
+    }
+}
+
+/// One line, as `ssh-keygen` writes it. Checked here rather than at first
+/// boot: a key with a newline in it is a seed that never produces a login, and
+/// finding that out needs a second trip to the machine.
+fn validate_ssh_key(key: &str) -> Result<()> {
+    let mut parts = key.split_whitespace();
+    let (Some(kind), Some(body)) = (parts.next(), parts.next()) else {
+        bail!("a public key is `<type> <base64> [comment]` — this has fewer than two words");
+    };
+    if !kind.starts_with("ssh-") && !kind.starts_with("ecdsa-") && !kind.starts_with("sk-") {
+        bail!("{kind:?} is not a key type — expected ssh-ed25519, ssh-rsa or similar");
+    }
+    if body.len() < 16
+        || !body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
+        bail!("the key body is not base64 — this looks like a private key or a truncated paste");
+    }
+    if key.contains('\n') {
+        bail!("a public key is one line; this has a line break in it");
+    }
+    Ok(())
 }
 
 /// Door 2: the join token is every cloud answer, so only the disk answers
 /// already given are needed — and the review, because the erase is still an
 /// erase.
+#[allow(clippy::too_many_arguments)]
 fn join(
     chosen: Vec<&Disk>,
     raid: Raid,
@@ -595,6 +711,11 @@ fn join(
     passphrase: Option<String>,
     hostname: String,
     network: Network,
+    // Asked once, in `collect`, before the door was chosen — the question is
+    // about this machine and not about how it joins. Passed in rather than
+    // asked again, which is what door 2 did the first time round.
+    ssh_key: String,
+    root_password: String,
 ) -> Result<Option<Answers>> {
     println!("\nPaste the join token the console showed when this node was created.");
     println!("It starts with `velstra1.` and is one line; a wrapped paste is fine.");
@@ -642,6 +763,7 @@ fn join(
     }
     println!("  vmm:           qemu");
     println!("  credentials:   (from the token — not echoed)");
+    print_access(&ssh_key, &root_password);
 
     let confirm = prompt("\nThis ERASES the selected disk(s). Type YES to proceed: ")?;
     if confirm.trim() != "YES" {
@@ -674,6 +796,8 @@ fn join(
         admin_password: String::new(),
         api_ca_pem: token.ca,
         ceph_osds: Vec::new(),
+        ssh_key,
+        root_password,
     }))
 }
 

@@ -136,6 +136,19 @@ enum Cmd {
         #[arg(long, default_value = "/var/lib/velstra")]
         dir: PathBuf,
     },
+    /// Apply what the seed says about logging in to this machine: the root
+    /// password, the SSH key, and closing both when it says nothing. Runs
+    /// every boot, because `/etc` here does not survive one.
+    ApplyAccess {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: PathBuf,
+    },
+    /// Write the console banner: this machine's name, its addresses, what it
+    /// runs, and where its console is.
+    Banner {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: PathBuf,
+    },
     /// Open the encrypted data volume at boot (a no-op on a plaintext
     /// install).
     Unlock,
@@ -169,6 +182,8 @@ fn main() -> Result<()> {
         Cmd::HasRole { role } => roles::has_role_or_exit(&role),
         Cmd::EnsureTls { dir } => cell::ensure_tls(&dir),
         Cmd::BootstrapCell { dir } => cell::bootstrap(&dir),
+        Cmd::ApplyAccess { dir } => cell::apply_access(&dir),
+        Cmd::Banner { dir } => cell::banner(&dir),
         Cmd::Unlock => unlock::run(),
         Cmd::Update { image } => update::run_update(&image),
     }

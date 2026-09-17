@@ -146,6 +146,15 @@ pub fn fingerprint_of_der(der: &[u8]) -> String {
 /// The PEM's base64 decoded by hand rather than with a crate: it is one
 /// certificate, the format is four lines of framing around base64, and this is
 /// the only place that needs it.
+/// The fingerprint of the certificate already at `root`, if there is one.
+///
+/// For the console banner, which wants to state it without minting anything —
+/// `ensure` would make a certificate as a side effect of being asked.
+pub fn fingerprint_at(root: &Path) -> Option<String> {
+    let pem = std::fs::read_to_string(dir(root).join("cert.pem")).ok()?;
+    fingerprint_of_pem(&pem).ok()
+}
+
 fn fingerprint_of_pem(pem: &str) -> Result<String> {
     let body: String = pem
         .lines()

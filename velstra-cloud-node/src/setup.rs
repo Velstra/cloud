@@ -107,6 +107,20 @@ pub struct Machine {
     /// `bootstrap-cell` resolves them to the stable paths the node agent
     /// reports and creates the cluster. Empty on every other machine.
     pub bootstrap_ceph_osds: Vec<String>,
+    /// An SSH public key that may log in as root, and whether a password was
+    /// set. Both empty is the default and the sealed shape: no account anybody
+    /// can use, fleet access through the control plane, break-glass by booting
+    /// the installer medium.
+    ///
+    /// Offered at install rather than decided here. A machine nobody can log
+    /// in to is the safer default and a genuinely awkward one to debug, and
+    /// which of those matters more is the operator's call, not this
+    /// platform's.
+    pub ssh_key: String,
+    /// The root password, in the clear, on its way to a 0600 file beside the
+    /// seed. Never rendered into `node.env`, which is world-readable — the
+    /// same split the tokens and the bootstrap password already make.
+    pub root_password: String,
     /// Where the API is. Empty on a control-plane-only machine, which *is* the
     /// API — a URL pointing at itself would be a fact with two owners.
     pub api_url: String,
@@ -299,6 +313,15 @@ pub fn render(m: &Machine) -> String {
             out.push_str(&format!("VELSTRA_CELLS={}\n", m.cells.join(",")));
         }
     }
+    // Console and SSH access, when the operator asked for it. The key is not a
+    // secret and rides in the seed; the password does not — it goes to a 0600
+    // file beside it, the same split the tokens already make.
+    if !m.ssh_key.is_empty() {
+        out.push_str(&format!("VELSTRA_SSH_KEY={}\n", m.ssh_key));
+    }
+    if !m.root_password.is_empty() {
+        out.push_str("VELSTRA_CONSOLE_LOGIN=1\n");
+    }
     if m.local_network {
         out.push_str("VELSTRA_LOCAL_NETWORK=1\n");
     }
@@ -452,6 +475,15 @@ pub fn parse(text: &str) -> Result<Machine> {
         store: or("VELSTRA_STORE", "127.0.0.1:2379"),
         listen: or("VELSTRA_LISTEN", ""),
         advertise: or("VELSTRA_ADVERTISE", ""),
+        ssh_key: or("VELSTRA_SSH_KEY", ""),
+        // Read back as a marker only: the password itself lives in its own
+        // file, and a seed that carried it would be a secret in a
+        // world-readable file.
+        root_password: if or("VELSTRA_CONSOLE_LOGIN", "") == "1" {
+            "(set)".into()
+        } else {
+            String::new()
+        },
         bootstrap_ceph_osds: or("VELSTRA_BOOTSTRAP_CEPH_OSDS", "")
             .split(',')
             .map(str::trim)
@@ -701,6 +733,16 @@ pub(crate) fn write_seed(dir: &Path, m: &Machine) -> Result<()> {
         write_with_mode(
             &dir.join("pool-token"),
             &format!("{}\n", m.pool_token),
+            0o600,
+        )?;
+    }
+    // The root password, its own file with its own mode, for the same reason
+    // the tokens have one: `node.env` is world-readable and the units that
+    // read it do not all run as root.
+    if !m.root_password.is_empty() && m.root_password != "(set)" {
+        write_with_mode(
+            &dir.join("root-password"),
+            &format!("{}\n", m.root_password),
             0o600,
         )?;
     }
@@ -1024,6 +1066,8 @@ fn collect() -> Result<Option<Machine>> {
         api_ca_pem: String::new(),
         advertise: String::new(),
         bootstrap_ceph_osds: Vec::new(),
+        ssh_key: String::new(),
+        root_password: String::new(),
         pool_token: String::new(),
         api_ca: api_ca.clone(),
         tls_cert: String::new(),
@@ -1428,6 +1472,8 @@ mod tests {
             api_ca_pem: String::new(),
             advertise: String::new(),
             bootstrap_ceph_osds: Vec::new(),
+            ssh_key: String::new(),
+            root_password: String::new(),
             pool_token: String::new(),
             api_ca: String::new(),
             tls_cert: String::new(),

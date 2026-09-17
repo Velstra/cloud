@@ -215,6 +215,76 @@ in
       '';
     };
 
+    # SSH, present but not started. The seed decides: `velstra-node-access`
+    # starts it when a key was seeded and stops it when one was not, so the
+    # closed default is closed on every boot rather than only the first.
+    #
+    # Host keys on the writable partition, or every reboot would present a new
+    # identity and every client would refuse to connect a second time.
+    services.openssh = {
+      enable = true;
+      startWhenNeeded = false;
+      hostKeys = [
+        {
+          type = "ed25519";
+          path = "${cfg.stateDir}/ssh/ssh_host_ed25519_key";
+        }
+      ];
+      settings = {
+        # Key only, even when a console password is set: a password that is
+        # reachable from the network is a different decision from one that is
+        # reachable by somebody standing at the machine, and the installer only
+        # asks for the second.
+        PasswordAuthentication = false;
+        KbdInteractiveAuthentication = false;
+        PermitRootLogin = "prohibit-password";
+      };
+    };
+    systemd.services.sshd.wantedBy = lib.mkForce [ ];
+    systemd.tmpfiles.rules = [ "d ${cfg.stateDir}/ssh 0700 root root -" ];
+
+    # Who may log in, from the seed, every boot — `/etc` here is a tmpfs, so a
+    # password set last week is gone by morning and the seed is the only
+    # durable statement of it.
+    systemd.services.velstra-node-access = {
+      description = "Apply what the seed says about logging in to this machine";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "velstra-node-boot.service" ];
+      before = [ "getty.target" ];
+      unitConfig.RequiresMountsFor = [ cfg.stateDir ];
+      path = [
+        pkgs.shadow
+        pkgs.systemd
+        pkgs.coreutils
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${cfg.package}/bin/velstra-cloud-node apply-access --dir ${cfg.stateDir}";
+      };
+    };
+
+    # What the screen says before anybody signs in. Every machine: a hypervisor
+    # that shows nothing leaves whoever is standing at it with no way to learn
+    # the address they need.
+    systemd.services.velstra-node-banner = {
+      description = "Write the console banner (name, addresses, roles)";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-online.target" ];
+      after = [
+        "network-online.target"
+        "velstra-node-boot.service"
+      ];
+      before = [ "getty.target" ];
+      unitConfig.RequiresMountsFor = [ cfg.stateDir ];
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${cfg.package}/bin/velstra-cloud-node banner --dir ${cfg.stateDir}";
+      };
+    };
+
     # The first machine of a cell, brought up from its seed alone. What
     # `quickstart` does after writing the seed on a Debian box happens here at
     # first boot, in two halves, because a flashed machine had no API to talk

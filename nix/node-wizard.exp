@@ -34,6 +34,11 @@ answer "Mode "              "1"
 # single disk rather than the plural it used to say whatever the mode was.
 answer "Disk number"        "$env(PICK)"
 
+# Access to the machine itself, asked once and before the door — the question
+# is about this machine, not about how it joins a cell. `1` is "none", the
+# sealed default, which is what ships unless somebody says otherwise.
+answer "Access "            "1"
+
 # Plaintext data partition here; the encrypted flow shares the LUKS code the
 # unlock unit exercises.
 answer "Encrypt the data partition" "n"
@@ -50,6 +55,9 @@ answer "Use DHCP"  "y"
 # the third is the one that proves every question still exists.
 answer "Install as"        "$env(DOOR)"
 
+# Access to the machine itself, asked at every door. `1` is "none", the sealed
+# default — the check installs a machine nobody can log in to, which is what
+# ships unless somebody says otherwise.
 if {$env(DOOR) == 2} {
     answer "Join token"    "$env(JOIN)"
 } elseif {$env(DOOR) == 1} {

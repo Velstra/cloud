@@ -73,37 +73,147 @@ pub fn ensure_tls(dir: &Path) -> Result<()> {
         );
     }
 
-    // What the screen says before anybody signs in. The appliance has no
-    // local accounts, so a getty is the last thing a first boot shows — and a
-    // person who just flashed a machine and sees `login:` has been told
-    // nothing. agetty reads `/run/issue.d/*.issue` beside `/etc/issue`.
-    let issue = issue_text(&m.advertise, &cert.fingerprint);
-    if let Err(e) = std::fs::create_dir_all("/run/issue.d")
-        .and_then(|()| std::fs::write("/run/issue.d/50-velstra.issue", issue))
-    {
-        println!("could not write the console banner: {e}");
+    Ok(())
+}
+
+/// What the screen says before anybody signs in.
+///
+/// Every machine, not only a control plane — a hypervisor that shows nothing
+/// leaves its operator with no way to learn the address they need, which is
+/// the first thing anybody wants from a box that just came up. agetty reads
+/// `/run/issue.d/*.issue` beside `/etc/issue`, so this is a file and not a
+/// patch of the image.
+pub fn banner(dir: &Path) -> Result<()> {
+    let seed_path = dir.join("node.env");
+    let m = std::fs::read_to_string(&seed_path)
+        .ok()
+        .and_then(|t| setup::parse(&t).ok());
+    let fingerprint = tls::fingerprint_at(dir).unwrap_or_default();
+    let text = issue_text(
+        &crate::wizard::hostname(),
+        &own_addresses(),
+        m.as_ref(),
+        &fingerprint,
+    );
+    std::fs::create_dir_all("/run/issue.d")
+        .and_then(|()| std::fs::write("/run/issue.d/50-velstra.issue", &text))
+        .with_context(|| "writing the console banner")?;
+    print!("{text}");
+    Ok(())
+}
+
+/// Open the console and SSH to whoever the seed says may use them.
+///
+/// Runs on every boot, not only the first: `/etc` is a tmpfs on this image, so
+/// a password set last week is gone by morning. The seed is the only durable
+/// statement of who may log in, and applying it every boot is what makes it
+/// one — an operator who changes their mind edits the seed and reboots, rather
+/// than editing a file that the next boot discards.
+///
+/// A seed that asks for nothing closes both, deliberately and every time: the
+/// default is a machine nobody can log in to, and it stays that way even if
+/// something wrote a password into the running system.
+pub fn apply_access(dir: &Path) -> Result<()> {
+    let seed_path = dir.join("node.env");
+    let m = std::fs::read_to_string(&seed_path)
+        .ok()
+        .and_then(|t| setup::parse(&t).ok())
+        .unwrap_or_default();
+
+    let password = std::fs::read_to_string(dir.join("root-password"))
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+
+    match &password {
+        Some(secret) => {
+            // Through stdin, never a command line: an argument is in `ps` for
+            // every process on the machine, and this one is the root password.
+            crate::install::run_stdin("chpasswd", &[], format!("root:{secret}\n").as_bytes())
+                .context("setting the root password")?;
+            println!("console login is open for root");
+        }
+        None => {
+            // `--lock` rather than deleting the hash: a locked account cannot
+            // be logged into and can still be unlocked by seeding a password,
+            // which is what makes this reversible without a reinstall.
+            let _ = crate::install::run("passwd", &["--lock", "root"]);
+            println!("console login is closed");
+        }
+    }
+
+    let ssh_dir = std::path::Path::new("/root/.ssh");
+    let authorized = ssh_dir.join("authorized_keys");
+    if m.ssh_key.trim().is_empty() {
+        let _ = std::fs::remove_file(&authorized);
+        let _ = crate::install::run("systemctl", &["stop", "sshd.service"]);
+        println!("ssh is closed");
+    } else {
+        std::fs::create_dir_all(ssh_dir).context("creating /root/.ssh")?;
+        setup::write_with_mode(&authorized, &format!("{}\n", m.ssh_key.trim()), 0o600)?;
+        let _ = crate::install::run("chmod", &["0700", "/root/.ssh"]);
+        crate::install::run("systemctl", &["start", "sshd.service"]).context("starting sshd")?;
+        println!("ssh is open for the key in the seed");
     }
     Ok(())
 }
 
-/// The banner: where the console is and how to know it is this machine.
+/// The banner: who this machine is, where to reach it, and what runs here.
 ///
-/// The fingerprint is the point. A self-signed certificate makes a browser
-/// warn — correctly — and the warning is only worth something to somebody who
-/// can check what they are agreeing to. `quickstart` printed this once on a
-/// Debian box; a flashed machine shows it every time the screen is looked at.
-fn issue_text(advertise: &str, fingerprint: &str) -> String {
-    let urls: Vec<&str> = advertise.split(',').filter(|u| !u.is_empty()).collect();
-    let mut out = String::from("\nVelstra Cloud\n");
-    match urls.first() {
-        Some(url) => out.push_str(&format!("  console:      {url}\n")),
-        None => out.push_str("  console:      (no reachable address yet)\n"),
+/// The addresses come first because they are the answer to the question
+/// somebody standing at the machine actually has. A machine with a DHCP lease
+/// has no other way of telling anybody what it got.
+///
+/// The fingerprint is the other half, and only for a control plane: a
+/// self-signed certificate makes a browser warn — correctly — and the warning
+/// is worth something only to somebody who can check what they are agreeing
+/// to. `quickstart` printed it once on a Debian box; a flashed machine shows
+/// it whenever the screen is looked at.
+///
+/// Pure, so the shape is tested without a machine.
+fn issue_text(
+    hostname: &str,
+    addresses: &[String],
+    seed: Option<&setup::Machine>,
+    fingerprint: &str,
+) -> String {
+    let mut out = format!("\nVelstra Cloud — {hostname}\n");
+    if addresses.is_empty() {
+        out.push_str("  address:      (none yet — no link, or no lease)\n");
+    } else {
+        out.push_str(&format!("  address:      {}\n", addresses[0]));
+        for more in addresses.iter().skip(1) {
+            out.push_str(&format!("                {more}\n"));
+        }
     }
-    for more in urls.iter().skip(1) {
-        out.push_str(&format!("                {more}\n"));
+    let Some(m) = seed else {
+        // Flashed and not yet installed, or a seed this build cannot read.
+        out.push_str("  status:       no seed — this machine has not been told what it is\n\n");
+        return out;
+    };
+    out.push_str(&format!(
+        "  runs:         {}\n",
+        crate::roles::render_list(&m.roles)
+    ));
+    if m.roles.contains(&crate::roles::Role::ControlPlane) {
+        let port = m
+            .listen
+            .rsplit(':')
+            .next()
+            .filter(|p| !p.is_empty())
+            .unwrap_or("8443");
+        match addresses.first() {
+            Some(a) => out.push_str(&format!("  console:      https://{a}:{port}\n")),
+            None => out.push_str("  console:      (no reachable address yet)\n"),
+        }
+        if !fingerprint.is_empty() {
+            out.push_str(&format!("  certificate:  sha256 {fingerprint}\n"));
+        }
+        out.push_str("  sign in as the administrator named at install.\n");
+    } else if !m.api_url.is_empty() {
+        out.push_str(&format!("  cell:         {} at {}\n", m.cell, m.api_url));
     }
-    out.push_str(&format!("  certificate:  sha256 {fingerprint}\n"));
-    out.push_str("  sign in as the administrator named at install.\n\n");
+    out.push('\n');
     out
 }
 
@@ -468,21 +578,69 @@ mod tests {
         );
     }
 
-    /// The screen names the console first, every address after it, and the
-    /// fingerprint a browser warning can be checked against.
+    fn machine(roles: Vec<crate::roles::Role>) -> setup::Machine {
+        setup::Machine {
+            roles,
+            cell: "cell-1".into(),
+            listen: "0.0.0.0:8443".into(),
+            api_url: "https://10.10.10.8:8443".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The address first — it is the answer to the question somebody standing
+    /// at the machine actually has — then what runs here, then the console and
+    /// the fingerprint a browser warning can be checked against.
     #[test]
-    fn the_banner_says_where_the_console_is_and_how_to_know_it() {
-        let text = issue_text("https://10.10.10.8:8443,https://horst:8443", "AB:CD");
+    fn a_control_plane_says_where_its_console_is() {
+        let text = issue_text(
+            "horst",
+            &["10.10.10.8".into(), "fd00::8".into()],
+            Some(&machine(vec![
+                crate::roles::Role::ControlPlane,
+                crate::roles::Role::Hypervisor,
+            ])),
+            "AB:CD",
+        );
+        assert!(text.contains("Velstra Cloud — horst\n"), "{text}");
+        assert!(text.contains("address:      10.10.10.8\n"), "{text}");
+        assert!(text.contains("                fd00::8\n"), "{text}");
+        assert!(
+            text.contains("runs:         control-plane,hypervisor\n"),
+            "{text}"
+        );
         assert!(
             text.contains("console:      https://10.10.10.8:8443\n"),
             "{text}"
         );
+        assert!(text.contains("sha256 AB:CD"), "{text}");
+    }
+
+    /// A hypervisor has no console of its own, so it names the cell it joined
+    /// instead — and still, first of all, its address.
+    #[test]
+    fn a_hypervisor_names_its_address_and_its_cell() {
+        let text = issue_text(
+            "peter",
+            &["10.10.10.47".into()],
+            Some(&machine(vec![crate::roles::Role::Hypervisor])),
+            "",
+        );
+        assert!(text.contains("address:      10.10.10.47\n"), "{text}");
         assert!(
-            text.contains("                https://horst:8443\n"),
+            text.contains("cell:         cell-1 at https://10.10.10.8:8443\n"),
             "{text}"
         );
-        assert!(text.contains("sha256 AB:CD"), "{text}");
-        assert!(issue_text("", "AB:CD").contains("no reachable address"));
+        assert!(!text.contains("console:"), "{text}");
+    }
+
+    /// Flashed and not yet installed: say so, rather than showing a login
+    /// prompt over a machine that has been told nothing.
+    #[test]
+    fn a_machine_with_no_seed_says_that_is_what_it_is() {
+        let text = issue_text("velstra-node", &[], None, "");
+        assert!(text.contains("address:      (none yet"), "{text}");
+        assert!(text.contains("no seed"), "{text}");
     }
 
     /// Nothing global is nothing, not a crash and not a loopback address.

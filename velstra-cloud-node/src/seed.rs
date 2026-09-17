@@ -70,6 +70,17 @@ pub fn seed(targets: &[&Disk], raid: Raid, answers: &Answers, crypto: &Crypto) -
     // would satisfy the node agent's `ConditionPathExists` with nothing in it
     // — a unit that starts, authenticates as nobody, and is refused for ever.
     let mut wrote = vec!["node.env"];
+    // The root password, when one was asked for: its own file and mode, like
+    // every other secret here.
+    if !answers.root_password.is_empty() {
+        write_with_mode(
+            &mnt.join("root-password"),
+            &format!("{}\n", answers.root_password),
+            0o600,
+        )?;
+        wrote.push("root-password");
+    }
+
     if !answers.token.is_empty() {
         write_with_mode(
             &mnt.join("node-token"),
@@ -158,6 +169,8 @@ fn machine_from(a: &Answers) -> crate::setup::Machine {
         admin_password: a.admin_password.clone(),
         api_ca_pem: a.api_ca_pem.clone(),
         bootstrap_ceph_osds: a.ceph_osds.clone(),
+        ssh_key: a.ssh_key.clone(),
+        root_password: a.root_password.clone(),
         // A machine born with Ceph opens the cluster with the files the node
         // agent writes from the cell — the same files every hypervisor gets —
         // as the client the cell minted for them.
@@ -232,6 +245,8 @@ mod tests {
             admin_password: String::new(),
             api_ca_pem: String::new(),
             ceph_osds: Vec::new(),
+            ssh_key: String::new(),
+            root_password: String::new(),
         }
     }
 
@@ -329,6 +344,8 @@ mod door_tests {
             admin_password: String::new(),
             api_ca_pem: String::new(),
             ceph_osds: Vec::new(),
+            ssh_key: String::new(),
+            root_password: String::new(),
         }
     }
 
@@ -422,6 +439,8 @@ mod born_with_ceph {
             admin_password: "correcthorsebattery".into(),
             api_ca_pem: String::new(),
             ceph_osds: vec!["sdb".into(), "sdc".into()],
+            ssh_key: String::new(),
+            root_password: String::new(),
         };
         let env = render_node_env(&a);
         assert!(

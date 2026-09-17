@@ -166,6 +166,10 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         api_ca_pem: String::new(),
         advertise: advertise.clone(),
         bootstrap_ceph_osds: Vec::new(),
+        // A Debian box already has accounts and an ssh the operator owns;
+        // this command does not reach into either.
+        ssh_key: String::new(),
+        root_password: String::new(),
         // One machine that is the whole cell: its pool agent reaches the store
         // directly, and is deliberately given no token.
         pool_token: String::new(),
