@@ -530,7 +530,19 @@ pub fn parse(text: &str) -> Result<Machine> {
     // person to change it would be changing nothing.
     if roles.contains(&Role::Hypervisor) {
         m.node = need("VELSTRA_NODE")?;
-        if m.api_url.is_empty() {
+        // The same exemption the pool below has always had, and its absence
+        // here broke every first machine of a cell installed from the image.
+        //
+        // A control plane *is* the API, so the installer writes no
+        // `VELSTRA_API_URL` for one — and door 1 writes
+        // `control-plane,hypervisor,pool`. This branch then refused the seed
+        // by name, `velstra-cell-tls` died on the first boot, the API had no
+        // certificate to serve, and the console was never there. The banner
+        // reads the same seed through `.ok()`, so it printed a machine with
+        // no name, no roles and no address — three symptoms, one missing
+        // condition. `ensure-tls` fills the URL in afterwards, for the agents
+        // on this machine that do need one.
+        if m.api_url.is_empty() && !roles.contains(&Role::ControlPlane) {
             m.api_url = need("VELSTRA_API_URL")?;
         }
     }

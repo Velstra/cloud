@@ -575,6 +575,71 @@
                   assert src.startswith("/dev/"), src
                   machine.succeed("echo persisted > /var/lib/velstra/marker")
                   machine.succeed("grep -qx persisted /var/lib/velstra/marker")
+
+              # Everything above is a machine nobody has told anything. The
+              # half that was never proven here is the one an operator
+              # actually gets: a seed written by the installer, and a first
+              # boot that has to turn it into a cell. Seeded the way door 1
+              # seeds it, then rebooted, because the units under test are
+              # first-boot units and restarting them by hand would prove
+              # something else.
+              machine.succeed(
+                  "install -d -m 0755 /var/lib/velstra",
+                  "printf '%s\\n' "
+                  "VELSTRA_REGION=eu-central VELSTRA_CELL=cell-1"
+                  " VELSTRA_ROLES=control-plane,hypervisor,pool"
+                  " VELSTRA_NODE=node-1 VELSTRA_VMM=qemu"
+                  " VELSTRA_POOL=local VELSTRA_POOL_BACKEND=directory"
+                  " VELSTRA_STORE=127.0.0.1:2379 VELSTRA_LISTEN=0.0.0.0:8443"
+                  " VELSTRA_BOOTSTRAP_ADMIN=admin"
+                  " > /var/lib/velstra/node.env",
+                  "printf 'correcthorsebattery\\n' > /var/lib/velstra/bootstrap-password",
+                  "chmod 600 /var/lib/velstra/bootstrap-password",
+              )
+              machine.shutdown()
+              machine.start()
+              machine.wait_for_unit("multi-user.target")
+
+              with subtest("the first boot makes the cell's certificate"):
+                  machine.wait_for_unit("velstra-cell-tls.service")
+                  seed = machine.succeed("cat /var/lib/velstra/node.env")
+                  for key in ["VELSTRA_TLS_CERT=", "VELSTRA_TLS_KEY=", "VELSTRA_ADVERTISE="]:
+                      assert key in seed, f"ensure-tls wrote no {key}:\n{seed}"
+
+              with subtest("the API answers over the TLS it just made"):
+                  machine.wait_for_unit("velstra-cloud-api.service")
+                  machine.wait_for_open_port(8443)
+                  cert = "/var/lib/velstra/tls/cert.pem"
+                  machine.wait_until_succeeds(
+                      f"curl -sS --cacert {cert} https://127.0.0.1:8443/healthz"
+                  )
+
+              with subtest("the cell has its Node and Pool, made by the machine itself"):
+                  machine.wait_for_unit("velstra-cell-bootstrap.service")
+                  machine.succeed("test -s /var/lib/velstra/node-token")
+
+              # The one thing somebody standing at the machine needs, and the
+              # reason this subtest exists: a first boot used to end at a
+              # `login:` prompt over a box whose DHCP lease nobody could read.
+              with subtest("the console says where this machine is"):
+                  machine.wait_for_unit("velstra-node-banner.service")
+                  issue = machine.succeed("cat /run/issue.d/50-velstra.issue")
+                  for want in ["node-1", "control-plane", "https://"]:
+                      assert want in issue, f"the banner does not say {want}:\n{issue}"
+                  # agetty has to be told to read that directory, or the file
+                  # is written and never seen. NixOS passes --issue-file; this
+                  # asserts it rather than trusting it.
+                  getty = machine.succeed("systemctl cat getty@tty1.service")
+                  assert "/run/issue.d" in getty, getty
+                  # And it has to be there *before* the prompt is drawn. The
+                  # banner unit and getty@tty1 are both Before=getty.target,
+                  # which orders neither against the other — so the ordering
+                  # is stated against the getty itself, and this is what says
+                  # it stayed stated.
+                  order = machine.succeed(
+                      "systemctl show velstra-node-banner.service -p Before"
+                  )
+                  assert "getty@tty1.service" in order, order
             '';
         };
 

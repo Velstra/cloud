@@ -65,6 +65,23 @@ pub fn ensure_tls(dir: &Path) -> Result<()> {
         m.advertise = advertise;
         changed = true;
     }
+    // The machine's own API, for the node and pool agents standing on it.
+    //
+    // The seed the installer wrote names no API, correctly — a control plane
+    // is the API, and a URL pointing at itself would be a fact with two
+    // owners. But the agents here are ordinary clients and need one, and this
+    // is the first moment anything knows both the scheme and the port: the
+    // certificate did not exist at install time. `localhost` and not the
+    // address, because the certificate names hostnames and curl matches what
+    // was typed. `quickstart` computes the same URL the same way on Debian;
+    // the image had nobody doing it, so a flashed first machine came up with
+    // a control plane and two agents that could not reach it.
+    let own_api = format!("https://localhost:{port}");
+    if m.api_url.is_empty() {
+        m.api_url = own_api;
+        m.api_ca = cert.cert.display().to_string();
+        changed = true;
+    }
     if changed {
         setup::write_with_mode(&seed_path, &setup::render(&m), 0o644)?;
         println!(

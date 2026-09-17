@@ -305,12 +305,29 @@ in
         "network-online.target"
         "velstra-node-boot.service"
       ];
-      before = [ "getty.target" ];
+      # Before the getty **instance**, not before `getty.target`.
+      #
+      # `getty@tty1` is itself `Before=getty.target`, so two units that are
+      # both before the target are ordered against the target and against
+      # nothing else — systemd was free to draw the login prompt first, and on
+      # a machine waiting for a DHCP lease it did. agetty reads the issue when
+      # it prints the prompt, so a banner that lands afterwards is a file
+      # nobody sees until the next prompt. Measured on real hardware: the
+      # machine came up, the screen said `login:`, and the address the banner
+      # exists to show was in a file written seconds later.
+      before = [
+        "getty@tty1.service"
+        "getty.target"
+      ];
       unitConfig.RequiresMountsFor = [ cfg.stateDir ];
       path = [ pkgs.iproute2 ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
+        # A machine whose network never comes up still gets a prompt. The
+        # banner is worth waiting for and not worth waiting for ever: without
+        # this, `network-online.target` failing would hold tty1 hostage.
+        TimeoutStartSec = 45;
         ExecStart = "${cfg.package}/bin/velstra-cloud-node banner --dir ${cfg.stateDir}";
       };
     };

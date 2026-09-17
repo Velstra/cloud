@@ -402,6 +402,80 @@ mod door_tests {
         assert!(!env.contains("VELSTRA_PASSTHROUGH"), "{env}");
     }
 
+    /// **The seed door 1 writes has to be one the machine can read back.**
+    ///
+    /// Two halves that must agree, and nothing put them in the same test: the
+    /// wizard writes no `VELSTRA_API_URL` for a control plane — correctly,
+    /// because a control plane is the API — and the parser demanded one
+    /// anyway, for the hypervisor role that door 1 also names. Every first
+    /// machine of a cell installed from the image therefore failed its first
+    /// boot with "VELSTRA_API_URL is missing": no certificate, no API, no
+    /// console, and a banner that printed a machine with no name because it
+    /// reads the same seed through `.ok()`.
+    ///
+    /// Both halves had tests. Neither test ran the other half.
+    #[test]
+    fn the_seed_the_first_door_writes_parses_back() {
+        let mut a = base();
+        a.roles = vec![
+            crate::roles::Role::ControlPlane,
+            crate::roles::Role::Hypervisor,
+            crate::roles::Role::Pool,
+        ];
+        a.listen = "0.0.0.0:8443".into();
+        a.pool = "local".into();
+        a.pool_backend = "directory".into();
+        a.admin = "admin".into();
+        a.admin_password = "correcthorsebattery".into();
+        let env = render_node_env(&a);
+        let back = crate::setup::parse(&env).unwrap_or_else(|e| {
+            panic!("the installer wrote a seed this machine cannot read: {e:#}\n{env}")
+        });
+        assert_eq!(back.node, "horst");
+        assert!(back.roles.contains(&crate::roles::Role::ControlPlane));
+        assert!(
+            back.api_url.is_empty(),
+            "a control plane is the API; ensure-tls fills this in at first boot: {:?}",
+            back.api_url
+        );
+    }
+
+    /// And the other three doors, so the same trap cannot be set again in one
+    /// of them: every seed this wizard writes is read back by the code that
+    /// runs on the machine.
+    #[test]
+    fn every_role_set_the_wizard_can_write_parses_back() {
+        use crate::roles::Role::*;
+        for roles in [
+            vec![Hypervisor],
+            vec![Pool],
+            vec![Hypervisor, Pool],
+            vec![ControlPlane],
+            vec![ControlPlane, Hypervisor],
+            vec![ControlPlane, Pool],
+            vec![ControlPlane, Hypervisor, Pool],
+        ] {
+            let mut a = base();
+            let is_cp = roles.contains(&ControlPlane);
+            a.roles = roles.clone();
+            if is_cp {
+                a.listen = "0.0.0.0:8443".into();
+                a.admin = "admin".into();
+            } else {
+                a.api_url = "https://cell-1:8443".into();
+                a.token = "ab".repeat(32);
+            }
+            if roles.contains(&Pool) {
+                a.pool = "local".into();
+                a.pool_backend = "directory".into();
+            }
+            let env = render_node_env(&a);
+            crate::setup::parse(&env).unwrap_or_else(|e| {
+                panic!("the wizard wrote a seed for {roles:?} that cannot be read: {e:#}\n{env}")
+            });
+        }
+    }
+
     /// A joiner: the certificate rides in, and the seed names where it lands.
     #[test]
     fn a_joiner_seeds_the_certificate_it_was_handed() {
