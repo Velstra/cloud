@@ -169,7 +169,19 @@ pub fn may_publish(
     // Only when it is actually bound to something. An address held and pointing
     // at nothing announces nothing, so a cell with no gateway may still hold
     // one — which is the whole reason an unassociated address exists.
-    if !view.port.is_empty()
+    //
+    // And only when it is *announced* at all. A translated address is never
+    // announced by anybody — `announcer` answers `Nowhere(Translated)` for it
+    // before it looks at anything else — so asking who would announce it is a
+    // question about a thing that does not happen. Nat is the default
+    // delivery, which made this the refusal every ordinary floating IP hit on
+    // a cell with no gateway node: measured live, a plain
+    // `POST …/floatingips {subnet, port}` was turned away with "no node in
+    // this cell is marked as a gateway, so there is nothing to announce … from"
+    // for an address that would have been translated on the guest's own host.
+    // The `NotExternal` branch above already carries the same guard.
+    if view.delivery == Delivery::Routed
+        && !view.port.is_empty()
         && view.announce.unwrap_or(network_default) == Announce::FromGateway
         && gateways == 0
     {
@@ -348,6 +360,44 @@ mod tests {
         );
 
         assert_eq!(may_publish(&address, Announce::FromHost, 1), Ok(()));
+    }
+
+    /// **A translated address needs no gateway, because nobody announces it.**
+    ///
+    /// `announcer` answers `Nowhere(Translated)` for Nat before it looks at
+    /// anything else, so "who would announce this" is a question about a thing
+    /// that does not happen. Nat is also the *default* delivery, which made
+    /// this the refusal every ordinary floating IP hit on a cell with no
+    /// gateway node — measured live: a plain `POST …/floatingips {subnet,
+    /// port}` turned away with "no node in this cell is marked as a gateway,
+    /// so there is nothing to announce … from", for an address that would have
+    /// been translated on the guest's own host.
+    #[test]
+    fn a_translated_address_is_published_on_a_cell_with_no_gateway() {
+        let mut nat = routed();
+        nat.delivery = Delivery::Nat;
+        nat.announce = Some(Announce::FromGateway);
+        assert_eq!(
+            may_publish(&nat, Announce::FromGateway, 0),
+            Ok(()),
+            "a translated address was refused for want of a gateway that would \
+             never have announced it"
+        );
+        // And it is indeed announced by nobody, which is why the question does
+        // not apply — the two answers have to agree.
+        assert!(matches!(
+            announcer(&nat, Announce::FromGateway, Some("horst"), &[]),
+            Announcer::Nowhere(Silent::Translated)
+        ));
+
+        // The routed case is untouched: that one really is announced from a
+        // gateway, and a cell with none cannot carry it.
+        let mut routed_one = routed();
+        routed_one.announce = Some(Announce::FromGateway);
+        assert!(matches!(
+            may_publish(&routed_one, Announce::FromGateway, 0),
+            Err(Refusal::NoGateway { .. })
+        ));
     }
 
     /// An address held and pointing at nothing is the reason the object exists;
