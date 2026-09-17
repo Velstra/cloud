@@ -865,6 +865,11 @@
         "additionalProperties": true,
         "description": "Virtual machines. What was asked for is the spec; what the node reports is the status, and they are shown together.",
         "properties": {
+          "bootVolume": {
+            "description": "The name of a `volumes` object. Left empty, the root disk is a file on whichever machine runs this guest, sized by the flavor — and the guest cannot be moved to another machine, because moving a guest does not move its disk. Named, the root disk is that volume, in its pool: it is sized by the volume rather than by the flavor, it outlives the guest, and a guest whose root is in a pool both machines can reach can be moved between them. Settable at creation only.",
+            "type": "string",
+            "x-at-creation": true
+          },
           "console": {
             "description": "Publishes what the operating system inside writes to its serial console, so it can be read here. Off by default because it costs a report every time it logs a line. An instance that is not running shows its last output whether this is on or not.",
             "type": "boolean"
@@ -2564,6 +2569,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -2929,6 +2938,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -3294,6 +3307,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -3659,6 +3676,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -4024,6 +4045,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -4389,6 +4414,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -4754,6 +4783,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -5119,6 +5152,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -5484,6 +5521,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -5834,7 +5875,7 @@
             "description": "Refused, with a code a program can branch on and a sentence a person can read."
           }
         },
-        "summary": "Mint a fresh credential for a machine that already exists; shown once. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+        "summary": "Mint a fresh credential for a machine that already exists; shown once, as `nodeToken` and — when this API advertises an address — as `joinToken`, the whole hand-off in one string. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
         "tags": [
           "Nodes"
         ]
@@ -6180,6 +6221,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -6487,7 +6532,7 @@
             "description": "Refused, with a code a program can branch on and a sentence a person can read."
           }
         },
-        "summary": "Mint a fresh credential for a pool that already exists; shown once. The body may carry `purpose` and `expiresAt`.",
+        "summary": "Mint a fresh credential for a pool that already exists; shown once, as `poolToken` and — when this API advertises an address — as `joinToken`. The body may carry `purpose` and `expiresAt`.",
         "tags": [
           "Pools"
         ]
@@ -6673,6 +6718,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -7151,6 +7200,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -7623,6 +7676,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -8033,6 +8090,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -8372,6 +8433,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -8711,6 +8776,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -9121,6 +9190,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -9583,6 +9656,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -9993,6 +10070,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -10762,6 +10843,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -11172,6 +11257,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -11511,6 +11600,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -12113,6 +12206,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -12585,6 +12682,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -12995,6 +13096,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -13405,6 +13510,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -13815,6 +13924,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -14225,6 +14338,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -14827,6 +14944,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -15281,6 +15402,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -15785,6 +15910,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"

@@ -119,6 +119,7 @@ async fn a_directly_booted_kernel_runs_and_says_so() {
         memory_mib: 1024,
         image: "projects/p1/images/netboot".into(),
         root_disk_gib: 1,
+        boot_disk: None,
         nics: vec![],
         cpu_baseline: None,
     };

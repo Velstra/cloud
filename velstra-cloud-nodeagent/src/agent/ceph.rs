@@ -143,6 +143,30 @@ impl Agent {
             .await,
         );
 
+        // A monitor holds the admin keyring, so it is the node that can say
+        // what a *client* needs — and every monitor says the same thing, so it
+        // is fine that all of them do. Nothing is written to the cluster: both
+        // commands are idempotent reads of state the bootstrap made.
+        if daemons.0 {
+            let pools: Vec<String> = cluster.spec.pools.iter().map(|p| p.pool.clone()).collect();
+            match self.cephadm.client_config(&pools).await {
+                Ok((conf, keyring)) => {
+                    if let Some(mine) = host.ceph.as_mut() {
+                        mine.client_conf = conf;
+                        mine.client_keyring = keyring;
+                    }
+                }
+                Err(e) => tracing::debug!(error = %e, "could not read the client configuration"),
+            }
+        }
+
+        // Every node, named in the cluster or not: a hypervisor that runs no
+        // Ceph daemon still opens the cluster's volumes, and this is how it
+        // gets the files to do it with. Before the `concerns_me` return, on
+        // purpose — that return is about the *deployment*, and this is not
+        // deployment.
+        self.install_client_files(cluster).await;
+
         // Reported, and then done with: a node the deployment has no business
         // with still publishes its disks and its daemons, because that is what
         // an operator reads when deciding to add it.
@@ -222,6 +246,48 @@ impl Agent {
     /// cell: the list was filtered, which means this agent's identity is not a
     /// cell operator. Said once, because it is a configuration mistake and
     /// repeating it every resync would bury everything else.
+    /// Put the cluster's client files where QEMU looks, when the cell has
+    /// published them and they differ from what is there.
+    ///
+    /// Rewritten only on change, so a keyring is not touched on every pass —
+    /// and created with the keyring's mode rather than chmod'd afterwards,
+    /// because a credential that was world-readable for a moment was
+    /// world-readable.
+    async fn install_client_files(&self, cluster: &velstra_cloud_model::ceph::CephCluster) {
+        let Some(dir) = &self.config.ceph_client_dir else {
+            return;
+        };
+        let (conf, keyring) = (&cluster.status.client_conf, &cluster.status.client_keyring);
+        if conf.is_empty() || keyring.is_empty() {
+            return;
+        }
+        for (name, contents, mode) in [("ceph.conf", conf, 0o644), ("keyring", keyring, 0o600)] {
+            let path = dir.join(name);
+            if tokio::fs::read_to_string(&path).await.ok().as_deref() == Some(contents.as_str()) {
+                continue;
+            }
+            if let Err(e) = tokio::fs::create_dir_all(dir).await {
+                tracing::warn!(error = %e, dir = %dir.display(), "could not make the Ceph client directory");
+                return;
+            }
+            let written = async {
+                let mut options = tokio::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true).mode(mode);
+                let mut file = options.open(&path).await?;
+                tokio::io::AsyncWriteExt::write_all(&mut file, contents.as_bytes()).await
+            }
+            .await;
+            match written {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), "wrote the cell's Ceph client file")
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "could not write the Ceph client file")
+                }
+            }
+        }
+    }
+
     fn say_if_filtered(&self, nodes: &[velstra_cloud_model::resources::Node]) {
         if nodes.iter().any(|n| n.meta.name.id() == self.config.node) {
             return;

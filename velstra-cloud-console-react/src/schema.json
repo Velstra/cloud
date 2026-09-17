@@ -40,6 +40,20 @@
     "atCreation": true
    },
    {
+    "key": "bootVolume",
+    "label": "Root disk on",
+    "kind": "ref",
+    "collection": "volumes",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "a file on this guest's own machine",
+    "help": "Left empty, the root disk is a file on whichever machine runs this guest, sized by the flavor — and the guest cannot be moved to another machine, because moving a guest does not move its disk. Named, the root disk is that volume, in its pool: it is sized by the volume rather than by the flavor, it outlives the guest, and a guest whose root is in a pool both machines can reach can be moved between them.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
     "key": "vcpus",
     "label": "vCPUs",
     "kind": "number",

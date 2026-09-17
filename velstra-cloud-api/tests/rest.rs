@@ -105,6 +105,21 @@ impl Harness {
     ///
     /// Named here rather than read from the environment inside the handler, so
     /// two tests in one process cannot disagree about which console this is.
+    /// A cell that knows where it can be reached, so registrations answer
+    /// with a join token.
+    fn with_join(urls: Vec<String>, cert_pem: &str) -> Self {
+        let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single(TOKEN));
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+            .with_cell_admins(vec!["dev".into()])
+            .with_join_facts(urls, cert_pem.to_string());
+        Self {
+            router: velstra_cloud_api::server(api.clone()),
+            store,
+            api,
+        }
+    }
+
     fn with_console(dir: &std::path::Path) -> Self {
         let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single(TOKEN));
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
@@ -6269,4 +6284,240 @@ async fn the_console_and_its_files_are_reachable_before_anyone_has_signed_in() {
         StatusCode::UNAUTHORIZED
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A guest's root disk is one nothing else is holding.**
+///
+/// Booting from a volume makes it the guest's root: the machine opens it
+/// read-write at start and keeps it open while the guest runs. Two machines
+/// with the same disk open is the corruption an attachment's finalizer exists
+/// to prevent, and a boot disk is no different for being first.
+#[tokio::test]
+async fn a_boot_volume_is_refused_when_something_else_holds_it() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    h.pool("local").await;
+    for id in ["root-a", "root-b"] {
+        let made = h
+            .post(
+                "projects/p1/volumes",
+                json!({ "id": id, "spec": { "sizeGib": 5, "pool": "local" } }),
+            )
+            .await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    }
+
+    // A volume that is there, held by nobody: the ordinary case.
+    let made = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "web", "spec": {
+                "vcpus": 1, "memoryMib": 512, "node": "node-a",
+                "bootVolume": "projects/p1/volumes/root-a",
+            }}),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+    let back = h.get("projects/p1/instances/web").await;
+    assert_eq!(
+        back.body["spec"]["bootVolume"],
+        json!("projects/p1/volumes/root-a"),
+        "{:?}",
+        back.body
+    );
+
+    // The same volume, for a second guest.
+    let refused = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "web2", "spec": {
+                "vcpus": 1, "memoryMib": 512, "node": "node-a",
+                "bootVolume": "projects/p1/volumes/root-a",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let why = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(why.contains("already boots from"), "{why}");
+    assert_eq!(refused.body["error"]["field"], json!("spec.bootVolume"));
+
+    // One that is attached, which is the same disk open twice by another route.
+    let attached = h
+        .post(
+            "projects/p1/attachments",
+            json!({ "id": "mount", "spec": {
+                "volume": "projects/p1/volumes/root-b",
+                "instance": "projects/p1/instances/web",
+            }}),
+        )
+        .await;
+    assert_eq!(attached.status, StatusCode::ACCEPTED, "{:?}", attached.body);
+    let refused = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "web3", "spec": {
+                "vcpus": 1, "memoryMib": 512, "node": "node-a",
+                "bootVolume": "projects/p1/volumes/root-b",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is attached by"),
+        "{:?}",
+        refused.body
+    );
+
+    // And one that does not exist at all, said as what it is rather than as a
+    // failure somewhere downstream.
+    let refused = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "web4", "spec": {
+                "vcpus": 1, "memoryMib": 512, "node": "node-a",
+                "bootVolume": "projects/p1/volumes/never-made",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("there is no volume called"),
+        "{:?}",
+        refused.body
+    );
+
+    // Another project's volume is not this project's to boot from.
+    let refused = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "web5", "spec": {
+                "vcpus": 1, "memoryMib": 512, "node": "node-a",
+                "bootVolume": "projects/p2/volumes/root-a",
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("its own project"),
+        "{:?}",
+        refused.body
+    );
+}
+
+/// Registering a node on a cell that advertises itself answers with the whole
+/// hand-off in one string — and the string carries what the six routes used
+/// to: cell, region, node, addresses, certificate, credential. See
+/// `docs/joining.md`.
+#[tokio::test]
+async fn a_registration_answers_with_a_join_token_when_the_cell_is_reachable() {
+    let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+    let h = Harness::with_join(
+        vec![
+            "https://10.10.10.8:8443".into(),
+            "https://horst:8443".into(),
+        ],
+        pem,
+    );
+    let made = h
+        .post(
+            "nodes",
+            json!({ "id": "peter", "spec": { "schedulable": true } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{}", made.body);
+    let bare = made.body["nodeToken"].as_str().expect("a node token");
+    let join = made.body["joinToken"].as_str().expect("a join token");
+    let t = velstra_cloud_wire::join::JoinToken::decode(join).expect("decodes");
+    assert_eq!(t.node, "peter");
+    assert_eq!(t.cell, "cell-1");
+    assert_eq!(t.region, "eu-central");
+    assert_eq!(
+        t.urls,
+        vec!["https://10.10.10.8:8443", "https://horst:8443"]
+    );
+    assert_eq!(t.ca, pem);
+    assert_eq!(
+        t.token, bare,
+        "the join token carries the same credential the bare field does"
+    );
+    assert!(t.pool.is_none());
+
+    // A second credential for a machine that already exists, the same way.
+    let again = h.post("nodes/peter:issueCredential", json!({})).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    let t2 = velstra_cloud_wire::join::JoinToken::decode(
+        again.body["joinToken"]
+            .as_str()
+            .expect("a join token on re-issue"),
+    )
+    .expect("decodes");
+    assert_eq!(t2.node, "peter");
+    assert_ne!(t2.token, bare, "re-issue mints a fresh credential");
+
+    // A pool's token names the pool and carries its own credential.
+    let pool = h
+        .post(
+            "pools",
+            json!({ "id": "local-2", "spec": { "accepting": true } }),
+        )
+        .await;
+    assert_eq!(pool.status, StatusCode::ACCEPTED, "{}", pool.body);
+    let tp = velstra_cloud_wire::join::JoinToken::decode(
+        pool.body["joinToken"].as_str().expect("a pool join token"),
+    )
+    .expect("decodes");
+    let p = tp.pool.expect("a pool credential");
+    assert_eq!(p.id, "local-2");
+    assert_eq!(p.token, pool.body["poolToken"].as_str().unwrap());
+    assert!(
+        tp.token.is_empty(),
+        "a pool-only token carries no node credential"
+    );
+}
+
+/// A cell that advertises nothing mints nothing — a token nobody could use
+/// is worse than the field's absence, which the console reads as "not here".
+#[tokio::test]
+async fn a_cell_nobody_can_reach_mints_no_join_token() {
+    let h = Harness::new();
+    let made = h
+        .post(
+            "nodes",
+            json!({ "id": "peter", "spec": { "schedulable": true } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{}", made.body);
+    assert!(made.body["nodeToken"].is_string());
+    assert!(made.body.get("joinToken").is_none(), "{}", made.body);
 }

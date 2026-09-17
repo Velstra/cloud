@@ -1090,6 +1090,7 @@ mod tests {
             memory_mib: 2048,
             image: "sha256:abc".into(),
             root_disk_gib: 10,
+            boot_disk: None,
             nics: vec![],
             cpu_baseline: None,
         }

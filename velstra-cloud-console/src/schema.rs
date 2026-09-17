@@ -1531,6 +1531,41 @@ const INSTANCE_FIELDS: &[Field] = &[
         at_creation: true,
     },
     Field {
+        key: "bootVolume",
+        // Named for the choice, not for the field. "Where the root disk lives"
+        // is the question somebody actually has in front of them, and the two
+        // answers are this machine and a pool.
+        label: "Root disk on",
+        kind: Kind::Ref {
+            collection: "volumes",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: false,
+        advanced: true,
+        help: "Left empty, the root disk is a file on whichever machine runs \
+               this guest, sized by the flavor — and the guest cannot be moved \
+               to another machine, because moving a guest does not move its \
+               disk. Named, the root disk is that volume, in its pool: it is \
+               sized by the volume rather than by the flavor, it outlives the \
+               guest, and a guest whose root is in a pool both machines can \
+               reach can be moved between them.",
+        // Said out loud, because the empty case is a real choice with a real
+        // consequence and not an absence.
+        when_empty: "a file on this guest's own machine",
+        derived: false,
+        // Behind the disclosure, and the guard above is why: the common path is
+        // the five things somebody fills in every time — image, size, network,
+        // key, first-boot file — and this is not one of them. The default is
+        // right for a cell with one machine and for every guest that is never
+        // going to move, which is most of them. It is a real choice with a real
+        // consequence, so it is offered and explained; it is not a sixth box
+        // between somebody and a machine.
+        // Where a machine boots from is decided when it is made. Changing it
+        // afterwards is building a different machine.
+        at_creation: true,
+    },
+    Field {
         key: "vcpus",
         label: "vCPUs",
         kind: Kind::Number {

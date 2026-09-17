@@ -179,6 +179,14 @@ pub struct VmRequest {
     pub memory_mib: u64,
     pub image: String,
     pub root_disk_gib: u64,
+    /// Where the root disk is, when the guest boots from a volume.
+    ///
+    /// `None` — every guest before this — means the VMM is to use the file
+    /// this agent keeps for it, sized by `root_disk_gib`. `Some` is the place
+    /// an attached disk would be opened by: a path, or an `rbd:` image. A guest
+    /// that boots from one is not tied to this machine's filesystem, which is
+    /// the whole reason to do it.
+    pub boot_disk: Option<String>,
     /// The guest's NICs, in the order the instance's ports are declared. The
     /// order is the guest's NIC order, and a guest that finds its addresses on
     /// the wrong NIC after a restart is an outage with no error message.

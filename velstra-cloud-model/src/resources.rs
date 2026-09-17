@@ -1502,6 +1502,29 @@ pub struct InstanceSpec {
     /// `projects/p1/images/sha256-…`
     pub image: String,
     pub root_disk_gib: u64,
+    /// The volume this guest boots from, instead of a disk on the machine's
+    /// own filesystem.
+    ///
+    /// Empty — the default, and what every guest before this was — means the
+    /// node writes a `root.raw` in its own state directory, sized by the
+    /// flavor. That is the right shape for a laptop cell and the wrong one for
+    /// every cell with shared storage, because **a disk on one machine's
+    /// filesystem is the reason a guest cannot move**: migration refuses
+    /// outright unless every node mounts one shared state directory, and says
+    /// so in [`crate::migration`] — "a guest stays where its disk is".
+    ///
+    /// Named, the root disk is an ordinary [`Volume`] in an ordinary pool, with
+    /// everything that follows from it: it is sized by the volume and not by
+    /// the flavor, it can be made from an image like any other volume, it
+    /// survives the guest, and a guest whose root is in a pool both machines
+    /// can reach can be moved between them without a shared filesystem.
+    ///
+    /// The volume is the guest's alone while it is named here: it may not also
+    /// be attached, and no second guest may boot from it. Two machines with the
+    /// same root disk open is the corruption an attachment's finalizer exists
+    /// to prevent, and a boot disk is no different for being first.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_volume: String,
     /// What an operator wants it to be doing. Not a command — asking twice is
     /// the same as asking once.
     pub desired_state: DesiredState,

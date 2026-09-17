@@ -156,6 +156,7 @@ async fn a_stock_cloud_image_boots_and_says_so() {
         memory_mib: 512,
         image: format!("projects/p1/images/sha256-{digest}"),
         root_disk_gib: 1,
+        boot_disk: None,
         nics: vec![],
         cpu_baseline: None,
     };

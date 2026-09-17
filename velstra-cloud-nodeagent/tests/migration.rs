@@ -374,6 +374,7 @@ async fn a_receiver_that_outlived_its_transfer_is_taken_down() {
         memory_mib: 2048,
         image: IMAGE.to_string(),
         root_disk_gib: 20,
+        boot_disk: None,
         nics: vec![],
         cpu_baseline: None,
     };

@@ -716,6 +716,8 @@ impl From<&ceph::NodeCeph> for v1::NodeCeph {
             cluster_hosts: c.cluster_hosts.clone(),
             address: c.address.clone(),
             ssh_pubkey: c.ssh_pubkey.clone(),
+            client_conf: c.client_conf.clone(),
+            client_keyring: c.client_keyring.clone(),
             trusts_key: c.trusts_key,
             seen: c.seen.as_ref().map(Into::into),
         }
@@ -734,6 +736,8 @@ impl From<&v1::NodeCeph> for ceph::NodeCeph {
             cluster_hosts: c.cluster_hosts.clone(),
             address: c.address.clone(),
             ssh_pubkey: c.ssh_pubkey.clone(),
+            client_conf: c.client_conf.clone(),
+            client_keyring: c.client_keyring.clone(),
             trusts_key: c.trusts_key,
             seen: c.seen.as_ref().map(Into::into),
         }
@@ -1086,6 +1090,7 @@ impl From<&resources::InstanceSpec> for v1::InstanceSpec {
             memory_mib: s.memory_mib,
             image: s.image.clone(),
             root_disk_gib: s.root_disk_gib,
+            boot_volume: s.boot_volume.clone(),
             flavor: s.flavor.clone(),
             desired_state: v1::DesiredState::from(s.desired_state) as i32,
             ports: s.ports.clone(),
@@ -1114,6 +1119,7 @@ impl From<&v1::InstanceSpec> for resources::InstanceSpec {
             memory_mib: s.memory_mib,
             image: s.image.clone(),
             root_disk_gib: s.root_disk_gib,
+            boot_volume: s.boot_volume.clone(),
             flavor: s.flavor.clone(),
             desired_state: s.desired_state().into(),
             ports: s.ports.clone(),
@@ -2002,6 +2008,7 @@ mod tests {
             meta,
             InstanceSpec {
                 flavor: None,
+                boot_volume: "projects/p1/volumes/root-1".into(),
                 volumes: Vec::new(),
                 start_order: 0,
                 start_delay_s: 0,

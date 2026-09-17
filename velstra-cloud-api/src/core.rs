@@ -220,6 +220,13 @@ pub struct Created {
     /// registration answers with exactly one of them, and which one says what
     /// was registered.
     pub pool_token: Option<String>,
+    /// The whole hand-off in one string: the token above, plus where this API
+    /// answers, its certificate, and which cell and region this is.
+    ///
+    /// Present only when the API was told what to advertise (`--advertise`)
+    /// and serves TLS — a cell that is plaintext on loopback has nothing a
+    /// stranger could join. See `docs/joining.md`.
+    pub join_token: Option<String>,
 }
 
 /// The outcome of a change: the object as it now stands, and the operation
@@ -451,6 +458,12 @@ impl Scratch {
     }
 }
 
+/// What this API tells a machine that wants to join it. See `docs/joining.md`.
+struct JoinFacts {
+    urls: Vec<String>,
+    cert_pem: String,
+}
+
 struct Inner {
     /// What this instance has been asked to do, for `/metrics`.
     requests: Requests,
@@ -505,6 +518,9 @@ struct Inner {
     /// and nothing else can: they are not in `collections`, so there is no
     /// route, no list, no watch and no proxy hop that arrives at them.
     identity: crate::sessions::IdentityStore,
+    /// What a joining machine is told about this API, or `None` when there is
+    /// nothing to tell: no advertised address, or no certificate to verify.
+    join: Option<JoinFacts>,
     /// One allowance per caller, for **writes**.
     ///
     /// A mutex rather than anything cleverer: taking a token is a few integer
@@ -756,6 +772,7 @@ impl Api {
                 placement: Placement::new(region, cell),
                 verifier: verifier.clone(),
                 identity: crate::sessions::IdentityStore::new(store.clone(), region, cell),
+                join: None,
                 limiter: std::sync::Mutex::new(velstra_cloud_model::limit::Limiter::new()),
                 // Off unless a caller asks for it: a limiter is about one
                 // tenant taking the write path from another, and a cell with
@@ -943,6 +960,14 @@ impl Api {
         if self.may_see_machines(who) {
             return;
         }
+        // The client keyring is published on the cluster's status so every
+        // hypervisor can read it; it is still a credential, and nobody who is
+        // not an operator has a use for it.
+        if kind == "ceph-clusters"
+            && let Some(status) = document.get_mut("status").and_then(Value::as_object_mut)
+        {
+            status.remove("clientKeyring");
+        }
         // `captures` is the sixth door: the API itself writes the guest's
         // machine onto `spec.node` (it is the assignee — only the machine with
         // the disk can copy it), and the agent claims `status.node`. Both
@@ -1004,6 +1029,53 @@ impl Api {
     /// Named by the caller rather than read from the environment inside the
     /// handler, so a test can serve a console it wrote itself and two tests in
     /// the same process cannot disagree about which one this is.
+    /// Tell this API what to say to a machine that wants to join.
+    ///
+    /// `urls` are tried in order by the joiner and must be names the
+    /// certificate at `cert_pem` verifies for. They are, because the code that
+    /// writes `VELSTRA_ADVERTISE` is the code that chose the certificate's
+    /// names — one list, two consumers, and nothing here parses X.509 to check.
+    pub fn with_join_facts(mut self, urls: Vec<String>, cert_pem: String) -> Self {
+        let urls: Vec<String> = urls
+            .into_iter()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect();
+        if !urls.is_empty() && !cert_pem.trim().is_empty() {
+            Arc::get_mut(&mut self.inner)
+                .expect("with_join_facts is called before the Api is shared")
+                .join = Some(JoinFacts { urls, cert_pem });
+        }
+        self
+    }
+
+    /// The join token for a freshly issued credential, or `None` when this
+    /// API has nothing a stranger could reach.
+    fn join_token(
+        &self,
+        id: &str,
+        node_token: Option<&str>,
+        pool: Option<(&str, &str)>,
+    ) -> Option<String> {
+        let facts = self.inner.join.as_ref()?;
+        Some(
+            velstra_cloud_wire::join::JoinToken {
+                v: 1,
+                region: self.inner.placement.region.clone(),
+                cell: self.inner.placement.cell.clone(),
+                node: id.to_string(),
+                urls: facts.urls.clone(),
+                ca: facts.cert_pem.clone(),
+                token: node_token.unwrap_or_default().to_string(),
+                pool: pool.map(|(id, token)| velstra_cloud_wire::join::PoolJoin {
+                    id: id.to_string(),
+                    token: token.to_string(),
+                }),
+            }
+            .encode(),
+        )
+    }
+
     pub fn with_console_dir(mut self, dir: &std::path::Path) -> Self {
         let read = crate::console_files::Console::read(dir).map(Arc::new);
         let inner =
@@ -2878,6 +2950,7 @@ impl Api {
                     target: record.target,
                     node_token: None,
                     pool_token: None,
+                    join_token: None,
                 },
                 true,
             ));
@@ -3046,6 +3119,8 @@ impl Api {
                 .await?;
         }
         if kind == "instances" {
+            self.refuse_a_boot_volume_that_is_not_free(parent, &name, &spec)
+                .await?;
             self.refuse_a_device_this_project_was_not_given(&spec, allowed_in, who)
                 .await?;
             self.refuse_a_port_two_guests_would_share(&name, &spec)
@@ -3292,11 +3367,17 @@ impl Api {
             None
         };
         self.record_change(who, "create", &name).await;
+        let join_token = match (&node_token, &pool_token) {
+            (Some(t), _) => self.join_token(name.id(), Some(t), None),
+            (None, Some(t)) => self.join_token(name.id(), None, Some((name.id(), t))),
+            (None, None) => None,
+        };
         Ok(Created {
             operation,
             target: name.to_string(),
             node_token,
             pool_token,
+            join_token,
         })
     }
 
@@ -3632,7 +3713,15 @@ impl Api {
         } else {
             "poolToken"
         };
+        let join = if kind == "nodes" {
+            self.join_token(name.id(), Some(&token), None)
+        } else {
+            self.join_token(name.id(), None, Some((name.id(), &token)))
+        };
         body.insert(field.into(), Value::String(token));
+        if let Some(join) = join {
+            body.insert("joinToken".into(), Value::String(join));
+        }
         // No `operation`: nothing converges here. A create answers with one
         // because the object it made has not settled yet; a credential is
         // finished the moment it is in the answer, and a field naming an
@@ -6490,6 +6579,120 @@ impl Api {
         Ok(())
     }
 
+    /// A guest's root disk is one nothing else is holding.
+    ///
+    /// Booting from a volume makes it the guest's root: the machine opens it
+    /// read-write at start and keeps it open for as long as it runs. Two
+    /// machines with the same disk open is the corruption an attachment's
+    /// finalizer exists to prevent, and a *boot* disk is no different for being
+    /// first — so the same volume may not also be attached, and no second guest
+    /// may boot from it.
+    ///
+    /// Asked at the door because every part of it is knowable there, and
+    /// because the alternative is a guest that starts, writes, and finds out
+    /// later. What is deliberately *not* asked here is whether the machine that
+    /// ends up running this guest can reach the volume's pool: at create time
+    /// there is no machine yet. That is the scheduler's question, and it is
+    /// answered where placement is decided.
+    async fn refuse_a_boot_volume_that_is_not_free(
+        &self,
+        parent: &str,
+        instance: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let Some(asked) = spec.get("boot_volume").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if asked.is_empty() {
+            return Ok(());
+        }
+        // Its own project's, and said as such. A name from somewhere else is a
+        // typo far more often than it is an attempt at anything, and the
+        // sentence that helps is the one that says where it looked.
+        let home = if parent.is_empty() {
+            String::new()
+        } else {
+            parent.to_string()
+        };
+        if !asked.starts_with(&format!("{home}/volumes/")) {
+            return Err(ApiError::invalid(format!(
+                "a guest boots from a volume in its own project. `{asked}` is not one of \
+                 {home}'s."
+            ))
+            .at("spec.bootVolume"));
+        }
+
+        let Ok(volumes) = self.collection("volumes") else {
+            return Ok(());
+        };
+        if !matches!(volumes.get(asked).await, Ok(Some(_))) {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "there is no volume called `{asked}`. A guest that boots from one needs it \
+                     to exist first — make the volume, from an image if it is to be bootable, \
+                     and name it here."
+                ),
+            )
+            .at("spec.bootVolume"));
+        }
+
+        // Held by an attachment, which is the same disk open twice.
+        if let Ok(attachments) = self.collection("attachments") {
+            let held = attachments.list().await.unwrap_or_default();
+            if let Some(holder) = held.iter().find(|a| {
+                a.get("spec")
+                    .and_then(|s| s.get("volume"))
+                    .and_then(Value::as_str)
+                    == Some(asked)
+            }) {
+                let by = holder
+                    .get("meta")
+                    .and_then(|m| m.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("something");
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "`{asked}` is attached by {by}, and a root disk is opened read-write for \
+                         as long as the guest runs. Detach it first, or boot from another volume."
+                    ),
+                )
+                .at("spec.bootVolume"));
+            }
+        }
+
+        // Held by another guest's boot.
+        if let Ok(instances) = self.collection("instances") {
+            let guests = instances.list().await.unwrap_or_default();
+            if let Some(other) = guests.iter().find(|g| {
+                g.get("spec")
+                    .and_then(|s| s.get("boot_volume"))
+                    .and_then(Value::as_str)
+                    == Some(asked)
+                    && g.get("meta")
+                        .and_then(|m| m.get("name"))
+                        .and_then(Value::as_str)
+                        != Some(instance.to_string().as_str())
+            }) {
+                let by = other
+                    .get("meta")
+                    .and_then(|m| m.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("another guest");
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "{by} already boots from `{asked}`. Two machines with the same root disk \
+                         open is the way to lose what is on it."
+                    ),
+                )
+                .at("spec.bootVolume"));
+            }
+        }
+        Ok(())
+    }
+
     /// A disk on one machine cannot be opened by a guest on another.
     ///
     /// The volume names a pool, the pool may name the machine its bytes are on,
@@ -9179,6 +9382,11 @@ pub fn created_body(created: &Created) -> Value {
     }
     if let Some(token) = &created.pool_token {
         body.insert("poolToken".into(), Value::String(token.clone()));
+    }
+    // The whole hand-off in one string, when this API can be reached at all.
+    // See docs/joining.md.
+    if let Some(join) = &created.join_token {
+        body.insert("joinToken".into(), Value::String(join.clone()));
     }
     Value::Object(body)
 }

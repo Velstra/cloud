@@ -124,6 +124,8 @@ fn every_resource_survives_its_own_wire() {
                 can_mask: true,
             }),
             ceph: Some(NodeCeph {
+                client_conf: "[global]\nfsid = 1\nmon_host = 10.0.0.5\n".into(),
+                client_keyring: "[client.velstra]\n\tkey = AQ==\n".into(),
                 installed: true,
                 version: "19.2.0".into(),
                 monitor: true,
@@ -229,6 +231,8 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "CephClusterStatus",
         CephClusterStatus {
+            client_conf: "[global]\nfsid = 1\nmon_host = 10.0.0.5\n".into(),
+            client_keyring: "[client.velstra]\n\tkey = AQ==\n".into(),
             ssh_pubkey: "ssh-ed25519 AAAA cluster".into(),
             observed_generation: 2,
             conditions: vec![],
@@ -325,6 +329,7 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "InstanceSpec",
         InstanceSpec {
+            boot_volume: "projects/p1/volumes/root-1".into(),
             flavor: None,
             start_order: 0,
             start_delay_s: 0,

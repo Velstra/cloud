@@ -67,6 +67,27 @@ impl DiskController {
 /// `AlreadyExists` — which is the right answer — instead of a second attachment
 /// for one disk. The evacuation controller derives a migration's name for the
 /// same reason.
+/// Every volume this guest needs open, the one it boots from first.
+///
+/// First because order is what would distinguish them if anything downstream
+/// ever read the list positionally: a guest's root disk is the disk it starts
+/// from, and a machine that opened its data disks first and its root second
+/// would be a machine that boots from the wrong one. Nothing relies on the
+/// order today — the agent picks the boot disk out by name — and the day
+/// something does, the answer is already here.
+fn boot_first(instance: &Instance) -> Vec<String> {
+    let mut all = Vec::with_capacity(instance.spec.volumes.len() + 1);
+    if !instance.spec.boot_volume.is_empty() {
+        all.push(instance.spec.boot_volume.clone());
+    }
+    for volume in &instance.spec.volumes {
+        if *volume != instance.spec.boot_volume {
+            all.push(volume.clone());
+        }
+    }
+    all
+}
+
 pub fn attachment_name(instance: &str, volume: &str) -> Option<String> {
     let i = ResourceName::parse(instance).ok()?;
     let v = ResourceName::parse(volume).ok()?;
@@ -195,7 +216,18 @@ impl Reconciler for DiskController {
 
         let mine = self.mine(name).await?;
 
-        for volume in &instance.spec.volumes {
+        // The boot volume is one more disk this guest asked for, and it is
+        // attached by the same rule as the rest. It is kept out of
+        // `spec.volumes` because it is not a disk somebody adds and removes —
+        // it is what the machine boots from, decided when the machine is made —
+        // but from here the two are the same thing: a volume this guest needs
+        // open, on the node holding it, at a place only the pool can say.
+        //
+        // Minted here rather than at create for the reason the port controller
+        // learned the hard way: an attachment names the node holding the guest,
+        // and at create time there is none.
+        for volume in boot_first(instance) {
+            let volume = &volume;
             let Some(attachment) = attachment_name(name, volume) else {
                 continue;
             };
@@ -243,7 +275,9 @@ impl Reconciler for DiskController {
         // Taken off the list: detach. Only ours — an attachment somebody made by
         // hand is theirs, and removing it would be a detach nobody asked for.
         for existing in &mine {
-            if instance.spec.volumes.contains(&existing.spec.volume) {
+            if instance.spec.volumes.contains(&existing.spec.volume)
+                || existing.spec.volume == instance.spec.boot_volume
+            {
                 continue;
             }
             if existing.meta.is_deleting() {
@@ -291,7 +325,7 @@ pub mod tests {
         meta(name)
     }
 
-    fn meta(name: &str) -> Meta {
+    pub(super) fn meta(name: &str) -> Meta {
         Meta::new(
             ResourceName::parse(name).unwrap(),
             Placement::new("eu-central", "cell-1"),
@@ -579,6 +613,127 @@ mod the_ones_nobody_witnessed {
             live.iter()
                 .map(|a| a.meta.name.to_string())
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod boot_volume_tests {
+    use velstra_cloud_model::{
+        access::Writer,
+        resources::{Instance, InstanceSpec, InstanceStatus, Resource},
+    };
+
+    use super::{
+        tests::{cell, meta},
+        *,
+    };
+
+    const GUEST: &str = "projects/p1/instances/db";
+
+    /// A guest with a root disk in a pool, placed on a node.
+    async fn booted_from(
+        instances: &velstra_cloud_store::TypedStore<InstanceSpec, InstanceStatus>,
+        boot: &str,
+        volumes: &[&str],
+    ) -> Instance {
+        let object = Resource::new(
+            meta(GUEST),
+            InstanceSpec {
+                boot_volume: boot.to_string(),
+                volumes: volumes.iter().map(|v| v.to_string()).collect(),
+                ..InstanceSpec::default()
+            },
+            InstanceStatus {
+                node: Some("nodes/n1".into()),
+                ..InstanceStatus::default()
+            },
+        );
+        instances
+            .create(&object, &Writer::controller("test"))
+            .await
+            .unwrap();
+        object
+    }
+
+    /// **A guest that boots from a volume gets that volume attached.**
+    ///
+    /// The root disk has to be open on the node before the machine starts, and
+    /// the only party that knows where a volume's bytes are is its pool — which
+    /// says so on the attachment, once one exists. So the boot volume is
+    /// attached by the same rule as every other disk, and it is not in
+    /// `spec.volumes` because it is not a disk somebody adds and removes.
+    #[tokio::test]
+    async fn the_boot_volume_is_attached_like_any_other_disk() {
+        let (disk, attachments, instances) = cell().await;
+        let guest = booted_from(
+            &instances,
+            "projects/p1/volumes/root-1",
+            &["projects/p1/volumes/data"],
+        )
+        .await;
+
+        disk.reconcile(GUEST, Some(&guest)).await.unwrap();
+
+        let mut volumes: Vec<String> = attachments
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.spec.volume.clone())
+            .collect();
+        volumes.sort();
+        assert_eq!(
+            volumes,
+            vec![
+                "projects/p1/volumes/data".to_string(),
+                "projects/p1/volumes/root-1".to_string()
+            ],
+            "the guest's root disk was not attached"
+        );
+    }
+
+    /// And it is not detached again on the next pass.
+    ///
+    /// The removal rule is "take away what `spec.volumes` no longer lists", and
+    /// the boot volume is deliberately not in that list. Reading it as removed
+    /// would detach a running machine's root disk once a pass, for ever.
+    #[tokio::test]
+    async fn the_boot_volume_is_not_detached_for_being_absent_from_the_list() {
+        let (disk, attachments, instances) = cell().await;
+        let guest = booted_from(&instances, "projects/p1/volumes/root-1", &[]).await;
+
+        disk.reconcile(GUEST, Some(&guest)).await.unwrap();
+        disk.reconcile(GUEST, Some(&guest)).await.unwrap();
+
+        let made = attachments.list().await.unwrap();
+        let root = made
+            .iter()
+            .find(|a| a.spec.volume == "projects/p1/volumes/root-1")
+            .expect("the root disk's attachment");
+        assert!(
+            !root.meta.is_deleting(),
+            "a running guest's root disk was detached for not being in spec.volumes"
+        );
+    }
+
+    /// Naming the same volume twice asks for it once.
+    #[tokio::test]
+    async fn a_boot_volume_also_listed_as_a_disk_is_not_asked_for_twice() {
+        let (_disk, _attachments, instances) = cell().await;
+        let guest = booted_from(
+            &instances,
+            "projects/p1/volumes/root-1",
+            &["projects/p1/volumes/root-1", "projects/p1/volumes/data"],
+        )
+        .await;
+        assert_eq!(
+            boot_first(&guest),
+            vec![
+                "projects/p1/volumes/root-1".to_string(),
+                "projects/p1/volumes/data".to_string()
+            ],
+            "the root disk was asked for twice"
         );
     }
 }

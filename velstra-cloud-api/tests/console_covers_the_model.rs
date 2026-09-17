@@ -108,6 +108,7 @@ mod complete {
     pub fn instance() -> InstanceSpec {
         InstanceSpec {
             flavor: None,
+            boot_volume: String::new(),
             start_order: 0,
             start_delay_s: 0,
             on_node_loss: Default::default(),
@@ -889,6 +890,8 @@ mod settled {
 
     pub fn ceph_cluster() -> CephClusterStatus {
         CephClusterStatus {
+            client_conf: "[global]\nfsid = 1\nmon_host = 10.0.0.5\n".into(),
+            client_keyring: "[client.velstra]\n\tkey = AQ==\n".into(),
             ssh_pubkey: "ssh-ed25519 AAAA cluster".into(),
             observed_generation: 1,
             conditions: vec![],

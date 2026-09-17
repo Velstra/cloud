@@ -405,6 +405,8 @@ survives_the_wire!(
             cluster_hosts: vec!["hv-1".into(), "hv-2".into()],
             address: "10.0.0.5".into(),
             ssh_pubkey: "ssh-ed25519 AAAA cluster".into(),
+            client_conf: "[global]\nfsid = 1\nmon_host = 10.0.0.5\n".into(),
+            client_keyring: "[client.velstra]\n\tkey = AQ==\n".into(),
             trusts_key: true,
             seen: Some(velstra_cloud_model::ceph::CephSeen {
                 health: "HEALTH_WARN".into(),
@@ -539,6 +541,7 @@ survives_the_wire!(
         memory_mib: 8192,
         image: "projects/p1/images/sha256-abc".into(),
         root_disk_gib: 40,
+        boot_volume: "projects/p1/volumes/root-1".into(),
         // `Running` is the default, so `Stopped` is the distinct one.
         desired_state: resources::DesiredState::Stopped,
         ports: vec!["projects/p1/ports/port-a".into()],
@@ -557,8 +560,8 @@ survives_the_wire!(
         },
     },
     {
-        vcpus, memory_mib, image, root_disk_gib, desired_state, ports, networks, volumes, ssh_keys,
-        user_data, node, placement_policy, devices, console, on_node_loss,
+        vcpus, memory_mib, image, root_disk_gib, boot_volume, desired_state, ports, networks,
+        volumes, ssh_keys, user_data, node, placement_policy, devices, console, on_node_loss,
         start_order, start_delay_s, flavor,
     }
 );
@@ -1209,6 +1212,7 @@ whole_object_survives!(
         memory_mib: 8192,
         image: "projects/p1/images/sha256-abc".into(),
         root_disk_gib: 40,
+        boot_volume: "projects/p1/volumes/root-1".into(),
         desired_state: resources::DesiredState::Stopped,
         ports: vec!["projects/p1/ports/port-a".into()],
         networks: vec!["projects/p1/networks/prod".to_string()],
