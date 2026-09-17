@@ -61,6 +61,7 @@ pub mod api_cell;
 pub mod balancer;
 pub mod bgp;
 pub mod cell;
+pub mod ceph_access;
 pub mod ceph_deploy;
 pub mod ceph_pool;
 pub mod ceph_seen;

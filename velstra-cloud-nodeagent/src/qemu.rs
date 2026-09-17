@@ -681,8 +681,8 @@ impl Vmm for QemuVmm {
         // `qcow2` for a file, because that is what the directory pool writes and
         // opening a qcow2 as `raw` hands the guest the image header as its first
         // sector. Ceph names itself.
-        let file = if let Some(image) = at.strip_prefix("rbd:") {
-            json!({ "driver": "rbd", "image": image })
+        let file = if let Some(rbd) = crate::ceph_access::split(at) {
+            self.layout.ceph.blockdev(&rbd)
         } else {
             json!({ "driver": "file", "filename": at })
         };
@@ -756,7 +756,11 @@ impl Vmm for QemuVmm {
         }
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
-        if !self.layout.disk(&request.instance).exists() {
+        // A guest booting from a volume keeps its root disk in a pool, not on
+        // this filesystem, and the receiver opens it by the same place the
+        // sender did — which is the arrangement that makes the move possible
+        // without both machines sharing a filesystem.
+        if request.boot_disk.is_none() && !self.layout.disk(&request.instance).exists() {
             // The guest resumes into its own root disk by the path its command
             // line names, and QEMU opens that disk at start — before anything
             // arrives. A receiver without one fails immediately.
@@ -1007,6 +1011,37 @@ fn levels_listed(listing: &str) -> bool {
         .all(|l| listing.contains(&l.to_string()))
 }
 
+/// The `-drive` the guest boots from.
+///
+/// Two shapes, and the difference is where the disk lives rather than what the
+/// guest sees. A guest with no boot volume boots the file this agent keeps for
+/// it — raw, because that is what the agent writes — and that file being on
+/// this machine's filesystem is the reason such a guest cannot move.
+///
+/// A guest that boots from a volume boots the place the pool put it: a path for
+/// a directory or LVM pool, an `rbd:` image for Ceph. The format is read off
+/// the place for the same reason `open_volume` reads it — a directory pool
+/// writes qcow2, and opening a qcow2 as raw hands the guest the image header as
+/// its first sector.
+fn boot_drive(request: &VmRequest, layout: &Layout) -> OsString {
+    let Some(place) = request.boot_disk.as_deref() else {
+        return format!(
+            "file={},format=raw,if=virtio",
+            layout.disk(&request.instance).display()
+        )
+        .into();
+    };
+    if let Some(rbd) = crate::ceph_access::split(place) {
+        return format!("{},format=raw,if=virtio", layout.ceph.drive_options(&rbd)).into();
+    }
+    let format = if place.ends_with(".qcow2") {
+        "qcow2"
+    } else {
+        "raw"
+    };
+    format!("file={place},format={format},if=virtio").into()
+}
+
 fn qemu_args(
     layout: &Layout,
     request: &VmRequest,
@@ -1079,11 +1114,7 @@ fn qemu_args(
         "-m".into(),
         request.memory_mib.to_string().into(),
         "-drive".into(),
-        format!(
-            "file={},format=raw,if=virtio",
-            layout.disk(&request.instance).display()
-        )
-        .into(),
+        boot_drive(request, layout),
         "-qmp".into(),
         format!("unix:{},server=on,wait=off", monitor.display()).into(),
         // A socket **and** a file, which is one chardev doing both.
@@ -1298,6 +1329,7 @@ mod tests {
             memory_mib: 8192,
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
+            boot_disk: None,
             nics: vec![
                 Nic {
                     tap: "vt-a".into(),
@@ -1327,6 +1359,94 @@ mod tests {
             timeout_s: 3600,
             connections: 1,
         }
+    }
+
+    /// **A guest that boots from a volume boots that volume, not a local file.**
+    ///
+    /// The whole point of booting from a volume is that the root disk is not on
+    /// the machine's own filesystem — which is what ties every other guest to
+    /// the machine it was made on, because moving a guest does not move its
+    /// disk. A command line that named `root.raw` anyway would hand somebody an
+    /// empty local disk with their volume alongside it as a second drive.
+    #[test]
+    fn a_guest_with_a_boot_volume_boots_it() {
+        let mut wants = request();
+        wants.boot_disk = Some("/var/lib/velstra/pool/root-1.qcow2".into());
+        let args = words(&qemu_args(
+            &layout(),
+            &wants,
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let drive = args
+            .windows(2)
+            .find(|w| w[0] == "-drive")
+            .map(|w| w[1].clone())
+            .expect("a guest with no drive at all");
+        assert!(
+            drive.contains("/var/lib/velstra/pool/root-1.qcow2"),
+            "{drive}"
+        );
+        assert!(!drive.contains("root.raw"), "{drive}");
+        // qcow2, read off the place for the reason `open_volume` reads it: a
+        // directory pool writes qcow2, and opening one as raw hands the guest
+        // the image header as its first sector.
+        assert!(drive.contains("format=qcow2"), "{drive}");
+
+        // Ceph names itself, and the drive says so rather than treating the
+        // URI as a filename — as the fields QEMU's schema names, so that a
+        // guest starting and a disk being plugged into a running one say the
+        // same thing.
+        let mut on_ceph = request();
+        on_ceph.boot_disk = Some("rbd:velstra-volumes/root-1".into());
+        let mut with_ceph = layout();
+        with_ceph.ceph = crate::ceph_access::CephAccess {
+            conf: Some("/var/lib/velstra/ceph/ceph.conf".into()),
+            user: Some("velstra".into()),
+        };
+        let args = words(&qemu_args(
+            &with_ceph,
+            &on_ceph,
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let drive = args
+            .windows(2)
+            .find(|w| w[0] == "-drive")
+            .map(|w| w[1].clone())
+            .expect("a guest with no drive at all");
+        assert!(drive.contains("file.driver=rbd"), "{drive}");
+        assert!(drive.contains("file.pool=velstra-volumes"), "{drive}");
+        assert!(drive.contains("file.image=root-1"), "{drive}");
+        // The two the node was configured with. Without them QEMU reads
+        // /etc/ceph/ceph.conf, which on the sealed appliance is a read-only
+        // verity store nobody can put a file on.
+        assert!(
+            drive.contains("file.conf=/var/lib/velstra/ceph/ceph.conf"),
+            "{drive}"
+        );
+        assert!(drive.contains("file.user=velstra"), "{drive}");
+        // The pool must never travel inside the image name: `pool` is not
+        // optional in QEMU's schema.
+        assert!(
+            !drive.contains("file.image=velstra-volumes/root-1"),
+            "{drive}"
+        );
+        assert!(drive.contains("format=raw"), "{drive}");
+
+        // And a guest without one is unchanged: the file this agent keeps.
+        let args = words(&qemu_args(
+            &layout(),
+            &request(),
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let drive = args
+            .windows(2)
+            .find(|w| w[0] == "-drive")
+            .map(|w| w[1].clone())
+            .expect("a guest with no drive at all");
+        assert!(drive.contains("root.raw"), "{drive}");
     }
 
     /// Every guest gets a display adapter, and it is not decoration.

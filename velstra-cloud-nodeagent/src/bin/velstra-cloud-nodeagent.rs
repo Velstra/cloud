@@ -253,6 +253,22 @@ struct Args {
     #[arg(long)]
     boot_initrd: Option<PathBuf>,
 
+    /// `ceph.conf`, for a guest whose disk is an RBD image.
+    ///
+    /// The same two answers the pool agent is given, and the same two seed
+    /// keys — because the process that *creates* a volume and the process that
+    /// *opens* it are on different machines whenever Ceph is worth having.
+    /// Without them QEMU falls back to `/etc/ceph/ceph.conf` and the default
+    /// client, which is right on a machine where Ceph was installed the usual
+    /// way and impossible on the sealed appliance, whose `/etc` is a read-only
+    /// verity store.
+    #[arg(long, env = "VELSTRA_CEPH_CONF")]
+    ceph_conf: Option<String>,
+
+    /// The Ceph client id to open images as — `admin`, not `client.admin`.
+    #[arg(long, env = "VELSTRA_CEPH_USER")]
+    ceph_user: Option<String>,
+
     /// The kernel command line. `console=ttyS0` is not decoration: without it a
     /// kernel boots perfectly and says nothing, which is indistinguishable from
     /// not booting at all.
@@ -438,6 +454,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         migration_address: args.migration_address.clone(),
         migration_ports: args.migration_port_first..args.migration_port_last,
         migration_tls_dir: args.migration_tls_dir.clone(),
+        // Unless the seed says otherwise, the files this agent writes from the
+        // cell's own Ceph cluster — see `agent/ceph.rs`. They may not exist
+        // yet, and that is fine: QEMU only reads them to open an RBD image,
+        // and by then the cluster that minted them has been reported.
+        ceph: velstra_cloud_nodeagent::ceph_access::CephAccess::new(
+            args.ceph_conf
+                .clone()
+                .or_else(|| Some(args.state_dir.join("ceph/ceph.conf").display().to_string())),
+            args.ceph_user.clone().or_else(|| Some("velstra".into())),
+        ),
         boot,
         scope: match args.scope {
             ScopeKind::System => Scope::System,
@@ -531,6 +557,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig::new(&args.node, &args.region, &args.cell);
     config.resync = Duration::from_secs(args.resync_secs);
     config.shared_state = args.shared_state;
+    // The same place the VMM is told to look (see `Layout.ceph` above).
+    config.ceph_client_dir = Some(args.state_dir.join("ceph"));
     config.image_signing_keys = args
         .image_signing_key
         .iter()
