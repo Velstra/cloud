@@ -2619,7 +2619,9 @@ dependencies = [
  "anyhow",
  "clap",
  "rcgen",
+ "serde_json",
  "sha2",
+ "velstra-cloud-wire",
 ]
 
 [[package]]
@@ -2684,6 +2686,7 @@ dependencies = [
 name = "velstra-cloud-wire"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "velstra-cloud-model",

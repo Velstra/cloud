@@ -104,7 +104,7 @@ const initial = (c: Collection, r?: Resource): Values => {
 };
 
 export function Form({ coll, existing, onDone, onCancel }: {
-  coll: Collection; existing?: Resource; onDone: (r: Resource) => void; onCancel: () => void;
+  coll: Collection; existing?: Resource; onDone: (r: Resource, answer?: unknown) => void; onCancel: () => void;
 }) {
   const storeProject = useStore((s) => s.project);
   // The project this form writes to: an existing object's own, or — when the
@@ -264,6 +264,7 @@ export function Form({ coll, existing, onDone, onCancel }: {
       ...(Object.keys(written).length || existing ? { labels: written } : {}),
     });
     let saved: Resource;
+    let created: unknown = undefined;
     try {
       if (existing) {
         // The revision this edit was read at goes in `If-Match`, not in the
@@ -284,6 +285,7 @@ export function Form({ coll, existing, onDone, onCancel }: {
         const answer = await call(`create:${coll.id}`, "POST", basePath(coll, project), undefined,
           { meta: meta(name), spec: body });
         saved = await settled(coll, project, answer, name);
+        created = answer;
       }
     } catch (e) {
       const err = e as ApiError;
@@ -295,7 +297,10 @@ export function Form({ coll, existing, onDone, onCancel }: {
     // Outside the try, and deliberately: what the caller does next — a toast, a
     // route change, a re-read — is not this form's failure to report. That is
     // how a create came to look refused.
-    onDone(saved);
+    // The create's own answer travels with the object: a registration's
+    // `nodeToken`/`joinToken` live only there, shown once, and the settled
+    // resource does not carry them. This page dropped them on the floor.
+    onDone(saved, created);
   };
 
   return (

@@ -16,6 +16,7 @@ import { listEvery } from "@/lib/listing";
 import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
 import { useAsk } from "@/features/Ask";
+import { JoinTokenButton } from "./Join";
 
 const coll = (id: string) => SCHEMA.find((c) => c.id === id)!;
 
@@ -234,8 +235,14 @@ export function NodeQuick({ r, c, reload }: { r: Resource; c: Collection; reload
         }}>
         {evacuating ? "Stop evacuating" : "Evacuate"}
       </Pressed>
+      <JoinTokenButton r={r} c={c} />
     </>
   );
+}
+
+/** A pool has one thing to do from its page: hand out the credential its agent joins with. */
+export function PoolQuick({ r, c }: { r: Resource; c: Collection; reload: () => void }) {
+  return <JoinTokenButton r={r} c={c} />;
 }
 
 /** Allocate-and-associate, or release: the two things a public address is for. */

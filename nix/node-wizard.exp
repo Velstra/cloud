@@ -10,7 +10,8 @@
 # The disk number is not hardcoded: it comes from $PICK, which the test reads
 # off the wizard's own candidate listing. The control-plane URL and token come
 # from $API_URL and $TOKEN — the wizard records them for the first boot; no
-# control plane needs to be reachable during the install.
+# control plane needs to be reachable during the install. $ROLES says what the
+# machine is for, and decides which of the questions below are even asked.
 
 # Prompts are instant; the install that follows the last answer is not.
 set timeout 120
@@ -38,14 +39,42 @@ answer "Encrypt the data partition" "n"
 answer "Hostname"  "node-t1"
 answer "Use DHCP"  "y"
 
-# The registration hand-off: where the control plane is, who this node is, and
-# the one-time token the operator was shown when they created the node.
-answer "Control plane URL" "$env(API_URL)"
-answer "Node name"         "node-1"
-answer "Cell "             ""
-answer "Region "           ""
-answer "Node registration token" "$env(TOKEN)"
-answer "VMM "              "2"
+# What this box is for. `$ROLES` rather than a fixed answer, so the same script
+# can drive the hypervisor install this check makes today and a control-plane or
+# pool install without a second copy of the whole flow.
+# The three doors. `$DOOR` picks. Door 2 is the join token and asks nothing
+# else; door 3 is the wizard as it was, every question still asked — and the
+# check runs both, because the second door is the one an operator takes and
+# the third is the one that proves every question still exists.
+answer "Install as"        "$env(DOOR)"
+
+if {$env(DOOR) == 2} {
+    answer "Join token"    "$env(JOIN)"
+} elseif {$env(DOOR) == 1} {
+    # The first machine: an administrator, storage, where the API listens.
+    # The password is typed twice and never echoed; the check greps the
+    # transcript for it afterwards.
+    answer "Administrator"       ""
+    answer "Password (not echoed)" "$env(ADMIN_PASSWORD)"
+    answer "Again"               "$env(ADMIN_PASSWORD)"
+    answer "Storage "            "2"
+    answer "Disk numbers"        "$env(OSD_PICK)"
+    answer "API listen address"  ""
+    answer "Cell "               ""
+    answer "Region "             ""
+    answer "VMM "                "2"
+} else {
+    answer "Roles "            "$env(ROLES)"
+
+    # The registration hand-off: where the control plane is, who this node is,
+    # and the one-time token the operator was shown when they created the node.
+    answer "Control plane URL" "$env(API_URL)"
+    answer "Node name"         "node-1"
+    answer "Cell "             ""
+    answer "Region "           ""
+    answer "Node registration token" "$env(TOKEN)"
+    answer "VMM "              "2"
+}
 
 answer "Type YES to proceed" "YES"
 

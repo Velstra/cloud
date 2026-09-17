@@ -37,8 +37,27 @@ in
 
     qemu = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.qemu_kvm;
-      description = "QEMU used when the seed selects `VELSTRA_VMM=qemu`.";
+      default = pkgs.qemu_kvm.override { cephSupport = true; };
+      description = ''
+        QEMU used when the seed selects `VELSTRA_VMM=qemu`.
+
+        Built with the RBD block driver, which nixpkgs leaves off
+        (`cephSupport ? false`, so no `--enable-rbd`). Without it a guest whose
+        disk is a Ceph volume cannot start at all: QEMU answers
+        `Unknown driver 'rbd'`, and the node reports a guest that will not boot
+        with no indication that the cause is which QEMU was built.
+
+        It is on by default rather than opt-in because this is the module the
+        sealed appliance uses, and an appliance is flashed long before anybody
+        knows whether that cell will have Ceph. The cost is real — an override
+        means building QEMU rather than taking the cached one — and a cell that
+        is certain it will never use Ceph can set this back to
+        `pkgs.qemu_kvm`.
+
+        Cloud Hypervisor has no equivalent: it takes a path and nothing else,
+        so `velstra-cloud-nodeagent` refuses an `rbd:` disk there by name
+        rather than handing it a path that is not one.
+      '';
     };
 
     cloudHypervisor = lib.mkOption {
@@ -104,8 +123,16 @@ in
         pkgs.cryptsetup
         pkgs.e2fsprogs
         pkgs.mdadm
+        # `cephadm` and the `ceph` CLI, so an operator can add a Ceph cluster
+        # to a cell of flashed machines afterwards. The platform still installs
+        # nothing on its own — cephadm pulls the daemon containers only once
+        # somebody has asked for a cluster — but a machine with no package
+        # manager has nowhere to get cephadm from, and the image has to carry
+        # what it cannot fetch. Daemons run as containers, hence podman.
+        pkgs.ceph
       ]
       ++ lib.optional (cfg.fabricAgent != null) cfg.fabricAgent;
+    virtualisation.podman.enable = true;
 
     # KVM now, IOMMU-ready for the passthrough phase: the design doc's device
     # model needs `iommu=pt` and the vendor IOMMU enabled from day one, because
@@ -188,6 +215,61 @@ in
       '';
     };
 
+    # The first machine of a cell, brought up from its seed alone. What
+    # `quickstart` does after writing the seed on a Debian box happens here at
+    # first boot, in two halves, because a flashed machine had no API to talk
+    # to at install time and no addresses to put in a certificate.
+    #
+    # Both are gated on the seed naming the control-plane role — on every
+    # other machine they show as skipped — and both are no-ops after the first
+    # boot: `ensure-tls` keeps a certificate that exists, `bootstrap-cell`
+    # creates nothing twice. See docs/joining.md.
+    systemd.services.velstra-cell-tls = {
+      description = "Make this cell's certificate and tell the seed about it";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-online.target" ];
+      # After the network, so a DHCP lease is in the certificate; before the
+      # API, so it has one to serve.
+      after = [
+        "network-online.target"
+        "velstra-node-boot.service"
+      ];
+      before = [ "velstra-cloud-api.service" ];
+      unitConfig = {
+        ConditionPathExists = "${cfg.stateDir}/node.env";
+        RequiresMountsFor = [ cfg.stateDir ];
+      };
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role control-plane";
+        ExecStart = "${cfg.package}/bin/velstra-cloud-node ensure-tls --dir ${cfg.stateDir}";
+      };
+    };
+
+    systemd.services.velstra-cell-bootstrap = {
+      description = "Create this machine's Node and Pool objects in the cell it is";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "velstra-cloud-api.service" ];
+      after = [ "velstra-cloud-api.service" ];
+      # Not ordered before the agents: they park on the token this writes
+      # (`ConditionPathExists`), and this starts them itself once it exists —
+      # then, for a machine born with Ceph, waits for the node agent's first
+      # inventory to name the OSD disks the way the node names them.
+      unitConfig = {
+        ConditionPathExists = "${cfg.stateDir}/node.env";
+        RequiresMountsFor = [ cfg.stateDir ];
+      };
+      path = [ pkgs.curl ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role control-plane";
+        ExecStart = "${cfg.package}/bin/velstra-cloud-node bootstrap-cell --dir ${cfg.stateDir}";
+      };
+    };
+
     # The node agent. Everything identifying this node comes from the seed —
     # the image is identical across the fleet, which is what makes an image
     # update one artefact instead of one per node.
@@ -221,6 +303,21 @@ in
       ];
       serviceConfig = {
         EnvironmentFile = "${cfg.stateDir}/node.env";
+        # The seed's own answer to "is this box a hypervisor", asked the same
+        # way the control-plane and pool units ask about theirs.
+        #
+        # It mattered the moment the image stopped being hypervisor-only: a
+        # machine flashed to be nothing but a control plane has a seed and a
+        # token, so both `ConditionPathExists` above are satisfied and this
+        # agent would come up, claim the box for guests, and report capacity
+        # for a hypervisor nobody asked for.
+        #
+        # A seed with no `VELSTRA_ROLES` at all still runs it — `roles_of_seed`
+        # reads an absent key as `[hypervisor]`, because that is the only thing
+        # the installer could make before roles existed, and reading it as
+        # "nothing" would turn an upgrade into a fleet that stops running
+        # guests.
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role hypervisor";
         Restart = "on-failure";
         RestartSec = 5;
       };

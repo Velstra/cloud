@@ -16,3 +16,7 @@ rcgen = "0.13"
 sha2 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+# The join token is a wire format the installer reads and the API writes; the
+# wire crate is the one both already agree on, and it is small.
+velstra-cloud-wire = { workspace = true }
+serde_json = { workspace = true }

@@ -21,6 +21,8 @@
 //!   person all use, so the join happens here and its inverse happens on the
 //!   way in.
 
+pub mod join;
+
 use serde_json::{Map, Value};
 
 /// Model shape in, contract shape out.

@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod cell;
 mod disks;
 mod install;
 mod product;
@@ -84,6 +85,11 @@ enum Cmd {
         /// should not have to carry.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Join a cell with the token its console showed when the node was
+        /// created. One string, everything in it: cell, address, certificate,
+        /// credential. Nothing else is asked. See docs/joining.md.
+        #[arg(long, conflicts_with = "config")]
+        join: Option<String>,
     },
     /// One box, one command: seed, units, and the two objects a cell needs.
     ///
@@ -114,6 +120,22 @@ enum Cmd {
         /// `control-plane`, `hypervisor` or `pool`.
         role: String,
     },
+    /// First boot of a new cell's first machine, part one: make this
+    /// machine's certificate with the addresses it actually has, and tell the
+    /// seed where it is and what to advertise. Runs before the API; a no-op
+    /// once the certificate exists.
+    EnsureTls {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: PathBuf,
+    },
+    /// First boot of a new cell's first machine, part two: the Node and Pool
+    /// objects this machine is, and their credentials. Runs after the API
+    /// answers; every step is idempotent. What `quickstart` does after it has
+    /// written the seed, for a machine that was flashed rather than set up.
+    BootstrapCell {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: PathBuf,
+    },
     /// Open the encrypted data volume at boot (a no-op on a plaintext
     /// install).
     Unlock,
@@ -137,9 +159,16 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Install { source } => install::run_install(source),
-        Cmd::Setup { dir, nixos, config } => setup::run_with(dir, nixos, config),
+        Cmd::Setup {
+            dir,
+            nixos,
+            config,
+            join,
+        } => setup::run_with(dir, nixos, config, join),
         Cmd::Quickstart { dir, listen, node } => quickstart::run(dir, listen, node),
         Cmd::HasRole { role } => roles::has_role_or_exit(&role),
+        Cmd::EnsureTls { dir } => cell::ensure_tls(&dir),
+        Cmd::BootstrapCell { dir } => cell::bootstrap(&dir),
         Cmd::Unlock => unlock::run(),
         Cmd::Update { image } => update::run_update(&image),
     }

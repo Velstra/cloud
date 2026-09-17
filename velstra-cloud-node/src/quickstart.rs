@@ -143,6 +143,12 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         &crate::wizard::hostname(),
         &addresses,
     )?);
+    // What a joining machine is told to try, in order: this machine's own
+    // addresses first, then its name. The same list the certificate was just
+    // made with, so every URL here is one it verifies for — which is the whole
+    // reason the API is *told* this rather than left to work it out.
+    let port = listen.rsplit(':').next().unwrap_or("8443");
+    let advertise = crate::tls::advertise_urls(&crate::wizard::hostname(), &addresses, port);
     if let Some(cert) = &tls {
         say(if cert.made {
             "made a certificate for this machine"
@@ -152,6 +158,14 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     }
 
     let machine = Machine {
+        // Empty: this box already runs an operating system and already has a
+        // name. Only the installer, seeding a filesystem that has never
+        // booted, answers this.
+        hostname: String::new(),
+        // The certificate is a file on this machine, named by path below.
+        api_ca_pem: String::new(),
+        advertise: advertise.clone(),
+        bootstrap_ceph_osds: Vec::new(),
         // One machine that is the whole cell: its pool agent reaches the store
         // directly, and is deliberately given no token.
         pool_token: String::new(),
@@ -283,7 +297,7 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     Ok(())
 }
 
-fn say(what: &str) {
+pub(crate) fn say(what: &str) {
     println!("  · {what}");
 }
 
@@ -291,7 +305,7 @@ fn say(what: &str) {
 ///
 /// `0.0.0.0` is a bind, never a destination: connecting to it works on Linux by
 /// accident and is wrong to print at somebody.
-fn local_api(listen: &str, tls: bool) -> String {
+pub(crate) fn local_api(listen: &str, tls: bool) -> String {
     let port = listen.rsplit(':').next().unwrap_or("8443");
     let scheme = if tls { "https" } else { "http" };
     // `localhost` and not `127.0.0.1`, because the certificate names hostnames
@@ -364,7 +378,7 @@ pub(crate) fn curl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn wait_for(api: &str) -> Result<()> {
+pub(crate) fn wait_for(api: &str) -> Result<()> {
     for _ in 0..API_WAIT_SECS {
         if curl(&["-o", "/dev/null", "-w", "%{http_code}", api])
             .is_ok_and(|c| c.starts_with('2') || c.starts_with('4'))
@@ -392,7 +406,7 @@ pub(crate) fn field(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn api_token(api: &str, user: &str, password: &str) -> Result<String> {
+pub(crate) fn api_token(api: &str, user: &str, password: &str) -> Result<String> {
     let body = curl(&[
         "-X",
         "POST",
@@ -411,7 +425,7 @@ fn api_token(api: &str, user: &str, password: &str) -> Result<String> {
     })
 }
 
-fn ensure_node(api: &str, token: &str, id: &str, dir: &std::path::Path) -> Result<()> {
+pub(crate) fn ensure_node(api: &str, token: &str, id: &str, dir: &std::path::Path) -> Result<()> {
     let token_file = dir.join("node-token");
     if token_file.exists() {
         say("the node already has its token");
@@ -440,7 +454,7 @@ fn ensure_node(api: &str, token: &str, id: &str, dir: &std::path::Path) -> Resul
     Ok(())
 }
 
-fn ensure_pool(api: &str, token: &str, id: &str) -> Result<()> {
+pub(crate) fn ensure_pool(api: &str, token: &str, id: &str) -> Result<()> {
     let body = curl(&[
         "-X",
         "POST",

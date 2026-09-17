@@ -31,6 +31,12 @@ a token), then **the machine is told what it is** (and uses the token).
 
 ## 0. One machine, all of it
 
+> **From the installer ISO** the same thing is door 1 — *the first machine of
+> a new cell*. It asks for the administrator, where the API listens, and
+> whether storage is a directory or Ceph on the machine's other disks; the
+> objects and their credentials are made at first boot. Every later machine is
+> door 2 with the join token from the console. See [`joining.md`](joining.md).
+
 **One command, if this box is the whole cell:**
 
 ```
@@ -168,7 +174,32 @@ says otherwise, which is the question the wizard asks just before the password.
 
 ---
 
-## 2. Adding a machine — through the console
+## 2. Adding a machine — the short way
+
+**Nodes → New node.** Give it an id. The answer is a **join token**: one
+string, shown once, that carries everything the machine needs — cell, region,
+node id, where the API answers, its certificate, and the credential.
+
+On the new machine, one of:
+
+```
+sudo velstra-cloud-node setup --join velstra1.…        # a box that runs Debian
+```
+
+or boot the installer ISO and choose *a machine joining a cell* — it asks for
+the disk, the network, and the token, and nothing else.
+
+The token was minted *for* this node, so region, cell and id are facts, not
+questions. The certificate is inside it, so nothing is copied. The URL is one
+the certificate verifies for, so `https://<ip>:8443` works. If the token is
+lost, the node's page has *Join token*, which mints another; the one the
+machine holds keeps working until revoked. The design is in
+[`joining.md`](joining.md).
+
+Everything below is the same thing by hand, for a machine that cannot take a
+token — a seed written by configuration management, or a pool on its own.
+
+## 2a. Adding a machine — through the console
 
 **Nodes → New node.** Give it an id. That id is what everything else will refer
 to, and it cannot be changed afterwards.
@@ -314,6 +345,27 @@ enables. `setup` prints the module snippet for the answers it was given:
 ---
 
 ## 4. Storage
+
+### Ceph, added afterwards
+
+A cell does not have to be born with Ceph. Create the cluster from the console
+whenever — **Storage → Ceph clusters → New** — name the monitors and pick the
+OSD disks from what the nodes report (a USB stick is refused as unsuitable
+until you say *even if unsuitable* for it; that is a lab's answer, spelled out
+per disk). The deployment blocks by name until `cephadm` is on the named
+nodes; the appliance image carries it, and a Debian node gets it with
+`apt install cephadm`.
+
+Nothing is copied onto the hypervisors. Once a monitor is up, the cell
+publishes the client configuration — a minimal `ceph.conf` and a
+`client.velstra` keyring with read/write on the platform's pools — on the
+cluster's status, and every node agent writes both to
+`/var/lib/velstra/ceph/` and opens volumes with them. A hypervisor installed a
+month before the cluster existed needs nothing done to it. Only `qemu` can
+open an RBD image; a machine that joined with a token is `qemu` already.
+
+The rest of this section is storage as it was: pools declared per machine.
+
 
 A pool is not a machine — several nodes reach one Ceph pool, one node may export
 three volume groups — so it is its own role and its own module.

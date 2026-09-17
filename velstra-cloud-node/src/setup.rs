@@ -46,7 +46,7 @@ use anyhow::{Context, Result, bail};
 use crate::{
     roles::{Role, render_list},
     wizard::{
-        ask_valid, ask_yes, prompt, prompt_secret, validate_interface, validate_ip,
+        ask_valid, ask_valid_or, ask_yes, prompt, prompt_secret, validate_interface, validate_ip,
         validate_node_name, validate_srv6_locator, validate_token, validate_url,
     },
 };
@@ -79,6 +79,34 @@ pub struct Machine {
     pub region: String,
     pub cell: String,
     pub roles: Vec<Role>,
+    /// What this box should call itself, for a machine that does not have a
+    /// name yet.
+    ///
+    /// Only the installer answers it: it is seeding a filesystem that has never
+    /// booted, and `velstra-node-boot` reads this to set the hostname on the
+    /// first start. [`run_with`] leaves it empty, because a machine that
+    /// already runs an operating system already has a name and renaming it is
+    /// not a thing a wizard about cloud roles should do.
+    ///
+    /// Here rather than in the installer's own seed writer because there used
+    /// to be two of those, and only one of them knew about `VELSTRA_ROLES` —
+    /// which is why every flashed machine was a hypervisor whatever it was
+    /// installed to be.
+    pub hostname: String,
+    /// The API's certificate as PEM, when it arrived *inside* a join token
+    /// rather than as a path on this machine. `write_seed` puts it beside the
+    /// seed as `api-ca.pem` and points `api_ca` at it, so the agents read a
+    /// file like they always have. Empty on every other path.
+    pub api_ca_pem: String,
+    /// Where this control plane tells joiners to reach it: URLs, comma
+    /// separated, each a name its certificate carries. Written for the API
+    /// as `VELSTRA_ADVERTISE`. Empty on a machine that is not a control
+    /// plane, and on one nobody can reach.
+    pub advertise: String,
+    /// Disks the first machine hands to Ceph at first boot, as kernel names.
+    /// `bootstrap-cell` resolves them to the stable paths the node agent
+    /// reports and creates the cluster. Empty on every other machine.
+    pub bootstrap_ceph_osds: Vec<String>,
     /// Where the API is. Empty on a control-plane-only machine, which *is* the
     /// API — a URL pointing at itself would be a fact with two owners.
     pub api_url: String,
@@ -202,6 +230,9 @@ pub fn render(m: &Machine) -> String {
         m.cell,
         render_list(&m.roles)
     );
+    if !m.hostname.is_empty() {
+        out.push_str(&format!("VELSTRA_HOSTNAME={}\n", m.hostname));
+    }
     if !m.api_url.is_empty() {
         out.push_str(&format!("VELSTRA_API_URL={}\n", m.api_url));
         if !m.api_ca.is_empty() {
@@ -247,6 +278,15 @@ pub fn render(m: &Machine) -> String {
                 m.tls_cert, m.tls_key
             ));
         }
+        if !m.advertise.is_empty() {
+            out.push_str(&format!("VELSTRA_ADVERTISE={}\n", m.advertise));
+        }
+        if !m.bootstrap_ceph_osds.is_empty() {
+            out.push_str(&format!(
+                "VELSTRA_BOOTSTRAP_CEPH_OSDS={}\n",
+                m.bootstrap_ceph_osds.join(",")
+            ));
+        }
         if !m.listen.is_empty() {
             out.push_str(&format!("VELSTRA_LISTEN={}\n", m.listen));
         }
@@ -277,6 +317,61 @@ pub fn render(m: &Machine) -> String {
         }
     }
     out
+}
+
+/// The answers from a join token, which is every one of them.
+///
+/// The token was minted by the cell for exactly one node object, so region,
+/// cell and node id are facts rather than questions, the certificate is inside
+/// it, and the URL is one the certificate verifies for — the six things that
+/// used to travel by six routes. See `docs/joining.md`.
+///
+/// `qemu` unconditionally. Cloud Hypervisor takes a path and nothing else, so
+/// it cannot open a Ceph volume; a machine joining a cell cannot know what
+/// storage the cell will grow, and the hypervisor that can open everything is
+/// the only safe answer for a wizard that is not going to ask.
+pub(crate) fn from_join(token: &str, dir: &Path) -> Result<Machine> {
+    let t = velstra_cloud_wire::join::JoinToken::decode(token)?;
+    let mut roles = Vec::new();
+    if !t.token.is_empty() {
+        roles.push(Role::Hypervisor);
+    }
+    if t.pool.is_some() {
+        roles.push(Role::Pool);
+    }
+    if roles.is_empty() {
+        bail!(
+            "the join token carries neither a node nor a pool credential, so there is nothing \
+             for this machine to be"
+        );
+    }
+    let (pool, pool_token, pool_backend) = match &t.pool {
+        // The backend is this machine's to answer, not the token's: it is a
+        // fact about the disks here. Directory unless told otherwise — the one
+        // that needs nothing but a writable directory.
+        Some(p) => (p.id.clone(), p.token.clone(), "directory".to_string()),
+        None => (String::new(), String::new(), String::new()),
+    };
+    Ok(Machine {
+        region: t.region,
+        cell: t.cell,
+        roles,
+        api_ca_pem: t.ca,
+        // The path the seed names; `write_seed` puts the PEM there first.
+        api_ca: dir.join("api-ca.pem").display().to_string(),
+        api_url: t
+            .urls
+            .into_iter()
+            .find(|u| !u.trim().is_empty())
+            .unwrap_or_default(),
+        node: t.node,
+        token: t.token,
+        vmm: "qemu".into(),
+        pool,
+        pool_token,
+        pool_backend,
+        ..Default::default()
+    })
 }
 
 /// Read the answers from a file instead of asking for them.
@@ -323,6 +418,9 @@ pub fn parse(text: &str) -> Result<Machine> {
         );
     }
     let mut m = Machine {
+        // Not a question this wizard asks: the machine is already installed
+        // and already named.
+        hostname: String::new(),
         tls_cert: String::new(),
         tls_key: String::new(),
         lvm_group: String::new(),
@@ -353,6 +451,14 @@ pub fn parse(text: &str) -> Result<Machine> {
         pool_backend: or("VELSTRA_POOL_BACKEND", "directory"),
         store: or("VELSTRA_STORE", "127.0.0.1:2379"),
         listen: or("VELSTRA_LISTEN", ""),
+        advertise: or("VELSTRA_ADVERTISE", ""),
+        bootstrap_ceph_osds: or("VELSTRA_BOOTSTRAP_CEPH_OSDS", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        api_ca_pem: String::new(),
         cells: values
             .get("VELSTRA_CELLS")
             .map(|v| {
@@ -428,6 +534,7 @@ pub fn run_with(
     dir: Option<PathBuf>,
     assume_nixos: Option<bool>,
     config: Option<PathBuf>,
+    join: Option<String>,
 ) -> Result<()> {
     let nixos = assume_nixos.unwrap_or_else(|| Path::new("/etc/NIXOS").exists());
     // Where the seed goes is decided by which machine this is, not by taste.
@@ -438,8 +545,10 @@ pub fn run_with(
     // read-only verity store there, and a machine whose state directory is
     // its own alone has nobody to be renamed by.
     let dir = dir.unwrap_or_else(|| PathBuf::from(if nixos { SEED_DIR } else { IDENTITY_DIR }));
-    let machine = match &config {
-        Some(path) => {
+    let machine = match (&config, &join) {
+        // Everything is in the token; nothing is asked. See `from_join`.
+        (_, Some(token)) => Some(from_join(token, &dir)?),
+        (Some(path), None) => {
             let text =
                 fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
             // The token is the one answer a file should not have to carry: it
@@ -454,7 +563,7 @@ pub fn run_with(
             }
             Some(m)
         }
-        None => collect()?,
+        (None, None) => collect()?,
     };
     let Some(machine) = machine else {
         println!("Nothing was written.");
@@ -568,6 +677,12 @@ pub fn nix_snippet(m: &Machine) -> String {
 
 pub(crate) fn write_seed(dir: &Path, m: &Machine) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // The certificate first, so the seed that names its path never exists
+    // without it. World-readable: it is a certificate, not a secret, and the
+    // agents that verify against it do not all run as root.
+    if !m.api_ca_pem.trim().is_empty() {
+        write_with_mode(&dir.join("api-ca.pem"), &m.api_ca_pem, 0o644)?;
+    }
     write_with_mode(&dir.join("node.env"), &render(m), 0o644)?;
     if m.roles.contains(&Role::Hypervisor) && !m.token.is_empty() {
         // The one secret here, and it gets its own file with its own mode. The
@@ -609,7 +724,7 @@ pub(crate) fn write_secret(path: &Path, contents: &str) -> Result<()> {
     write_with_mode(path, &format!("{}\n", contents.trim()), 0o600)
 }
 
-fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
+pub(crate) fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
     fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .with_context(|| format!("setting the mode on {}", path.display()))
@@ -885,23 +1000,30 @@ fn collect() -> Result<Option<Machine>> {
             println!(
                 "and one of them told where the others are, so a client reaches one address.\n"
             );
-            let region = ask_valid(
+            // Same defect as the installer's administrator prompt had: the
+            // validator refused the empty answer before the map could turn it
+            // into the default, so Enter at `[eu-central]` asked again.
+            let region = ask_valid_or(
+                "eu-central",
                 "Region [eu-central]: ",
                 validate_node_name,
                 "lowercase letters, digits and '-'",
-            )
-            .map(|s| if s.is_empty() { "eu-central".into() } else { s })?;
-            let cell = ask_valid(
+            )?;
+            let cell = ask_valid_or(
+                "cell-1",
                 "Cell [cell-1]: ",
                 validate_node_name,
                 "lowercase letters, digits and '-'",
-            )
-            .map(|s| if s.is_empty() { "cell-1".into() } else { s })?;
+            )?;
             (region, cell, String::new())
         }
     };
 
     let mut m = Machine {
+        hostname: String::new(),
+        api_ca_pem: String::new(),
+        advertise: String::new(),
+        bootstrap_ceph_osds: Vec::new(),
         pool_token: String::new(),
         api_ca: api_ca.clone(),
         tls_cert: String::new(),
@@ -1302,6 +1424,10 @@ mod tests {
 
     pub(super) fn hypervisor() -> Machine {
         Machine {
+            hostname: String::new(),
+            api_ca_pem: String::new(),
+            advertise: String::new(),
+            bootstrap_ceph_osds: Vec::new(),
             pool_token: String::new(),
             api_ca: String::new(),
             tls_cert: String::new(),
@@ -2095,5 +2221,103 @@ mod role_spelling_tests {
         assert!(why.contains("control-plane"), "{why}");
         assert!(why.contains("hypervisor"), "{why}");
         assert!(why.contains("pool"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use velstra_cloud_wire::join::{JoinToken, PoolJoin};
+
+    use super::*;
+
+    fn token(pool: bool) -> String {
+        JoinToken {
+            v: 1,
+            region: "eu-central".into(),
+            cell: "cell-1".into(),
+            node: "peter".into(),
+            urls: vec![
+                "https://10.10.10.8:8443".into(),
+                "https://horst:8443".into(),
+            ],
+            ca: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into(),
+            token: "ab".repeat(32),
+            pool: pool.then(|| PoolJoin {
+                id: "local-2".into(),
+                token: "cd".repeat(32),
+            }),
+        }
+        .encode()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("velstra-join-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// One string in, a machine out: every fact the six routes used to carry,
+    /// and the certificate as a file beside the seed where the agents look.
+    #[test]
+    fn a_join_token_is_the_whole_answer() {
+        let dir = scratch("node");
+        let m = from_join(&token(false), &dir).expect("a machine");
+        assert_eq!(m.roles, vec![Role::Hypervisor]);
+        assert_eq!(m.region, "eu-central");
+        assert_eq!(m.cell, "cell-1");
+        assert_eq!(m.node, "peter");
+        assert_eq!(m.api_url, "https://10.10.10.8:8443");
+        assert_eq!(m.vmm, "qemu", "the only hypervisor that can open Ceph");
+        assert_eq!(m.api_ca, dir.join("api-ca.pem").display().to_string());
+
+        write_seed(&dir, &m).expect("written");
+        let env = fs::read_to_string(dir.join("node.env")).unwrap();
+        assert!(env.contains("VELSTRA_ROLES=hypervisor\n"), "{env}");
+        assert!(
+            env.contains(&format!("VELSTRA_API_CA={}\n", m.api_ca)),
+            "{env}"
+        );
+        assert!(
+            env.contains("VELSTRA_API_URL=https://10.10.10.8:8443\n"),
+            "{env}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("api-ca.pem")).unwrap(),
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("node-token")).unwrap(),
+            format!("{}\n", "ab".repeat(32))
+        );
+        // The token is a secret and the seed is world-readable.
+        assert!(!env.contains(&"ab".repeat(32)), "{env}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pool rides along as a second role with its own credential.
+    #[test]
+    fn a_pool_in_the_token_is_a_second_role_with_its_own_token() {
+        let dir = scratch("pool");
+        let m = from_join(&token(true), &dir).expect("a machine");
+        assert_eq!(m.roles, vec![Role::Hypervisor, Role::Pool]);
+        assert_eq!(m.pool, "local-2");
+        assert_eq!(m.pool_backend, "directory");
+        write_seed(&dir, &m).expect("written");
+        assert_eq!(
+            fs::read_to_string(dir.join("pool-token")).unwrap(),
+            format!("{}\n", "cd".repeat(32))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The wrong paste is refused by name, before anything is written.
+    #[test]
+    fn the_wrong_paste_is_refused_by_name() {
+        let dir = scratch("bad");
+        let err = from_join("https://horst:8443", &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a join token"), "{err}");
+        assert!(!dir.exists(), "nothing may be written on refusal");
     }
 }

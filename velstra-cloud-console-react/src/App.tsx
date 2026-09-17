@@ -28,12 +28,17 @@ import { Me } from "@/features/Me";
 import { Spend } from "@/features/Spend";
 import { Pressed } from "@/features/Pressed";
 import { toast } from "sonner";
+import { MintedBox, hasMinted, type Minted } from "@/features/Join";
 
 export default function App() {
   const who = useStore((s) => s.who);
   const project = useStore((s) => s.project);
   const route = useRoute();
   const [census, setCensus] = useState<Census>({});
+  // A registration's credential, held on screen until it is copied. It is
+  // shown once by the API — only a digest is kept — so the page must not move
+  // on by itself the way every other create does.
+  const [minted, setMinted] = useState<{ coll: string; id: string; minted: Minted } | null>(null);
 
   useEffect(() => {
     if (!token()) return;
@@ -151,14 +156,35 @@ export default function App() {
                           <p className="text-xs" style={{ color: "var(--text-faint)" }}>{coll.blurb}</p>
                         </div>
                         <div className="px-5 py-4">
+                          {minted && minted.coll === coll.id ? (
+                            <div className="grid gap-3">
+                              <p className="text-sm" style={{ color: "var(--text-body)" }}>
+                                <span className="font-medium" style={{ color: "var(--text-strong)" }}>{minted.id}</span> is registered. This is what the machine joins with.
+                              </p>
+                              <MintedBox minted={minted.minted} what={`the ${coll.singular}`} />
+                              <div>
+                                <Pressed size="sm" onPress={() => { const id = minted.id; setMinted(null); go({ view: "board", coll: coll.id, id }); }}>I have copied it</Pressed>
+                              </div>
+                            </div>
+                          ) : (
                           <Form coll={coll}
-                            onDone={(r) => {
+                            onDone={(r, answer) => {
                               const id = r.meta.name.split("/").pop()!;
-                              toast(`${id} created.`, { description: "The platform is making it; this page follows along." });
                               sweep(); collectionChanged(coll.id);
+                              if (hasMinted(answer)) {
+                                // Shown once and only here: a node or pool
+                                // answers its create with the credential a
+                                // machine joins with, and the object's page
+                                // cannot show it later. Stay until it is
+                                // copied.
+                                setMinted({ coll: coll.id, id, minted: answer });
+                                return;
+                              }
+                              toast(`${id} created.`, { description: "The platform is making it; this page follows along." });
                               go({ view: "board", coll: coll.id, id });
                             }}
                             onCancel={() => go({ view: "board", coll: coll.id })} />
+                          )}
                         </div>
                       </div>
                     ) : (

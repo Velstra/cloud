@@ -53,16 +53,16 @@ struct Args {
 
     /// This pool's id. It must match the id in the pool object, because that is
     /// what every volume is written against.
-    #[arg(long)]
+    #[arg(long, env = "VELSTRA_POOL")]
     pool: String,
 
     #[arg(long, env = "VELSTRA_CELL", default_value = "cell-1")]
     cell: String,
 
-    #[arg(long, default_value = "eu-central")]
+    #[arg(long, env = "VELSTRA_REGION", default_value = "eu-central")]
     region: String,
 
-    #[arg(long, value_enum, default_value_t = Backend::Directory)]
+    #[arg(long, env = "VELSTRA_POOL_BACKEND", value_enum, default_value_t = Backend::Directory)]
     backend: Backend,
 
     /// Where volumes live, for the directory backend. Copies live in
@@ -157,13 +157,22 @@ struct Args {
     ///
     /// Writes still go straight to the store either way: a pool's writes are
     /// already proportional to its own work.
-    #[arg(long)]
+    #[arg(long, env = "VELSTRA_API_URL")]
     api: Option<String>,
 
     /// The bearer token for `--api`. A file rather than a flag, so it is not in
     /// anybody's process list.
-    #[arg(long)]
-    api_token_file: Option<PathBuf>,
+    ///
+    /// Defaults to where `velstra-cloud-node setup` writes it. A machine that
+    /// has been set up should not have to say this again — and on the sealed
+    /// appliance it must not have to, because the unit there is started bare
+    /// and every answer comes from the seed.
+    #[arg(
+        long,
+        env = "VELSTRA_POOL_TOKEN_FILE",
+        default_value = "/etc/velstra/pool-token"
+    )]
+    api_token_file: PathBuf,
 
     /// How often the pool is re-read and reconciled.
     ///
@@ -268,18 +277,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.resync = Duration::from_secs(args.resync_secs);
     let agent = match &args.api {
         Some(url) => {
-            let token = match &args.api_token_file {
-                Some(path) => std::fs::read_to_string(path)
-                    .map_err(|e| format!("reading {}: {e}", path.display()))?
-                    .trim()
-                    .to_string(),
-                None => {
-                    return Err("--api needs --api-token-file: the API will refuse an \
-                                unauthenticated reader, and finding that out as an empty pool is \
-                                the worst way to learn it"
-                        .into());
-                }
-            };
+            // Named in the error, because the default is a path nobody typed:
+            // "reading /etc/velstra/pool-token: No such file" is an instruction,
+            // where "--api needs --api-token-file" — what this said while the
+            // flag was optional — sends somebody to look for a flag that the
+            // seed was supposed to make unnecessary.
+            let token = std::fs::read_to_string(&args.api_token_file)
+                .map_err(|e| {
+                    format!(
+                        "reading this pool's token from {}: {e} — the API refuses an \
+                         unauthenticated reader, and finding that out as an empty pool is \
+                         the worst way to learn it",
+                        args.api_token_file.display()
+                    )
+                })?
+                .trim()
+                .to_string();
             let cell = Arc::new(ApiCell::for_pool(url, &token, &args.pool)?);
             // No store at all. A pool on any machine but the control plane's has
             // no etcd to open, and opening one anyway is what this agent used to

@@ -205,6 +205,13 @@ impl Reconciler for CephController {
         if !observed.ssh_pubkey.is_empty() {
             next.status.ssh_pubkey = observed.ssh_pubkey.clone();
         }
+        // The client configuration, published the way the SSH key is, so a
+        // hypervisor installed before this cluster existed can open its
+        // volumes without anybody copying a file onto it. See docs/joining.md.
+        if !observed.client_conf.is_empty() && !observed.client_keyring.is_empty() {
+            next.status.client_conf = observed.client_conf.clone();
+            next.status.client_keyring = observed.client_keyring.clone();
+        }
         // Likewise never cleared: the reading carries its own `at`, and a
         // stale one that says when it was taken beats a blank that says
         // nothing.

@@ -22,9 +22,50 @@ in
   options.velstra.cloud.controlPlane = {
     enable = lib.mkEnableOption "the Velstra Cloud control plane (api + controllers)";
 
+    fromSeed = lib.mkEnableOption ''
+      taking every answer from `/etc/velstra/node.env` instead of from the
+      options below, and running only when that seed names the `control-plane`
+      role.
+
+      For a machine that is **flashed rather than declared**. Every option in
+      this module is read when the image is built, and an appliance is built
+      once for a fleet: which of those boxes is the control plane, what it
+      listens on and which cell it belongs to are all answered at install time,
+      by somebody standing at a console. Until this existed the sealed image
+      could only ever be a hypervisor, so a cell built from it needed a
+      separately-managed machine for its own control plane.
+
+      etcd ships in the image and is gated by the same role, so a single box
+      can be the whole cell without fetching anything.
+    '';
+
     package = lib.mkOption {
       type = lib.types.package;
       description = "The velstra-cloud workspace build.";
+    };
+    seedFile = lib.mkOption {
+      type = lib.types.path;
+      default = "/etc/velstra/node.env";
+      description = ''
+        Which file `fromSeed` reads the answers out of.
+
+        The default is where a machine keeps *who it is*: `/etc` is per-machine
+        by construction, and that is the whole reason identity was moved out of
+        the state directory. A cell whose machines share one filesystem — which
+        is what makes moving a guest possible at all — had every agent reading
+        one `node.env` and answering to one name; the second machine to mount it
+        renamed the first, and the next upgrade took the control plane down.
+
+        The sealed appliance is the one machine that cannot use that path: its
+        `/etc` is a read-only dm-verity store, so it points this at its own
+        writable partition instead. That is safe there for the same reason the
+        default is safe everywhere else — the partition belongs to one machine.
+
+        Deliberately one file and not a search order. Reading both and letting
+        one win is not the fix: the keys the winner does not mention would still
+        come from the loser, so a control plane would inherit a hypervisor's
+        pool.
+      '';
     };
 
     listen = lib.mkOption {
@@ -227,7 +268,9 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = (cfg.bootstrapAdmin.username == null) == (cfg.bootstrapAdmin.passwordFile == null);
+        assertion =
+          cfg.fromSeed
+          || (cfg.bootstrapAdmin.username == null) == (cfg.bootstrapAdmin.passwordFile == null);
         message = ''
           velstra.cloud.controlPlane.bootstrapAdmin: set username and
           passwordFile together — the api refuses a half-configured bootstrap
@@ -236,10 +279,25 @@ in
       }
     ];
 
-    services.etcd = lib.mkIf cfg.store.bundledEtcd {
+    services.etcd = lib.mkIf (cfg.fromSeed || cfg.store.bundledEtcd) {
       enable = true;
       listenClientUrls = [ "http://127.0.0.1:2379" ];
       advertiseClientUrls = [ "http://127.0.0.1:2379" ];
+    };
+
+    # On a flashed machine the store has to be *in* the image — there is no
+    # package manager to fetch it from later — but only the box that turns out
+    # to be the control plane should run one. So etcd ships either way and is
+    # gated by the same seed everything else here reads: on a hypervisor the
+    # unit is skipped, which systemd shows as skipped rather than failed.
+    #
+    # An etcd running on every appliance would be worse than wasteful. It would
+    # be a second empty store on every machine, listening on the loopback
+    # address the API looks for — so a control plane that lost its seed would
+    # come up against a store that answers and holds nothing, which reads
+    # exactly like a cell whose objects have been deleted.
+    systemd.services.etcd = lib.mkIf cfg.fromSeed {
+      serviceConfig.ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role control-plane";
     };
 
     systemd.services.velstra-cloud-api = {
@@ -248,7 +306,11 @@ in
       wants = [ "network-online.target" ];
       after =
         [ "network-online.target" ]
-        ++ lib.optional cfg.store.bundledEtcd "etcd.service";
+        ++ lib.optional (cfg.fromSeed || cfg.store.bundledEtcd) "etcd.service";
+      # `wants`, not `requires`, under fromSeed: etcd is skipped by its own
+      # ExecCondition on a machine that is not the control plane, and a hard
+      # requirement on a unit that legitimately did not run is how a hypervisor
+      # would refuse to finish booting.
       requires = lib.optional cfg.store.bundledEtcd "etcd.service";
       serviceConfig = {
         Restart = "on-failure";
@@ -256,13 +318,44 @@ in
         # Root only for reading tokenFile/passwordFile wherever the operator
         # keeps them; the process itself needs no privilege.
         DynamicUser = false;
+      }
+      // lib.optionalAttrs cfg.fromSeed {
+        EnvironmentFile = "-${cfg.seedFile}";
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role control-plane";
       };
-      script = ''
-        ${lib.optionalString (cfg.bootstrapAdmin.passwordFile != null) ''
-          VELSTRA_BOOTSTRAP_PASSWORD="$(cat ${cfg.bootstrapAdmin.passwordFile})"
-          export VELSTRA_BOOTSTRAP_PASSWORD
-        ''}
-        exec ${cfg.package}/bin/velstra-cloud-api \
+      script =
+        if cfg.fromSeed then
+          # Bare but for the two things an environment file cannot express: a
+          # secret that must not be in anybody's process list, and a default
+          # that has to be a default rather than a value the seed carries.
+          #
+          # Everything else reaches the binary through its own `env =`
+          # fallbacks. This is deliberately the same shape the Debian package's
+          # unit has — it is the same machine described twice, and the moment
+          # the two descriptions differ, one of the two packagings is wrong
+          # about a cell in a way nobody sees until an upgrade.
+          ''
+            # Identity first, state as the fallback — the same order the
+            # Debian unit uses. On the sealed appliance only the second exists,
+            # because /etc there is a read-only verity store; on every other
+            # machine the wizards write the first.
+            pw=/var/lib/velstra/bootstrap-password
+            [ -f /etc/velstra/bootstrap-password ] && pw=/etc/velstra/bootstrap-password
+            if [ -f "$pw" ]; then
+              VELSTRA_BOOTSTRAP_PASSWORD="$(cat "$pw")"
+              export VELSTRA_BOOTSTRAP_PASSWORD
+            fi
+            : "''${VELSTRA_STORE_BACKUP_DIR:=/var/lib/velstra/store-backups}"
+            export VELSTRA_STORE_BACKUP_DIR
+            exec ${cfg.package}/bin/velstra-cloud-api
+          ''
+        else
+          ''
+            ${lib.optionalString (cfg.bootstrapAdmin.passwordFile != null) ''
+              VELSTRA_BOOTSTRAP_PASSWORD="$(cat ${cfg.bootstrapAdmin.passwordFile})"
+              export VELSTRA_BOOTSTRAP_PASSWORD
+            ''}
+            exec ${cfg.package}/bin/velstra-cloud-api \
           --store ${cfg.store.endpoints} \
           --listen ${cfg.listen} \
           --cell ${cfg.cell} \
@@ -286,11 +379,25 @@ in
       wants = [ "network-online.target" ];
       after =
         [ "network-online.target" ]
-        ++ lib.optional cfg.store.bundledEtcd "etcd.service";
+        ++ lib.optional (cfg.fromSeed || cfg.store.bundledEtcd) "etcd.service";
+      # `wants`, not `requires`, under fromSeed: etcd is skipped by its own
+      # ExecCondition on a machine that is not the control plane, and a hard
+      # requirement on a unit that legitimately did not run is how a hypervisor
+      # would refuse to finish booting.
       requires = lib.optional cfg.store.bundledEtcd "etcd.service";
       serviceConfig = {
         Restart = "on-failure";
         RestartSec = 2;
+      }
+      // lib.optionalAttrs cfg.fromSeed {
+        EnvironmentFile = "-${cfg.seedFile}";
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role control-plane";
+        # Bare, exactly as the Debian package starts it. The controller's own
+        # arguments carry `env =` fallbacks for everything a seed answers, and
+        # the rest are defaults no cell has ever had a reason to state.
+        ExecStart = "${cfg.package}/bin/velstra-cloud-controller";
+      }
+      // lib.optionalAttrs (!cfg.fromSeed) {
         ExecStart = lib.concatStringsSep " " (
           [
             "${cfg.package}/bin/velstra-cloud-controller"

@@ -108,9 +108,24 @@ let
       # cheaper than a retry loop, and etcd is what the seed says this machine
       # runs when it is the control plane.
       after = "network-online.target etcd.service";
+      # The identity directory first, the state directory as a fallback — the
+      # same order `velstra-cloud-poolagent-ceph` uses for its token, and for
+      # the same reason: both wizards write credentials beside the seed, which
+      # moved to /etc when identity was separated from state, and a machine
+      # installed before that still has its own under /var/lib.
+      #
+      # This looked only in /var/lib. `setup` and `quickstart` had been writing
+      # to /etc for as long as identity has been separate, so on a freshly
+      # quickstarted box the seed named a bootstrap administrator, the password
+      # never reached the process, and the API refused to start with
+      # "--bootstrap-admin needs --bootstrap-password" — restarting every five
+      # seconds, for ever. Nothing caught it: the setup check proves the file is
+      # written and with mode 600, and no check has ever run `quickstart`.
       exec = ''
-        /bin/sh -c 'if [ -f /var/lib/velstra/bootstrap-password ]; then \
-          VELSTRA_BOOTSTRAP_PASSWORD="$(cat /var/lib/velstra/bootstrap-password)"; \
+        /bin/sh -c 'pw=/var/lib/velstra/bootstrap-password; \
+          [ -f /etc/velstra/bootstrap-password ] && pw=/etc/velstra/bootstrap-password; \
+          if [ -f "$pw" ]; then \
+          VELSTRA_BOOTSTRAP_PASSWORD="$(cat "$pw")"; \
           export VELSTRA_BOOTSTRAP_PASSWORD; fi; \
           : "''${VELSTRA_STORE_BACKUP_DIR:=/var/lib/velstra/store-backups}"; \
           export VELSTRA_STORE_BACKUP_DIR; \

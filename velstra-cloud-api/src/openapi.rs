@@ -350,6 +350,7 @@ fn collection_paths(
                             "target": { "type": "string", "description": "The name the object was given." },
                             "nodeToken": { "type": "string", "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again." },
                             "poolToken": { "type": "string", "description": "Only when a pool was registered: the pool agent's bearer token, returned once and never readable again." },
+                            "joinToken": { "type": "string", "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md." },
                         },
                     } } },
                 },
@@ -560,7 +561,7 @@ const VERBS: &[Verb] = &[
         verb: "issueCredential",
         method: "post",
         on_collection: false,
-        summary: "Mint a fresh credential for a machine that already exists; shown once. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+        summary: "Mint a fresh credential for a machine that already exists; shown once, as `nodeToken` and — when this API advertises an address — as `joinToken`, the whole hand-off in one string. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
         query: &[],
     },
     Verb {
@@ -568,7 +569,7 @@ const VERBS: &[Verb] = &[
         verb: "issueCredential",
         method: "post",
         on_collection: false,
-        summary: "Mint a fresh credential for a pool that already exists; shown once. The body may carry `purpose` and `expiresAt`.",
+        summary: "Mint a fresh credential for a pool that already exists; shown once, as `poolToken` and — when this API advertises an address — as `joinToken`. The body may carry `purpose` and `expiresAt`.",
         query: &[],
     },
     Verb {

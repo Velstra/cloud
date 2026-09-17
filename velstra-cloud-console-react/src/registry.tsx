@@ -18,6 +18,7 @@ const InstanceQuick = lazy(() => import("@/features/Quick").then((m) => ({ defau
 const VolumeQuick = lazy(() => import("@/features/Quick").then((m) => ({ default: m.VolumeQuick })));
 const Connect = lazy(() => import("@/features/Quick").then((m) => ({ default: m.Connect })));
 const NodeQuick = lazy(() => import("@/features/Quick").then((m) => ({ default: m.NodeQuick })));
+const PoolQuick = lazy(() => import("@/features/Quick").then((m) => ({ default: m.PoolQuick })));
 const Members = lazy(() => import("@/features/Members").then((m) => ({ default: m.Members })));
 const RuleList = lazy(() => import("@/features/Structured").then((m) => ({ default: m.RuleList })));
 const ListenerList = lazy(() => import("@/features/Structured").then((m) => ({ default: m.ListenerList })));
@@ -199,6 +200,10 @@ register("ceph-clusters", {
 
 register("nodes", {
   quick: (r, c, reload) => <Suspense fallback={null}><NodeQuick r={r} c={c} reload={reload} /></Suspense>,
+});
+
+register("pools", {
+  quick: (r, c, reload) => <Suspense fallback={null}><PoolQuick r={r} c={c} reload={reload} /></Suspense>,
 });
 
 register("volumes", {
