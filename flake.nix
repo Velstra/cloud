@@ -504,6 +504,14 @@
         #   nix build .#checks.x86_64-linux.node-image-boots -L
         node-image-boots = pkgs.testers.runNixOSTest {
           name = "velstra-node-image-boots";
+          # A second machine on the same network, and the only reason it is
+          # here: every assertion about the API used to be a curl on the
+          # appliance's own loopback, which passes on a machine the firewall
+          # has sealed shut. "The console is reachable" is a statement about
+          # somebody else's machine, so it is made from one.
+          nodes.client = {
+            environment.systemPackages = [ pkgs.curl ];
+          };
           nodes.machine = {
             imports = applianceModules ++ [ nodeIdentity ];
             virtualisation = {
@@ -612,6 +620,22 @@
                   cert = "/var/lib/velstra/tls/cert.pem"
                   machine.wait_until_succeeds(
                       f"curl -sS --cacert {cert} https://127.0.0.1:8443/healthz"
+                  )
+
+              # And from somewhere that is not this machine. The loopback curl
+              # above passed on a box whose firewall dropped every packet from
+              # the network: the API was active, listening on 0.0.0.0:8443 and
+              # unreachable, and nothing in `systemctl status` said so.
+              with subtest("and from another machine on the network"):
+                  client.start()
+                  client.wait_for_unit("multi-user.target")
+                  address = machine.succeed(
+                      "ip -4 -brief addr show scope global"
+                      " | awk '{print $3}' | cut -d/ -f1 | head -n1"
+                  ).strip()
+                  assert address, "the appliance has no address to be reached at"
+                  client.wait_until_succeeds(
+                      f"curl -sS -k --max-time 5 https://{address}:8443/healthz"
                   )
 
               with subtest("the cell has its Node and Pool, made by the machine itself"):

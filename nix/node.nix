@@ -143,6 +143,35 @@ in
     # model needs `iommu=pt` and the vendor IOMMU enabled from day one, because
     # a node that must reboot to *see* its devices cannot report them. The
     # cross-vendor pair is harmless on the other vendor's hardware.
+    # The ports this machine serves, opened because NixOS closes everything by
+    # default and the appliance opened nothing.
+    #
+    # A machine came up with `velstra-cloud-api` active, listening on
+    # 0.0.0.0:8443, answering curl on its own loopback — and unreachable from
+    # the network, because every packet from outside was dropped before it got
+    # there. Nothing in `systemctl status` says "the firewall ate this", which
+    # is exactly what made it look like a broken API. Only one place in this
+    # repository had ever opened the port, and it was a test VM in `flake.nix`
+    # — so every check passed and every real machine was closed.
+    #
+    # Opened unconditionally rather than per role: which of these is
+    # *listening* is the seed's answer, made by units already gated on it, and
+    # a port with nothing behind it is refused by the kernel. A firewall that
+    # followed the seed as well would be a second place for the same fact to
+    # be wrong, which is the failure this file keeps finding.
+    networking.firewall.allowedTCPPorts = [
+      # The API, and the console it serves.
+      8443
+      # The node agent's guest consoles: a serial console in the browser is
+      # proxied from here, and an operator who cannot reach it has a guest
+      # they can only look at.
+      8447
+      # Open to a key and nothing else. `velstra-node-access` starts sshd when
+      # the seed carries one and stops it when it does not, so on a machine
+      # nobody asked for ssh this is a port with no listener.
+      22
+    ];
+
     boot.kernelModules = [
       "kvm-intel"
       "kvm-amd"
