@@ -186,6 +186,7 @@ pub fn run(hostname: &str) -> Result<Option<JoinToken>> {
     println!("its console prints the same one, and if it does not, something is in between.");
     println!("\nWaiting for approval. Ctrl-C stops and changes nothing.");
 
+    let mut last_said = String::new();
     for tick in 0..(WAIT_SECS / EVERY_SECS) {
         std::thread::sleep(std::time::Duration::from_secs(EVERY_SECS));
         match claim(&url, &id, &pair) {
@@ -198,6 +199,17 @@ pub fn run(hostname: &str) -> Result<Option<JoinToken>> {
                 // that scrolls is a screen nobody reads the fingerprints off.
                 if tick % 12 == 11 {
                     println!("  still waiting…");
+                }
+            }
+            Claimed::Fixable(why) => {
+                // Once per distinct reason. The operator is at the console,
+                // and the sentence tells them what to do; this machine keeps
+                // asking so that when they have done it, nothing here has to
+                // be started again.
+                if why != last_said {
+                    println!("\n  {why}");
+                    println!("  (still waiting — this clears itself once that is done)");
+                    last_said = why;
                 }
             }
             Claimed::No(why) => {
@@ -338,7 +350,12 @@ fn announce(url: &str, public: &str, hostname: &str) -> Result<(serde_json::Valu
 
 enum Claimed {
     Token(JoinToken),
+    /// Nothing to do yet, or nothing new to say.
     Waiting,
+    /// Something an operator can fix without this machine doing anything —
+    /// said once, then back to waiting. See `claim`.
+    Fixable(String),
+    /// Over, one way or another. Said, and the machine stops.
     No(String),
 }
 
@@ -363,14 +380,41 @@ fn claim(url: &str, id: &str, pair: &ring::signature::Ed25519KeyPair) -> Claimed
     }
     let code = answer["error"]["code"].as_str().unwrap_or_default();
     let message = answer["error"]["message"].as_str().unwrap_or_default();
+    // Three kinds of answer, and the middle one is the one that was missing.
+    //
+    // The first version had two: "not yet" and "no". Every refusal that was not
+    // "nobody has approved this machine yet" made the installer print it and
+    // stop — including the ones an operator fixes in seconds at the console:
+    // approved without roles, approved before the cell recorded who did it. The
+    // operator clicked Let it in, the console said "it installs from here", and
+    // the machine had already given up over a sentence that told the operator
+    // what to do and then did not wait for them to do it.
+    //
+    // So: a refusal that names something the *cell* can still change is said
+    // once and waited out. Only a refusal that is *over* — turned away, expired,
+    // already collected — stops the machine. And the code is printed with the
+    // message, because a report of the message alone cost an evening.
+    let said = || {
+        if code.is_empty() {
+            message.to_string()
+        } else {
+            format!("{message} [{code}]")
+        }
+    };
     match code {
-        // Not yet. This is the ordinary case and the reason there is a loop.
-        "FAILED_PRECONDITION" if message.contains("approved this machine yet") => Claimed::Waiting,
         "" => Claimed::Waiting,
-        // Everything else is an answer: turned away, expired, approved without
-        // being named. Each says what to do about it, so it is printed as it
-        // came rather than translated.
-        _ => Claimed::No(message.to_string()),
+        "FAILED_PRECONDITION" if message.contains("approved this machine yet") => Claimed::Waiting,
+        "FAILED_PRECONDITION"
+            if message.contains("expired")
+                || message.contains("already been collected")
+                || message.contains("turned away") =>
+        {
+            Claimed::No(said())
+        }
+        "PERMISSION_DENIED" if message.contains("turned away") => Claimed::No(said()),
+        // Everything else the cell might change its mind about — roles not
+        // set, approver not recorded, a transient failure inside the cell.
+        _ => Claimed::Fixable(said()),
     }
 }
 

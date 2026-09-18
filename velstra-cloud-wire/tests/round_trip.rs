@@ -15,6 +15,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use velstra_cloud_model::{
     ceph::{BlockDevice, CephClusterSpec, CephClusterStatus, DeviceUse, NodeCeph, OsdSpec},
+    enrollment::{EnrollmentSpec, EnrollmentStatus, Reported},
     identity::{
         CredentialSpec, CredentialStatus, SessionSpec, SessionStatus, UserSpec, UserStatus,
     },
@@ -514,4 +515,45 @@ fn every_spec_and_status() -> Vec<(&'static str, serde_json::Value)> {
         "migrations" => migration::MigrationSpec, migration::MigrationStatus,
         "security-groups" => security::SecurityGroupSpec, security::SecurityGroupStatus,
     }
+}
+
+/// A machine that announced, and the decision about it, survive the wire.
+///
+/// These are the types every field of which arrives through `from_wire`, and
+/// the ones where a spelling that did not survive cost the most: `memoryMib`
+/// read as none, `runsGuests` refused as unknown. Both were the camel-renamed
+/// struct being converted twice; this pins that they are not.
+#[test]
+fn an_enrolment_survives_its_wire() {
+    survives(
+        "EnrollmentSpec",
+        EnrollmentSpec {
+            node: "peter".into(),
+            runs_guests: true,
+            serves_storage: true,
+            is_control_plane: false,
+            pool: "local-2".into(),
+            approved: true,
+            refused: false,
+        },
+    );
+    survives(
+        "EnrollmentStatus",
+        EnrollmentStatus {
+            public_key: "MCowBQYDK2VwAyEA".into(),
+            fingerprint: "1A:2B:3C:4D:5E:6F:70:81".into(),
+            seen_certificate: "9F:2C".into(),
+            cell_certificate: "9F:2C".into(),
+            reported: Reported {
+                hostname: "peter".into(),
+                addresses: vec!["10.10.10.47".into()],
+                vcpus: 16,
+                memory_mib: 65536,
+                disks: vec!["nvme0n1".into()],
+                serial: "PT-0042".into(),
+            },
+            approved_by: "admin".into(),
+            ..Default::default()
+        },
+    );
 }

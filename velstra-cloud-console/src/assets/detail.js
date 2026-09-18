@@ -1066,10 +1066,12 @@ function openApproval(r) {
             "\u2717 It was served a certificate that is not this cell's. Something is between " +
             "that machine and here. Do not let it in until you know what.");
 
+    // One row per role: the box, the name, and what it means, aligned so the
+    // eye reads down a column rather than across three run-on sentences.
     const check = (key, label, help) => {
       const box = el("input", { type: "checkbox", checked: roles[key] ? "" : null });
       box.onchange = () => { roles[key] = box.checked; };
-      return el("label.prose", box, " " + label, el("span.muted", " — " + help));
+      return el("label.role", box, el("span.rolename", label), el("span.rolehelp", help));
     };
     const decide = async (spec, said) => {
       try {
@@ -1093,11 +1095,12 @@ function openApproval(r) {
       el("p.prose", "If they are the same, this is the machine in front of you." +
         (says ? " It says it has " + says + "." : "")),
       cell,
-      el("p.prose", "What should it be for?"),
-      check("runsGuests", "Runs guests", "starts and holds virtual machines"),
-      check("servesStorage", "Serves storage", "its disks become a pool"),
-      check("isControlPlane", "Is a control plane", "runs this cell's API and store — rare"),
-      el("div.formacts",
+      el("fieldset.roles",
+        el("legend", "What should it be for?"),
+        check("runsGuests", "Runs guests", "starts and holds virtual machines"),
+        check("servesStorage", "Serves storage", "its disks become a pool other machines use"),
+        check("isControlPlane", "Is a control plane", "runs this cell's API and store — rare")),
+      el("div.formacts.approveacts",
         btn("Not this one", {
           title: "Turn it away. It stops asking, and its row goes.",
           onclick: () => decide({ refused: true }, id + " was turned away."),
