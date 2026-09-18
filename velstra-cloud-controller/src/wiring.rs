@@ -355,6 +355,19 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
         ),
         TypedStore::new(store.clone(), id, "snapshot-schedules")
     );
+    // Unanswered announcements, retired so the list an operator reads is what
+    // is actually waiting for them. It writes down what the clock already
+    // decided; the claim door does its own arithmetic and does not consult
+    // this phase. See `enrollment`.
+    spawn!(
+        "enrollment",
+        crate::enrollment::EnrollmentController::new(TypedStore::new(
+            store.clone(),
+            id,
+            "enrollments"
+        )),
+        TypedStore::new(store.clone(), id, "enrollments")
+    );
     spawn!(
         "capture",
         crate::capture::CaptureController::new(

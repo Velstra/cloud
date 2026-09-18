@@ -2611,6 +2611,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "uuid",
+ "velstra-cloud-wire",
 ]
 
 [[package]]
@@ -2620,6 +2621,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rcgen",
+ "ring",
  "serde_json",
  "sha2",
  "velstra-cloud-wire",

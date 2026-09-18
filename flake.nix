@@ -294,6 +294,12 @@
           pkgs.mdadm
           pkgs.cryptsetup
           pkgs.e2fsprogs
+          # `curl`, for the door where the machine asks the cell to let it in:
+          # it announces itself, reads back the certificate it was served, and
+          # polls until somebody approves. An installer carrying its own HTTP
+          # and TLS stacks to make four requests would be an installer nobody
+          # could audit for the sake of four requests.
+          pkgs.curl
         ];
       };
 
@@ -1119,7 +1125,11 @@
             # installer that had just printed the reason.
             status, _ = machine.execute(
                 f"API_URL=http://cell.example:8443 TOKEN={token} PICK={pick}"
-                f" ROLES=hypervisor DOOR=3"
+                # Door 4 now: door 3 became "ask the cell to let it in", which
+                # needs a control plane on the wire that this check does not
+                # have. The custom door — every question still asked — moved
+                # along by one.
+                f" ROLES=hypervisor DOOR=4"
                 f" expect ${./nix/node-wizard.exp} >/tmp/transcript 2>&1"
             )
             if status != 0:

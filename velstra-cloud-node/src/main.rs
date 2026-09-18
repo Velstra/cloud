@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod announce;
 mod cell;
 mod disks;
 mod install;

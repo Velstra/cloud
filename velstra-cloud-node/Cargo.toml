@@ -14,6 +14,10 @@ repository.workspace = true
 # hoped to be the same file.
 rcgen = "0.13"
 sha2 = { workspace = true }
+# Ed25519 for the enrolment door: the machine proves it holds the key it
+# announced. Already in the tree under rustls and used by the model for image
+# signatures, from the same workspace pin.
+ring = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 # The join token is a wire format the installer reads and the API writes; the

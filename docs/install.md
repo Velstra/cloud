@@ -67,8 +67,10 @@ an `rbd:` disk is refused there by name.
    neither, which is the sealed default), then optional LUKS2 encryption of the
    data partition, the hostname, DHCP or a static uplink, and finally **what
    this machine is for**: the first machine of a new cell, a machine joining one
-   with a join token, or the questions one by one. [`joining.md`](joining.md)
-   has the three doors and the token.
+   with a join token, a machine that **asks the cell to let it in** — you type
+   only the cell's address, compare a fingerprint, and approve it in the
+   console — or the questions one by one. [`joining.md`](joining.md) has the
+   four doors, the token and what the fingerprints are for.
 
    Passing a card into guests is deliberately **not** asked here: it is a
    decision about what the machine will run, which nobody has made yet while

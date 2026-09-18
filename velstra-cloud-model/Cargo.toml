@@ -17,3 +17,8 @@ base64 = { workspace = true }
 ring = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# Only to pin `claim_message` against the wire crate's copy. Never a real
+# dependency: the arrow runs from transport to domain, not back.
+velstra-cloud-wire = { workspace = true }

@@ -32,6 +32,7 @@ pub mod ceph;
 pub mod disk;
 pub mod drift;
 pub mod election;
+pub mod enrollment;
 pub mod evacuation;
 pub mod floating_ip;
 pub mod imagesource;

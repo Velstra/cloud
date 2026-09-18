@@ -208,13 +208,15 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
     println!("\nInstall as:");
     println!("  [1] the first machine of a new cell   control plane, hypervisor, storage");
     println!("  [2] a machine joining a cell          paste the join token from the console");
-    println!("  [3] custom                            the questions, one by one");
+    println!("  [3] ask the cell to let it in         type only the cell's address");
+    println!("  [4] custom                            the questions, one by one");
     let door = loop {
         match prompt("Install as [1]: ")?.trim() {
             "" | "1" => break 1,
             "2" => break 2,
             "3" => break 3,
-            other => println!("  {other:?} is not an option — pick 1, 2 or 3."),
+            "4" => break 4,
+            other => println!("  {other:?} is not an option — pick 1, 2, 3 or 4."),
         }
     };
 
@@ -228,6 +230,28 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
             network,
             ssh_key,
             root_password,
+            None,
+        );
+    }
+    // The same door as 2, arrived at differently: the token is handed over by
+    // the cell once somebody approves, instead of being carried here. What
+    // happens with it afterwards is identical, which is the point — there is
+    // one code path that turns a token into an install.
+    if door == 3 {
+        let Some(token) = crate::announce::run()? else {
+            println!("\nNothing was written, and this machine is unchanged.");
+            return Ok(None);
+        };
+        return join(
+            chosen,
+            raid,
+            picks,
+            passphrase,
+            hostname,
+            network,
+            ssh_key,
+            root_password,
+            Some(token),
         );
     }
 
@@ -755,7 +779,23 @@ fn join(
     // asked again, which is what door 2 did the first time round.
     ssh_key: String,
     root_password: String,
+    // Already in hand, when the cell handed it over after an approval. `None`
+    // means look on the media and then ask.
+    handed: Option<velstra_cloud_wire::join::JoinToken>,
 ) -> Result<Option<Answers>> {
+    if let Some(token) = handed {
+        return from_token(
+            token,
+            chosen,
+            raid,
+            picks,
+            passphrase,
+            hostname,
+            network,
+            ssh_key,
+            root_password,
+        );
+    }
     // Anything plugged in first. A join token is a little over a thousand
     // characters of base64: it carries six facts from the control plane so
     // nothing has to be copied by hand, and then asks somebody to type it at a
@@ -778,6 +818,37 @@ fn join(
             }
         }
     };
+    from_token(
+        token,
+        chosen,
+        raid,
+        picks,
+        passphrase,
+        hostname,
+        network,
+        ssh_key,
+        root_password,
+    )
+}
+
+/// What a token turns into, however it was obtained.
+///
+/// One path for all of it: pasted, found on a stick, or handed over by the
+/// cell after somebody approved this machine. Three ways in and one way
+/// through — the alternative is three copies of the same translation from
+/// token to seed, which is the shape this codebase has paid for four times.
+#[allow(clippy::too_many_arguments)]
+fn from_token(
+    token: velstra_cloud_wire::join::JoinToken,
+    chosen: Vec<&Disk>,
+    raid: Raid,
+    picks: Vec<usize>,
+    passphrase: Option<String>,
+    hostname: String,
+    network: Network,
+    ssh_key: String,
+    root_password: String,
+) -> Result<Option<Answers>> {
     let mut roles = Vec::new();
     if !token.token.is_empty() {
         roles.push(crate::roles::Role::Hypervisor);

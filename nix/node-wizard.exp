@@ -46,13 +46,18 @@ answer "Encrypt the data partition" "n"
 answer "Hostname"  "node-t1"
 answer "Use DHCP"  "y"
 
-# The three doors. `$DOOR` picks. Door 1 is the first machine of a cell; door 2
+# The four doors. `$DOOR` picks. Door 1 is the first machine of a cell; door 2
 # is the join token and asks nothing else; door 3 is the wizard as it was, every
 # question still asked — and the check runs all three, because door 2 is the one
 # an operator takes and door 3 is the one that proves every question still
-# exists. Behind door 3, `$ROLES` says what this box is for, so the same script
+# exists. Behind door 4, `$ROLES` says what this box is for, so the same script
 # drives the hypervisor install this check makes today and a control-plane or
 # pool install without a second copy of the whole flow.
+#
+# Door 3 — the machine asking a cell to let it in — is not driven here: it
+# needs a control plane on the wire, which this check deliberately does not
+# have, and the half that differs from door 2 ends at the same `from_token`.
+# `checks.register` is where a live API is available.
 answer "Install as"        "$env(DOOR)"
 
 if {$env(DOOR) == 2} {

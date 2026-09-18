@@ -155,7 +155,15 @@ pub fn fingerprint_at(root: &Path) -> Option<String> {
     fingerprint_of_pem(&pem).ok()
 }
 
-fn fingerprint_of_pem(pem: &str) -> Result<String> {
+/// The fingerprint of a certificate in PEM, by the same arithmetic as
+/// everything else here.
+///
+/// Public because the enrolment door needs it: the machine shows the
+/// fingerprint of the certificate it was *served*, and an operator compares
+/// that against the one the control plane's banner prints for itself. Two
+/// numbers computed two ways would be worse than showing none — so there is
+/// one function, and both callers use it.
+pub fn fingerprint_of_pem(pem: &str) -> Result<String> {
     let body: String = pem
         .lines()
         .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))

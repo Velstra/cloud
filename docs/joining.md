@@ -216,20 +216,46 @@ it changes its hash and destroys the property that makes it worth having — one
 artefact for a whole fleet. Image plus a few kilobytes of seed is the same
 convenience without either cost.
 
-**Approval in the console** — for when somebody is. The machine boots, takes a
-lease, generates a keypair, announces itself to a cell address (the one short
-thing anybody types, and a DHCP option can carry it), and shows a short
-fingerprint on its screen. A `Pending` row appears in the console with the
-same fingerprint and what the machine reported about its hardware; the
-operator compares, picks the roles, and approves. Nothing secret is typed —
-the comparison *is* the authentication, in both directions, because the
-machine also shows the fingerprint of the certificate it was served and the
-banner on the control plane prints that cell's own. This is MAAS's enlistment
-and Proxmox's join in one gesture, and it scales to a rack: twenty machines
-from one ISO are twenty rows to approve.
+**Approval in the console** — for when somebody is. Shipping, as the
+installer's third door and the `enrollments` collection. The machine boots,
+takes a lease, generates a keypair, announces itself to a cell address (the
+one short thing anybody types), and shows **two** fingerprints on its screen.
+A `Pending` row appears in the console with the first of them and what the
+machine reported about itself; the operator compares, names the machine, says
+what it is for, and approves. The machine is polling, so it moves on while
+they are still looking at it, and from there the install is the same code path
+door 2 takes.
 
-It needs the network at install time, which the token deliberately does not,
-so it is a door beside the others and not a replacement for them.
+Nothing secret is typed in either direction, because the comparison *is* the
+authentication both ways. The first fingerprint is eight bytes of SHA-256 over
+the machine's public key: only the holder of the private key can produce it,
+and nothing on the wire can change it without changing the number. The second
+is the certificate the machine was *served* — it has no CA yet and cannot
+verify anything — and the control plane's own banner prints that same value
+for itself, by the same function, so somebody in the middle has to show a
+certificate they hold the key for, which is a different number, on this
+machine's screen.
+
+**Nobody registers themselves.** The claim has to create a Node and mint a
+credential, and the machine may do neither. The API records *who approved* on
+the enrolment's status — a field the platform writes and no caller can send —
+and mints as that person: the registration happens on the recorded authority
+of somebody who may already create nodes, once, for the one node they named,
+and the audit line carries a human. The two rejected alternatives are worth
+naming, because both are the kind of thing that never gets revisited: an
+internal service identity is a trust root nobody would question again, and
+sealing the token to the machine's key is X25519 + HKDF + AEAD written by hand.
+
+It scales to a rack — twenty machines from one ISO are twenty rows to
+approve — and it needs the network at install time, which the token
+deliberately does not. So it is a door beside the others and not a
+replacement: only a token on a medium installs a machine on a network that is
+not up yet.
+
+An unanswered announcement stands for an hour and is then retired by a
+controller, so the list an operator reads is what is actually waiting for
+them. Retiring one costs nothing: the row's id comes from the machine's key,
+so it announces again and lands on the same row.
 
 ## What this does not do
 
@@ -240,7 +266,7 @@ so it is a door beside the others and not a replacement for them.
   key do not (see `install.md`). A fleet update is still images by hand.
 * **No push.** Talos's direction — an operator pushing configuration at a
   listening machine — is a different platform. This one pulls, from a seed.
-* **No enrolment yet.** The approval flow above is designed and not built:
-  there is no `Enrollment` resource, no unauthenticated announce, and no
-  pending list in the console. Until there is, a token on a medium is the way
-  to avoid typing one.
+* **No attestation in the enrolment door either.** A machine's key is
+  introduced by a person comparing two numbers, not vouched for by hardware. A
+  key a TPM stood behind would enter through the same door, and nothing here
+  is shaped against it.

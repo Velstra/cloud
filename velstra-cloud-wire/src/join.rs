@@ -286,3 +286,34 @@ mod tests {
         assert!(t.encode().len() < 2048, "{}", t.encode().len());
     }
 }
+
+/// What a machine signs to prove it holds the key it announced.
+///
+/// Here rather than in the model, because both ends need it and only one of
+/// them carries the model: the API verifies, and the *installer* signs — and
+/// the installer is a small binary on a sealed medium that deliberately
+/// depends on this crate and nothing larger. A message spelled twice is a
+/// machine that signs something the cell does not check.
+///
+/// The enrolment's own id and nothing else. A nonce would be better against
+/// replay and is not needed: a claim succeeds once, so a replayed signature
+/// buys a refusal. Versioned, so a future shape cannot be mistaken for this
+/// one by a machine running older code.
+pub fn claim_message(id: &str) -> Vec<u8> {
+    format!("velstra-enrollment-claim:v1:{id}").into_bytes()
+}
+
+#[cfg(test)]
+mod claim_message_tests {
+    use super::claim_message;
+
+    /// Pinned, because it is a wire format: changing it silently would stop
+    /// every machine already in the field from being able to claim.
+    #[test]
+    fn the_message_is_the_id_under_a_versioned_prefix() {
+        assert_eq!(
+            claim_message("m-1a2b3c4d5e6f"),
+            b"velstra-enrollment-claim:v1:m-1a2b3c4d5e6f".to_vec()
+        );
+    }
+}

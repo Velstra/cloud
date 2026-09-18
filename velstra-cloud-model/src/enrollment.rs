@@ -335,11 +335,18 @@ fn encode_standard(raw: &[u8]) -> String {
 
 /// What a machine signs to prove it holds the key it announced.
 ///
+/// Spelled here *and* in `velstra-cloud-wire`, deliberately, with a test below
+/// pinning the two together. The installer signs and carries only the wire
+/// crate — a small thing on a sealed medium — and this crate verifies; a
+/// domain that depended on its own transport to say what a signature covers
+/// would have the arrow pointing the wrong way. So the duplication is real,
+/// and it is the kind this codebase permits: two spellings with a test that
+/// fails the moment they differ, rather than two spellings and a hope.
+///
 /// The enrolment's own id and nothing else. A nonce would be better against
-/// replay and is not needed here: a claim succeeds once — the second is
-/// [`NotClaimable::AlreadyClaimed`] — so a replayed signature buys an attacker
-/// a refusal. Versioned, so a future message shape cannot be confused with
-/// this one by a machine running older code.
+/// replay and is not needed: a claim succeeds once, so a replayed signature
+/// buys a refusal. Versioned, so a future shape cannot be mistaken for this
+/// one by a machine running older code.
 pub fn claim_message(id: &str) -> Vec<u8> {
     format!("velstra-enrollment-claim:v1:{id}").into_bytes()
 }
@@ -763,5 +770,25 @@ mod claims {
             verify_claim(&public, "m-1", "AAAA"),
             Err(BadKey::NotASignature(3))
         );
+    }
+}
+
+/// The two spellings of the claim message are one spelling.
+///
+/// `velstra-cloud-wire` is a dev-dependency here and never a real one: the
+/// arrow runs from transport to domain, not back. This is the whole reason the
+/// duplication above is allowed to exist.
+#[cfg(test)]
+mod one_message {
+    #[test]
+    fn the_model_and_the_wire_agree_about_what_a_claim_signs() {
+        for id in ["m-1a2b3c4d5e6f", "m-000000000000", ""] {
+            assert_eq!(
+                super::claim_message(id),
+                velstra_cloud_wire::join::claim_message(id),
+                "the model and the wire disagree, so a machine would sign something the \
+                 cell does not check"
+            );
+        }
     }
 }
