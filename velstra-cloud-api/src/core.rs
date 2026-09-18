@@ -4082,16 +4082,24 @@ impl Api {
         // trail names a person; an enrolment approved by nobody cannot be
         // claimed, which `claimable` has already refused above.
         if status.approved_by.trim().is_empty() {
-            // Approved with nobody recorded. That is not a state this API
-            // produces — `patch` records the approver as it writes the flag —
-            // so it means the row was written by something else, and minting a
-            // credential on an authority nobody can name is the one thing this
-            // door must not do.
+            // Approved with nobody recorded. `patch` writes the approver as it
+            // writes the flag, so this is a row from a build that did not — or
+            // one whose recording write was lost — and minting a credential on
+            // an authority nobody can name is the one thing this door must not
+            // do.
+            //
+            // It used to say "turn it away and let the machine announce
+            // again", which was true and useless: the operator had approved a
+            // machine and was told to start over for a reason about this
+            // platform's bookkeeping. The refusal now says what actually
+            // clears it, and approving again does — the flag is already set,
+            // the patch is still a write, and the hook records the person
+            // making it.
             return Err(ApiError::new(
                 Code::FailedPrecondition,
-                "this enrolment is approved and carries no record of who approved it, so there \
-                 is no authority to register the node under. Turn it away and let the machine \
-                 announce again.",
+                "this machine was approved before the cell recorded who approved it, and a \
+                 credential is only ever minted on a person's authority. Press Approve once \
+                 more and it goes through — the machine is still waiting and keeps its place.",
             ));
         }
         let approver = Identity::new(status.approved_by.trim().to_string());
@@ -4649,6 +4657,9 @@ impl Api {
         if !approved {
             return;
         }
+        // Refused as well as approved: both are a decision, and a row whose
+        // refusal nobody is recorded for is a row nobody can account for
+        // later.
         let Ok(mut status) = serde_json::from_value::<en::EnrollmentStatus>(
             document.get("status").cloned().unwrap_or(Value::Null),
         ) else {

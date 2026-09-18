@@ -623,6 +623,16 @@ fn unscreened(kind: &str) -> Option<&'static str> {
              object, which is machinery rather than a schema entry — until then a volume is \
              restored by typing the snapshot's name",
         ),
+        "enrollments" => Some(
+            "a machine waiting to be let in is shown on the page of the Node it is asking to \
+             become, not on a board of its own. It had one, and the first person to use it said \
+             what was wrong with that: the same machine appeared twice — once under Pending \
+             machines and once under Nodes — and the decision was on the row that was not where \
+             anybody looks for a machine. Everything the decision needs is on the node now: the \
+             fingerprint to compare, what the machine says it is, the roles, and one button. \
+             The collection is still served, listed and patched; it is the *board* that would \
+             be the second place to remember",
+        ),
         "console-sessions" => Some(
             "a console session is minted and spent within a minute of somebody clicking \
              Console, and there is nothing on it a person would go looking for: the ticket is \
@@ -637,8 +647,10 @@ fn unscreened(kind: &str) -> Option<&'static str> {
 /// The unscreened list is a claim about what a person cannot do, so it says why.
 #[test]
 fn every_unscreened_collection_says_why() {
-    let why = unscreened("snapshots").expect("listed above but not exempt");
-    assert!(why.len() > 60, "snapshots is unscreened without saying why");
+    for kind in ["snapshots", "console-sessions", "enrollments"] {
+        let why = unscreened(kind).expect("listed above but not exempt");
+        assert!(why.len() > 60, "{kind} is unscreened without saying why");
+    }
 }
 
 // ---- the other direction ---------------------------------------------------

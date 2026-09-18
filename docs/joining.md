@@ -220,12 +220,13 @@ convenience without either cost.
 installer's third door and the `enrollments` collection. The machine boots,
 takes a lease, generates a keypair, announces itself to a cell address (the
 one short thing anybody types), and shows **two** fingerprints on its screen.
-Two things then appear in the console. **The machine is under Nodes**, beside
-the others, out of service — because that is where somebody looks for a new
-machine, and a separate list of pending things is a second place to remember.
-And a row under *Pending machines* carries the first fingerprint and what the
-machine reported about itself; the operator compares, says what it is for, and
-approves.
+**The machine appears under Nodes**, beside the others, out of service — and
+that is the only place it appears. It had a board of its own for a day, and
+the first person to use it found the same machine in two lists with the
+decision on the one nobody looks at. So the whole decision is on the node's
+page: the fingerprint to compare, what the machine says it is, three switches
+for what it should be for, and one button. No name is asked for — it was typed
+into the installer and the announcement carried it.
 
 The Node exists before anybody has said yes, and four things make that safe on
 a door nobody authenticates: it has **no credential**, so nothing can report

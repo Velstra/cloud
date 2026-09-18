@@ -494,6 +494,31 @@
         ],
         "type": "object"
       },
+      "Enrollment": {
+        "description": "What was asked for (`spec`), what is (`status`), and how far the second is behind the first (`meta.generation` against `status.observedGeneration`).",
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/EnrollmentSpec"
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          }
+        },
+        "required": [
+          "meta",
+          "spec",
+          "status"
+        ],
+        "type": "object"
+      },
+      "EnrollmentSpec": {
+        "additionalProperties": true,
+        "description": "The console has no form for this collection, so its fields are not enumerated here; docs/rest-contract.md names them.",
+        "type": "object"
+      },
       "Error": {
         "properties": {
           "error": {
@@ -1467,66 +1492,6 @@
         "required": [
           "target",
           "verb"
-        ],
-        "type": "object"
-      },
-      "PendingMachine": {
-        "description": "What was asked for (`spec`), what is (`status`), and how far the second is behind the first (`meta.generation` against `status.observedGeneration`).",
-        "properties": {
-          "meta": {
-            "$ref": "#/components/schemas/Meta"
-          },
-          "spec": {
-            "$ref": "#/components/schemas/PendingMachineSpec"
-          },
-          "status": {
-            "$ref": "#/components/schemas/Status"
-          }
-        },
-        "required": [
-          "meta",
-          "spec",
-          "status"
-        ],
-        "type": "object"
-      },
-      "PendingMachineSpec": {
-        "additionalProperties": true,
-        "description": "Machines that have announced themselves and are waiting to be let in. Compare the fingerprint on a row with the one on that machine's own screen, say what it is for, and approve — that comparison is the authentication, in both directions, and nothing secret is typed either way.",
-        "properties": {
-          "approved": {
-            "description": "Turn on once the fingerprint on this row matches the one on the machine's own screen. That comparison is the whole authentication: nothing secret is typed in either direction, so a row you approve without looking is a machine you have not checked.",
-            "type": "boolean"
-          },
-          "isControlPlane": {
-            "description": "It runs this cell's API and store. Rare, and never the machine's own answer: a box that could make itself a control plane could make itself the cell.",
-            "type": "boolean"
-          },
-          "node": {
-            "description": "What the whole cell will call this machine, for ever. It cannot be changed afterwards, and it is the name on every guest, volume and alert that mentions the machine. The machine's own hostname is on this row under \"Calls itself\" — using it keeps the two names the same, which is one fewer thing to hold in your head.",
-            "format": "id",
-            "type": "string"
-          },
-          "pool": {
-            "description": "Which storage pool it serves, when `pool` is one of the roles.",
-            "format": "id",
-            "type": "string"
-          },
-          "refused": {
-            "description": "For a machine that should not join this cell — one somebody flashed by mistake, or one you do not recognise. It stops asking immediately instead of retrying for the hour, and the row stays so it is clear somebody decided rather than forgot.",
-            "type": "boolean"
-          },
-          "runsGuests": {
-            "description": "The usual answer. This machine starts and holds virtual machines — the `hypervisor` role.",
-            "type": "boolean"
-          },
-          "servesStorage": {
-            "description": "Its disks become a pool other machines can put volumes in — the `pool` role. Name the pool below.",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "node"
         ],
         "type": "object"
       },
@@ -3922,328 +3887,6 @@
         "summary": "Change the spec of one of Device classes",
         "tags": [
           "Device classes"
-        ]
-      }
-    },
-    "/api/v1/enrollments": {
-      "get": {
-        "operationId": "list-enrollments",
-        "parameters": [
-          {
-            "description": "How many to return; the response carries `nextPageToken` when there are more.",
-            "in": "query",
-            "name": "pageSize",
-            "required": false,
-            "schema": {
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Where the previous page ended.",
-            "in": "query",
-            "name": "pageToken",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Only objects carrying these labels, as `key=value,key2=value2`.",
-            "in": "query",
-            "name": "labels",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "`true` streams changes as server-sent events instead of listing.",
-            "in": "query",
-            "name": "watch",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
-          },
-          {
-            "description": "With `watch`: the revision a list reported, so nothing between the list and the watch is lost.",
-            "in": "query",
-            "name": "fromRevision",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Only objects created at or after this moment: milliseconds since the epoch, or a span back from now like `30m`, `6h`, `7d`.",
-            "in": "query",
-            "name": "since",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Only objects created before this moment, same spellings as `since`. Exclusive, so two adjacent ranges neither overlap nor skip.",
-            "in": "query",
-            "name": "until",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "`name` or `createdAt`, optionally followed by ` desc`. An ordered listing is a top-N: everything the filter admits is read and sorted, and the first `pageSize` of the sorted order is returned with no `nextPageToken` (and `\"truncated\": true` when the answer was cut). Refused together with `pageToken`.",
-            "in": "query",
-            "name": "orderBy",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "A read mask: comma-separated dotted paths, as `meta.name,status.conditions`. `meta.name` is always returned.",
-            "in": "query",
-            "name": "fields",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "properties": {
-                    "items": {
-                      "items": {
-                        "$ref": "#/components/schemas/PendingMachine"
-                      },
-                      "type": "array"
-                    },
-                    "nextPageToken": {
-                      "type": "string"
-                    },
-                    "revision": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "items",
-                    "revision"
-                  ],
-                  "type": "object"
-                }
-              }
-            },
-            "description": "A page of objects. `X-Velstra-Revision` is the revision the list is consistent at."
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Refused, with a code a program can branch on and a sentence a person can read."
-          }
-        },
-        "summary": "List Pending machines",
-        "tags": [
-          "Pending machines"
-        ]
-      }
-    },
-    "/api/v1/enrollments/{name}": {
-      "get": {
-        "operationId": "get-enrollments",
-        "parameters": [
-          {
-            "description": "The object's id — the last segment of its name.",
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PendingMachine"
-                }
-              }
-            },
-            "description": "The object."
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Refused, with a code a program can branch on and a sentence a person can read."
-          }
-        },
-        "summary": "Read one of Pending machines",
-        "tags": [
-          "Pending machines"
-        ]
-      },
-      "patch": {
-        "description": "Only `spec` and `labels` are writable here; `status` is the owning agent's, written through `:reportStatus`. Send `If-Match` with the revision read to make the write a compare-and-swap.",
-        "operationId": "patch-enrollments",
-        "parameters": [
-          {
-            "description": "The object's id — the last segment of its name.",
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "properties": {
-                  "labels": {
-                    "additionalProperties": {
-                      "type": "string"
-                    },
-                    "type": "object"
-                  },
-                  "spec": {
-                    "$ref": "#/components/schemas/PendingMachineSpec"
-                  }
-                },
-                "type": "object"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PendingMachine"
-                }
-              }
-            },
-            "description": "The object as stored."
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Refused, with a code a program can branch on and a sentence a person can read."
-          }
-        },
-        "summary": "Change the spec of one of Pending machines",
-        "tags": [
-          "Pending machines"
-        ]
-      }
-    },
-    "/api/v1/enrollments:announce": {
-      "post": {
-        "operationId": "announce-enrollments",
-        "parameters": [],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "additionalProperties": true,
-                "type": "object"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "The answer."
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Refused, with a code a program can branch on and a sentence a person can read."
-          }
-        },
-        "summary": "A machine announcing itself to this cell, with no token — it has just booted an installer and holds none. Carries `publicKey` (Ed25519, base64), optionally `seenCertificate` and `reported`. Answers the enrolment's id and the fingerprint of the key, which the machine prints on its screen for an operator to compare. Grants nothing: an operator has to name the machine and say what it is for before anything can be claimed. Idempotent in the key, so a machine that announces again lands on its own row; capped, because it is the one door a stranger can write through.",
-        "tags": [
-          "Pending machines"
-        ]
-      }
-    },
-    "/api/v1/enrollments:claim": {
-      "post": {
-        "operationId": "claim-enrollments",
-        "parameters": [],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "additionalProperties": true,
-                "type": "object"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "The answer."
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Refused, with a code a program can branch on and a sentence a person can read."
-          }
-        },
-        "summary": "A machine collecting the credential an operator approved for it, with no token. Carries `id` and `signature` — an Ed25519 signature over `velstra-enrollment-claim:v1:<id>`, made with the key the machine announced — and answers `nodeToken` and `joinToken`, once. Authorised by that signature and by the recorded approval of a person. A collection verb rather than `enrollments/<id>:claim` because a path segment in this router is either a literal or a parameter and never both; the id is not a secret.",
-        "tags": [
-          "Pending machines"
         ]
       }
     },
@@ -9551,6 +9194,375 @@
         "summary": "Change the spec of one of console-sessions",
         "tags": [
           "console-sessions"
+        ]
+      }
+    },
+    "/api/v1/projects/{project}/enrollments": {
+      "get": {
+        "operationId": "list-enrollments",
+        "parameters": [
+          {
+            "description": "The project the object belongs to.",
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "How many to return; the response carries `nextPageToken` when there are more.",
+            "in": "query",
+            "name": "pageSize",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Where the previous page ended.",
+            "in": "query",
+            "name": "pageToken",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects carrying these labels, as `key=value,key2=value2`.",
+            "in": "query",
+            "name": "labels",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`true` streams changes as server-sent events instead of listing.",
+            "in": "query",
+            "name": "watch",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With `watch`: the revision a list reported, so nothing between the list and the watch is lost.",
+            "in": "query",
+            "name": "fromRevision",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created at or after this moment: milliseconds since the epoch, or a span back from now like `30m`, `6h`, `7d`.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created before this moment, same spellings as `since`. Exclusive, so two adjacent ranges neither overlap nor skip.",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`name` or `createdAt`, optionally followed by ` desc`. An ordered listing is a top-N: everything the filter admits is read and sorted, and the first `pageSize` of the sorted order is returned with no `nextPageToken` (and `\"truncated\": true` when the answer was cut). Refused together with `pageToken`.",
+            "in": "query",
+            "name": "orderBy",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A read mask: comma-separated dotted paths, as `meta.name,status.conditions`. `meta.name` is always returned.",
+            "in": "query",
+            "name": "fields",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "items": {
+                      "items": {
+                        "$ref": "#/components/schemas/Enrollment"
+                      },
+                      "type": "array"
+                    },
+                    "nextPageToken": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "revision"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A page of objects. `X-Velstra-Revision` is the revision the list is consistent at."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "List enrollments",
+        "tags": [
+          "enrollments"
+        ]
+      }
+    },
+    "/api/v1/projects/{project}/enrollments/{name}": {
+      "get": {
+        "operationId": "get-enrollments",
+        "parameters": [
+          {
+            "description": "The project the object belongs to.",
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Enrollment"
+                }
+              }
+            },
+            "description": "The object."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Read one of enrollments",
+        "tags": [
+          "enrollments"
+        ]
+      },
+      "patch": {
+        "description": "Only `spec` and `labels` are writable here; `status` is the owning agent's, written through `:reportStatus`. Send `If-Match` with the revision read to make the write a compare-and-swap.",
+        "operationId": "patch-enrollments",
+        "parameters": [
+          {
+            "description": "The project the object belongs to.",
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "labels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "spec": {
+                    "$ref": "#/components/schemas/EnrollmentSpec"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Enrollment"
+                }
+              }
+            },
+            "description": "The object as stored."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Change the spec of one of enrollments",
+        "tags": [
+          "enrollments"
+        ]
+      }
+    },
+    "/api/v1/projects/{project}/enrollments:announce": {
+      "post": {
+        "operationId": "announce-enrollments",
+        "parameters": [
+          {
+            "description": "The project the object belongs to.",
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "A machine announcing itself to this cell, with no token — it has just booted an installer and holds none. Carries `publicKey` (Ed25519, base64), optionally `seenCertificate` and `reported`. Answers the enrolment's id and the fingerprint of the key, which the machine prints on its screen for an operator to compare. Grants nothing: an operator has to name the machine and say what it is for before anything can be claimed. Idempotent in the key, so a machine that announces again lands on its own row; capped, because it is the one door a stranger can write through.",
+        "tags": [
+          "enrollments"
+        ]
+      }
+    },
+    "/api/v1/projects/{project}/enrollments:claim": {
+      "post": {
+        "operationId": "claim-enrollments",
+        "parameters": [
+          {
+            "description": "The project the object belongs to.",
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "A machine collecting the credential an operator approved for it, with no token. Carries `id` and `signature` — an Ed25519 signature over `velstra-enrollment-claim:v1:<id>`, made with the key the machine announced — and answers `nodeToken` and `joinToken`, once. Authorised by that signature and by the recorded approval of a person. A collection verb rather than `enrollments/<id>:claim` because a path segment in this router is either a literal or a parameter and never both; the id is not a secret.",
+        "tags": [
+          "enrollments"
         ]
       }
     },

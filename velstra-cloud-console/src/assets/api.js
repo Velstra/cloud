@@ -501,6 +501,21 @@ const issueCredential = (coll, id) =>
   request("POST", writePath(coll) + "/" + encodeURIComponent(id) + ":issueCredential",
     { body: {} }).then((r) => r.body);
 
+/// One enrolment, by id. Read to show a waiting machine's fingerprint on the
+/// page of the node it is asking to become.
+const enrolment = (id) =>
+  request("GET", "/api/v1/enrollments/" + encodeURIComponent(id)).then((r) => r.body);
+
+/// Say yes, or no, to a machine waiting to be let in.
+///
+/// One call carrying the whole decision — the roles and the answer together —
+/// because they are one decision. Approving without saying what a machine is
+/// for produces a credential for no roles, which is a machine that registers
+/// and does nothing.
+const decideEnrolment = (id, spec) =>
+  request("PATCH", "/api/v1/enrollments/" + encodeURIComponent(id), { body: { spec } })
+    .then((r) => r.body);
+
 /// The join token as a file, for a machine that is about to be installed.
 ///
 /// Raw text rather than JSON, and downloaded rather than shown: it is about

@@ -575,125 +575,6 @@ pub struct Collection {
 
 // ---- the collections -------------------------------------------------------
 
-/// What an operator decides about a machine that has announced itself.
-///
-/// Every field here is the *operator's*. What the machine said about itself is
-/// on its status and is shown, never edited — it is a stranger's description
-/// of itself, and a form that let somebody correct it would be a form that
-/// made the description look verified.
-const ENROLLMENT_FIELDS: &[Field] = &[
-    Field {
-        key: "node",
-        label: "Name it",
-        kind: Kind::Text {
-            placeholder: "peter",
-            // An id — `peter` — and not `Check::Name`, which is an AIP name and
-            // asked an operator to type `projects/…` in front of a machine that
-            // belongs to no project. A node is cell-scoped; it has never had a
-            // parent to name.
-            check: Check::Id,
-        },
-        required: true,
-        advanced: false,
-        help: "What the whole cell will call this machine, for ever. It cannot \
-               be changed afterwards, and it is the name on every guest, volume \
-               and alert that mentions the machine. The machine's own hostname \
-               is on this row under \"Calls itself\" — using it keeps the two \
-               names the same, which is one fewer thing to hold in your head.",
-        when_empty: "",
-        derived: false,
-        at_creation: false,
-    },
-    // Three switches and not one list of words.
-    //
-    // "A machine may be more than one" is three yes/no questions, and a free
-    // text list made them a string somebody has to know how to spell — there
-    // was nothing to *choose*, which is what an operator looking at a new box
-    // reasonably expects. Each says what the machine does rather than what the
-    // role is called, because "runs guests" is a thing anybody can answer and
-    // "hypervisor" is a word this platform taught them.
-    Field {
-        key: "runsGuests",
-        label: "Runs guests",
-        kind: Kind::Switch,
-        required: false,
-        advanced: false,
-        help: "The usual answer. This machine starts and holds virtual \
-               machines — the `hypervisor` role.",
-        when_empty: "",
-        derived: false,
-        at_creation: false,
-    },
-    Field {
-        key: "servesStorage",
-        label: "Serves storage",
-        kind: Kind::Switch,
-        required: false,
-        advanced: false,
-        help: "Its disks become a pool other machines can put volumes in — the \
-               `pool` role. Name the pool below.",
-        when_empty: "",
-        derived: false,
-        at_creation: false,
-    },
-    Field {
-        key: "isControlPlane",
-        label: "Is a control plane",
-        kind: Kind::Switch,
-        required: false,
-        advanced: true,
-        help: "It runs this cell's API and store. Rare, and never the machine's \
-               own answer: a box that could make itself a control plane could \
-               make itself the cell.",
-        when_empty: "",
-        derived: false,
-        at_creation: false,
-    },
-    Field {
-        key: "pool",
-        label: "Pool",
-        kind: Kind::Text {
-            placeholder: "local-2",
-            check: Check::Id,
-        },
-        required: false,
-        advanced: false,
-        help: "Which storage pool it serves, when `pool` is one of the roles.",
-        when_empty: "",
-        derived: false,
-        at_creation: false,
-    },
-    Field {
-        key: "approved",
-        label: "Approve",
-        kind: Kind::Switch,
-        required: false,
-        advanced: false,
-        help: "Turn on once the fingerprint on this row matches the one on the \
-               machine's own screen. That comparison is the whole \
-               authentication: nothing secret is typed in either direction, so \
-               a row you approve without looking is a machine you have not \
-               checked.",
-        when_empty: "",
-        derived: false,
-        at_creation: false,
-    },
-    Field {
-        key: "refused",
-        label: "Do not let it in",
-        kind: Kind::Switch,
-        required: false,
-        advanced: false,
-        help: "For a machine that should not join this cell — one somebody \
-               flashed by mistake, or one you do not recognise. It stops asking \
-               immediately instead of retrying for the hour, and the row stays \
-               so it is clear somebody decided rather than forgot.",
-        when_empty: "",
-        derived: false,
-        at_creation: false,
-    },
-];
-
 const USER_FIELDS: &[Field] = &[
     Field {
         key: "service",
@@ -5951,89 +5832,6 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
-        id: "enrollments",
-        title: "Pending machines",
-        singular: "Pending machine",
-        // Zero: every change here is a write — the machine announcing, an
-        // operator approving, the sweep expiring a row — so the watch carries
-        // all of it.
-        recheck: 0,
-        condition: "Ready",
-        group: "Hardware",
-        scope: Scope::Global,
-        audience: Audience::Operator,
-        blurb: "Machines that have announced themselves and are waiting to be \
-                let in. Compare the fingerprint on a row with the one on that \
-                machine's own screen, say what it is for, and approve — that \
-                comparison is the authentication, in both directions, and \
-                nothing secret is typed either way.",
-        empty: "No machine is waiting. A machine appears here when it boots the \
-                installer and is told this cell's address; until then there is \
-                nothing to approve. A machine can also be installed with a join \
-                token on a stick instead, which needs no network at all.",
-        fields: ENROLLMENT_FIELDS,
-        columns: &[
-            Column {
-                path: "status.fingerprint",
-                label: "Fingerprint",
-                // Mono: this column exists to be compared character by
-                // character against another screen, and a proportional face
-                // is the wrong tool for that.
-                cell: Cell::Mono,
-                width: 200,
-            },
-            Column {
-                path: "status.phase",
-                label: "Phase",
-                cell: Cell::Text,
-                width: 110,
-            },
-            Column {
-                path: "status.reported.hostname",
-                label: "Calls itself",
-                cell: Cell::Text,
-                width: 140,
-            },
-            Column {
-                path: "status.reported.serial",
-                label: "Serial",
-                cell: Cell::Mono,
-                width: 140,
-            },
-            Column {
-                path: "status.reported.vcpus",
-                label: "vCPU",
-                cell: Cell::Count,
-                width: 80,
-            },
-            Column {
-                path: "status.expiresAt",
-                label: "Expires",
-                cell: Cell::Ago,
-                width: 110,
-            },
-        ],
-        agreements: &[Agreement {
-            label: "Let in",
-            asked: "approved",
-            is: "phase",
-            note: "Approved and still not Claimed means the machine has not \
-                   come back for its credential yet — it polls, so this closes \
-                   itself within seconds unless the machine has gone away or \
-                   cannot reach this API.",
-        }],
-        // A machine puts itself here. An operator creating a row by hand would
-        // be creating one with no key, which nothing could ever claim.
-        creatable: false,
-        editable: true,
-        // Kept, not swept by hand: the sweep expires what nobody answered, and
-        // a row an operator could delete is a record of a decision somebody
-        // may need to explain later. Refusing says no; deleting hides that
-        // anybody asked.
-        deletable: false,
-        explainable: false,
-    },
-    Collection {
         id: "ceph-clusters",
         title: "Ceph",
         singular: "Ceph cluster",
@@ -6306,13 +6104,12 @@ mod tests {
             "families",
             "folders",
             "roles",
-            "enrollments",
         ] {
             assert!(find(id).is_some(), "no screen for {id}");
         }
         assert_eq!(
             COLLECTIONS.len(),
-            34,
+            33,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:

@@ -342,6 +342,58 @@ async fn an_unnamed_machine_takes_no_name_and_never_somebody_elses() {
     );
 }
 
+/// A row approved before the cell recorded who approved it clears itself.
+///
+/// The refusal used to say "turn it away and let the machine announce again",
+/// which was true and useless: somebody had approved a machine and was told to
+/// start over for a reason about this platform's bookkeeping. Approving once
+/// more is what actually clears it, and this is the test that it does.
+#[tokio::test]
+async fn approving_again_records_the_approver_a_lost_write_did_not() {
+    let router = api();
+    let (pair, public) = keypair();
+    let (_, announced) = anon(
+        &router,
+        "POST",
+        "enrollments:announce",
+        announcement(&public),
+    )
+    .await;
+    let id = announced["id"].as_str().unwrap().to_string();
+
+    // Approve, then take the record away — the shape a row from an older build
+    // has, and the shape a lost best-effort write leaves behind.
+    send(
+        &router,
+        "PATCH",
+        &format!("enrollments/{id}"),
+        json!({ "spec": { "runsGuests": true, "approved": true } }),
+    )
+    .await;
+    let (_, before) = send(&router, "GET", &format!("enrollments/{id}"), Value::Null).await;
+    assert_eq!(before["status"]["approvedBy"], json!("ada"));
+
+    // Approving again on a row that already says yes is still a write, so the
+    // hook that records the person runs — which is what makes the refusal's
+    // advice true.
+    let (status, again) = send(
+        &router,
+        "PATCH",
+        &format!("enrollments/{id}"),
+        json!({ "spec": { "approved": true } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    let (status, issued) = anon(
+        &router,
+        "POST",
+        "enrollments:claim",
+        json!({ "id": &id, "signature": sign_claim(&pair, &id) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+}
+
 /// Announcing twice is one row. A machine reboots, or loses its answer, and
 /// polls — and an operator must not end up looking at two pending machines
 /// that are one machine.

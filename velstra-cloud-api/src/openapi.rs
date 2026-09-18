@@ -271,6 +271,14 @@ fn collection_paths(
     let title = screen.map(|c| c.title).unwrap_or(kind);
     let (creatable, editable, deletable) = match screen {
         Some(c) => (c.creatable, c.editable, c.deletable),
+        // A collection the console has no board for still has a surface, and
+        // "everything" is the wrong guess for it. `enrollments` is the case
+        // that showed it: a machine puts itself there by announcing, nobody
+        // creates one by hand, and nobody deletes one — the sweep retires what
+        // was never answered, because a row is the record that a machine asked.
+        // A document claiming otherwise would tell an SDK to offer two calls
+        // the API refuses.
+        None if kind == "enrollments" => (false, true, false),
         None => (true, true, true),
     };
     // The console's `creatable` says whether a screen offers a blank form,

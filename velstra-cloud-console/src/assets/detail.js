@@ -1011,6 +1011,98 @@ function credentialControl(coll, r) {
   return host;
 }
 
+/// The whole approval, on the page of the machine it is about.
+///
+/// This used to be two places: a row under "Pending machines" carrying the
+/// fingerprint, and the Node object it was asking to become. The first person
+/// to use it said what was wrong with that — *"das pending machine sollte weg
+/// und dafür sollte dann in Nodes die neue Maschine zu sehen sein"* — and they
+/// were right. A machine waiting to join is a machine; where you look for a
+/// machine is the list of machines.
+///
+/// So everything the decision needs is here: the fingerprint to compare
+/// against the one on the machine's own screen, what the machine says it is,
+/// what it should be for, and one button. No name is asked for — it was typed
+/// into the installer and the announcement carried it, and asking again is
+/// asking somebody to keep two names in step by memory.
+function awaitingBlock(coll, r) {
+  const enrolId = (r.meta && r.meta.labels && r.meta.labels["velstra.io/awaiting-approval"]) || "";
+  if (!enrolId) return null;
+  const host = el("div.awaiting");
+  const roles = { runsGuests: true, servesStorage: false, isControlPlane: false };
+
+  // Whatever happened, the sheet is what says where this machine has got to,
+  // so it is what is brought up to date — the same gesture `powerControl` makes
+  // after a change.
+  const decide = async (spec, said) => {
+    try {
+      await decideEnrolment(enrolId, spec);
+      toast(said);
+      const name = nameOf(r);
+      const fresh = await get(coll, name).catch(() => null);
+      if (fresh && sheet.open && sheet.name === name) openSheet(coll, fresh);
+    } catch (e) {
+      toast(String((e && e.message) || e));
+    }
+  };
+
+  const draw = (row) => {
+    const st = (row && row.status) || {};
+    const rep = st.reported || {};
+    const says = [
+      rep.hostname && "calls itself " + rep.hostname,
+      rep.vcpus && rep.vcpus + " vCPU",
+      rep.memoryMib && Math.round(rep.memoryMib / 1024) + " GiB",
+      rep.disks && rep.disks.length && rep.disks.length + (rep.disks.length === 1 ? " disk" : " disks"),
+      rep.serial && "serial " + rep.serial,
+    ].filter(Boolean).join(" · ");
+
+    const check = (key, label) => {
+      const box = el("input", { type: "checkbox", checked: roles[key] });
+      box.onchange = () => { roles[key] = box.checked; };
+      return el("label.rolebox", box, el("span", label));
+    };
+
+    fill(host,
+      el("p.muted",
+        "This machine is waiting to be let in. Compare the fingerprint below with the one on " +
+        "its own screen — that comparison is the whole check, and nothing secret is typed " +
+        "either way."),
+      el("dl.kv",
+        el("dt", "Fingerprint"),
+        el("dd", el("code.mono", st.fingerprint || "—")),
+        el("dt", "It says it is"),
+        el("dd", says || "nothing about itself")),
+      el("p.muted", "What should it be for?"),
+      el("div.roles",
+        check("runsGuests", "Runs guests"),
+        check("servesStorage", "Serves storage"),
+        check("isControlPlane", "Is a control plane")),
+      el("span.btns",
+        btn("Approve", {
+          quiet: true,
+          title: "The fingerprints match: let this machine in. It is polling, so it starts " +
+                 "installing within seconds.",
+          onclick: () => decide(
+            Object.assign({ approved: true }, roles),
+            "Approved — the machine takes it from here."),
+        }),
+        btn("Do not let it in", {
+          title: "For a machine that should not join this cell. It stops asking immediately, " +
+                 "and this row goes away with it.",
+          onclick: () => decide({ refused: true }, "Turned away."),
+        })));
+  };
+
+  fill(host, el("p.muted", "Reading what this machine said about itself…"));
+  enrolment(enrolId).then(draw).catch((e) => {
+    fill(host, el("p.muted",
+      "This machine is waiting to be let in, and its announcement could not be read: " +
+      String((e && e.message) || e)));
+  });
+  return host;
+}
+
 /// The two media a machine is installed from, handed over as files.
 ///
 /// Beside the credential control because it is the same credential: the token
@@ -1392,6 +1484,12 @@ function renderSheet(coll, r) {
   // somebody commits to the window, and a control they have to find is one
   // they find afterwards.
   if (coll.id === "nodes") {
+    // First, because a machine nobody has let in yet is the only thing anybody
+    // opening this page wants to do something about.
+    const waiting = awaitingBlock(coll, r);
+    if (waiting) {
+      panel.appendChild(spread("Waiting to be let in", waiting, "compare the fingerprint, then approve"));
+    }
     const host = el("div", { id: "maintenance" });
     panel.appendChild(spread("Maintenance", host, "what is scheduled, and what it will cost"));
     maintenanceInto(host, r);
