@@ -465,7 +465,22 @@ function renderBoard() {
       })));
     }
     tr.appendChild(el("td.name", el("span.id", { title: nameOf(r) }, idOf(r))));
-    tr.appendChild(el("td", stateOf(r, coll.condition)));
+    // A machine waiting to be let in gets the decision on its row, not behind
+    // it: the state cell becomes the button. Everything the decision needs is
+    // in the dialog it opens, and the click is stopped so it does not also
+    // open the sheet under the dialog.
+    const waiting = coll.id === "nodes" && r.meta && r.meta.labels &&
+      r.meta.labels["velstra.io/awaiting-approval"];
+    if (waiting) {
+      tr.appendChild(el("td", btn("Let it in\u2026", {
+        primary: true,
+        "data-approve": idOf(r),
+        title: "This machine has asked to join. Compare its fingerprint, then approve.",
+        onclick: (e) => { e.stopPropagation(); openApproval(r); },
+      })));
+    } else {
+      tr.appendChild(el("td", stateOf(r, coll.condition)));
+    }
     for (const c of columnsFor(coll)) tr.appendChild(cell(r, c));
     body.appendChild(tr);
   }

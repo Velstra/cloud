@@ -222,6 +222,41 @@ export function NodeQuick({ r, c, reload }: { r: Resource; c: Collection; reload
   const flip = async (spec: Record<string, unknown>, said: string) => {
     try { await patch(project, r, c, spec); toast(said); reload(); } catch (e) { toast.error((e as Error).message); }
   };
+  // A machine that has asked to join. The decision is the first thing on its
+  // row, and the dialog carries what the decision needs: the fingerprint to
+  // compare against the machine's own screen, and whether it reached this
+  // cell — which the platform checks itself, because that half is arithmetic.
+  const enrolId = (r.meta?.labels as Record<string, string> | undefined)?.["velstra.io/awaiting-approval"];
+  if (enrolId) {
+    return (
+      <Pressed size="sm" variant="default" title="This machine has asked to join. Compare its fingerprint, then approve."
+        onPress={async () => {
+          try {
+            const row = await call("get:enrollments", "GET", `/api/v1/enrollments/${encodeURIComponent(enrolId)}`);
+            const st = (row as { status?: Record<string, unknown> })?.status ?? {};
+            const rep = (st.reported ?? {}) as Record<string, unknown>;
+            const seen = String(st.seenCertificate ?? "").trim(); const ours = String(st.cellCertificate ?? "").trim();
+            const cell = !seen || !ours
+              ? "Whether it reached this cell could not be checked."
+              : seen.toUpperCase() === ours.toUpperCase()
+                ? "\u2713 It reached this cell — the certificate it was served is ours."
+                : "\u2717 It was served a certificate that is not this cell's. Something is between that machine and here.";
+            const says = [rep.vcpus && `${rep.vcpus} vCPU`, rep.memoryMib && `${Math.round(Number(rep.memoryMib) / 1024)} GiB`, rep.serial && `serial ${rep.serial}`].filter(Boolean).join(" · ");
+            const yes = await ask({
+              title: `Let ${idOf(r)} in?`,
+              body: `On the machine's screen, under "This machine:", there is a fingerprint. The cell received:\n\n${st.fingerprint ?? "—"}\n\nIf they are the same, this is the machine in front of you.${says ? ` It says it has ${says}.` : ""}\n\n${cell}\n\nIt will run guests. Change its roles on its page afterwards if it should also serve storage.`,
+              confirmLabel: "Let it in",
+            });
+            if (!yes) return;
+            await call("patch:enrollments", "PATCH", `/api/v1/enrollments/${encodeURIComponent(enrolId)}`, undefined, { spec: { approved: true, runsGuests: true } });
+            toast(`${idOf(r)} is being let in — it installs from here.`);
+            reload();
+          } catch (e) { toast.error((e as Error).message); }
+        }}>
+        Let it in…
+      </Pressed>
+    );
+  }
   return (
     <>
       <Pressed size="sm" variant="secondary" title={schedulable ? "New guests stop being placed here; the ones here stay" : "Let new guests be placed here again"}

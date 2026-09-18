@@ -3845,6 +3845,7 @@ impl Api {
             // Otherwise this is the same machine saying it is still here: the
             // facts it reports are refreshed and the clock is wound back on.
             let mut fresh = en::announced(public_key, seen, reported, now);
+            fresh.cell_certificate = self.own_certificate_fingerprint();
             fresh.phase = if spec.approved {
                 en::EnrollmentPhase::Approved
             } else {
@@ -3906,7 +3907,11 @@ impl Api {
                 serde_json::to_value(en::EnrollmentSpec::default()).expect("a spec"),
             )
             .await?;
-        let status = en::announced(public_key, seen, reported, now);
+        let mut status = en::announced(public_key, seen, reported, now);
+        // What this cell actually serves, so the console can say whether the
+        // machine saw it — by arithmetic, not by asking a person to compare a
+        // second number.
+        status.cell_certificate = self.own_certificate_fingerprint();
         let written = collection
             .report_status(
                 &name,
@@ -3934,6 +3939,37 @@ impl Api {
                 .await;
         }
         Ok(announced_body(&id, &status))
+    }
+
+    /// The fingerprint of the certificate this API serves, as the banner on
+    /// its own console prints it — SHA-256 over the DER, colon-separated hex.
+    ///
+    /// Computed from the same PEM the join token carries, so the three places
+    /// a person can see this value (the banner, the join token's `ca`, and an
+    /// enrolment's `cellCertificate`) are one value. Empty when the API was
+    /// never told its certificate, and the console reads empty as "cannot
+    /// tell" rather than as a mismatch.
+    fn own_certificate_fingerprint(&self) -> String {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let Some(facts) = self.inner.join.as_ref() else {
+            return String::new();
+        };
+        let body: String = facts
+            .cert_pem
+            .lines()
+            .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("-----END CERTIFICATE-----"))
+            .collect();
+        let Ok(der) = base64::engine::general_purpose::STANDARD.decode(body.trim()) else {
+            return String::new();
+        };
+        Sha256::digest(&der)
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
     }
 
     /// Make the Node a machine is asking to become, out of service.

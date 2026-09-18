@@ -1011,96 +1011,119 @@ function credentialControl(coll, r) {
   return host;
 }
 
-/// The whole approval, on the page of the machine it is about.
+/// Let a machine in, from wherever somebody found it.
 ///
-/// This used to be two places: a row under "Pending machines" carrying the
-/// fingerprint, and the Node object it was asking to become. The first person
-/// to use it said what was wrong with that — *"das pending machine sollte weg
-/// und dafür sollte dann in Nodes die neue Maschine zu sehen sein"* — and they
-/// were right. A machine waiting to join is a machine; where you look for a
-/// machine is the list of machines.
+/// One dialog, reached from the button on the machine's row and from its
+/// page, because it is one decision. The first version was a panel of
+/// switches on the page; the first person to use it said it was still too
+/// complicated and described this instead — *"das ist die Maschine, das ist
+/// unsere Zelle, vergleich es bitte, und möchtest du installieren?"* — which
+/// is the right shape, and is what this draws.
 ///
-/// So everything the decision needs is here: the fingerprint to compare
-/// against the one on the machine's own screen, what the machine says it is,
-/// what it should be for, and one button. No name is asked for — it was typed
-/// into the installer and the announcement carried it, and asking again is
-/// asking somebody to keep two names in step by memory.
-function awaitingBlock(coll, r) {
+/// The dialog answers two questions, and only one of them needs a person.
+///
+/// *Is this the machine in front of me?* Its fingerprint, large, beside the
+/// words the machine's own screen uses, so the operator's eyes go from one to
+/// the other. Nothing here can do that comparison for them.
+///
+/// *Did it reach our cell?* That one is arithmetic: the API stamped the
+/// fingerprint of the certificate it serves onto the row, the machine reported
+/// the one it was served, and if they differ something is between them. So it
+/// is said outright — a tick, or a sentence — rather than as a second number
+/// somebody has to compare.
+function openApproval(r) {
   const enrolId = (r.meta && r.meta.labels && r.meta.labels["velstra.io/awaiting-approval"]) || "";
-  if (!enrolId) return null;
-  const host = el("div.awaiting");
-  const roles = { runsGuests: true, servesStorage: false, isControlPlane: false };
+  if (!enrolId) return;
+  const id = idOf(r);
+  const scrim = el("div", { id: "dialogscrim", onclick: () => closeDialog() });
+  const dialog = el("div", { id: "dialog", role: "dialog", "aria-label": "Let " + id + " in?" });
+  document.body.appendChild(scrim);
+  document.body.appendChild(dialog);
+  fill(dialog, el("h2", "Let " + id + " in?"), el("p.prose", "Reading what the machine said…"));
 
-  // Whatever happened, the sheet is what says where this machine has got to,
-  // so it is what is brought up to date — the same gesture `powerControl` makes
-  // after a change.
-  const decide = async (spec, said) => {
-    try {
-      await decideEnrolment(enrolId, spec);
-      toast(said);
-      const name = nameOf(r);
-      const fresh = await get(coll, name).catch(() => null);
-      if (fresh && sheet.open && sheet.name === name) openSheet(coll, fresh);
-    } catch (e) {
-      toast(String((e && e.message) || e));
-    }
-  };
-
-  const draw = (row) => {
+  enrolment(enrolId).then((row) => {
     const st = (row && row.status) || {};
     const rep = st.reported || {};
+    const roles = { runsGuests: true, servesStorage: false, isControlPlane: false };
     const says = [
-      rep.hostname && "calls itself " + rep.hostname,
       rep.vcpus && rep.vcpus + " vCPU",
       rep.memoryMib && Math.round(rep.memoryMib / 1024) + " GiB",
       rep.disks && rep.disks.length && rep.disks.length + (rep.disks.length === 1 ? " disk" : " disks"),
       rep.serial && "serial " + rep.serial,
     ].filter(Boolean).join(" · ");
 
-    const check = (key, label) => {
-      const box = el("input", { type: "checkbox", checked: roles[key] });
+    // The cell half, decided here. Empty on either side is "cannot tell",
+    // which is not "no": a machine that reported nothing must not be shown
+    // as intercepted.
+    const seen = String(st.seenCertificate || "").trim();
+    const ours = String(st.cellCertificate || "").trim();
+    const cell = !seen || !ours
+      ? el("p.prose", "Whether it reached this cell could not be checked: " +
+          (seen ? "this API was never told its own certificate." : "the machine did not report what it was served."))
+      : seen.toUpperCase() === ours.toUpperCase()
+        ? el("p.prose", "\u2713 It reached this cell — the certificate it was served is ours.")
+        : el("p.prose.bad",
+            "\u2717 It was served a certificate that is not this cell's. Something is between " +
+            "that machine and here. Do not let it in until you know what.");
+
+    const check = (key, label, help) => {
+      const box = el("input", { type: "checkbox", checked: roles[key] ? "" : null });
       box.onchange = () => { roles[key] = box.checked; };
-      return el("label.rolebox", box, el("span", label));
+      return el("label.prose", box, " " + label, el("span.muted", " — " + help));
+    };
+    const decide = async (spec, said) => {
+      try {
+        await decideEnrolment(enrolId, spec);
+        closeDialog();
+        toast(said);
+        // Whatever happened, the list is what says where the machine has got
+        // to, and the sheet if one is open on it.
+        if (typeof renderBoard === "function") renderBoard();
+        const fresh = await get(sheet.coll || { id: "nodes" }, nameOf(r)).catch(() => null);
+        if (fresh && sheet.open && sheet.name === nameOf(r)) openSheet(sheet.coll, fresh);
+      } catch (e) {
+        toast(String((e && e.message) || e));
+      }
     };
 
-    fill(host,
-      el("p.muted",
-        "This machine is waiting to be let in. Compare the fingerprint below with the one on " +
-        "its own screen — that comparison is the whole check, and nothing secret is typed " +
-        "either way."),
-      el("dl.kv",
-        el("dt", "Fingerprint"),
-        el("dd", el("code.mono", st.fingerprint || "—")),
-        el("dt", "It says it is"),
-        el("dd", says || "nothing about itself")),
-      el("p.muted", "What should it be for?"),
-      el("div.roles",
-        check("runsGuests", "Runs guests"),
-        check("servesStorage", "Serves storage"),
-        check("isControlPlane", "Is a control plane")),
-      el("span.btns",
-        btn("Approve", {
-          quiet: true,
-          title: "The fingerprints match: let this machine in. It is polling, so it starts " +
-                 "installing within seconds.",
-          onclick: () => decide(
-            Object.assign({ approved: true }, roles),
-            "Approved — the machine takes it from here."),
+    fill(dialog,
+      el("h2", "Let " + id + " in?"),
+      el("p.prose", "On the machine's screen, under \"This machine:\", there is a fingerprint. This is the one the cell received:"),
+      el("pre.logblock", st.fingerprint || "\u2014"),
+      el("p.prose", "If they are the same, this is the machine in front of you." +
+        (says ? " It says it has " + says + "." : "")),
+      cell,
+      el("p.prose", "What should it be for?"),
+      check("runsGuests", "Runs guests", "starts and holds virtual machines"),
+      check("servesStorage", "Serves storage", "its disks become a pool"),
+      check("isControlPlane", "Is a control plane", "runs this cell's API and store — rare"),
+      el("div.formacts",
+        btn("Not this one", {
+          title: "Turn it away. It stops asking, and its row goes.",
+          onclick: () => decide({ refused: true }, id + " was turned away."),
         }),
-        btn("Do not let it in", {
-          title: "For a machine that should not join this cell. It stops asking immediately, " +
-                 "and this row goes away with it.",
-          onclick: () => decide({ refused: true }, "Turned away."),
+        btn("Cancel", { onclick: () => closeDialog() }),
+        btn("Let it in", {
+          primary: true,
+          id: "approvebtn",
+          title: "The fingerprints match: approve. The machine is polling and starts installing within seconds.",
+          onclick: () => decide(Object.assign({ approved: true }, roles), id + " is being let in — it installs from here."),
         })));
-  };
-
-  fill(host, el("p.muted", "Reading what this machine said about itself…"));
-  enrolment(enrolId).then(draw).catch((e) => {
-    fill(host, el("p.muted",
-      "This machine is waiting to be let in, and its announcement could not be read: " +
-      String((e && e.message) || e)));
+  }).catch((e) => {
+    fill(dialog,
+      el("h2", "Let " + id + " in?"),
+      el("p.prose.bad", "Its announcement could not be read: " + String((e && e.message) || e)),
+      el("div.formacts", btn("Close", { onclick: () => closeDialog() })));
   });
-  return host;
+}
+
+/// The one line on a machine's page while it is waiting, and the button.
+function awaitingBlock(coll, r) {
+  const enrolId = (r.meta && r.meta.labels && r.meta.labels["velstra.io/awaiting-approval"]) || "";
+  if (!enrolId) return null;
+  return el("div",
+    el("p.prose", "This machine has asked to join and is waiting for somebody to let it in."),
+    el("span.btns", btn("Let it in\u2026", { primary: true, onclick: () => openApproval(r) })));
 }
 
 /// The two media a machine is installed from, handed over as files.

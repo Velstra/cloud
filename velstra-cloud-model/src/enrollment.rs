@@ -171,6 +171,18 @@ pub struct EnrollmentStatus {
     /// the middle.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub seen_certificate: String,
+    /// The fingerprint of the certificate this cell actually serves, stamped
+    /// by the API at the announce.
+    ///
+    /// Beside `seen_certificate` so the two can be compared by the platform
+    /// rather than by a person: a machine that saw a different certificate
+    /// than the cell serves has something between it and the cell, and that is
+    /// a sentence the console can say outright. The person still compares the
+    /// *machine's* fingerprint against its screen — nothing here can do that
+    /// for them — but the cell half is arithmetic, and arithmetic is not what
+    /// people are for.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cell_certificate: String,
     /// What the machine says it has. Unverified by construction — it is a
     /// stranger's description of itself — and useful anyway: it is how an
     /// operator tells two identical pending rows apart.
@@ -230,6 +242,23 @@ pub struct Reported {
     /// and absent often enough that nothing may depend on it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub serial: String,
+}
+
+impl EnrollmentStatus {
+    /// Whether the machine was served this cell's own certificate.
+    ///
+    /// `None` when either side is unknown — a machine that reported nothing,
+    /// or an API that was never told its certificate — because "we cannot
+    /// tell" and "no" are different answers and only one of them should stop
+    /// somebody.
+    pub fn certificate_matches(&self) -> Option<bool> {
+        let seen = self.seen_certificate.trim();
+        let ours = self.cell_certificate.trim();
+        if seen.is_empty() || ours.is_empty() {
+            return None;
+        }
+        Some(seen.eq_ignore_ascii_case(ours))
+    }
 }
 
 impl Reported {
@@ -507,6 +536,7 @@ pub fn announced(
         fingerprint: fingerprint_of(public_key),
         public_key: public_key.trim().to_string(),
         seen_certificate: seen_certificate.trim().to_string(),
+        cell_certificate: String::new(),
         reported,
         phase: EnrollmentPhase::Pending,
         expires_at: Timestamp(now + DEFAULT_TTL_SECS * 1000),
@@ -946,5 +976,50 @@ mod suggested_names {
         // Long enough to be somebody being clever.
         assert_eq!(suggested_node_id(&"a".repeat(64)), None);
         assert_eq!(suggested_node_id(&"a".repeat(63)), Some("a".repeat(63)));
+    }
+}
+
+/// The cell half of the comparison is arithmetic, and done here.
+#[cfg(test)]
+mod certificate_comparison {
+    use super::*;
+
+    fn with(seen: &str, ours: &str) -> EnrollmentStatus {
+        EnrollmentStatus {
+            seen_certificate: seen.into(),
+            cell_certificate: ours.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_same_certificate_matches_whatever_the_case() {
+        assert_eq!(
+            with("9F:2C:AB", "9F:2C:AB").certificate_matches(),
+            Some(true)
+        );
+        assert_eq!(
+            with("9f:2c:ab", "9F:2C:AB").certificate_matches(),
+            Some(true)
+        );
+    }
+
+    /// Somebody between the machine and the cell, and this is the sentence
+    /// that says so.
+    #[test]
+    fn a_different_certificate_is_a_no() {
+        assert_eq!(
+            with("9F:2C:AB", "11:22:33").certificate_matches(),
+            Some(false)
+        );
+    }
+
+    /// "We cannot tell" is not "no". A machine that reported nothing, or an
+    /// API never told its certificate, must not be shown as intercepted.
+    #[test]
+    fn an_unknown_side_is_not_a_verdict() {
+        assert_eq!(with("", "9F:2C:AB").certificate_matches(), None);
+        assert_eq!(with("9F:2C:AB", "").certificate_matches(), None);
+        assert_eq!(with("", "").certificate_matches(), None);
     }
 }

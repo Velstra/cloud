@@ -223,10 +223,22 @@ one short thing anybody types), and shows **two** fingerprints on its screen.
 **The machine appears under Nodes**, beside the others, out of service — and
 that is the only place it appears. It had a board of its own for a day, and
 the first person to use it found the same machine in two lists with the
-decision on the one nobody looks at. So the whole decision is on the node's
-page: the fingerprint to compare, what the machine says it is, three switches
-for what it should be for, and one button. No name is asked for — it was typed
-into the installer and the announcement carried it.
+decision on the one nobody looks at. So the whole decision is one button on
+the machine's row — *Let it in…* — and one dialog: the fingerprint to compare
+against the machine's own screen, whether it reached this cell, what it should
+be for, and *Let it in*. No name is asked for — it was typed into the installer
+and the announcement carried it.
+
+The dialog answers two questions and only one of them needs a person. *Is this
+the machine in front of me?* Its fingerprint, beside the words the machine's
+own screen uses, so the eyes go from one to the other; nothing can do that
+comparison for them. *Did it reach our cell?* That one is arithmetic: the API
+stamps the fingerprint of the certificate it serves onto the row at the
+announce, the machine reports the one it was served, and if they differ
+something is between them — so the dialog says so outright, as a tick or a
+sentence, rather than as a second number to compare. Empty on either side is
+"could not check", which is not "no": a machine that reported nothing must not
+be shown as intercepted.
 
 The Node exists before anybody has said yes, and four things make that safe on
 a door nobody authenticates: it has **no credential**, so nothing can report
