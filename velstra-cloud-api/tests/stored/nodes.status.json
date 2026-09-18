@@ -17,6 +17,9 @@
   "conditions": [],
   "console_tls": false,
   "images": [],
+  "installed": {
+    "kind": "Unknown"
+  },
   "last_heartbeat": 0,
   "observed_generation": 0,
   "shared_state": false

@@ -15,9 +15,9 @@ four is connected to the others.
 | appliance node | flashed from the node image | `velstra-cloud-node update --image <raw>`, by hand, then a reboot by hand |
 | Debian node    | `apt install ./velstra-cloud.deb` | `apt install ./velstra-cloud_<v>.deb`, by hand; `postinst` restarts what runs |
 
-Every step is somebody's ssh session. Nothing knows which build a node runs
-beyond `status.agentVersion`, which is the crate version and says `0.1.0` for
-every build there has ever been. Nothing drains a node before its reboot
+Every step is somebody's ssh session. Until `status.installed` (below) nothing
+knew which build a node ran beyond `status.agentVersion`, which is the crate
+version and says `0.1.0` for every build there has ever been. Nothing drains a node before its reboot
 unless somebody remembers `spec.evacuate`. Nothing stops the second node being
 updated while the first is still coming back. And nothing verifies the file
 that was scp'd onto a machine is the one that was published — the A/B writer
@@ -124,17 +124,38 @@ ever had.
 nodes/peter
   status:
     installed:
-      kind:    Appliance | Package
+      kind:    Appliance | Package | NixOS
+      distro:  "Debian GNU/Linux 13 (trixie)"   # os-release, for a person
       version: "0.1.0+20260918.c571d71"
-      slot:    "a"                         # appliance only
-      other:   "0.1.0+20260917.681269c"    # what the inactive slot holds, if known
+      slot:    "a"                               # appliance only
 ```
 
-Reported by the node agent, because only the machine knows. `kind` is
-`/etc/NIXOS`; `version` is the image's own stamp on an appliance and
-`dpkg-query -W velstra-cloud` on Debian; `slot` is what the A/B writer already
-computes. Without this field nothing can say which build a node runs, which is
-the first thing an operator asks and the last thing a rollout needs.
+Reported by the node agent, because only the machine knows — and there are
+**three** kinds, not the two the first draft of this document had.
+
+* **Appliance** — `/etc/NIXOS` exists *and* the disk carries the A/B slot
+  partitions the image lays down (`product.rs` knows their type GUIDs). Updated
+  by writing the inactive slot. `version` is the image's own stamp,
+  `/etc/velstra-release`, the same `<version>+<timestamp>.<revision>` the
+  package calls itself; `slot` is read the way the A/B writer reads it, from
+  the partition under `/dev/mapper/usr`.
+* **Package** — no `/etc/NIXOS`, and `dpkg-query -W velstra-cloud` answers.
+  Debian or Ubuntu; the same `.deb` on both, and `distro` says which for the
+  person reading the row. Updated by installing the package.
+* **NixOS** — `/etc/NIXOS` exists and there are no slots: a machine running
+  the platform's NixOS *module* on an operating system the operator manages
+  with their own configuration. **The cell cannot update it**, and a rollout
+  that included one refuses it by name — "this machine is updated by its own
+  configuration" — rather than skipping it silently, because a fleet that is
+  half on a new build with one row nobody explained is the failure that looks
+  most like success.
+
+The distinction is decided on the machine, from the filesystem and the
+partition table, never from a label somebody set: a `Package` node that an
+operator mislabelled `Appliance` would have its inactive slot written on a
+disk that has no slots. Without this field nothing can say which build a node
+runs, which is the first thing an operator asks and the last thing a rollout
+needs.
 
 ### What a node should run: `spec.wanted`
 
@@ -247,7 +268,7 @@ units on a version change, in either direction.
 | signed manifest, channel fetch, verification    | shipped in Sentinel — to port, seam already named |
 | cordon, evacuate, maintenance windows           | shipped                                           |
 | release publishing image, deb, iso, `SHA256SUMS` | shipped — CI, this branch                        |
-| `status.installed` on a node                    | **next**                                          |
+| `status.installed` on a node — three kinds      | shipped — this branch                             |
 | `Release` resource + manifest verification      | **next**                                          |
 | `spec.wanted` + the agent's fetch/verify/apply   | after                                             |
 | `Rollout` resource + controller                 | after                                             |

@@ -2037,6 +2037,18 @@
     "width": 96
    },
    {
+    "path": "status.installed.kind",
+    "label": "Installed",
+    "cell": "text",
+    "width": 96
+   },
+   {
+    "path": "status.installed.version",
+    "label": "Build",
+    "cell": "mono",
+    "width": 176
+   },
+   {
     "path": "status.lastHeartbeat",
     "label": "Heard from",
     "cell": "ago",

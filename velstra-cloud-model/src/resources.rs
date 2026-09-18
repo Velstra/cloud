@@ -1104,6 +1104,19 @@ pub struct NodeStatus {
     /// exists to forbid. Here it is what it really is: one node's report about
     /// itself. Whoever needs the aggregate computes it from these.
     pub images: Vec<String>,
+
+    /// How this machine was installed — image with A/B slots, the Debian
+    /// package, or the NixOS module — and which build it runs.
+    ///
+    /// Reported, like everything else here, because only the machine knows,
+    /// and decided from the filesystem and the partition table rather than
+    /// from a label somebody set. It is what a rollout reads to know what to
+    /// hand a node and whether it may hand it anything; `agent_version` cannot
+    /// be that, being the crate version that says `0.1.0` for every build.
+    /// Defaults to unknown, so a report from an agent older than this field is
+    /// not mistaken for a machine of some kind.
+    #[serde(default)]
+    pub installed: crate::installed::Installed,
 }
 
 /// What a running guest was actually given.

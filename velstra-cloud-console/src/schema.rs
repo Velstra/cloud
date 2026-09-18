@@ -4852,6 +4852,23 @@ pub const COLLECTIONS: &[Collection] = &[
                 cell: Cell::Mono,
                 width: 96,
             },
+            // How the machine was installed, and which build it runs. Beside
+            // the agent's version because that one is the crate's and says
+            // `0.1.0` for every build there has ever been; this is the stamp a
+            // rollout compares, and the kind decides what a rollout may hand
+            // the machine — an image for a slot, a package for apt, or nothing.
+            Column {
+                path: "status.installed.kind",
+                label: "Installed",
+                cell: Cell::Text,
+                width: 96,
+            },
+            Column {
+                path: "status.installed.version",
+                label: "Build",
+                cell: Cell::Mono,
+                width: 176,
+            },
             Column {
                 path: "status.lastHeartbeat",
                 label: "Heard from",

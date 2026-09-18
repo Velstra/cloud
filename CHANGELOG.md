@@ -13,6 +13,18 @@ is. A tag makes that revision a real one instead of `dirty`.
 
 ## [Unreleased]
 
+### Added
+
+- **A node says how it was installed.** `status.installed` on every node:
+  the sealed image with A/B slots, the Debian package, or the NixOS module —
+  with the operating system, the build it runs, and the slot in use. Read by
+  the node from its own filesystem and partition table, never from a label,
+  because the kind decides what an upgrade may hand the machine and a guess
+  would be a slot written onto a disk that has none. The image now carries
+  its build stamp in `/etc/velstra-release`, the same string the package
+  calls itself. On the nodes board as *Installed* and *Build*; the first
+  piece of the upgrade path in `docs/upgrading.md`.
+
 ## [0.1.0] — 2026-09-10
 
 ### Added

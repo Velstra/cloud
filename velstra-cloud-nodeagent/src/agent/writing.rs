@@ -176,6 +176,7 @@ impl Agent {
         // The hardware this machine has, with this node's guests already
         // marked on it by `Agent::mark_held_devices`.
         next.status.pci_devices = host.pci_devices.clone();
+        next.status.installed = host.installed.clone();
         set_condition(
             &mut next.status.conditions,
             Condition::new(

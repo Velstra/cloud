@@ -575,6 +575,8 @@ impl Vmm for FakeVmm {
     async fn observe(&self) -> Result<HostState> {
         let m = self.machine.lock().unwrap();
         Ok(HostState {
+            // A fake machine was installed no way at all, and says so.
+            installed: Default::default(),
             vms: m.vms.clone(),
             disks: m.disks.clone(),
             disk_gib: m.disk_gib.clone(),

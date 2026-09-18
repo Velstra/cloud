@@ -359,6 +359,7 @@ impl Vmm for CloudHypervisorVmm {
         // sysfs cannot tell them apart. The agent overlays that from the
         // instances it holds — see `Agent::mark_held_devices`.
         host.pci_devices = crate::pcidev::observe(&Default::default());
+        host.installed = crate::installed::observe();
 
         for digest in hostfs::read_dir_names(&self.layout.image_dir)? {
             // A file is only ever moved in here after its bytes hashed to this

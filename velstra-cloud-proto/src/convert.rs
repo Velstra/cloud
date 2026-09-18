@@ -15,7 +15,7 @@
 //!   honest value — `Unknown` for a condition, `Unknown` for an instance state
 //!   — never to a plausible-looking one.
 
-use velstra_cloud_model::{ceph, cpu, meta, migration, pci, resources};
+use velstra_cloud_model::{ceph, cpu, installed, meta, migration, pci, resources};
 
 use crate::v1;
 
@@ -398,6 +398,7 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             capacity: Some((&s.capacity).into()),
             allocated: Some((&s.allocated).into()),
             agent_version: s.agent_version.clone(),
+            installed: Some((&s.installed).into()),
             console_endpoint: s.console_endpoint.clone(),
             vmm: s.vmm.clone(),
             datapath: s.datapath.clone(),
@@ -412,6 +413,52 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             cpu: s.cpu.as_ref().map(Into::into),
             pci_devices: s.pci_devices.iter().map(Into::into).collect(),
         }
+    }
+}
+
+// ---- installed ------------------------------------------------------------
+
+impl From<&installed::Installed> for v1::Installed {
+    fn from(i: &installed::Installed) -> Self {
+        Self {
+            kind: install_kind_out(i.kind).to_string(),
+            distro: i.distro.clone(),
+            version: i.version.clone(),
+            slot: i.slot.clone(),
+        }
+    }
+}
+
+impl From<&v1::Installed> for installed::Installed {
+    fn from(i: &v1::Installed) -> Self {
+        Self {
+            kind: install_kind_in(&i.kind),
+            distro: i.distro.clone(),
+            version: i.version.clone(),
+            slot: i.slot.clone(),
+        }
+    }
+}
+
+/// The kind as a word, like `device_kind_out`: a string rather than a proto
+/// enum, so a kind this build has not heard of reads back as `Unknown` —
+/// which the model treats as "will not guess" — and not as an enum's zero
+/// value dressed up as something.
+fn install_kind_out(k: installed::InstallKind) -> &'static str {
+    match k {
+        installed::InstallKind::Unknown => "unknown",
+        installed::InstallKind::Appliance => "appliance",
+        installed::InstallKind::Package => "package",
+        installed::InstallKind::NixOs => "nixos",
+    }
+}
+
+fn install_kind_in(k: &str) -> installed::InstallKind {
+    match k {
+        "appliance" => installed::InstallKind::Appliance,
+        "package" => installed::InstallKind::Package,
+        "nixos" => installed::InstallKind::NixOs,
+        _ => installed::InstallKind::Unknown,
     }
 }
 
@@ -876,6 +923,7 @@ impl From<&v1::NodeStatus> for resources::NodeStatus {
             capacity: s.capacity.as_ref().map(Into::into).unwrap_or_default(),
             allocated: s.allocated.as_ref().map(Into::into).unwrap_or_default(),
             agent_version: s.agent_version.clone(),
+            installed: s.installed.as_ref().map(Into::into).unwrap_or_default(),
             console_endpoint: s.console_endpoint.clone(),
             vmm: s.vmm.clone(),
             datapath: s.datapath.clone(),

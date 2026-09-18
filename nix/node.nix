@@ -107,9 +107,27 @@ in
         are configured for hugepage backing.
       '';
     };
+
+    release = lib.mkOption {
+      type = lib.types.str;
+      default = cfg.package.version;
+      description = ''
+        The build this machine runs, written to `/etc/velstra-release` for
+        the node agent to report as `status.installed.version` — the thing a
+        rollout compares against a release. The image sets it to the release
+        stamp (`0.1.0+20260918.c571d71`); a machine running this module on
+        its own NixOS has only the crate version, which is honest: the cell
+        cannot update that machine, so nothing compares it.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    # The stamp the node agent reads to say which build this is. On the
+    # image `/etc` is the sealed store, so this is the one place the build
+    # can be written and the one place it cannot be changed afterwards.
+    environment.etc."velstra-release".text = cfg.release + "\n";
+
     # The agent + installer, the hypervisors, and the disk tools the installer
     # and updater resolve by name on PATH (this repo does not pin tool paths
     # the way Sentinel's wrapped CLI does — PATH is supplied here instead).

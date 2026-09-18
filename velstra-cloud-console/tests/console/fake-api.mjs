@@ -373,6 +373,11 @@ function seed() {
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
       allocated: { vcpus: 10, memoryMib: 20480, diskGib: 200, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 4000,
+      // How the machine was installed and which build it runs. The image
+      // carries a slot; a package does not, and the API omits the empty
+      // field, so the package nodes below omit it too.
+      installed: { kind: "Appliance", distro: "NixOS 25.11 (Xantusia)",
+        version: "0.1.0+20260918.c571d71", slot: "a" },
       // Whether this node's console stream is encrypted. `datapath` and
       // `balancers` are deliberately absent: the API omits them when empty,
       // and the fixture answering what the API does not is the same defect in
@@ -408,6 +413,8 @@ function seed() {
       capacity: { vcpus: 32, memoryMib: 65536, diskGib: 2048, numaFreeMib: [16384, 16384], hugepages1gi: 0 },
       allocated: { vcpus: 30, memoryMib: 61440, diskGib: 1900, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 900_000,
+      installed: { kind: "Package", distro: "Debian GNU/Linux 13 (trixie)",
+        version: "0.1.0+20260910.681269c" },
       // A generation behind the other two: this is what makes the cell mixed.
       cpu: cpu("v2"),
       devices: [
@@ -421,6 +428,8 @@ function seed() {
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
       allocated: { vcpus: 4, memoryMib: 8192, diskGib: 80, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 3000,
+      installed: { kind: "Appliance", distro: "NixOS 25.11 (Xantusia)",
+        version: "0.1.0+20260918.c571d71", slot: "b" },
       cpu: cpu("v3"),
       devices: [
         disk("/dev/disk/by-id/nvme-eui.0007", "nvme0n1", 1863, false, "WD Black SN850X", { kind: "Free" }),
@@ -440,6 +449,9 @@ function seed() {
       capacity: { vcpus: 32, memoryMib: 131072, diskGib: 2048, numaFreeMib: [65536, 65536], hugepages1gi: 0 },
       allocated: { vcpus: 2, memoryMib: 4096, diskGib: 40, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 2000,
+      // A build behind the others: the *Build* column exists to show that.
+      installed: { kind: "Package", distro: "Ubuntu 24.04.3 LTS",
+        version: "0.1.0+20260910.681269c" },
       cpu: cpu("v2"),
       devices: [
         disk("/dev/disk/by-id/ata-SEAGATE-0009", "sda", 1863, false, "ST2000DM008", { kind: "Free" }),
@@ -1731,6 +1743,8 @@ function blankStatus(collectionName) {
       agentVersion: "",
       lastHeartbeat: 0,
       images: [],
+      // Not reported yet: the API answers the kind alone and omits the rest.
+      installed: { kind: "Unknown" },
       devices: [],
     };
   }

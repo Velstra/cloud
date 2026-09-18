@@ -142,6 +142,10 @@ pub struct HostState {
     /// Empty on a machine with no PCI bus or no readable sysfs, which is the
     /// honest answer and not an error: most nodes never pass anything through.
     pub pci_devices: Vec<velstra_cloud_model::pci::PciDevice>,
+    /// How this machine was installed and which build it runs — image with
+    /// slots, package, or the NixOS module. Read off the filesystem and the
+    /// partition table, never from a label; see `installed`.
+    pub installed: velstra_cloud_model::installed::Installed,
     /// This machine's processor, and whether its VMM can present another.
     ///
     /// `None` only before the first pass. Read centrally — see

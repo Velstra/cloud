@@ -150,6 +150,12 @@
           "images": [
             "string"
           ],
+          "installed": {
+            "distro": "string",
+            "kind": "string",
+            "slot": "string",
+            "version": "string"
+          },
           "lastHeartbeat": "number",
           "observedGeneration": "number",
           "pciDevices": [
@@ -258,6 +264,12 @@
       "images": [
         "string"
       ],
+      "installed": {
+        "distro": "string",
+        "kind": "string",
+        "slot": "string",
+        "version": "string"
+      },
       "lastHeartbeat": "number",
       "observedGeneration": "number",
       "pciDevices": [

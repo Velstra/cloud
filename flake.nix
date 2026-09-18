@@ -171,6 +171,9 @@
           enable = true;
           package = velstra-cloud;
           fabricAgent = fabricAgent;
+          # The image's build stamp — the same string the package carries, so
+          # a release names one version for both kinds of machine.
+          release = debVersion;
         };
         # All three roles ship, and the machine's seed decides which of them
         # actually runs. Every unit is gated by its own `has-role`, so a box

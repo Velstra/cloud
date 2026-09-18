@@ -52,6 +52,7 @@ use tower::ServiceExt;
 use velstra_cloud_api::{Api, StaticTokenVerifier, TokenVerifier};
 use velstra_cloud_model::{
     access::Writer,
+    installed::{InstallKind, Installed},
     meta::{Condition, Meta, Placement, ResourceName},
     resources::{Capacity, NodeSpec, NodeStatus, Resource},
 };
@@ -203,6 +204,15 @@ async fn seed(h: &Harness) {
                     hugepages_1gi: 0,
                 },
                 agent_version: "0.1.0".into(),
+                // An appliance, with every field of the installation filled:
+                // the API omits an empty one, and a recording made from a node
+                // that reported nothing would hold the fixture to `kind` alone.
+                installed: Installed {
+                    kind: InstallKind::Appliance,
+                    distro: "NixOS 25.11 (Xantusia)".into(),
+                    version: "0.1.0+20260918.c571d71".into(),
+                    slot: "a".into(),
+                },
                 // Filled in rather than left at its default, because a field
                 // that is empty here is a field this recording says nothing
                 // about — and the console reads all three.

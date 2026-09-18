@@ -24,7 +24,7 @@
 //!
 //! The one deliberate exception is stated where it is made.
 
-use velstra_cloud_model::{meta, migration, resources};
+use velstra_cloud_model::{installed, meta, migration, resources};
 use velstra_cloud_proto::v1;
 
 /// One type, its populated value, and every field of it named.
@@ -367,6 +367,15 @@ survives_the_wire!(
             hugepages_1gi: 1,
         },
         agent_version: "0.1.0".into(),
+        // An appliance on slot `a`, so every field of the installation has a
+        // value: a package has no slot, and a slot left empty would hold
+        // whether or not the wire carried it.
+        installed: installed::Installed {
+            kind: installed::InstallKind::Appliance,
+            distro: "NixOS 25.11 (Xantusia)".into(),
+            version: "0.2.0+20260918.c571d71".into(),
+            slot: "a".into(),
+        },
         last_heartbeat: meta::Timestamp(1_786_732_802_000),
         images: vec!["projects/p1/images/sha256-abc".into()],
         // One free disk and one that is not, because the *reason* a disk is
@@ -469,9 +478,46 @@ survives_the_wire!(
     {
         observed_generation, conditions, capacity, allocated, agent_version,
         console_endpoint, last_heartbeat, images, devices, ceph, cpu, pci_devices,
-        vmm, datapath, console_tls, balancers, fetching, shared_state,
+        vmm, datapath, console_tls, balancers, fetching, shared_state, installed,
     }
 );
+
+// ---- installed ------------------------------------------------------------
+
+survives_the_wire!(
+    an_installation_survives_the_wire,
+    installed::Installed,
+    v1::Installed,
+    installed::Installed {
+        kind: installed::InstallKind::Package,
+        distro: "Debian GNU/Linux 13 (trixie)".into(),
+        version: "0.1.0+20260918.c571d71".into(),
+        slot: "b".into(),
+    },
+    { kind, distro, version, slot }
+);
+
+/// The kind crosses as a word, and every word comes back as the kind it left
+/// as — including `Unknown`, which the macro above cannot ask about because
+/// it is the default.
+#[test]
+fn every_install_kind_survives_the_wire() {
+    use installed::InstallKind::*;
+    for kind in [Unknown, Appliance, Package, NixOs] {
+        let original = installed::Installed {
+            kind,
+            ..Default::default()
+        };
+        let back = installed::Installed::from(&v1::Installed::from(&original));
+        assert_eq!(back.kind, kind, "{kind:?} did not survive the wire");
+    }
+    // And a word this build has never heard of is not guessed at.
+    let odd = v1::Installed {
+        kind: "container".into(),
+        ..Default::default()
+    };
+    assert_eq!(installed::Installed::from(&odd).kind, Unknown);
+}
 
 // ---- image ----------------------------------------------------------------
 
@@ -976,6 +1022,15 @@ whole_object_survives!(
         },
         allocated: resources::Capacity::default(),
         agent_version: "0.1.0".into(),
+        // An appliance on slot `a`, so every field of the installation has a
+        // value: a package has no slot, and a slot left empty would hold
+        // whether or not the wire carried it.
+        installed: installed::Installed {
+            kind: installed::InstallKind::Appliance,
+            distro: "NixOS 25.11 (Xantusia)".into(),
+            version: "0.2.0+20260918.c571d71".into(),
+            slot: "a".into(),
+        },
         last_heartbeat: meta::Timestamp(1_786_732_802_000),
         images: vec!["projects/p1/images/sha256-abc".into()],
         devices: vec![velstra_cloud_model::ceph::BlockDevice {

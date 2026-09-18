@@ -261,6 +261,12 @@ mod tests {
                 },
                 allocated: Capacity::default(),
                 agent_version: "0.1.0".into(),
+                installed: velstra_cloud_model::installed::Installed {
+                    kind: velstra_cloud_model::installed::InstallKind::Package,
+                    distro: "Debian GNU/Linux 13 (trixie)".into(),
+                    version: "0.1.0+20260918.c571d71".into(),
+                    slot: String::new(),
+                },
                 console_endpoint: "10.0.0.7:8447".into(),
                 last_heartbeat: Timestamp(1786732800000),
                 images: vec!["projects/p1/images/sha256-abc".into()],

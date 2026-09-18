@@ -19,6 +19,7 @@ use velstra_cloud_model::{
     identity::{
         CredentialSpec, CredentialStatus, SessionSpec, SessionStatus, UserSpec, UserStatus,
     },
+    installed::{InstallKind, Installed},
     migration::{MigrationSpec, MigrationStatus},
     resources::*,
 };
@@ -95,6 +96,12 @@ fn every_resource_survives_its_own_wire() {
             },
             allocated: Capacity::default(),
             agent_version: "0.1.0".into(),
+            installed: Installed {
+                kind: InstallKind::Appliance,
+                distro: "NixOS 25.11 (Xantusia)".into(),
+                version: "0.2.0+20260918.c571d71".into(),
+                slot: "a".into(),
+            },
             console_endpoint: "10.0.0.7:8447".into(),
             last_heartbeat: velstra_cloud_model::meta::Timestamp(1),
             images: vec!["projects/p1/images/sha256-abc".into()],

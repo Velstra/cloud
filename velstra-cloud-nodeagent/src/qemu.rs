@@ -386,6 +386,7 @@ impl Vmm for QemuVmm {
         // sysfs cannot tell them apart. The agent overlays that from the
         // instances it holds — see `Agent::mark_held_devices`.
         host.pci_devices = crate::pcidev::observe(&Default::default());
+        host.installed = crate::installed::observe();
 
         let ceph = self.cephadm.installed().await;
         if ceph.installed {

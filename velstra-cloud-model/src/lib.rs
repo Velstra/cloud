@@ -23,6 +23,7 @@ pub mod hierarchy;
 pub mod idempotency;
 pub mod identity;
 pub mod images;
+pub mod installed;
 pub mod ipam;
 pub mod limit;
 pub mod loadbalancer;

@@ -396,6 +396,12 @@ message NodeStatus {
   // owns its status, so each node says what it serves and the controller adds
   // the reports up.
   repeated string balancers = 18;
+  // How this machine was installed — the sealed image with A/B slots, the
+  // Debian package, or the NixOS module — and which build it runs. Reported
+  // by the node from its own filesystem and partition table, never set: it
+  // decides what a rollout may hand the machine, and a guess here would be a
+  // slot written onto a disk that has none.
+  Installed installed = 19;
 }
 
 // One PCI device, as the node holding it sees it.
@@ -437,6 +443,20 @@ message DeviceClass {
   Meta meta = 1;
   DeviceClassSpec spec = 2;
   DeviceClassStatus status = 3;
+}
+
+// How a node was installed, and therefore how it can be updated. See
+// `docs/upgrading.md`.
+message Installed {
+  // `appliance`, `package`, `nixos`, or `unknown` — the last for a node that
+  // has not reported, which a rollout refuses by name rather than guessing.
+  string kind = 1;
+  // The operating system as `os-release` names it for a person.
+  string distro = 2;
+  // The build this machine runs: the image's stamp, or the package version.
+  string version = 3;
+  // The A/B slot in use, `a` or `b`. Appliance only.
+  string slot = 4;
 }
 
 // What a node reports about its processor. See `docs/cpu-heterogeneity.md`.
