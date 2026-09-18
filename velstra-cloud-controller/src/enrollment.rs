@@ -42,13 +42,24 @@ const WHO: &str = "enrollment";
 
 pub struct EnrollmentController {
     enrollments: TypedStore<EnrollmentSpec, EnrollmentStatus>,
+    nodes: TypedStore<
+        velstra_cloud_model::resources::NodeSpec,
+        velstra_cloud_model::resources::NodeStatus,
+    >,
     now: std::sync::Arc<dyn Fn() -> Timestamp + Send + Sync>,
 }
 
 impl EnrollmentController {
-    pub fn new(enrollments: TypedStore<EnrollmentSpec, EnrollmentStatus>) -> Self {
+    pub fn new(
+        enrollments: TypedStore<EnrollmentSpec, EnrollmentStatus>,
+        nodes: TypedStore<
+            velstra_cloud_model::resources::NodeSpec,
+            velstra_cloud_model::resources::NodeStatus,
+        >,
+    ) -> Self {
         Self {
             enrollments,
+            nodes,
             now: std::sync::Arc::new(Timestamp::now),
         }
     }
@@ -120,6 +131,18 @@ impl Reconciler for EnrollmentController {
         self.enrollments
             .update(&next, &Writer::controller(WHO))
             .await?;
+        // The Node the announcement made, if nobody ever said yes to it.
+        //
+        // An unapproved row is an object with no credential, not schedulable,
+        // and now with nobody waiting on it — a machine that asked and was
+        // ignored. Leaving it would fill the one list an operator reads with
+        // rows for machines that never joined, which is the thing that made
+        // this whole feature worth building. Only a row this controller can
+        // see was made by an announcement: the label says so, and it is
+        // removed when a claim takes the node into service.
+        if matches!(phase, EnrollmentPhase::Expired | EnrollmentPhase::Refused) {
+            self.let_go_of_the_node(row.meta.name.id()).await;
+        }
         info!(
             enrollment = %row.meta.name,
             fingerprint = %row.status.fingerprint,
@@ -127,6 +150,45 @@ impl Reconciler for EnrollmentController {
             "an announcement moved on",
         );
         Ok(())
+    }
+}
+
+impl EnrollmentController {
+    /// Remove the Node an unanswered announcement made, and nothing else.
+    ///
+    /// Matched by the label rather than by name: a node that has been claimed
+    /// loses the label, and one an operator made by hand never had it. So a
+    /// machine that joined and was later decommissioned under the same name is
+    /// not swept away by an old enrolment expiring — which would be the worst
+    /// possible version of this, quietly and an hour late.
+    ///
+    /// Best-effort: an enrolment that expired and left a row behind is untidy,
+    /// and an expiry that failed because of it would be worse.
+    async fn let_go_of_the_node(&self, enrolment: &str) {
+        let Ok(nodes) = self.nodes.list().await else {
+            return;
+        };
+        for node in nodes {
+            let holds = node
+                .meta
+                .labels
+                .get(velstra_cloud_model::enrollment::AWAITING_LABEL)
+                .is_some_and(|v| v == enrolment);
+            if !holds || node.meta.is_deleting() {
+                continue;
+            }
+            let _ = self
+                .nodes
+                .delete(
+                    &node.meta.name.to_string(),
+                    // The revision it was read at, so a node an operator was
+                    // editing at that moment is not swept out from under them.
+                    node.meta.revision,
+                    &Writer::controller(WHO),
+                )
+                .await;
+            info!(node = %node.meta.name, "nobody answered, so the machine's row goes too");
+        }
     }
 }
 

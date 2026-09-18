@@ -3918,7 +3918,84 @@ impl Api {
         let status: en::EnrollmentStatus =
             serde_json::from_value(written.get("status").cloned().unwrap_or(Value::Null))
                 .unwrap_or_default();
+        // And the Node it is asking to become, so it appears where an operator
+        // looks for a new machine: under Nodes, beside the others. Held out of
+        // service until somebody approves it — see `hold_a_node`.
+        if let Some(node) = self.hold_a_node(&status, &id).await {
+            let _ = collection
+                .patch(
+                    &name,
+                    &crate::collection::Patch {
+                        spec: Some(serde_json::json!({ "node": node })),
+                        labels: None,
+                    },
+                    None,
+                )
+                .await;
+        }
         Ok(announced_body(&id, &status))
+    }
+
+    /// Make the Node a machine is asking to become, out of service.
+    ///
+    /// ## Why the object exists before anybody has said yes
+    ///
+    /// Because that is where an operator looks for a new machine. A separate
+    /// list of pending things is a second place to remember, and the first
+    /// person to use this said so: *"am besten ist es, wenn er unter den
+    /// anderen Nodes ist"*. The row shows up under Nodes with nothing heard
+    /// from it, not schedulable, and a label pointing at the enrolment that
+    /// carries the fingerprint to compare.
+    ///
+    /// ## Why that is safe on an unauthenticated door
+    ///
+    /// Four things hold it down, and the object is worth nothing without all
+    /// of them:
+    ///
+    /// * **It has no credential.** Nothing can report as this node, or read
+    ///   the cell as it, until a claim mints one — and a claim needs a
+    ///   person's approval.
+    /// * **It is not schedulable.** The scheduler will not place anything on
+    ///   it, so an unapproved row cannot receive a guest.
+    /// * **It cannot take a name that exists.** The create is allowed to fail,
+    ///   and failing is the correct outcome: a machine announcing itself as
+    ///   `horst` must not land on the control plane's own object.
+    /// * **It does not outlive the request.** The sweep deletes it with the
+    ///   enrolment when nobody answers within the hour, so a rack flashed by
+    ///   mistake tidies itself up.
+    ///
+    /// Returns the id when one was made, so the enrolment can be prefilled
+    /// with it and an operator is not asked to type a name the machine already
+    /// knows.
+    async fn hold_a_node(
+        &self,
+        status: &velstra_cloud_model::enrollment::EnrollmentStatus,
+        enrolment: &str,
+    ) -> Option<String> {
+        let id = velstra_cloud_model::enrollment::suggested_node_id(&status.reported.hostname)?;
+        let nodes = self.collection("nodes").ok()?;
+        let full = format!("nodes/{id}");
+        // Taken already: leave it entirely alone. Somebody else's machine, or
+        // this one announcing a second time after it was approved.
+        if nodes.get(&full).await.ok().flatten().is_some() {
+            return None;
+        }
+        let resource = ResourceName::parse(&full).ok()?;
+        let mut meta = velstra_cloud_model::meta::Meta::new(resource, self.inner.placement.clone());
+        // The thread between the two objects, and what the console reads to
+        // know this row is waiting rather than broken.
+        meta.labels.insert(
+            velstra_cloud_model::enrollment::AWAITING_LABEL.to_string(),
+            enrolment.to_string(),
+        );
+        nodes
+            .create(
+                serde_json::to_value(&meta).ok()?,
+                serde_json::json!({ "schedulable": false }),
+            )
+            .await
+            .ok()?;
+        Some(id)
     }
 
     /// A machine collecting the credential an operator approved for it.
@@ -4021,14 +4098,37 @@ impl Api {
 
         let node = ResourceName::parse(&format!("nodes/{}", spec.node.trim()))
             .map_err(|e| ApiError::invalid(format!("the approved node name is not one: {e}")))?;
-        // Created if absent, kept if not. An operator who made the Node first
-        // and then approved the machine meant one machine, not two.
-        if self.get(&node, &approver).await.is_err() {
-            let asked = serde_json::json!({
-                "id": spec.node.trim(),
-                "spec": { "schedulable": true },
-            });
-            self.create("", "nodes", &asked, &approver).await?;
+        // Created if absent, taken into service if the announcement already
+        // made it. An operator who made the Node first and then approved the
+        // machine meant one machine, not two.
+        match self.get(&node, &approver).await {
+            Err(_) => {
+                let asked = serde_json::json!({
+                    "id": spec.node.trim(),
+                    "spec": { "schedulable": true },
+                });
+                self.create("", "nodes", &asked, &approver).await?;
+            }
+            Ok(_) => {
+                // Out of the waiting state: schedulable, and the label gone.
+                // The label is what the sweep matches on, so leaving it would
+                // mean an old enrolment expiring an hour later deletes a node
+                // that is by then running guests — quietly, and at the worst
+                // moment. Removing it here is what makes that unreachable.
+                let _ = self
+                    .patch(
+                        &node,
+                        &serde_json::json!({
+                            "spec": { "schedulable": true },
+                            "meta": { "labels": {
+                                velstra_cloud_model::enrollment::AWAITING_LABEL: Value::Null
+                            } },
+                        }),
+                        None,
+                        &approver,
+                    )
+                    .await;
+            }
         }
         let issued = self
             .issue_credential(

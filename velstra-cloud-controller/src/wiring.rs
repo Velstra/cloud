@@ -361,11 +361,10 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
     // this phase. See `enrollment`.
     spawn!(
         "enrollment",
-        crate::enrollment::EnrollmentController::new(TypedStore::new(
-            store.clone(),
-            id,
-            "enrollments"
-        )),
+        crate::enrollment::EnrollmentController::new(
+            TypedStore::new(store.clone(), id, "enrollments"),
+            nodes.clone(),
+        ),
         TypedStore::new(store.clone(), id, "enrollments")
     );
     spawn!(

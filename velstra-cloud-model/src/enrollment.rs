@@ -77,6 +77,13 @@ pub const DEFAULT_TTL_SECS: u64 = 60 * 60;
 /// read. A rack is tens of machines; a thousand is somebody else.
 pub const MAX_PENDING: usize = 512;
 
+/// The label a Node carries while it is waiting to be let in.
+///
+/// Its value is the enrolment's id, so a console showing a node that is not
+/// ready can say *why* — and offer the fingerprint to compare rather than
+/// leaving somebody to guess whether the machine is broken or merely new.
+pub const AWAITING_LABEL: &str = "velstra.io/awaiting-approval";
+
 /// What an operator decided about a machine that announced itself.
 /// No `rename_all` here, and that is the convention rather than an omission:
 /// every stored spec and status in this crate is plain `snake_case`, and
@@ -429,6 +436,56 @@ pub fn fingerprint_of(public_key: &str) -> String {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(":")
+}
+
+/// The node id a machine's own hostname suggests, if it suggests one.
+///
+/// ## Why the machine gets to propose a name at all
+///
+/// It was named at install time — somebody typed `peter` into the wizard —
+/// and asking them to type it again in the console is asking them to keep two
+/// names in step by memory. So the announcement carries it and the platform
+/// makes the Node object straight away, which is also where an operator
+/// expects to find a new machine: under Nodes, beside the others.
+///
+/// ## Why it is a proposal and not a decision
+///
+/// The announce door is unauthenticated, so this is a stranger's string. It
+/// is refused unless it is a plain id — the rules a name has to satisfy to
+/// survive a URL, a store key and a log line — and it is refused if it is one
+/// of the defaults an unnamed image reports, because a rack flashed from one
+/// image would otherwise all propose `nixos` and the first one would take it.
+///
+/// Taking a name that already exists is refused at the store, not here: a
+/// machine that announced `horst` must not land on the control plane's own
+/// object, and the only safe way to say so is to fail the create.
+pub fn suggested_node_id(hostname: &str) -> Option<String> {
+    let name = hostname.trim().to_lowercase();
+    // What an image says before anybody has named it. A machine calling itself
+    // one of these has not been named, whatever its /etc/hostname says.
+    const UNNAMED: [&str; 6] = [
+        "nixos",
+        "localhost",
+        "velstra",
+        "velstra-node",
+        "debian",
+        "ubuntu",
+    ];
+    if name.is_empty() || UNNAMED.contains(&name.as_str()) {
+        return None;
+    }
+    // The id rules, spelled here rather than borrowed, because this crate is
+    // the one that must not accept a stranger's string on trust: lowercase
+    // letters, digits and single hyphens between them, and short enough to
+    // read on a row.
+    let ok = name.len() <= 63
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.contains("--");
+    ok.then_some(name)
 }
 
 /// What an announcement becomes when it is accepted.
@@ -827,5 +884,63 @@ mod one_message {
                  cell does not check"
             );
         }
+    }
+}
+
+/// A machine proposes the name it was given at install, and nothing else.
+#[cfg(test)]
+mod suggested_names {
+    use super::suggested_node_id;
+
+    /// The ordinary case: somebody typed it into the wizard, and the console
+    /// should not ask them to type it again.
+    #[test]
+    fn a_named_machine_proposes_its_name() {
+        assert_eq!(suggested_node_id("peter"), Some("peter".into()));
+        assert_eq!(suggested_node_id("  Peter\n"), Some("peter".into()));
+        assert_eq!(
+            suggested_node_id("rack-4-node-11"),
+            Some("rack-4-node-11".into())
+        );
+    }
+
+    /// An image that nobody has named yet. A rack flashed from one image would
+    /// otherwise all propose the same word, and the first one would take it.
+    #[test]
+    fn an_unnamed_image_proposes_nothing() {
+        for name in [
+            "nixos",
+            "NixOS",
+            "localhost",
+            "velstra-node",
+            "debian",
+            "ubuntu",
+            "",
+            "   ",
+        ] {
+            assert_eq!(suggested_node_id(name), None, "{name} is not a name");
+        }
+    }
+
+    /// A stranger's string on an unauthenticated door. Anything that would not
+    /// survive a URL, a store key or a log line is not a proposal.
+    #[test]
+    fn what_is_not_an_id_is_not_taken_on_trust() {
+        for bad in [
+            "../horst",
+            "peter/../horst",
+            "peter peter",
+            "-peter",
+            "peter-",
+            "peter--two",
+            "Peter_2",
+            "9peter",
+            "peter.example.org",
+        ] {
+            assert_eq!(suggested_node_id(bad), None, "{bad} should be refused");
+        }
+        // Long enough to be somebody being clever.
+        assert_eq!(suggested_node_id(&"a".repeat(64)), None);
+        assert_eq!(suggested_node_id(&"a".repeat(63)), Some("a".repeat(63)));
     }
 }

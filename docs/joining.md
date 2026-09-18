@@ -220,9 +220,27 @@ convenience without either cost.
 installer's third door and the `enrollments` collection. The machine boots,
 takes a lease, generates a keypair, announces itself to a cell address (the
 one short thing anybody types), and shows **two** fingerprints on its screen.
-A `Pending` row appears in the console with the first of them and what the
-machine reported about itself; the operator compares, names the machine, says
-what it is for, and approves. The machine is polling, so it moves on while
+Two things then appear in the console. **The machine is under Nodes**, beside
+the others, out of service — because that is where somebody looks for a new
+machine, and a separate list of pending things is a second place to remember.
+And a row under *Pending machines* carries the first fingerprint and what the
+machine reported about itself; the operator compares, says what it is for, and
+approves.
+
+The Node exists before anybody has said yes, and four things make that safe on
+a door nobody authenticates: it has **no credential**, so nothing can report
+or read as it; it is **not schedulable**, so the scheduler will not place a
+guest on it; it **cannot take a name that already exists**, because the create
+is allowed to fail and failing is the correct outcome when a stranger
+announces itself as `horst`; and it **does not outlive the request** — the
+sweep removes it with the enrolment when nobody answers within the hour, so a
+rack flashed by mistake tidies itself up.
+
+The machine proposes its own name, from the hostname somebody typed into the
+installer, so nobody is asked to type it twice. A machine that calls itself
+what every unflashed image calls itself — `nixos`, `localhost`, `debian` —
+proposes nothing, because a rack flashed from one image would otherwise all
+propose the same word and the first one would take it. The machine is polling, so it moves on while
 they are still looking at it, and from there the install is the same code path
 door 2 takes.
 

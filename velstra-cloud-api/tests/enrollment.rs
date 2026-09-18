@@ -100,7 +100,7 @@ fn announcement(public: &str) -> Value {
         "publicKey": public,
         "seenCertificate": "9F:2C:11:22:33:44:55:66",
         "reported": {
-            "hostname": "nixos",
+            "hostname": "peter-box",
             "addresses": ["10.10.10.47"],
             "vcpus": 16,
             "memoryMib": 65536,
@@ -230,6 +230,115 @@ async fn a_machine_announces_is_approved_and_collects_its_credential() {
         again["error"]["code"],
         json!("FAILED_PRECONDITION"),
         "{again}"
+    );
+}
+
+/// The machine appears under Nodes the moment it asks, held out of service.
+///
+/// Where an operator looks for a new machine is the list of machines. A
+/// separate list of pending things is a second place to remember, and the
+/// first person to use this said so. What makes it safe is everything the row
+/// does *not* have: no credential, not schedulable, and a label saying what it
+/// is waiting for.
+#[tokio::test]
+async fn the_node_exists_from_the_announcement_and_is_out_of_service() {
+    let router = api();
+    let (pair, public) = keypair();
+    let (_, announced) = anon(
+        &router,
+        "POST",
+        "enrollments:announce",
+        announcement(&public),
+    )
+    .await;
+    let id = announced["id"].as_str().unwrap().to_string();
+
+    // Under Nodes, named the way the installer named it.
+    let (status, node) = send(&router, "GET", "nodes/peter-box", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    assert_eq!(node["spec"]["schedulable"], json!(false), "{node}");
+    assert_eq!(
+        node["meta"]["labels"]["velstra.io/awaiting-approval"],
+        json!(id),
+        "the row does not say what it is waiting for: {node}"
+    );
+
+    // And the enrolment was filled in with it, so nobody types a name the
+    // machine already knows.
+    let (_, row) = send(&router, "GET", &format!("enrollments/{id}"), Value::Null).await;
+    assert_eq!(row["spec"]["node"], json!("peter-box"), "{row}");
+
+    // Approve, claim, and it goes into service with the label gone — which is
+    // what the sweep matches on, so leaving it would let an old enrolment
+    // expiring an hour later delete a node that is by then running guests.
+    send(
+        &router,
+        "PATCH",
+        &format!("enrollments/{id}"),
+        json!({ "spec": { "runsGuests": true, "approved": true } }),
+    )
+    .await;
+    let (status, issued) = anon(
+        &router,
+        "POST",
+        "enrollments:claim",
+        json!({ "id": &id, "signature": sign_claim(&pair, &id) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+    let (_, node) = send(&router, "GET", "nodes/peter-box", Value::Null).await;
+    assert_eq!(node["spec"]["schedulable"], json!(true), "{node}");
+    assert_eq!(
+        node["meta"]["labels"]["velstra.io/awaiting-approval"],
+        Value::Null,
+        "a node in service still carries the waiting label: {node}"
+    );
+}
+
+/// A machine that calls itself what every unflashed image calls itself does
+/// not get to take that name — and a name somebody else holds is left alone.
+#[tokio::test]
+async fn an_unnamed_machine_takes_no_name_and_never_somebody_elses() {
+    let router = api();
+
+    // The image default: no node is made, and the operator names it.
+    let (_, bare) = keypair();
+    let mut nameless = announcement(&bare);
+    nameless["reported"]["hostname"] = json!("nixos");
+    let (_, announced) = anon(&router, "POST", "enrollments:announce", nameless).await;
+    let id = announced["id"].as_str().unwrap().to_string();
+    let (status, _) = send(&router, "GET", "nodes/nixos", Value::Null).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unnamed image took a name"
+    );
+    let (_, row) = send(&router, "GET", &format!("enrollments/{id}"), Value::Null).await;
+    assert_eq!(row["spec"]["node"], Value::Null, "{row}");
+
+    // A name that is already a machine in this cell. The control plane's own
+    // object must not be landed on by anybody who can reach the port.
+    send(
+        &router,
+        "POST",
+        "nodes",
+        json!({ "id": "horst", "spec": { "schedulable": true } }),
+    )
+    .await;
+    let (_, other) = keypair();
+    let mut pretending = announcement(&other);
+    pretending["reported"]["hostname"] = json!("horst");
+    anon(&router, "POST", "enrollments:announce", pretending).await;
+    let (_, horst) = send(&router, "GET", "nodes/horst", Value::Null).await;
+    assert_eq!(
+        horst["spec"]["schedulable"],
+        json!(true),
+        "a stranger's announcement took an existing machine out of service: {horst}"
+    );
+    assert_eq!(
+        horst["meta"]["labels"]["velstra.io/awaiting-approval"],
+        Value::Null,
+        "{horst}"
     );
 }
 
@@ -373,13 +482,13 @@ async fn a_refusal_answers_differently_from_a_wait() {
 async fn approving_without_naming_the_machine_says_which_field_is_missing() {
     let router = api();
     let (pair, public) = keypair();
-    let (_, announced) = anon(
-        &router,
-        "POST",
-        "enrollments:announce",
-        announcement(&public),
-    )
-    .await;
+    // An image nobody has named. A named machine proposes its own name at the
+    // announce and the form is prefilled with it, so this is the one shape
+    // where "approved and still unnamed" is reachable — and it is the shape a
+    // rack flashed from one image actually has.
+    let mut nameless = announcement(&public);
+    nameless["reported"]["hostname"] = json!("nixos");
+    let (_, announced) = anon(&router, "POST", "enrollments:announce", nameless).await;
     let id = announced["id"].as_str().unwrap().to_string();
 
     send(
