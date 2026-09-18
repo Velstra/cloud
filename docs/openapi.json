@@ -1498,29 +1498,35 @@
             "description": "Turn on once the fingerprint on this row matches the one on the machine's own screen. That comparison is the whole authentication: nothing secret is typed in either direction, so a row you approve without looking is a machine you have not checked.",
             "type": "boolean"
           },
+          "isControlPlane": {
+            "description": "It runs this cell's API and store. Rare, and never the machine's own answer: a box that could make itself a control plane could make itself the cell.",
+            "type": "boolean"
+          },
           "node": {
-            "description": "What the whole cell will call this machine, for ever. It cannot be changed afterwards, and it is the name on every guest, volume and alert that mentions the machine.",
+            "description": "What the whole cell will call this machine, for ever. It cannot be changed afterwards, and it is the name on every guest, volume and alert that mentions the machine. The machine's own hostname is on this row under \"Calls itself\" — using it keeps the two names the same, which is one fewer thing to hold in your head.",
+            "format": "id",
             "type": "string"
           },
           "pool": {
             "description": "Which storage pool it serves, when `pool` is one of the roles.",
+            "format": "id",
             "type": "string"
           },
           "refused": {
-            "description": "Say no rather than nothing. The machine stops asking, and the row stays so somebody wondering what happened to that box can see. Leaving it alone means \"not yet\", which is a different answer.",
+            "description": "For a machine that should not join this cell — one somebody flashed by mistake, or one you do not recognise. It stops asking immediately instead of retrying for the hour, and the row stays so it is clear somebody decided rather than forgot.",
             "type": "boolean"
           },
-          "roles": {
-            "description": "hypervisor runs guests, pool serves storage, control-plane is the cell's API. A machine may be more than one. This is your answer and not the machine's: a box that could make itself a control plane could make itself the cell.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
+          "runsGuests": {
+            "description": "The usual answer. This machine starts and holds virtual machines — the `hypervisor` role.",
+            "type": "boolean"
+          },
+          "servesStorage": {
+            "description": "Its disks become a pool other machines can put volumes in — the `pool` role. Name the pool below.",
+            "type": "boolean"
           }
         },
         "required": [
-          "node",
-          "roles"
+          "node"
         ],
         "type": "object"
       },
@@ -6058,6 +6064,43 @@
       }
     },
     "/api/v1/nodes/{name}": {
+      "delete": {
+        "description": "Marks the object for deletion; it is gone once every finalizer has released it.",
+        "operationId": "delete-nodes",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deleting: the object exists until its finalizers release it."
+          },
+          "204": {
+            "description": "Gone."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Delete one of Nodes",
+        "tags": [
+          "Nodes"
+        ]
+      },
       "get": {
         "operationId": "get-nodes",
         "parameters": [
@@ -6864,6 +6907,43 @@
       }
     },
     "/api/v1/pools/{name}": {
+      "delete": {
+        "description": "Marks the object for deletion; it is gone once every finalizer has released it.",
+        "operationId": "delete-pools",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deleting: the object exists until its finalizers release it."
+          },
+          "204": {
+            "description": "Gone."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Delete one of Pools",
+        "tags": [
+          "Pools"
+        ]
+      },
       "get": {
         "operationId": "get-pools",
         "parameters": [

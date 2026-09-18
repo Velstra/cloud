@@ -182,7 +182,7 @@ async fn a_machine_announces_is_approved_and_collects_its_credential() {
         &router,
         "PATCH",
         &format!("enrollments/{id}"),
-        json!({ "spec": { "node": "peter", "roles": ["hypervisor"], "approved": true } }),
+        json!({ "spec": { "node": "peter", "runsGuests": true, "approved": true } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{approved}");
@@ -296,7 +296,7 @@ async fn a_claim_without_the_key_is_indistinguishable_from_an_unknown_id() {
         &router,
         "PATCH",
         &format!("enrollments/{id}"),
-        json!({ "spec": { "node": "peter", "roles": ["hypervisor"], "approved": true } }),
+        json!({ "spec": { "node": "peter", "runsGuests": true, "approved": true } }),
     )
     .await;
 

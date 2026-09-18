@@ -78,20 +78,38 @@ pub const DEFAULT_TTL_SECS: u64 = 60 * 60;
 pub const MAX_PENDING: usize = 512;
 
 /// What an operator decided about a machine that announced itself.
+/// No `rename_all` here, and that is the convention rather than an omission:
+/// every stored spec and status in this crate is plain `snake_case`, and
+/// `velstra-cloud-wire` converts to and from the contract's `camelCase` at the
+/// edge. A struct that renamed its own fields would be converted twice — the
+/// wire hands over `runs_guests`, a camel-renamed struct expects `runsGuests`,
+/// and the field reads as absent. That cost this branch two bugs before the
+/// pattern was spotted: a machine reporting 64 GiB as none, and an approval
+/// refused with "there is no field called runsGuests".
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct EnrollmentSpec {
     /// What the node will be called. Empty until an operator says, and then it
     /// is the name everything in the cell uses for this machine for ever.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub node: String,
-    /// What the machine is for: `hypervisor`, `pool`, `control-plane`.
+    /// What the machine is for, as three answers rather than a list of words.
     ///
-    /// The operator's answer and not the machine's. A machine that could
-    /// nominate itself a control plane would be a machine that could nominate
-    /// itself the cell — the same reason a node cannot make itself a gateway.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub roles: Vec<String>,
+    /// The operator's answer and not the machine's: a box that could nominate
+    /// itself a control plane could nominate itself the cell, which is the
+    /// same reason a node cannot make itself a gateway.
+    ///
+    /// Three booleans and not `roles: Vec<String>`, which is what this was.
+    /// "A machine may be more than one" is three yes/no questions, and a list
+    /// of role names made them a string somebody has to know how to spell —
+    /// there was nothing to *choose* in any interface, which is exactly what
+    /// an operator looking at a new machine expects to do. [`Self::roles`]
+    /// turns them back into the names the seed uses.
+    #[serde(default)]
+    pub runs_guests: bool,
+    #[serde(default)]
+    pub serves_storage: bool,
+    #[serde(default)]
+    pub is_control_plane: bool,
     /// Which pool it serves, when `roles` names one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pool: String,
@@ -107,9 +125,29 @@ pub struct EnrollmentSpec {
     pub refused: bool,
 }
 
+impl EnrollmentSpec {
+    /// The role names the seed uses, in the order `VELSTRA_ROLES` lists them.
+    ///
+    /// One place turns the three answers into the three words, so a console, a
+    /// script and the claim cannot disagree about what "serves storage" is
+    /// called.
+    pub fn roles(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.is_control_plane {
+            out.push("control-plane".to_string());
+        }
+        if self.runs_guests {
+            out.push("hypervisor".to_string());
+        }
+        if self.serves_storage {
+            out.push("pool".to_string());
+        }
+        out
+    }
+}
+
 /// What the machine said about itself, and where it has got to.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct EnrollmentStatus {
     /// The public half of the keypair the machine generated, base64url, no
     /// padding. Written once, at the announce, and never again: it is what the
@@ -162,20 +200,7 @@ pub struct EnrollmentStatus {
 /// — it decides nothing, grants nothing, and is not matched against a policy.
 /// It exists so that a person looking at three pending rows can tell which one
 /// is the box in front of them.
-/// `memory_mib` is accepted under both spellings, and that is not sloppiness.
-///
-/// Every body reaching the API has been through `from_wire`, which snake-cases
-/// the keys — so the `memoryMib` a machine sends arrives as `memory_mib`, and
-/// a struct that knew only the camel spelling read it as absent and reported
-/// zero. Silently: serde ignores keys it does not know, every other field here
-/// is a single word that snake-casing does not touch, and the API test
-/// asserted the serial. A machine with 128 GiB showed up in the console with
-/// none.
-///
-/// The alias is the honest fix rather than renaming the field, because both
-/// spellings are real: a client writes camel and the wire hands over snake.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Reported {
     /// What the machine calls itself right now — usually the image default,
     /// because nobody has named it yet.
@@ -189,7 +214,7 @@ pub struct Reported {
     /// is built from these three.
     #[serde(default)]
     pub vcpus: u32,
-    #[serde(default, alias = "memory_mib")]
+    #[serde(default)]
     pub memory_mib: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<String>,
@@ -506,7 +531,7 @@ pub fn claimable(
     if spec.node.trim().is_empty() {
         return Err(NotClaimable::NoNode);
     }
-    if spec.roles.is_empty() {
+    if spec.roles().is_empty() {
         return Err(NotClaimable::NoRoles);
     }
     Ok(())
@@ -583,7 +608,7 @@ mod tests {
         let (mut spec, status) = pending(now);
         spec.approved = true;
         spec.node = "peter".into();
-        spec.roles = vec!["hypervisor".into()];
+        spec.runs_guests = true;
         assert_eq!(claimable(&spec, &status, now), Ok(()));
     }
 
@@ -626,7 +651,7 @@ mod tests {
         let (mut spec, status) = pending(now);
         spec.approved = true;
         spec.node = "peter".into();
-        spec.roles = vec!["hypervisor".into()];
+        spec.runs_guests = true;
         assert_eq!(status.phase, EnrollmentPhase::Pending);
         assert_eq!(
             claimable(&spec, &status, now + 3_600_001),
@@ -643,7 +668,7 @@ mod tests {
         let (mut spec, mut status) = pending(now);
         spec.approved = true;
         spec.node = "peter".into();
-        spec.roles = vec!["hypervisor".into()];
+        spec.runs_guests = true;
         status.claimed_at = Some(Timestamp(now));
         assert_eq!(
             claimable(&spec, &status, now),

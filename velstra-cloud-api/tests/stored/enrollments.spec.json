@@ -1,4 +1,7 @@
 {
   "approved": false,
-  "refused": false
+  "is_control_plane": false,
+  "refused": false,
+  "runs_guests": false,
+  "serves_storage": false
 }

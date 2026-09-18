@@ -1011,6 +1011,49 @@ function credentialControl(coll, r) {
   return host;
 }
 
+/// The two media a machine is installed from, handed over as files.
+///
+/// Beside the credential control because it is the same credential: the token
+/// this mints is the one `:issueCredential` shows, formatted for the two places
+/// it actually has to go. `velstra/join` on any medium plugged into the
+/// machine, which the installer finds by itself and offers by name; or a
+/// `#cloud-config` for a box that boots Debian or Ubuntu.
+///
+/// Downloaded and never shown. A credential in a panel is one somebody
+/// screenshots, and reading it is not what anybody does with it.
+function mediumControl(coll, r) {
+  const id = idOf(r);
+  const host = el("span.btns");
+  const grab = (verb, filename, what) => async () => {
+    try {
+      const text = await joinMedium(id, verb);
+      const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+      const a = el("a", { href: url, download: filename });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast(filename + " — it is a credential; anything holding it can register as " + id + ".");
+    } catch (e) {
+      toast(String((e && e.message) || e));
+    }
+  };
+  fill(host,
+    btn("Join file", {
+      quiet: true,
+      title: "The token as the file the installer looks for. Put it at velstra/join on any " +
+             "medium you plug into the machine and it offers it by name — nothing is typed.",
+      onclick: grab("joinFile", id + ".join"),
+    }),
+    btn("cloud-init", {
+      quiet: true,
+      title: "The same token as a #cloud-config for a machine that boots Debian or Ubuntu: it " +
+             "writes the join file, runs the installer against it, and shreds it.",
+      onclick: grab("cloudInit", id + "-cloud-init.yaml"),
+    }));
+  return host;
+}
+
 /// Ask again, a few seconds apart, until there is an answer or the time is up.
 ///
 /// Bounded, and deliberately not by much: this is a courtesy on top of the
@@ -1237,6 +1280,12 @@ function renderSheet(coll, r) {
   // deleting the thing every volume in it is written against.
   if (coll.id === "nodes" || coll.id === "pools") {
     acts.appendChild(credentialControl(coll, r));
+  }
+  // And the same credential as a file. Only for a node: a pool agent is
+  // configured on a machine that is already installed, so there is no medium
+  // for it to arrive on.
+  if (coll.id === "nodes" && holdsThePen) {
+    acts.appendChild(mediumControl(coll, r));
   }
   // Abandoning a migration is not deleting a row: what it costs depends on the
   // mode, and the sentence is different enough that it is written where the

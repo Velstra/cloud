@@ -501,6 +501,33 @@ const issueCredential = (coll, id) =>
   request("POST", writePath(coll) + "/" + encodeURIComponent(id) + ":issueCredential",
     { body: {} }).then((r) => r.body);
 
+/// The join token as a file, for a machine that is about to be installed.
+///
+/// Raw text rather than JSON, and downloaded rather than shown: it is about
+/// 1.3 KB of base64, which pastes into a shell and cannot be typed at a
+/// console — and a console is where an installer runs. What you do with it is
+/// put it on a medium, so this hands over the file to put there.
+///
+/// A POST, like `:issueCredential` and for the same reason: it mints a
+/// credential, and a GET that minted one is a GET a browser can be made to
+/// issue from somebody else's page.
+async function joinMedium(id, verb) {
+  const headers = {};
+  if (session.token) headers.Authorization = "Bearer " + session.token;
+  const res = await fetch("/api/v1/nodes/" + encodeURIComponent(id) + ":" + verb, {
+    method: "POST",
+    headers,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    // The refusal is JSON even though the success is not.
+    let said = text;
+    try { said = JSON.parse(text).error.message; } catch (e) { /* the body is the sentence */ }
+    throw new Error(said);
+  }
+  return text;
+}
+
 /// One month's consumption, summed the way a bill is.
 const explainUsage = (project, month) =>
   request("GET", "/api/v1/" + project + ":explainUsage" +

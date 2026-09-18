@@ -587,30 +587,64 @@ const ENROLLMENT_FIELDS: &[Field] = &[
         label: "Name it",
         kind: Kind::Text {
             placeholder: "peter",
-            check: Check::Name,
+            // An id — `peter` — and not `Check::Name`, which is an AIP name and
+            // asked an operator to type `projects/…` in front of a machine that
+            // belongs to no project. A node is cell-scoped; it has never had a
+            // parent to name.
+            check: Check::Id,
         },
         required: true,
         advanced: false,
         help: "What the whole cell will call this machine, for ever. It cannot \
                be changed afterwards, and it is the name on every guest, volume \
-               and alert that mentions the machine.",
+               and alert that mentions the machine. The machine's own hostname \
+               is on this row under \"Calls itself\" — using it keeps the two \
+               names the same, which is one fewer thing to hold in your head.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    // Three switches and not one list of words.
+    //
+    // "A machine may be more than one" is three yes/no questions, and a free
+    // text list made them a string somebody has to know how to spell — there
+    // was nothing to *choose*, which is what an operator looking at a new box
+    // reasonably expects. Each says what the machine does rather than what the
+    // role is called, because "runs guests" is a thing anybody can answer and
+    // "hypervisor" is a word this platform taught them.
+    Field {
+        key: "runsGuests",
+        label: "Runs guests",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "The usual answer. This machine starts and holds virtual \
+               machines — the `hypervisor` role.",
         when_empty: "",
         derived: false,
         at_creation: false,
     },
     Field {
-        key: "roles",
-        label: "What it is for",
-        kind: Kind::TextList {
-            placeholder: "hypervisor",
-            check: Check::None,
-        },
-        required: true,
+        key: "servesStorage",
+        label: "Serves storage",
+        kind: Kind::Switch,
+        required: false,
         advanced: false,
-        help: "hypervisor runs guests, pool serves storage, control-plane is \
-               the cell's API. A machine may be more than one. This is your \
-               answer and not the machine's: a box that could make itself a \
-               control plane could make itself the cell.",
+        help: "Its disks become a pool other machines can put volumes in — the \
+               `pool` role. Name the pool below.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "isControlPlane",
+        label: "Is a control plane",
+        kind: Kind::Switch,
+        required: false,
+        advanced: true,
+        help: "It runs this cell's API and store. Rare, and never the machine's \
+               own answer: a box that could make itself a control plane could \
+               make itself the cell.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -620,7 +654,7 @@ const ENROLLMENT_FIELDS: &[Field] = &[
         label: "Pool",
         kind: Kind::Text {
             placeholder: "local-2",
-            check: Check::Name,
+            check: Check::Id,
         },
         required: false,
         advanced: false,
@@ -646,14 +680,14 @@ const ENROLLMENT_FIELDS: &[Field] = &[
     },
     Field {
         key: "refused",
-        label: "Turn away",
+        label: "Do not let it in",
         kind: Kind::Switch,
         required: false,
         advanced: false,
-        help: "Say no rather than nothing. The machine stops asking, and the \
-               row stays so somebody wondering what happened to that box can \
-               see. Leaving it alone means \"not yet\", which is a different \
-               answer.",
+        help: "For a machine that should not join this cell — one somebody \
+               flashed by mistake, or one you do not recognise. It stops asking \
+               immediately instead of retrying for the hour, and the row stays \
+               so it is clear somebody decided rather than forgot.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -4947,7 +4981,18 @@ pub const COLLECTIONS: &[Collection] = &[
         agreements: &[],
         creatable: true,
         editable: true,
-        deletable: false,
+        // Yes, and the API is what makes it safe rather than this flag. A node
+        // holding a guest is refused by name — the refusal lists the instances
+        // — so the console offering the button does not offer a way to lose
+        // anything; it offers the only way to retire a machine that has been
+        // decommissioned.
+        //
+        // It was `false` with no reason written down, which meant a cell
+        // accumulated rows for machines that no longer exist and an operator
+        // had to reach for `curl` to remove one. A platform whose console
+        // cannot undo what its console did is a platform people stop trusting
+        // the console with.
+        deletable: true,
         explainable: false,
     },
     Collection {
@@ -5735,7 +5780,10 @@ pub const COLLECTIONS: &[Collection] = &[
         // pretend to hand one out.
         creatable: true,
         editable: true,
-        deletable: false,
+        // The same as nodes, and the guard matters more here: a pool still
+        // holding volumes is refused, because deleting one is deleting the
+        // thing every volume in it is written against.
+        deletable: true,
         explainable: false,
     },
     Collection {

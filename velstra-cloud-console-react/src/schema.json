@@ -2046,7 +2046,7 @@
   "agreements": [],
   "creatable": true,
   "editable": true,
-  "deletable": false,
+  "deletable": true,
   "explainable": false
  },
  {
@@ -3496,7 +3496,7 @@
   "agreements": [],
   "creatable": true,
   "editable": true,
-  "deletable": false,
+  "deletable": true,
   "explainable": false
  },
  {
@@ -3783,24 +3783,44 @@
     "label": "Name it",
     "kind": "text",
     "placeholder": "peter",
-    "check": "name",
+    "check": "id",
     "required": true,
     "advanced": false,
     "whenEmpty": "",
-    "help": "What the whole cell will call this machine, for ever. It cannot be changed afterwards, and it is the name on every guest, volume and alert that mentions the machine.",
+    "help": "What the whole cell will call this machine, for ever. It cannot be changed afterwards, and it is the name on every guest, volume and alert that mentions the machine. The machine's own hostname is on this row under \"Calls itself\" — using it keeps the two names the same, which is one fewer thing to hold in your head.",
     "derived": false,
     "atCreation": false
    },
    {
-    "key": "roles",
-    "label": "What it is for",
-    "kind": "textList",
-    "placeholder": "hypervisor",
-    "check": "none",
-    "required": true,
+    "key": "runsGuests",
+    "label": "Runs guests",
+    "kind": "switch",
+    "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "hypervisor runs guests, pool serves storage, control-plane is the cell's API. A machine may be more than one. This is your answer and not the machine's: a box that could make itself a control plane could make itself the cell.",
+    "help": "The usual answer. This machine starts and holds virtual machines — the `hypervisor` role.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "servesStorage",
+    "label": "Serves storage",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Its disks become a pool other machines can put volumes in — the `pool` role. Name the pool below.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "isControlPlane",
+    "label": "Is a control plane",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "It runs this cell's API and store. Rare, and never the machine's own answer: a box that could make itself a control plane could make itself the cell.",
     "derived": false,
     "atCreation": false
    },
@@ -3809,7 +3829,7 @@
     "label": "Pool",
     "kind": "text",
     "placeholder": "local-2",
-    "check": "name",
+    "check": "id",
     "required": false,
     "advanced": false,
     "whenEmpty": "",
@@ -3830,12 +3850,12 @@
    },
    {
     "key": "refused",
-    "label": "Turn away",
+    "label": "Do not let it in",
     "kind": "switch",
     "required": false,
     "advanced": false,
     "whenEmpty": "",
-    "help": "Say no rather than nothing. The machine stops asking, and the row stays so somebody wondering what happened to that box can see. Leaving it alone means \"not yet\", which is a different answer.",
+    "help": "For a machine that should not join this cell — one somebody flashed by mistake, or one you do not recognise. It stops asking immediately instead of retrying for the hour, and the row stays so it is clear somebody decided rather than forgot.",
     "derived": false,
     "atCreation": false
    }

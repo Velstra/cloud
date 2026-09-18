@@ -1811,6 +1811,20 @@
   ]
  },
  {
+  "id": "delete-nodes",
+  "method": "DELETE",
+  "path": "/api/v1/nodes/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Nodes",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
   "id": "list-operations",
   "method": "GET",
   "path": "/api/v1/projects/{project}/operations",
@@ -1921,6 +1935,20 @@
   "query": [],
   "body": true,
   "summary": "Mint a fresh credential for a pool that already exists; shown once, as `poolToken` and \u2014 when this API advertises an address \u2014 as `joinToken`. The body may carry `purpose` and `expiresAt`.",
+  "tags": [
+   "Pools"
+  ]
+ },
+ {
+  "id": "delete-pools",
+  "method": "DELETE",
+  "path": "/api/v1/pools/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Pools",
   "tags": [
    "Pools"
   ]
