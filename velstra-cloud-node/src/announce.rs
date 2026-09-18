@@ -135,12 +135,37 @@ pub fn run() -> Result<Option<JoinToken>> {
         }
     };
 
+    // Reachable at all, before a keypair and an announcement. "I cannot reach
+    // that address" is the answer nine times out of ten, and it is worth
+    // saying on its own rather than inside a sentence about an enrolment.
+    if let Err(e) = reachable(&url) {
+        println!("\n  {e}");
+        println!("  Nothing was written, and this machine is unchanged.");
+        return Ok(None);
+    }
+
     let (pair, public) = keypair()?;
     let (answer, served) = announce(&url, &public)?;
-    let id = answer["id"]
-        .as_str()
-        .context("the cell's answer names no enrolment id")?
-        .to_string();
+    let id = match answer["id"].as_str() {
+        Some(id) => id.to_string(),
+        None => {
+            // Whatever the cell said, said back. An error body carries a
+            // message written for exactly this moment; replacing it with a
+            // sentence about a missing field is how a fixable problem becomes
+            // an evening.
+            let said = answer["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .trim();
+            if said.is_empty() {
+                bail!(
+                    "the cell answered something this installer cannot read:\n  {}",
+                    answer
+                );
+            }
+            bail!("the cell refused the announcement: {said}");
+        }
+    };
     let mine = answer["fingerprint"].as_str().unwrap_or_default();
 
     println!("\n  This machine:  {mine}");
@@ -208,6 +233,44 @@ fn cell_url(typed: &str) -> Result<String> {
         format!("{authority}:8443")
     };
     Ok(format!("https://{with_port}"))
+}
+
+/// Whether the cell answers at all.
+///
+/// `/healthz` needs no token and no certificate anybody trusts, which makes it
+/// exactly the right question to ask first: it separates "the network is not
+/// up", "that is the wrong address" and "the API is not running" from anything
+/// about enrolment.
+fn reachable(url: &str) -> Result<()> {
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "10",
+            "--insecure",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("{url}/healthz"),
+        ])
+        .output()
+        .context("running curl — the installer medium carries it")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    let said = said.trim();
+    bail!(
+        "{url} did not answer: {}\n  Check that this machine has an address (ip -brief addr), \
+         that the cell is that one, and that its console opens in a browser from somewhere \
+         else.",
+        if said.is_empty() {
+            "no reason given".to_string()
+        } else {
+            said.to_string()
+        }
+    )
 }
 
 fn keypair() -> Result<(ring::signature::Ed25519KeyPair, String)> {
@@ -325,6 +388,27 @@ fn post(url: &str, verb: &str, body: &serde_json::Value) -> Result<(serde_json::
         ])
         .output()
         .context("running curl — the installer medium carries it")?;
+    // curl's own complaint, said out loud.
+    //
+    // This was thrown away, and it cost somebody an evening: a request that
+    // never reached the cell leaves stdout empty, which parsed as no JSON,
+    // which read as an answer with no enrolment id — so "I cannot reach
+    // 10.10.10.8" was reported as "the cell's answer names no enrolment id".
+    // The machine had said exactly what was wrong on stderr and this function
+    // dropped it. Whatever else is true of a door nobody has walked through
+    // yet, it has to be able to say why it did not open.
+    if !out.status.success() {
+        let said = String::from_utf8_lossy(&out.stderr);
+        let said = said.trim();
+        bail!(
+            "could not reach {url}: {}",
+            if said.is_empty() {
+                format!("curl gave up with status {:?}", out.status.code())
+            } else {
+                said.to_string()
+            }
+        );
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     // The body is everything before the certificate block curl appends.
     let (body_text, certs) = match text.find("\nSubject:") {

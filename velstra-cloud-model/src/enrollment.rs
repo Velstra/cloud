@@ -162,6 +162,18 @@ pub struct EnrollmentStatus {
 /// — it decides nothing, grants nothing, and is not matched against a policy.
 /// It exists so that a person looking at three pending rows can tell which one
 /// is the box in front of them.
+/// `memory_mib` is accepted under both spellings, and that is not sloppiness.
+///
+/// Every body reaching the API has been through `from_wire`, which snake-cases
+/// the keys — so the `memoryMib` a machine sends arrives as `memory_mib`, and
+/// a struct that knew only the camel spelling read it as absent and reported
+/// zero. Silently: serde ignores keys it does not know, every other field here
+/// is a single word that snake-casing does not touch, and the API test
+/// asserted the serial. A machine with 128 GiB showed up in the console with
+/// none.
+///
+/// The alias is the honest fix rather than renaming the field, because both
+/// spellings are real: a client writes camel and the wire hands over snake.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Reported {
@@ -177,7 +189,7 @@ pub struct Reported {
     /// is built from these three.
     #[serde(default)]
     pub vcpus: u32,
-    #[serde(default)]
+    #[serde(default, alias = "memory_mib")]
     pub memory_mib: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<String>,

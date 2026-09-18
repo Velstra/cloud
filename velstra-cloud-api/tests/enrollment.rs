@@ -161,6 +161,17 @@ async fn a_machine_announces_is_approved_and_collects_its_credential() {
     let row = &list["items"][0];
     assert_eq!(row["status"]["fingerprint"], json!(fingerprint));
     assert_eq!(row["status"]["reported"]["serial"], json!("PT-0042"));
+    // The field that is two words. Every body here has been through
+    // `from_wire`, which snake-cases the keys, so `memoryMib` arrives as
+    // `memory_mib` — and a struct that knew only the camel spelling read it as
+    // absent and put a machine with 64 GiB on the operator's screen with none.
+    // This assertion is the only reason that is not still true.
+    assert_eq!(
+        row["status"]["reported"]["memoryMib"],
+        json!(65536),
+        "{row}"
+    );
+    assert_eq!(row["status"]["reported"]["vcpus"], json!(16), "{row}");
     assert_eq!(
         row["status"]["seenCertificate"],
         json!("9F:2C:11:22:33:44:55:66")

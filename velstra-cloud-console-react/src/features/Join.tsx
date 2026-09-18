@@ -15,7 +15,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { call } from "@/api/transport";
+import { call, token } from "@/api/transport";
 import { idOf, type Resource } from "@/lib/model";
 import type { Collection } from "@/lib/schema";
 import { Pressed } from "./Pressed";
@@ -73,6 +73,73 @@ export function MintedBox({ minted, what }: { minted: Minted; what: string }) {
  * Issuing is additive: the credential the machine holds keeps working until
  * it is revoked, so a mistyped paste never takes an agent down.
  */
+/**
+ * The same credential, as a file somebody can carry to the machine.
+ *
+ * A join token is about 1.3 KB of base64. Pasting it is fine into a shell and
+ * impossible at a console, which is where an installer runs — so the platform
+ * answers with the artefact instead of the string: `velstra/join` on a stick
+ * the installer finds by itself, or a `#cloud-config` for a machine that boots
+ * Debian or Ubuntu.
+ *
+ * Downloaded rather than shown. It is a credential, and a credential in a
+ * `<pre>` is one somebody screenshots; it is also the wrong shape to read —
+ * what you do with it is put it on a medium, and this hands you the file to
+ * put there.
+ */
+function MediumButton({
+  node,
+  verb,
+  filename,
+  label,
+  title,
+}: {
+  node: string;
+  verb: string;
+  filename: string;
+  label: string;
+  title: string;
+}) {
+  return (
+    <Pressed
+      size="sm"
+      variant="secondary"
+      title={title}
+      onPress={async () => {
+        try {
+          const r = await fetch(`/api/v1/nodes/${encodeURIComponent(node)}:${verb}`, {
+            method: "POST",
+            headers: { ...(token() ? { authorization: "Bearer " + token() } : {}) },
+          });
+          const text = await r.text();
+          if (!r.ok) {
+            // The API's refusal is JSON even when the success is not.
+            let said = text;
+            try {
+              said = JSON.parse(text)?.error?.message ?? text;
+            } catch {
+              /* it was not JSON; the body is the sentence */
+            }
+            toast.error(said);
+            return;
+          }
+          const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          a.click();
+          URL.revokeObjectURL(url);
+          toast(`${filename} — it is a credential; anything holding it can register as ${node}.`);
+        } catch (e) {
+          toast.error((e as Error).message);
+        }
+      }}
+    >
+      {label}
+    </Pressed>
+  );
+}
+
 export function JoinTokenButton({ r, c }: { r: Resource; c: Collection }) {
   const [minted, setMinted] = useState<Minted | null>(null);
   const noun = c.id === "pools" ? "pool" : "node";
@@ -87,6 +154,24 @@ export function JoinTokenButton({ r, c }: { r: Resource; c: Collection }) {
             else toast.error("The cell answered without a token.");
           } catch (e) { toast.error((e as Error).message); }
         }}>Join token</Pressed>
+      {c.id === "nodes" && (
+        <>
+          <MediumButton
+            node={idOf(r)}
+            verb="joinFile"
+            filename={`${idOf(r)}.join`}
+            label="Join file"
+            title="The token as the file the installer looks for. Put it at velstra/join on any medium you plug into the machine and it offers it by name — no typing."
+          />
+          <MediumButton
+            node={idOf(r)}
+            verb="cloudInit"
+            filename={`${idOf(r)}-cloud-init.yaml`}
+            label="cloud-init"
+            title="The same token as a #cloud-config, for a machine that boots Debian or Ubuntu: it writes the join file, runs the installer against it, and shreds it."
+          />
+        </>
+      )}
       {minted && <div className="basis-full"><MintedBox minted={minted} what={`the ${noun}`} /></div>}
     </>
   );
