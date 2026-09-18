@@ -463,11 +463,15 @@ pub fn suggested_node_id(hostname: &str) -> Option<String> {
     let name = hostname.trim().to_lowercase();
     // What an image says before anybody has named it. A machine calling itself
     // one of these has not been named, whatever its /etc/hostname says.
-    const UNNAMED: [&str; 6] = [
+    const UNNAMED: [&str; 7] = [
         "nixos",
         "localhost",
         "velstra",
         "velstra-node",
+        // The installer ISO's own name. The installer now announces the name
+        // the wizard was given, so this should never arrive — and if it does,
+        // a machine named after the medium it booted from is not named.
+        "velstra-node-installer",
         "debian",
         "ubuntu",
     ];

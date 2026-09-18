@@ -394,6 +394,90 @@ async fn approving_again_records_the_approver_a_lost_write_did_not() {
     assert_eq!(status, StatusCode::OK, "{issued}");
 }
 
+/// The approver is a cell admin by *session scope*, not by the static list.
+///
+/// This is how a real cell's administrator is one — `admin` signs in and the
+/// session carries the scope — and it is the shape the first real approval was
+/// refused in. The claim used to rebuild an `Identity` from the recorded name
+/// and act as it, and an identity rebuilt from a name carries no scope, so the
+/// platform told the operator "only a cell operator may make it" about the
+/// operator. The static-list admin every other test uses passed by a route the
+/// real one never takes.
+#[tokio::test]
+async fn an_approval_by_a_session_admin_is_executed_not_reauthorised() {
+    use velstra_cloud_api::sessions::CELL_ADMIN_SCOPE;
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::new([(
+        TOKEN.to_string(),
+        velstra_cloud_api::Identity {
+            subject: "admin".into(),
+            scopes: vec![CELL_ADMIN_SCOPE.into()],
+        },
+    )]));
+    let router = velstra_cloud_api::server(
+        Api::new(
+            Arc::new(MemoryStore::new()),
+            "eu-central",
+            "cell-1",
+            verifier,
+        )
+        // Deliberately nobody: the authority has to come from the scope.
+        .with_cell_admins(vec![])
+        .with_join_facts(
+            vec!["https://cell-1:8443".into()],
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into(),
+        ),
+    );
+    let (pair, public) = keypair();
+    let (_, announced) = anon(
+        &router,
+        "POST",
+        "enrollments:announce",
+        announcement(&public),
+    )
+    .await;
+    let id = announced["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &router,
+        "PATCH",
+        &format!("enrollments/{id}"),
+        json!({ "spec": { "runsGuests": true, "approved": true } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the session admin may approve: {body}"
+    );
+
+    let (status, issued) = anon(
+        &router,
+        "POST",
+        "enrollments:claim",
+        json!({ "id": &id, "signature": sign_claim(&pair, &id) }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an approval by a session admin was not executed: {issued}"
+    );
+    assert!(
+        issued["joinToken"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("velstra1.")),
+        "{issued}"
+    );
+    // In service, and no longer waiting.
+    let (_, node) = send(&router, "GET", "nodes/peter-box", Value::Null).await;
+    assert_eq!(node["spec"]["schedulable"], json!(true), "{node}");
+    assert_eq!(
+        node["meta"]["labels"]["velstra.io/awaiting-approval"],
+        Value::Null,
+        "{node}"
+    );
+}
+
 /// Announcing twice is one row. A machine reboots, or loses its answer, and
 /// polls — and an operator must not end up looking at two pending machines
 /// that are one machine.

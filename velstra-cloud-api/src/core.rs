@@ -4102,49 +4102,91 @@ impl Api {
                  more and it goes through — the machine is still waiting and keeps its place.",
             ));
         }
+        // The person who approved, for the audit line — and *only* for the
+        // audit line.
+        //
+        // This used to rebuild an `Identity` from the recorded name and call
+        // `create`, `patch` and `issue_credential` as them, and every one of
+        // those refused: an identity rebuilt from a name carries no scopes,
+        // and the cell-admin authority lives in a scope a real session has.
+        // So a machine an operator had just approved was told "only a cell
+        // operator may make it" — by the platform, about the operator.
+        //
+        // The authorisation happened when the approval was written: that PATCH
+        // went through `authorize` as a real session, and this row records who
+        // it was. A claim *executes* that decision. It writes through the
+        // collections as the platform, the way the announce did, and names the
+        // person in the audit — the same shape as every controller acting on a
+        // spec somebody was allowed to write.
         let approver = Identity::new(status.approved_by.trim().to_string());
 
-        let node = ResourceName::parse(&format!("nodes/{}", spec.node.trim()))
+        let node_id = spec.node.trim().to_string();
+        let node = ResourceName::parse(&format!("nodes/{node_id}"))
             .map_err(|e| ApiError::invalid(format!("the approved node name is not one: {e}")))?;
+        let nodes = self.collection("nodes")?;
         // Created if absent, taken into service if the announcement already
         // made it. An operator who made the Node first and then approved the
         // machine meant one machine, not two.
-        match self.get(&node, &approver).await {
-            Err(_) => {
-                let asked = serde_json::json!({
-                    "id": spec.node.trim(),
-                    "spec": { "schedulable": true },
-                });
-                self.create("", "nodes", &asked, &approver).await?;
+        match nodes.get(&node.to_string()).await? {
+            None => {
+                let meta = velstra_cloud_model::meta::Meta::new(
+                    node.clone(),
+                    self.inner.placement.clone(),
+                );
+                let meta = serde_json::to_value(&meta).map_err(|e| {
+                    ApiError::invalid(format!("the node's metadata will not serialise: {e}"))
+                })?;
+                nodes
+                    .create(meta, serde_json::json!({ "schedulable": true }))
+                    .await?;
+                self.record_change(&approver, "create", &node).await;
             }
-            Ok(_) => {
+            Some(_) => {
                 // Out of the waiting state: schedulable, and the label gone.
                 // The label is what the sweep matches on, so leaving it would
                 // mean an old enrolment expiring an hour later deletes a node
                 // that is by then running guests — quietly, and at the worst
                 // moment. Removing it here is what makes that unreachable.
-                let _ = self
+                nodes
                     .patch(
-                        &node,
-                        &serde_json::json!({
-                            "spec": { "schedulable": true },
-                            "meta": { "labels": {
+                        &node.to_string(),
+                        &crate::collection::Patch {
+                            spec: Some(serde_json::json!({ "schedulable": true })),
+                            labels: Some(serde_json::json!({
                                 velstra_cloud_model::enrollment::AWAITING_LABEL: Value::Null
-                            } },
-                        }),
+                            })),
+                        },
                         None,
-                        &approver,
                     )
-                    .await;
+                    .await?;
+                self.record_change(&approver, "update", &node).await;
             }
         }
-        let issued = self
-            .issue_credential(
-                &node,
-                &serde_json::json!({ "purpose": "enrolment" }),
-                &approver,
+        // The credential, minted the way `:issueCredential` mints one, without
+        // the authorisation step that call makes — for the reason above.
+        let token = self
+            .inner
+            .identity
+            .mint_agent_credential_for(
+                &node_id,
+                velstra_cloud_model::identity::AgentKind::Node,
+                None,
+                "enrolment",
             )
             .await?;
+        let join = self
+            .join_token(&node_id, Some(&token), None)
+            .ok_or_else(|| {
+                ApiError::invalid(
+                    "this API was not told what to advertise, so a join token would name no \
+                 address a machine could reach",
+                )
+            })?;
+        let mut issued = Map::new();
+        issued.insert("target".into(), Value::String(node.to_string()));
+        issued.insert("nodeToken".into(), Value::String(token));
+        issued.insert("joinToken".into(), Value::String(join));
+        let issued = Value::Object(issued);
 
         // Claimed, once. Written before the answer goes out: a claim whose
         // answer is lost must not mint a second credential, and the machine

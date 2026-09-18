@@ -59,14 +59,20 @@ const EVERY_SECS: u64 = 5;
 /// Every field is this machine's own claim and decides nothing. It is here so
 /// that a person looking at three pending rows can tell which one is the box
 /// in front of them — which, in a rack of identical machines, is the serial.
-fn reported() -> serde_json::Value {
+///
+/// `hostname` is the one the wizard was given, never the live medium's own. The
+/// installer runs on an ISO whose hostname is `velstra-node-installer`, and
+/// that is what the first machine to try this announced itself as: a node
+/// called after the medium rather than after itself, on the one field an
+/// operator reads to know which box it is.
+fn reported(hostname: &str) -> serde_json::Value {
     let disks: Vec<String> = crate::disks::discover_disks()
         .unwrap_or_default()
         .into_iter()
         .map(|d| d.name)
         .collect();
     serde_json::json!({
-        "hostname": crate::wizard::hostname(),
+        "hostname": hostname,
         "addresses": crate::cell::own_addresses(),
         "vcpus": num_cpus(),
         "memoryMib": memory_mib(),
@@ -124,7 +130,10 @@ fn dmi_from(raw: &str) -> String {
 }
 
 /// Ask the cell, show the fingerprints, and wait to be let in.
-pub fn run() -> Result<Option<JoinToken>> {
+///
+/// `hostname` is the name the wizard collected — it is asked before the door
+/// is chosen, so it is known here and is what the machine announces itself as.
+pub fn run(hostname: &str) -> Result<Option<JoinToken>> {
     println!("\nThis machine will ask the cell to let it in, and you approve it there.");
     println!("Nothing secret is typed here or in the console — you compare two numbers.");
     let url = loop {
@@ -145,7 +154,7 @@ pub fn run() -> Result<Option<JoinToken>> {
     }
 
     let (pair, public) = keypair()?;
-    let (answer, served) = announce(&url, &public)?;
+    let (answer, served) = announce(&url, &public, hostname)?;
     let id = match answer["id"].as_str() {
         Some(id) => id.to_string(),
         None => {
@@ -308,10 +317,10 @@ fn base64(raw: &[u8]) -> String {
 }
 
 /// Say hello, and learn what certificate answered.
-fn announce(url: &str, public: &str) -> Result<(serde_json::Value, String)> {
+fn announce(url: &str, public: &str, hostname: &str) -> Result<(serde_json::Value, String)> {
     let body = serde_json::json!({
         "publicKey": public,
-        "reported": reported(),
+        "reported": reported(hostname),
     });
     // The fingerprint of what answered has to be recorded *before* it is
     // reported, so it is computed here and sent in a second call. One request
@@ -321,7 +330,7 @@ fn announce(url: &str, public: &str) -> Result<(serde_json::Value, String)> {
     let told = serde_json::json!({
         "publicKey": public,
         "seenCertificate": served,
-        "reported": reported(),
+        "reported": reported(hostname),
     });
     let (answer, _) = post(url, "enrollments:announce", &told).unwrap_or((answer, served.clone()));
     Ok((answer, served))

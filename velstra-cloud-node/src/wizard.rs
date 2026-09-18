@@ -238,7 +238,7 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
     // happens with it afterwards is identical, which is the point — there is
     // one code path that turns a token into an install.
     if door == 3 {
-        let Some(token) = crate::announce::run()? else {
+        let Some(token) = crate::announce::run(&hostname)? else {
             println!("\nNothing was written, and this machine is unchanged.");
             return Ok(None);
         };
