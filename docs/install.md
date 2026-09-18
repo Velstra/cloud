@@ -13,10 +13,28 @@ out of `flake.nix`.
 
 ## The compute-node image
 
+Every release publishes both media, with a `SHA256SUMS` beside them:
+
+```
+velstra-cloud-installer_<version>_amd64.iso    # boot this to install
+velstra-cloud-node_<version>_amd64.raw.zst     # the sealed image itself
+velstra-cloud_<version>_amd64.deb              # for a machine that runs Debian
+```
+
+**Check the file before you boot it.** `sha256sum -c SHA256SUMS` is the whole
+gesture, and it is the same one the appliance's own story rests on — a medium
+written to a stick is verified before it is booted, or it is not verified at
+all.
+
+Or build them, which is the same artefact by the same recipe:
+
 ```
 nix build .#node-image     # → result/…/velstra-cloud-node.raw (signed, sealed)
 nix build .#node-iso       # → result/iso/velstra-cloud-node-installer.iso
 ```
+
+The nightly CI lane builds both, so a stale input or a renamed output is found
+on a Tuesday rather than while somebody is cutting a release.
 
 The image is built by the same factory as the Velstra Sentinel firewall
 appliance (the Sentinel flake exports it as `nixosModules.applianceImage` /
