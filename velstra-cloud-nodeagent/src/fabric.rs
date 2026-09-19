@@ -447,12 +447,24 @@ impl Datapath for FabricDatapath {
     }
 
     async fn observe(&self) -> Result<BTreeMap<String, ProgrammedPort>> {
-        // From the taps, not from the fabric. The question this answers is what
-        // *this machine* is carrying, and the tap is the machine's own record of
-        // it — the same reason nothing else in this crate remembers what it did.
-        // A port the fabric knows about and this host has no tap for is not a
-        // port this host is carrying.
-        let carried = self.taps.observe().await?;
+        // Both halves have to exist. A tap alone is only a wire leading nowhere,
+        // and reporting it as programmed prevents the next pass from recreating
+        // a fabric port that was lost (for example when the fabric controller
+        // restarted from an older topology). Conversely, a fabric port without
+        // its host tap is not carried by this machine either.
+        let mut carried = self.taps.observe().await?;
+        let mut client = self.client().await?;
+        let fabric_ports = client
+            .list_ports(pb::ListPortsRequest {})
+            .await
+            .map_err(|e| HostError::failed(format!("listing the fabric's ports: {e}")))?
+            .into_inner()
+            .ports;
+        carried.retain(|_, local| {
+            fabric_ports
+                .iter()
+                .any(|remote| remote.host == self.host && remote.tap == local.tap)
+        });
 
         // The rules are a different question with a different answer-holder.
         // The tap layer does not know them — it is deliberately programmed with
