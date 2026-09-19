@@ -358,6 +358,7 @@ async fn a_port_with_rules_reaches_the_fabric() {
         .iter()
         .find(|p| p.tap == tap)
         .expect("the fabric does not have the port this agent just created");
+    let fabric_port_id = mine.id.clone();
     assert_eq!(mine.vni, VNI);
     assert_eq!(
         mine.ip, "10.20.0.7",
@@ -485,6 +486,27 @@ async fn a_port_with_rules_reaches_the_fabric() {
         !datapath.agrees(PORT, mine, &fewer),
         "this datapath agrees with anything"
     );
+
+    // A tap is only half a fabric port. If the controller loses its half, the
+    // node must report the port absent so the next reconciliation recreates it;
+    // otherwise the guest remains Ready behind a wire that reaches nowhere.
+    client
+        .remove_port(pb::RemovePortRequest { id: fabric_port_id })
+        .await
+        .expect("removing only the fabric half");
+    let observed = datapath
+        .observe()
+        .await
+        .expect("observing after the fabric lost its port");
+    assert!(
+        !observed.contains_key(PORT),
+        "a bare tap was reported as a programmed fabric port"
+    );
+
+    datapath
+        .program(PORT, &spec, &network, &rules)
+        .await
+        .expect("recreating the missing fabric port");
 
     let _ = datapath.unprogram(PORT).await;
 }
