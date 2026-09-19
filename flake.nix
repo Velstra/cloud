@@ -139,9 +139,18 @@
           defaultHostname = "velstra-node";
           stateDir = "/var/lib/velstra";
           unlockUnit = "velstra-node-unlock.service";
+          # Everything that reads the seed or writes the cell's state: ordered
+          # after the data partition is mounted. `nofail` on that mount means
+          # the boot does not wait for it, and a unit that started first would
+          # read no seed — and be skipped by its own role condition — or write
+          # under the mount point, onto the tmpfs the mount then hides.
           stateDirServices = [
             "velstra-node-boot"
             "velstra-cloud-nodeagent"
+            "etcd"
+            "velstra-cloud-api"
+            "velstra-cloud-controller"
+            "velstra-cloud-poolagent"
           ];
           slotTypesEnvFile = "velstra-node/slot-types.env";
           # The node closure carries two hypervisors *and* all three roles:
@@ -208,6 +217,22 @@
           tokenFile = "/var/lib/velstra/pool-token";
           package = velstra-cloud;
         };
+        # The store's data on the data partition. etcd's default is
+        # `/var/lib/etcd`, and on this image `/var/lib` is the volatile root:
+        # every object in the cell lived in RAM, and the first reboot of the
+        # control plane emptied it. The nodes were gone from the list, and so
+        # was everything else — but the bootstrap password is under the state
+        # directory and survived, so the wiped cell signed the operator in and
+        # looked like a cell with no nodes rather than like a wiped machine.
+        #
+        # The unit is ordered after the mount (`stateDirServices` above), and
+        # the directory is made by root just before the store starts: the
+        # module's tmpfiles rule is not ordered after a `nofail` mount, and a
+        # directory made on the tmpfs under the mount point is one the mount
+        # then hides.
+        services.etcd.dataDir = "/var/lib/velstra/etcd";
+        systemd.services.etcd.serviceConfig.ExecStartPre =
+          "+${pkgs.coreutils}/bin/install -d -o etcd -g etcd -m 0700 /var/lib/velstra/etcd";
         system.stateVersion = "25.05";
       };
 
@@ -536,6 +561,7 @@
           testScript =
             { nodes, ... }:
             ''
+              import json
               import os
               import subprocess
               import tempfile
@@ -631,6 +657,42 @@
                       f"curl -sS --cacert {cert} https://127.0.0.1:8443/healthz"
                   )
 
+              # The store used to live on the volatile root — etcd's default
+              # data directory — so a cell's every object lived in RAM and the
+              # first reboot of the control plane emptied it. The nodes were
+              # gone from the list; so was everything else. Proven the only
+              # way it can be: an object made, the machine rebooted, the
+              # object still there.
+              with subtest("the store is on the data partition and survives a reboot"):
+                  at = machine.succeed("findmnt -no TARGET -T /var/lib/velstra/etcd").strip()
+                  assert at == "/var/lib/velstra", f"the store writes under {at}, which a reboot empties"
+                  # The cell bootstrap makes this machine's own Node object:
+                  # the one that has to still be there afterwards.
+                  machine.wait_for_unit("velstra-cell-bootstrap.service")
+
+                  def nodes():
+                      session = json.loads(machine.succeed(
+                          f"curl -sS --cacert {cert} https://127.0.0.1:8443/api/v1/sessions"
+                          " -H 'content-type: application/json'"
+                          " -d '{\"username\":\"admin\",\"password\":\"correcthorsebattery\"}'"
+                      ))
+                      listing = json.loads(machine.succeed(
+                          f"curl -sS --cacert {cert} https://127.0.0.1:8443/api/v1/nodes"
+                          f" -H 'authorization: Bearer {session['token']}'"
+                      ))
+                      return sorted(item["meta"]["name"] for item in listing["items"])
+
+                  before = nodes()
+                  assert before, "the cell bootstrap made no node object"
+                  machine.shutdown()
+                  machine.start()
+                  machine.wait_for_unit("velstra-cloud-api.service")
+                  machine.wait_until_succeeds(
+                      f"curl -sS --cacert {cert} https://127.0.0.1:8443/healthz"
+                  )
+                  after = nodes()
+                  assert after == before, f"the reboot lost the cell's objects: {before} -> {after}"
+
               # And from somewhere that is not this machine. The loopback curl
               # above passed on a box whose firewall dropped every packet from
               # the network: the API was active, listening on 0.0.0.0:8443 and
@@ -690,7 +752,7 @@
                   # this image is pinned to does not pass agetty
                   # `--issue-file`, so the banner was written every boot into
                   # a directory nothing read, and the screen said `login:`.
-                  screen = machine.get_tty_text(1)
+                  screen = machine.get_tty_text("1")
                   assert "node-1" in screen, f"the console does not show it:\n{screen}"
                   # And it has to be there *before* the prompt is drawn. The
                   # banner unit and getty@tty1 are both Before=getty.target,

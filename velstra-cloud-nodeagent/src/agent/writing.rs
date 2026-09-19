@@ -177,6 +177,17 @@ impl Agent {
         // marked on it by `Agent::mark_held_devices`.
         next.status.pci_devices = host.pci_devices.clone();
         next.status.installed = host.installed.clone();
+        // What this machine is wanted to run, when that is not what it runs:
+        // fetched, verified and applied by the machine itself, and reported
+        // as it goes. See `update`.
+        if let Some(condition) = self.updater.consider(
+            stored.spec.wanted.as_ref(),
+            &host.installed,
+            self.cell.clone(),
+            stored.meta.generation,
+        ) {
+            set_condition(&mut next.status.conditions, condition);
+        }
         set_condition(
             &mut next.status.conditions,
             Condition::new(

@@ -24,6 +24,51 @@ is. A tag makes that revision a real one instead of `dirty`.
   its build stamp in `/etc/velstra-release`, the same string the package
   calls itself. On the nodes board as *Installed* and *Build*; the first
   piece of the upgrade path in `docs/upgrading.md`.
+- **Releases, and the cell as its machines' channel.** A `Release` names a
+  channel — a GitHub release's download directory, or a directory copied onto
+  the control plane — and the cell reads its `SHA256SUMS`, learns which build
+  it holds, fetches every file onto its own disk and verifies each against its
+  digest before the release is `Ready`. A channel with two builds in it, or
+  none, is refused by name. Nodes fetch a release's files from their own cell,
+  so a cell with no route out is upgraded from a directory somebody carried in.
+- **Rollouts.** `Rollout` moves the cell's machines to a release one at a
+  time: cordoned, drained if asked, told what to run, waited for, put back —
+  the control plane last, because the controller runs there. A machine that
+  does not come back stops the rollout by name and leaves the rest as they
+  were; one the cell cannot update is refused by name and the rest go on;
+  paused finishes the machine in flight and starts no other. Every step is on
+  the rollout's status, per machine. The node's half is `spec.wanted` and the
+  `Updating` condition: fetch, verify, apply — the image into the inactive
+  slot and a reboot, or `apt-get install` and the package's own restarts —
+  and report `installed` again on the way back.
+- **Upgrade from the nodes board.** Pick machines, press *Upgrade*, choose
+  the release, and a rollout is made and shown. Releases and rollouts have
+  boards of their own under Hardware.
+- **An install medium cut for one machine.** *Install medium…* on a node's
+  page answers a one-time link to the release's installer ISO with that node's
+  join file appended after the ISO's last byte; the installer reads it off the
+  medium's own tail and offers the token by name. One download, one stick,
+  nothing typed — and the ISO's bytes are untouched.
+
+### Fixed
+
+- **A rebooted control plane kept its cell.** On the sealed image the store
+  wrote to etcd's default `/var/lib/etcd`, which is the volatile root: every
+  object in the cell lived in RAM, and the first reboot of the control plane
+  emptied it — the nodes were gone from the list, and so was everything
+  else, while the bootstrap password under the state directory survived and
+  signed the operator into what looked like a cell with no nodes. The store
+  now lives at `/var/lib/velstra/etcd` on the data partition, every unit that
+  reads the seed or writes the state is ordered after that mount, and the
+  image check reboots the machine and finds its objects still there.
+- **Approving a machine is one write.** The approval and who approved it
+  were two writes, and a machine polling for its credential between them
+  was approved with nobody recorded — and refused, in words that sent the
+  operator back to press *Approve* again. That was the error on the
+  installer's screen the moment after *Let it in*. The approver is now
+  stamped in the same revision as the flag, so there is no between.
+- The OpenAPI document placed `enrollments` under a project; they are the
+  cell's, and are served at `/api/v1/enrollments`.
 
 ## [0.1.0] — 2026-09-10
 

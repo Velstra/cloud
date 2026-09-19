@@ -33,6 +33,11 @@ systemctl start etcd velstra-cloud-api velstra-cloud-controller
 
 (Older etcd installs ship the same verb as `etcdctl snapshot restore`.)
 
+On the sealed image the store's data directory is **`/var/lib/velstra/etcd`**
+— on the data partition, the one place a reboot of that machine does not
+empty — and the snapshots are beside it under `/var/lib/velstra/store-backups`.
+Substitute that path above; `etcdutl` and `etcd` are on the image.
+
 What comes back is the cell as of the snapshot: up to an hour of writes are
 gone, which for this platform means *asks*, not machines — a guest created in
 that hour is still running on its node, and the node agent's next resync

@@ -21,7 +21,9 @@ use velstra_cloud_model::{
     },
     installed::{InstallKind, Installed},
     migration::{MigrationSpec, MigrationStatus},
+    release::{Artefact, ReleaseSpec, ReleaseStatus, Wanted},
     resources::*,
+    rollout::{NodePhase, NodeProgress, RolloutPhase, RolloutSpec, RolloutStatus},
 };
 
 /// The wire's own promise: what goes out comes back.
@@ -321,6 +323,70 @@ fn every_resource_survives_its_own_wire() {
         CredentialSpec {
             password_hash: "$argon2id$…".into(),
             updated_at: velstra_cloud_model::meta::Timestamp(1),
+        },
+    );
+    survives(
+        "ReleaseSpec",
+        ReleaseSpec {
+            url: "https://github.com/Velstra/cloud/releases/download/v0.2.0/".into(),
+        },
+    );
+    survives(
+        "ReleaseStatus",
+        ReleaseStatus {
+            observed_generation: 2,
+            conditions: vec![],
+            version: "0.2.0+20260918.c571d71".into(),
+            image: Some(Artefact {
+                file: "velstra-cloud-node_0.2.0+20260918.c571d71_amd64.raw.zst".into(),
+                sha256: "ab".repeat(32),
+                fetched: true,
+            }),
+            package: Some(Artefact {
+                file: "velstra-cloud_0.2.0+20260918.c571d71_amd64.deb".into(),
+                sha256: "cd".repeat(32),
+                fetched: false,
+            }),
+            installer: None,
+            checked_at: velstra_cloud_model::meta::Timestamp(7),
+        },
+    );
+    survives(
+        "RolloutSpec",
+        RolloutSpec {
+            release: "releases/v0.2.0".into(),
+            nodes: vec!["peter".into()],
+            evacuate: true,
+            max_unavailable: 2,
+            paused: true,
+        },
+    );
+    survives(
+        "RolloutStatus",
+        RolloutStatus {
+            observed_generation: 3,
+            conditions: vec![],
+            phase: RolloutPhase::Running,
+            nodes: vec![NodeProgress {
+                node: "peter".into(),
+                from: "0.1.0+20260910.681269c".into(),
+                to: "0.2.0+20260918.c571d71".into(),
+                phase: NodePhase::Applying,
+                message: "fetching the image".into(),
+                since: velstra_cloud_model::meta::Timestamp(5),
+            }],
+            message: "0 of 1 on 0.2.0+20260918.c571d71".into(),
+            started_at: velstra_cloud_model::meta::Timestamp(4),
+            finished_at: velstra_cloud_model::meta::Timestamp(0),
+        },
+    );
+    survives(
+        "Wanted",
+        Wanted {
+            release: "releases/v0.2.0".into(),
+            version: "0.2.0+20260918.c571d71".into(),
+            file: "velstra-cloud_0.2.0+20260918.c571d71_amd64.deb".into(),
+            sha256: "cd".repeat(32),
         },
     );
     survives("CredentialStatus", CredentialStatus::default());

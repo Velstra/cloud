@@ -138,6 +138,8 @@ in
         cfg.cloudHypervisor
         pkgs.gptfdisk
         pkgs.parted
+        # The node agent unpacks a release's image before writing the slot.
+        pkgs.zstd
         pkgs.cryptsetup
         pkgs.e2fsprogs
         pkgs.mdadm

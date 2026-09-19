@@ -313,6 +313,7 @@ mod tests {
                     labels: vec![],
                     cpu_baseline: None,
                     gateway: false,
+                    wanted: None,
                 },
                 NodeStatus {
                     // Both machines on one state directory. Emptying a node is

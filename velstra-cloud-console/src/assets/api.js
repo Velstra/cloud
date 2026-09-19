@@ -543,6 +543,16 @@ async function joinMedium(id, verb) {
   return text;
 }
 
+/// The releases this cell knows, whole: few, and the whole object is what a
+/// chooser reads (the version, and which files are here).
+const releases = () => request("GET", "/api/v1/releases").then((r) => (r.body && r.body.items) || []);
+
+/// Cut an install medium for a node from a release: a one-time link, which the
+/// caller follows as a plain download. POST because it mints a credential.
+const installMedium = (id, release) =>
+  request("POST", "/api/v1/nodes/" + encodeURIComponent(id) + ":installMedium", { body: { release } })
+    .then((r) => r.body);
+
 /// One month's consumption, summed the way a bill is.
 const explainUsage = (project, month) =>
   request("GET", "/api/v1/" + project + ":explainUsage" +

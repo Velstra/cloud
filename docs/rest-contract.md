@@ -90,7 +90,7 @@ Collections, in the order the API serves them: `projects`, `users`,
 `device-classes`, `backup-targets`, `backups`, `backup-schedules`, `audit`,
 `captures`, `console-sessions`, `image-sources`, `usage`,
 `snapshot-schedules`,
-`maintenance-windows`, `operations`, `flavors`, `bgp-peers`.
+`maintenance-windows`, `releases`, `rollouts`, `operations`, `flavors`, `bgp-peers`.
 
 ### BGP peers: announcing the cell to the router in front of it
 
@@ -2947,6 +2947,103 @@ If-Match: "412"                 # the revision the agent read, for a compare-and
 A person, a service account or a cell operator has no node identity and so may
 not use it: `status` is the agent's half, and the API does not get to be more
 permissive than the store.
+
+### Releases, rollouts, and the install medium
+
+A **release** is a build the cell can move to, named by its channel: a
+directory holding the artefacts CI publishes and the `SHA256SUMS` that names
+them. A GitHub release's download directory is one; so is a directory copied
+onto the control plane and named as `file:///var/lib/velstra/releases/v0.2.0`.
+Cell-scoped, and the cell operator's to add.
+
+```
+POST /api/v1/releases
+{ "id": "v0.2.0", "spec": { "url": "https://github.com/Velstra/cloud/releases/download/v0.2.0/" } }
+```
+
+The release controller reads the sums, writes what the channel offers onto the
+status — `version`, and `image`, `package` and `installer` with the digest each
+must hash to — and fetches every file into the releases directory, one per
+pass, verifying each before it is marked `fetched`. The `Ready` condition is
+True when all of them are; while it is not, its message says which file is
+being fetched, or why one was refused. A channel that carries two builds, or
+names nothing a release publishes, is refused rather than guessed at. From then
+on **the cell is the channel for its machines**: nothing on a node reaches out
+past its own control plane.
+
+```
+GET /api/v1/releases/{id}/files/{file}      # one of the release's files, verified
+```
+
+is what a node fetches — only a file the release's status names, only once it
+is fetched, and only for the cell's machines and its operators.
+
+What a node runs is `status.installed` on the node (see *Nodes*); what it
+should run is `spec.wanted`, written by a rollout or by hand:
+
+```
+PATCH /api/v1/nodes/peter
+{ "spec": { "wanted": { "release": "releases/v0.2.0", "version": "0.2.0+…",
+                        "file": "velstra-cloud_0.2.0+…_amd64.deb", "sha256": "…" } } }
+```
+
+Everything the machine needs is in it, chosen for its kind of installation, so
+the agent reads its own node and nothing else. It fetches the file from its
+cell, verifies the digest, applies it — an appliance writes the image into its
+inactive slot and reboots; a package node runs `apt-get install` and lets the
+package's `postinst` restart what runs — and reports `installed` again on the
+way back. It reports as it goes on the node's `Updating` condition: True with
+`Fetching`, `Working` or `Applied` and a sentence, False with `Failed` and the
+sentence when it could not, or `UpToDate` once it runs what it is wanted to.
+A machine that failed does not try again until it is wanted something else.
+
+A **rollout** moves machines to a release, one at a time:
+
+```
+POST /api/v1/rollouts
+{ "id": "spring", "spec": { "release": "v0.2.0", "nodes": ["peter", "paul"],
+                            "evacuate": true, "maxUnavailable": 1, "paused": false } }
+```
+
+`release` is the bare id, as every reference to a cell-scoped object is (the
+full name is accepted too); `nodes` empty means every node. The controller cordons the next machine,
+evacuates it if asked and waits until nothing is running there, writes
+`spec.wanted`, waits until the node is `Ready` on the release's version with a
+heartbeat newer than the hand-over, puts it back in service, and moves on —
+**the control plane last**, because the controller runs there and its own
+reboot ends the pass. `status.nodes[]` carries each machine's `phase`
+(`Pending`, `Refused`, `Cordoned`, `Draining`, `Applying`, `Done`, `Failed`),
+what it moved `from` and `to`, and a `message`; `status.phase` is the whole:
+`Planning` until the release is ready, then `Running`, `Paused`, `Done` or
+`Failed`. **It fails closed**: a machine that reports its apply failed, or is
+not back within 45 minutes, stops the rollout with that machine named and every
+machine not yet started left as it was. A machine the cell cannot update — the
+NixOS module on somebody's own operating system, or one that has not reported
+how it was installed — is `Refused` by name, and the rest go on. `paused: true`
+finishes the machine in flight and starts no other.
+
+The **install medium** is the last piece: the installer a release holds, cut
+for one machine.
+
+```
+POST /api/v1/nodes/{name}:installMedium     { "release": "v0.2.0" }   # optional
+→ { "url": "/api/v1/media/<ticket>", "filename": "velstra-cloud-installer_0.2.0+…_peter.iso",
+    "release": "releases/v0.2.0", "version": "0.2.0+…", "size": …, "expiresAt": … }
+GET  /api/v1/media/{ticket}                 # once, no token; streams the medium
+```
+
+The medium is the release's installer ISO, byte for byte, with the node's join
+file — the same one `:joinFile` hands out — appended after the ISO's last byte
+between two markers. Nothing in the ISO is rewritten; the installer reads past
+the end its volume descriptor declares and finds the file there, so a machine
+booted from the stick joins as that node without anything typed. `POST`,
+because it mints the node's credential, and audited as `installMedium`; the
+answer is a one-time link rather than the bytes, because two gigabytes are not
+a thing to hand a browser's `fetch()`. The link needs no token — it is the
+credential, as a console ticket is — is spent on the first `GET`, and is gone
+after ten minutes. Without `release`, the newest release whose installer is on
+this cell is used; while no release holds one, the cut is refused with
+`FAILED_PRECONDITION` and says to add one.
 
 ## Image families and where images come from
 

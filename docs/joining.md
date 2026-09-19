@@ -288,6 +288,19 @@ controller, so the list an operator reads is what is actually waiting for
 them. Retiring one costs nothing: the row's id comes from the machine's key,
 so it announces again and lands on the same row.
 
+### The medium, cut for the machine
+
+Once a release is on the cell (see `upgrading.md`), the cell can hand out its
+installer **with the join file already on it**: on the node's page, *Install
+medium…* — or `POST /api/v1/nodes/<id>:installMedium` — answers a one-time
+link to the ISO with that machine's join file appended after the ISO's last
+byte. Write it to a stick with `dd` or Etcher, boot the machine from it, and
+the wizard finds the token on the medium's own tail and offers it by name. One
+download, one stick, nothing typed — and the ISO's bytes are untouched, so the
+medium is still exactly the published installer for everything that reads it
+as one. A tool that unpacks the ISO onto a stick instead of writing it drops
+the tail, and the wizard asks the way it always did.
+
 ## What this does not do
 
 * **No attestation.** Introduction is a shared secret, moved once. A machine

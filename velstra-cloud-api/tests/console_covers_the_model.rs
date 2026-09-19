@@ -202,6 +202,20 @@ mod complete {
         }
     }
 
+    pub fn release() -> velstra_cloud_model::release::ReleaseSpec {
+        velstra_cloud_model::release::ReleaseSpec {
+            url: "https://github.com/Velstra/cloud/releases/download/v0.2.0/".into(),
+        }
+    }
+    pub fn rollout() -> velstra_cloud_model::rollout::RolloutSpec {
+        velstra_cloud_model::rollout::RolloutSpec {
+            release: "releases/v0.2.0".into(),
+            nodes: vec!["peter".into()],
+            evacuate: true,
+            max_unavailable: 2,
+            paused: true,
+        }
+    }
     pub fn maintenance_window() -> velstra_cloud_model::maintenance::MaintenanceWindowSpec {
         velstra_cloud_model::maintenance::MaintenanceWindowSpec {
             node: "node-a".into(),
@@ -332,6 +346,16 @@ fn the_console_can_express_every_backup_target_field() {
 #[test]
 fn the_console_can_express_every_backup_field() {
     assert_covered("backups", &complete::backup());
+}
+
+#[test]
+fn the_console_can_express_every_release_field() {
+    assert_covered("releases", &complete::release());
+}
+
+#[test]
+fn the_console_can_express_every_rollout_field() {
+    assert_covered("rollouts", &complete::rollout());
 }
 
 #[test]

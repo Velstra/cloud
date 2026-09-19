@@ -37,6 +37,21 @@ struct Args {
     #[arg(long, env = "VELSTRA_REGION", default_value = "eu-central")]
     region: String,
 
+    /// Where releases are kept: what the release controller fetches into and
+    /// verifies, and what the API on this machine serves nodes and install
+    /// media from. The same directory for both, on the control plane's disk.
+    #[arg(
+        long,
+        env = "VELSTRA_RELEASES_DIR",
+        default_value = "/var/lib/velstra/releases"
+    )]
+    releases_dir: std::path::PathBuf,
+
+    /// The node this control plane is. A rollout moves it last, because the
+    /// controller's own reboot ends the pass; the seed says it.
+    #[arg(long, env = "VELSTRA_NODE")]
+    node: Option<String>,
+
     /// How often to re-list everything and reconcile it again, in seconds.
     ///
     /// This is the longest a missed watch event can cost, which is the only
@@ -201,6 +216,8 @@ async fn main() {
         region: args.region.clone(),
         cell: args.cell.clone(),
         fabric: args.fabric.clone(),
+        releases_dir: args.releases_dir.clone(),
+        node: args.node.clone().filter(|n| !n.trim().is_empty()),
     };
     let alerts = velstra_cloud_controller::alerts::Config {
         targets: velstra_cloud_controller::alerts::Targets {

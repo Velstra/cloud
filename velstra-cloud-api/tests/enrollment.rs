@@ -342,6 +342,60 @@ async fn an_unnamed_machine_takes_no_name_and_never_somebody_elses() {
     );
 }
 
+/// The approval and the approver land in one revision.
+///
+/// They used to be two writes, and a machine polling for its credential
+/// between them found itself approved with nobody recorded — and was refused
+/// in words that sent the operator back to press Approve again. That was the
+/// error on the installer's screen the moment after *Let it in*.
+#[tokio::test]
+async fn an_approval_records_its_approver_in_the_same_write() {
+    let router = api();
+    let (_pair, public) = keypair();
+    let (_, announced) = anon(
+        &router,
+        "POST",
+        "enrollments:announce",
+        announcement(&public),
+    )
+    .await;
+    let id = announced["id"].as_str().expect("an id").to_string();
+    let (_, before) = send(&router, "GET", &format!("enrollments/{id}"), Value::Null).await;
+
+    let (status, approved) = send(
+        &router,
+        "PATCH",
+        &format!("enrollments/{id}"),
+        json!({ "spec": { "node": "peter", "runsGuests": true, "approved": true } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+
+    // The answer to the change already names the approver, and the revision
+    // moved exactly once: there was no second write for a claim to land in
+    // front of.
+    let revision = |row: &Value| {
+        row["meta"]["revision"]
+            .as_str()
+            .and_then(|r| r.parse::<u64>().ok())
+            .expect("a revision")
+    };
+    assert_eq!(approved["status"]["approvedBy"], json!("ada"), "{approved}");
+    assert_eq!(approved["status"]["phase"], json!("Approved"), "{approved}");
+    assert_eq!(
+        revision(&approved),
+        revision(&before) + 1,
+        "{before}\n{approved}"
+    );
+    let (_, after) = send(&router, "GET", &format!("enrollments/{id}"), Value::Null).await;
+    assert_eq!(
+        revision(&after),
+        revision(&approved),
+        "something wrote after the answer: {after}"
+    );
+    assert_eq!(after["status"]["approvedBy"], json!("ada"), "{after}");
+}
+
 /// A row approved before the cell recorded who approved it clears itself.
 ///
 /// The refusal used to say "turn it away and let the machine announce again",

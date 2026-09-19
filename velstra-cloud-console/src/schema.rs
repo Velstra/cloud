@@ -3190,6 +3190,106 @@ const FLOATING_IP_FIELDS: &[Field] = &[
 ];
 
 /// "This node is out of service from then, for that long."
+const RELEASE_FIELDS: &[Field] = &[Field {
+    key: "url",
+    label: "Channel",
+    kind: Kind::Text {
+        placeholder: "https://github.com/Velstra/cloud/releases/download/v0.2.0/",
+        check: Check::Url,
+    },
+    required: true,
+    advanced: false,
+    help: "A directory holding the files a release publishes and their SHA256SUMS: a \
+           GitHub release's download directory, or file:///var/lib/velstra/releases/<version> \
+           for a directory copied onto the control plane. What it holds is what the release \
+           is — the version is read off the files, never typed — and the cell fetches every \
+           file onto its own disk before it is ready.",
+    when_empty: "",
+    derived: false,
+    at_creation: false,
+}];
+
+const ROLLOUT_FIELDS: &[Field] = &[
+    Field {
+        key: "release",
+        label: "Release",
+        kind: Kind::Ref {
+            collection: "releases",
+            filter_by: None,
+            // A cell-scoped root object: the bare id, like every reference to
+            // a node.
+            spelling: Spelling::Id,
+        },
+        required: true,
+        advanced: false,
+        help: "What to move the machines to. Only a release that is ready — every file \
+               fetched and verified — moves anything.",
+        when_empty: "No release is known to this cell yet. Add one under Releases: the \
+                     channel a published version was downloaded from.",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
+        key: "nodes",
+        label: "Machines",
+        kind: Kind::RefList {
+            collection: "nodes",
+            also: None,
+            spelling: Spelling::Id,
+        },
+        required: false,
+        advanced: false,
+        help: "Which machines; none means every node in the cell. One at a time, the \
+               control plane last. A machine the cell cannot update — one running the NixOS \
+               module on its own operating system — is refused by name and the rest go on.",
+        when_empty: "",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
+        key: "evacuate",
+        label: "Move guests off first",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "Every guest on a machine is moved to another before it is updated — live \
+               where the destination can take it. Off, its guests go down with its reboot.",
+        when_empty: "",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
+        key: "maxUnavailable",
+        label: "At once",
+        kind: Kind::Number {
+            unit: "machines",
+            min: 1,
+            max: 64,
+            step: 1,
+            scale: Scale::None,
+            zero: None,
+        },
+        required: false,
+        advanced: true,
+        help: "How many machines may be out of service at the same time.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "paused",
+        label: "Paused",
+        kind: Kind::Switch,
+        required: false,
+        advanced: true,
+        help: "Finish the machine in flight and start no other. The knob to reach for at \
+               the first sign of trouble.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+];
+
 const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
     Field {
         key: "node",
@@ -4962,6 +5062,142 @@ pub const COLLECTIONS: &[Collection] = &[
         explainable: false,
     },
     Collection {
+        id: "releases",
+        title: "Releases",
+        singular: "release",
+        // The controller reads the channel and fetches; every step lands on the
+        // status, and the watch delivers it.
+        recheck: 0,
+        condition: "Ready",
+        group: "Hardware",
+        scope: Scope::Global,
+        audience: Audience::Operator,
+        blurb: "A build the cell can move to, and where it comes from. Name the \
+                channel a published version was downloaded from — a GitHub \
+                release's directory, or a directory copied onto the control plane \
+                — and the cell reads which build it holds, fetches every file onto \
+                its own disk and verifies each. From then on the cell is the \
+                channel for its machines: a rollout hands each node what the cell \
+                holds, and an install medium is cut from the installer here.",
+        empty: "No release is known to this cell. Add one: the channel a published \
+                version was downloaded from, and the cell fetches it.",
+        fields: RELEASE_FIELDS,
+        columns: &[
+            Column {
+                path: "status.version",
+                label: "Build",
+                cell: Cell::Mono,
+                width: 176,
+            },
+            Column {
+                path: "status.image.fetched",
+                label: "Image",
+                cell: Cell::Yes {
+                    yes: "on this cell",
+                    no: "not yet",
+                },
+                width: 104,
+            },
+            Column {
+                path: "status.package.fetched",
+                label: "Package",
+                cell: Cell::Yes {
+                    yes: "on this cell",
+                    no: "not yet",
+                },
+                width: 104,
+            },
+            Column {
+                path: "status.installer.fetched",
+                label: "Installer",
+                cell: Cell::Yes {
+                    yes: "on this cell",
+                    no: "not yet",
+                },
+                width: 104,
+            },
+            Column {
+                path: "status.checkedAt",
+                label: "Read",
+                cell: Cell::Ago,
+                width: 112,
+            },
+            Column {
+                path: "spec.url",
+                label: "Channel",
+                cell: Cell::Mono,
+                width: 300,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "rollouts",
+        title: "Rollouts",
+        singular: "rollout",
+        recheck: 0,
+        // Ready when it is done; False with the phase as its reason otherwise,
+        // which is what makes a running rollout something to watch and a
+        // failed one something to act on.
+        condition: "Ready",
+        group: "Hardware",
+        scope: Scope::Global,
+        audience: Audience::Operator,
+        blurb: "Moving the cell's machines to a release, one at a time: taken out of \
+                service, drained if asked, handed what to run, waited for, put \
+                back. The control plane goes last. A machine that does not come \
+                back stops the rollout by name and leaves the rest as they were; \
+                one the cell cannot update is refused by name and the rest go on. \
+                Pause it and the machine in flight finishes while no other starts.",
+        empty: "Nothing is being rolled out. Pick machines on the Nodes board and \
+                press Upgrade, or make a rollout here.",
+        fields: ROLLOUT_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.release",
+                label: "Release",
+                cell: Cell::Mono,
+                width: 160,
+            },
+            Column {
+                path: "status.phase",
+                label: "Phase",
+                cell: Cell::Text,
+                width: 96,
+            },
+            Column {
+                path: "status.message",
+                label: "Progress",
+                cell: Cell::Text,
+                width: 360,
+            },
+            Column {
+                path: "spec.evacuate",
+                label: "Guests",
+                cell: Cell::Yes {
+                    yes: "moved off first",
+                    no: "go down with the reboot",
+                },
+                width: 150,
+            },
+            Column {
+                path: "status.startedAt",
+                label: "Started",
+                cell: Cell::Ago,
+                width: 112,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
         id: "snapshot-schedules",
         title: "Snapshot schedules",
         singular: "snapshot schedule",
@@ -6117,6 +6353,8 @@ mod tests {
             "users",
             "ceph-clusters",
             "maintenance-windows",
+            "releases",
+            "rollouts",
             "usage",
             "families",
             "folders",
@@ -6126,7 +6364,7 @@ mod tests {
         }
         assert_eq!(
             COLLECTIONS.len(),
-            33,
+            35,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:

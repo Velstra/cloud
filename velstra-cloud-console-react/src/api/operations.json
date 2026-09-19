@@ -1246,7 +1246,7 @@
   ],
   "query": [],
   "body": false,
-  "summary": "Why the guest is where it is \u2014 or which rule stopped it going anywhere.",
+  "summary": "Why the guest is where it is — or which rule stopped it going anywhere.",
   "tags": [
    "Instances"
   ]
@@ -1662,7 +1662,7 @@
   ],
   "query": [],
   "body": true,
-  "summary": "Mint a fresh credential for a machine that already exists; shown once, as `nodeToken` and \u2014 when this API advertises an address \u2014 as `joinToken`, the whole hand-off in one string. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+  "summary": "Mint a fresh credential for a machine that already exists; shown once, as `nodeToken` and — when this API advertises an address — as `joinToken`, the whole hand-off in one string. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
   "tags": [
    "Nodes"
   ]
@@ -1676,7 +1676,7 @@
   ],
   "query": [],
   "body": true,
-  "summary": "The same credential as `:issueCredential`, formatted as the file the installer looks for on anything plugged into a machine. Answers `text/plain`, not JSON: `curl -X POST \u2026 -o /mnt/velstra/join` is the intended use. A comment above the token names the node and the cell, because the file will be found by somebody who did not write it. POST and not GET because it mints a credential.",
+  "summary": "The same credential as `:issueCredential`, formatted as the file the installer looks for on anything plugged into a machine. Answers `text/plain`, not JSON: `curl -X POST … -o /mnt/velstra/join` is the intended use. A comment above the token names the node and the cell, because the file will be found by somebody who did not write it. POST and not GET because it mints a credential.",
   "tags": [
    "Nodes"
   ]
@@ -1690,7 +1690,7 @@
   ],
   "query": [],
   "body": true,
-  "summary": "The same token as a `#cloud-config` for a machine that boots Debian or Ubuntu: it writes the join file 0600, runs `velstra-cloud-node setup --join-file` against it, and shreds it. It installs no package \u2014 which repository a fleet takes one from is the fleet's decision. Answers `text/plain`.",
+  "summary": "The same token as a `#cloud-config` for a machine that boots Debian or Ubuntu: it writes the join file 0600, runs `velstra-cloud-node setup --join-file` against it, and shreds it. It installs no package — which repository a fleet takes one from is the fleet's decision. Answers `text/plain`.",
   "tags": [
    "Nodes"
   ]
@@ -1698,9 +1698,8 @@
  {
   "id": "get-enrollments",
   "method": "GET",
-  "path": "/api/v1/projects/{project}/enrollments/{name}",
+  "path": "/api/v1/enrollments/{name}",
   "params": [
-   "project",
    "name"
   ],
   "query": [],
@@ -1713,10 +1712,8 @@
  {
   "id": "list-enrollments",
   "method": "GET",
-  "path": "/api/v1/projects/{project}/enrollments",
-  "params": [
-   "project"
-  ],
+  "path": "/api/v1/enrollments",
+  "params": [],
   "query": [
    "pageSize",
    "pageToken",
@@ -1737,9 +1734,8 @@
  {
   "id": "patch-enrollments",
   "method": "PATCH",
-  "path": "/api/v1/projects/{project}/enrollments/{name}",
+  "path": "/api/v1/enrollments/{name}",
   "params": [
-   "project",
    "name"
   ],
   "query": [],
@@ -1752,13 +1748,11 @@
  {
   "id": "announce-enrollments",
   "method": "POST",
-  "path": "/api/v1/projects/{project}/enrollments:announce",
-  "params": [
-   "project"
-  ],
+  "path": "/api/v1/enrollments:announce",
+  "params": [],
   "query": [],
   "body": true,
-  "summary": "A machine announcing itself to this cell, with no token \u2014 it has just booted an installer and holds none. Carries `publicKey` (Ed25519, base64), optionally `seenCertificate` and `reported`. Answers the enrolment's id and the fingerprint of the key, which the machine prints on its screen for an operator to compare. Grants nothing: an operator has to name the machine and say what it is for before anything can be claimed. Idempotent in the key, so a machine that announces again lands on its own row; capped, because it is the one door a stranger can write through.",
+  "summary": "A machine announcing itself to this cell, with no token — it has just booted an installer and holds none. Carries `publicKey` (Ed25519, base64), optionally `seenCertificate` and `reported`. Answers the enrolment's id and the fingerprint of the key, which the machine prints on its screen for an operator to compare. Grants nothing: an operator has to name the machine and say what it is for before anything can be claimed. Idempotent in the key, so a machine that announces again lands on its own row; capped, because it is the one door a stranger can write through.",
   "tags": [
    "enrollments"
   ]
@@ -1766,13 +1760,11 @@
  {
   "id": "claim-enrollments",
   "method": "POST",
-  "path": "/api/v1/projects/{project}/enrollments:claim",
-  "params": [
-   "project"
-  ],
+  "path": "/api/v1/enrollments:claim",
+  "params": [],
   "query": [],
   "body": true,
-  "summary": "A machine collecting the credential an operator approved for it, with no token. Carries `id` and `signature` \u2014 an Ed25519 signature over `velstra-enrollment-claim:v1:<id>`, made with the key the machine announced \u2014 and answers `nodeToken` and `joinToken`, once. Authorised by that signature and by the recorded approval of a person. A collection verb rather than `enrollments/<id>:claim` because a path segment in this router is either a literal or a parameter and never both; the id is not a secret.",
+  "summary": "A machine collecting the credential an operator approved for it, with no token. Carries `id` and `signature` — an Ed25519 signature over `velstra-enrollment-claim:v1:<id>`, made with the key the machine announced — and answers `nodeToken` and `joinToken`, once. Authorised by that signature and by the recorded approval of a person. A collection verb rather than `enrollments/<id>:claim` because a path segment in this router is either a literal or a parameter and never both; the id is not a secret.",
   "tags": [
    "enrollments"
   ]
@@ -1942,7 +1934,7 @@
   ],
   "query": [],
   "body": true,
-  "summary": "Mint a fresh credential for a pool that already exists; shown once, as `poolToken` and \u2014 when this API advertises an address \u2014 as `joinToken`. The body may carry `purpose` and `expiresAt`.",
+  "summary": "Mint a fresh credential for a pool that already exists; shown once, as `poolToken` and — when this API advertises an address — as `joinToken`. The body may carry `purpose` and `expiresAt`.",
   "tags": [
    "Pools"
   ]
@@ -3039,7 +3031,7 @@
   ],
   "query": [],
   "body": false,
-  "summary": "Every token this account holds, without the tokens \u2014 id, purpose and when it was minted.",
+  "summary": "Every token this account holds, without the tokens — id, purpose and when it was minted.",
   "tags": [
    "Users"
   ]
@@ -3068,7 +3060,7 @@
   ],
   "query": [],
   "body": false,
-  "summary": "Every credential this node's agent holds, without the tokens \u2014 id, purpose, when it was issued and when it ends.",
+  "summary": "Every credential this node's agent holds, without the tokens — id, purpose, when it was issued and when it ends.",
   "tags": [
    "Nodes"
   ]
@@ -3097,7 +3089,7 @@
   ],
   "query": [],
   "body": false,
-  "summary": "Every credential this storage pool's agent holds, without the tokens \u2014 id, purpose, when it was issued and when it ends.",
+  "summary": "Every credential this storage pool's agent holds, without the tokens — id, purpose, when it was issued and when it ends.",
   "tags": [
    "Pools"
   ]
@@ -3115,6 +3107,201 @@
   "summary": "Take one credential out of use. Already gone is not an error.",
   "tags": [
    "Pools"
+  ]
+ },
+ {
+  "id": "collect-medium",
+  "method": "GET",
+  "path": "/api/v1/media/{ticket}",
+  "params": [
+   "ticket"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Collect an install medium cut by `nodes/{name}:installMedium`, once. The ticket is the credential — the link carries no other, so a browser's plain download can fetch it — and it is spent on the way in and gone after ten minutes. Streams the ISO and then the node's join file.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "installMedium-nodes",
+  "method": "POST",
+  "path": "/api/v1/nodes/{name}:installMedium",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Cut an install medium for this machine: the installer ISO a release holds, with this node's join file appended after the ISO's last byte — one download, one stick, nothing typed. The body may name `release`; without it the newest release whose installer is on this cell is used. Answers a one-time link (`url`), the `filename`, the `release` and its `version`, the `size` and `expiresAt`: `GET` the link without a token within ten minutes and it streams the medium once. POST because it mints the node's credential, as `:joinFile` does; refused with `FAILED_PRECONDITION` while no release on this cell holds a verified installer.",
+  "tags": [
+   "Nodes"
+  ]
+ },
+ {
+  "id": "list-releases",
+  "method": "GET",
+  "path": "/api/v1/releases",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision",
+   "since",
+   "until",
+   "orderBy",
+   "fields"
+  ],
+  "body": false,
+  "summary": "List Releases",
+  "tags": [
+   "Releases"
+  ]
+ },
+ {
+  "id": "create-releases",
+  "method": "POST",
+  "path": "/api/v1/releases",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Releases",
+  "tags": [
+   "Releases"
+  ]
+ },
+ {
+  "id": "get-release-file",
+  "method": "GET",
+  "path": "/api/v1/releases/{id}/files/{file}",
+  "params": [
+   "id",
+   "file"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "One of a release's files, as this cell fetched and verified it — what a node fetches when told what to run. Only a file the release's status names, and only once it is recorded as fetched; a name is never a path. For the cell's machines and its operators.",
+  "tags": [
+   "Releases"
+  ]
+ },
+ {
+  "id": "delete-releases",
+  "method": "DELETE",
+  "path": "/api/v1/releases/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Releases",
+  "tags": [
+   "Releases"
+  ]
+ },
+ {
+  "id": "get-releases",
+  "method": "GET",
+  "path": "/api/v1/releases/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Releases",
+  "tags": [
+   "Releases"
+  ]
+ },
+ {
+  "id": "patch-releases",
+  "method": "PATCH",
+  "path": "/api/v1/releases/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Releases",
+  "tags": [
+   "Releases"
+  ]
+ },
+ {
+  "id": "list-rollouts",
+  "method": "GET",
+  "path": "/api/v1/rollouts",
+  "params": [],
+  "query": [
+   "pageSize",
+   "pageToken",
+   "labels",
+   "watch",
+   "fromRevision",
+   "since",
+   "until",
+   "orderBy",
+   "fields"
+  ],
+  "body": false,
+  "summary": "List Rollouts",
+  "tags": [
+   "Rollouts"
+  ]
+ },
+ {
+  "id": "create-rollouts",
+  "method": "POST",
+  "path": "/api/v1/rollouts",
+  "params": [],
+  "query": [],
+  "body": true,
+  "summary": "Create one of Rollouts",
+  "tags": [
+   "Rollouts"
+  ]
+ },
+ {
+  "id": "delete-rollouts",
+  "method": "DELETE",
+  "path": "/api/v1/rollouts/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Delete one of Rollouts",
+  "tags": [
+   "Rollouts"
+  ]
+ },
+ {
+  "id": "get-rollouts",
+  "method": "GET",
+  "path": "/api/v1/rollouts/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": false,
+  "summary": "Read one of Rollouts",
+  "tags": [
+   "Rollouts"
+  ]
+ },
+ {
+  "id": "patch-rollouts",
+  "method": "PATCH",
+  "path": "/api/v1/rollouts/{name}",
+  "params": [
+   "name"
+  ],
+  "query": [],
+  "body": true,
+  "summary": "Change the spec of one of Rollouts",
+  "tags": [
+   "Rollouts"
   ]
  }
 ]

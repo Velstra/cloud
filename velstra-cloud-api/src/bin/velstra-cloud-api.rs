@@ -38,6 +38,16 @@ struct Args {
     #[arg(long, env = "VELSTRA_STORE_BACKUP_DIR", default_value = "")]
     store_backup_dir: String,
 
+    /// Where releases are kept on this machine — what the controller beside
+    /// this API fetches into, and what this API serves a node fetching what it
+    /// was told to run, or an install medium cut for one. Empty keeps none.
+    #[arg(
+        long,
+        env = "VELSTRA_RELEASES_DIR",
+        default_value = "/var/lib/velstra/releases"
+    )]
+    releases_dir: String,
+
     /// A public key an image's `spec.signature` may verify under: Ed25519, the
     /// raw 32 bytes as base64. Repeat the flag, or separate keys with commas in
     /// the variable. Without any, every signature is refused at admission.
@@ -333,6 +343,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if !args.store_backup_dir.is_empty() {
         api = api.with_store_backups(std::path::PathBuf::from(&args.store_backup_dir));
+    }
+    if !args.releases_dir.is_empty() {
+        api = api.with_releases_dir(std::path::PathBuf::from(&args.releases_dir));
     }
     if !args.console_ca.is_empty() {
         api = api.with_console_ca(std::path::PathBuf::from(&args.console_ca));

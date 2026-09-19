@@ -260,6 +260,35 @@ units on a version change, in either direction.
   reason, and the cell is left half way — that is the correct state, and the
   reason is the operator's to act on, not the platform's to paper over.
 
+### The install medium, from the same release
+
+The installer a release holds is the image a new machine is installed from,
+and once it is on the cell the cell can hand it out **cut for one machine**:
+`nodes/<id>:installMedium` answers a one-time link to the ISO with that node's
+join file appended after the ISO's last byte. Nothing in the ISO is rewritten
+— the bytes a digest covers are the bytes that are there — and the installer
+reads past the end the volume descriptor declares and finds the file, so the
+machine joins as that node with nothing typed. One download, one stick. The
+release channel is what makes this possible without an upload endpoint: the
+bytes are already on the control plane, verified, for the upgrade path.
+
+### As built
+
+What shipped differs from the draft above in three places, each on purpose.
+
+* **The manifest is `SHA256SUMS`**, which CI already publishes, rather than a
+  `manifest.json` of its own; the release's `spec.url` is the channel and the
+  version is read off the file names. A signed `manifest.json` is the next
+  step, and a release that carries one will verify it before trusting the sums.
+* **`spec.wanted` carries the artefact**, not only the release name: the file
+  for this node's kind and its digest, chosen by the rollout from the release's
+  status. The agent reads its own node and nothing else, and fetches from its
+  own cell (`releases/<id>/files/<file>`) rather than from the channel — so a
+  cell with no route out is upgraded from a directory somebody carried in.
+* **The node reports on an `Updating` condition** rather than on fields of its
+  own: True with a reason and a sentence while it works, False with `Failed`
+  and the sentence when it could not — which is what the rollout reads to stop.
+
 ## What exists, and what is built next
 
 | piece                                          | state                                             |
@@ -269,11 +298,12 @@ units on a version change, in either direction.
 | cordon, evacuate, maintenance windows           | shipped                                           |
 | release publishing image, deb, iso, `SHA256SUMS` | shipped — CI, this branch                        |
 | `status.installed` on a node — three kinds      | shipped — this branch                             |
-| `Release` resource + manifest verification      | **next**                                          |
-| `spec.wanted` + the agent's fetch/verify/apply   | after                                             |
-| `Rollout` resource + controller                 | after                                             |
-| console: releases, rollouts, a node's version   | after                                             |
-| CI: publish a signed `manifest.json`            | after                                             |
+| `Release` resource: channel read, files fetched and verified by digest | shipped — this branch      |
+| `spec.wanted` + the agent's fetch/verify/apply   | shipped — this branch                             |
+| `Rollout` resource + controller                 | shipped — this branch                             |
+| console: releases, rollouts, *Upgrade* on the nodes board, a node's build | shipped — this branch |
+| the install medium: a release's installer with a node's join file on its tail | shipped — this branch |
+| CI: publish a signed `manifest.json`; the release verifies the signature | **next**              |
 
 The order is the order of risk: reporting what a node runs is safe and
 immediately useful; a release that verifies a manifest changes nothing on any

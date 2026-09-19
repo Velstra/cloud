@@ -102,8 +102,11 @@ const collectionOf = (path: string): string | null => {
  * * `:issueCredential` mints a registration token that is shown once and stored
  *   only as a hash. It belongs behind a deliberate flow that shows the token
  *   and says so, not on a row of grey buttons beside "Explain placement".
+ * * `:installMedium` answers a one-time download link for two gigabytes of
+ *   installer. The node's page has a button that follows it; a grey button
+ *   that showed the link as JSON would be a link somebody copies.
  */
-const NOT_A_BUTTON = /:(reportStatus|issueCredential)$/;
+const NOT_A_BUTTON = /:(reportStatus|issueCredential|installMedium)$/;
 
 /** Verbs only a cell operator may ask. The API says so; this keeps the console
  *  from offering what it would refuse. */

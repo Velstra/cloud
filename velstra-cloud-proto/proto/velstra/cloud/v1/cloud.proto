@@ -329,6 +329,22 @@ message NodeSpec {
   // This machine carries traffic between the cell and the world: a public
   // address whose network announces `FromGateway` is announced from here.
   bool gateway = 7;
+  // What this machine should run, when that is not what it runs: set by a
+  // rollout, or by hand for one machine. Everything the agent needs is in
+  // it, chosen for this machine's kind of installation. Absent when the
+  // machine is wanted as it is.
+  Wanted wanted = 8;
+}
+
+// What a node should run, chosen for it. See `docs/upgrading.md`.
+message Wanted {
+  // The release, by name: `releases/v0.2.0`.
+  string release = 1;
+  // The build it carries; what `NodeStatus.installed.version` reads afterwards.
+  string version = 2;
+  // The artefact for this node's kind, and what it must hash to.
+  string file = 3;
+  string sha256 = 4;
 }
 
 message NodeStatus {

@@ -255,6 +255,7 @@ impl Cell {
                 labels: vec![],
                 cpu_baseline: None,
                 gateway: false,
+                wanted: None,
             },
             NodeStatus {
                 // One state directory between these machines. It is what makes a

@@ -44,6 +44,13 @@ const ATTEMPTS: usize = 4;
 pub struct Patch {
     pub spec: Option<Value>,
     pub labels: Option<Value>,
+    /// The platform's own stamp on the status, written in the same revision
+    /// as the change it accompanies — who approved a machine, beside the
+    /// flag that approves it. Never from a client: the API refuses a body
+    /// that carries a status before a `Patch` is ever built. And never on
+    /// its own: a stamp with nothing to accompany is a status write, which
+    /// has its own door.
+    pub status: Option<Value>,
 }
 
 impl Patch {
@@ -222,6 +229,15 @@ where
             );
         }
 
+        if let Some(status) = &patch.status {
+            merge(
+                document
+                    .get_mut("status")
+                    .expect("a resource always has a status"),
+                status,
+            );
+        }
+
         let merged = document["spec"].clone();
         let mut next: Resource<S, T> =
             serde_json::from_value(document).map_err(|e| blame::<S>(&merged, &before, e))?;
@@ -229,7 +245,8 @@ where
 
         let spec_changed = next.spec != stored.spec;
         let labels_changed = next.meta.labels != stored.meta.labels;
-        if !spec_changed && !labels_changed {
+        let stamped = next.status != stored.status;
+        if !spec_changed && !labels_changed && !stamped {
             // An identical PATCH is a success with nothing behind it. Writing
             // anyway would move the revision and wake every watcher in the cell
             // for a change nobody made.

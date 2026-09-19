@@ -535,10 +535,65 @@ function bulkActions(coll) {
   // sheet says so in as many words before it lets anybody do it — and a bar
   // that prints "Delete m1, m2?" over a mixture of finished and in-flight
   // records is the same command with the warning taken off.
+  // Moving machines to a release is a rollout, which the bar makes from the
+  // picked rows: the one place an operator has the machines in front of them.
+  if (coll.id === "nodes" && session.who && session.who.cellAdmin) {
+    out.push({ id: "upgrade", label: "Upgrade\u2026", upgrade: true });
+  }
   if (coll.deletable && mayDelete && coll.id !== "migrations" && allows("create")) {
     out.push({ id: "delete", label: "Delete", destroys: true, asks: true });
   }
   return out;
+}
+
+/// Which release, whether to move the guests off, then a rollout for the
+/// picked machines — and the Rollouts board, where it can be watched.
+async function askUpgrade(coll) {
+  const host = $("bulkresult");
+  const names = [...view.picked].map(shortName);
+  let ready;
+  try {
+    ready = (await releases()).filter((r) => ((r.status && r.status.conditions) || [])
+      .some((c) => c.kind === "Ready" && c.status === "True"));
+  } catch (e) {
+    fill(host, el("span.err", String((e && e.message) || e)));
+    return;
+  }
+  if (!ready.length) {
+    fill(host, el("span.err", "No release is ready on this cell. Add one under Releases \u2014 the " +
+         "channel a published version was downloaded from \u2014 and wait until it is fetched."));
+    return;
+  }
+  const pick = el("select", { id: "upgraderelease", "aria-label": "Release" });
+  for (const r of ready) {
+    pick.appendChild(el("option", { value: idOf(r) }, idOf(r) + " \u2014 " + ((r.status && r.status.version) || "")));
+  }
+  pick.value = idOf(ready[ready.length - 1]);
+  const evacuate = el("input", { type: "checkbox", id: "upgradeevacuate", checked: "" });
+  fill(host,
+    el("span", "Move " + names.join(", ") + " to "), pick,
+    el("label", { for: "upgradeevacuate" }, evacuate, " move guests off first"),
+    btn("Upgrade " + names.length, {
+      primary: true,
+      id: "bulkyes",
+      onclick: async () => {
+        const id = "upgrade-" + Date.now().toString(36);
+        try {
+          await create(collection("rollouts"), {
+            id,
+            spec: { release: pick.value, nodes: names, evacuate: evacuate.checked },
+          });
+        } catch (e) {
+          fill(host, el("span.err", String((e && e.message) || e)));
+          return;
+        }
+        toast("Rollout " + id + " started \u2014 one machine at a time, the control plane last.");
+        view.picked.clear();
+        bulkOutcome = null;
+        show("rollouts");
+      },
+    }),
+    btn("Not now", { id: "bulkno", onclick: () => clear(host) }));
 }
 
 function pickRow(name, on) {
@@ -599,6 +654,7 @@ function renderPicked() {
 /// Naming the objects rather than counting them is the difference between
 /// "delete 12?" and seeing `db-1` in the list and stopping.
 function askBulk(coll, action) {
+  if (action.upgrade) return askUpgrade(coll);
   if (!action.asks) return runBulk(coll, action);
   const host = $("bulkresult");
   const names = [...view.picked].map(shortName);

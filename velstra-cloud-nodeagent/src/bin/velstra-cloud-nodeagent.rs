@@ -559,6 +559,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.shared_state = args.shared_state;
     // The same place the VMM is told to look (see `Layout.ceph` above).
     config.ceph_client_dir = Some(args.state_dir.join("ceph"));
+    config.updates_dir = args.state_dir.join("updates");
     config.image_signing_keys = args
         .image_signing_key
         .iter()

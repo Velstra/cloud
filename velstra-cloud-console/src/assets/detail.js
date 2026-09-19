@@ -1168,8 +1168,55 @@ function mediumControl(coll, r) {
       title: "The same token as a #cloud-config for a machine that boots Debian or Ubuntu: it " +
              "writes the join file, runs the installer against it, and shreds it.",
       onclick: grab("cloudInit", id + "-cloud-init.yaml"),
+    }),
+    btn("Install medium\u2026", {
+      quiet: true,
+      title: "The installer with this machine's join file on it. Write it to a stick, boot " +
+             "the machine from it, and it joins as this node without anything typed.",
+      onclick: () => offerMedium(host, id),
     }));
   return host;
+}
+
+/// Which release to cut the medium from, then the download.
+///
+/// The answer is a one-time link and the browser is sent to it: the medium is
+/// two gigabytes, and a download the page held in memory first would be a page
+/// that falls over on exactly the machines this is for.
+async function offerMedium(host, id) {
+  let ready;
+  try {
+    ready = (await releases()).filter((r) => r.status && r.status.installer && r.status.installer.fetched);
+  } catch (e) {
+    toast(String((e && e.message) || e));
+    return;
+  }
+  if (!ready.length) {
+    toast("No release on this cell holds an installer yet. Add one under Releases \u2014 the channel " +
+          "a published version was downloaded from \u2014 and wait until it is fetched.");
+    return;
+  }
+  const cut = async (release) => {
+    try {
+      const answer = await installMedium(id, release);
+      window.location.assign(answer.url);
+      toast(answer.filename + " \u2014 write it to a stick with dd or Etcher and boot the machine from " +
+            "it; it joins as " + id + ". The link works once.");
+    } catch (e) {
+      toast(String((e && e.message) || e));
+    }
+  };
+  if (ready.length === 1) return cut(idOf(ready[0]));
+  const pick = el("select", { "aria-label": "Release" });
+  for (const r of ready) {
+    pick.appendChild(el("option", { value: idOf(r) }, idOf(r) + " \u2014 " + ((r.status && r.status.version) || "")));
+  }
+  pick.value = idOf(ready[ready.length - 1]);
+  const ask = el("span.btns");
+  fill(ask, pick,
+    btn("Cut it", { primary: true, onclick: () => { ask.remove(); cut(pick.value); } }),
+    btn("Not now", { quiet: true, onclick: () => ask.remove() }));
+  host.appendChild(ask);
 }
 
 /// Ask again, a few seconds apart, until there is an answer or the time is up.

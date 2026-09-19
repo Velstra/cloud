@@ -15,7 +15,7 @@
 //!   honest value — `Unknown` for a condition, `Unknown` for an instance state
 //!   — never to a plausible-looking one.
 
-use velstra_cloud_model::{ceph, cpu, installed, meta, migration, pci, resources};
+use velstra_cloud_model::{ceph, cpu, installed, meta, migration, pci, release, resources};
 
 use crate::v1;
 
@@ -293,6 +293,7 @@ impl From<&resources::NodeSpec> for v1::NodeSpec {
             evacuate: s.evacuate,
             vcpu_overcommit: s.vcpu_overcommit,
             gateway: s.gateway,
+            wanted: s.wanted.as_ref().map(Into::into),
         }
     }
 }
@@ -307,6 +308,29 @@ impl From<&v1::NodeSpec> for resources::NodeSpec {
             evacuate: s.evacuate,
             vcpu_overcommit: s.vcpu_overcommit,
             gateway: s.gateway,
+            wanted: s.wanted.as_ref().map(Into::into),
+        }
+    }
+}
+
+impl From<&release::Wanted> for v1::Wanted {
+    fn from(w: &release::Wanted) -> Self {
+        Self {
+            release: w.release.clone(),
+            version: w.version.clone(),
+            file: w.file.clone(),
+            sha256: w.sha256.clone(),
+        }
+    }
+}
+
+impl From<&v1::Wanted> for release::Wanted {
+    fn from(w: &v1::Wanted) -> Self {
+        Self {
+            release: w.release.clone(),
+            version: w.version.clone(),
+            file: w.file.clone(),
+            sha256: w.sha256.clone(),
         }
     }
 }

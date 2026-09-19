@@ -17,6 +17,7 @@ import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
 import { useAsk } from "@/features/Ask";
 import { JoinTokenButton } from "./Join";
+import { InstallMediumButton } from "./Upgrade";
 
 const coll = (id: string) => SCHEMA.find((c) => c.id === id)!;
 
@@ -271,6 +272,7 @@ export function NodeQuick({ r, c, reload }: { r: Resource; c: Collection; reload
         {evacuating ? "Stop evacuating" : "Evacuate"}
       </Pressed>
       <JoinTokenButton r={r} c={c} />
+      <InstallMediumButton node={idOf(r)} />
     </>
   );
 }

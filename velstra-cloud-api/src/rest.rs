@@ -115,6 +115,8 @@ pub fn router(api: Api) -> Router {
         // behind a token. The page itself is markup with no data in it — it
         // carries the sign-in form, and demanding a token to fetch the form
         // that asks for one is a locked door with the key inside.
+        // What a node fetches when told what to run: the cell is its channel.
+        .route("/api/v1/releases/:id/files/:file", get(release_file))
         .layer(middleware::from_fn_with_state(api.clone(), authenticate))
         // Outside the token layer, so probes and sign-ins are counted too. A
         // request nobody can see is a request nobody can debug: before this
@@ -126,6 +128,10 @@ pub fn router(api: Api) -> Router {
         // the token every other route demands. Behind the layer it would be a
         // door whose key is on the other side of it.
         .route("/api/v1/sessions", post(sign_in))
+        // A cut install medium, collected once under its ticket — the ticket
+        // is the credential, as a console ticket is, so a browser's plain
+        // download can fetch two gigabytes without a header it cannot send.
+        .route("/api/v1/media/:ticket", get(medium))
         // Documentation, not data: the same schema the console page below
         // embeds, so it is served the way the page is — without a token.
         .route("/api/v1/openapi.json", get(openapi))
@@ -440,6 +446,97 @@ async fn list_service_tokens(
             }))
             .collect::<Vec<_>>(),
     })))
+}
+
+/// The medium a ticket names, streamed: the ISO from disk, then the trailer.
+///
+/// Streamed rather than read, because an installer is two gigabytes and this
+/// process holds the cell's state. The ticket is spent on the way in, so a
+/// link that leaks after the download is a link to nothing.
+async fn medium(State(api): State<Api>, Path(ticket): Path<String>) -> ApiResult<Response> {
+    let Some(cut) = api.take_medium(&ticket) else {
+        return Err(ApiError::not_found(
+            "a medium under that link: it was collected already or the link expired; cut it \
+             again from the node's page",
+        ));
+    };
+    let file = tokio::fs::File::open(&cut.iso)
+        .await
+        .map_err(|e| ApiError::internal(format!("opening {}: {e}", cut.iso.display())))?;
+    let mut answer = Response::new(streamed(file, cut.trailer));
+    let headers = answer.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&cut.size.to_string()) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+    if let Ok(value) =
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", cut.filename))
+    {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(answer)
+}
+
+/// One of a release's files, for the machine that was told to run it.
+async fn release_file(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+    Path((release, file)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let path = api.release_file(&release, &file, &who).await?;
+    let opened = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::internal(format!("opening {}: {e}", path.display())))?;
+    let size = opened
+        .metadata()
+        .await
+        .map_err(|e| ApiError::internal(format!("{}: {e}", path.display())))?
+        .len();
+    let mut answer = Response::new(streamed(opened, Vec::new()));
+    let headers = answer.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&size.to_string()) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+    Ok(answer)
+}
+
+/// A file as a body, a megabyte at a time, with `tail` after its last byte.
+fn streamed(mut file: tokio::fs::File, tail: Vec<u8>) -> axum::body::Body {
+    use tokio::io::AsyncReadExt;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    tokio::spawn(async move {
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .send(Ok(Bytes::copy_from_slice(&buffer[..n])))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !tail.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(tail))).await;
+        }
+    });
+    axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
 async fn list_node_credentials(
@@ -1515,6 +1612,13 @@ async fn create(
         }
         // POST, and never GET: it mints a credential, and a GET that did that
         // is one a browser can be made to issue from somebody else's page.
+        Target::Verb { name, verb } if verb == "installMedium" => {
+            // `{}` cuts from the newest release with an installer; `release`
+            // names one.
+            let ask = document(&body).unwrap_or_else(|_| serde_json::json!({}));
+            let cut = api.install_medium(&name, &ask, &identity).await?;
+            return Ok((StatusCode::OK, Json(cut)).into_response());
+        }
         Target::Verb { name, verb } if verb == "issueCredential" => {
             // The body is optional: `{}` is the ordinary case, and a caller
             // may say `purpose` and `expiresAt`.

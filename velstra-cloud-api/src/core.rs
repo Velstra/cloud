@@ -50,7 +50,7 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 35] = [
+pub const COLLECTIONS: [&str; 37] = [
     "projects",
     "flavors",
     "bgp-peers",
@@ -88,6 +88,8 @@ pub const COLLECTIONS: [&str; 35] = [
     "usage",
     "snapshot-schedules",
     "maintenance-windows",
+    "releases",
+    "rollouts",
     "operations",
 ];
 
@@ -469,6 +471,11 @@ struct JoinFacts {
 }
 
 struct Inner {
+    /// Where the release controller keeps what it fetched, and where the
+    /// files a node or an install medium is served from come from.
+    releases_dir: Option<std::path::PathBuf>,
+    /// Media cut for one machine each, waiting to be collected once.
+    media: std::sync::Mutex<BTreeMap<String, Medium>>,
     /// What this instance has been asked to do, for `/metrics`.
     requests: Requests,
     /// The store itself, beside the typed views over it — for the one job no
@@ -675,6 +682,22 @@ fn announced_body(id: &str, status: &velstra_cloud_model::enrollment::Enrollment
 }
 
 /// Which shape of join artefact a caller asked for.
+/// How long a cut medium waits to be collected. A browser follows the link
+/// at once; ten minutes is for a `curl` somebody types.
+const MEDIUM_TTL_MS: u64 = 10 * 60 * 1000;
+
+/// A medium cut for one machine, waiting under a one-time ticket.
+pub struct Medium {
+    pub filename: String,
+    /// The installer ISO, as the release fetched it.
+    pub iso: std::path::PathBuf,
+    /// ISO plus trailer, for `Content-Length`.
+    pub size: u64,
+    /// The join file for this machine, as the bytes that follow the ISO.
+    pub trailer: Vec<u8>,
+    pub expires: Timestamp,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinArtifact {
     /// The file the installer looks for on anything plugged in.
@@ -847,6 +870,16 @@ impl Api {
                 velstra_cloud_model::backup::BackupScheduleStatus
             ),
             collection!(
+                "releases",
+                velstra_cloud_model::release::ReleaseSpec,
+                velstra_cloud_model::release::ReleaseStatus
+            ),
+            collection!(
+                "rollouts",
+                velstra_cloud_model::rollout::RolloutSpec,
+                velstra_cloud_model::rollout::RolloutStatus
+            ),
+            collection!(
                 "maintenance-windows",
                 velstra_cloud_model::maintenance::MaintenanceWindowSpec,
                 velstra_cloud_model::maintenance::MaintenanceWindowStatus
@@ -857,6 +890,8 @@ impl Api {
         ]);
         Self {
             inner: Arc::new(Inner {
+                releases_dir: None,
+                media: std::sync::Mutex::new(BTreeMap::new()),
                 // Named afterwards with `with_console_dir`, if this machine
                 // has one. A cell with none serves its built-in page.
                 console: None,
@@ -1209,6 +1244,15 @@ impl Api {
         let inner =
             Arc::get_mut(&mut self.inner).expect("signing keys are named before the API is shared");
         inner.image_signing_keys = keys;
+        self
+    }
+
+    /// Where releases live on this machine. See `install_medium` and
+    /// `release_file`.
+    pub fn with_releases_dir(mut self, dir: std::path::PathBuf) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("the releases dir is named before the API is shared");
+        inner.releases_dir = Some(dir);
         self
     }
 
@@ -3716,6 +3760,7 @@ impl Api {
                 let patch = crate::collection::Patch {
                     spec: Some(serde_json::json!({ "bindings": left })),
                     labels: None,
+                    status: None,
                 };
                 let Ok(collection) = self.collection(kind) else {
                     continue;
@@ -3933,6 +3978,7 @@ impl Api {
                     &crate::collection::Patch {
                         spec: Some(serde_json::json!({ "node": node })),
                         labels: None,
+                        status: None,
                     },
                     None,
                 )
@@ -4191,6 +4237,7 @@ impl Api {
                             labels: Some(serde_json::json!({
                                 velstra_cloud_model::enrollment::AWAITING_LABEL: Value::Null
                             })),
+                            status: None,
                         },
                         None,
                     )
@@ -4307,6 +4354,203 @@ impl Api {
             JoinArtifact::File => join_file(name.id(), &self.inner.placement.cell, &join),
             JoinArtifact::CloudInit => cloud_config(name.id(), &join),
         })
+    }
+
+    /// Cut an install medium for one machine: the installer ISO a release
+    /// holds, with this node's join file on its tail — one download, one
+    /// stick, no typing. See `velstra_cloud_wire::join::trailer`.
+    ///
+    /// Answers with a link and not with the bytes, because two gigabytes are
+    /// not a thing to hand a `fetch()` that will hold them in a browser's
+    /// memory to make a download of. The link is a one-time ticket that
+    /// `GET /api/v1/media/<ticket>` collects without a token, the way a console
+    /// ticket is — minted here on this person's authority, spent once, gone in
+    /// ten minutes. Minted, because it carries a credential: the join file is
+    /// `:joinFile`'s, and this is audited as that is.
+    pub async fn install_medium(
+        &self,
+        name: &ResourceName,
+        ask: &Value,
+        who: &Identity,
+    ) -> ApiResult<Value> {
+        use velstra_cloud_model::release::{ReleaseSpec, ReleaseStatus};
+
+        if name.collection() != "nodes" {
+            return Err(ApiError::invalid(format!(
+                "an install medium is cut for a node, and {name} is a {}",
+                name.collection()
+            )));
+        }
+        // Authorised before anything about releases is said: a caller who may
+        // not cut a medium learns nothing about what the cell holds.
+        self.authorize_for(who, Verb::Write, name, "nodes").await?;
+        self.get(name, who).await?;
+        let Some(dir) = self.inner.releases_dir.clone() else {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                "this API keeps no releases: start it with --releases-dir (VELSTRA_RELEASES_DIR). \
+                 The appliance and the package point it at /var/lib/velstra/releases.",
+            ));
+        };
+        let releases: Vec<Resource<ReleaseSpec, ReleaseStatus>> =
+            self.typed_list("", "releases").await?;
+        let asked = ask
+            .get("release")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        let release = match asked {
+            Some(named) => releases
+                .iter()
+                .find(|r| r.meta.name.to_string() == named || r.meta.name.id() == named)
+                .ok_or_else(|| ApiError::not_found(format!("release {named}")))?,
+            // Left to the cell: the newest release whose installer is here.
+            None => releases
+                .iter()
+                .filter(|r| r.status.installer.as_ref().is_some_and(|a| a.fetched))
+                .max_by_key(|r| r.meta.created_at)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        Code::FailedPrecondition,
+                        "no release on this cell holds an installer yet. Add one under Releases — \
+                         the channel a published version was downloaded from — and cut the medium \
+                         once it is ready.",
+                    )
+                })?,
+        };
+        let installer = release
+            .status
+            .installer
+            .as_ref()
+            .filter(|a| a.fetched)
+            .ok_or_else(|| {
+                ApiError::new(
+                    Code::FailedPrecondition,
+                    match &release.status.installer {
+                        None => format!(
+                            "{} names no installer; a medium is cut from the installer ISO a \
+                             release publishes",
+                            release.meta.name
+                        ),
+                        Some(_) => format!(
+                            "{} holds no installer yet: {}",
+                            release.meta.name,
+                            release.status.not_ready_because()
+                        ),
+                    },
+                )
+            })?;
+        let iso = dir.join(release.meta.name.id()).join(&installer.file);
+        let size = tokio::fs::metadata(&iso)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "{} is recorded as fetched and is not on this disk ({e}); delete the \
+                         release and add it again",
+                        installer.file
+                    ),
+                )
+            })?
+            .len();
+        // The join file exactly as `:joinFile` hands it out: authorised the
+        // same way, minted the same way.
+        let text = self.join_artifact(name, JoinArtifact::File, who).await?;
+        let trailer = velstra_cloud_wire::join::trailer(&text);
+        let now = Timestamp::now();
+        let ticket = uuid::Uuid::new_v4().to_string();
+        let filename = format!(
+            "velstra-cloud-installer_{}_{}.iso",
+            release.status.version,
+            name.id()
+        );
+        let expires = Timestamp(now.0 + MEDIUM_TTL_MS);
+        let total = size + trailer.len() as u64;
+        {
+            let mut media = self.inner.media.lock().unwrap();
+            media.retain(|_, m| m.expires > now);
+            media.insert(
+                velstra_cloud_model::console::sha256_hex(&ticket),
+                Medium {
+                    filename: filename.clone(),
+                    iso,
+                    size: total,
+                    trailer,
+                    expires,
+                },
+            );
+        }
+        self.record_change(who, "installMedium", name).await;
+        Ok(json!({
+            "url": format!("/api/v1/media/{ticket}"),
+            "filename": filename,
+            "release": release.meta.name.to_string(),
+            "version": release.status.version,
+            "size": total,
+            "expiresAt": expires.0,
+        }))
+    }
+
+    /// Collect a cut medium, once. Nothing under that ticket afterwards.
+    pub fn take_medium(&self, ticket: &str) -> Option<Medium> {
+        let now = Timestamp::now();
+        let mut media = self.inner.media.lock().unwrap();
+        media.retain(|_, m| m.expires > now);
+        media.remove(&velstra_cloud_model::console::sha256_hex(ticket))
+    }
+
+    /// Where a release's file is on this disk, for a node fetching what it was
+    /// told to run, or an operator.
+    ///
+    /// Only a file the release's own status names, and only once it is
+    /// recorded as fetched — so what is served is what was verified, and a
+    /// name is never a path.
+    pub async fn release_file(
+        &self,
+        release: &str,
+        file: &str,
+        who: &Identity,
+    ) -> ApiResult<std::path::PathBuf> {
+        use velstra_cloud_model::release::{ReleaseSpec, ReleaseStatus, safe_file_name};
+
+        let agent = who
+            .scopes
+            .iter()
+            .any(|s| s.starts_with(crate::sessions::AGENT_SCOPE_PREFIX));
+        if !agent && !self.is_operator(who) {
+            return Err(ApiError::forbidden(
+                "a release's files are for the cell's machines and its operators",
+            ));
+        }
+        if !safe_file_name(file) {
+            return Err(ApiError::invalid(
+                "that is not the name of a file in a release",
+            ));
+        }
+        let Some(dir) = self.inner.releases_dir.clone() else {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                "this API keeps no releases: it was started without --releases-dir",
+            ));
+        };
+        let releases: Vec<Resource<ReleaseSpec, ReleaseStatus>> =
+            self.typed_list("", "releases").await?;
+        let found = releases
+            .iter()
+            .find(|r| r.meta.name.id() == release)
+            .ok_or_else(|| ApiError::not_found(format!("releases/{release}")))?;
+        let named = found
+            .status
+            .artefacts()
+            .into_iter()
+            .any(|(_, a)| a.file == file && a.fetched);
+        if !named {
+            return Err(ApiError::not_found(format!(
+                "releases/{release} holds no verified file called {file}"
+            )));
+        }
+        Ok(dir.join(release).join(file))
     }
 
     pub async fn issue_credential(
@@ -4457,6 +4701,7 @@ impl Api {
         let mut patch = Patch {
             spec: body.get("spec").cloned(),
             labels: body.get("meta").and_then(|m| m.get("labels")).cloned(),
+            status: None,
         };
         if let Some(spec) = &mut patch.spec {
             if name.collection() == "folders" || name.collection() == "projects" {
@@ -4679,9 +4924,13 @@ impl Api {
             )
             .at("spec"));
         }
-        let mut document = collection.patch(&name.to_string(), &patch, expect).await?;
-        // Approving a machine records who did it, here, where the identity is
-        // in hand and the write has just succeeded.
+        // Approving a machine records who did it — in the same write as the
+        // flag, with the identity in hand. It used to be a second write after
+        // the first had succeeded, and a machine polling for its credential
+        // landed between the two: approved, with nobody recorded, and refused
+        // in words that told the operator to press Approve again. That was
+        // the error on the installer's screen the moment after Let it in. One
+        // revision now, so there is no between.
         //
         // In the status rather than the spec: the status is the platform's to
         // write, so nothing a caller sends can set this, and `claim` mints the
@@ -4692,9 +4941,9 @@ impl Api {
         // or a service identity, and both are new trust nobody would ever
         // question again.
         if name.collection() == "enrollments" {
-            self.remember_approver(name, &document, who).await;
-            document = collection.get(&name.to_string()).await?.unwrap_or(document);
+            patch.status = self.approver_stamp(name, &patch, who).await?;
         }
+        let mut document = collection.patch(&name.to_string(), &patch, expect).await?;
         self.answer(&mut document, &mut Scratch::default()).await?;
         self.record_change(who, "update", name).await;
         // A change to the spec is work somebody has asked for and nobody has
@@ -4721,49 +4970,45 @@ impl Api {
         })
     }
 
-    /// Write who approved an enrolment, the moment somebody does.
+    /// Who is approving, as the stamp the write carries — or nothing, when
+    /// this change is not an approval or the row already names its approver.
     ///
-    /// Best-effort on purpose: an approval that worked must not be reported as
-    /// failed because the record of it could not be written — the same rule
-    /// sign-in follows for `users.status.lastLogin`. A claim against a row with
-    /// no approver recorded is refused by name, so the cost of losing this
-    /// write is that the operator approves again, not that a machine is let in
-    /// on an authority nobody can name.
-    async fn remember_approver(&self, name: &ResourceName, document: &Value, who: &Identity) {
-        use velstra_cloud_model::enrollment as en;
-        let approved = document["spec"]["approved"].as_bool().unwrap_or(false);
-        if !approved {
-            return;
+    /// Written once. A second approval by somebody else does not rewrite the
+    /// authority the machine will register under — the first person to say
+    /// yes is who said it. So a row approved by a build that lost the
+    /// recording, and approved again, takes the second person: the first was
+    /// never written down, and `claim` says so and asks for exactly this.
+    async fn approver_stamp(
+        &self,
+        name: &ResourceName,
+        patch: &Patch,
+        who: &Identity,
+    ) -> ApiResult<Option<Value>> {
+        let approving = patch
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.get("approved"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !approving {
+            return Ok(None);
         }
-        // Refused as well as approved: both are a decision, and a row whose
-        // refusal nobody is recorded for is a row nobody can account for
-        // later.
-        let Ok(mut status) = serde_json::from_value::<en::EnrollmentStatus>(
-            document.get("status").cloned().unwrap_or(Value::Null),
-        ) else {
-            return;
-        };
-        // Written once. A second approval by somebody else does not rewrite
-        // the authority the machine will register under — the first person to
-        // say yes is who said it.
-        if !status.approved_by.trim().is_empty() {
-            return;
+        let stored = self
+            .collection("enrollments")?
+            .get(&name.to_string())
+            .await?;
+        let recorded = stored
+            .as_ref()
+            .and_then(|row| row["status"]["approved_by"].as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if !recorded.is_empty() {
+            return Ok(None);
         }
-        status.approved_by = who.subject.clone();
-        status.phase = en::EnrollmentPhase::Approved;
-        let Ok(body) = serde_json::to_value(&status) else {
-            return;
-        };
-        if let Ok(collection) = self.collection("enrollments") {
-            let _ = collection
-                .report_status(
-                    &name.to_string(),
-                    &body,
-                    None,
-                    &velstra_cloud_model::access::Writer::controller("enrollment"),
-                )
-                .await;
-        }
+        Ok(Some(json!({
+            "approved_by": who.subject,
+            "phase": velstra_cloud_model::enrollment::EnrollmentPhase::Approved,
+        })))
     }
 
     /// Report the status of an object, as the node agent that owns it.

@@ -163,6 +163,7 @@ fn node(id: &str) -> Node {
             labels: vec![],
             cpu_baseline: None,
             gateway: false,
+            wanted: None,
         },
         NodeStatus {
             // A live machine: nothing is placed on one that has gone quiet.

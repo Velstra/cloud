@@ -978,6 +978,7 @@ async fn explain_placement_answers_with_the_chain_of_rejections() {
             labels: vec![],
             cpu_baseline: None,
             gateway: false,
+            wanted: None,
         },
         NodeStatus {
             // A live machine. Nothing is placed on one that has gone quiet,
@@ -1543,6 +1544,7 @@ async fn two_nodes(h: &Harness) {
                 labels: vec![],
                 cpu_baseline: None,
                 gateway: false,
+                wanted: None,
             },
             NodeStatus {
                 // A live machine. Nothing is placed on one that has gone quiet,
@@ -1602,6 +1604,7 @@ async fn two_nodes(h: &Harness) {
             labels: vec![],
             cpu_baseline: None,
             gateway: false,
+            wanted: None,
         },
         NodeStatus {
             // A live machine. Nothing is placed on one that has gone quiet,
@@ -2017,6 +2020,7 @@ async fn a_destination_without_the_image_is_refused_with_the_sentence() {
             labels: vec![],
             cpu_baseline: None,
             gateway: false,
+            wanted: None,
         },
         NodeStatus {
             // A live machine. Nothing is placed on one that has gone quiet,
@@ -2921,6 +2925,7 @@ async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reaso
             labels: vec![],
             cpu_baseline: None,
             gateway: false,
+            wanted: None,
         },
         NodeStatus {
             // A live machine. Nothing is placed on one that has gone quiet,

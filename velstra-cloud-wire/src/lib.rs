@@ -234,6 +234,7 @@ mod tests {
                 labels: vec!["ssd".into()],
                 cpu_baseline: None,
                 gateway: false,
+                wanted: None,
             },
             NodeStatus {
                 shared_state: false,

@@ -59,7 +59,11 @@ systemd distinguishes from failed, and which is the difference between "this box
 is not a pool" and "the pool agent is broken". etcd carries the same gate: an
 etcd on every appliance would be a second, empty store on every machine,
 listening on exactly the address the API looks for, so a control plane that lost
-its seed would come up against a store that answers and holds nothing.
+its seed would come up against a store that answers and holds nothing. Its data
+lives under the data partition, at `/var/lib/velstra/etcd` — the one place on
+this image a reboot does not empty. (etcd's own default is `/var/lib/etcd`,
+which here is the volatile root: a cell kept there lasted exactly until its
+control plane was first rebooted.)
 
 The image has to carry what it cannot fetch. An appliance is built once for a
 fleet and installed onto boxes weeks later, and which of them turns out to be

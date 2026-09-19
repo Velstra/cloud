@@ -91,6 +91,7 @@ pub mod qemu;
 pub mod ra;
 pub(crate) mod reporting;
 pub mod sink;
+pub mod update;
 
 pub use agent::{Agent, AgentConfig, Pass};
 pub use cell::{CellReader, StoreCell};

@@ -46,6 +46,8 @@ pub mod port;
 pub mod queue;
 pub mod quota;
 pub mod recovery;
+pub mod release;
+pub mod rollout;
 pub mod router;
 pub mod runner;
 pub mod scheduler;

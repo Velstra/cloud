@@ -23,6 +23,10 @@
 //! included on purpose: a USB stick written with the ISO usually has room
 //! after it, and putting the token there means one stick instead of two.
 //!
+//! And the install medium's own tail: the cell cuts a medium for one machine
+//! by appending the join file after the ISO's last byte, and the ISO's volume
+//! descriptor says where that is. One download, one stick, nothing typed.
+//!
 //! Read-only, `nosuid`, `nodev`, `noexec`: this is a filesystem somebody else
 //! wrote, handed to a program running as root, before anybody has been asked
 //! anything. It is read for one small text file and nothing else.
@@ -87,7 +91,92 @@ pub fn find() -> Vec<Found> {
             out.push(found);
         }
     }
+    // The medium this installer booted from, past the end of the ISO on it:
+    // where the cell puts the join file when it cuts a medium for one machine.
+    if let Some(found) = on_the_medium() {
+        out.push(found);
+    }
     out
+}
+
+/// The join file the cell appended to this install medium, if it cut one.
+///
+/// `nodes/<id>:installMedium` hands out the installer ISO with the join file
+/// after the ISO's last byte, between two markers. The ISO's own volume
+/// descriptor says where its last byte is, so this reads the medium from
+/// there — a window of a few megabytes, which is where the trailer is and
+/// where a hybrid ISO's own padding is, and no further.
+fn on_the_medium() -> Option<Found> {
+    let medium = boot_medium()?;
+    let text = read_trailer(Path::new(&medium))?;
+    let token = token_in(&text)?;
+    Some(Found {
+        device: medium,
+        file: "the medium's tail".to_string(),
+        token,
+    })
+}
+
+/// The whole device the running ISO was read from — the disk, not the
+/// partition the ISO's filesystem is found on, because a hybrid ISO's first
+/// partition ends where the ISO ends and the trailer lies past it.
+fn boot_medium() -> Option<String> {
+    let source = Command::new("findmnt")
+        .args(["-no", "SOURCE", "/iso"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let parent = Command::new("lsblk")
+        .args(["-no", "PKNAME", &source])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some(match parent {
+        Some(disk) => format!("/dev/{disk}"),
+        None => source,
+    })
+}
+
+/// The trailer past the ISO on `medium`, as text.
+fn read_trailer(medium: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut device = std::fs::File::open(medium).ok()?;
+    let mut sector = [0u8; 2048];
+    device.seek(SeekFrom::Start(PVD_AT)).ok()?;
+    device.read_exact(&mut sector).ok()?;
+    let end = pvd_end(&sector)?;
+    device.seek(SeekFrom::Start(end)).ok()?;
+    let mut window = Vec::with_capacity(1 << 20);
+    let mut chunk = vec![0u8; 1 << 20];
+    while (window.len() as u64) < velstra_cloud_wire::join::TRAILER_WINDOW {
+        let read = match device.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        window.extend_from_slice(&chunk[..read]);
+        if let Some(text) = velstra_cloud_wire::join::trailer_in(&window) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Where an ISO 9660 primary volume descriptor sits: sector 16.
+const PVD_AT: u64 = 16 * 2048;
+
+/// Where the ISO ends, read off its primary volume descriptor: the volume's
+/// size in blocks times the block size. `None` for a sector that is not one.
+fn pvd_end(sector: &[u8]) -> Option<u64> {
+    if sector.len() < 132 || sector[0] != 1 || &sector[1..6] != b"CD001" {
+        return None;
+    }
+    let blocks = u32::from_le_bytes([sector[80], sector[81], sector[82], sector[83]]) as u64;
+    let block = u16::from_le_bytes([sector[128], sector[129]]) as u64;
+    let block = if block == 0 { 2048 } else { block };
+    (blocks > 0).then_some(blocks * block)
 }
 
 /// The partitions the kernel knows, as `/dev/...` paths.
@@ -274,5 +363,26 @@ mod tests {
         assert!(line.contains("peter"), "{line}");
         assert!(line.contains("cell-1"), "{line}");
         assert!(line.contains("/dev/sdb1"), "{line}");
+    }
+
+    /// The end of the ISO is arithmetic on its volume descriptor, and a
+    /// sector that is not a descriptor is not read as one.
+    #[test]
+    fn the_iso_ends_where_its_volume_descriptor_says() {
+        let mut pvd = vec![0u8; 2048];
+        pvd[0] = 1;
+        pvd[1..6].copy_from_slice(b"CD001");
+        pvd[80..84].copy_from_slice(&1_000_000u32.to_le_bytes());
+        pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+        assert_eq!(pvd_end(&pvd), Some(1_000_000 * 2048));
+        pvd[128..130].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            pvd_end(&pvd),
+            Some(1_000_000 * 2048),
+            "no block size means 2048"
+        );
+        pvd[1] = b'X';
+        assert_eq!(pvd_end(&pvd), None);
+        assert_eq!(pvd_end(&[0u8; 100]), None);
     }
 }

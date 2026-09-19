@@ -67,6 +67,7 @@ pub async fn create_node(store: &Arc<dyn Store>, id: &str) {
             labels: vec![],
             cpu_baseline: None,
             gateway: false,
+            wanted: None,
         },
         NodeStatus::default(),
     );

@@ -165,6 +165,16 @@ fn cases() -> &'static [Case] {
             velstra_cloud_model::migration::MigrationStatus
         ),
         (
+            "releases",
+            velstra_cloud_model::release::ReleaseSpec,
+            velstra_cloud_model::release::ReleaseStatus
+        ),
+        (
+            "rollouts",
+            velstra_cloud_model::rollout::RolloutSpec,
+            velstra_cloud_model::rollout::RolloutStatus
+        ),
+        (
             "networks",
             velstra_cloud_model::resources::NetworkSpec,
             velstra_cloud_model::resources::NetworkStatus

@@ -176,6 +176,49 @@ impl JoinToken {
     }
 }
 
+/// The join file, carried on the install medium itself.
+///
+/// The cell hands out the installer ISO with this appended after the ISO's
+/// last byte: a marker, the join file, a marker. The medium stays exactly the
+/// ISO for everything that reads it as one — the filesystem ends where its
+/// volume descriptor says — and the installer reads past that end for the
+/// trailer. Nothing in the ISO is rewritten and no partition table is touched,
+/// which is what makes this safe to do to an image that was verified against a
+/// published digest: the bytes the digest covers are the bytes that are there.
+/// A medium written with `dd`, Etcher or Ventoy carries it, because they copy
+/// every byte; a tool that unpacks the ISO onto a stick does not, and the
+/// wizard then asks for the token the way it always did.
+pub const TRAILER_BEGIN: &[u8] = b"-----BEGIN VELSTRA JOIN-----\n";
+pub const TRAILER_END: &[u8] = b"-----END VELSTRA JOIN-----\n";
+
+/// How far past the ISO's declared end the installer looks. A hybrid ISO's
+/// own padding and its backup partition table lie inside this, and so does
+/// the trailer; the far end of a large stick does not, and is not read.
+pub const TRAILER_WINDOW: u64 = 8 * 1024 * 1024;
+
+/// The bytes appended to the medium for one machine.
+pub fn trailer(join_file: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(join_file.len() + 80);
+    out.push(b'\n');
+    out.extend_from_slice(TRAILER_BEGIN);
+    out.extend_from_slice(join_file.as_bytes());
+    if !join_file.ends_with('\n') {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(TRAILER_END);
+    out
+}
+
+/// The join file inside a trailer, if these bytes hold one.
+pub fn trailer_in(bytes: &[u8]) -> Option<String> {
+    let start = find(bytes, TRAILER_BEGIN)? + TRAILER_BEGIN.len();
+    let end = start + find(&bytes[start..], TRAILER_END)?;
+    String::from_utf8(bytes[start..end].to_vec()).ok()
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +357,31 @@ mod claim_message_tests {
         assert_eq!(
             claim_message("m-1a2b3c4d5e6f"),
             b"velstra-enrollment-claim:v1:m-1a2b3c4d5e6f".to_vec()
+        );
+    }
+
+    /// The trailer carries the file exactly, and nothing else in a medium is
+    /// mistaken for one.
+    #[test]
+    fn a_trailer_carries_the_join_file_and_is_found_after_the_iso() {
+        use super::{TRAILER_BEGIN, trailer, trailer_in};
+
+        let file = "# velstra join: peter in cell-1\nvelstra1.abc\n";
+        let mut medium = vec![0u8; 4096];
+        medium.extend_from_slice(&trailer(file));
+        medium.extend_from_slice(&[0u8; 100]);
+        assert_eq!(trailer_in(&medium).as_deref(), Some(file));
+        assert_eq!(trailer_in(&[0u8; 4096]), None);
+        // A begin without an end is not a trailer: a write that stopped half
+        // way is not a token.
+        let mut cut = vec![0u8; 16];
+        cut.extend_from_slice(TRAILER_BEGIN);
+        cut.extend_from_slice(b"velstra1.abc\n");
+        assert_eq!(trailer_in(&cut), None);
+        // A file without its own newline gets one, so the end marker starts a line.
+        assert_eq!(
+            trailer_in(&trailer("velstra1.abc")).as_deref(),
+            Some("velstra1.abc\n")
         );
     }
 }

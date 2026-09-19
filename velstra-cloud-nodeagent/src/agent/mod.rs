@@ -140,6 +140,10 @@ pub struct AgentConfig {
     /// `ceph.conf` and `keyring` — for QEMU to open volumes with. `None`
     /// writes nothing, which is right for a test and wrong for a machine.
     pub ceph_client_dir: Option<std::path::PathBuf>,
+    /// Where a build this machine is told to run is fetched to before it is
+    /// verified and applied. Under the state directory: a gigabyte that is
+    /// not on the volatile root of an appliance.
+    pub updates_dir: std::path::PathBuf,
     /// How often a guest's utilisation is *reported*, in milliseconds.
     ///
     /// Five minutes, which is what every cloud calls basic monitoring. It is a
@@ -169,6 +173,7 @@ impl AgentConfig {
             image_keep_seconds: 30 * 24 * 60 * 60,
             usage_every_ms: 5 * 60 * 1000,
             ceph_client_dir: None,
+            updates_dir: std::path::PathBuf::from("/var/lib/velstra/updates"),
         }
     }
 }
@@ -428,6 +433,8 @@ pub struct Agent {
     /// grew with the cell rather than with this node's own work. See
     /// [`crate::cell`] for the two ways it can be answered and why it matters.
     cell: Arc<dyn CellReader>,
+    /// Moving this machine to what it is wanted to run. See `update`.
+    updater: crate::update::Updater,
     vmm: Arc<dyn Vmm>,
     datapath: Arc<dyn Datapath>,
     /// The far end of the wire, when this node is it. `None` is the fabric case
@@ -540,6 +547,7 @@ impl Agent {
             bgp_peers: TypedStore::new(store.clone(), &cell, "bgp-peers"),
             migrations: TypedStore::new(store, &cell, "migrations"),
             cell: reader,
+            updater: crate::update::Updater::new(config.updates_dir.clone()),
             config,
             vmm,
             datapath,

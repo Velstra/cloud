@@ -429,6 +429,56 @@ impl Observed for DeviceClassStatus {
 
 impl Assigned for crate::pci::DeviceClassSpec {}
 
+/// A build a cell can move to, and where to get it.
+///
+/// Cell-scoped: what the cell's machines run is the cell's, and a tenant who
+/// could name a channel would be a tenant who could put their own build on
+/// every hypervisor. See `docs/upgrading.md`.
+pub type Release = Resource<crate::release::ReleaseSpec, crate::release::ReleaseStatus>;
+
+impl Observed for crate::release::ReleaseStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        // The release controller reads the channel and writes what it found;
+        // no agent ever reports on a release.
+        true
+    }
+}
+
+impl Assigned for crate::release::ReleaseSpec {}
+
+/// Moving the cell's machines to a release, one at a time.
+///
+/// Cell-scoped, for the same reason a release is.
+pub type Rollout = Resource<crate::rollout::RolloutSpec, crate::rollout::RolloutStatus>;
+
+impl Observed for crate::rollout::RolloutStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        // The rollout controller's, and nobody else's: the machines report on
+        // their own nodes, and the rollout reads those.
+        true
+    }
+}
+
+impl Assigned for crate::rollout::RolloutSpec {}
+
 // ---- flavors -------------------------------------------------------------
 
 /// A named machine size, offered by the cell.
@@ -949,6 +999,13 @@ pub struct NodeSpec {
     /// come and go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_baseline: Option<crate::cpu::CpuLevel>,
+    /// What this machine should run, when that is not what it runs: set by a
+    /// rollout, or by hand for one machine. The agent fetches it from its own
+    /// cell, verifies it, applies it the way its kind is applied, reboots or
+    /// restarts, and reports `status.installed` again. Cleared by the rollout
+    /// once the machine is back. See `docs/upgrading.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wanted: Option<crate::release::Wanted>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

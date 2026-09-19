@@ -24,7 +24,7 @@
 //!
 //! The one deliberate exception is stated where it is made.
 
-use velstra_cloud_model::{installed, meta, migration, resources};
+use velstra_cloud_model::{installed, meta, migration, release, resources};
 use velstra_cloud_proto::v1;
 
 /// One type, its populated value, and every field of it named.
@@ -321,8 +321,27 @@ survives_the_wire!(
         fence_after_s: 60,
         evacuate: true,
         gateway: true,
+        wanted: Some(release::Wanted {
+            release: "releases/v0.2.0".into(),
+            version: "0.2.0+20260918.c571d71".into(),
+            file: "velstra-cloud-node_0.2.0+20260918.c571d71_amd64.raw.zst".into(),
+            sha256: "ab".repeat(32),
+        }),
     },
-    { schedulable, labels, cpu_baseline, fence_after_s, evacuate, vcpu_overcommit, gateway }
+    { schedulable, labels, cpu_baseline, fence_after_s, evacuate, vcpu_overcommit, gateway, wanted }
+);
+
+survives_the_wire!(
+    a_wanted_build_survives_the_wire,
+    release::Wanted,
+    v1::Wanted,
+    release::Wanted {
+        release: "releases/v0.2.0".into(),
+        version: "0.2.0+20260918.c571d71".into(),
+        file: "velstra-cloud_0.2.0+20260918.c571d71_amd64.deb".into(),
+        sha256: "cd".repeat(32),
+    },
+    { release, version, file, sha256 }
 );
 
 survives_the_wire!(
@@ -1000,6 +1019,7 @@ whole_object_survives!(
         labels: vec!["ssd".into()],
         cpu_baseline: None,
         gateway: false,
+        wanted: None,
     },
     resources::NodeStatus {
         shared_state: false,

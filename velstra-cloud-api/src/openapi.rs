@@ -247,6 +247,9 @@ fn base_path(kind: &str, screen: Option<&Collection>) -> (String, Vec<Value>) {
                 | "device-classes"
                 | "image-sources"
                 | "maintenance-windows"
+                | "enrollments"
+                | "releases"
+                | "rollouts"
                 | "audit"
                 | "operations"
         ),
@@ -589,6 +592,14 @@ const VERBS: &[Verb] = &[
         query: &[],
     },
     Verb {
+        collection: "nodes",
+        verb: "installMedium",
+        method: "post",
+        on_collection: false,
+        summary: "Cut an install medium for this machine: the installer ISO a release holds, with this node's join file appended after the ISO's last byte — one download, one stick, nothing typed. The body may name `release`; without it the newest release whose installer is on this cell is used. Answers a one-time link (`url`), the `filename`, the `release` and its `version`, the `size` and `expiresAt`: `GET` the link without a token within ten minutes and it streams the medium once. POST because it mints the node's credential, as `:joinFile` does; refused with `FAILED_PRECONDITION` while no release on this cell holds a verified installer.",
+        query: &[],
+    },
+    Verb {
         collection: "enrollments",
         verb: "announce",
         method: "post",
@@ -722,6 +733,31 @@ fn fixed_paths(paths: &mut Map<String, Value>) {
                 "properties": { "current": { "type": "string", "format": "password" }, "password": { "type": "string", "format": "password" } },
             } } } },
             "responses": { "204": { "description": "Set; every other session of the account is ended." }, "default": error_response() },
+        },
+    }));
+    paths.insert("/api/v1/media/{ticket}".into(), json!({
+        "get": {
+            "tags": ["Nodes"],
+            "summary": "Collect an install medium cut by `nodes/{name}:installMedium`, once. The ticket is the credential — the link carries no other, so a browser's plain download can fetch it — and it is spent on the way in and gone after ten minutes. Streams the ISO and then the node's join file.",
+            "operationId": "collect-medium",
+            "security": [],
+            "parameters": [path_param("ticket", "The one-time ticket the cut answered with.")],
+            "responses": {
+                "200": { "description": "The medium, as `application/octet-stream` with a `Content-Disposition` naming the file." },
+                "default": error_response(),
+            },
+        },
+    }));
+    paths.insert("/api/v1/releases/{id}/files/{file}".into(), json!({
+        "get": {
+            "tags": ["Releases"],
+            "summary": "One of a release's files, as this cell fetched and verified it — what a node fetches when told what to run. Only a file the release's status names, and only once it is recorded as fetched; a name is never a path. For the cell's machines and its operators.",
+            "operationId": "get-release-file",
+            "parameters": [path_param("id", "The release."), path_param("file", "The file, by the name the release's status gives it.")],
+            "responses": {
+                "200": { "description": "The file, as `application/octet-stream`." },
+                "default": error_response(),
+            },
         },
     }));
     paths.insert("/api/v1/users/{id}/tokens".into(), json!({
