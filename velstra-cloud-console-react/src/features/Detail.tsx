@@ -3,8 +3,8 @@
 // it, the spec as a form, the status as it came, and whatever the registry
 // adds. A pane you can keep open while you move through the rows.
 
-import { useEffect, useState } from "react";
-import { ExternalLink, Pencil, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ExternalLink, RefreshCw, Pencil, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
@@ -18,7 +18,7 @@ import { useCan } from "@/lib/iam";
 import { go } from "@/app/router";
 import { fetchOne } from "@/hooks/useCollection";
 import { Explain } from "./Explain";
-import { Form } from "./Form";
+import { Form as ResourceForm } from "./Form";
 import { lazy, Suspense } from "react";
 const Relations = lazy(() => import("./Relations").then((m) => ({ default: m.Relations })));
 import { Timeline } from "./Timeline";
@@ -38,19 +38,29 @@ export function Detail({ coll, id, mode, onChanged }: {
   const [err, setErr] = useState("");
   const [answers, setAnswers] = useState<Record<string, unknown>>({});
 
-  const load = () => fetchOne(coll, project, id).then((x) => { setR(x); setErr(""); }).catch((e) => setErr(e.message));
-  useEffect(() => { setR(null); load(); remember(`${coll.id}/${id}`); }, [coll.id, id, project]);
-
-  // A drifting object is worth asking about again: the agent is on it.
+  const generation = useRef(0);
+  const request = useRef(0);
+  const load = useCallback(async () => {
+    const current = generation.current;
+    const sequence = ++request.current;
+    try {
+      const value = await fetchOne(coll, project, id);
+      if (current === generation.current && sequence === request.current) { setR(value); setErr(""); }
+    } catch (e) {
+      if (current === generation.current && sequence === request.current) setErr((e as Error).message);
+    }
+  }, [coll, project, id]);
   useEffect(() => {
-    if (!r || !verdict(r, coll).busy) return;
-    const t = setInterval(load, Math.max(3, coll.recheck || 5) * 1000);
-    return () => clearInterval(t);
-  }, [r, coll]);
+    generation.current++;
+    setR(null); setErr(""); setAnswers({});
+    void load(); remember(`${coll.id}/${id}`);
+    const timer = setInterval(() => { if (!document.hidden) void load(); }, Math.max(3, coll.recheck || 5) * 1000);
+    return () => { generation.current++; clearInterval(timer); };
+  }, [coll.id, id, project, load]);
 
   const close = () => go({ view: "board", coll: coll.id });
 
-  if (err) return <Pane title={id} onClose={close}><p className="text-sm" style={{ color: "var(--failing)" }}>{err}</p></Pane>;
+  if (err && !r) return <Pane title={id} onClose={close}><p role="alert" className="text-sm text-destructive">{err}</p><Pressed onPress={load}>Retry</Pressed></Pane>;
   if (!r) return <Pane title={id} onClose={close}><p className="text-sm" style={{ color: "var(--text-muted)" }}>Reading…</p></Pane>;
 
   const v = verdict(r, coll);
@@ -63,7 +73,7 @@ export function Detail({ coll, id, mode, onChanged }: {
   if (mode === "edit") {
     return (
       <Pane title={`Edit ${idOf(r)}`} sub={nameOf(r)} onClose={() => go({ view: "board", coll: coll.id, id })}>
-        <Form coll={coll} existing={r}
+        <ResourceForm coll={coll} existing={r}
           onDone={(saved) => {
             toast(`${idOf(saved)} saved.`);
             setR(saved); onChanged(); collectionChanged(coll.id);
@@ -78,9 +88,10 @@ export function Detail({ coll, id, mode, onChanged }: {
     <Pane title={idOf(r)} sub={nameOf(r)} onClose={close}
       head={
         <div className="flex flex-wrap gap-2">
+          <Pressed size="sm" variant="outline" onPress={load}><RefreshCw className="size-3.5" />Refresh</Pressed>
           {coll.editable && mayOperate && <Button size="sm" onClick={() => go({ view: "board", coll: coll.id, id, mode: "edit" })}><Pencil className="size-3.5" /> Edit</Button>}
           {mayOperate && custom.quick?.(r, coll, load)}
-          {actions.map((a) => (
+          {actions.length > 0 && <details className="relative text-xs"><summary className="rounded-md border border-border px-3 py-2 hover:bg-accent">More actions</summary><div className="mt-2 flex flex-wrap gap-2">{actions.map((a) => (
             <Pressed key={a.id} size="sm" title={a.summary} variant={a.destructive ? "destructive" : "secondary"} onPress={async () => {
               if (a.destructive && !(await ask({ title: `${a.label} ${idOf(r)}?`, confirmLabel: a.label, tone: "danger" }))) return;
               try {
@@ -90,7 +101,7 @@ export function Detail({ coll, id, mode, onChanged }: {
                 load();
               } catch (e) { toast.error((e as Error).message); }
             }}>{a.label}</Pressed>
-          ))}
+          ))}</div></details>}
           {coll.deletable && mayWrite && (
             <Pressed size="sm" variant="destructive" onPress={async () => {
               if (!(await ask({ title: `Delete ${idOf(r)}?`, body: `It stays visible until its finalizers let go.`, confirmLabel: "Delete", tone: "danger" }))) return;
@@ -109,25 +120,18 @@ export function Detail({ coll, id, mode, onChanged }: {
           )}
         </div>
       }>
-      <Section label="Convergence" sub="what was asked for, and what is">
+      {err && <p role="alert" className="text-sm text-destructive">Update failed. Displaying the last known state. {err}</p>}
+      <Section label="Status">
         <div className="grid gap-2" style={{ borderLeft: `3px solid var(--${v.kind === "unreported" ? "border-strong" : "dot-" + v.kind})`, paddingLeft: 12 }}>
           <State of={r} coll={coll} detail />
           {v.detail && <p className="text-sm" style={{ color: "var(--text-body)" }}>{v.detail}</p>}
-          {refusals(r).filter((c) => c.message !== v.detail).map((c) => (
+          {refusals(r).filter((c) => v.kind === "failing" && c.message !== v.detail).map((c) => (
             <p key={c.kind} className="break-all text-sm" style={{ color: "var(--text-body)" }}>
               <span className="font-mono text-xs" style={{ color: "var(--failing)" }}>{c.kind} · {c.reason}</span>{c.message ? ` — ${c.message}` : ""}
             </p>
           ))}
         </div>
-        {coll.condition !== "" && <Timeline r={r} coll={coll} />}
-      </Section>
-
-      <Section label="History" sub="what was asked, by whom — and what was refused, in the words they were given">
-        <History r={r} />
-      </Section>
-
-      <Section label="Relations" sub="what it depends on, and what would notice if it went">
-        <Suspense fallback={<p className="text-xs" style={{ color: "var(--text-faint)" }}>Reading the neighbourhood…</p>}><Relations r={r} coll={coll} /></Suspense>
+        {coll.condition !== "" && <details className="text-xs text-muted-foreground"><summary>Deployment details</summary><Timeline r={r} coll={coll} /></details>}
       </Section>
 
       {diffs.length > 0 && (
@@ -160,8 +164,11 @@ export function Detail({ coll, id, mode, onChanged }: {
       )}
 
       {custom.panels?.map((p) => (
-        <Section key={p.id} label={p.title} sub={p.sub}>{p.render(r, coll, load)}</Section>
+        <Section key={p.id} label={p.title}>{p.render(r, coll, load)}</Section>
       ))}
+
+      <details className="rounded-lg border border-border p-3"><summary className="text-sm font-medium">Activity history</summary><div className="mt-3"><History r={r} /></div></details>
+      <details className="rounded-lg border border-border p-3"><summary className="text-sm font-medium">Dependencies</summary><div className="mt-3"><Suspense fallback={<p className="text-xs text-muted-foreground">Loading dependencies…</p>}><Relations r={r} coll={coll} /></Suspense></div></details>
 
       <Tabs defaultValue="spec" className="flex w-full flex-col gap-1">
         <TabsList>

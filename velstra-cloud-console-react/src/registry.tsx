@@ -106,7 +106,7 @@ const collectionOf = (path: string): string | null => {
  *   installer. The node's page has a button that follows it; a grey button
  *   that showed the link as JSON would be a link somebody copies.
  */
-const NOT_A_BUTTON = /:(reportStatus|issueCredential|installMedium)$/;
+const NOT_A_BUTTON = /:(reportStatus|issueCredential|installMedium|console|consoleStream)$/;
 
 /** Verbs only a cell operator may ask. The API says so; this keeps the console
  *  from offering what it would refuse. */
@@ -153,7 +153,7 @@ register("instances", {
     },
   ],
   fieldEditors: {
-    userData: (p) => <Suspense fallback={loading("the editor")}><CloudInit {...p} /></Suspense>,
+    userData: (p) => <details className="rounded-lg border border-border p-3"><summary className="text-sm">Customize first boot{p.value ? " · configured" : " (optional)"}</summary><div className="mt-3"><Suspense fallback={loading("the editor")}><CloudInit {...p} /></Suspense></div></details>,
   },
 });
 

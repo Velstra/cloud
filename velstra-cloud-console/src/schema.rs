@@ -874,8 +874,9 @@ const PROJECT_FIELDS: &[Field] = &[
     Field {
         key: "policy.hostBridges",
         label: "Host bridges this project may use",
-        kind: Kind::Lines {
+        kind: Kind::TextList {
             placeholder: "br0\nvmbr1",
+            check: Check::None,
         },
         required: false,
         advanced: true,

@@ -7,12 +7,14 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { ArrowRightLeft, Copy, Play, Power, RotateCw } from "lucide-react";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { call } from "@/api/transport";
 import { humanise, idOf, nameOf, type Resource } from "@/lib/model";
 import { SCHEMA, basePath, projectOf, type Collection } from "@/lib/schema";
 import { listEvery } from "@/lib/listing";
+import { href } from "@/app/router";
 import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
 import { useAsk } from "@/features/Ask";
@@ -30,9 +32,15 @@ const useProjectOf = (r: Resource) => {
   return projectOf(nameOf(r)) ?? picked;
 };
 
-const patch = (project: string, r: Resource, c: Collection, spec: Record<string, unknown>) =>
-  call(`patch:${c.id}`, "PATCH", `${basePath(c, project)}/${encodeURIComponent(idOf(r))}`, undefined, { spec },
-    r.meta.revision ? { "if-match": String(r.meta.revision) } : undefined);
+const patch = async (project: string, r: Resource, c: Collection, spec: Record<string, unknown>) => {
+  const path = `${basePath(c, project)}/${encodeURIComponent(idOf(r))}`;
+  const latest: Resource = await call(`get:${c.id}`, "GET", path);
+  if (latest.meta.deletedAt || latest.meta.generation !== r.meta.generation) {
+    throw new Error("This resource changed. Refresh it and review the latest state before trying again.");
+  }
+  return call(`patch:${c.id}`, "PATCH", path, undefined, { spec },
+    latest.meta.revision ? { "if-match": String(latest.meta.revision) } : undefined);
+};
 
 const fresh = (project: string, c: Collection, id: string): Promise<Resource> =>
   call(`get:${c.id}`, "GET", `${basePath(c, project)}/${encodeURIComponent(id)}`);
@@ -321,10 +329,17 @@ export function VolumeQuick({ r, reload }: { r: Resource; c: Collection; reload:
   const [guests, setGuests] = useState<Resource[] | null>(null);
   const holder = guests?.find((g) => ((g.spec?.volumes ?? []) as string[]).includes(nameOf(r)));
   const inst = coll("instances"); const backups = coll("backups");
-  useEffect(() => { all(project, "instances").then(setGuests).catch(() => setGuests([])); }, [project, r.meta.revision]);
+  const [guestError, setGuestError] = useState("");
+  useEffect(() => {
+    let current = true;
+    all(project, "instances").then((items) => { if (current) { setGuests(items); setGuestError(""); } })
+      .catch(() => { if (current) { setGuests(null); setGuestError("Could not read attachments. Refresh to retry."); } });
+    return () => { current = false; };
+  }, [project, r]);
 
   return (
     <>
+      {guestError && <span role="alert" className="text-xs text-destructive">{guestError}</span>}
       {guests && !holder && (
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button size="sm" variant="secondary" title="Hang this volume on a guest of the project" />}>Attach to a guest ▾</DropdownMenuTrigger>
@@ -362,9 +377,9 @@ export function VolumeQuick({ r, reload }: { r: Resource; c: Collection; reload:
 /** The user an image's family logs in as, by convention of the distributions. */
 const loginUser = (image: string) => {
   const f = image.split("/").pop() ?? "";
-  for (const [k, u] of [["debian", "debian"], ["ubuntu", "ubuntu"], ["fedora", "fedora"], ["centos", "centos"], ["rocky", "rocky"], ["alma", "almalinux"], ["alpine", "alpine"], ["arch", "arch"]] as const)
+  for (const [k, u] of [["cirros", "cirros"], ["debian", "debian"], ["ubuntu", "ubuntu"], ["fedora", "fedora"], ["centos", "centos"], ["rocky", "rocky"], ["alma", "almalinux"], ["alpine", "alpine"], ["arch", "arch"]] as const)
     if (f.startsWith(k)) return u;
-  return "root";
+  return "";
 };
 
 export function Connect({ r }: { r: Resource }) {
@@ -374,9 +389,10 @@ export function Connect({ r }: { r: Resource }) {
     all(project, "floatingips").then((f) => setPublicIps(f.filter((x) => x.spec?.instance === nameOf(r)).map((x) => x.spec?.address ?? x.status?.address).filter(Boolean))).catch(() => {});
   }, [project, r.meta.name, r.meta.revision]);
   const privateIps: string[] = r.status?.addresses ?? [];
-  const user = loginUser(String(r.spec?.image ?? ""));
+  const [chosenUser, setChosenUser] = useState("");
+  const user = chosenUser || loginUser(String(r.spec?.image ?? ""));
   const reach = publicIps[0] ?? privateIps[0];
-  const line = reach ? `ssh ${user}@${reach}` : "";
+  const line = reach && user ? `ssh ${user}@${reach}` : "";
   const Line = ({ label, value }: { label: string; value: string }) => (
     <div className="flex items-center gap-2 text-xs">
       <span className="w-24 shrink-0" style={{ color: "var(--text-muted)" }}>{label}</span>
@@ -389,11 +405,14 @@ export function Connect({ r }: { r: Resource }) {
       {publicIps.map((ip) => <Line key={ip} label="Public IP" value={ip} />)}
       {privateIps.map((ip) => <Line key={ip} label="Private IP" value={ip} />)}
       {!privateIps.length && !publicIps.length && <p className="text-xs" style={{ color: "var(--text-faint)" }}>No address yet — it comes with the first lease once the guest is running.</p>}
+      {reach && <label className="flex items-center gap-2 text-xs text-muted-foreground">
+        <span className="w-24 shrink-0">SSH user</span><Input className="h-8 max-w-44" value={user} placeholder="Image login username" onChange={(e) => setChosenUser(e.target.value)} />
+      </label>}
       {line && <Line label="SSH" value={line} />}
+      {!!r.spec?.ports?.length && <div className="mt-2 flex flex-wrap gap-2">{(r.spec.ports as string[]).map((port, i) => <a key={port} href={href({ view: "board", coll: "ports", id: `${project}/${port.split("/").pop()}` })} className="rounded-md border border-border px-2 py-1 text-xs text-primary hover:bg-accent">Interface {i + 1} · firewall & limits →</a>)}</div>}
       {line && !(r.spec?.sshKeys ?? []).length && !r.spec?.userData && (
-        <p className="text-[11px]" style={{ color: "var(--drifting)" }}>No SSH key or cloud-init was given at creation, so the image's default user has nothing to log in with. The Screen panel still works.</p>
+        <p className="text-[11px]" style={{ color: "var(--drifting)" }}>No SSH key configured. Use the console or your image's login credentials.</p>
       )}
-      <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>The login user is the image family's convention ({user}); a cloud-init file may have chosen another.</p>
     </div>
   );
 }

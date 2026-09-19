@@ -8,8 +8,8 @@
 // at three in the morning has a phone, and "cordon this node" is four taps or
 // it is a drive to a desk.
 
-import { useEffect, useMemo, useState } from "react";
-import { Bell, ChevronDown, ChevronRight, Command as Cmd, LogOut, Menu, Moon, Rows3, Search, Sun, UserRound } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Bell, ChevronDown, ChevronRight, Command as Cmd, LogOut, Menu, Moon, Rows3, Search, Sun, UserRound, Box, Database, Network, Server, Shield, Activity, LayoutDashboard, Workflow, Cloud, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator,
@@ -19,10 +19,11 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useCan } from "@/lib/iam";
 import { call, clearToken } from "@/api/transport";
 import { listEvery } from "@/lib/listing";
-import { idOf, nameOf, verdict, VERDICT_ORDER, type Resource, type Verdict } from "@/lib/model";
-import { ALL, SCHEMA, collection, groups, navigable, type Collection } from "@/lib/schema";
+import { attentionName, idOf, nameOf, verdict, VERDICT_ORDER, type Resource, type Verdict } from "@/lib/model";
+import { ALL, SCHEMA, collection, groups, navigable, routeId, type Collection } from "@/lib/schema";
 import { go, href, useRoute } from "@/app/router";
 import { setState, useStore } from "@/app/store";
 import { State } from "@/features/State";
@@ -43,6 +44,10 @@ export function Shell({ census, onSweep, children }: {
   // preference, it is where the last tap put it.
   const [railOpen, setRailOpen] = useState(false);
   const [projects, setProjects] = useState<string[]>([project]);
+  const navInput = useRef<HTMLInputElement>(null);
+  const [navQuery, setNavQuery] = useState("");
+  const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({});
+  const primarySections = new Set(["instances", "image-families", "volumes", "ceph-clusters", "pools", "networks", "subnets", "security-groups", "nodes", "maintenance", "projects", "users", "audit", "usage"]);
 
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
@@ -83,13 +88,14 @@ export function Shell({ census, onSweep, children }: {
         className="flex w-[232px] shrink-0 flex-col border-r max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:-translate-x-full max-md:transition-transform max-md:data-[open=true]:translate-x-0"
         style={{ background: "var(--sidebar-bg)", borderColor: "var(--border)" }}
       >
-        <div className="px-4 pb-3 pt-4 text-[15px] font-semibold" style={{ color: "var(--text-strong)" }}>
-          Velstra <span style={{ color: "var(--product)" }}>Cloud</span>
+        <div className="flex items-center gap-2.5 px-4 pb-4 pt-5 text-[17px] font-semibold tracking-tight" style={{ color: "var(--text-strong)" }}>
+          <span className="grid size-8 place-items-center rounded-lg bg-primary text-primary-foreground"><Cloud className="size-5" /></span>Velstra <span style={{ color: "var(--product)" }}>Cloud</span>
         </div>
         <button onClick={() => setPaletteOpen(true)} className="mx-3 mb-3 flex items-center gap-2 rounded-[4px] border px-2.5 py-1.5 text-xs"
           style={{ borderColor: "var(--border)", color: "var(--text-muted)", background: "var(--surface-sunken)" }}>
           <Search className="size-3.5" /> Jump to… <kbd className="ml-auto rounded border px-1 font-mono text-[10px]" style={{ borderColor: "var(--border-strong)" }}>⌘K</kbd>
         </button>
+        <div className="relative mx-3 mb-3"><Search className="absolute left-2.5 top-2.5 size-3.5 text-muted-foreground" /><input ref={navInput} aria-label="Filter navigation" value={navQuery} onChange={(e) => setNavQuery(e.target.value)} placeholder="Find a section" className="h-9 w-full rounded-lg border border-border bg-background pl-8 pr-7 text-xs" />{navQuery && <button aria-label="Clear navigation filter" onClick={() => { setNavQuery(""); navInput.current?.focus(); }} className="absolute right-2 top-2.5"><X className="size-3.5" /></button>}</div>
         {/* A link followed from in here closes the drawer, on the click that
             caused it rather than on the route it produced. Without this,
             tapping a collection on a phone loads the board underneath a rail
@@ -105,17 +111,20 @@ export function Shell({ census, onSweep, children }: {
             badge={attention.length ? <Badge n={attention.length} tone={failing ? "failing" : "drifting"} /> : null} />
           <RailLink active={route.view === "map"} to={href({ view: "map" })} label="Map" />
           {groups(!!who?.cellAdmin).map((g) => {
-            const items = g.items.filter((c) => who?.cellAdmin || c.scope === "project");
-            const open = !collapsed[g.name];
+            const items = g.items.filter((c) => (who?.cellAdmin || c.scope === "project") && (!navQuery || c.title.toLowerCase().includes(navQuery.toLowerCase())));
+            if (!items.length) return null;
+            const open = !!navQuery || !(collapsed[g.name] ?? ["Records", "Access"].includes(g.name));
+            const expanded = !!navQuery || (expandedSections[g.name] ?? items.some((c) => c.id === current?.id && !primarySections.has(c.id)));
+            const shown = expanded ? items : items.filter((c) => primarySections.has(c.id));
             return (
               <div key={g.name} className="mt-3">
-                <button onClick={() => setState({ railCollapsed: { ...collapsed, [g.name]: open } })}
+                <button aria-expanded={open} onClick={() => setState({ railCollapsed: { ...collapsed, [g.name]: open } })}
                   className="flex w-full items-center gap-1 px-2 pb-1 text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)" }}>
                   {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />} {g.name}
                   {!open && <span className="ml-auto font-mono text-[10px] normal-case tracking-normal">{items.reduce((n, c) => n + (census[c.id]?.unsettled.length ?? 0), 0) || ""}</span>}
                 </button>
                 <div className="fold" data-closed={!open}><div>
-                  {items.map((c) => {
+                  {shown.map((c) => {
                     const seen = census[c.id]; const un = seen?.unsettled.length ?? 0;
                     return (
                       <RailLink key={c.id} active={current?.id === c.id} to={href({ view: "board", coll: c.id })} label={c.title}
@@ -123,6 +132,7 @@ export function Shell({ census, onSweep, children }: {
                           : <span className="font-mono text-[11px]" style={{ color: "var(--text-faint)" }}>{seen ? seen.total : ""}</span>} />
                     );
                   })}
+                  {!navQuery && items.some((c) => !primarySections.has(c.id)) && <button className="ml-8 mt-1 text-xs text-muted-foreground hover:text-foreground" aria-expanded={!!expanded} onClick={() => setExpandedSections((old) => ({ ...old, [g.name]: !expanded }))}>{expanded ? "Show less" : `More (${items.length - shown.length})`}</button>}
                   {/* The bill belongs with the readings it is summed from —
                       one group, evidence and total. It is not a collection, so
                       the schema cannot put it here and this does. */}
@@ -157,7 +167,7 @@ export function Shell({ census, onSweep, children }: {
               <DropdownMenu>
                 <DropdownMenuTrigger className="rounded-[3px] border px-2 py-0.5" style={{ borderColor: "var(--border)" }}>{project === ALL ? "all projects" : project} ▾</DropdownMenuTrigger>
                 <DropdownMenuContent align="start">
-                  <DropdownMenuItem onClick={() => setState({ project: ALL })}>All projects<span className="ml-2 text-[11px]" style={{ color: "var(--text-faint)" }}>every tenant's objects, on one board</span></DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setState({ project: ALL })}>All projects</DropdownMenuItem>
                   {projects.map((p) => <DropdownMenuItem key={p} onClick={() => setState({ project: p })}>{p}</DropdownMenuItem>)}
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -185,7 +195,7 @@ export function Shell({ census, onSweep, children }: {
                   {attention.length > 0 && <span className="absolute -right-0.5 -top-0.5 rounded-full px-1 font-mono text-[10px]" style={{ background: failing ? "var(--dot-failing)" : "var(--dot-drifting)", color: "#fff" }}>{attention.length}</span>}
                 </PopoverTrigger>
               } /><TooltipContent>Attention inbox</TooltipContent></Tooltip>
-              <PopoverContent align="end" className="w-[26rem] p-0">
+              <PopoverContent align="end" className="w-[min(26rem,calc(100vw-1.5rem))] p-0">
                 <div className="flex items-center justify-between border-b px-3 py-2 text-xs" style={{ borderColor: "var(--border-subtle)" }}>
                   <span className="font-semibold" style={{ color: "var(--text-strong)" }}>{attention.length ? `${attention.length} not settled` : "Everything has settled"}</span>
                   <button className="hover:underline" style={{ color: "var(--text-muted)" }} onClick={onSweep}>Sweep again</button>
@@ -193,8 +203,8 @@ export function Shell({ census, onSweep, children }: {
                 <ul className="max-h-[24rem] overflow-y-auto">
                   {attention.slice(0, 60).map(({ coll, r }) => (
                     <li key={nameOf(r)}>
-                      <a href={href({ view: "board", coll: coll.id, id: idOf(r) })} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs hover:bg-[var(--surface-hover)]">
-                        <span className="truncate font-mono" style={{ color: "var(--text-body)" }}>{coll.id}/{idOf(r)}</span>
+                      <a href={href({ view: "board", coll: coll.id, id: routeId(coll, r, project) })} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs hover:bg-[var(--surface-hover)]">
+                        <span className="truncate font-mono" style={{ color: "var(--text-body)" }}>{attentionName(r, coll)}</span>
                         <State of={r} coll={coll} />
                       </a>
                     </li>
@@ -212,14 +222,14 @@ export function Shell({ census, onSweep, children }: {
             }} />}>
               <LogOut className="size-4" />
             </TooltipTrigger><TooltipContent>Sign out</TooltipContent></Tooltip>
-            <Tooltip><TooltipTrigger render={<Button size="sm" variant="ghost" aria-label="Toggle density" onClick={() => setState({ density: density === "compact" ? "comfortable" : "compact" })} />}>
+            <Tooltip><TooltipTrigger render={<Button size="sm" variant="ghost" className="hidden md:inline-flex" aria-label="Toggle density" onClick={() => setState({ density: density === "compact" ? "comfortable" : "compact" })} />}>
               <Rows3 className="size-4" />
             </TooltipTrigger><TooltipContent>{density === "compact" ? "Comfortable rows" : "Compact rows"}</TooltipContent></Tooltip>
             <Tooltip><TooltipTrigger render={<Button size="sm" variant="ghost" aria-label="Toggle appearance" onClick={() => setState({ theme: theme === "dark" ? "light" : theme === "light" ? "system" : "dark" })} />}>
               {theme === "light" ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </TooltipTrigger><TooltipContent>Appearance: {theme}</TooltipContent></Tooltip>
-            <Button size="sm" variant="ghost" aria-label="Open the palette" onClick={() => setPaletteOpen(true)}><Cmd className="size-4" /></Button>
-            <span className="ml-2 text-xs" style={{ color: "var(--text-muted)" }}>{who?.displayName ?? "—"}{who?.cellAdmin ? " · operator" : ""}</span>
+            <Button size="sm" variant="ghost" className="hidden md:inline-flex" aria-label="Open the palette" onClick={() => setPaletteOpen(true)}><Cmd className="size-4" /></Button>
+            <span className="ml-2 hidden text-xs lg:inline" style={{ color: "var(--text-muted)" }}>{who?.displayName ?? "—"}{who?.cellAdmin ? " · administrator" : ""}</span>
           </div>
         </header>
         <main className="min-h-0 flex-1">{children}</main>
@@ -231,11 +241,13 @@ export function Shell({ census, onSweep, children }: {
 }
 
 function RailLink({ active, to, label, badge }: { active: boolean; to: string; label: string; badge?: React.ReactNode }) {
+  const group = SCHEMA.find((c) => c.title === label)?.group;
+  const Icon = label === "Overview" ? LayoutDashboard : label === "Map" ? Workflow : group === "Storage" ? Database : group === "Network" ? Network : group === "Hardware" ? Server : group === "Access" ? Shield : group === "Records" ? Activity : Box;
   return (
     <a href={to} aria-current={active ? "page" : undefined}
-      className="flex items-center justify-between rounded-[4px] px-2 py-1.5 text-[13px] hover:bg-[var(--surface-hover)] focus-visible:outline-none focus-visible:ring-[3px]"
+      className="my-0.5 flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] transition-colors hover:bg-[var(--surface-hover)] focus-visible:outline-none focus-visible:ring-[3px]"
       style={{ background: active ? "color-mix(in srgb, var(--brand) 16%, transparent)" : undefined, color: active ? "var(--text-strong)" : "var(--text-body)" }}>
-      {label}{badge}
+      <Icon className="size-4 shrink-0 text-muted-foreground" /><span className="flex-1">{label}</span>{badge}
     </a>
   );
 }
@@ -247,6 +259,7 @@ function Badge({ n, tone }: { n: number; tone: "failing" | "drifting" }) {
 }
 
 function Palette({ open, onOpenChange, census }: { open: boolean; onOpenChange: (o: boolean) => void; census: Census }) {
+  const can = useCan();
   const recents = useStore((s) => s.recents);
   const who = useStore((s) => s.who);
   const project = useStore((s) => s.project);
@@ -279,7 +292,7 @@ function Palette({ open, onOpenChange, census }: { open: boolean; onOpenChange: 
         {found.length > 0 && (
           <CommandGroup heading="Objects">
             {found.map(({ coll, r }) => (
-              <CommandItem key={nameOf(r)} value={`${coll.id}/${idOf(r)}`} onSelect={() => run(() => go({ view: "board", coll: coll.id, id: idOf(r) }))}>
+              <CommandItem key={nameOf(r)} value={`${coll.id}/${idOf(r)}`} onSelect={() => run(() => go({ view: "board", coll: coll.id, id: routeId(coll, r, project) }))}>
                 <span className="font-mono text-xs">{coll.id}/{idOf(r)}</span><span className="ml-auto"><State of={r} coll={coll} /></span>
               </CommandItem>
             ))}
@@ -294,7 +307,7 @@ function Palette({ open, onOpenChange, census }: { open: boolean; onOpenChange: 
           </CommandGroup>
         )}
         <CommandGroup heading="Actions">
-          {current?.creatable && <CommandItem value={`new ${current.singular}`} onSelect={() => run(() => go({ view: "board", coll: current.id, mode: "new" }))}>New {current.singular}</CommandItem>}
+          {current?.creatable && can("write", current) && <CommandItem value={`new ${current.singular}`} onSelect={() => run(() => go({ view: "board", coll: current.id, mode: "new" }))}>New {current.singular}</CommandItem>}
           <CommandItem value="theme dark" onSelect={() => run(() => setState({ theme: "dark" }))}>Appearance: dark</CommandItem>
           <CommandItem value="theme light" onSelect={() => run(() => setState({ theme: "light" }))}>Appearance: light</CommandItem>
           <CommandItem value="theme system" onSelect={() => run(() => setState({ theme: "system" }))}>Appearance: follow the system</CommandItem>

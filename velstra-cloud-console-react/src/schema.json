@@ -4284,8 +4284,9 @@
    {
     "key": "policy.hostBridges",
     "label": "Host bridges this project may use",
-    "kind": "lines",
+    "kind": "textList",
     "placeholder": "br0\nvmbr1",
+    "check": "none",
     "required": false,
     "advanced": true,
     "whenEmpty": "",

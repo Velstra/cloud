@@ -209,6 +209,12 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
 
   return {
     evaluate, thrown, requests,
+    async key(key, code = key) {
+      await send("Input.dispatchKeyEvent", { type: "keyDown", key, code, windowsVirtualKeyCode: key === "Enter" ? 13 : undefined });
+      await send("Input.dispatchKeyEvent", { type: "keyUp", key, code });
+    },
+    async type(text) { await send("Input.insertText", { text }); },
+    async resize(width, height) { await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false }); },
     /// Pretend the viewer has a preference set. The three the console honours —
     /// reduced motion, reduced transparency, more contrast — have no other way
     /// to be checked: they are media queries, so nothing about the page reveals

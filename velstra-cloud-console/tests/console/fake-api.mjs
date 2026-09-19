@@ -1534,6 +1534,8 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "POST" && isCollectionName(name)) {
     const body = await readBody(req);
+    // Resource envelopes use meta.name; retain the legacy console's id spelling.
+    if (body?.meta?.name?.startsWith(name + "/")) body.id ??= body.meta.name.slice(name.length + 1);
     if (!body || !body.id) return fail(res, 400, "INVALID_ARGUMENT", "an id is required", "id");
     if (!/^[a-z0-9][a-z0-9.-]*$/.test(body.id)) {
       return fail(res, 400, "INVALID_ARGUMENT", "an id may hold only a-z, 0-9, '-' and '.'", "id");

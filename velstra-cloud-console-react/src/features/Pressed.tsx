@@ -27,20 +27,23 @@ export const presentTense = (label: string) => {
 export function Pressed({ children, onPress, busyLabel, ...rest }:
   React.ComponentProps<typeof Button> & { onPress: () => Promise<unknown> | unknown; busyLabel?: string }) {
   const [busy, setBusy] = useState(false);
+  const pending = useRef(false);
   const run = useRef(0);
   return (
     <Button {...rest} disabled={busy || rest.disabled} aria-busy={busy || undefined}
       onClick={async (e) => {
         e.preventDefault();
-        const answer = onPress();
-        if (!answer || typeof (answer as Promise<unknown>).then !== "function") return;
+        if (pending.current) return;
+        pending.current = true;
         const mine = ++run.current;
         setBusy(true);
-        try { await answer; } catch { /* the caller shows it */ }
-        finally { if (mine === run.current) setBusy(false); }
+        try { await onPress(); } catch { /* the caller shows it */ }
+        finally { if (mine === run.current) { pending.current = false; setBusy(false); } }
       }}>
-      {busy && <span className="inline-block size-3 animate-spin rounded-full border-2 border-current border-r-transparent" />}
-      {busy ? (busyLabel ?? presentTense(String(children))) : children}
+      <span className="relative inline-grid place-items-center">
+        <span className={busy ? "invisible inline-flex items-center gap-1.5" : "inline-flex items-center gap-1.5"}>{children}</span>
+        {busy && <span className="absolute inset-0 flex items-center justify-center" role="status" aria-label={busyLabel ?? presentTense(String(children))}><span className="size-4 animate-spin rounded-full border-2 border-current border-r-transparent" /></span>}
+      </span>
     </Button>
   );
 }

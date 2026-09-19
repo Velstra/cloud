@@ -34,9 +34,10 @@ async function historyOf(name: string): Promise<Entry[]> {
 
   const ops = collection("operations");
   if (ops) {
-    const answer = await call("list:operations", "GET", basePath(ops, project), {
+    const answer = await call("list:operations", "GET", project ? basePath(ops, project) : "/api/v1/operations", {
       target: name,
       pageSize: 50,
+      orderBy: "createdAt desc",
     });
     for (const r of (answer.items ?? []) as Resource[]) {
       const spec = (r.spec ?? {}) as Record<string, unknown>;
@@ -57,6 +58,7 @@ async function historyOf(name: string): Promise<Entry[]> {
     const answer = await call("list:audit", "GET", basePath(audit, ""), {
       target: name,
       pageSize: 50,
+      orderBy: "createdAt desc",
     });
     for (const r of (answer.items ?? []) as Resource[]) {
       const spec = (r.spec ?? {}) as Record<string, unknown>;
@@ -66,7 +68,7 @@ async function historyOf(name: string): Promise<Entry[]> {
         who: String(spec.subject ?? "somebody"),
         what: String(spec.verb ?? ""),
         detail: String(spec.detail ?? ""),
-        kind: kind === "Refused" ? "refused" : "changed",
+        kind: kind.toLowerCase() === "refused" ? "refused" : "changed",
       });
     }
   }

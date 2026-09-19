@@ -157,14 +157,13 @@ pub fn add_host_argv(host: &str, address: &str, admin: bool) -> Vec<String> {
     argv
 }
 
-/// The argv for asking the cluster for the SSH key it drives hosts with.
-/// The client every hypervisor opens volumes as: read/write on the platform's
-/// two pools and nothing else — not `client.admin`, which can do anything to
+/// Reconcile the client every hypervisor opens volumes as: read/write on the
+/// platform's configured pools and nothing else — not `client.admin`, which can do anything to
 /// the cluster and belongs on the monitors alone.
 ///
-/// `get-or-create` is idempotent and prints the keyring either way, so a
-/// monitor that reports this every pass reports the same key every pass.
-pub fn client_keyring_argv(pools: &[String]) -> Vec<String> {
+/// `auth caps` updates an existing identity when managed pools change;
+/// `get-or-create` with different caps only reports a mismatch.
+pub fn client_caps_argv(pools: &[String]) -> Vec<String> {
     let osd_caps = if pools.is_empty() {
         "profile rbd".to_string()
     } else {
@@ -176,7 +175,7 @@ pub fn client_keyring_argv(pools: &[String]) -> Vec<String> {
     };
     vec![
         "auth".into(),
-        "get-or-create".into(),
+        "caps".into(),
         CLIENT.into(),
         "mon".into(),
         "profile rbd".into(),
@@ -361,6 +360,23 @@ pub fn parse_pools(json: &str) -> Result<Vec<String>> {
         .map_err(|e| HostError::failed(format!("`ceph osd pool ls` did not answer with json: {e}")))
 }
 
+// Ceph's keyring parser includes the secret value in its diagnostic. Errors
+// travel to resource status, so that diagnostic must never cross this boundary.
+fn safe_diagnostic(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(|line| {
+            if line.contains("type=key") || line.contains("key =") || line.contains("key=") {
+                "Ceph could not parse a keyring; verify client and cluster version compatibility."
+                    .to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl CephAdmin {
     /// Whether the tooling is on this machine, and what it reports about itself.
     ///
@@ -381,11 +397,20 @@ impl CephAdmin {
                     ..NodeCeph::default()
                 }
             }
-            // It ran and said no. Ordinary, and the reason this is not an
-            // error: most nodes in most cells will never run Ceph.
+            // Distribution builds can lack embedded version metadata and
+            // return 1 with `cephadm version UNKNOWN`. Probe the command's
+            // parser before treating that as an absent installation.
             Ok(_) => {
                 self.forget_spawn_failure();
-                NodeCeph::default()
+                let available = tokio::process::Command::new(&self.cephadm)
+                    .arg("--help")
+                    .output()
+                    .await
+                    .is_ok_and(|out| out.status.success());
+                NodeCeph {
+                    installed: available,
+                    ..NodeCeph::default()
+                }
             }
             // It could not be run at all, which is a different thing and is
             // worth saying. The answer stays `false`, because a machine that
@@ -463,7 +488,7 @@ impl CephAdmin {
         Err(HostError::failed(format!(
             "`ceph {}` failed: {}",
             args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+            safe_diagnostic(&out.stderr)
         )))
     }
 
@@ -471,7 +496,13 @@ impl CephAdmin {
     /// that holds the admin keyring. `(conf, keyring)`, both complete files.
     pub async fn client_config(&self, pools: &[String]) -> Result<(String, String)> {
         let conf = self.ceph(&client_conf_argv()).await?;
-        let keyring = self.ceph(&client_keyring_argv(pools)).await?;
+        // get-or-create with caps rejects an existing client when the desired
+        // pools change. Create the identity independently, then reconcile its
+        // permissions so adding/removing a managed pool actually takes effect.
+        let keyring = self
+            .ceph(&["auth".into(), "get-or-create".into(), CLIENT.into()])
+            .await?;
+        self.ceph(&client_caps_argv(pools)).await?;
         Ok((
             String::from_utf8_lossy(&conf).trim().to_string() + "\n",
             String::from_utf8_lossy(&keyring).trim().to_string() + "\n",
@@ -537,7 +568,7 @@ impl CephAdmin {
         }
         Err(HostError::failed(format!(
             "`cephadm bootstrap` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            safe_diagnostic(&out.stderr)
         )))
     }
 
@@ -568,6 +599,39 @@ impl CephAdmin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyring_diagnostics_do_not_publish_credentials() {
+        let diagnostic = safe_diagnostic(b"auth: error setting modifier type=key val=secret: Malformed input\nconnection refused");
+        assert!(!diagnostic.contains("secret"));
+        assert!(diagnostic.contains("version compatibility"));
+        assert!(diagnostic.contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn distro_build_without_version_metadata_is_installed() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("cephadm-probe-{}", std::process::id()));
+        std::fs::write(&path, "#!/bin/sh\ncase \"$1\" in version) echo 'cephadm version UNKNOWN'; exit 1;; --help) exit 0;; *) exit 2;; esac\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let admin = CephAdmin {
+            cephadm: path.to_string_lossy().into_owned(),
+            ..CephAdmin::default()
+        };
+        let report = admin.installed().await;
+        assert!(report.installed);
+        assert!(report.version.is_empty(), "do not invent a version");
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(
+            !admin.installed().await.installed,
+            "a broken executable is unavailable"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            !admin.installed().await.installed,
+            "a missing executable is unavailable"
+        );
+    }
 
     /// A one-node cluster is a legitimate thing to build, and without
     /// `--single-host-defaults` it comes up warning for ever about a rule that
@@ -741,12 +805,12 @@ mod client_tests {
     /// be trusted with.
     #[test]
     fn the_client_a_hypervisor_acts_as_can_reach_its_pools_and_nothing_else() {
-        let argv = client_keyring_argv(&["velstra-volumes".into(), "velstra-images".into()]);
+        let argv = client_caps_argv(&["velstra-volumes".into(), "velstra-images".into()]);
         assert_eq!(
             argv,
             vec![
                 "auth",
-                "get-or-create",
+                "caps",
                 "client.velstra",
                 "mon",
                 "profile rbd",

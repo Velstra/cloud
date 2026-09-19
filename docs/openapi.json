@@ -1673,7 +1673,10 @@
           },
           "policy.hostBridges": {
             "description": "One bridge per line, as they are named on the nodes. A network put on one takes its instances off this platform's networks and onto whatever the machine is on — no address from us, no gateway, no security group. Empty means this project gets logical networks only, which is what a new customer should have. Named rather than a yes/no, because what anybody means by a host bridge is a particular wire. Settable at creation only.",
-            "type": "string",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
             "x-at-creation": true
           },
           "quota.backupGib": {

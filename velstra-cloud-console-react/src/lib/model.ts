@@ -25,6 +25,9 @@ export type Resource = {
 
 export const idOf = (r: Resource) => r.meta.name.split("/").pop() ?? r.meta.name;
 export const nameOf = (r: Resource) => r.meta.name;
+export const attentionName = (r: Resource, c: Collection) => c.id === "operations" && r.spec?.target
+  ? `${humanise(String(r.spec.verb ?? "Operation"))} ${String(r.spec.target).split("/").pop()}`
+  : idOf(r);
 
 export const VERDICT_ORDER: Record<Verdict, number> = {
   failing: 0, drifting: 1, unreported: 2, deleting: 3, settled: 4,
@@ -92,7 +95,9 @@ export const disagreements = (r: Resource, c: Collection) =>
   c.agreements
     .map((a) => ({ ...a, askedValue: at(r.spec, a.asked), isValue: at(r.status, a.is) }))
     .filter((a) => a.askedValue !== undefined && a.isValue !== undefined &&
-      String(a.askedValue) !== String(a.isValue));
+      (c.id === "ceph-clusters" && a.asked === "monitors" && Array.isArray(a.askedValue) && Array.isArray(a.isValue)
+        ? JSON.stringify([...a.askedValue].sort()) !== JSON.stringify([...a.isValue].sort())
+        : String(a.askedValue) !== String(a.isValue)));
 
 // ---- formatting -----------------------------------------------------------
 

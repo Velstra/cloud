@@ -54,7 +54,7 @@ export function Account({ r }: { r: Resource }) {
       </div>
 
       {!r.spec?.service && (
-        <form className="grid gap-2" onSubmit={(e) => e.preventDefault()}>
+        <form noValidate className="grid gap-2" onSubmit={(e) => e.preventDefault()}>
           <div className="text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)" }}>Password</div>
           <div className="flex flex-wrap items-center gap-2">
             {me && <Input type="password" value={current} onChange={(e) => setCurrent(e.target.value)} placeholder="current password" className="h-8 w-52 text-xs" autoComplete="current-password" />}

@@ -77,17 +77,17 @@ export function CloudInit({ value, onChange, disabled }: { value: string; onChan
             <span className="mx-2" />
             <Switch checked={b.updates} onCheckedChange={(v) => set("updates", !!v)} disabled={disabled} /> update and upgrade packages on first boot
           </div>
-          <Field label="SSH public keys" help="One per line."><Textarea disabled={disabled} rows={2} className="font-mono text-xs" value={b.sshKeys} onChange={(e) => set("sshKeys", e.target.value)} placeholder="ssh-ed25519 AAAA… name@host" /></Field>
+          <Field label="SSH public keys" help="One per line."><Textarea disabled={disabled} rows={2} className="resize-none font-mono text-xs" value={b.sshKeys} onChange={(e) => set("sshKeys", e.target.value)} placeholder="ssh-ed25519 AAAA… name@host" /></Field>
           <div className="grid grid-cols-2 gap-4">
-            <Field label="Packages" help="One per line."><Textarea disabled={disabled} rows={3} className="font-mono text-xs" value={b.packages} onChange={(e) => set("packages", e.target.value)} placeholder={"nginx\ncurl"} /></Field>
-            <Field label="Commands to run once" help="One per line, after packages."><Textarea disabled={disabled} rows={3} className="font-mono text-xs" value={b.runcmd} onChange={(e) => set("runcmd", e.target.value)} placeholder="systemctl enable --now nginx" /></Field>
+            <Field label="Packages" help="One per line."><Textarea disabled={disabled} rows={3} className="resize-none font-mono text-xs" value={b.packages} onChange={(e) => set("packages", e.target.value)} placeholder={"nginx\ncurl"} /></Field>
+            <Field label="Commands to run once" help="One per line, after packages."><Textarea disabled={disabled} rows={3} className="resize-none font-mono text-xs" value={b.runcmd} onChange={(e) => set("runcmd", e.target.value)} placeholder="systemctl enable --now nginx" /></Field>
           </div>
         </div>
       </TabsContent>
 
       <TabsContent value="raw">
         <div className="grid gap-2 pt-3">
-          <Textarea disabled={disabled} rows={14} className="font-mono text-xs" value={value ?? ""} onChange={(e) => onChange(e.target.value)}
+          <Textarea disabled={disabled} rows={14} className="resize-none font-mono text-xs" value={value ?? ""} onChange={(e) => onChange(e.target.value)}
             placeholder={"#cloud-config\nhostname: web-4\n…"} spellCheck={false} />
           <div className="flex items-center gap-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
             {value && !/^#cloud-config|^#!|^Content-Type: multipart/.test(value.trimStart()) && <span style={{ color: "var(--drifting)" }}>Does not start with <code>#cloud-config</code> or <code>#!</code> — cloud-init will ignore it.</span>}

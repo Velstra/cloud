@@ -74,7 +74,7 @@ export function Members({ r, coll, reload }: { r: Resource; coll: Collection; re
       </table>
 
       {may && (
-        <form className="flex flex-wrap items-center gap-2" onSubmit={(e) => { e.preventDefault(); if (!member.trim()) return; setList([...list, { member: member.trim(), role }]); setMember(""); }}>
+        <form noValidate className="flex flex-wrap items-center gap-2" onSubmit={(e) => { e.preventDefault(); if (!member.trim()) return; setList([...list, { member: member.trim(), role }]); setMember(""); }}>
           <Input list="velstra-users" value={member} onChange={(e) => setMember(e.target.value)} placeholder="user id or subject, as the sign-in reports it" className="h-8 w-72 font-mono text-xs" />
           <datalist id="velstra-users">{users.map((u) => <option key={u} value={u} />)}</datalist>
           <select value={role} onChange={(e) => setRole(e.target.value)} className="h-8 rounded-[4px] border px-1.5 text-xs" style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text-body)" }}>

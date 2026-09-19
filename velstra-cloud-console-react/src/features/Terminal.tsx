@@ -20,8 +20,12 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
   const host = useRef<HTMLDivElement>(null);
   const term = useRef<XTerm | null>(null);
   const socket = useRef<WebSocket | null>(null);
+  const fitObserver = useRef<ResizeObserver | null>(null);
+  const input = useRef<{ dispose: () => void } | null>(null);
+  const attempt = useRef(0);
   const [state, setState] = useState<"closed" | "asking" | "open" | "gone">("closed");
   const [why, setWhy] = useState("");
+  const [readOnly, setReadOnly] = useState(false);
   // Whether the hop from the API to the node carrying this guest is private.
   // The browser's own leg is TLS whenever this page is; this is the one behind
   // it, across whatever network the cell's machines share. Said out loud
@@ -30,14 +34,17 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
   // private.
   const [encrypted, setEncrypted] = useState<boolean | null>(null);
 
-  useEffect(() => () => { socket.current?.close(); term.current?.dispose(); }, []);
+  useEffect(() => () => { ++attempt.current; socket.current?.close(); input.current?.dispose(); fitObserver.current?.disconnect(); term.current?.dispose(); }, []);
 
   const attach = async () => {
+    const current = ++attempt.current;
     setWhy(""); setState("asking");
     try {
       const path = `${pathOf(coll, r, project)}/${encodeURIComponent(idOf(r))}`;
       const grant = await call("console", "POST", `${path}:console`, undefined, {});
+      if (current !== attempt.current) return;
       setEncrypted(grant.encrypted === true);
+      setReadOnly(grant.readOnly === true);
       const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${path}:consoleStream?session=${encodeURIComponent(grant.session)}&ticket=${encodeURIComponent(grant.ticket)}`;
       if (!term.current && host.current) {
         const t = new XTerm({
@@ -45,16 +52,19 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
           theme: { background: getComputedStyle(document.documentElement).getPropertyValue("--ink-950").trim() || "#080c11" },
         });
         const fit = new FitAddon(); t.loadAddon(fit); t.open(host.current); fit.fit();
-        addEventListener("resize", () => fit.fit());
+        fitObserver.current = new ResizeObserver(() => fit.fit());
+        fitObserver.current.observe(host.current);
         term.current = t;
       }
       const ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
       socket.current = ws;
       ws.onopen = () => { setState("open"); term.current?.focus(); };
       ws.onmessage = (e) => term.current?.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data as ArrayBuffer));
       ws.onclose = () => setState("gone");
       ws.onerror = () => { setWhy("The stream did not open."); setState("gone"); };
-      term.current?.onData((d) => { if (ws.readyState === WebSocket.OPEN) ws.send(d); });
+      input.current?.dispose();
+      input.current = grant.readOnly ? null : term.current?.onData((d) => { if (ws.readyState === WebSocket.OPEN) ws.send(d); }) ?? null;
     } catch (e) {
       setWhy((e as Error).message); setState("closed");
     }
@@ -67,13 +77,13 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
         {state === "asking" && <span>Asking for a session…</span>}
         {state === "open" && <><span style={{ color: "var(--settled)" }}>● attached</span><Button size="sm" variant="secondary" onClick={() => socket.current?.close()}>Detach</Button></>}
         {state === "gone" && <><span>Detached.</span><Button size="sm" variant="secondary" onClick={attach}>Attach again</Button></>}
+        {readOnly && state === "open" && <span>Read-only session</span>}
         {why && <span role="alert" style={{ color: "var(--failing)" }}>{why}</span>}
         {encrypted === false && (
           // Not an error and not decoration: it is the one thing somebody
           // needs to know before they type a password into this box.
           <span role="status" style={{ color: "var(--drifting)" }}>
-            ⚠ Not encrypted past this browser — what you type crosses the cell's own network in
-            the clear. Give the node a console certificate to change that.
+            ⚠ Node connection is unencrypted. Configure console TLS before entering secrets.
           </span>
         )}
         {encrypted === true && (
