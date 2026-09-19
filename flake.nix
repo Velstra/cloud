@@ -822,6 +822,41 @@
                     f"curl -fsS {auth} {api}/nodes/node-1 | grep -q vcpus",
                     timeout=120,
                 )
+
+            with subtest("guest metadata crosses the host firewall only from a guest interface"):
+                # A network namespace represents the guest side of the same
+                # bridge input path used by a VM. The real metadata service
+                # must answer an unknown source with 404, never guest data.
+                node.succeed(
+                    "ip netns add metadata-guest",
+                    "ip link add vbr-test type bridge",
+                    "ip addr add 10.250.0.1/24 dev vbr-test",
+                    "ip link set vbr-test up",
+                    "ip link add metadata-host type veth peer name guest0",
+                    "ip link set metadata-host master vbr-test",
+                    "ip link set metadata-host up",
+                    "ip link set guest0 netns metadata-guest",
+                    "ip -n metadata-guest link set lo up",
+                    "ip -n metadata-guest addr add 10.250.0.2/24 dev guest0",
+                    "ip -n metadata-guest link set guest0 up",
+                    "ip -n metadata-guest route add 169.254.169.254/32 via 10.250.0.1",
+                )
+                for _ in range(2):
+                    node.wait_until_succeeds(
+                        "test $(ip netns exec metadata-guest ${pkgs.curl}/bin/curl"
+                        " --noproxy '*' --max-time 5 -s -o /dev/null -w '%{http_code}'"
+                        " http://169.254.169.254/latest/meta-data/instance-id) = 404"
+                    )
+                    node.succeed("systemctl restart firewall")
+
+                address = node.succeed(
+                    "ip -4 -o addr show dev eth1 | awk '{print $4}' | cut -d/ -f1"
+                ).strip()
+                cell.succeed(f"ip route replace 169.254.169.254/32 via {address}")
+                cell.fail(
+                    "curl --noproxy '*' --max-time 5 -s -o /dev/null"
+                    " http://169.254.169.254/latest/meta-data/instance-id"
+                )
           '';
         };
 

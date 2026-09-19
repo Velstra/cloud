@@ -217,6 +217,14 @@ knowing when reading a cluster by hand: a pool with `size: 1` needs
 so a disk that was something else has to be wiped (`wipefs -a`) before it can
 be an OSD.
 
+## Guest metadata access
+
+The NixOS node firewall allows metadata HTTP only to `169.254.169.254:80`
+from the default guest bridges (`vbr+`) and taps (`vt+`). When using custom
+guest-facing interface names, set `velstra.cloud.node.metadataInterfaces`
+accordingly. Do not include uplinks or open port 80 globally. Unknown guest
+addresses still receive no metadata from the node agent.
+
 ## Replicated control planes and release storage
 
 The bundled etcd is a single-member development/small-cell default and is a

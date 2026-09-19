@@ -98,6 +98,20 @@ in
       '';
     };
 
+    metadataInterfaces = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "vbr+"
+        "vt+"
+      ];
+      description = ''
+        Guest-facing interfaces allowed to reach 169.254.169.254:80.
+        A trailing + matches an interface prefix. Add an explicitly managed
+        guest bridge here when using custom bridge or tap names; uplinks must
+        not be included. Other ports and destinations remain filtered.
+      '';
+    };
+
     hugepages = lib.mkOption {
       type = lib.types.int;
       default = 0;
@@ -191,6 +205,25 @@ in
       # nobody asked for ssh this is a port with no listener.
       22
     ];
+
+    # Metadata is a host input packet, not forwarded tenant traffic. The
+    # guest's security-group rules cannot open the NixOS host firewall.
+    networking.firewall.extraCommands = lib.mkIf (!config.networking.nftables.enable) (
+      lib.concatMapStringsSep "\n" (iface: ''
+        iptables -w -A nixos-fw -i ${lib.escapeShellArg iface} -d 169.254.169.254/32 -p tcp --dport 80 -j nixos-fw-accept
+      '') cfg.metadataInterfaces
+    );
+    networking.firewall.extraInputRules = lib.mkIf config.networking.nftables.enable (
+      lib.concatMapStringsSep "\n" (
+        iface:
+        let
+          pattern = if lib.hasSuffix "+" iface then lib.removeSuffix "+" iface + "*" else iface;
+        in
+        ''
+          iifname ${builtins.toJSON pattern} ip daddr 169.254.169.254 tcp dport 80 accept
+        ''
+      ) cfg.metadataInterfaces
+    );
 
     boot.kernelModules = [
       "kvm-intel"
