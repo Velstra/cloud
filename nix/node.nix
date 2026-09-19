@@ -137,6 +137,7 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    networking.nftables.enable = true;
     # The stamp the node agent reads to say which build this is. On the
     # image `/etc` is the sealed store, so this is the one place the build
     # can be written and the one place it cannot be changed afterwards.
@@ -172,6 +173,7 @@ in
       ]
       ++ lib.optional (cfg.fabricAgent != null) cfg.fabricAgent;
     virtualisation.podman.enable = true;
+    virtualisation.containers.containersConf.settings.network.firewall_driver = "nftables";
 
     # KVM now, IOMMU-ready for the passthrough phase: the design doc's device
     # model needs `iommu=pt` and the vendor IOMMU enabled from day one, because
@@ -208,12 +210,7 @@ in
 
     # Metadata is a host input packet, not forwarded tenant traffic. The
     # guest's security-group rules cannot open the NixOS host firewall.
-    networking.firewall.extraCommands = lib.mkIf (!config.networking.nftables.enable) (
-      lib.concatMapStringsSep "\n" (iface: ''
-        iptables -w -A nixos-fw -i ${lib.escapeShellArg iface} -d 169.254.169.254/32 -p tcp --dport 80 -j nixos-fw-accept
-      '') cfg.metadataInterfaces
-    );
-    networking.firewall.extraInputRules = lib.mkIf config.networking.nftables.enable (
+    networking.firewall.extraInputRules =
       lib.concatMapStringsSep "\n" (
         iface:
         let
@@ -222,8 +219,7 @@ in
         ''
           iifname ${builtins.toJSON pattern} ip daddr 169.254.169.254 tcp dport 80 accept
         ''
-      ) cfg.metadataInterfaces
-    );
+      ) cfg.metadataInterfaces;
 
     boot.kernelModules = [
       "kvm-intel"

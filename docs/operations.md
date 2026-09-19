@@ -219,6 +219,12 @@ be an OSD.
 
 ## Guest metadata access
 
+Cloud's NixOS modules use the native nftables host firewall. The node's Podman
+networking also selects nftables. Fabric continues to enforce its dataplane
+policies through eBPF/XDP; nodes using the local networking mode use nftables
+for guest filtering and NAT. The Debian package does not replace an existing
+operator-managed host firewall.
+
 The NixOS node firewall allows metadata HTTP only to `169.254.169.254:80`
 from the default guest bridges (`vbr+`) and taps (`vt+`). When using custom
 guest-facing interface names, set `velstra.cloud.node.metadataInterfaces`

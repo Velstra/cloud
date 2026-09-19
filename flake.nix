@@ -824,6 +824,9 @@
                 )
 
             with subtest("guest metadata crosses the host firewall only from a guest interface"):
+                node.succeed("nft list table inet nixos-fw")
+                # A host firewall reload must preserve agent-owned tables.
+                node.succeed("nft add table inet velstra-reload-test")
                 # A network namespace represents the guest side of the same
                 # bridge input path used by a VM. The real metadata service
                 # must answer an unknown source with 404, never guest data.
@@ -847,7 +850,8 @@
                         " --noproxy '*' --max-time 5 -s -o /dev/null -w '%{http_code}'"
                         " http://169.254.169.254/latest/meta-data/instance-id) = 404"
                     )
-                    node.succeed("systemctl restart firewall")
+                    node.succeed("systemctl restart nftables")
+                    node.succeed("nft list table inet velstra-reload-test")
 
                 address = node.succeed(
                     "ip -4 -o addr show dev eth1 | awk '{print $4}' | cut -d/ -f1"

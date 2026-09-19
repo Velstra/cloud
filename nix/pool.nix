@@ -217,6 +217,7 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    networking.nftables.enable = true;
     assertions = [
       {
         assertion = cfg.fromSeed || (cfg.apiUrl == null) == (cfg.tokenFile == null);
