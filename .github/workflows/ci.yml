@@ -535,6 +535,11 @@ jobs:
     if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v7
+      # systemd-repart maps root inside a user namespace while building images.
+      # Ubuntu 24.04 blocks that mapping by default, including in Nix builders.
+      - name: Allow user namespaces for image construction
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
@@ -646,6 +651,12 @@ jobs:
             exit 1
           fi
 
+      # systemd-repart maps root inside a user namespace while building images.
+      # Ubuntu 24.04 blocks that mapping by default, including in Nix builders.
+      - name: Allow user namespaces for image construction
+        if: matrix.check == 'node-image-boots'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
@@ -670,6 +681,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nixos-test-${{ matrix.check }}
-          path: /tmp/nix-build-*
+          path: |
+            /tmp/nix-build-*
+            /nix/var/nix/builds/nix-*
           retention-days: 7
           if-no-files-found: warn

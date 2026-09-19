@@ -1775,7 +1775,9 @@
             };
             virtualisation = {
               memorySize = 2048;
-              diskSize = 4096;
+              # Backups require 8 GiB of free target headroom in addition
+              # to the operating system and volume files.
+              diskSize = 16384;
             };
           };
           testScript = ''
@@ -1846,7 +1848,7 @@
                     f" {api}/projects/p1/backups"
                 )
                 cell.wait_until_succeeds(
-                    f"curl -fsS {auth} {api}/projects/p1/backups/b1 | grep -q '\"taken\":true'",
+                    f"curl -fsS {auth} {api}/projects/p1/backups/b1 | tee /dev/stderr | grep -q '\"taken\":true'",
                     timeout=180,
                 )
                 # Named for the backup with its slashes flattened, so a person

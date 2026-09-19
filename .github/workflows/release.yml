@@ -41,6 +41,11 @@ jobs:
           echo "----- release notes for $version -----"
           cat RELEASE_NOTES.md
 
+      # systemd-repart maps root inside a user namespace while building images.
+      # Ubuntu 24.04 blocks that mapping by default, including in Nix builders.
+      - name: Allow user namespaces for image construction
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
