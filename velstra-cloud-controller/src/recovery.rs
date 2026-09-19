@@ -1,7 +1,7 @@
 //! Bringing guests back from a node that stopped answering.
 //!
 //! This controller does exactly one thing: it clears `spec.node` on a guest
-//! whose node has been quiet long enough that the guest is certainly stopped.
+//! whose node has exceeded its quiet deadline and has confirmed external fencing.
 //! The scheduler then does what it always does with an unplaced guest, and the
 //! destination's agent starts it.
 //!
@@ -12,15 +12,10 @@
 //!
 //! ## What makes it safe
 //!
-//! Nothing here decides that a node is dead. It reads how long ago the node
-//! last reported and compares that against the node's **own** fencing deadline
-//! plus a margin — and the node's agent stops its guests at that deadline,
-//! using its own clock, needing nothing from anybody. So by the time this acts,
-//! the guests are stopped or the machine is gone.
-//!
-//! A node with no deadline is never recovered from. The arithmetic and the
-//! reasons live in [`velstra_cloud_model::ha`]; this is the loop that performs
-//! what they decide.
+//! Silence alone does not authorize recovery. The node's deadline and margin
+//! must have elapsed and an operator must have confirmed external fencing for
+//! this exact last heartbeat. The agent's own process may be dead while its
+//! guests continue running, so its best-effort self-fence cannot prove safety.
 //!
 //! ## Where the reasons are, and why they are not here
 //!
@@ -114,7 +109,11 @@ impl Reconciler for RecoveryController {
             return Ok(());
         }
 
-        let Some(node) = self.nodes.get(&node_name).await? else {
+        let Some(node) = self
+            .nodes
+            .get(&format!("nodes/{}", node_name.trim_start_matches("nodes/")))
+            .await?
+        else {
             // The node object has gone while a guest still names it. Not this
             // controller's to fix: clearing `spec.node` here would race with
             // whoever is removing the node, and a guest placed on a machine
@@ -133,6 +132,7 @@ impl Reconciler for RecoveryController {
         let view = NodeView {
             name: node_name.clone(),
             last_heartbeat: node.status.last_heartbeat,
+            fenced_heartbeat: velstra_cloud_model::ha::confirmed_heartbeat(&node.meta.labels),
             fence_after_s: node.spec.fence_after_s,
             ready: velstra_cloud_model::meta::condition(&node.status.conditions, "Ready")
                 .is_some_and(|c| c.status == ConditionStatus::True),
@@ -229,6 +229,9 @@ mod tests {
                 ..Default::default()
             },
         );
+        n.meta
+            .labels
+            .insert(ha::FENCED_HEARTBEAT_LABEL.into(), heard.to_string());
         set_condition(&mut n.status.conditions, Condition::ready(1));
         nodes.create(&n, &Writer::controller("test")).await.unwrap();
 
@@ -241,7 +244,7 @@ mod tests {
                 start_order: 0,
                 start_delay_s: 0,
                 on_node_loss: policy,
-                node: Some(NODE.into()),
+                node: Some("node-b".into()),
                 vcpus: 2,
                 memory_mib: 4096,
                 image: "projects/p1/images/debian".into(),
@@ -250,7 +253,7 @@ mod tests {
             },
             InstanceStatus {
                 state: InstanceState::Running,
-                node: Some(NODE.into()),
+                node: Some("node-b".into()),
                 ..Default::default()
             },
         );
@@ -295,7 +298,10 @@ mod tests {
             let n = self
                 .controller
                 .nodes
-                .get(i.spec.node.as_deref().unwrap_or_default())
+                .get(&format!(
+                    "nodes/{}",
+                    i.spec.node.as_deref().unwrap_or_default()
+                ))
                 .await
                 .unwrap()
                 .unwrap();
@@ -310,6 +316,7 @@ mod tests {
                 &NodeView {
                     name: n.meta.name.to_string(),
                     last_heartbeat: n.status.last_heartbeat,
+                    fenced_heartbeat: ha::confirmed_heartbeat(&n.meta.labels),
                     fence_after_s: n.spec.fence_after_s,
                     ready: true,
                 },
@@ -330,7 +337,7 @@ mod tests {
         // for.
         f.quiet_for(10);
         f.pass().await;
-        assert_eq!(f.placed_on().await.as_deref(), Some(NODE));
+        assert_eq!(f.placed_on().await.as_deref(), Some("node-b"));
         let Err(ha::NotRecoverable::NotQuietLongEnough { need_s, .. }) = f.verdict().await else {
             panic!("nothing explained why the guest had not moved");
         };
@@ -341,7 +348,7 @@ mod tests {
         // the two clocks disagreeing about when "now" is.
         f.quiet_for(70);
         f.pass().await;
-        assert_eq!(f.placed_on().await.as_deref(), Some(NODE));
+        assert_eq!(f.placed_on().await.as_deref(), Some("node-b"));
 
         // Past both: unplaced, which is all this controller ever does. The
         // scheduler takes it from here exactly as it would any unplaced guest.
@@ -364,7 +371,7 @@ mod tests {
 
         assert_eq!(
             f.placed_on().await.as_deref(),
-            Some(NODE),
+            Some("node-b"),
             "a guest was moved off a node that never stops its own"
         );
         let Err(why @ ha::NotRecoverable::NodeDoesNotFence { .. }) = f.verdict().await else {
@@ -385,7 +392,7 @@ mod tests {
         f.quiet_for(86_400);
         f.pass().await;
 
-        assert_eq!(f.placed_on().await.as_deref(), Some(NODE));
+        assert_eq!(f.placed_on().await.as_deref(), Some("node-b"));
         // And nothing was written about it. This is nearly every guest in
         // nearly every cell, so it is the path that has to be free.
         let after = f.instances.get(GUEST).await.unwrap().unwrap();

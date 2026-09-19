@@ -2103,14 +2103,15 @@ unreachable and still running every guest it holds, and starting those guests
 elsewhere then produces two of each writing to one volume — an outage turned
 into a restore from backup.
 
-So recovery rests on one mechanism: **the node's own agent stops its guests
-before anything may start them.** `nodes/<id>.spec.fenceAfterS` is how long the
-agent may fail to report before it does, decided against its own clock, needing
-nothing from anybody. The control plane then waits that long *again* before
-unplacing anything.
+Recovery requires independent fencing: the host must be powered off or isolated
+from shared storage before an operator records its current `status.lastHeartbeat`
+in the node label `velstra.io/fenced-heartbeat`. A later heartbeat invalidates
+that confirmation. The agent attempts to kill its guests after `spec.fenceAfterS`,
+but an agent crash can leave guests running, so silence alone is never proof.
+The control plane also waits for the configured deadline plus its safety margin.
+See `operations.md` for the fencing and reconciliation procedure.
 
 A node whose `fenceAfterS` is zero — the default — is **never recovered from**.
-Nothing can tell "unreachable" from "stopped", so nothing is assumed.
 
 A guest opts in with `spec.onNodeLoss: "restart"` (default `"leave"`). Only for
 one whose storage every node can reach: a guest on local storage started
@@ -2123,11 +2124,11 @@ this platform is built to prevent:
 ```
 GET /api/v1/projects/p1/instances/i1:explainRecovery
 { "node": "nodes/node-b", "recoverable": false, "why": "WaitingForFencing",
-  "detail": "nodes/node-b was last heard from 30s ago; 120s is when its guests are certainly stopped" }
+  "detail": "nodes/node-b was last heard from 30s ago; recovery requires at least 120s of silence and external fencing confirmation" }
 ```
 
 `why` is a stable token — `PolicyIsLeave`, `WaitingForFencing`,
-`NodeDoesNotFence`, `HoldsDevices`, `NotRunning`, `NotPlaced` — because the
+`NodeDoesNotFence`, `FenceNotConfirmed`, `HoldsDevices`, `NotRunning`, `NotPlaced` — because the
 reasons are four different afternoons for whoever reads them. Recovery itself
 is one write: the controller clears `spec.node`, and the scheduler then places
 the guest exactly as it would any unplaced one.

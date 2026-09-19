@@ -25,6 +25,7 @@ repository = "https://github.com/Velstra/cloud"
 homepage = "https://github.com/Velstra/cloud"
 
 [workspace.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
 velstra-cloud-fabric = { path = "velstra-cloud-fabric" }
 velstra-cloud-model = { path = "velstra-cloud-model" }
 velstra-cloud-proto = { path = "velstra-cloud-proto" }

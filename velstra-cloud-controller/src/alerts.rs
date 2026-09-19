@@ -338,6 +338,7 @@ pub fn evaluate(
         let view = NodeView {
             name: node.meta.name.to_string(),
             last_heartbeat: node.status.last_heartbeat,
+            fenced_heartbeat: velstra_cloud_model::ha::confirmed_heartbeat(&node.meta.labels),
             fence_after_s: node.spec.fence_after_s,
             ready: condition(&node.status.conditions, "Ready")
                 .is_some_and(|c| c.status == velstra_cloud_model::meta::ConditionStatus::True),

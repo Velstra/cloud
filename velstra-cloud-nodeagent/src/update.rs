@@ -62,6 +62,15 @@ enum Decision {
 
 /// The whole decision, from what is wanted, what runs, and what is under way.
 fn decide(phase: &Phase, wanted: Option<&Wanted>, installed: &Installed) -> Decision {
+    match phase {
+        Phase::Working { message, .. } => {
+            return Decision::Say(ConditionStatus::True, "Working", message.clone());
+        }
+        Phase::Applied { version, message } if !installed.runs(version) => {
+            return Decision::Say(ConditionStatus::True, "Applied", message.clone());
+        }
+        _ => {}
+    }
     let Some(wanted) = wanted else {
         return Decision::Nothing;
     };
@@ -79,7 +88,7 @@ fn decide(phase: &Phase, wanted: Option<&Wanted>, installed: &Installed) -> Deci
         Phase::Applied { version, message } if *version == wanted.version => {
             Decision::Say(ConditionStatus::True, "Applied", message.clone())
         }
-        Phase::Failed { version, why } if *version == wanted.version => {
+        Phase::Failed { version, why } if version.is_empty() || *version == wanted.version => {
             Decision::Say(ConditionStatus::False, "Failed", why.clone())
         }
         _ => Decision::Start,
@@ -95,8 +104,8 @@ pub struct Updater {
 impl Updater {
     pub fn new(dir: PathBuf) -> Self {
         Self {
+            phase: Arc::new(Mutex::new(read_attempt(&dir))),
             dir,
-            phase: Arc::new(Mutex::new(Phase::Idle)),
         }
     }
 
@@ -110,17 +119,36 @@ impl Updater {
         cell: Arc<dyn CellReader>,
         generation: u64,
     ) -> Option<Condition> {
-        let current = self.phase.lock().unwrap().clone();
+        let mut held = self.phase.lock().unwrap();
+        let current = held.clone();
         match decide(&current, wanted, installed) {
             Decision::Nothing => {
                 if !matches!(current, Phase::Working { .. }) {
-                    *self.phase.lock().unwrap() = Phase::Idle;
+                    if let Err(message) = clear_attempt(&self.dir) {
+                        return Some(Condition::new(
+                            UPDATING,
+                            ConditionStatus::False,
+                            "Failed",
+                            &message,
+                            generation,
+                        ));
+                    }
+                    *held = Phase::Idle;
                 }
                 None
             }
             Decision::Say(status, reason, message) => {
                 if reason == "UpToDate" {
-                    *self.phase.lock().unwrap() = Phase::Idle;
+                    if let Err(message) = clear_attempt(&self.dir) {
+                        return Some(Condition::new(
+                            UPDATING,
+                            ConditionStatus::False,
+                            "Failed",
+                            &message,
+                            generation,
+                        ));
+                    }
+                    *held = Phase::Idle;
                 }
                 Some(Condition::new(
                     UPDATING, status, reason, &message, generation,
@@ -131,10 +159,11 @@ impl Updater {
                     .expect("a start is only decided for a wanted build")
                     .clone();
                 let message = format!("fetching {}", wanted.file);
-                *self.phase.lock().unwrap() = Phase::Working {
+                *held = Phase::Working {
                     version: wanted.version.clone(),
                     message: message.clone(),
                 };
+                drop(held);
                 let phase = self.phase.clone();
                 let dir = self.dir.clone();
                 let kind = installed.kind;
@@ -165,6 +194,73 @@ impl Updater {
             }
         }
     }
+}
+
+/// An unfinished attempt must never be replayed on boot: the machine may
+/// have just rolled back from that very image. Clearing wanted explicitly
+/// acknowledges the failure and permits a deliberate retry.
+fn read_attempt(dir: &Path) -> Phase {
+    match std::fs::read(dir.join("attempt.json")) {
+        Ok(bytes) => match serde_json::from_slice::<Wanted>(&bytes) {
+            Ok(wanted) => Phase::Failed { version: wanted.version, why: "the previous update was interrupted or rolled back; clear wanted before retrying".into() },
+            Err(_) => Phase::Failed { version: String::new(), why: "the update attempt record is unreadable; inspect and remove attempt.json before retrying".into() },
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Phase::Idle,
+        Err(e) => Phase::Failed { version: String::new(), why: format!("cannot read the update attempt: {e}") },
+    }
+}
+
+fn attempt_lock(dir: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join("update.lock"))
+        .map_err(|e| e.to_string())?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|e| format!("another update owns this machine: {e}"))?;
+    Ok(lock)
+}
+
+fn clear_attempt(dir: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let _lock = attempt_lock(dir)?;
+    match std::fs::remove_file(dir.join("attempt.json")) {
+        Ok(()) => std::fs::File::open(dir)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot clear the update attempt: {e}")),
+    }
+}
+
+fn record_attempt(dir: &Path, wanted: &Wanted) -> Result<std::fs::File, String> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let lock = attempt_lock(dir)?;
+    if let Ok(bytes) = std::fs::read(dir.join("attempt.json")) {
+        let previous: Wanted = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if previous.version != wanted.version {
+            std::fs::remove_file(dir.join("attempt.json")).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join("attempt.json"))
+        .map_err(|e| format!("an update attempt already exists or cannot be recorded: {e}"))?;
+    file.write_all(&serde_json::to_vec(wanted).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    std::fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(lock)
 }
 
 fn say(phase: &Arc<Mutex<Phase>>, version: &str, message: &str) {
@@ -202,6 +298,7 @@ async fn run(
             );
         }
     }
+    let _lock = record_attempt(dir, wanted)?;
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| format!("making {}: {e}", dir.display()))?;
@@ -298,13 +395,17 @@ async fn apply_image(
         &wanted.version,
         "written into the inactive slot; rebooting into it",
     );
-    tokio::spawn(async {
-        tokio::time::sleep(REBOOT_AFTER).await;
-        let _ = tokio::process::Command::new("systemctl")
-            .arg("reboot")
-            .status()
-            .await;
-    });
+    tokio::time::sleep(REBOOT_AFTER).await;
+    run_tool(
+        &[
+            "systemctl",
+            "/run/current-system/sw/bin/systemctl",
+            "/usr/bin/systemctl",
+        ],
+        &["reboot"],
+    )
+    .await
+    .map_err(|why| format!("the image was written but reboot failed: {why}"))?;
     Ok(format!(
         "written into the inactive slot; rebooting into {} (a boot that fails three times rolls \
          back)",
@@ -456,5 +557,62 @@ mod tests {
             why.contains("expected aa") && why.contains("got bb"),
             "{why}"
         );
+    }
+    #[test]
+    fn another_target_cannot_interrupt_an_inflight_update() {
+        let mut next = wanted();
+        next.version = "other".into();
+        let active = Phase::Working {
+            version: "first".into(),
+            message: "writing a slot".into(),
+        };
+        assert!(matches!(
+            decide(&active, Some(&next), &running("old")),
+            Decision::Say(..)
+        ));
+        assert!(matches!(
+            decide(&active, None, &running("old")),
+            Decision::Say(..)
+        ));
+        let applied = Phase::Applied {
+            version: "first".into(),
+            message: "rebooting".into(),
+        };
+        assert!(matches!(
+            decide(&applied, Some(&next), &running("old")),
+            Decision::Say(..)
+        ));
+    }
+
+    #[test]
+    fn an_interrupted_update_is_not_replayed_and_attempts_are_exclusive() {
+        let dir =
+            std::env::temp_dir().join(format!("velstra-update-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = wanted();
+        let lock = record_attempt(&dir, &w).unwrap();
+        let other = Wanted {
+            version: "another".into(),
+            ..w.clone()
+        };
+        assert!(record_attempt(&dir, &other).is_err());
+        assert!(clear_attempt(&dir).is_err());
+        assert!(dir.join("attempt.json").exists());
+        drop(lock);
+        let restarted = Updater::new(dir.clone());
+        let phase = restarted.phase.lock().unwrap();
+        assert!(matches!(
+            decide(&phase, Some(&w), &running("old")),
+            Decision::Say(ConditionStatus::False, "Failed", _)
+        ));
+        assert!(matches!(
+            decide(&phase, Some(&w), &running(&w.version)),
+            Decision::Say(ConditionStatus::False, "UpToDate", _)
+        ));
+        assert!(record_attempt(&dir, &w).is_err());
+        clear_attempt(&dir).unwrap();
+        assert_eq!(read_attempt(&dir), Phase::Idle);
+        drop(record_attempt(&dir, &w).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

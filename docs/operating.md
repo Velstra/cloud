@@ -74,18 +74,18 @@ until 03:00 for the memory swap" wherever a placement is refused.
 
 ## 3. When a machine dies without being asked to
 
-Recovery is **off** unless two things are true, and both are deliberate:
+Recovery requires all three:
 
-1. the node has `fenceAfterS` set, so it stops its own guests when it loses the
-   control plane; and
-2. the guest has `onNodeLoss: "restart"`.
+1. a node fencing deadline (`fenceAfterS`) and the additional recovery margin have elapsed;
+2. the guest requests `onNodeLoss: "restart"` and has storage reachable from its replacement;
+3. a cell operator has confirmed **external fencing** for the node's current last heartbeat.
 
-Without the first, nothing can tell "unreachable" from "stopped", and starting
-the guest elsewhere is how two machines come to write to one volume. Without the
-second, a guest on local storage would be restarted somewhere with nothing to
-restart *into* — an empty machine wearing a familiar name.
-
-`:explainRecovery` says which of the two is missing, per guest, in a sentence.
+The agent attempts a hard stop when contact is lost, but a crashed or blocked
+agent cannot guarantee it. A silent host is never proof that its guests stopped.
+Power the host off through an independent management path, keep it off, and
+follow the confirmation procedure in `operations.md`. `:explainRecovery` reports
+`FenceNotConfirmed` until the confirmation is present. A new heartbeat invalidates
+an old confirmation.
 
 ---
 
@@ -100,7 +100,7 @@ became so:
 
 | rule | severity | fires when |
 |---|---|---|
-| `node-silent` | critical | a machine has not reported for longer than its own `fenceAfterS` plus a minute — the moment its guests are certainly stopped and recovery may move them |
+| `node-silent` | critical | a machine has not reported for longer than its own `fenceAfterS` plus a minute — external fencing must be checked before recovery may move its guests |
 | `ceph-error` | critical | the cluster says `HEALTH_ERR` |
 | `ceph-osd-down` | critical | a disk is not up, or is up and out |
 | `ceph-warning` | warning | the cluster says `HEALTH_WARN`, with the checks it named |

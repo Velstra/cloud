@@ -240,6 +240,19 @@ pub fn plan(
         };
     }
     let to = release.version.clone();
+    if status
+        .nodes
+        .iter()
+        .any(|row| !row.to.is_empty() && row.to != to)
+    {
+        next.phase = RolloutPhase::Failed;
+        next.message =
+            "the release changed its build after this rollout started; create a new rollout".into();
+        return Plan {
+            status: next,
+            actions,
+        };
+    }
 
     // Which machines, in what order: as named, or every node by name — and the
     // control plane last either way.
@@ -290,6 +303,13 @@ pub fn plan(
             NodePhase::Pending => {
                 if seen.installed.runs(&to) {
                     settle(row, NodePhase::Done, &format!("already on {to}"), now);
+                } else if !seen.schedulable || seen.evacuating {
+                    settle(
+                        row,
+                        NodePhase::Refused,
+                        "node is already cordoned or evacuating; its existing maintenance state is preserved",
+                        now,
+                    );
                 } else if let Some(why) = seen.installed.rollout_refusal() {
                     settle(row, NodePhase::Refused, &why, now);
                 } else if Wanted::for_node(release_name, release, seen.installed.kind).is_none() {
@@ -989,5 +1009,49 @@ mod tests {
             "{}",
             out.status.message
         );
+    }
+    #[test]
+    fn a_rollout_does_not_take_over_an_existing_maintenance_cordon() {
+        let mut machine = node("paul", InstallKind::Package, FROM);
+        machine.schedulable = false;
+        let out = plan(
+            &RolloutSpec {
+                release: RELEASE.into(),
+                ..Default::default()
+            },
+            &RolloutStatus::default(),
+            Some((RELEASE, &release())),
+            &[machine],
+            Timestamp(1000),
+        );
+        assert_eq!(out.status.nodes[0].phase, NodePhase::Refused);
+        assert!(out.actions.is_empty());
+    }
+    #[test]
+    fn a_changed_release_build_cannot_reuse_completed_progress() {
+        let spec = RolloutSpec {
+            release: RELEASE.into(),
+            ..Default::default()
+        };
+        let fleet = [node("paul", InstallKind::Package, TO)];
+        let first = plan(
+            &spec,
+            &RolloutStatus::default(),
+            Some((RELEASE, &release())),
+            &fleet,
+            Timestamp(1000),
+        );
+        assert_eq!(first.status.phase, RolloutPhase::Done);
+        let mut changed = release();
+        changed.version = "another-build".into();
+        let next = plan(
+            &spec,
+            &first.status,
+            Some((RELEASE, &changed)),
+            &fleet,
+            Timestamp(2000),
+        );
+        assert_eq!(next.status.phase, RolloutPhase::Failed);
+        assert!(next.actions.is_empty());
     }
 }

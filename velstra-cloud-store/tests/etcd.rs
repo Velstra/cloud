@@ -281,6 +281,7 @@ macro_rules! cases {
 }
 
 cases! {
+    admission_is_atomic,
     a_revision_moves_forward_and_never_repeats,
     an_object_round_trips_through_create_read_update_delete,
     a_stale_writer_is_refused_rather_than_winning,
@@ -540,6 +541,17 @@ async fn a_snapshot_is_written_whole_and_restorable_in_shape() {
         .expect("etcd has something durable to copy");
     let bytes = std::fs::read(&wrote).unwrap();
     // A bbolt file starts with a meta page whose magic is 0xED0CDAED at offset
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        assert_eq!(
+            entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     // 16 (little-endian). Checking it is what tells "a snapshot" from "an
     // empty file the stream never filled".
     assert!(bytes.len() > 4096, "the snapshot is {} bytes", bytes.len());

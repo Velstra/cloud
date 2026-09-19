@@ -310,3 +310,29 @@ immediately useful; a release that verifies a manifest changes nothing on any
 machine; the agent applying `wanted` is the first step that writes a slot,
 and it is the one the VM checks have to prove before a controller is allowed
 to set it on forty machines.
+
+## Retry, rollback, and maintenance ownership
+
+Only one update may run on a machine. Changing the target while an update is
+running does not start a second installer. The agent durably records an attempt
+before downloading or applying anything; an interrupted attempt or an appliance
+that rolled back reports `Updating=False/Failed` instead of reinstalling the
+same image on every boot. After investigating, clear `spec.wanted`, wait for the
+agent to observe that change, then explicitly request a retry. An unreadable
+attempt record also blocks updates until inspected.
+
+A rollout's release is immutable; create another rollout for a different target.
+Nodes already cordoned or evacuating are refused and retain their maintenance
+state. The rollout labels the nodes it cordons with `velstra.io/rollout-owner` and
+only releases its own cordons. An explicit operator edit to `schedulable` or
+`evacuate` or `wanted` removes that ownership, preventing the rollout from undoing the edit.
+
+Use the shared release-directory arrangement in `operations.md` when running
+multiple control-plane replicas. Channel checksums protect against corruption;
+until signed release manifests are supported, use an operator-controlled HTTPS
+or local channel. Plain HTTP is unsuitable across an untrusted network.
+
+Rollouts already in progress when installing this safety update may have nodes
+without an ownership label. They stop rather than assume ownership of an existing
+cordon. Inspect the node's maintenance state before clearing it and starting a
+new rollout.

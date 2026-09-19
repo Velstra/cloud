@@ -8,6 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+rustix = { workspace = true }
 # Images live on https. The digest is what makes the *bytes* trustworthy — a
 # wrong byte gives a wrong digest and the fetch fails — but refusing https meant
 # refusing every place a cloud image is actually published, and an operator was

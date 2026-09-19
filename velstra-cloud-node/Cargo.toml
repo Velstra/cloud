@@ -8,6 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+rustix = { workspace = true }
 # A self-signed certificate at install. In Rust rather than by shelling out to
 # `openssl`, so a machine without it still gets one — and so the fingerprint can
 # be printed from the same bytes that were written, rather than read back and

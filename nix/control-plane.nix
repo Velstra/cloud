@@ -72,10 +72,20 @@ in
       type = lib.types.str;
       default = "127.0.0.1:8443";
       description = ''
-        API listen address (REST + gRPC + console on one port). The binary
-        terminates no TLS; anything beyond loopback belongs behind a TLS
-        reverse proxy, and nodes are pointed at that proxy's URL.
+        API listen address (REST + gRPC + console on one port). Set tlsCert
+        and tlsKey together, or terminate TLS at a trusted reverse proxy.
       '';
+    };
+
+    tlsCert = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Runtime path to the API TLS certificate PEM.";
+    };
+    tlsKey = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Runtime path to the API TLS private key PEM (root-readable only).";
     };
 
     cell = lib.mkOption {
@@ -268,6 +278,10 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
+        assertion = cfg.fromSeed || (cfg.tlsCert == null) == (cfg.tlsKey == null);
+        message = "velstra.cloud.controlPlane: set tlsCert and tlsKey together.";
+      }
+      {
         assertion =
           cfg.fromSeed
           || (cfg.bootstrapAdmin.username == null) == (cfg.bootstrapAdmin.passwordFile == null);
@@ -358,6 +372,8 @@ in
             exec ${cfg.package}/bin/velstra-cloud-api \
           --store ${cfg.store.endpoints} \
           --listen ${cfg.listen} \
+          ${lib.optionalString (cfg.tlsCert != null) "--tls-cert ${lib.escapeShellArg (toString cfg.tlsCert)}"} \
+          ${lib.optionalString (cfg.tlsKey != null) "--tls-key ${lib.escapeShellArg (toString cfg.tlsKey)}"} \
           --cell ${cfg.cell} \
           --region ${cfg.region} \
           ${lib.optionalString (

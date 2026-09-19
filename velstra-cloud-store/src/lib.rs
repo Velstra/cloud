@@ -69,6 +69,27 @@ pub enum Expect {
     Revision(Revision),
 }
 
+/// Admission reads this watermark before checking cross-object invariants.
+/// A commit compares and advances it atomically with the resource write, so
+/// another API replica cannot admit against the same obsolete inventory.
+#[derive(Clone, Debug)]
+pub struct Admission {
+    pub key: String,
+    pub revision: Revision,
+}
+
+impl Admission {
+    pub async fn read(store: &dyn Store, cell: &str) -> Result<Self> {
+        let key = key_for(cell, "admission", "api");
+        let revision = store
+            .get(&key)
+            .await?
+            .map(|e| e.revision)
+            .unwrap_or(Revision(0));
+        Ok(Self { key, revision })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Put(Entry),
@@ -158,6 +179,21 @@ pub trait Store: Send + Sync + 'static {
 
     /// Write, subject to `expect`. Returns the new revision.
     async fn put(&self, key: &str, value: Vec<u8>, expect: Expect) -> Result<Revision>;
+
+    /// Both comparisons and writes must be one backend transaction. There is
+    /// deliberately no read-then-write fallback for stores without this primitive.
+    async fn put_admitted(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        expect: Expect,
+        admission: &Admission,
+    ) -> Result<Revision> {
+        let _ = (key, value, expect, admission);
+        Err(StoreError::Backend(
+            "this store does not support atomic admission".into(),
+        ))
+    }
 
     async fn delete(&self, key: &str, expect: Expect) -> Result<Revision>;
 

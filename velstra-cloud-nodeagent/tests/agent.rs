@@ -1259,14 +1259,9 @@ async fn a_volume_whose_pool_has_not_said_where_it_is_waits_instead_of_guessing(
     let _ = pass;
 }
 
-/// A guest whose instance is gone from the cell is stopped, not carried.
-///
-/// The delete pipeline stops a guest while its record still exists; a guest
-/// that survives past that (an agent that was down for the whole deletion) has
-/// nobody left to ask for its end. Found live as a QEMU running two days after
-/// its instance was deleted, holding a tap the sweep could never remove.
+/// Absence after restoring an older store is not a deletion request.
 #[tokio::test]
-async fn a_guest_whose_instance_is_gone_is_stopped() {
+async fn a_guest_whose_instance_is_gone_is_preserved() {
     let store = store();
     let vmm = FakeVmm::new();
     let datapath = FakeDatapath::new();
@@ -1278,9 +1273,28 @@ async fn a_guest_whose_instance_is_gone_is_stopped() {
 
     agent.resync().await;
     assert!(
-        !vmm.is_running(I1),
-        "a guest with no instance anywhere kept running"
+        vmm.is_running(I1),
+        "restoring a snapshot that lacks a guest must not terminate it"
     );
+}
+
+/// Restoring a snapshot also loses ports created after that snapshot.
+#[tokio::test]
+async fn an_unknown_guest_keeps_its_network_until_inventory_is_reconciled() {
+    use velstra_cloud_store::{Expect, key_for};
+    let (store, vmm, datapath, agent) = one_instance_on("node-a").await;
+    agent.resync().await;
+    store
+        .delete(&key_for(CELL, "instances", I1), Expect::Any)
+        .await
+        .unwrap();
+    store
+        .delete(&key_for(CELL, "ports", PORT_A), Expect::Any)
+        .await
+        .unwrap();
+    agent.resync().await;
+    assert!(vmm.is_running(I1));
+    assert!(datapath.is_programmed(PORT_A));
 }
 
 /// A guest another agent on the same machine made is left alone.

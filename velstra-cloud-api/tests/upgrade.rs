@@ -428,3 +428,39 @@ async fn a_node_fetches_a_releases_file_from_its_cell_by_name_only() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn a_rollout_cannot_be_retargeted_after_it_was_created() {
+    let c = cell("immutable-rollout");
+    // Resource references are validated at admission, so both releases exist.
+    for id in ["one", "two"] {
+        let (code, body) = json(
+            &c.router,
+            "POST",
+            "releases",
+            json!({"id": id, "spec":{"url":"https://example.invalid/channel"}}),
+            Some(OPERATOR),
+        )
+        .await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+    }
+    let (code, body) = json(
+        &c.router,
+        "POST",
+        "rollouts",
+        json!({"id":"upgrade", "spec":{"release":"releases/one"}}),
+        Some(OPERATOR),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+    let (code, body) = json(
+        &c.router,
+        "PATCH",
+        "rollouts/upgrade",
+        json!({"spec":{"release":"releases/two"}}),
+        Some(OPERATOR),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["field"], "spec.release");
+}
