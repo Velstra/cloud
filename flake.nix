@@ -548,6 +548,10 @@
           };
           nodes.machine = {
             imports = applianceModules ++ [ nodeIdentity ];
+            # This test seeds the distribution image directly, bypassing the
+            # installer that expands the data partition on the target disk.
+            # etcd needs room for its WAL beyond the image's 128 MiB floor.
+            velstra.appliance.dataSize = "1G";
             virtualisation = {
               directBoot.enable = false;
               mountHostNixStore = false;
