@@ -49,6 +49,12 @@ pub struct Cell {
     /// The fabric's northbound endpoint, when this cell has one; the network,
     /// router, floating-IP and load-balancer controllers program it.
     pub fabric: Option<String>,
+    /// Where releases are kept on this machine: what the release controller
+    /// fetches into, and what the API beside it serves from.
+    pub releases_dir: std::path::PathBuf,
+    /// The node this control plane is, if it was told. A rollout does it
+    /// last, because the controller's own reboot ends the pass.
+    pub node: Option<String>,
 }
 
 /// How every loop runs: its pacing, where its numbers go, when it stops, and
@@ -354,6 +360,48 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
             volumes.clone()
         ),
         TypedStore::new(store.clone(), id, "snapshot-schedules")
+    );
+    // Unanswered announcements, retired so the list an operator reads is what
+    // is actually waiting for them. It writes down what the clock already
+    // decided; the claim door does its own arithmetic and does not consult
+    // this phase. See `enrollment`.
+    spawn!(
+        "enrollment",
+        crate::enrollment::EnrollmentController::new(
+            TypedStore::new(store.clone(), id, "enrollments"),
+            nodes.clone(),
+        ),
+        TypedStore::new(store.clone(), id, "enrollments")
+    );
+    // Releases: the channel read, the files brought here and verified. Over
+    // an HTTP client of its own, plus `file://` for a directory somebody
+    // carried in.
+    match crate::release::OverHttp::new() {
+        Ok(fetch) => {
+            spawn!(
+                "release",
+                crate::release::ReleaseController::new(
+                    StatusWriter::new(store.clone(), id, "releases", "release"),
+                    Arc::new(fetch),
+                    cell.releases_dir.clone(),
+                ),
+                TypedStore::new(store.clone(), id, "releases")
+            );
+        }
+        Err(why) => warn!(%why, "no HTTP client, so no release is fetched on this cell"),
+    }
+    // Rollouts: the plan is the model's; this walks the nodes as it says.
+    spawn!(
+        "rollout",
+        crate::rollout::RolloutController::new(
+            nodes.clone(),
+            instances.clone(),
+            TypedStore::new(store.clone(), id, "releases"),
+            StatusWriter::new(store.clone(), id, "rollouts", "rollout"),
+            cell.node.clone(),
+            id,
+        ),
+        TypedStore::new(store.clone(), id, "rollouts")
     );
     spawn!(
         "capture",

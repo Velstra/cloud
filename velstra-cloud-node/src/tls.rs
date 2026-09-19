@@ -146,7 +146,24 @@ pub fn fingerprint_of_der(der: &[u8]) -> String {
 /// The PEM's base64 decoded by hand rather than with a crate: it is one
 /// certificate, the format is four lines of framing around base64, and this is
 /// the only place that needs it.
-fn fingerprint_of_pem(pem: &str) -> Result<String> {
+/// The fingerprint of the certificate already at `root`, if there is one.
+///
+/// For the console banner, which wants to state it without minting anything —
+/// `ensure` would make a certificate as a side effect of being asked.
+pub fn fingerprint_at(root: &Path) -> Option<String> {
+    let pem = std::fs::read_to_string(dir(root).join("cert.pem")).ok()?;
+    fingerprint_of_pem(&pem).ok()
+}
+
+/// The fingerprint of a certificate in PEM, by the same arithmetic as
+/// everything else here.
+///
+/// Public because the enrolment door needs it: the machine shows the
+/// fingerprint of the certificate it was *served*, and an operator compares
+/// that against the one the control plane's banner prints for itself. Two
+/// numbers computed two ways would be worse than showing none — so there is
+/// one function, and both callers use it.
+pub fn fingerprint_of_pem(pem: &str) -> Result<String> {
     let body: String = pem
         .lines()
         .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))
@@ -224,5 +241,66 @@ mod tests {
             printed.chars().all(|c| c.is_ascii_hexdigit() || c == ':'),
             "{printed}"
         );
+    }
+}
+
+/// The URLs a joining machine should try, from the names a certificate was
+/// made with: addresses first, then the hostname, `localhost` never.
+///
+/// One list feeds both [`ensure`] and the API's `--advertise`, so a URL a
+/// joiner is handed is always a name the certificate verifies for. Nothing
+/// parses X.509 to find out; the two are the same list by construction.
+///
+/// `localhost` and `127.0.0.1` are in the certificate for this machine's own
+/// use and are left out here: a joiner that tried them would reach itself.
+pub fn advertise_urls(hostname: &str, addresses: &[String], port: &str) -> String {
+    let mut urls: Vec<String> = Vec::new();
+    let mut push = |host: &str| {
+        let host = host.trim();
+        if host.is_empty() || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            return;
+        }
+        let url = if host.contains(':') {
+            format!("https://[{host}]:{port}")
+        } else {
+            format!("https://{host}:{port}")
+        };
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    };
+    for address in addresses {
+        push(address);
+    }
+    push(hostname);
+    push(hostname.split('.').next().unwrap_or(hostname));
+    urls.join(",")
+}
+
+#[cfg(test)]
+mod advertise_tests {
+    use super::advertise_urls;
+
+    /// Addresses first — they need no DNS — then the name; the loopback names
+    /// the certificate carries for this machine's own use are not offered to
+    /// a stranger.
+    #[test]
+    fn a_joiner_is_offered_addresses_then_the_name_and_never_loopback() {
+        let urls = advertise_urls(
+            "horst.lan",
+            &["10.10.10.8".into(), "127.0.0.1".into(), "fd00::8".into()],
+            "8443",
+        );
+        assert_eq!(
+            urls,
+            "https://10.10.10.8:8443,https://[fd00::8]:8443,https://horst.lan:8443,https://horst:8443"
+        );
+    }
+
+    /// A machine that only knows itself as localhost advertises nothing, and
+    /// the API then mints no join tokens rather than ones nobody can use.
+    #[test]
+    fn a_machine_with_no_reachable_name_advertises_nothing() {
+        assert_eq!(advertise_urls("localhost", &[], "8443"), "");
     }
 }

@@ -282,6 +282,77 @@ impl Store for EtcdStore {
         .await
     }
 
+    async fn put_admitted(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        expect: Expect,
+        admission: &crate::Admission,
+    ) -> Result<Revision> {
+        bounded("admission", async {
+            let mut checks = vec![Compare::mod_revision(
+                admission.key.clone(),
+                CompareOp::Equal,
+                admission.revision.0 as i64,
+            )];
+            match expect {
+                Expect::Any => {}
+                Expect::Absent => checks.push(Compare::create_revision(key, CompareOp::Equal, 0)),
+                Expect::Revision(rev) => {
+                    checks.push(Compare::mod_revision(key, CompareOp::Equal, rev.0 as i64))
+                }
+            }
+            let response = self
+                .client
+                .kv_client()
+                .txn(
+                    Txn::new()
+                        .when(checks)
+                        .and_then([
+                            TxnOp::put(key, value, None),
+                            TxnOp::put(admission.key.clone(), Vec::<u8>::new(), None),
+                        ])
+                        .or_else([
+                            TxnOp::get(key, None),
+                            TxnOp::get(admission.key.clone(), None),
+                        ]),
+                )
+                .await
+                .map_err(backend)?;
+            let revision = self.observe(response.header());
+            if response.succeeded() {
+                return Ok(revision);
+            }
+            let ops = response.op_responses();
+            let read_revision = |i: usize| match &ops[i] {
+                TxnOpResponse::Get(get) => get
+                    .kvs()
+                    .first()
+                    .map(|kv| Revision(kv.mod_revision() as u64))
+                    .unwrap_or(Revision(0)),
+                _ => Revision(0),
+            };
+            let actual = read_revision(1);
+            if actual != admission.revision {
+                return Err(StoreError::Conflict {
+                    key: admission.key.clone(),
+                    expected: admission.revision,
+                    actual,
+                });
+            }
+            match expect {
+                Expect::Absent => Err(StoreError::Exists { key: key.into() }),
+                Expect::Revision(expected) => Err(StoreError::Conflict {
+                    key: key.into(),
+                    expected,
+                    actual: read_revision(0),
+                }),
+                Expect::Any => unreachable!("the admission comparison was the only condition"),
+            }
+        })
+        .await
+    }
+
     async fn delete(&self, key: &str, expect: Expect) -> Result<Revision> {
         bounded("delete", async {
             let compare = match expect {
@@ -395,6 +466,10 @@ impl Store for EtcdStore {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| StoreError::Backend(format!("creating {}: {e}", dir.display())))?;
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
         // Named by the moment, so a listing is a history and pruning is a sort.
         let at = velstra_cloud_model::meta::Timestamp::now().0;
         let final_path = dir.join(format!("etcd-{at:013}.snap"));
@@ -405,7 +480,11 @@ impl Store for EtcdStore {
             .snapshot()
             .await
             .map_err(backend)?;
-        let mut file = tokio::fs::File::create(&partial)
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&partial)
             .await
             .map_err(|e| StoreError::Backend(format!("creating {}: {e}", partial.display())))?;
         while let Some(chunk) = stream.message().await.map_err(backend)? {

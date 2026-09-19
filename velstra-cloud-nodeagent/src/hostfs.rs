@@ -130,6 +130,14 @@ pub struct Layout {
     /// available over TCP — over a unix socket both VMMs refuse it — so this is
     /// ignored for a local move rather than silently downgrading it.
     pub migration_tls_dir: Option<PathBuf>,
+    /// How this node reaches Ceph, for a guest whose disk is an RBD image.
+    ///
+    /// Here rather than on the VMM for the same reason [`Self::boot`] is: a
+    /// migration's destination has to open the *same* volume, so this has to be
+    /// part of what a node is rather than part of one call. Empty is the
+    /// ordinary answer and means QEMU's own defaults, which is right on a
+    /// machine where Ceph was installed the usual way.
+    pub ceph: crate::ceph_access::CephAccess,
 }
 
 impl Default for Layout {
@@ -148,6 +156,7 @@ impl Default for Layout {
             migration_address: None,
             migration_ports: 4900..4950,
             migration_tls_dir: None,
+            ceph: crate::ceph_access::CephAccess::default(),
         }
     }
 }

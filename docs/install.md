@@ -13,10 +13,28 @@ out of `flake.nix`.
 
 ## The compute-node image
 
+Every release publishes both media, with a `SHA256SUMS` beside them:
+
+```
+velstra-cloud-installer_<version>_amd64.iso    # boot this to install
+velstra-cloud-node_<version>_amd64.raw.zst     # the sealed image itself
+velstra-cloud_<version>_amd64.deb              # for a machine that runs Debian
+```
+
+**Check the file before you boot it.** `sha256sum -c SHA256SUMS` is the whole
+gesture, and it is the same one the appliance's own story rests on — a medium
+written to a stick is verified before it is booted, or it is not verified at
+all.
+
+Or build them, which is the same artefact by the same recipe:
+
 ```
 nix build .#node-image     # → result/…/velstra-cloud-node.raw (signed, sealed)
 nix build .#node-iso       # → result/iso/velstra-cloud-node-installer.iso
 ```
+
+The nightly CI lane builds both, so a stale input or a renamed output is found
+on a Tuesday rather than while somebody is cutting a release.
 
 The image is built by the same factory as the Velstra Sentinel firewall
 appliance (the Sentinel flake exports it as `nixosModules.applianceImage` /
@@ -28,11 +46,37 @@ slot — and one writable partition, mounted at `/var/lib/velstra`, optionally
 LUKS2-encrypted. Secure Boot ships with generated demo PK/KEK/db keys under
 `/loader/keys/velstra-node/`; a real fleet enrolls its own.
 
-On the image: the node agent, **QEMU and Cloud Hypervisor**, the Velstra
-fabric agent binary, and a kernel booted with
-`intel_iommu=on amd_iommu=on iommu=pt` — the passthrough phase of
-`deployment-and-devices.md` needs the IOMMU on from the first install, because
-a node that must reboot to *see* its devices cannot report them.
+On the image: **all three roles**, and the seed decides which of them runs.
+The node agent with **QEMU and Cloud Hypervisor**, the pool agent, the API and
+the controllers with a bundled etcd, the Velstra fabric agent binary, and a
+kernel booted with `intel_iommu=on amd_iommu=on iommu=pt` — the passthrough
+phase of `deployment-and-devices.md` needs the IOMMU on from the first install,
+because a node that must reboot to *see* its devices cannot report them.
+
+Every unit is gated by its own `ExecCondition` on `velstra-cloud-node has-role`,
+so a box installed as a hypervisor shows the other two as **skipped** — which
+systemd distinguishes from failed, and which is the difference between "this box
+is not a pool" and "the pool agent is broken". etcd carries the same gate: an
+etcd on every appliance would be a second, empty store on every machine,
+listening on exactly the address the API looks for, so a control plane that lost
+its seed would come up against a store that answers and holds nothing. Its data
+lives under the data partition, at `/var/lib/velstra/etcd` — the one place on
+this image a reboot does not empty. (etcd's own default is `/var/lib/etcd`,
+which here is the volatile root: a cell kept there lasted exactly until its
+control plane was first rebooted.)
+
+The image has to carry what it cannot fetch. An appliance is built once for a
+fleet and installed onto boxes weeks later, and which of them turns out to be
+the control plane is answered at a console by whoever is standing there. Until
+this was so, a cell built from this image still needed a separately-managed
+Debian machine to be its own control plane and to own its storage.
+
+QEMU here is built with the RBD block driver, which nixpkgs leaves off
+(`cephSupport ? false`). Without it a guest whose disk is a Ceph volume cannot
+start at all — QEMU answers `Unknown driver 'rbd'` — and the node reports a
+guest that will not boot with no indication that the cause is which QEMU was
+built. Cloud Hypervisor has no equivalent: it takes a path and nothing else, so
+an `rbd:` disk is refused there by name.
 
 ## Installing a node, start to finish
 
@@ -40,9 +84,30 @@ a node that must reboot to *see* its devices cannot report them.
    carries `nodeToken` — a one-time credential, shown exactly once, that lets
    this node read its cell and write only its own status.
 2. Boot the installer ISO. It drops straight into the wizard
-   (`velstra-cloud-node install`): target disk or RAID set, optional LUKS2
-   encryption of the data partition, DHCP or a static uplink, and then the
-   hand-off that matters — **the control-plane URL and the node token**.
+   (`velstra-cloud-node install`): what it is about to do and to which disk or
+   RAID set, then **who may log in** (an SSH key, a console password, or
+   neither, which is the sealed default), then optional LUKS2 encryption of the
+   data partition, the hostname, DHCP or a static uplink, and finally **what
+   this machine is for**: the first machine of a new cell, a machine joining one
+   with a join token, a machine that **asks the cell to let it in** — you type
+   only the cell's address, compare a fingerprint, and approve it in the
+   console — or the questions one by one. [`joining.md`](joining.md) has the
+   four doors, the token and what the fingerprints are for.
+
+   Passing a card into guests is deliberately **not** asked here: it is a
+   decision about what the machine will run, which nobody has made yet while
+   standing in front of a disk that is about to be erased, and it is one line
+   in the seed afterwards — see [`setup-guide.md`](setup-guide.md).
+
+   Behind the third door, roles are a set, not a choice, and the rest of the
+   questions follow the answer. A control plane is asked what its API binds
+   rather than where the control plane is: it *is* the API, and a URL pointing
+   at itself would be a fact with two owners. A pool is asked for its id, its
+   backend and its **own** one-time token — a second credential, because the API
+   authenticates a pool agent as `pool:<id>` and a node agent as `node:<id>`, and
+   a node token presented by a pool agent is answered `401` for ever with the
+   seed looking complete. A pool on the control plane's own machine gets no token
+   at all: its agent reaches the store directly.
 3. The wizard clones the sealed image onto the disk(s) and seeds the data
    partition (`node.env`, `node-token`, optional `network/`). Nothing needs to
    be reachable during the install; the wizard records.
@@ -136,13 +201,26 @@ sudo velstra-cloud-node setup
 ```
 
 asks region, cell, roles, and the role-specific answers (node id + token,
-pool id + backend, store endpoints + other cells), writes
-`/var/lib/velstra/node.env`, and then either names the units to enable (Debian)
-or prints the NixOS module snippet (NixOS — units there are a declaration, and a
-wizard reaching into them would be fighting the operating system).
+pool id + backend, store endpoints + other cells), writes the seed, and then
+either names the units to enable (Debian) or prints the NixOS module snippet
+(NixOS — units there are a declaration, and a wizard reaching into them would be
+fighting the operating system).
+
+`velstra-cloud-node install` asks the same questions for a machine that is being
+flashed, and **writes the seed with the same renderer**. There used to be two of
+those, and only one of them knew about `VELSTRA_ROLES`: the installer wrote six
+keys and this wizard twenty-eight. An absent `VELSTRA_ROLES` reads as
+`[hypervisor]` — correctly, for a seed written before roles existed — so every
+flashed machine was a hypervisor whatever it had been installed to be, and
+nothing was going to notice: both renderers had tests, both passed, and each was
+right about the keys it knew.
 
 **One seed, three systems.** The appliance, Debian and NixOS all read the same
-file at the same path. The appliance decides the path: its `/etc` is on a
+file, written by one renderer and read through one `EnvironmentFile`. No unit
+assembles a command line out of it: every agent's own arguments carry `env =`
+fallbacks, so a unit that built the arguments itself would be a second place for
+these keys to be spelled — and the last time two places spelled one of them
+differently, it cost a Ceph volume that could be created and not opened. The appliance decides the path: its `/etc` is on a
 read-only verity store and its writable partition mounts at `/var/lib/velstra`.
 
 ## Debian

@@ -44,6 +44,13 @@ const ATTEMPTS: usize = 4;
 pub struct Patch {
     pub spec: Option<Value>,
     pub labels: Option<Value>,
+    /// The platform's own stamp on the status, written in the same revision
+    /// as the change it accompanies — who approved a machine, beside the
+    /// flag that approves it. Never from a client: the API refuses a body
+    /// that carries a status before a `Patch` is ever built. And never on
+    /// its own: a stamp with nothing to accompany is a status write, which
+    /// has its own door.
+    pub status: Option<Value>,
 }
 
 impl Patch {
@@ -76,6 +83,7 @@ pub trait Collection: Send + Sync {
 
     async fn get(&self, name: &str) -> ApiResult<Option<Value>>;
     async fn list(&self) -> ApiResult<Vec<Value>>;
+    async fn list_strict(&self) -> ApiResult<Vec<Value>>;
 
     /// One page of the collection, resuming strictly after the object named
     /// `after`, and whether anything follows it.
@@ -118,6 +126,20 @@ pub trait Collection: Send + Sync {
 
     /// Create from a complete `meta` and a complete `spec`.
     async fn create(&self, meta: Value, spec: Value) -> ApiResult<Value>;
+    async fn create_admitted(
+        &self,
+        meta: Value,
+        spec: Value,
+        admission: velstra_cloud_store::Admission,
+    ) -> ApiResult<Value>;
+    async fn patch_admitted(
+        &self,
+        name: &str,
+        patch: &Patch,
+        expect: Option<Revision>,
+        admission: velstra_cloud_store::Admission,
+    ) -> ApiResult<Value>;
+
     async fn patch(&self, name: &str, patch: &Patch, expect: Option<Revision>) -> ApiResult<Value>;
     async fn delete(&self, name: &str, expect: Option<Revision>) -> ApiResult<Deleted>;
 
@@ -222,6 +244,42 @@ where
             );
         }
 
+        if let Some(status) = &patch.status {
+            merge(
+                document
+                    .get_mut("status")
+                    .expect("a resource always has a status"),
+                status,
+            );
+        }
+
+        if self.kind == "rollouts" && document["spec"]["release"] != before["release"] {
+            return Err(ApiError::invalid(
+                "a rollout's release is immutable; create a new rollout for another target",
+            )
+            .at("spec.release"));
+        }
+        if self.kind == "attachments" {
+            for field in ["volume", "instance"] {
+                if document["spec"][field] != before[field] {
+                    return Err(ApiError::invalid(
+                        "detach the existing attachment before creating another holder",
+                    )
+                    .at(format!("spec.{field}")));
+                }
+            }
+        }
+        if self.kind == "nodes"
+            && patch.spec.as_ref().is_some_and(|s| {
+                s.get("schedulable").is_some()
+                    || s.get("evacuate").is_some()
+                    || s.get("wanted").is_some()
+            })
+        {
+            if let Some(labels) = document["meta"]["labels"].as_object_mut() {
+                labels.remove("velstra.io/rollout-owner");
+            }
+        }
         let merged = document["spec"].clone();
         let mut next: Resource<S, T> =
             serde_json::from_value(document).map_err(|e| blame::<S>(&merged, &before, e))?;
@@ -229,7 +287,8 @@ where
 
         let spec_changed = next.spec != stored.spec;
         let labels_changed = next.meta.labels != stored.meta.labels;
-        if !spec_changed && !labels_changed {
+        let stamped = next.status != stored.status;
+        if !spec_changed && !labels_changed && !stamped {
             // An identical PATCH is a success with nothing behind it. Writing
             // anyway would move the revision and wake every watcher in the cell
             // for a change nobody made.
@@ -343,6 +402,15 @@ where
             .collect()
     }
 
+    async fn list_strict(&self) -> ApiResult<Vec<Value>> {
+        self.store
+            .list_strict()
+            .await?
+            .iter()
+            .map(Self::document)
+            .collect()
+    }
+
     async fn list_page(&self, after: Option<&str>, limit: usize) -> ApiResult<(Vec<Value>, bool)> {
         let (objects, more) = self.store.list_page(after, limit).await?;
         let documents = objects
@@ -435,6 +503,35 @@ where
             return Err(refuse_unknown(self.kind(), key));
         }
         Ok(())
+    }
+
+    async fn create_admitted(
+        &self,
+        meta: Value,
+        spec: Value,
+        admission: velstra_cloud_store::Admission,
+    ) -> ApiResult<Value> {
+        let guarded = Self {
+            kind: self.kind,
+            store: self.store.clone().with_admission(Some(admission)),
+            _marker: PhantomData,
+        };
+        guarded.create(meta, spec).await
+    }
+
+    async fn patch_admitted(
+        &self,
+        name: &str,
+        patch: &Patch,
+        expect: Option<Revision>,
+        admission: velstra_cloud_store::Admission,
+    ) -> ApiResult<Value> {
+        let guarded = Self {
+            kind: self.kind,
+            store: self.store.clone().with_admission(Some(admission)),
+            _marker: PhantomData,
+        };
+        guarded.patch(name, patch, expect).await
     }
 
     async fn create(&self, meta: Value, spec: Value) -> ApiResult<Value> {

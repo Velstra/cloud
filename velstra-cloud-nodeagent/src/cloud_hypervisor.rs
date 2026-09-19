@@ -359,6 +359,7 @@ impl Vmm for CloudHypervisorVmm {
         // sysfs cannot tell them apart. The agent overlays that from the
         // instances it holds — see `Agent::mark_held_devices`.
         host.pci_devices = crate::pcidev::observe(&Default::default());
+        host.installed = crate::installed::observe();
 
         for digest in hostfs::read_dir_names(&self.layout.image_dir)? {
             // A file is only ever moved in here after its bytes hashed to this
@@ -526,6 +527,22 @@ impl Vmm for CloudHypervisorVmm {
     }
 
     async fn start(&self, request: &VmRequest) -> Result<()> {
+        // Cloud Hypervisor's `--disk` takes a path and nothing else: it has no
+        // RBD client, so a guest whose root disk is a Ceph image cannot be
+        // booted here. Said plainly, at the one moment somebody is waiting for
+        // an answer — the alternative is `path=rbd:velstra-volumes/root-1`
+        // reaching a VMM that reports a missing file and names a path that was
+        // never one.
+        if let Some(place) = request.boot_disk.as_deref() {
+            if place.starts_with("rbd:") {
+                return Err(HostError::failed(format!(
+                    "{} boots from a Ceph volume and this machine runs cloud-hypervisor, which \
+                     cannot open one. Run this guest on a machine whose VMM is qemu, or give it \
+                     a root disk in a pool this one can open.",
+                    request.instance
+                )));
+            }
+        }
         let dir = self.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
         let socket = self.socket(&request.instance);
@@ -796,7 +813,19 @@ fn vmm_args(layout: &Layout, request: &VmRequest, socket: &std::path::Path) -> V
         "--memory".into(),
         format!("size={}M", request.memory_mib).into(),
         "--disk".into(),
-        format!("path={}", layout.disk(&request.instance).display()).into(),
+        // The place the root disk is, which for a guest that boots from a
+        // volume is its pool rather than this machine's filesystem. Cloud
+        // Hypervisor takes a path and nothing else here; an `rbd:` image is
+        // turned away in `start`, with the reason, rather than handed over as
+        // a filename that was never one.
+        format!(
+            "path={}",
+            request
+                .boot_disk
+                .clone()
+                .unwrap_or_else(|| layout.disk(&request.instance).display().to_string())
+        )
+        .into(),
         // To a file, always: a guest that will not boot is the one with the most
         // to say and the least chance of being heard.
         "--serial".into(),
@@ -1462,6 +1491,7 @@ mod tests {
             memory_mib: 2048,
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
+            boot_disk: None,
             nics: vec![],
             cpu_baseline: None,
         };
@@ -1581,6 +1611,7 @@ mod tests {
             memory_mib: 8192,
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
+            boot_disk: None,
             nics: vec![
                 Nic {
                     tap: "vt-a".into(),

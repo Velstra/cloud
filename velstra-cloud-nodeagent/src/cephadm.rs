@@ -158,6 +158,42 @@ pub fn add_host_argv(host: &str, address: &str, admin: bool) -> Vec<String> {
 }
 
 /// The argv for asking the cluster for the SSH key it drives hosts with.
+/// The client every hypervisor opens volumes as: read/write on the platform's
+/// two pools and nothing else — not `client.admin`, which can do anything to
+/// the cluster and belongs on the monitors alone.
+///
+/// `get-or-create` is idempotent and prints the keyring either way, so a
+/// monitor that reports this every pass reports the same key every pass.
+pub fn client_keyring_argv(pools: &[String]) -> Vec<String> {
+    let osd_caps = if pools.is_empty() {
+        "profile rbd".to_string()
+    } else {
+        pools
+            .iter()
+            .map(|p| format!("profile rbd pool={p}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    vec![
+        "auth".into(),
+        "get-or-create".into(),
+        CLIENT.into(),
+        "mon".into(),
+        "profile rbd".into(),
+        "osd".into(),
+        osd_caps,
+    ]
+}
+
+/// The smallest `ceph.conf` a client needs: the cluster's id and where its
+/// monitors are. Everything else a client might want has a default.
+pub fn client_conf_argv() -> Vec<String> {
+    vec!["config".into(), "generate-minimal-conf".into()]
+}
+
+/// The Ceph client the platform's hypervisors act as.
+pub const CLIENT: &str = "client.velstra";
+
 pub fn pubkey_argv() -> Vec<String> {
     vec!["cephadm".into(), "get-pub-key".into()]
 }
@@ -431,6 +467,17 @@ impl CephAdmin {
         )))
     }
 
+    /// What a hypervisor needs to open this cluster's volumes, from a node
+    /// that holds the admin keyring. `(conf, keyring)`, both complete files.
+    pub async fn client_config(&self, pools: &[String]) -> Result<(String, String)> {
+        let conf = self.ceph(&client_conf_argv()).await?;
+        let keyring = self.ceph(&client_keyring_argv(pools)).await?;
+        Ok((
+            String::from_utf8_lossy(&conf).trim().to_string() + "\n",
+            String::from_utf8_lossy(&keyring).trim().to_string() + "\n",
+        ))
+    }
+
     pub async fn pools(&self) -> Result<Vec<String>> {
         let out = self
             .ceph(&[
@@ -682,5 +729,32 @@ mod tests {
             assert!(parse_pools(junk).is_err(), "{junk:?}");
         }
         assert_eq!(parse_pools(r#"["a","b"]"#).unwrap(), ["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    /// Read/write on the platform's pools, nothing on anything else, and never
+    /// the admin key: what every hypervisor is handed is what a hypervisor can
+    /// be trusted with.
+    #[test]
+    fn the_client_a_hypervisor_acts_as_can_reach_its_pools_and_nothing_else() {
+        let argv = client_keyring_argv(&["velstra-volumes".into(), "velstra-images".into()]);
+        assert_eq!(
+            argv,
+            vec![
+                "auth",
+                "get-or-create",
+                "client.velstra",
+                "mon",
+                "profile rbd",
+                "osd",
+                "profile rbd pool=velstra-volumes, profile rbd pool=velstra-images",
+            ]
+        );
+        assert!(!argv.iter().any(|a| a.contains("admin")));
+        assert_eq!(client_conf_argv(), vec!["config", "generate-minimal-conf"]);
     }
 }

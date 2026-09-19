@@ -18,6 +18,7 @@ const InstanceQuick = lazy(() => import("@/features/Quick").then((m) => ({ defau
 const VolumeQuick = lazy(() => import("@/features/Quick").then((m) => ({ default: m.VolumeQuick })));
 const Connect = lazy(() => import("@/features/Quick").then((m) => ({ default: m.Connect })));
 const NodeQuick = lazy(() => import("@/features/Quick").then((m) => ({ default: m.NodeQuick })));
+const PoolQuick = lazy(() => import("@/features/Quick").then((m) => ({ default: m.PoolQuick })));
 const Members = lazy(() => import("@/features/Members").then((m) => ({ default: m.Members })));
 const RuleList = lazy(() => import("@/features/Structured").then((m) => ({ default: m.RuleList })));
 const ListenerList = lazy(() => import("@/features/Structured").then((m) => ({ default: m.ListenerList })));
@@ -101,8 +102,11 @@ const collectionOf = (path: string): string | null => {
  * * `:issueCredential` mints a registration token that is shown once and stored
  *   only as a hash. It belongs behind a deliberate flow that shows the token
  *   and says so, not on a row of grey buttons beside "Explain placement".
+ * * `:installMedium` answers a one-time download link for two gigabytes of
+ *   installer. The node's page has a button that follows it; a grey button
+ *   that showed the link as JSON would be a link somebody copies.
  */
-const NOT_A_BUTTON = /:(reportStatus|issueCredential)$/;
+const NOT_A_BUTTON = /:(reportStatus|issueCredential|installMedium)$/;
 
 /** Verbs only a cell operator may ask. The API says so; this keeps the console
  *  from offering what it would refuse. */
@@ -199,6 +203,10 @@ register("ceph-clusters", {
 
 register("nodes", {
   quick: (r, c, reload) => <Suspense fallback={null}><NodeQuick r={r} c={c} reload={reload} /></Suspense>,
+});
+
+register("pools", {
+  quick: (r, c, reload) => <Suspense fallback={null}><PoolQuick r={r} c={c} reload={reload} /></Suspense>,
 });
 
 register("volumes", {

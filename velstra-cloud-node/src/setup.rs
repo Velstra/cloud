@@ -46,7 +46,7 @@ use anyhow::{Context, Result, bail};
 use crate::{
     roles::{Role, render_list},
     wizard::{
-        ask_valid, ask_yes, prompt, prompt_secret, validate_interface, validate_ip,
+        ask_valid, ask_valid_or, ask_yes, prompt, prompt_secret, validate_interface, validate_ip,
         validate_node_name, validate_srv6_locator, validate_token, validate_url,
     },
 };
@@ -79,6 +79,65 @@ pub struct Machine {
     pub region: String,
     pub cell: String,
     pub roles: Vec<Role>,
+    /// What this box should call itself, for a machine that does not have a
+    /// name yet.
+    ///
+    /// Only the installer answers it: it is seeding a filesystem that has never
+    /// booted, and `velstra-node-boot` reads this to set the hostname on the
+    /// first start. [`run_with`] leaves it empty, because a machine that
+    /// already runs an operating system already has a name and renaming it is
+    /// not a thing a wizard about cloud roles should do.
+    ///
+    /// Here rather than in the installer's own seed writer because there used
+    /// to be two of those, and only one of them knew about `VELSTRA_ROLES` —
+    /// which is why every flashed machine was a hypervisor whatever it was
+    /// installed to be.
+    pub hostname: String,
+    /// The API's certificate as PEM, when it arrived *inside* a join token
+    /// rather than as a path on this machine. `write_seed` puts it beside the
+    /// seed as `api-ca.pem` and points `api_ca` at it, so the agents read a
+    /// file like they always have. Empty on every other path.
+    pub api_ca_pem: String,
+    /// Where this control plane tells joiners to reach it: URLs, comma
+    /// separated, each a name its certificate carries. Written for the API
+    /// as `VELSTRA_ADVERTISE`. Empty on a machine that is not a control
+    /// plane, and on one nobody can reach.
+    pub advertise: String,
+    /// Disks the first machine hands to Ceph at first boot, as kernel names.
+    /// `bootstrap-cell` resolves them to the stable paths the node agent
+    /// reports and creates the cluster. Empty on every other machine.
+    pub bootstrap_ceph_osds: Vec<String>,
+    /// An SSH public key that may log in as root, and whether a password was
+    /// set. Both empty is the default and the sealed shape: no account anybody
+    /// can use, fleet access through the control plane, break-glass by booting
+    /// the installer medium.
+    ///
+    /// Offered at install rather than decided here. A machine nobody can log
+    /// in to is the safer default and a genuinely awkward one to debug, and
+    /// which of those matters more is the operator's call, not this
+    /// platform's.
+    pub ssh_key: String,
+    /// The root password, in the clear, on its way to a 0600 file beside the
+    /// seed. Never rendered into `node.env`, which is world-readable — the
+    /// same split the tokens and the bootstrap password already make.
+    pub root_password: String,
+    /// PCI devices this machine holds back for guests: addresses
+    /// (`0000:41:00.0`) or vendor:device pairs (`10de:2204`), comma
+    /// separated. Empty is the default and means the host keeps every card.
+    ///
+    /// In the seed rather than on the kernel command line, which is where the
+    /// usual `vfio-pci.ids=` recipe puts it: this image's command line is
+    /// sealed into a signed UKI, so a device id there would be a fact about
+    /// the image — and an image is built once for a fleet of boxes with
+    /// different cards in them.
+    ///
+    /// **No wizard asks for this.** Which cards a machine holds back is a
+    /// decision about what it will run, and nobody has made it while they are
+    /// standing in front of a disk that is about to be erased. It is one line
+    /// added to the seed afterwards, and a restart of the node agent — which
+    /// is also how it is taken back, where an answer given at install time
+    /// would have meant a reinstall.
+    pub passthrough: String,
     /// Where the API is. Empty on a control-plane-only machine, which *is* the
     /// API — a URL pointing at itself would be a fact with two owners.
     pub api_url: String,
@@ -202,6 +261,9 @@ pub fn render(m: &Machine) -> String {
         m.cell,
         render_list(&m.roles)
     );
+    if !m.hostname.is_empty() {
+        out.push_str(&format!("VELSTRA_HOSTNAME={}\n", m.hostname));
+    }
     if !m.api_url.is_empty() {
         out.push_str(&format!("VELSTRA_API_URL={}\n", m.api_url));
         if !m.api_ca.is_empty() {
@@ -238,13 +300,27 @@ pub fn render(m: &Machine) -> String {
         }
     }
     if m.roles.contains(&Role::ControlPlane) {
-        out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
+        // Named or absent, never empty: `VELSTRA_STORE=` sets the variable to
+        // the empty string, and the API reads its own `env =` fallback as
+        // present-and-empty rather than falling back at all.
+        if !m.store.is_empty() {
+            out.push_str(&format!("VELSTRA_STORE={}\n", m.store));
+        }
         // Both or neither: the API refuses one without the other rather than
         // serving plaintext on a port somebody believes is encrypted.
         if !m.tls_cert.is_empty() && !m.tls_key.is_empty() {
             out.push_str(&format!(
                 "VELSTRA_TLS_CERT={}\nVELSTRA_TLS_KEY={}\n",
                 m.tls_cert, m.tls_key
+            ));
+        }
+        if !m.advertise.is_empty() {
+            out.push_str(&format!("VELSTRA_ADVERTISE={}\n", m.advertise));
+        }
+        if !m.bootstrap_ceph_osds.is_empty() {
+            out.push_str(&format!(
+                "VELSTRA_BOOTSTRAP_CEPH_OSDS={}\n",
+                m.bootstrap_ceph_osds.join(",")
             ));
         }
         if !m.listen.is_empty() {
@@ -258,6 +334,18 @@ pub fn render(m: &Machine) -> String {
         if !m.cells.is_empty() {
             out.push_str(&format!("VELSTRA_CELLS={}\n", m.cells.join(",")));
         }
+    }
+    // Console and SSH access, when the operator asked for it. The key is not a
+    // secret and rides in the seed; the password does not — it goes to a 0600
+    // file beside it, the same split the tokens already make.
+    if !m.ssh_key.is_empty() {
+        out.push_str(&format!("VELSTRA_SSH_KEY={}\n", m.ssh_key));
+    }
+    if !m.root_password.is_empty() {
+        out.push_str("VELSTRA_CONSOLE_LOGIN=1\n");
+    }
+    if !m.passthrough.is_empty() {
+        out.push_str(&format!("VELSTRA_PASSTHROUGH={}\n", m.passthrough));
     }
     if m.local_network {
         out.push_str("VELSTRA_LOCAL_NETWORK=1\n");
@@ -277,6 +365,61 @@ pub fn render(m: &Machine) -> String {
         }
     }
     out
+}
+
+/// The answers from a join token, which is every one of them.
+///
+/// The token was minted by the cell for exactly one node object, so region,
+/// cell and node id are facts rather than questions, the certificate is inside
+/// it, and the URL is one the certificate verifies for — the six things that
+/// used to travel by six routes. See `docs/joining.md`.
+///
+/// `qemu` unconditionally. Cloud Hypervisor takes a path and nothing else, so
+/// it cannot open a Ceph volume; a machine joining a cell cannot know what
+/// storage the cell will grow, and the hypervisor that can open everything is
+/// the only safe answer for a wizard that is not going to ask.
+pub(crate) fn from_join(token: &str, dir: &Path) -> Result<Machine> {
+    let t = velstra_cloud_wire::join::JoinToken::decode(token)?;
+    let mut roles = Vec::new();
+    if !t.token.is_empty() {
+        roles.push(Role::Hypervisor);
+    }
+    if t.pool.is_some() {
+        roles.push(Role::Pool);
+    }
+    if roles.is_empty() {
+        bail!(
+            "the join token carries neither a node nor a pool credential, so there is nothing \
+             for this machine to be"
+        );
+    }
+    let (pool, pool_token, pool_backend) = match &t.pool {
+        // The backend is this machine's to answer, not the token's: it is a
+        // fact about the disks here. Directory unless told otherwise — the one
+        // that needs nothing but a writable directory.
+        Some(p) => (p.id.clone(), p.token.clone(), "directory".to_string()),
+        None => (String::new(), String::new(), String::new()),
+    };
+    Ok(Machine {
+        region: t.region,
+        cell: t.cell,
+        roles,
+        api_ca_pem: t.ca,
+        // The path the seed names; `write_seed` puts the PEM there first.
+        api_ca: dir.join("api-ca.pem").display().to_string(),
+        api_url: t
+            .urls
+            .into_iter()
+            .find(|u| !u.trim().is_empty())
+            .unwrap_or_default(),
+        node: t.node,
+        token: t.token,
+        vmm: "qemu".into(),
+        pool,
+        pool_token,
+        pool_backend,
+        ..Default::default()
+    })
 }
 
 /// Read the answers from a file instead of asking for them.
@@ -323,10 +466,30 @@ pub fn parse(text: &str) -> Result<Machine> {
         );
     }
     let mut m = Machine {
-        tls_cert: String::new(),
-        tls_key: String::new(),
-        lvm_group: String::new(),
-        lvm_thin_pool: String::new(),
+        // Read back, every one of them, because `render` writes every one of
+        // them — and this is where that stopped being true.
+        //
+        // A seed goes through parse→render whenever anything rewrites it:
+        // `ensure-tls` on a control plane's first boot, `migrate-seed` on an
+        // upgrade, `setup --config`. Five keys were written and not read, so
+        // every rewrite silently dropped them. `VELSTRA_TLS_CERT` cost the
+        // most: `bootstrap-cell` decides whether the cell speaks TLS by
+        // whether that field is set, read it back as empty, and spent ninety
+        // seconds asking an https port over http before giving up — so the
+        // first machine of a cell got a certificate and an API, and no Node,
+        // no Pool and no token. `VELSTRA_HOSTNAME` cost the quietest: a
+        // machine installed under a name lost it on the first rewrite and
+        // answered to the image's default from the next boot on.
+        //
+        // `seed_survives_a_round_trip` is what keeps this honest now: it
+        // populates every field, renders, parses, and compares — so a key
+        // added to one side and not the other fails a test rather than a
+        // fleet.
+        hostname: or("VELSTRA_HOSTNAME", ""),
+        tls_cert: or("VELSTRA_TLS_CERT", ""),
+        tls_key: or("VELSTRA_TLS_KEY", ""),
+        lvm_group: or("VELSTRA_LVM_GROUP", ""),
+        lvm_thin_pool: or("VELSTRA_LVM_THIN_POOL", ""),
         // Read from the seed like everything else, which they were not: an
         // unattended install could name a Ceph backend and had no way to say
         // which cluster, which pools or which client — so `--config` could
@@ -353,6 +516,24 @@ pub fn parse(text: &str) -> Result<Machine> {
         pool_backend: or("VELSTRA_POOL_BACKEND", "directory"),
         store: or("VELSTRA_STORE", "127.0.0.1:2379"),
         listen: or("VELSTRA_LISTEN", ""),
+        advertise: or("VELSTRA_ADVERTISE", ""),
+        ssh_key: or("VELSTRA_SSH_KEY", ""),
+        passthrough: or("VELSTRA_PASSTHROUGH", ""),
+        // Read back as a marker only: the password itself lives in its own
+        // file, and a seed that carried it would be a secret in a
+        // world-readable file.
+        root_password: if or("VELSTRA_CONSOLE_LOGIN", "") == "1" {
+            "(set)".into()
+        } else {
+            String::new()
+        },
+        bootstrap_ceph_osds: or("VELSTRA_BOOTSTRAP_CEPH_OSDS", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        api_ca_pem: String::new(),
         cells: values
             .get("VELSTRA_CELLS")
             .map(|v| {
@@ -371,7 +552,19 @@ pub fn parse(text: &str) -> Result<Machine> {
     // person to change it would be changing nothing.
     if roles.contains(&Role::Hypervisor) {
         m.node = need("VELSTRA_NODE")?;
-        if m.api_url.is_empty() {
+        // The same exemption the pool below has always had, and its absence
+        // here broke every first machine of a cell installed from the image.
+        //
+        // A control plane *is* the API, so the installer writes no
+        // `VELSTRA_API_URL` for one — and door 1 writes
+        // `control-plane,hypervisor,pool`. This branch then refused the seed
+        // by name, `velstra-cell-tls` died on the first boot, the API had no
+        // certificate to serve, and the console was never there. The banner
+        // reads the same seed through `.ok()`, so it printed a machine with
+        // no name, no roles and no address — three symptoms, one missing
+        // condition. `ensure-tls` fills the URL in afterwards, for the agents
+        // on this machine that do need one.
+        if m.api_url.is_empty() && !roles.contains(&Role::ControlPlane) {
             m.api_url = need("VELSTRA_API_URL")?;
         }
     }
@@ -428,7 +621,29 @@ pub fn run_with(
     dir: Option<PathBuf>,
     assume_nixos: Option<bool>,
     config: Option<PathBuf>,
+    join: Option<String>,
+    join_file: Option<PathBuf>,
 ) -> Result<()> {
+    // A token from a file is the same token. Read here rather than threaded
+    // through: a token on a command line is in `ps` for every user on the
+    // machine and in the shell's history afterwards, and configuration
+    // management would rather write a file than quote a kilobyte.
+    let join = match (join, join_file) {
+        (Some(t), _) => Some(t),
+        (None, Some(path)) => {
+            let text =
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            let token = crate::joinfile::token_in(&text).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} holds no join token — one line starting `velstra1.`, \
+                     with or without a comment above it",
+                    path.display()
+                )
+            })?;
+            Some(token.encode())
+        }
+        (None, None) => None,
+    };
     let nixos = assume_nixos.unwrap_or_else(|| Path::new("/etc/NIXOS").exists());
     // Where the seed goes is decided by which machine this is, not by taste.
     //
@@ -438,8 +653,10 @@ pub fn run_with(
     // read-only verity store there, and a machine whose state directory is
     // its own alone has nobody to be renamed by.
     let dir = dir.unwrap_or_else(|| PathBuf::from(if nixos { SEED_DIR } else { IDENTITY_DIR }));
-    let machine = match &config {
-        Some(path) => {
+    let machine = match (&config, &join) {
+        // Everything is in the token; nothing is asked. See `from_join`.
+        (_, Some(token)) => Some(from_join(token, &dir)?),
+        (Some(path), None) => {
             let text =
                 fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
             // The token is the one answer a file should not have to carry: it
@@ -454,7 +671,7 @@ pub fn run_with(
             }
             Some(m)
         }
-        None => collect()?,
+        (None, None) => collect()?,
     };
     let Some(machine) = machine else {
         println!("Nothing was written.");
@@ -568,6 +785,12 @@ pub fn nix_snippet(m: &Machine) -> String {
 
 pub(crate) fn write_seed(dir: &Path, m: &Machine) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // The certificate first, so the seed that names its path never exists
+    // without it. World-readable: it is a certificate, not a secret, and the
+    // agents that verify against it do not all run as root.
+    if !m.api_ca_pem.trim().is_empty() {
+        write_with_mode(&dir.join("api-ca.pem"), &m.api_ca_pem, 0o644)?;
+    }
     write_with_mode(&dir.join("node.env"), &render(m), 0o644)?;
     if m.roles.contains(&Role::Hypervisor) && !m.token.is_empty() {
         // The one secret here, and it gets its own file with its own mode. The
@@ -586,6 +809,16 @@ pub(crate) fn write_seed(dir: &Path, m: &Machine) -> Result<()> {
         write_with_mode(
             &dir.join("pool-token"),
             &format!("{}\n", m.pool_token),
+            0o600,
+        )?;
+    }
+    // The root password, its own file with its own mode, for the same reason
+    // the tokens have one: `node.env` is world-readable and the units that
+    // read it do not all run as root.
+    if !m.root_password.is_empty() && m.root_password != "(set)" {
+        write_with_mode(
+            &dir.join("root-password"),
+            &format!("{}\n", m.root_password),
             0o600,
         )?;
     }
@@ -609,10 +842,32 @@ pub(crate) fn write_secret(path: &Path, contents: &str) -> Result<()> {
     write_with_mode(path, &format!("{}\n", contents.trim()), 0o600)
 }
 
-fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
-    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("setting the mode on {}", path.display()))
+pub(crate) fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    // A private temporary file avoids both a permissive creation window and
+    // truncating a live credential if the process dies midway through a write.
+    let parent = path.parent().context("the file has no parent directory")?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let tmp = parent.join(format!(".seed-{}-{nonce}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("writing {}", path.display()))
 }
 
 /// What the cell says about the machine holding this token.
@@ -885,23 +1140,33 @@ fn collect() -> Result<Option<Machine>> {
             println!(
                 "and one of them told where the others are, so a client reaches one address.\n"
             );
-            let region = ask_valid(
+            // Same defect as the installer's administrator prompt had: the
+            // validator refused the empty answer before the map could turn it
+            // into the default, so Enter at `[eu-central]` asked again.
+            let region = ask_valid_or(
+                "eu-central",
                 "Region [eu-central]: ",
                 validate_node_name,
                 "lowercase letters, digits and '-'",
-            )
-            .map(|s| if s.is_empty() { "eu-central".into() } else { s })?;
-            let cell = ask_valid(
+            )?;
+            let cell = ask_valid_or(
+                "cell-1",
                 "Cell [cell-1]: ",
                 validate_node_name,
                 "lowercase letters, digits and '-'",
-            )
-            .map(|s| if s.is_empty() { "cell-1".into() } else { s })?;
+            )?;
             (region, cell, String::new())
         }
     };
 
     let mut m = Machine {
+        hostname: String::new(),
+        api_ca_pem: String::new(),
+        advertise: String::new(),
+        bootstrap_ceph_osds: Vec::new(),
+        ssh_key: String::new(),
+        root_password: String::new(),
+        passthrough: String::new(),
         pool_token: String::new(),
         api_ca: api_ca.clone(),
         tls_cert: String::new(),
@@ -1238,6 +1503,129 @@ fn resolve_roles(raw: &str) -> Result<Vec<Role>, String> {
     Ok(out)
 }
 
+/// The one test that makes "render writes it, parse reads it" structural.
+///
+/// Three keys had drifted apart before this existed — `VELSTRA_API_URL` (a
+/// control plane's seed could not be read back at all), `VELSTRA_TLS_CERT`
+/// and `VELSTRA_TLS_KEY` (so `bootstrap-cell` thought its own cell spoke
+/// plain HTTP), `VELSTRA_HOSTNAME` and the two LVM keys (dropped on every
+/// rewrite). Each side had tests. Nothing ran a value through both.
+///
+/// So: populate every field, render, parse, compare. A key added to one side
+/// and not the other fails here, by name, the first time somebody runs the
+/// suite.
+#[cfg(test)]
+mod round_trip {
+    use super::*;
+
+    #[test]
+    fn seed_survives_a_round_trip() {
+        let m = Machine {
+            region: "eu-west".into(),
+            cell: "cell-9".into(),
+            roles: vec![Role::ControlPlane, Role::Hypervisor, Role::Pool],
+            hostname: "horst".into(),
+            advertise: "https://horst:8443,https://10.0.0.8:8443".into(),
+            bootstrap_ceph_osds: vec!["/dev/disk/by-id/a".into(), "/dev/disk/by-id/b".into()],
+            ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA nobody@example".into(),
+            passthrough: "10de:2204,10de:1aef".into(),
+            api_url: "https://localhost:8443".into(),
+            node: "horst".into(),
+            vmm: "qemu".into(),
+            pool: "local".into(),
+            api_ca: "/var/lib/velstra/tls/cert.pem".into(),
+            tls_cert: "/var/lib/velstra/tls/cert.pem".into(),
+            tls_key: "/var/lib/velstra/tls/key.pem".into(),
+            pool_backend: "lvm-thin".into(),
+            lvm_group: "vg0".into(),
+            lvm_thin_pool: "thin".into(),
+            ceph_conf: "/var/lib/velstra/ceph/ceph.conf".into(),
+            ceph_user: "velstra".into(),
+            ceph_pool: "rbd".into(),
+            ceph_image_pool: "images".into(),
+            ceph_pool_id: "ceph".into(),
+            store: "127.0.0.1:2379".into(),
+            cells: vec!["cell-2=https://cell-2:8443".into()],
+            local_network: true,
+            listen: "0.0.0.0:8443".into(),
+            admin: "admin".into(),
+            fabric: Some(Fabric {
+                orchestrator: "https://fabric:9443".into(),
+                control: "10.0.0.8:4789".into(),
+                vtep: "10.0.0.8".into(),
+                underlay: "eth0".into(),
+                srv6_locator: String::new(),
+            }),
+            // Deliberately not in the file, each for a stated reason, so each
+            // is compared against what it *should* come back as rather than
+            // against itself.
+            token: "ab".repeat(32),
+            pool_token: "cd".repeat(32),
+            admin_password: "correcthorsebattery".into(),
+            root_password: "hunter2hunter2".into(),
+            api_ca_pem: "-----BEGIN CERTIFICATE-----\n".into(),
+        };
+
+        let rendered = render(&m);
+        let back = parse(&rendered).expect("a rendered seed parses");
+
+        // Everything the file is allowed to carry comes back unchanged.
+        assert_eq!(back.region, m.region, "{rendered}");
+        assert_eq!(back.cell, m.cell, "{rendered}");
+        assert_eq!(back.roles, m.roles, "{rendered}");
+        assert_eq!(back.hostname, m.hostname, "{rendered}");
+        assert_eq!(back.advertise, m.advertise, "{rendered}");
+        assert_eq!(
+            back.bootstrap_ceph_osds, m.bootstrap_ceph_osds,
+            "{rendered}"
+        );
+        assert_eq!(back.ssh_key, m.ssh_key, "{rendered}");
+        assert_eq!(back.passthrough, m.passthrough, "{rendered}");
+        assert_eq!(back.api_url, m.api_url, "{rendered}");
+        assert_eq!(back.node, m.node, "{rendered}");
+        assert_eq!(back.vmm, m.vmm, "{rendered}");
+        assert_eq!(back.pool, m.pool, "{rendered}");
+        assert_eq!(back.api_ca, m.api_ca, "{rendered}");
+        assert_eq!(back.tls_cert, m.tls_cert, "{rendered}");
+        assert_eq!(back.tls_key, m.tls_key, "{rendered}");
+        assert_eq!(back.pool_backend, m.pool_backend, "{rendered}");
+        assert_eq!(back.lvm_group, m.lvm_group, "{rendered}");
+        assert_eq!(back.lvm_thin_pool, m.lvm_thin_pool, "{rendered}");
+        assert_eq!(back.ceph_conf, m.ceph_conf, "{rendered}");
+        assert_eq!(back.ceph_user, m.ceph_user, "{rendered}");
+        assert_eq!(back.ceph_pool, m.ceph_pool, "{rendered}");
+        assert_eq!(back.ceph_image_pool, m.ceph_image_pool, "{rendered}");
+        assert_eq!(back.ceph_pool_id, m.ceph_pool_id, "{rendered}");
+        assert_eq!(back.store, m.store, "{rendered}");
+        assert_eq!(back.cells, m.cells, "{rendered}");
+        assert_eq!(back.local_network, m.local_network, "{rendered}");
+        assert_eq!(back.listen, m.listen, "{rendered}");
+        assert_eq!(back.admin, m.admin, "{rendered}");
+        assert_eq!(back.fabric, m.fabric, "{rendered}");
+
+        // And the secrets are not in it. Each of these lives in its own 0600
+        // file beside the seed; `node.env` is world-readable.
+        for secret in [
+            &m.token,
+            &m.pool_token,
+            &m.admin_password,
+            &m.root_password,
+            &m.api_ca_pem,
+        ] {
+            assert!(
+                !rendered.contains(secret.trim()),
+                "a secret reached node.env: {rendered}"
+            );
+        }
+        assert!(back.token.is_empty(), "{:?}", back.token);
+        assert!(back.pool_token.is_empty(), "{:?}", back.pool_token);
+        assert!(back.api_ca_pem.is_empty(), "{:?}", back.api_ca_pem);
+        // The console password is a marker in the file and the secret in a
+        // file of its own, so what comes back is "there is one", not the one.
+        assert!(!back.root_password.is_empty(), "the marker is lost");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// A pasted token is taken as the paste arrives.
@@ -1302,6 +1690,13 @@ mod tests {
 
     pub(super) fn hypervisor() -> Machine {
         Machine {
+            hostname: String::new(),
+            api_ca_pem: String::new(),
+            advertise: String::new(),
+            bootstrap_ceph_osds: Vec::new(),
+            ssh_key: String::new(),
+            root_password: String::new(),
+            passthrough: String::new(),
             pool_token: String::new(),
             api_ca: String::new(),
             tls_cert: String::new(),
@@ -2095,5 +2490,103 @@ mod role_spelling_tests {
         assert!(why.contains("control-plane"), "{why}");
         assert!(why.contains("hypervisor"), "{why}");
         assert!(why.contains("pool"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use velstra_cloud_wire::join::{JoinToken, PoolJoin};
+
+    use super::*;
+
+    fn token(pool: bool) -> String {
+        JoinToken {
+            v: 1,
+            region: "eu-central".into(),
+            cell: "cell-1".into(),
+            node: "peter".into(),
+            urls: vec![
+                "https://10.10.10.8:8443".into(),
+                "https://horst:8443".into(),
+            ],
+            ca: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into(),
+            token: "ab".repeat(32),
+            pool: pool.then(|| PoolJoin {
+                id: "local-2".into(),
+                token: "cd".repeat(32),
+            }),
+        }
+        .encode()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("velstra-join-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// One string in, a machine out: every fact the six routes used to carry,
+    /// and the certificate as a file beside the seed where the agents look.
+    #[test]
+    fn a_join_token_is_the_whole_answer() {
+        let dir = scratch("node");
+        let m = from_join(&token(false), &dir).expect("a machine");
+        assert_eq!(m.roles, vec![Role::Hypervisor]);
+        assert_eq!(m.region, "eu-central");
+        assert_eq!(m.cell, "cell-1");
+        assert_eq!(m.node, "peter");
+        assert_eq!(m.api_url, "https://10.10.10.8:8443");
+        assert_eq!(m.vmm, "qemu", "the only hypervisor that can open Ceph");
+        assert_eq!(m.api_ca, dir.join("api-ca.pem").display().to_string());
+
+        write_seed(&dir, &m).expect("written");
+        let env = fs::read_to_string(dir.join("node.env")).unwrap();
+        assert!(env.contains("VELSTRA_ROLES=hypervisor\n"), "{env}");
+        assert!(
+            env.contains(&format!("VELSTRA_API_CA={}\n", m.api_ca)),
+            "{env}"
+        );
+        assert!(
+            env.contains("VELSTRA_API_URL=https://10.10.10.8:8443\n"),
+            "{env}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("api-ca.pem")).unwrap(),
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("node-token")).unwrap(),
+            format!("{}\n", "ab".repeat(32))
+        );
+        // The token is a secret and the seed is world-readable.
+        assert!(!env.contains(&"ab".repeat(32)), "{env}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pool rides along as a second role with its own credential.
+    #[test]
+    fn a_pool_in_the_token_is_a_second_role_with_its_own_token() {
+        let dir = scratch("pool");
+        let m = from_join(&token(true), &dir).expect("a machine");
+        assert_eq!(m.roles, vec![Role::Hypervisor, Role::Pool]);
+        assert_eq!(m.pool, "local-2");
+        assert_eq!(m.pool_backend, "directory");
+        write_seed(&dir, &m).expect("written");
+        assert_eq!(
+            fs::read_to_string(dir.join("pool-token")).unwrap(),
+            format!("{}\n", "cd".repeat(32))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The wrong paste is refused by name, before anything is written.
+    #[test]
+    fn the_wrong_paste_is_refused_by_name() {
+        let dir = scratch("bad");
+        let err = from_join("https://horst:8443", &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a join token"), "{err}");
+        assert!(!dir.exists(), "nothing may be written on refusal");
     }
 }

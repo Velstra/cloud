@@ -1011,6 +1011,214 @@ function credentialControl(coll, r) {
   return host;
 }
 
+/// Let a machine in, from wherever somebody found it.
+///
+/// One dialog, reached from the button on the machine's row and from its
+/// page, because it is one decision. The first version was a panel of
+/// switches on the page; the first person to use it said it was still too
+/// complicated and described this instead — *"das ist die Maschine, das ist
+/// unsere Zelle, vergleich es bitte, und möchtest du installieren?"* — which
+/// is the right shape, and is what this draws.
+///
+/// The dialog answers two questions, and only one of them needs a person.
+///
+/// *Is this the machine in front of me?* Its fingerprint, large, beside the
+/// words the machine's own screen uses, so the operator's eyes go from one to
+/// the other. Nothing here can do that comparison for them.
+///
+/// *Did it reach our cell?* That one is arithmetic: the API stamped the
+/// fingerprint of the certificate it serves onto the row, the machine reported
+/// the one it was served, and if they differ something is between them. So it
+/// is said outright — a tick, or a sentence — rather than as a second number
+/// somebody has to compare.
+function openApproval(r) {
+  const enrolId = (r.meta && r.meta.labels && r.meta.labels["velstra.io/awaiting-approval"]) || "";
+  if (!enrolId) return;
+  const id = idOf(r);
+  const scrim = el("div", { id: "dialogscrim", onclick: () => closeDialog() });
+  const dialog = el("div", { id: "dialog", role: "dialog", "aria-label": "Let " + id + " in?" });
+  document.body.appendChild(scrim);
+  document.body.appendChild(dialog);
+  fill(dialog, el("h2", "Let " + id + " in?"), el("p.prose", "Reading what the machine said…"));
+
+  enrolment(enrolId).then((row) => {
+    const st = (row && row.status) || {};
+    const rep = st.reported || {};
+    const roles = { runsGuests: true, servesStorage: false, isControlPlane: false };
+    const says = [
+      rep.vcpus && rep.vcpus + " vCPU",
+      rep.memoryMib && Math.round(rep.memoryMib / 1024) + " GiB",
+      rep.disks && rep.disks.length && rep.disks.length + (rep.disks.length === 1 ? " disk" : " disks"),
+      rep.serial && "serial " + rep.serial,
+    ].filter(Boolean).join(" · ");
+
+    // The cell half, decided here. Empty on either side is "cannot tell",
+    // which is not "no": a machine that reported nothing must not be shown
+    // as intercepted.
+    const seen = String(st.seenCertificate || "").trim();
+    const ours = String(st.cellCertificate || "").trim();
+    const cell = !seen || !ours
+      ? el("p.prose", "Whether it reached this cell could not be checked: " +
+          (seen ? "this API was never told its own certificate." : "the machine did not report what it was served."))
+      : seen.toUpperCase() === ours.toUpperCase()
+        ? el("p.prose", "\u2713 It reached this cell — the certificate it was served is ours.")
+        : el("p.prose.bad",
+            "\u2717 It was served a certificate that is not this cell's. Something is between " +
+            "that machine and here. Do not let it in until you know what.");
+
+    // One row per role: the box, the name, and what it means, aligned so the
+    // eye reads down a column rather than across three run-on sentences.
+    const check = (key, label, help) => {
+      const box = el("input", { type: "checkbox", checked: roles[key] ? "" : null });
+      box.onchange = () => { roles[key] = box.checked; };
+      return el("label.role", box, el("span.rolename", label), el("span.rolehelp", help));
+    };
+    const decide = async (spec, said) => {
+      try {
+        await decideEnrolment(enrolId, spec);
+        closeDialog();
+        toast(said);
+        // Whatever happened, the list is what says where the machine has got
+        // to, and the sheet if one is open on it.
+        if (typeof renderBoard === "function") renderBoard();
+        const fresh = await get(sheet.coll || { id: "nodes" }, nameOf(r)).catch(() => null);
+        if (fresh && sheet.open && sheet.name === nameOf(r)) openSheet(sheet.coll, fresh);
+      } catch (e) {
+        toast(String((e && e.message) || e));
+      }
+    };
+
+    fill(dialog,
+      el("h2", "Let " + id + " in?"),
+      el("p.prose", "On the machine's screen, under \"This machine:\", there is a fingerprint. This is the one the cell received:"),
+      el("pre.logblock", st.fingerprint || "\u2014"),
+      el("p.prose", "If they are the same, this is the machine in front of you." +
+        (says ? " It says it has " + says + "." : "")),
+      cell,
+      el("fieldset.roles",
+        el("legend", "What should it be for?"),
+        check("runsGuests", "Runs guests", "starts and holds virtual machines"),
+        check("servesStorage", "Serves storage", "its disks become a pool other machines use"),
+        check("isControlPlane", "Is a control plane", "runs this cell's API and store — rare")),
+      el("div.formacts.approveacts",
+        btn("Not this one", {
+          title: "Turn it away. It stops asking, and its row goes.",
+          onclick: () => decide({ refused: true }, id + " was turned away."),
+        }),
+        btn("Cancel", { onclick: () => closeDialog() }),
+        btn("Let it in", {
+          primary: true,
+          id: "approvebtn",
+          title: "The fingerprints match: approve. The machine is polling and starts installing within seconds.",
+          onclick: () => decide(Object.assign({ approved: true }, roles), id + " is being let in — it installs from here."),
+        })));
+  }).catch((e) => {
+    fill(dialog,
+      el("h2", "Let " + id + " in?"),
+      el("p.prose.bad", "Its announcement could not be read: " + String((e && e.message) || e)),
+      el("div.formacts", btn("Close", { onclick: () => closeDialog() })));
+  });
+}
+
+/// The one line on a machine's page while it is waiting, and the button.
+function awaitingBlock(coll, r) {
+  const enrolId = (r.meta && r.meta.labels && r.meta.labels["velstra.io/awaiting-approval"]) || "";
+  if (!enrolId) return null;
+  return el("div",
+    el("p.prose", "This machine has asked to join and is waiting for somebody to let it in."),
+    el("span.btns", btn("Let it in\u2026", { primary: true, onclick: () => openApproval(r) })));
+}
+
+/// The two media a machine is installed from, handed over as files.
+///
+/// Beside the credential control because it is the same credential: the token
+/// this mints is the one `:issueCredential` shows, formatted for the two places
+/// it actually has to go. `velstra/join` on any medium plugged into the
+/// machine, which the installer finds by itself and offers by name; or a
+/// `#cloud-config` for a box that boots Debian or Ubuntu.
+///
+/// Downloaded and never shown. A credential in a panel is one somebody
+/// screenshots, and reading it is not what anybody does with it.
+function mediumControl(coll, r) {
+  const id = idOf(r);
+  const host = el("span.btns");
+  const grab = (verb, filename, what) => async () => {
+    try {
+      const text = await joinMedium(id, verb);
+      const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+      const a = el("a", { href: url, download: filename });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast(filename + " — it is a credential; anything holding it can register as " + id + ".");
+    } catch (e) {
+      toast(String((e && e.message) || e));
+    }
+  };
+  fill(host,
+    btn("Join file", {
+      quiet: true,
+      title: "The token as the file the installer looks for. Put it at velstra/join on any " +
+             "medium you plug into the machine and it offers it by name — nothing is typed.",
+      onclick: grab("joinFile", id + ".join"),
+    }),
+    btn("cloud-init", {
+      quiet: true,
+      title: "The same token as a #cloud-config for a machine that boots Debian or Ubuntu: it " +
+             "writes the join file, runs the installer against it, and shreds it.",
+      onclick: grab("cloudInit", id + "-cloud-init.yaml"),
+    }),
+    btn("Install medium\u2026", {
+      quiet: true,
+      title: "The installer with this machine's join file on it. Write it to a stick, boot " +
+             "the machine from it, and it joins as this node without anything typed.",
+      onclick: () => offerMedium(host, id),
+    }));
+  return host;
+}
+
+/// Which release to cut the medium from, then the download.
+///
+/// The answer is a one-time link and the browser is sent to it: the medium is
+/// two gigabytes, and a download the page held in memory first would be a page
+/// that falls over on exactly the machines this is for.
+async function offerMedium(host, id) {
+  let ready;
+  try {
+    ready = (await releases()).filter((r) => r.status && r.status.installer && r.status.installer.fetched);
+  } catch (e) {
+    toast(String((e && e.message) || e));
+    return;
+  }
+  if (!ready.length) {
+    toast("No release on this cell holds an installer yet. Add one under Releases \u2014 the channel " +
+          "a published version was downloaded from \u2014 and wait until it is fetched.");
+    return;
+  }
+  const cut = async (release) => {
+    try {
+      const answer = await installMedium(id, release);
+      window.location.assign(answer.url);
+      toast(answer.filename + " \u2014 write it to a stick with dd or Etcher and boot the machine from " +
+            "it; it joins as " + id + ". The link works once.");
+    } catch (e) {
+      toast(String((e && e.message) || e));
+    }
+  };
+  if (ready.length === 1) return cut(idOf(ready[0]));
+  const pick = el("select", { "aria-label": "Release" });
+  for (const r of ready) {
+    pick.appendChild(el("option", { value: idOf(r) }, idOf(r) + " \u2014 " + ((r.status && r.status.version) || "")));
+  }
+  pick.value = idOf(ready[ready.length - 1]);
+  const ask = el("span.btns");
+  fill(ask, pick,
+    btn("Cut it", { primary: true, onclick: () => { ask.remove(); cut(pick.value); } }),
+    btn("Not now", { quiet: true, onclick: () => ask.remove() }));
+  host.appendChild(ask);
+}
+
 /// Ask again, a few seconds apart, until there is an answer or the time is up.
 ///
 /// Bounded, and deliberately not by much: this is a courtesy on top of the
@@ -1238,6 +1446,12 @@ function renderSheet(coll, r) {
   if (coll.id === "nodes" || coll.id === "pools") {
     acts.appendChild(credentialControl(coll, r));
   }
+  // And the same credential as a file. Only for a node: a pool agent is
+  // configured on a machine that is already installed, so there is no medium
+  // for it to arrive on.
+  if (coll.id === "nodes" && holdsThePen) {
+    acts.appendChild(mediumControl(coll, r));
+  }
   // Abandoning a migration is not deleting a row: what it costs depends on the
   // mode, and the sentence is different enough that it is written where the
   // modes are.
@@ -1343,6 +1557,12 @@ function renderSheet(coll, r) {
   // somebody commits to the window, and a control they have to find is one
   // they find afterwards.
   if (coll.id === "nodes") {
+    // First, because a machine nobody has let in yet is the only thing anybody
+    // opening this page wants to do something about.
+    const waiting = awaitingBlock(coll, r);
+    if (waiting) {
+      panel.appendChild(spread("Waiting to be let in", waiting, "compare the fingerprint, then approve"));
+    }
     const host = el("div", { id: "maintenance" });
     panel.appendChild(spread("Maintenance", host, "what is scheduled, and what it will cost"));
     maintenanceInto(host, r);

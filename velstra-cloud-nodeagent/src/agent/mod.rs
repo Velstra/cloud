@@ -136,6 +136,14 @@ pub struct AgentConfig {
     /// sweep at all: the cache grew with every distinct image ever booted here
     /// and never shrank, on the filesystem the guests' disks live on.
     pub image_keep_seconds: u64,
+    /// Where this node writes the Ceph client files the cell publishes —
+    /// `ceph.conf` and `keyring` — for QEMU to open volumes with. `None`
+    /// writes nothing, which is right for a test and wrong for a machine.
+    pub ceph_client_dir: Option<std::path::PathBuf>,
+    /// Where a build this machine is told to run is fetched to before it is
+    /// verified and applied. Under the state directory: a gigabyte that is
+    /// not on the volatile root of an appliance.
+    pub updates_dir: std::path::PathBuf,
     /// How often a guest's utilisation is *reported*, in milliseconds.
     ///
     /// Five minutes, which is what every cloud calls basic monitoring. It is a
@@ -164,6 +172,8 @@ impl AgentConfig {
             // carry a year of one-off images.
             image_keep_seconds: 30 * 24 * 60 * 60,
             usage_every_ms: 5 * 60 * 1000,
+            ceph_client_dir: None,
+            updates_dir: std::path::PathBuf::from("/var/lib/velstra/updates"),
         }
     }
 }
@@ -340,6 +350,20 @@ fn taps_of(programmed: &BTreeMap<String, ProgrammedPort>) -> BTreeMap<String, St
 /// Both of these are needed together wherever either is: what a port is allowed
 /// is a function of the groups *and* of every port, so a caller holding one
 /// without the other cannot answer the question anyway.
+/// What the caller had to go and find out before a guest can be described.
+///
+/// Three answers with a store read behind each — the node's declared CPU
+/// baseline, the PCI addresses this guest is to be given, and where its root
+/// disk is — carried together so that [`Agent::vm_request`] stays a pure
+/// builder over what the pass already holds. Separating them is the point:
+/// everything else that function reads is on the objects it was handed, and a
+/// builder that went looking would be one nothing could test.
+pub(super) struct Resolved {
+    pub baseline: Option<velstra_cloud_model::cpu::CpuLevel>,
+    pub devices: Vec<String>,
+    pub boot_disk: Option<String>,
+}
+
 pub(super) struct CellView<'a> {
     pub ports: &'a BTreeMap<String, Port>,
     /// The whole group object, not just its spec.
@@ -409,6 +433,8 @@ pub struct Agent {
     /// grew with the cell rather than with this node's own work. See
     /// [`crate::cell`] for the two ways it can be answered and why it matters.
     cell: Arc<dyn CellReader>,
+    /// Moving this machine to what it is wanted to run. See `update`.
+    updater: crate::update::Updater,
     vmm: Arc<dyn Vmm>,
     datapath: Arc<dyn Datapath>,
     /// The far end of the wire, when this node is it. `None` is the fabric case
@@ -521,6 +547,7 @@ impl Agent {
             bgp_peers: TypedStore::new(store.clone(), &cell, "bgp-peers"),
             migrations: TypedStore::new(store, &cell, "migrations"),
             cell: reader,
+            updater: crate::update::Updater::new(config.updates_dir.clone()),
             config,
             vmm,
             datapath,
@@ -784,6 +811,49 @@ impl Agent {
             .map_err(|why| why.to_string())
     }
 
+    /// Where this guest's root disk is, when it boots from a volume.
+    ///
+    /// `None` is the older shape and still the common one: the root disk is a
+    /// file this agent writes in its own state directory, sized by the flavor.
+    /// `Some(place)` is a volume in a pool, and the string is the same one an
+    /// attached disk is opened by — a path, or an `rbd:` image.
+    ///
+    /// Read here, beside the PCI assignment, and for the same reason: choosing
+    /// is a decision with a store read behind it, and `vm_request` stays a pure
+    /// builder. The place comes off the **attachment**, because that is the one
+    /// object in the cell that carries it: the pool says where it put the bytes
+    /// on the volume's status, and the attachment controller copies it across.
+    /// A boot volume with no attachment yet, or one whose pool has not said
+    /// where it is, is not an error here — it is a guest that cannot start
+    /// yet, and the sentence says which half is missing.
+    async fn boot_disk_for(&self, instance: &Instance) -> Result<Option<String>, String> {
+        if instance.spec.boot_volume.is_empty() {
+            return Ok(None);
+        }
+        let name = instance.meta.name.to_string();
+        let attachments = self
+            .cell
+            .attachments()
+            .await
+            .map_err(|e| format!("could not read this cell's attachments: {e}"))?;
+        let Some(mine) = attachments
+            .iter()
+            .find(|a| a.spec.instance == name && a.spec.volume == instance.spec.boot_volume)
+        else {
+            return Err(format!(
+                "{} boots from {} and nothing has attached it here yet",
+                name, instance.spec.boot_volume
+            ));
+        };
+        if mine.spec.at.is_empty() {
+            return Err(format!(
+                "{} has not said where it put {} yet, so there is nothing to boot from",
+                mine.spec.volume, instance.spec.boot_volume
+            ));
+        }
+        Ok(Some(mine.spec.at.clone()))
+    }
+
     /// The cell's PCI device classes, by id.
     ///
     /// Empty when the cell has none or they cannot be read. A node that
@@ -858,7 +928,7 @@ impl Agent {
              stopping its guests so they cannot run twice"
         );
         for instance in running {
-            if let Err(e) = self.vmm.stop(&instance).await {
+            if let Err(e) = self.vmm.kill(&instance).await {
                 // Reported and carried on. A guest that will not stop is worse
                 // than one that will, and the remaining ones are still worth
                 // stopping — leaving them running because a neighbour was
@@ -1306,56 +1376,20 @@ impl Agent {
             }
         }
 
-        // A guest with no instance anywhere in the cell. Nothing will ever ask
-        // for it to be stopped: the delete pipeline stops a guest while its
-        // record is still there, and once the record is gone no pass looks at
-        // the guest again. Found live as a QEMU that outlived its instance by
-        // two days, holding a tap for a port that no longer existed — which the
-        // tap sweep below then tried to remove, and was refused, every pass,
-        // for ever ("Device or resource busy").
-        //
-        // **Only guests this agent's own state directory holds.** The list
-        // above is this node's share and never was the cell — `CellReader`
-        // says so in one line ("the instances this node holds or has been
-        // given"), and the comment that used to sit here claimed otherwise.
-        // On that false premise the sweep reads as "an instance nobody's books
-        // mention", and what it actually means is "an instance *I* was not
-        // handed" — which is every other agent's guest on the same machine.
-        //
-        // Found by running a second agent on a live node, exactly as
-        // `--tap-prefix` and `--bridge-prefix` invite ("two agents on one
-        // machine need two"): it stopped the first agent's guest within
-        // seconds of starting, and the guest's own agent had to bring it back.
-        //
-        // `host.disks` is read from this agent's `run_dir`, so it is precisely
-        // "guests I made". The case this sweep exists for — a QEMU that
-        // outlived its instance by two days — is one of those, so nothing it
-        // was written to catch escapes.
-        //
-        // The list read failing returns early above, so an unreadable store
-        // never looks like an empty one.
+        // Missing records can follow a store restore or a schema rollback.
+        // Preserve the workloads and report them for operator reconciliation;
+        // only the explicit deletion pipeline may destroy a guest.
         let known: BTreeSet<String> = instances.iter().map(|i| i.meta.name.to_string()).collect();
+        let mut has_unknown_guest = false;
         for name in host.vms.keys() {
             if known.contains(name) || !host.disks.contains(name) {
                 continue;
             }
-            // Said once, now that a kill is terminal: the guest stops being
-            // observed, so this line stops repeating. It used to be every pass
-            // for as long as the node ran — 1055 an hour for twelve days on a
-            // live node — which is the shape of a warning nobody can act on and
-            // everybody learns to scroll past.
+            has_unknown_guest = true;
+            // An absent object may be a restored snapshot or an unreadable
+            // newer schema. Neither is an instruction to destroy a workload.
             tracing::warn!(instance = %name,
-                "stopping a guest of mine whose instance is gone from my share of the cell; \
-                 its disk is left behind and is an operator's to reclaim");
-            // `kill`, not `stop`: the graceful path asks over the monitor, and
-            // an orphan whose directory was deleted has no monitor left to ask
-            // — its unit is the only handle that still works.
-            if let Err(e) = self.vmm.kill(name).await {
-                tracing::warn!(instance = %name, error = %e, "the orphaned guest would not stop");
-                pass.failures += 1;
-            } else {
-                pass.actions += 1;
-            }
+                "guest has no readable instance in this node's share; preserving it for operator reconciliation");
         }
 
         match self.cell.attachments().await {
@@ -1435,7 +1469,9 @@ impl Agent {
         // port object. Once the guest stops concerning this node (the
         // migration record is gone), its tap does too.
         for (port_name, _tap) in taps.clone() {
-            if in_my_share.contains(port_name.as_str()) {
+            // Without the instance record we cannot identify its ports.
+            // Preserve the wire as well until the inventory is reconciled.
+            if has_unknown_guest || in_my_share.contains(port_name.as_str()) {
                 continue;
             }
             // A deleting port's teardown is the owner path's below — it is the
@@ -2080,13 +2116,24 @@ impl Agent {
                     .get(instance.spec.image.as_str())
                     .map(|i| i.digest.clone())
                     .unwrap_or_default();
+                let boot_disk = match self.boot_disk_for(instance).await {
+                    Ok(disk) => disk,
+                    // Said on the instance, like the devices above: a guest
+                    // whose root disk is not open yet is waiting for the pool,
+                    // and the operator should read that on the object rather
+                    // than in an agent's journal.
+                    Err(why) => return Err(why),
+                };
                 match self.vm_request(
                     instance,
                     taps,
                     ports,
-                    self.declared_baseline().await,
-                    devices,
                     &image_digest,
+                    Resolved {
+                        baseline: self.declared_baseline().await,
+                        devices,
+                        boot_disk,
+                    },
                 ) {
                     Ok(request) => self.vmm.start(&request).await,
                     Err(why) => Err(crate::host::HostError::failed(why)),
@@ -2111,19 +2158,12 @@ impl Agent {
         instance: &Instance,
         taps: &BTreeMap<String, String>,
         ports: &BTreeMap<String, Port>,
-        // Passed in rather than read here: this is a pure builder, and the
-        // baseline is one read of the node's own object that the caller has
-        // already made for the pass it is in the middle of.
-        baseline: Option<velstra_cloud_model::cpu::CpuLevel>,
-        // The PCI addresses this guest is to be given, already chosen. Same
-        // reasoning: choosing is a decision with a store read behind it, and
-        // this builder stays pure.
-        devices: Vec<String>,
         // What identifies the bytes, as against what identifies the object. A
         // VMM needs the first: the disk it boots was made from a file filed
         // under the digest, and an image called `debian-13` says nothing about
         // which bytes that is.
         image_digest: &str,
+        resolved: Resolved,
     ) -> Result<VmRequest, String> {
         let mut wanted = Vec::with_capacity(instance.spec.ports.len());
         for port in &instance.spec.ports {
@@ -2145,12 +2185,13 @@ impl Agent {
             memory_mib: instance.spec.memory_mib,
             image: image_digest.to_string(),
             root_disk_gib: instance.spec.root_disk_gib,
+            boot_disk: resolved.boot_disk,
             nics: wanted,
             // What this guest is to be given, as declared on this node right
             // now. A guest already running is unaffected: it keeps the CPU it
             // booted with, and adopts this one the next time it starts.
-            cpu_baseline: baseline,
-            devices,
+            cpu_baseline: resolved.baseline,
+            devices: resolved.devices,
         })
     }
 

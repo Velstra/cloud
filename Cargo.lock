@@ -2511,6 +2511,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
@@ -2559,6 +2560,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -2610,6 +2612,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "uuid",
+ "velstra-cloud-wire",
 ]
 
 [[package]]
@@ -2619,7 +2622,11 @@ dependencies = [
  "anyhow",
  "clap",
  "rcgen",
+ "ring",
+ "rustix",
+ "serde_json",
  "sha2",
+ "velstra-cloud-wire",
 ]
 
 [[package]]
@@ -2637,6 +2644,7 @@ dependencies = [
  "hyper-util",
  "prost 0.13.5",
  "reqwest",
+ "rustix",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -2684,6 +2692,7 @@ dependencies = [
 name = "velstra-cloud-wire"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "velstra-cloud-model",

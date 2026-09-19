@@ -30,6 +30,8 @@ const now = () => Date.now();
 // name -> resource. One flat map: the name carries the project, exactly as the
 // store's keys do.
 const store = new Map();
+// Media cut for one machine each, waiting under a ticket to be collected once.
+const media = new Map();
 const watchers = new Set();
 
 /// What every object of a kind carries before anybody sets anything.
@@ -373,6 +375,11 @@ function seed() {
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
       allocated: { vcpus: 10, memoryMib: 20480, diskGib: 200, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 4000,
+      // How the machine was installed and which build it runs. The image
+      // carries a slot; a package does not, and the API omits the empty
+      // field, so the package nodes below omit it too.
+      installed: { kind: "Appliance", distro: "NixOS 25.11 (Xantusia)",
+        version: "0.1.0+20260918.c571d71", slot: "a" },
       // Whether this node's console stream is encrypted. `datapath` and
       // `balancers` are deliberately absent: the API omits them when empty,
       // and the fixture answering what the API does not is the same defect in
@@ -408,6 +415,8 @@ function seed() {
       capacity: { vcpus: 32, memoryMib: 65536, diskGib: 2048, numaFreeMib: [16384, 16384], hugepages1gi: 0 },
       allocated: { vcpus: 30, memoryMib: 61440, diskGib: 1900, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 900_000,
+      installed: { kind: "Package", distro: "Debian GNU/Linux 13 (trixie)",
+        version: "0.1.0+20260910.681269c" },
       // A generation behind the other two: this is what makes the cell mixed.
       cpu: cpu("v2"),
       devices: [
@@ -421,6 +430,8 @@ function seed() {
       capacity: { vcpus: 64, memoryMib: 262144, diskGib: 4096, numaFreeMib: [65536, 65536], hugepages1gi: 32 },
       allocated: { vcpus: 4, memoryMib: 8192, diskGib: 80, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 3000,
+      installed: { kind: "Appliance", distro: "NixOS 25.11 (Xantusia)",
+        version: "0.1.0+20260918.c571d71", slot: "b" },
       cpu: cpu("v3"),
       devices: [
         disk("/dev/disk/by-id/nvme-eui.0007", "nvme0n1", 1863, false, "WD Black SN850X", { kind: "Free" }),
@@ -440,10 +451,32 @@ function seed() {
       capacity: { vcpus: 32, memoryMib: 131072, diskGib: 2048, numaFreeMib: [65536, 65536], hugepages1gi: 0 },
       allocated: { vcpus: 2, memoryMib: 4096, diskGib: 40, numaFreeMib: [], hugepages1gi: 0 },
       agentVersion: "0.1.0", lastHeartbeat: now() - 2000,
+      // A build behind the others: the *Build* column exists to show that.
+      installed: { kind: "Package", distro: "Ubuntu 24.04.3 LTS",
+        version: "0.1.0+20260910.681269c" },
       cpu: cpu("v2"),
       devices: [
         disk("/dev/disk/by-id/ata-SEAGATE-0009", "sda", 1863, false, "ST2000DM008", { kind: "Free" }),
       ] });
+
+  // A release the cell has read and fetched whole, so the Upgrade bar and the
+  // install-medium button have something to offer. A second one still
+  // fetching, so a chooser has two rows and a rollout has a release it must
+  // refuse to start on.
+  put("releases/v0.2.0", { url: "https://github.com/Velstra/cloud/releases/download/v0.2.0/" },
+    { observedGeneration: 1, conditions: ready(1), version: "0.2.0+20260918.c571d71",
+      image: { file: "velstra-cloud-node_0.2.0+20260918.c571d71_amd64.raw.zst", sha256: "ab".repeat(32), fetched: true },
+      package: { file: "velstra-cloud_0.2.0+20260918.c571d71_amd64.deb", sha256: "cd".repeat(32), fetched: true },
+      installer: { file: "velstra-cloud-installer_0.2.0+20260918.c571d71_amd64.iso", sha256: "ef".repeat(32), fetched: true },
+      checkedAt: now() - 60_000 });
+  put("releases/v0.3.0", { url: "https://github.com/Velstra/cloud/releases/download/v0.3.0/" },
+    { observedGeneration: 1, version: "0.3.0+20260925.1a2b3c4",
+      conditions: [{ kind: "Ready", status: "False", reason: "Fetching",
+        message: "fetching the image (2 of 3)", observedGeneration: 1, lastTransition: now() - 5_000 }],
+      image: { file: "velstra-cloud-node_0.3.0+20260925.1a2b3c4_amd64.raw.zst", sha256: "ab".repeat(32), fetched: false },
+      package: { file: "velstra-cloud_0.3.0+20260925.1a2b3c4_amd64.deb", sha256: "cd".repeat(32), fetched: true },
+      installer: { file: "velstra-cloud-installer_0.3.0+20260925.1a2b3c4_amd64.iso", sha256: "ef".repeat(32), fetched: false },
+      checkedAt: now() - 5_000 });
 
   // Two windows: one open over node-b right now, one still to come on node-c.
   // Both are needed — the open one is what an operator is looking at, and the
@@ -987,6 +1020,21 @@ const server = createServer(async (req, res) => {
   }
 
   const auth = req.headers.authorization || "";
+  // A cut medium, collected under its ticket and no token: the link is the
+  // credential, once. Four kilobytes stand in for the installer.
+  if (req.method === "GET" && path.startsWith("/api/v1/media/")) {
+    const ticket = path.slice("/api/v1/media/".length);
+    const cut = media.get(ticket);
+    if (!cut) return fail(res, 404, "NOT_FOUND", "a medium under that link: it was collected already or the link expired");
+    media.delete(ticket);
+    res.writeHead(200, {
+      "content-type": "application/octet-stream",
+      "content-length": String(cut.size),
+      "content-disposition": `attachment; filename="${cut.filename}"`,
+    });
+    res.end(Buffer.alloc(cut.size));
+    return;
+  }
   if (auth !== "Bearer " + TOKEN) {
     return fail(res, 401, "UNAUTHENTICATED", "a bearer token is required");
   }
@@ -1043,6 +1091,34 @@ const server = createServer(async (req, res) => {
     return json(res, 200, {
       target: name,
       [kind === "nodes" ? "nodeToken" : "poolToken"]: (kind === "nodes" ? "d" : "e").repeat(64),
+    });
+  }
+
+  // `nodes/node-a:installMedium` — the installer with this node's join file on
+  // its tail, as a one-time link. The real API streams two gigabytes; here a
+  // few kilobytes of zeros carry the same headers.
+  if (path.includes(":installMedium")) {
+    const name = nameFrom(path.replace(":installMedium", ""));
+    const r = store.get(name);
+    if (!r) return fail(res, 404, "NOT_FOUND", "no such object");
+    const kind = name.split("/")[0];
+    if (kind !== "nodes") {
+      return fail(res, 400, "INVALID_ARGUMENT", `an install medium is cut for a node, and ${name} is a ${kind}`);
+    }
+    const asked = await readBody(req);
+    const named = asked && asked.release ? String(asked.release) : "releases/v0.2.0";
+    const release = store.get(named.startsWith("releases/") ? named : "releases/" + named);
+    if (!release) return fail(res, 404, "NOT_FOUND", `release ${named}`);
+    if (!(release.status.installer && release.status.installer.fetched)) {
+      return fail(res, 400, "FAILED_PRECONDITION",
+        `${release.meta.name} holds no installer yet: ${(release.status.conditions[0] || {}).message || "the channel has not been read yet"}`);
+    }
+    const ticket = "m" + Math.random().toString(36).slice(2);
+    const filename = `velstra-cloud-installer_${release.status.version}_${name.split("/")[1]}.iso`;
+    media.set(ticket, { filename, size: 4096 });
+    return json(res, 200, {
+      url: "/api/v1/media/" + ticket, filename, release: release.meta.name,
+      version: release.status.version, size: 4096, expiresAt: now() + 600_000,
     });
   }
 
@@ -1731,6 +1807,8 @@ function blankStatus(collectionName) {
       agentVersion: "",
       lastHeartbeat: 0,
       images: [],
+      // Not reported yet: the API answers the kind alone and omits the rest.
+      installed: { kind: "Unknown" },
       devices: [],
     };
   }

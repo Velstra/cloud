@@ -25,18 +25,67 @@ in
   options.velstra.cloud.pool = {
     enable = lib.mkEnableOption "a Velstra Cloud storage pool agent";
 
+    fromSeed = lib.mkEnableOption ''
+      taking every answer from `/etc/velstra/node.env` instead of from the
+      options below, and running only when that seed names the `pool` role.
+
+      This is how a machine that is **flashed rather than declared** works. The
+      sealed appliance is built once for a fleet and installed onto boxes whose
+      pool id, backend and cell are not known at image-build time — which is
+      why it could not be a pool at all until this existed, and why a cell
+      wanting one had to keep a Debian machine around for it.
+
+      The agent reads the same keys the Debian package's units read, through
+      the same `EnvironmentFile`, so a pool states its answers once and all
+      three packagings agree about them. Nothing here builds a command line
+      out of the seed: the binary's own arguments carry `env =` fallbacks, so
+      the unit is started bare. A unit that assembled the arguments itself
+      would be a fourth place for these keys to be spelled, and the last time
+      two places spelled one of them differently it cost a Ceph volume that
+      could be created and not opened.
+    '';
+
     package = lib.mkOption {
       type = lib.types.package;
       description = "The velstra-cloud workspace build (poolagent binary).";
     };
+    seedFile = lib.mkOption {
+      type = lib.types.path;
+      default = "/etc/velstra/node.env";
+      description = ''
+        Which file `fromSeed` reads the answers out of.
+
+        The default is where a machine keeps *who it is*: `/etc` is per-machine
+        by construction, and that is the whole reason identity was moved out of
+        the state directory. A cell whose machines share one filesystem — which
+        is what makes moving a guest possible at all — had every agent reading
+        one `node.env` and answering to one name; the second machine to mount it
+        renamed the first, and the next upgrade took the control plane down.
+
+        The sealed appliance is the one machine that cannot use that path: its
+        `/etc` is a read-only dm-verity store, so it points this at its own
+        writable partition instead. That is safe there for the same reason the
+        default is safe everywhere else — the partition belongs to one machine.
+
+        Deliberately one file and not a search order. Reading both and letting
+        one win is not the fix: the keys the winner does not mention would still
+        come from the loser, so a control plane would inherit a hypervisor's
+        pool.
+      '';
+    };
 
     id = lib.mkOption {
       type = lib.types.str;
+      default = "";
       description = ''
         This pool's id, which has to match the `pools/<id>` object an operator
         registered. It is what every volume is written against, so a mismatch
         is a pool that claims nothing and a cell whose volumes are never
         provisioned — quietly.
+
+        Empty only with `fromSeed`, where the machine's own seed answers it.
+        An assertion refuses an empty one otherwise rather than letting the
+        agent start against a pool called nothing.
       '';
     };
 
@@ -168,15 +217,24 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    networking.nftables.enable = true;
     assertions = [
       {
-        assertion = (cfg.apiUrl == null) == (cfg.tokenFile == null);
+        assertion = cfg.fromSeed || (cfg.apiUrl == null) == (cfg.tokenFile == null);
         message = "velstra.cloud.pool: apiUrl and tokenFile are set together or not at all — a pool reading through the API has to authenticate as itself.";
+      }
+      {
+        assertion = cfg.fromSeed || cfg.id != "";
+        message = "velstra.cloud.pool: id is what every volume is written against, so it cannot be empty. Set it, or set fromSeed = true and let the machine's seed answer it.";
       }
     ];
 
     systemd.services.velstra-cloud-poolagent = {
-      description = "Velstra Cloud storage pool ${cfg.id}";
+      description =
+        if cfg.fromSeed then
+          "Velstra Cloud storage pool (from this machine's seed)"
+        else
+          "Velstra Cloud storage pool ${cfg.id}";
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
@@ -187,12 +245,41 @@ in
           # restarted must not fail on a missing binary it had a moment ago.
           pkgs.qemu-utils
         ]
-        ++ lib.optional (cfg.backend == "ceph") pkgs.ceph-client
+        # With `fromSeed` the backend is not known until the machine is
+        # installed, so both sets of tools ship. An appliance that had to be
+        # rebuilt to change a pool from directory to Ceph would not be an
+        # appliance.
+        ++ lib.optional (cfg.fromSeed || cfg.backend == "ceph") pkgs.ceph-client
         ++ cfg.extraPackages;
       serviceConfig = {
         Restart = "on-failure";
         RestartSec = 5;
         StateDirectory = "velstra";
+      }
+      // lib.optionalAttrs cfg.fromSeed {
+        # The machine's own seed, and only its own — identity lives in /etc
+        # because a cell whose machines share a state directory would otherwise
+        # have every agent reading one file and answering to one name.
+        EnvironmentFile = "-${cfg.seedFile}";
+        # `ExecCondition`, so a machine that is not a pool shows this unit as
+        # *skipped* rather than failed. The difference between "this box is not
+        # a pool" and "the pool agent is broken" is the whole reason an
+        # operator can read `systemctl status` on a fleet.
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role pool";
+        # Bare. Every answer reaches the binary through its own `env =`
+        # fallbacks, which is what keeps this unit from becoming a second
+        # spelling of the seed.
+        # Bare but for the token's path, and only when this machine's is not
+        # where the binary looks by default (`/etc/velstra/pool-token`). The
+        # sealed appliance is that machine: its `/etc` is read-only, so the
+        # installer puts the credential on the writable partition beside the
+        # seed.
+        ExecStart = lib.concatStringsSep " " (
+          [ "${cfg.package}/bin/velstra-cloud-poolagent" ]
+          ++ lib.optional (cfg.tokenFile != null) "--api-token-file ${cfg.tokenFile}"
+        );
+      }
+      // lib.optionalAttrs (!cfg.fromSeed) {
         ExecStart = lib.concatStringsSep " " (
           [
             "${cfg.package}/bin/velstra-cloud-poolagent"
@@ -227,7 +314,12 @@ in
     # the agent: a process that created its own pool directory could create one
     # on the wrong machine, on a root filesystem, exactly when a mount failed to
     # come up.
-    systemd.tmpfiles.rules = lib.mkIf (cfg.backend == "directory") [
+    #
+    # With `fromSeed` the backend is only known once the machine is installed,
+    # so the directories are made either way. They cost two empty directories on
+    # a machine that turns out to keep its volumes in Ceph, and they save the
+    # case this guards against on one that does not.
+    systemd.tmpfiles.rules = lib.mkIf (cfg.fromSeed || cfg.backend == "directory") [
       "d ${cfg.directory} 0700 root root -"
       "d ${cfg.images} 0755 root root -"
     ];

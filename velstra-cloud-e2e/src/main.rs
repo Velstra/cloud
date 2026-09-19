@@ -89,6 +89,8 @@ async fn main() {
         region: REGION.into(),
         cell: CELL.into(),
         fabric: None,
+        releases_dir: std::env::temp_dir().join("velstra-e2e-releases"),
+        node: None,
     };
     let loops = velstra_cloud_controller::wiring::Loops::unelected(
         config,
@@ -276,6 +278,7 @@ async fn register_node(store: Arc<dyn Store>, id: &str) {
             labels: vec!["dev".to_string()],
             cpu_baseline: None,
             gateway: false,
+            wanted: None,
         },
         NodeStatus::default(),
     );

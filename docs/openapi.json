@@ -494,6 +494,31 @@
         ],
         "type": "object"
       },
+      "Enrollment": {
+        "description": "What was asked for (`spec`), what is (`status`), and how far the second is behind the first (`meta.generation` against `status.observedGeneration`).",
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/EnrollmentSpec"
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          }
+        },
+        "required": [
+          "meta",
+          "spec",
+          "status"
+        ],
+        "type": "object"
+      },
+      "EnrollmentSpec": {
+        "additionalProperties": true,
+        "description": "The console has no form for this collection, so its fields are not enumerated here; docs/rest-contract.md names them.",
+        "type": "object"
+      },
       "Error": {
         "properties": {
           "error": {
@@ -865,6 +890,11 @@
         "additionalProperties": true,
         "description": "Virtual machines. What was asked for is the spec; what the node reports is the status, and they are shown together.",
         "properties": {
+          "bootVolume": {
+            "description": "The name of a `volumes` object. Left empty, the root disk is a file on whichever machine runs this guest, sized by the flavor — and the guest cannot be moved to another machine, because moving a guest does not move its disk. Named, the root disk is that volume, in its pool: it is sized by the volume rather than by the flavor, it outlives the guest, and a guest whose root is in a pool both machines can reach can be moved between them. Settable at creation only.",
+            "type": "string",
+            "x-at-creation": true
+          },
           "console": {
             "description": "Publishes what the operating system inside writes to its serial console, so it can be read here. Off by default because it costs a report every time it logs a line. An instance that is not running shows its last output whether this is on or not.",
             "type": "boolean"
@@ -914,7 +944,7 @@
             "type": "string"
           },
           "onNodeLoss": {
-            "description": "Only for an instance whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Nothing is moved until the node has been quiet long enough that its own agent has certainly stopped what it was running — a node with no fencing deadline is never recovered from.",
+            "description": "Only for an instance whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Recovery requires a fencing deadline and an operator's confirmation that the host was independently fenced. Silence alone never proves that its guests stopped.",
             "enum": [
               "leave",
               "restart"
@@ -1734,6 +1764,41 @@
         ],
         "type": "object"
       },
+      "Release": {
+        "description": "What was asked for (`spec`), what is (`status`), and how far the second is behind the first (`meta.generation` against `status.observedGeneration`).",
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/ReleaseSpec"
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          }
+        },
+        "required": [
+          "meta",
+          "spec",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ReleaseSpec": {
+        "additionalProperties": true,
+        "description": "A build the cell can move to, and where it comes from. Name the channel a published version was downloaded from — a GitHub release's directory, or a directory copied onto the control plane — and the cell reads which build it holds, fetches every file onto its own disk and verifies each. From then on the cell is the channel for its machines: a rollout hands each node what the cell holds, and an install medium is cut from the installer here.",
+        "properties": {
+          "url": {
+            "description": "A directory holding the files a release publishes and their SHA256SUMS: a GitHub release's download directory, or file:///var/lib/velstra/releases/<version> for a directory copied onto the control plane. What it holds is what the release is — the version is read off the files, never typed — and the cell fetches every file onto its own disk before it is ready.",
+            "format": "uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
       "Role": {
         "description": "What was asked for (`spec`), what is (`status`), and how far the second is behind the first (`meta.generation` against `status.observedGeneration`).",
         "properties": {
@@ -1776,6 +1841,66 @@
         },
         "required": [
           "grants"
+        ],
+        "type": "object"
+      },
+      "Rollout": {
+        "description": "What was asked for (`spec`), what is (`status`), and how far the second is behind the first (`meta.generation` against `status.observedGeneration`).",
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/RolloutSpec"
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          }
+        },
+        "required": [
+          "meta",
+          "spec",
+          "status"
+        ],
+        "type": "object"
+      },
+      "RolloutSpec": {
+        "additionalProperties": true,
+        "description": "Moving the cell's machines to a release, one at a time: taken out of service, drained if asked, handed what to run, waited for, put back. The control plane goes last. A machine that does not come back stops the rollout by name and leaves the rest as they were; one the cell cannot update is refused by name and the rest go on. Pause it and the machine in flight finishes while no other starts.",
+        "properties": {
+          "evacuate": {
+            "description": "Every guest on a machine is moved to another before it is updated — live where the destination can take it. Off, its guests go down with its reboot. Settable at creation only.",
+            "type": "boolean",
+            "x-at-creation": true
+          },
+          "maxUnavailable": {
+            "description": "How many machines may be out of service at the same time.",
+            "maximum": 64,
+            "minimum": 1,
+            "type": "integer",
+            "x-unit": "machines"
+          },
+          "nodes": {
+            "description": "Which machines; none means every node in the cell. One at a time, the control plane last. A machine the cell cannot update — one running the NixOS module on its own operating system — is refused by name and the rest go on. Settable at creation only.",
+            "items": {
+              "description": "The name of a `nodes` object.",
+              "type": "string"
+            },
+            "type": "array",
+            "x-at-creation": true
+          },
+          "paused": {
+            "description": "Finish the machine in flight and start no other. The knob to reach for at the first sign of trouble.",
+            "type": "boolean"
+          },
+          "release": {
+            "description": "The name of a `releases` object. What to move the machines to. Only a release that is ready — every file fetched and verified — moves anything. Settable at creation only.",
+            "type": "string",
+            "x-at-creation": true
+          }
+        },
+        "required": [
+          "release"
         ],
         "type": "object"
       },
@@ -2564,6 +2689,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -2929,6 +3058,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -3294,6 +3427,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -3659,6 +3796,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -3844,6 +3985,328 @@
         ]
       }
     },
+    "/api/v1/enrollments": {
+      "get": {
+        "operationId": "list-enrollments",
+        "parameters": [
+          {
+            "description": "How many to return; the response carries `nextPageToken` when there are more.",
+            "in": "query",
+            "name": "pageSize",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Where the previous page ended.",
+            "in": "query",
+            "name": "pageToken",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects carrying these labels, as `key=value,key2=value2`.",
+            "in": "query",
+            "name": "labels",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`true` streams changes as server-sent events instead of listing.",
+            "in": "query",
+            "name": "watch",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With `watch`: the revision a list reported, so nothing between the list and the watch is lost.",
+            "in": "query",
+            "name": "fromRevision",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created at or after this moment: milliseconds since the epoch, or a span back from now like `30m`, `6h`, `7d`.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created before this moment, same spellings as `since`. Exclusive, so two adjacent ranges neither overlap nor skip.",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`name` or `createdAt`, optionally followed by ` desc`. An ordered listing is a top-N: everything the filter admits is read and sorted, and the first `pageSize` of the sorted order is returned with no `nextPageToken` (and `\"truncated\": true` when the answer was cut). Refused together with `pageToken`.",
+            "in": "query",
+            "name": "orderBy",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A read mask: comma-separated dotted paths, as `meta.name,status.conditions`. `meta.name` is always returned.",
+            "in": "query",
+            "name": "fields",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "items": {
+                      "items": {
+                        "$ref": "#/components/schemas/Enrollment"
+                      },
+                      "type": "array"
+                    },
+                    "nextPageToken": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "revision"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A page of objects. `X-Velstra-Revision` is the revision the list is consistent at."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "List enrollments",
+        "tags": [
+          "enrollments"
+        ]
+      }
+    },
+    "/api/v1/enrollments/{name}": {
+      "get": {
+        "operationId": "get-enrollments",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Enrollment"
+                }
+              }
+            },
+            "description": "The object."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Read one of enrollments",
+        "tags": [
+          "enrollments"
+        ]
+      },
+      "patch": {
+        "description": "Only `spec` and `labels` are writable here; `status` is the owning agent's, written through `:reportStatus`. Send `If-Match` with the revision read to make the write a compare-and-swap.",
+        "operationId": "patch-enrollments",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "labels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "spec": {
+                    "$ref": "#/components/schemas/EnrollmentSpec"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Enrollment"
+                }
+              }
+            },
+            "description": "The object as stored."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Change the spec of one of enrollments",
+        "tags": [
+          "enrollments"
+        ]
+      }
+    },
+    "/api/v1/enrollments:announce": {
+      "post": {
+        "operationId": "announce-enrollments",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "A machine announcing itself to this cell, with no token — it has just booted an installer and holds none. Carries `publicKey` (Ed25519, base64), optionally `seenCertificate` and `reported`. Answers the enrolment's id and the fingerprint of the key, which the machine prints on its screen for an operator to compare. Grants nothing: an operator has to name the machine and say what it is for before anything can be claimed. Idempotent in the key, so a machine that announces again lands on its own row; capped, because it is the one door a stranger can write through.",
+        "tags": [
+          "enrollments"
+        ]
+      }
+    },
+    "/api/v1/enrollments:claim": {
+      "post": {
+        "operationId": "claim-enrollments",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "A machine collecting the credential an operator approved for it, with no token. Carries `id` and `signature` — an Ed25519 signature over `velstra-enrollment-claim:v1:<id>`, made with the key the machine announced — and answers `nodeToken` and `joinToken`, once. Authorised by that signature and by the recorded approval of a person. A collection verb rather than `enrollments/<id>:claim` because a path segment in this router is either a literal or a parameter and never both; the id is not a secret.",
+        "tags": [
+          "enrollments"
+        ]
+      }
+    },
     "/api/v1/flavors": {
       "get": {
         "operationId": "list-flavors",
@@ -4024,6 +4487,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -4389,6 +4856,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -4754,6 +5225,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -5119,6 +5594,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -5304,6 +5783,42 @@
         ]
       }
     },
+    "/api/v1/media/{ticket}": {
+      "get": {
+        "operationId": "collect-medium",
+        "parameters": [
+          {
+            "description": "The one-time ticket the cut answered with.",
+            "in": "path",
+            "name": "ticket",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The medium, as `application/octet-stream` with a `Content-Disposition` naming the file."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "security": [],
+        "summary": "Collect an install medium cut by `nodes/{name}:installMedium`, once. The ticket is the credential — the link carries no other, so a browser's plain download can fetch it — and it is spent on the way in and gone after ten minutes. Streams the ISO and then the node's join file.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/api/v1/nodes": {
       "get": {
         "operationId": "list-nodes",
@@ -5484,6 +5999,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -5641,6 +6160,43 @@
       }
     },
     "/api/v1/nodes/{name}": {
+      "delete": {
+        "description": "Marks the object for deletion; it is gone once every finalizer has released it.",
+        "operationId": "delete-nodes",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deleting: the object exists until its finalizers release it."
+          },
+          "204": {
+            "description": "Gone."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Delete one of Nodes",
+        "tags": [
+          "Nodes"
+        ]
+      },
       "get": {
         "operationId": "get-nodes",
         "parameters": [
@@ -5744,6 +6300,59 @@
         ]
       }
     },
+    "/api/v1/nodes/{name}:cloudInit": {
+      "post": {
+        "operationId": "cloudInit-nodes",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "The same token as a `#cloud-config` for a machine that boots Debian or Ubuntu: it writes the join file 0600, runs `velstra-cloud-node setup --join-file` against it, and shreds it. It installs no package — which repository a fleet takes one from is the fleet's decision. Answers `text/plain`.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/api/v1/nodes/{name}:explainMaintenance": {
       "get": {
         "operationId": "explainMaintenance-nodes",
@@ -5782,6 +6391,59 @@
           }
         },
         "summary": "What taking the machine out of service would move, and where to.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/api/v1/nodes/{name}:installMedium": {
+      "post": {
+        "operationId": "installMedium-nodes",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Cut an install medium for this machine: the installer ISO a release holds, with this node's join file appended after the ISO's last byte — one download, one stick, nothing typed. The body may name `release`; without it the newest release whose installer is on this cell is used. Answers a one-time link (`url`), the `filename`, the `release` and its `version`, the `size` and `expiresAt`: `GET` the link without a token within ten minutes and it streams the medium once. POST because it mints the node's credential, as `:joinFile` does; refused with `FAILED_PRECONDITION` while no release on this cell holds a verified installer.",
         "tags": [
           "Nodes"
         ]
@@ -5834,7 +6496,60 @@
             "description": "Refused, with a code a program can branch on and a sentence a person can read."
           }
         },
-        "summary": "Mint a fresh credential for a machine that already exists; shown once. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+        "summary": "Mint a fresh credential for a machine that already exists; shown once, as `nodeToken` and — when this API advertises an address — as `joinToken`, the whole hand-off in one string. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/api/v1/nodes/{name}:joinFile": {
+      "post": {
+        "operationId": "joinFile-nodes",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "The same credential as `:issueCredential`, formatted as the file the installer looks for on anything plugged into a machine. Answers `text/plain`, not JSON: `curl -X POST … -o /mnt/velstra/join` is the intended use. A comment above the token names the node and the cell, because the file will be found by somebody who did not write it. POST and not GET because it mints a credential.",
         "tags": [
           "Nodes"
         ]
@@ -6180,6 +6895,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -6337,6 +7056,43 @@
       }
     },
     "/api/v1/pools/{name}": {
+      "delete": {
+        "description": "Marks the object for deletion; it is gone once every finalizer has released it.",
+        "operationId": "delete-pools",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deleting: the object exists until its finalizers release it."
+          },
+          "204": {
+            "description": "Gone."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Delete one of Pools",
+        "tags": [
+          "Pools"
+        ]
+      },
       "get": {
         "operationId": "get-pools",
         "parameters": [
@@ -6487,7 +7243,7 @@
             "description": "Refused, with a code a program can branch on and a sentence a person can read."
           }
         },
-        "summary": "Mint a fresh credential for a pool that already exists; shown once. The body may carry `purpose` and `expiresAt`.",
+        "summary": "Mint a fresh credential for a pool that already exists; shown once, as `poolToken` and — when this API advertises an address — as `joinToken`. The body may carry `purpose` and `expiresAt`.",
         "tags": [
           "Pools"
         ]
@@ -6673,6 +7429,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -7151,6 +7911,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -7623,6 +8387,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -8033,6 +8801,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -8372,6 +9144,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -8711,6 +9487,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -9121,6 +9901,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -9583,6 +10367,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -9993,6 +10781,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -10762,6 +11554,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -11172,6 +11968,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -11511,6 +12311,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -12113,6 +12917,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -12585,6 +13393,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -12995,6 +13807,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -13405,6 +14221,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -13815,6 +14635,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -14225,6 +15049,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -14827,6 +15655,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -15101,6 +15933,419 @@
         ]
       }
     },
+    "/api/v1/releases": {
+      "get": {
+        "operationId": "list-releases",
+        "parameters": [
+          {
+            "description": "How many to return; the response carries `nextPageToken` when there are more.",
+            "in": "query",
+            "name": "pageSize",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Where the previous page ended.",
+            "in": "query",
+            "name": "pageToken",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects carrying these labels, as `key=value,key2=value2`.",
+            "in": "query",
+            "name": "labels",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`true` streams changes as server-sent events instead of listing.",
+            "in": "query",
+            "name": "watch",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With `watch`: the revision a list reported, so nothing between the list and the watch is lost.",
+            "in": "query",
+            "name": "fromRevision",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created at or after this moment: milliseconds since the epoch, or a span back from now like `30m`, `6h`, `7d`.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created before this moment, same spellings as `since`. Exclusive, so two adjacent ranges neither overlap nor skip.",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`name` or `createdAt`, optionally followed by ` desc`. An ordered listing is a top-N: everything the filter admits is read and sorted, and the first `pageSize` of the sorted order is returned with no `nextPageToken` (and `\"truncated\": true` when the answer was cut). Refused together with `pageToken`.",
+            "in": "query",
+            "name": "orderBy",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A read mask: comma-separated dotted paths, as `meta.name,status.conditions`. `meta.name` is always returned.",
+            "in": "query",
+            "name": "fields",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "items": {
+                      "items": {
+                        "$ref": "#/components/schemas/Release"
+                      },
+                      "type": "array"
+                    },
+                    "nextPageToken": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "revision"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A page of objects. `X-Velstra-Revision` is the revision the list is consistent at."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "List Releases",
+        "tags": [
+          "Releases"
+        ]
+      },
+      "post": {
+        "operationId": "create-releases",
+        "parameters": [
+          {
+            "description": "A key of the caller's own invention, sent again on every retry of the same create. The second attempt is answered with the first attempt's operation and target instead of making a second object, and carries `x-velstra-idempotent-replay: true`. Reusing a key for a different request is refused. Keys are remembered for a day. Registering a node or a pool does not take one: its answer carries a credential shown only once.",
+            "in": "header",
+            "name": "idempotency-key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "description": "The last segment of the name.",
+                    "type": "string"
+                  },
+                  "labels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "spec": {
+                    "$ref": "#/components/schemas/ReleaseSpec"
+                  }
+                },
+                "required": [
+                  "id",
+                  "spec"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
+                    "nodeToken": {
+                      "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
+                      "type": "string"
+                    },
+                    "operation": {
+                      "description": "The operation's resource name. Read it to learn when the object settled.",
+                      "type": "string"
+                    },
+                    "poolToken": {
+                      "description": "Only when a pool was registered: the pool agent's bearer token, returned once and never readable again.",
+                      "type": "string"
+                    },
+                    "target": {
+                      "description": "The name the object was given.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "target"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Accepted. The object exists and is converging; poll the operation named here."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Create one of Releases",
+        "tags": [
+          "Releases"
+        ]
+      }
+    },
+    "/api/v1/releases/{id}/files/{file}": {
+      "get": {
+        "operationId": "get-release-file",
+        "parameters": [
+          {
+            "description": "The release.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The file, by the name the release's status gives it.",
+            "in": "path",
+            "name": "file",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file, as `application/octet-stream`."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "One of a release's files, as this cell fetched and verified it — what a node fetches when told what to run. Only a file the release's status names, and only once it is recorded as fetched; a name is never a path. For the cell's machines and its operators.",
+        "tags": [
+          "Releases"
+        ]
+      }
+    },
+    "/api/v1/releases/{name}": {
+      "delete": {
+        "description": "Marks the object for deletion; it is gone once every finalizer has released it.",
+        "operationId": "delete-releases",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deleting: the object exists until its finalizers release it."
+          },
+          "204": {
+            "description": "Gone."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Delete one of Releases",
+        "tags": [
+          "Releases"
+        ]
+      },
+      "get": {
+        "operationId": "get-releases",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Release"
+                }
+              }
+            },
+            "description": "The object."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Read one of Releases",
+        "tags": [
+          "Releases"
+        ]
+      },
+      "patch": {
+        "description": "Only `spec` and `labels` are writable here; `status` is the owning agent's, written through `:reportStatus`. Send `If-Match` with the revision read to make the write a compare-and-swap.",
+        "operationId": "patch-releases",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "labels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "spec": {
+                    "$ref": "#/components/schemas/ReleaseSpec"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Release"
+                }
+              }
+            },
+            "description": "The object as stored."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Change the spec of one of Releases",
+        "tags": [
+          "Releases"
+        ]
+      }
+    },
     "/api/v1/roles": {
       "get": {
         "operationId": "list-roles",
@@ -15281,6 +16526,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"
@@ -15463,6 +16712,375 @@
         "summary": "Change the spec of one of Roles",
         "tags": [
           "Roles"
+        ]
+      }
+    },
+    "/api/v1/rollouts": {
+      "get": {
+        "operationId": "list-rollouts",
+        "parameters": [
+          {
+            "description": "How many to return; the response carries `nextPageToken` when there are more.",
+            "in": "query",
+            "name": "pageSize",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Where the previous page ended.",
+            "in": "query",
+            "name": "pageToken",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects carrying these labels, as `key=value,key2=value2`.",
+            "in": "query",
+            "name": "labels",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`true` streams changes as server-sent events instead of listing.",
+            "in": "query",
+            "name": "watch",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With `watch`: the revision a list reported, so nothing between the list and the watch is lost.",
+            "in": "query",
+            "name": "fromRevision",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created at or after this moment: milliseconds since the epoch, or a span back from now like `30m`, `6h`, `7d`.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only objects created before this moment, same spellings as `since`. Exclusive, so two adjacent ranges neither overlap nor skip.",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`name` or `createdAt`, optionally followed by ` desc`. An ordered listing is a top-N: everything the filter admits is read and sorted, and the first `pageSize` of the sorted order is returned with no `nextPageToken` (and `\"truncated\": true` when the answer was cut). Refused together with `pageToken`.",
+            "in": "query",
+            "name": "orderBy",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A read mask: comma-separated dotted paths, as `meta.name,status.conditions`. `meta.name` is always returned.",
+            "in": "query",
+            "name": "fields",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "items": {
+                      "items": {
+                        "$ref": "#/components/schemas/Rollout"
+                      },
+                      "type": "array"
+                    },
+                    "nextPageToken": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "revision"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A page of objects. `X-Velstra-Revision` is the revision the list is consistent at."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "List Rollouts",
+        "tags": [
+          "Rollouts"
+        ]
+      },
+      "post": {
+        "operationId": "create-rollouts",
+        "parameters": [
+          {
+            "description": "A key of the caller's own invention, sent again on every retry of the same create. The second attempt is answered with the first attempt's operation and target instead of making a second object, and carries `x-velstra-idempotent-replay: true`. Reusing a key for a different request is refused. Keys are remembered for a day. Registering a node or a pool does not take one: its answer carries a credential shown only once.",
+            "in": "header",
+            "name": "idempotency-key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "description": "The last segment of the name.",
+                    "type": "string"
+                  },
+                  "labels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "spec": {
+                    "$ref": "#/components/schemas/RolloutSpec"
+                  }
+                },
+                "required": [
+                  "id",
+                  "spec"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
+                    "nodeToken": {
+                      "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
+                      "type": "string"
+                    },
+                    "operation": {
+                      "description": "The operation's resource name. Read it to learn when the object settled.",
+                      "type": "string"
+                    },
+                    "poolToken": {
+                      "description": "Only when a pool was registered: the pool agent's bearer token, returned once and never readable again.",
+                      "type": "string"
+                    },
+                    "target": {
+                      "description": "The name the object was given.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "target"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Accepted. The object exists and is converging; poll the operation named here."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Create one of Rollouts",
+        "tags": [
+          "Rollouts"
+        ]
+      }
+    },
+    "/api/v1/rollouts/{name}": {
+      "delete": {
+        "description": "Marks the object for deletion; it is gone once every finalizer has released it.",
+        "operationId": "delete-rollouts",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deleting: the object exists until its finalizers release it."
+          },
+          "204": {
+            "description": "Gone."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Delete one of Rollouts",
+        "tags": [
+          "Rollouts"
+        ]
+      },
+      "get": {
+        "operationId": "get-rollouts",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Rollout"
+                }
+              }
+            },
+            "description": "The object."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Read one of Rollouts",
+        "tags": [
+          "Rollouts"
+        ]
+      },
+      "patch": {
+        "description": "Only `spec` and `labels` are writable here; `status` is the owning agent's, written through `:reportStatus`. Send `If-Match` with the revision read to make the write a compare-and-swap.",
+        "operationId": "patch-rollouts",
+        "parameters": [
+          {
+            "description": "The object's id — the last segment of its name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "labels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "spec": {
+                    "$ref": "#/components/schemas/RolloutSpec"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Rollout"
+                }
+              }
+            },
+            "description": "The object as stored."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Refused, with a code a program can branch on and a sentence a person can read."
+          }
+        },
+        "summary": "Change the spec of one of Rollouts",
+        "tags": [
+          "Rollouts"
         ]
       }
     },
@@ -15785,6 +17403,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "joinToken": {
+                      "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md.",
+                      "type": "string"
+                    },
                     "nodeToken": {
                       "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again.",
                       "type": "string"

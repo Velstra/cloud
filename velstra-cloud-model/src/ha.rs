@@ -9,28 +9,13 @@
 //! shared volume, and the filesystem does not survive that. It is the failure
 //! that turns an outage into a restore from backup.
 //!
-//! So recovery here rests on one mechanism and nothing else: **the agent stops
-//! its own guests before anybody else may start them.** Each node is given a
-//! deadline; if it has not managed to report for that long, it stops everything
-//! it holds, whatever it thinks about why. The control plane then waits
-//! *longer* than that deadline before re-placing anything, so by the time it
-//! acts the guests are stopped or the machine is gone.
-//!
-//! That inference is a promise about somebody's data, so its three conditions
-//! are stated rather than assumed:
-//!
-//! 1. The agent really does self-fence. Built, and tested by killing its
-//!    connection rather than by asking it nicely.
-//! 2. The two clocks agree to within the margin. They are compared directly,
-//!    so a node whose clock is minutes off is a node whose deadline is wrong.
-//! 3. The margin covers skew and scheduling delay. It is deliberately generous:
-//!    the cost of waiting is downtime, and the cost of being early is a
-//!    corrupted volume.
-//!
-//! **A node with no deadline set is never recovered from.** Nothing guarantees
-//! its guests have stopped, so nothing may be started in their place — see
-//! [`NotRecoverable::NodeDoesNotFence`]. That is the honest default and it is
-//! why this is opt-in rather than on.
+//! The agent attempts to stop its guests on loss of contact, but its own
+//! process may be dead. Silence therefore never proves a successful fence.
+//! Recovery additionally requires an operator to fence the machine externally
+//! and set `velstra.io/fenced-heartbeat` to its last reported heartbeat in
+//! milliseconds. The confirmation expires as soon as another heartbeat lands.
+//! Keep the machine powered off or isolated until its old workloads are
+//! reconciled. The deadline and margin remain minimum waiting periods.
 //!
 //! ## Why this is not the scheduler re-placing things
 //!
@@ -53,11 +38,24 @@ pub const DEFAULT_FENCE_AFTER_S: u32 = 60;
 
 /// How much longer than the node's own deadline the control plane waits.
 ///
-/// One deadline again, doubled. The agent's clock, the control plane's clock,
-/// the moment a status write actually lands, and the resync interval all move
-/// around inside this, and every one of them moving the wrong way at once is
-/// still covered. Waiting costs downtime; being early costs a volume.
+/// Additional time for delayed reports and reconciliation. Elapsed time is
+/// not proof that guests stopped; independent fencing confirmation is required.
 pub const RECOVERY_MARGIN_S: u32 = 60;
+
+pub const FENCED_HEARTBEAT_LABEL: &str = "velstra.io/fenced-heartbeat";
+
+/// Only a cell operator can edit node metadata. A fresh report invalidates
+/// the confirmation; a timestamp from a previous outage cannot authorize this one.
+pub fn confirmed_heartbeat(
+    labels: &std::collections::BTreeMap<String, String>,
+) -> Option<Timestamp> {
+    labels
+        .get(FENCED_HEARTBEAT_LABEL)?
+        .parse::<u64>()
+        .ok()
+        .filter(|t| *t > 0)
+        .map(Timestamp)
+}
 
 /// What an instance's operator wants done if its node stops answering.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,25 +84,19 @@ pub enum NotRecoverable {
     /// Its operator did not ask for this.
     #[error("its policy is to leave it where it is")]
     PolicyIsLeave,
-    /// The node has not been quiet long enough to be sure.
+    /// The minimum quiet period has not elapsed.
     #[error(
-        "{node} was last heard from {quiet_s}s ago; {need_s}s is when its guests are certainly stopped"
+        "{node} was last heard from {quiet_s}s ago; recovery requires at least {need_s}s of silence and external fencing confirmation"
     )]
     NotQuietLongEnough {
         node: String,
         quiet_s: u64,
         need_s: u64,
     },
-    /// The node does not stop its own guests, so nothing can know they stopped.
-    ///
-    /// The refusal that keeps this feature honest. Without self-fencing, "the
-    /// node is unreachable" and "the node is stopped" are different statements,
-    /// and acting on the first as though it were the second is what produces
-    /// two guests writing to one volume.
+    /// Recovery was not enabled by configuring a fencing deadline.
     #[error(
-        "{node} does not stop its own guests when it loses contact, so nothing can be sure they \
-         are stopped — set a fencing deadline on it, or move this guest by hand once you have \
-         checked the machine"
+        "{node} has no fencing deadline configured; enable one and confirm independent fencing \
+         before recovery, or move this guest by hand after fencing the machine"
     )]
     NodeDoesNotFence { node: String },
     /// It holds hardware that only exists on that machine.
@@ -113,6 +105,10 @@ pub enum NotRecoverable {
     /// It is not running, so there is nothing to bring back.
     #[error("it is not running")]
     NotRunning,
+    #[error(
+        "{node} has no external fencing confirmation for its last heartbeat; fence the host and set velstra.io/fenced-heartbeat before recovery"
+    )]
+    FenceNotConfirmed { node: String },
 }
 
 /// One node, as this decision sees it.
@@ -128,6 +124,7 @@ pub struct NodeView {
     /// says it is *not* ready is a different problem — a drained node, a node
     /// with a broken datapath — and is not what this is for.
     pub ready: bool,
+    pub fenced_heartbeat: Option<Timestamp>,
 }
 
 /// One guest, as this decision sees it.
@@ -174,7 +171,7 @@ pub fn may_recover(
     // itself, and it reads as "heard from just now" — which delays recovery
     // rather than hurrying it. That is the safe direction.
     let quiet_ms = now.0.saturating_sub(node.last_heartbeat.0);
-    let need_ms = u64::from(node.fence_after_s + margin_s) * 1000;
+    let need_ms = (u64::from(node.fence_after_s) + u64::from(margin_s)) * 1000;
     if quiet_ms < need_ms {
         return Err(NotRecoverable::NotQuietLongEnough {
             node: node.name.clone(),
@@ -182,18 +179,23 @@ pub fn may_recover(
             need_s: need_ms / 1000,
         });
     }
+    if node.fenced_heartbeat != Some(node.last_heartbeat) || node.last_heartbeat.0 == 0 {
+        return Err(NotRecoverable::FenceNotConfirmed {
+            node: node.name.clone(),
+        });
+    }
     Ok(())
 }
 
-/// Whether a node has been quiet long enough that its guests are certainly
-/// stopped.
+/// Whether the fencing deadline has elapsed. This is an alert threshold,
+/// not authorization to recover a guest; `may_recover` also requires confirmation.
 ///
 /// The same arithmetic [`may_recover`] uses, on its own so a console can say
 /// "node-b is being recovered from" without having to ask about a guest.
 pub fn is_fenced(node: &NodeView, now: Timestamp, margin_s: u32) -> bool {
     node.fence_after_s > 0
         && now.0.saturating_sub(node.last_heartbeat.0)
-            >= u64::from(node.fence_after_s + margin_s) * 1000
+            >= (u64::from(node.fence_after_s) + u64::from(margin_s)) * 1000
 }
 
 /// Whether *this* agent should stop the guests it holds.
@@ -226,6 +228,7 @@ mod tests {
             last_heartbeat: Timestamp(HEARD),
             fence_after_s,
             ready: false,
+            fenced_heartbeat: Some(Timestamp(HEARD)),
         }
     }
 
@@ -296,6 +299,18 @@ mod tests {
             may_recover(&g, &node(60), now_after(600), 60),
             Err(NotRecoverable::PolicyIsLeave)
         );
+    }
+
+    #[test]
+    fn silence_and_a_confirmation_for_an_older_heartbeat_do_not_authorize_recovery() {
+        let mut n = node(60);
+        for confirmation in [None, Some(Timestamp(HEARD - 1))] {
+            n.fenced_heartbeat = confirmation;
+            assert!(matches!(
+                may_recover(&guest(), &n, now_after(600), 60),
+                Err(NotRecoverable::FenceNotConfirmed { .. })
+            ));
+        }
     }
 
     /// A guest holding hardware cannot be recovered, and the refusal says what

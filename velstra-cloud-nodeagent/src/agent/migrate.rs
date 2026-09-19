@@ -741,16 +741,26 @@ impl Agent {
         // `may_migrate` refuses a live move of a guest holding hardware, and a
         // reboot migration starts it fresh on the destination.
         let devices = instance.status.devices.clone();
+        // And the same root disk. A guest that boots from a volume is one whose
+        // disk this machine has to open too — which is the arrangement that
+        // makes the move possible at all, since a root disk in a pool does not
+        // need both machines to share a filesystem. The attachment controller
+        // has already pointed the attachment at this node; if it has not yet,
+        // this says so rather than building a receiver with the wrong disk.
+        let boot_disk = self.boot_disk_for(instance).await?;
         let request = self.vm_request(
             instance,
             &taps,
             ports,
-            self.declared_baseline().await,
-            devices,
             cell.images
                 .get(&instance.spec.image)
                 .map(|i| i.digest.as_str())
                 .unwrap_or_default(),
+            super::Resolved {
+                baseline: self.declared_baseline().await,
+                devices,
+                boot_disk,
+            },
         )?;
         self.vmm
             .prepare_receiver(&request, mode)

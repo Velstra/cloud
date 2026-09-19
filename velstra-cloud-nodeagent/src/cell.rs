@@ -197,6 +197,16 @@ pub trait CellReader: Send + Sync + 'static {
     /// A cell that cannot answer this is a cell whose guests resolve each
     /// other on one node and nothing else — so an empty answer is a real
     /// answer, and an error is a failure of the pass rather than of DNS.
+    /// One of the cell's files, streamed to `dest`: what a node fetches when
+    /// told what to run. A reader with no cell — the direct-store default —
+    /// has nowhere to fetch from, and says so rather than guessing a URL.
+    async fn download(&self, path: &str, dest: &std::path::Path) -> Result<()> {
+        let _ = dest;
+        Err(HostError::failed(format!(
+            "this agent reads a store directly and has no cell to fetch {path} from"
+        )))
+    }
+
     async fn directory(&self) -> Result<Vec<crate::dns::Named>> {
         Ok(Vec::new())
     }

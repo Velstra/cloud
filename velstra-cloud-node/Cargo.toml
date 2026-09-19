@@ -8,11 +8,20 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+rustix = { workspace = true }
 # A self-signed certificate at install. In Rust rather than by shelling out to
 # `openssl`, so a machine without it still gets one — and so the fingerprint can
 # be printed from the same bytes that were written, rather than read back and
 # hoped to be the same file.
 rcgen = "0.13"
 sha2 = { workspace = true }
+# Ed25519 for the enrolment door: the machine proves it holds the key it
+# announced. Already in the tree under rustls and used by the model for image
+# signatures, from the same workspace pin.
+ring = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+# The join token is a wire format the installer reads and the API writes; the
+# wire crate is the one both already agree on, and it is small.
+velstra-cloud-wire = { workspace = true }
+serde_json = { workspace = true }

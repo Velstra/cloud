@@ -143,6 +143,12 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         &crate::wizard::hostname(),
         &addresses,
     )?);
+    // What a joining machine is told to try, in order: this machine's own
+    // addresses first, then its name. The same list the certificate was just
+    // made with, so every URL here is one it verifies for — which is the whole
+    // reason the API is *told* this rather than left to work it out.
+    let port = listen.rsplit(':').next().unwrap_or("8443");
+    let advertise = crate::tls::advertise_urls(&crate::wizard::hostname(), &addresses, port);
     if let Some(cert) = &tls {
         say(if cert.made {
             "made a certificate for this machine"
@@ -152,6 +158,19 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     }
 
     let machine = Machine {
+        // Empty: this box already runs an operating system and already has a
+        // name. Only the installer, seeding a filesystem that has never
+        // booted, answers this.
+        hostname: String::new(),
+        // The certificate is a file on this machine, named by path below.
+        api_ca_pem: String::new(),
+        advertise: advertise.clone(),
+        bootstrap_ceph_osds: Vec::new(),
+        // A Debian box already has accounts and an ssh the operator owns;
+        // this command does not reach into either.
+        ssh_key: String::new(),
+        root_password: String::new(),
+        passthrough: String::new(),
         // One machine that is the whole cell: its pool agent reaches the store
         // directly, and is deliberately given no token.
         pool_token: String::new(),
@@ -206,6 +225,22 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
         admin: "admin".into(),
         admin_password,
     };
+
+    let existing_seed = dir.join("node.env");
+    if existing_seed.exists() {
+        let previous = setup::parse(&std::fs::read_to_string(&existing_seed)?)?;
+        if previous.node != machine.node
+            || previous.cell != machine.cell
+            || previous.region != machine.region
+        {
+            bail!(
+                "this machine already belongs to {}/{}/{}; quickstart will not replace its identity",
+                previous.region,
+                previous.cell,
+                previous.node
+            );
+        }
+    }
 
     // The seed first: every unit below is conditional on a role being in it, so
     // enabling anything before it exists would enable something that skips.
@@ -283,7 +318,7 @@ pub fn run(dir: Option<PathBuf>, listen: Option<String>, node: Option<String>) -
     Ok(())
 }
 
-fn say(what: &str) {
+pub(crate) fn say(what: &str) {
     println!("  · {what}");
 }
 
@@ -291,7 +326,7 @@ fn say(what: &str) {
 ///
 /// `0.0.0.0` is a bind, never a destination: connecting to it works on Linux by
 /// accident and is wrong to print at somebody.
-fn local_api(listen: &str, tls: bool) -> String {
+pub(crate) fn local_api(listen: &str, tls: bool) -> String {
     let port = listen.rsplit(':').next().unwrap_or("8443");
     let scheme = if tls { "https" } else { "http" };
     // `localhost` and not `127.0.0.1`, because the certificate names hostnames
@@ -350,11 +385,23 @@ pub(crate) fn curl(args: &[&str]) -> Result<String> {
             base.extend(["--cacert".into(), ca]);
         }
     }
-    let out = Command::new("curl")
+    use std::{io::Write, process::Stdio};
+    let (public, config) = curl_input(args)?;
+    let mut child = Command::new("curl")
         .args(&base)
-        .args(args)
-        .output()
+        .args(&public)
+        .args(["--config", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("running curl — the package depends on it")?;
+    child
+        .stdin
+        .take()
+        .context("curl has no stdin")?
+        .write_all(config.as_bytes())?;
+    let out = child.wait_with_output()?;
     if !out.status.success() {
         bail!(
             "curl failed: {}",
@@ -364,7 +411,7 @@ pub(crate) fn curl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn wait_for(api: &str) -> Result<()> {
+pub(crate) fn wait_for(api: &str) -> Result<()> {
     for _ in 0..API_WAIT_SECS {
         if curl(&["-o", "/dev/null", "-w", "%{http_code}", api])
             .is_ok_and(|c| c.starts_with('2') || c.starts_with('4'))
@@ -379,27 +426,43 @@ fn wait_for(api: &str) -> Result<()> {
     )
 }
 
-/// One field out of a JSON object, without a JSON parser.
-///
-/// Deliberately crude and deliberately narrow: these are two responses this
-/// same codebase produces, the fields are flat strings, and a dependency added
-/// for six characters of parsing is a dependency in every future audit.
-pub(crate) fn field(body: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = body.find(&needle)? + needle.len();
-    let rest = &body[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+/// Sensitive headers and request bodies go through stdin, never argv.
+fn curl_input(args: &[&str]) -> Result<(Vec<String>, String)> {
+    let mut public = Vec::new();
+    let mut config = String::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let option = match *arg {
+            "-H" | "--header" => Some("header"),
+            "-d" | "--data" | "--data-raw" => Some("data-raw"),
+            _ => None,
+        };
+        if let Some(option) = option {
+            let value = args.next().context("missing curl option value")?;
+            config.push_str(&format!("{option} = {}\n", serde_json::to_string(value)?));
+        } else {
+            public.push((*arg).to_string());
+        }
+    }
+    Ok((public, config))
 }
 
-fn api_token(api: &str, user: &str, password: &str) -> Result<String> {
+pub(crate) fn field(body: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+pub(crate) fn api_token(api: &str, user: &str, password: &str) -> Result<String> {
     let body = curl(&[
         "-X",
         "POST",
         "-H",
         "Content-Type: application/json",
         "-d",
-        &format!("{{\"username\":\"{user}\",\"password\":\"{password}\"}}"),
+        &serde_json::json!({"username": user, "password": password}).to_string(),
         &format!("{api}/sessions"),
     ])?;
     field(&body, "token").ok_or_else(|| {
@@ -411,7 +474,7 @@ fn api_token(api: &str, user: &str, password: &str) -> Result<String> {
     })
 }
 
-fn ensure_node(api: &str, token: &str, id: &str, dir: &std::path::Path) -> Result<()> {
+pub(crate) fn ensure_node(api: &str, token: &str, id: &str, dir: &std::path::Path) -> Result<()> {
     let token_file = dir.join("node-token");
     if token_file.exists() {
         say("the node already has its token");
@@ -428,19 +491,36 @@ fn ensure_node(api: &str, token: &str, id: &str, dir: &std::path::Path) -> Resul
         &format!("{{\"id\":\"{id}\",\"spec\":{{\"schedulable\":true}}}}"),
         &format!("{api}/nodes"),
     ])?;
-    let Some(node_token) = field(&body, "nodeToken") else {
-        bail!(
-            "creating the node {id} did not hand back a token: {}. It is shown exactly once, so \
-             if the node already exists, delete it and run this again",
-            body.trim()
-        );
+    let node_token = match field(&body, "nodeToken") {
+        Some(token) => token,
+        None => {
+            let response: serde_json::Value = serde_json::from_str(&body)?;
+            if response["error"]["code"] != "ALREADY_EXISTS" {
+                bail!("creating node {id} failed: {}", body.trim());
+            }
+            // The seed written by this quickstart names this exact node. A
+            // previous run may have created it before losing its response.
+            let issued = curl(&[
+                "-f",
+                "-X",
+                "POST",
+                "-H",
+                &format!("Authorization: Bearer {token}"),
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                "{\"purpose\":\"quickstart recovery\"}",
+                &format!("{api}/nodes/{id}:issueCredential"),
+            ])?;
+            field(&issued, "nodeToken").context("credential recovery returned no nodeToken")?
+        }
     };
     crate::setup::write_secret(&token_file, &node_token)?;
     say("created the node and wrote its one-time token");
     Ok(())
 }
 
-fn ensure_pool(api: &str, token: &str, id: &str) -> Result<()> {
+pub(crate) fn ensure_pool(api: &str, token: &str, id: &str) -> Result<()> {
     let body = curl(&[
         "-X",
         "POST",
@@ -477,5 +557,119 @@ fn ask_for_a_password() -> Result<String> {
             continue;
         }
         break Ok(first);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn curl_secrets_never_appear_in_the_argument_list() {
+        let password = "a\"b\\c\nline";
+        let body = serde_json::json!({"username": "admin", "password": password}).to_string();
+        let (args, config) = curl_input(&[
+            "-X",
+            "POST",
+            "-H",
+            "Authorization: Bearer secret",
+            "-d",
+            &body,
+            "https://localhost",
+        ])
+        .unwrap();
+        assert!(!args.join(" ").contains("secret"));
+        assert!(!args.join(" ").contains("password"));
+        let data = config
+            .lines()
+            .find_map(|line| line.strip_prefix("data-raw = "))
+            .unwrap();
+        let decoded: String = serde_json::from_str(data).unwrap();
+        assert_eq!(field(&decoded, "password").as_deref(), Some(password));
+    }
+    #[test]
+    fn quickstart_authenticates_escaped_passwords_and_recovers_a_lost_node_token() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = format!("http://{}/api/v1", listener.local_addr().unwrap());
+        let password = "password-with-\"quotes\\and-slashes";
+        let server = std::thread::spawn(move || {
+            for (path, response) in [
+                ("/api/v1/sessions", r#"{"token":"session-secret"}"#),
+                ("/api/v1/nodes", r#"{"error":{"code":"ALREADY_EXISTS"}}"#),
+                (
+                    "/api/v1/nodes/recover:issueCredential",
+                    r#"{"nodeToken":"recovered-secret"}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut byte = [0];
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    bytes.push(byte[0]);
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                assert!(
+                    headers.starts_with(&format!("POST {path} HTTP/1.1")),
+                    "{headers}"
+                );
+                let len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_string)
+                    })
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let mut body = vec![0; len];
+                stream.read_exact(&mut body).unwrap();
+                if path.ends_with("sessions") {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["password"],
+                        password
+                    );
+                } else {
+                    assert!(headers.contains("Authorization: Bearer session-secret"));
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        let dir =
+            std::env::temp_dir().join(format!("velstra-quickstart-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = api_token(&api, "admin", password).unwrap();
+        ensure_node(&api, &token, "recover", &dir).unwrap();
+        server.join().unwrap();
+        ensure_node(&api, &token, "recover", &dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("node-token"))
+                .unwrap()
+                .trim(),
+            "recovered-secret"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(dir.join("node-token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

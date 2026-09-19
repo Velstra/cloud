@@ -104,11 +104,11 @@
         "wren": "wren"
       },
       "locked": {
-        "lastModified": 1787759309,
-        "narHash": "sha256-h77aV+fvKSnQ2sfK4EOJlp1DYYRNB7OkmXY6JsIX3AA=",
+        "lastModified": 1788638511,
+        "narHash": "sha256-K93zRAouM7FHj4k3eQkwdO6AV7WL2kwHvRE36A29Vp0=",
         "owner": "Velstra",
         "repo": "sentinel",
-        "rev": "977a1e365692185bdc5456b0df059f8dafb00b1a",
+        "rev": "53b0130a38807d310f77f5ca8f931e54cc84690b",
         "type": "github"
       },
       "original": {
@@ -120,11 +120,11 @@
     "wren": {
       "flake": false,
       "locked": {
-        "lastModified": 1786816762,
-        "narHash": "sha256-JZy/6pqHiUaCPGzWHR/TNbk8ar3EwzUsOYMUJyu8UhU=",
+        "lastModified": 1788538001,
+        "narHash": "sha256-YjblmCQjlGT1LinZe32MvWz2mQMspDDV8IGUyjeJ1u4=",
         "owner": "Velstra",
         "repo": "wren",
-        "rev": "5d84755ccbb31bb29e8651e5e886a06df0d51889",
+        "rev": "3afee7a911d2e8a59a7ca987354e001bb97c6ec3",
         "type": "github"
       },
       "original": {

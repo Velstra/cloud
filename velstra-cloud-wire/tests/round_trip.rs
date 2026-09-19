@@ -15,11 +15,15 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use velstra_cloud_model::{
     ceph::{BlockDevice, CephClusterSpec, CephClusterStatus, DeviceUse, NodeCeph, OsdSpec},
+    enrollment::{EnrollmentSpec, EnrollmentStatus, Reported},
     identity::{
         CredentialSpec, CredentialStatus, SessionSpec, SessionStatus, UserSpec, UserStatus,
     },
+    installed::{InstallKind, Installed},
     migration::{MigrationSpec, MigrationStatus},
+    release::{Artefact, ReleaseSpec, ReleaseStatus, Wanted},
     resources::*,
+    rollout::{NodePhase, NodeProgress, RolloutPhase, RolloutSpec, RolloutStatus},
 };
 
 /// The wire's own promise: what goes out comes back.
@@ -94,6 +98,12 @@ fn every_resource_survives_its_own_wire() {
             },
             allocated: Capacity::default(),
             agent_version: "0.1.0".into(),
+            installed: Installed {
+                kind: InstallKind::Appliance,
+                distro: "NixOS 25.11 (Xantusia)".into(),
+                version: "0.2.0+20260918.c571d71".into(),
+                slot: "a".into(),
+            },
             console_endpoint: "10.0.0.7:8447".into(),
             last_heartbeat: velstra_cloud_model::meta::Timestamp(1),
             images: vec!["projects/p1/images/sha256-abc".into()],
@@ -124,6 +134,8 @@ fn every_resource_survives_its_own_wire() {
                 can_mask: true,
             }),
             ceph: Some(NodeCeph {
+                client_conf: "[global]\nfsid = 1\nmon_host = 10.0.0.5\n".into(),
+                client_keyring: "[client.velstra]\n\tkey = AQ==\n".into(),
                 installed: true,
                 version: "19.2.0".into(),
                 monitor: true,
@@ -229,6 +241,8 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "CephClusterStatus",
         CephClusterStatus {
+            client_conf: "[global]\nfsid = 1\nmon_host = 10.0.0.5\n".into(),
+            client_keyring: "[client.velstra]\n\tkey = AQ==\n".into(),
             ssh_pubkey: "ssh-ed25519 AAAA cluster".into(),
             observed_generation: 2,
             conditions: vec![],
@@ -311,6 +325,70 @@ fn every_resource_survives_its_own_wire() {
             updated_at: velstra_cloud_model::meta::Timestamp(1),
         },
     );
+    survives(
+        "ReleaseSpec",
+        ReleaseSpec {
+            url: "https://github.com/Velstra/cloud/releases/download/v0.2.0/".into(),
+        },
+    );
+    survives(
+        "ReleaseStatus",
+        ReleaseStatus {
+            observed_generation: 2,
+            conditions: vec![],
+            version: "0.2.0+20260918.c571d71".into(),
+            image: Some(Artefact {
+                file: "velstra-cloud-node_0.2.0+20260918.c571d71_amd64.raw.zst".into(),
+                sha256: "ab".repeat(32),
+                fetched: true,
+            }),
+            package: Some(Artefact {
+                file: "velstra-cloud_0.2.0+20260918.c571d71_amd64.deb".into(),
+                sha256: "cd".repeat(32),
+                fetched: false,
+            }),
+            installer: None,
+            checked_at: velstra_cloud_model::meta::Timestamp(7),
+        },
+    );
+    survives(
+        "RolloutSpec",
+        RolloutSpec {
+            release: "releases/v0.2.0".into(),
+            nodes: vec!["peter".into()],
+            evacuate: true,
+            max_unavailable: 2,
+            paused: true,
+        },
+    );
+    survives(
+        "RolloutStatus",
+        RolloutStatus {
+            observed_generation: 3,
+            conditions: vec![],
+            phase: RolloutPhase::Running,
+            nodes: vec![NodeProgress {
+                node: "peter".into(),
+                from: "0.1.0+20260910.681269c".into(),
+                to: "0.2.0+20260918.c571d71".into(),
+                phase: NodePhase::Applying,
+                message: "fetching the image".into(),
+                since: velstra_cloud_model::meta::Timestamp(5),
+            }],
+            message: "0 of 1 on 0.2.0+20260918.c571d71".into(),
+            started_at: velstra_cloud_model::meta::Timestamp(4),
+            finished_at: velstra_cloud_model::meta::Timestamp(0),
+        },
+    );
+    survives(
+        "Wanted",
+        Wanted {
+            release: "releases/v0.2.0".into(),
+            version: "0.2.0+20260918.c571d71".into(),
+            file: "velstra-cloud_0.2.0+20260918.c571d71_amd64.deb".into(),
+            sha256: "cd".repeat(32),
+        },
+    );
     survives("CredentialStatus", CredentialStatus::default());
     survives(
         "SessionSpec",
@@ -325,6 +403,7 @@ fn every_resource_survives_its_own_wire() {
     survives(
         "InstanceSpec",
         InstanceSpec {
+            boot_volume: "projects/p1/volumes/root-1".into(),
             flavor: None,
             start_order: 0,
             start_delay_s: 0,
@@ -509,4 +588,45 @@ fn every_spec_and_status() -> Vec<(&'static str, serde_json::Value)> {
         "migrations" => migration::MigrationSpec, migration::MigrationStatus,
         "security-groups" => security::SecurityGroupSpec, security::SecurityGroupStatus,
     }
+}
+
+/// A machine that announced, and the decision about it, survive the wire.
+///
+/// These are the types every field of which arrives through `from_wire`, and
+/// the ones where a spelling that did not survive cost the most: `memoryMib`
+/// read as none, `runsGuests` refused as unknown. Both were the camel-renamed
+/// struct being converted twice; this pins that they are not.
+#[test]
+fn an_enrolment_survives_its_wire() {
+    survives(
+        "EnrollmentSpec",
+        EnrollmentSpec {
+            node: "peter".into(),
+            runs_guests: true,
+            serves_storage: true,
+            is_control_plane: false,
+            pool: "local-2".into(),
+            approved: true,
+            refused: false,
+        },
+    );
+    survives(
+        "EnrollmentStatus",
+        EnrollmentStatus {
+            public_key: "MCowBQYDK2VwAyEA".into(),
+            fingerprint: "1A:2B:3C:4D:5E:6F:70:81".into(),
+            seen_certificate: "9F:2C".into(),
+            cell_certificate: "9F:2C".into(),
+            reported: Reported {
+                hostname: "peter".into(),
+                addresses: vec!["10.10.10.47".into()],
+                vcpus: 16,
+                memory_mib: 65536,
+                disks: vec!["nvme0n1".into()],
+                serial: "PT-0042".into(),
+            },
+            approved_by: "admin".into(),
+            ..Default::default()
+        },
+    );
 }

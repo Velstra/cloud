@@ -154,6 +154,19 @@ pub struct NodeCeph {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cluster_hosts: Vec<String>,
 
+    /// What a hypervisor needs to open this cluster's volumes, reported by a
+    /// node that holds the admin keyring — a monitor — and by nobody else.
+    ///
+    /// `client_conf` is the minimal `ceph.conf` (fsid, monitors);
+    /// `client_keyring` is `client.velstra`, read/write on the platform's
+    /// pools and nothing more. Published on the cluster's status so a
+    /// hypervisor installed before the cluster existed can open its volumes
+    /// without anybody copying a file onto it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_conf: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_keyring: String,
+
     /// This node's own address inside the cluster's public network.
     ///
     /// The node picks it, because the node is the only thing that can see its
@@ -515,6 +528,13 @@ pub struct CephClusterStatus {
     /// A public key, so there is nothing here to keep secret.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ssh_pubkey: String,
+    /// The client configuration every hypervisor writes to disk and opens
+    /// volumes with. Published the way the SSH key is; the keyring is a
+    /// credential and is redacted for anybody who is not an operator.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_conf: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_keyring: String,
     pub observed_generation: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
@@ -674,6 +694,9 @@ pub struct NodeCephState {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CephObserved {
     pub nodes: Vec<NodeCephState>,
+    /// The client files, from the first monitor reporting them.
+    pub client_conf: String,
+    pub client_keyring: String,
     /// Pools that exist in the cluster.
     pub pools: Vec<String>,
     /// Hosts the orchestrator has been told about.
@@ -1044,11 +1067,24 @@ pub fn observe_at(nodes: &[crate::resources::Node], now: crate::meta::Timestamp)
         .find(|k| !k.is_empty())
         .unwrap_or_default();
 
+    // The client files come from a monitor, and any monitor's are the same
+    // files: `get-or-create` hands back the one key, and the minimal conf
+    // names the same fsid and the same monitors from wherever it is asked.
+    let (client_conf, client_keyring) = nodes
+        .iter()
+        .filter_map(|n| n.status.ceph.as_ref())
+        .filter(|c| !c.client_conf.is_empty() && !c.client_keyring.is_empty())
+        .map(|c| (c.client_conf.clone(), c.client_keyring.clone()))
+        .next()
+        .unwrap_or_default();
+
     CephObserved {
         bootstrapped: states.iter().any(|n| n.monitor),
         pools,
         hosts,
         ssh_pubkey,
+        client_conf,
+        client_keyring,
         nodes: states,
     }
 }
@@ -1204,6 +1240,8 @@ mod tests {
         CephObserved {
             hosts: nodes.iter().map(|n| n.node.clone()).collect(),
             ssh_pubkey: "ssh-rsa AAAA cluster".to_string(),
+            client_conf: String::new(),
+            client_keyring: String::new(),
             pools: pools.iter().map(|p| p.to_string()).collect(),
             nodes,
             bootstrapped,
@@ -1478,6 +1516,7 @@ mod tests {
                     labels: vec![],
                     cpu_baseline: None,
                     gateway: false,
+                    wanted: None,
                 },
                 NodeStatus {
                     shared_state: false,

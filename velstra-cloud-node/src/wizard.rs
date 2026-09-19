@@ -57,13 +57,51 @@ pub struct Answers {
     pub token: String,
     /// `cloud-hypervisor` or `qemu`, as the nodeagent's `--vmm` spells them.
     pub vmm: String,
+    /// What this machine is for.
+    ///
+    /// The installer did not ask this until the sealed image could serve more
+    /// than one role, and it had to stay silent while it could not: a seed
+    /// naming `pool` on an image with no pool agent would be a machine
+    /// promising something nothing on it can do. Now that the image carries
+    /// all three, this is the question that decides which units come up.
+    pub roles: Vec<crate::roles::Role>,
+    /// The pool's id and backend, asked only when `roles` names a pool.
+    pub pool: String,
+    pub pool_backend: String,
+    /// The pool's own one-time token. A second credential, because a pool
+    /// agent authenticates as `pool:<id>` and a node agent as `node:<id>` —
+    /// one token presented by the other is a 401 for ever, with the seed
+    /// looking complete.
+    pub pool_token: String,
+    /// What the API binds, asked only when `roles` names the control plane.
+    pub listen: String,
+    /// The cell's first administrator, for the first machine of a new cell.
+    /// Empty everywhere else.
+    pub admin: String,
+    pub admin_password: String,
+    /// The API's certificate, PEM, when it arrived inside a join token.
+    /// Written beside the seed as `api-ca.pem`; see `seed::seed`.
+    pub api_ca_pem: String,
+    /// Disks the first machine gives to Ceph, as kernel names (`sdb`). Empty
+    /// is "no Ceph now" — it can still be added from the console later.
+    pub ceph_osds: Vec<String>,
+    /// An SSH public key that may log in as root, and a root password for the
+    /// console. Both empty is the sealed default; see `ask_for_access`.
+    pub ssh_key: String,
+    pub root_password: String,
 }
 
 /// Run the wizard. Returns `None` when the operator declines the final YES —
 /// nothing has been written at that point.
 pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
-    list_disks(disks);
-
+    // The mode first, then the disks — and the disks are listed *after* the
+    // mode is known, so the list is read with its question already in mind.
+    //
+    // It ran the other way round: a table of disks, then a mode, then "select
+    // disk number(s)" about a table that had scrolled past. Somebody reading
+    // top to bottom met a list before there was anything to do with it, and a
+    // plural prompt whether or not the mode they had just picked takes more
+    // than one disk.
     println!("\nInstall mode:");
     println!("  [1] single disk");
     println!("  [2] RAID1  (mirror — redundancy, 2+ disks)");
@@ -79,10 +117,21 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
         }
     };
 
+    println!();
+    list_disks(disks);
+
     // Picks are validated against the full plan (count, size, removable) here,
     // so a refused disk costs a re-ask and not a restart of the wizard.
+    let disk_prompt = match raid {
+        Raid::None => "Disk number: ".to_string(),
+        _ => format!(
+            "Disk numbers for {:?}, space-separated (at least {}): ",
+            raid,
+            raid.min_disks()
+        ),
+    };
     let (picks, chosen) = loop {
-        let raw = prompt("Select disk number(s), space-separated: ")?;
+        let raw = prompt(&disk_prompt)?;
         match resolve_picks(disks, raw.trim()) {
             Ok(picks) => {
                 let targets: Vec<String> = picks
@@ -98,6 +147,8 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
             Err(e) => println!("  {e:#}"),
         }
     };
+
+    let (ssh_key, root_password) = ask_for_access()?;
 
     let passphrase = if ask_yes("Encrypt the data partition with LUKS2?", false)? {
         Some(resolve_passphrase()?)
@@ -139,17 +190,238 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
         }
     };
 
-    let api_url = ask_valid(
-        "Control plane URL (http:// or https://): ",
-        validate_url,
-        "a URL starting http:// or https://, e.g. https://cloud.example.net",
-    )?;
+    // What this box is for, asked before anything that depends on the answer.
+    //
+    // A set rather than a choice: the smallest real cell is one machine that is
+    // all three, and a wizard that made them exclusive would make that cell
+    // impossible to install. `gateway` is deliberately absent — it lives on the
+    // Node object and is an operator's to write, because a registration token
+    // exists so a machine can *report*, and one that could also declare its
+    // holder a gateway would be a token that grants itself the cell's external
+    // traffic.
+    // Three doors, and the two that matter ask almost nothing. The first
+    // machine of a cell has one question that is not about disks — who its
+    // administrator is — and every machine after it has none, because the
+    // cell already answered them all into a join token. The third door is the
+    // wizard as it was, for the machine that is neither: joining without a
+    // token, or a pool on its own.
+    println!("\nInstall as:");
+    println!("  [1] the first machine of a new cell   control plane, hypervisor, storage");
+    println!("  [2] a machine joining a cell          paste the join token from the console");
+    println!("  [3] ask the cell to let it in         type only the cell's address");
+    println!("  [4] custom                            the questions, one by one");
+    let door = loop {
+        match prompt("Install as [1]: ")?.trim() {
+            "" | "1" => break 1,
+            "2" => break 2,
+            "3" => break 3,
+            "4" => break 4,
+            other => println!("  {other:?} is not an option — pick 1, 2, 3 or 4."),
+        }
+    };
 
-    let node = ask_valid(
-        "Node name (e.g. node-7): ",
-        validate_node_name,
-        "the id the operator created via POST /api/v1/nodes — lowercase letters, digits and dashes",
-    )?;
+    if door == 2 {
+        return join(
+            chosen,
+            raid,
+            picks,
+            passphrase,
+            hostname,
+            network,
+            ssh_key,
+            root_password,
+            None,
+        );
+    }
+    // The same door as 2, arrived at differently: the token is handed over by
+    // the cell once somebody approves, instead of being carried here. What
+    // happens with it afterwards is identical, which is the point — there is
+    // one code path that turns a token into an install.
+    if door == 3 {
+        let Some(token) = crate::announce::run(&hostname)? else {
+            println!("\nNothing was written, and this machine is unchanged.");
+            return Ok(None);
+        };
+        return join(
+            chosen,
+            raid,
+            picks,
+            passphrase,
+            hostname,
+            network,
+            ssh_key,
+            root_password,
+            Some(token),
+        );
+    }
+
+    let (admin, admin_password) = if door == 1 {
+        println!("\nThe cell's first administrator signs into the console as this user.");
+        // `ask_valid_or`, not `ask_valid` with a map: the validator ran on the
+        // empty answer first and refused it, so the promised default was one
+        // nobody could take — the prompt asked again, for ever.
+        let admin = ask_valid_or(
+            "admin",
+            "Administrator [admin]: ",
+            validate_node_name,
+            "lowercase letters, digits and '-'",
+        )?;
+        let password = loop {
+            let first = prompt_secret("Password (not echoed): ")?;
+            if first.len() < 12 {
+                println!("  at least 12 characters — this is the cell's administrator");
+                continue;
+            }
+            let again = prompt_secret("Again: ")?;
+            if first == again {
+                break first;
+            }
+            println!("  they differ — once more");
+        };
+        (admin, password)
+    } else {
+        (String::new(), String::new())
+    };
+
+    // Storage for the first machine: a directory on its own disk, or Ceph on
+    // the disks it did not install onto. Ceph now is a real choice — a
+    // one-node cluster on a USB stick is a lab, and `quorum_advice` will say
+    // so on the console — and it is also not the only chance: a cell can
+    // grow a cluster later, from the console, once it has the machines.
+    let ceph_osds: Vec<String> = if door == 1 {
+        let spare: Vec<(usize, &Disk)> = disks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !picks.contains(i))
+            .collect();
+        if spare.is_empty() {
+            println!("\nNo other disk here, so storage is a directory on the install disk.");
+            println!("Ceph can be added from the console once the cell has disks for it.");
+            Vec::new()
+        } else {
+            println!("\nStorage:");
+            println!("  [1] a directory on the install disk   simplest; guests cannot move");
+            println!("  [2] Ceph, on other disks here          every node reaches every volume;");
+            println!("                                         one node and one disk is a lab");
+            let ceph = loop {
+                match prompt("Storage [1]: ")?.trim() {
+                    "" | "1" => break false,
+                    "2" => break true,
+                    other => println!("  {other:?} is not an option — pick 1 or 2."),
+                }
+            };
+            if ceph {
+                println!("\nDisks for Ceph — they are ERASED when the cluster is made:");
+                for (i, d) in &spare {
+                    println!(
+                        "  [{}] {} {} {}",
+                        i + 1,
+                        d.dev_path(),
+                        human_size(d.size),
+                        d.model
+                    );
+                }
+                loop {
+                    let got = prompt("Disk numbers, comma-separated: ")?;
+                    let mut names = Vec::new();
+                    let mut bad = false;
+                    for part in got.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                        match part.parse::<usize>() {
+                            Ok(n) if n >= 1 && spare.iter().any(|(i, _)| *i == n - 1) => {
+                                names.push(disks[n - 1].name.clone());
+                            }
+                            _ => {
+                                println!("  {part:?} is not one of the disks above");
+                                bad = true;
+                            }
+                        }
+                    }
+                    if !bad && !names.is_empty() {
+                        break names;
+                    }
+                    if !bad {
+                        println!("  at least one disk, or go back and pick a directory");
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let roles = if door == 1 {
+        vec![
+            crate::roles::Role::ControlPlane,
+            crate::roles::Role::Hypervisor,
+            crate::roles::Role::Pool,
+        ]
+    } else {
+        println!("\nWhat does this machine run?");
+        println!("  control-plane  the API, the controllers and this cell's store");
+        println!("  hypervisor     guests");
+        println!("  pool           storage");
+        println!("\nSeveral, comma-separated, is normal: one box that is all three is a whole");
+        println!("cell, and is what a first machine usually is.");
+        loop {
+            let got = prompt("Roles [hypervisor]: ")?;
+            let text = if got.trim().is_empty() {
+                "hypervisor"
+            } else {
+                got.trim()
+            };
+            let parsed = crate::roles::parse_list(text);
+            // `parse_list` drops what it does not recognise, so a typo would
+            // otherwise become a machine quietly missing a role. Comparing counts
+            // is what turns that into a question asked again.
+            if !parsed.is_empty()
+                && parsed.len() == text.split(',').filter(|p| !p.trim().is_empty()).count()
+            {
+                break parsed;
+            }
+            println!("  not a role list — one or more of control-plane, hypervisor, pool");
+        }
+    };
+    let is_control_plane = roles.contains(&crate::roles::Role::ControlPlane);
+    let is_hypervisor = roles.contains(&crate::roles::Role::Hypervisor);
+    let is_pool = roles.contains(&crate::roles::Role::Pool);
+
+    // A control plane *is* the API. Asking it for a URL pointing at itself
+    // would be a fact with two owners, and the two would disagree the first
+    // time somebody changed one of them.
+    let (api_url, listen) = if is_control_plane {
+        let listen = loop {
+            let got = ask("API listen address", "0.0.0.0:8443")?;
+            match validate_safe_value(&got) {
+                Ok(()) => break got,
+                Err(e) => println!("  {e:#}"),
+            }
+        };
+        (String::new(), listen)
+    } else {
+        let url = ask_valid(
+            "Control plane URL (http:// or https://): ",
+            validate_url,
+            "a URL starting http:// or https://, e.g. https://cloud.example.net",
+        )?;
+        (url, String::new())
+    };
+
+    let node = if door == 1 {
+        // The first machine names itself: there is no operator yet to have
+        // created a node object, and `bootstrap-cell` creates it at first boot
+        // under this id. The hostname is the obvious one.
+        hostname.clone()
+    } else if is_hypervisor {
+        ask_valid(
+            "Node name (e.g. node-7): ",
+            validate_node_name,
+            "the id the operator created via POST /api/v1/nodes — lowercase letters, digits and dashes",
+        )?
+    } else {
+        String::new()
+    };
 
     let cell = loop {
         let got = ask("Cell", product::DEFAULT_CELL)?;
@@ -170,22 +442,108 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
     // credential that admits a machine to the cluster, and an install console
     // is a serial line or an IPMI session that keeps its scrollback. The
     // summary below already declines to print it; the prompt has to agree.
-    let token = ask_valid_secret(
-        "Node registration token (64 hex chars): ",
-        validate_token,
-        "the one-time nodeToken the API returned when the operator created this \
-         node (POST /api/v1/nodes): exactly 64 lowercase hex characters",
-    )?;
+    let token = if door == 1 {
+        // Minted at first boot by `bootstrap-cell`, once there is an API to
+        // mint it. A token typed here would be one nothing had issued.
+        String::new()
+    } else if is_hypervisor {
+        ask_valid_secret(
+            "Node registration token (64 hex chars): ",
+            validate_token,
+            "the one-time nodeToken the API returned when the operator created this \
+             node (POST /api/v1/nodes): exactly 64 lowercase hex characters",
+        )?
+    } else {
+        String::new()
+    };
 
-    println!("\nVMM:");
-    println!("  [1] cloud-hypervisor (default)");
-    println!("  [2] qemu");
-    let vmm = loop {
-        match prompt("VMM [1]: ")?.trim() {
-            "" | "1" => break "cloud-hypervisor".to_string(),
-            "2" => break "qemu".to_string(),
-            other => println!("  {other:?} is not an option — pick 1 or 2."),
+    let vmm = if is_hypervisor {
+        // The default follows the storage: a machine born with Ceph, or
+        // joining a cell that may grow it, opens its volumes only with QEMU.
+        // Cloud Hypervisor takes a path and nothing else, so offering it as
+        // the default beside a Ceph answer would be a wizard that builds a
+        // machine unable to boot the guests it was installed for.
+        let qemu_default = !ceph_osds.is_empty();
+        println!("\nVMM:");
+        if qemu_default {
+            println!("  [1] cloud-hypervisor");
+            println!(
+                "  [2] qemu (default) — the only one that can open the Ceph volumes just chosen"
+            );
+        } else {
+            println!("  [1] cloud-hypervisor (default)");
+            println!("  [2] qemu — the only one that can open a Ceph volume");
         }
+        let ask = if qemu_default {
+            "VMM [2]: "
+        } else {
+            "VMM [1]: "
+        };
+        loop {
+            match prompt(ask)?.trim() {
+                "" => {
+                    break if qemu_default {
+                        "qemu"
+                    } else {
+                        "cloud-hypervisor"
+                    }
+                    .to_string();
+                }
+                "1" => break "cloud-hypervisor".to_string(),
+                "2" => break "qemu".to_string(),
+                other => println!("  {other:?} is not an option — pick 1 or 2."),
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let (pool, pool_backend, pool_token) = if door == 1 {
+        // The first machine's own pool, created at first boot: Ceph on the
+        // disks just named, or a directory called `local`. Either way the
+        // cell can grow a Ceph cluster later, from the console.
+        if ceph_osds.is_empty() {
+            ("local".to_string(), "directory".to_string(), String::new())
+        } else {
+            ("ceph".to_string(), "ceph".to_string(), String::new())
+        }
+    } else if is_pool {
+        let id = ask_valid(
+            "Pool id (e.g. local): ",
+            validate_node_name,
+            "the id the operator created via POST /api/v1/pools — lowercase letters, digits and dashes",
+        )?;
+        println!("\nBackend:");
+        println!("  [1] directory  qcow2 files on this machine. Everything it holds is here,");
+        println!("                 so a guest on such a volume cannot move to another node.");
+        println!("  [2] ceph       RBD images. Every node reaches every volume.");
+        println!("  [3] lvm        logical volumes on this machine, no image format.");
+        let backend = loop {
+            match prompt("Backend [1]: ")?.trim() {
+                "" | "1" => break "directory".to_string(),
+                "2" => break "ceph".to_string(),
+                "3" => break "lvm".to_string(),
+                other => println!("  {other:?} is not an option — pick 1, 2 or 3."),
+            }
+        };
+        // A control plane's pool agent reaches the store directly and is given
+        // no token at all. Every other pool needs its own, because the API
+        // issues `poolToken` and `nodeToken` separately and authenticates a
+        // pool agent as `pool:<id>` — a node token presented by a pool agent is
+        // answered 401 for ever, with the seed looking complete.
+        let token = if is_control_plane {
+            String::new()
+        } else {
+            ask_valid_secret(
+                "Pool registration token (64 hex chars): ",
+                validate_token,
+                "the one-time poolToken the API returned when the operator created this \
+                 pool (POST /api/v1/pools): exactly 64 lowercase hex characters",
+            )?
+        };
+        (id, backend, token)
+    } else {
+        (String::new(), String::new(), String::new())
     };
 
     // The review: everything the erase will produce, with the two secrets —
@@ -209,10 +567,34 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
             println!("  network:       {iface} static {address}, gateway {gateway}, DNS {dns}");
         }
     }
-    println!("  control plane: {api_url}");
-    println!("  node:          {node} (cell {cell}, region {region})");
-    println!("  vmm:           {vmm}");
-    println!("  node token:    (64 hex chars — not echoed)");
+    println!("  roles:         {}", crate::roles::render_list(&roles));
+    if is_control_plane {
+        println!("  api listens:   {listen}");
+        if !admin.is_empty() {
+            println!("  administrator: {admin} (password not echoed)");
+        }
+    } else {
+        println!("  control plane: {api_url}");
+    }
+    println!("  cell/region:   {cell} / {region}");
+    if is_hypervisor {
+        println!("  node:          {node}");
+        println!("  vmm:           {vmm}");
+        println!("  node token:    (64 hex chars — not echoed)");
+    }
+    print_access(&ssh_key, &root_password);
+    if is_pool {
+        println!("  pool:          {pool} ({pool_backend})");
+        if !ceph_osds.is_empty() {
+            println!(
+                "  ceph osds:     {} — ERASED at first boot",
+                ceph_osds.join(", ")
+            );
+        }
+        if !pool_token.is_empty() {
+            println!("  pool token:    (64 hex chars — not echoed)");
+        }
+    }
 
     let confirm = prompt("\nThis ERASES the selected disk(s). Type YES to proceed: ")?;
     if confirm.trim() != "YES" {
@@ -231,6 +613,314 @@ pub fn collect(disks: &[Disk]) -> Result<Option<Answers>> {
         region,
         token,
         vmm,
+        roles,
+        pool,
+        pool_backend,
+        pool_token,
+        listen,
+        admin,
+        admin_password,
+        api_ca_pem: String::new(),
+        ceph_osds,
+        ssh_key,
+        root_password,
+    }))
+}
+
+/// Whether anybody may log in to this machine, and how.
+///
+/// The image has no accounts: `root` exists with no password and
+/// `allowNoPasswordLogin` off, so the `login:` prompt on the screen is a dead
+/// end by construction. Fleet access is the control plane, and break-glass is
+/// booting the installer medium — which is a defensible default and a
+/// genuinely awkward one the first time something is wrong at three in the
+/// morning.
+///
+/// So it is offered rather than decided. Nothing is the default, and the
+/// question says what nothing means, because an operator who does not know
+/// the machine has no accounts cannot know to ask for one.
+fn ask_for_access() -> Result<(String, String)> {
+    println!("\nAccess to this machine itself:");
+    println!("  [1] none (default) — the console and SSH are closed. Manage it");
+    println!("      through the cell; to get a shell, boot this installer again.");
+    println!("  [2] an SSH key");
+    println!("  [3] a console password");
+    println!("  [4] both");
+    let (want_key, want_password) = loop {
+        match prompt("Access [1]: ")?.trim() {
+            "" | "1" => break (false, false),
+            "2" => break (true, false),
+            "3" => break (false, true),
+            "4" => break (true, true),
+            other => println!("  {other:?} is not an option — pick 1 to 4."),
+        }
+    };
+
+    let ssh_key = if want_key {
+        loop {
+            let got = prompt("Public key (ssh-ed25519 … / ssh-rsa …): ")?;
+            let got = got.trim().to_string();
+            match validate_ssh_key(&got) {
+                Ok(()) => break got,
+                Err(e) => println!("  {e:#}"),
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let root_password = if want_password {
+        loop {
+            let first = prompt_secret("Root password (not echoed): ")?;
+            if first.len() < 12 {
+                println!(
+                    "  at least 12 characters — this is a console anybody standing at the machine can reach"
+                );
+                continue;
+            }
+            let again = prompt_secret("Again: ")?;
+            if first == again {
+                break first;
+            }
+            println!("  they differ — once more");
+        }
+    } else {
+        String::new()
+    };
+    Ok((ssh_key, root_password))
+}
+
+/// Offer the join tokens found on attached media, if any.
+///
+/// `Ok(None)` means nothing was found or the operator declined all of them,
+/// and the caller asks. One token is a yes/no question — the common case, and
+/// the answer is almost always yes; several is a choice, because a stick that
+/// has been round a fleet can carry more than one and installing the wrong
+/// machine is the expensive mistake here.
+fn offer_found_tokens() -> Result<Option<velstra_cloud_wire::join::JoinToken>> {
+    let found = crate::joinfile::find();
+    match found.len() {
+        0 => Ok(None),
+        1 => {
+            println!("\nFound a join token on this machine:");
+            println!("  {}", found[0].describe());
+            if ask_yes("Use it?", true)? {
+                return Ok(Some(found[0].token.clone()));
+            }
+            Ok(None)
+        }
+        _ => {
+            println!("\nFound more than one join token:");
+            for (i, f) in found.iter().enumerate() {
+                println!("  [{}] {}", i + 1, f.describe());
+            }
+            println!("  [0] none of them — paste one instead");
+            loop {
+                let got = prompt(&format!("Which one [1-{}]: ", found.len()))?;
+                match got.trim().parse::<usize>() {
+                    Ok(0) => return Ok(None),
+                    Ok(n) if n <= found.len() => {
+                        return Ok(Some(found[n - 1].token.clone()));
+                    }
+                    _ => println!("  not one of the above"),
+                }
+            }
+        }
+    }
+}
+
+/// What the review says about access, in both doors.
+fn print_access(ssh_key: &str, root_password: &str) {
+    match (ssh_key.is_empty(), root_password.is_empty()) {
+        (true, true) => println!("  access:        none — console and SSH closed"),
+        (false, true) => println!("  access:        SSH key only"),
+        (true, false) => println!("  access:        console password (not echoed)"),
+        (false, false) => println!("  access:        SSH key and console password"),
+    }
+}
+
+/// One line, as `ssh-keygen` writes it. Checked here rather than at first
+/// boot: a key with a newline in it is a seed that never produces a login, and
+/// finding that out needs a second trip to the machine.
+fn validate_ssh_key(key: &str) -> Result<()> {
+    let mut parts = key.split_whitespace();
+    let (Some(kind), Some(body)) = (parts.next(), parts.next()) else {
+        bail!("a public key is `<type> <base64> [comment]` — this has fewer than two words");
+    };
+    if !kind.starts_with("ssh-") && !kind.starts_with("ecdsa-") && !kind.starts_with("sk-") {
+        bail!("{kind:?} is not a key type — expected ssh-ed25519, ssh-rsa or similar");
+    }
+    if body.len() < 16
+        || !body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
+        bail!("the key body is not base64 — this looks like a private key or a truncated paste");
+    }
+    if key.contains('\n') {
+        bail!("a public key is one line; this has a line break in it");
+    }
+    Ok(())
+}
+
+/// Door 2: the join token is every cloud answer, so only the disk answers
+/// already given are needed — and the review, because the erase is still an
+/// erase.
+#[allow(clippy::too_many_arguments)]
+fn join(
+    chosen: Vec<&Disk>,
+    raid: Raid,
+    picks: Vec<usize>,
+    passphrase: Option<String>,
+    hostname: String,
+    network: Network,
+    // Asked once, in `collect`, before the door was chosen — the question is
+    // about this machine and not about how it joins. Passed in rather than
+    // asked again, which is what door 2 did the first time round.
+    ssh_key: String,
+    root_password: String,
+    // Already in hand, when the cell handed it over after an approval. `None`
+    // means look on the media and then ask.
+    handed: Option<velstra_cloud_wire::join::JoinToken>,
+) -> Result<Option<Answers>> {
+    if let Some(token) = handed {
+        return from_token(
+            token,
+            chosen,
+            raid,
+            picks,
+            passphrase,
+            hostname,
+            network,
+            ssh_key,
+            root_password,
+        );
+    }
+    // Anything plugged in first. A join token is a little over a thousand
+    // characters of base64: it carries six facts from the control plane so
+    // nothing has to be copied by hand, and then asks somebody to type it at a
+    // console, where there is no paste. Write the ISO once, drop one text file
+    // on a second stick — or in the space after the image on the same stick —
+    // and this finds it. See `joinfile`.
+    let token = match offer_found_tokens()? {
+        Some(t) => t,
+        None => {
+            println!("\nPaste the join token the console showed when this node was created.");
+            println!("It starts with `velstra1.` and is one line; a wrapped paste is fine.");
+            println!("Typing it is not the intended way: put it in a file called");
+            println!("`velstra/join` on any stick you plug in, and this finds it by itself.");
+            loop {
+                let pasted = prompt("Join token: ")?;
+                match velstra_cloud_wire::join::JoinToken::decode(&pasted) {
+                    Ok(t) => break t,
+                    Err(e) => println!("  {e}"),
+                }
+            }
+        }
+    };
+    from_token(
+        token,
+        chosen,
+        raid,
+        picks,
+        passphrase,
+        hostname,
+        network,
+        ssh_key,
+        root_password,
+    )
+}
+
+/// What a token turns into, however it was obtained.
+///
+/// One path for all of it: pasted, found on a stick, or handed over by the
+/// cell after somebody approved this machine. Three ways in and one way
+/// through — the alternative is three copies of the same translation from
+/// token to seed, which is the shape this codebase has paid for four times.
+#[allow(clippy::too_many_arguments)]
+fn from_token(
+    token: velstra_cloud_wire::join::JoinToken,
+    chosen: Vec<&Disk>,
+    raid: Raid,
+    picks: Vec<usize>,
+    passphrase: Option<String>,
+    hostname: String,
+    network: Network,
+    ssh_key: String,
+    root_password: String,
+) -> Result<Option<Answers>> {
+    let mut roles = Vec::new();
+    if !token.token.is_empty() {
+        roles.push(crate::roles::Role::Hypervisor);
+    }
+    if token.pool.is_some() {
+        roles.push(crate::roles::Role::Pool);
+    }
+    let (pool, pool_token) = token
+        .pool
+        .as_ref()
+        .map(|p| (p.id.clone(), p.token.clone()))
+        .unwrap_or_default();
+    let api_url = token
+        .urls
+        .iter()
+        .find(|u| !u.trim().is_empty())
+        .cloned()
+        .unwrap_or_default();
+
+    println!();
+    print_plan(&chosen, raid);
+    if passphrase.is_some() {
+        println!("  data partition: LUKS2 encrypted (passphrase asked at each boot)");
+    }
+    println!("\nThe installed node will come up as:");
+    println!("  hostname:      {hostname}");
+    println!(
+        "  joining:       {} (cell {}, region {})",
+        token.node, token.cell, token.region
+    );
+    println!("  control plane: {api_url}");
+    println!("  roles:         {}", crate::roles::render_list(&roles));
+    if !pool.is_empty() {
+        println!("  pool:          {pool} (directory)");
+    }
+    println!("  vmm:           qemu");
+    println!("  credentials:   (from the token — not echoed)");
+    print_access(&ssh_key, &root_password);
+
+    let confirm = prompt("\nThis ERASES the selected disk(s). Type YES to proceed: ")?;
+    if confirm.trim() != "YES" {
+        return Ok(None);
+    }
+    Ok(Some(Answers {
+        raid,
+        picks,
+        passphrase,
+        hostname,
+        network,
+        api_url,
+        node: token.node,
+        cell: token.cell,
+        region: token.region,
+        token: token.token,
+        // The only hypervisor that can open a Ceph volume, and a joiner
+        // cannot know what storage the cell will grow.
+        vmm: "qemu".into(),
+        roles,
+        pool,
+        pool_backend: if pool_token.is_empty() {
+            String::new()
+        } else {
+            "directory".into()
+        },
+        pool_token,
+        listen: String::new(),
+        admin: String::new(),
+        admin_password: String::new(),
+        api_ca_pem: token.ca,
+        ceph_osds: Vec::new(),
+        ssh_key,
+        root_password,
     }))
 }
 

@@ -338,6 +338,7 @@ pub fn evaluate(
         let view = NodeView {
             name: node.meta.name.to_string(),
             last_heartbeat: node.status.last_heartbeat,
+            fenced_heartbeat: velstra_cloud_model::ha::confirmed_heartbeat(&node.meta.labels),
             fence_after_s: node.spec.fence_after_s,
             ready: condition(&node.status.conditions, "Ready")
                 .is_some_and(|c| c.status == velstra_cloud_model::meta::ConditionStatus::True),
@@ -514,12 +515,33 @@ pub fn evaluate(
             out.push(Alert {
                 rule: "stuck",
                 subject: d.name.clone(),
-                message: format!(
-                    "{} has been {} for {} s; the object's conditions say why",
-                    d.name,
-                    d.reason.label(),
-                    d.age_seconds
-                ),
+                // Two different situations wore one sentence. An object that
+                // has said something has an explanation on it and the operator
+                // should go and read it. An object with no conditions at all
+                // has said nothing — because nothing has ever written to it —
+                // and sending somebody to read its conditions sends them to an
+                // empty place. Found on a live cell: a backup and a router,
+                // both at `observedGeneration: 0` with no conditions, and the
+                // only thing the platform ever said about either was this
+                // alert telling an operator to look at what was not there.
+                message: if d.explained {
+                    format!(
+                        "{} has been {} for {} s; the object's conditions say why",
+                        d.name,
+                        d.reason.label(),
+                        d.age_seconds
+                    )
+                } else {
+                    format!(
+                        "{} has been {} for {} s and has said nothing at all — it carries no \
+                         conditions, so nothing in this cell has ever reported on it. Check that \
+                         whatever serves {} here is running.",
+                        d.name,
+                        d.reason.label(),
+                        d.age_seconds,
+                        d.name.rsplit('/').nth(1).unwrap_or("this kind")
+                    )
+                },
             });
         }
     }
@@ -1486,11 +1508,13 @@ mod tests {
                 name: "projects/p/instances/old".into(),
                 reason: DivergenceReason::Unconverged,
                 age_seconds: 1_000,
+                explained: true,
             },
             Divergent {
                 name: "projects/p/instances/young".into(),
                 reason: DivergenceReason::Unconverged,
                 age_seconds: 10,
+                explained: true,
             },
         ];
         let alerts = evaluate(
@@ -1507,6 +1531,48 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].rule, "stuck");
         assert_eq!(alerts[0].subject, "projects/p/instances/old");
+        assert!(
+            alerts[0].message.contains("conditions say why"),
+            "{}",
+            alerts[0].message
+        );
+    }
+
+    /// **An object that has said nothing is not told to explain itself.**
+    ///
+    /// The stuck alert sent an operator to read "the object's conditions",
+    /// which is right for an object that has reported something and wrong for
+    /// one that has reported nothing at all. Found on a live cell: a backup and
+    /// a router, both at `observedGeneration: 0` with an empty condition list,
+    /// because nothing in that cell serves either kind — and the only thing the
+    /// platform ever said about them was this alert, pointing at an empty
+    /// place.
+    #[test]
+    fn an_object_that_has_never_reported_is_not_sent_to_read_its_conditions() {
+        let divergent = [Divergent {
+            name: "projects/p/routers/r1".into(),
+            reason: DivergenceReason::Unconverged,
+            age_seconds: 1_000,
+            explained: false,
+        }];
+        let alerts = evaluate(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &divergent,
+            &[],
+            &Rules::default(),
+            NOW,
+        );
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        let said = &alerts[0].message;
+        assert!(!said.contains("conditions say why"), "{said}");
+        assert!(said.contains("said nothing at all"), "{said}");
+        // And it names what to go and look at, which is the thing that serves
+        // this kind — not the object, which is the part that is fine.
+        assert!(said.contains("routers"), "{said}");
     }
 
     #[tokio::test]

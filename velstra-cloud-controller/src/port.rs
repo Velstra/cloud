@@ -38,6 +38,15 @@ use crate::{
 
 const WHO: &str = "port";
 
+/// How long a minted port is too young to be called abandoned.
+///
+/// The window it covers is milliseconds wide — the gap inside `Api::create`
+/// between minting a guest's default port and writing the guest — so a minute
+/// is generous by three orders of magnitude. It is spent only on ports the
+/// platform minted itself whose guest is in no store, which is either that
+/// window or a guest that really is gone; the second case merely waits a pass.
+const MINTED_PORT_GRACE_MS: u64 = 60_000;
+
 /// Whether the node has said its datapath no longer carries this port.
 ///
 /// Read from the condition the agent writes and never inferred from
@@ -141,6 +150,32 @@ impl PortController {
             .flatten()
             .is_some()
         {
+            return Ok(false);
+        }
+        // And the store can be right and still too early.
+        //
+        // The check above closed the *cache* window and left the one under it
+        // open: `Api::create` mints this port from inside the instance-create
+        // request and writes the instance row afterwards, so between those two
+        // writes the guest is genuinely in no store at all, and every question
+        // this function can ask answers "gone". Measured on a live cell: three
+        // guests out of three lost their own default port a few dozen
+        // milliseconds after it was made, and because a guest does not run
+        // until every port it names is programmed, none of them ever booted.
+        // The symptom was `HostActions: port … is not in the store yet`, for
+        // ever, on a wire nothing would ever mint again.
+        //
+        // So a port younger than this is left alone. Not a fix for a slow
+        // store — it is the honest statement that a thing made a moment ago
+        // cannot yet be judged abandoned, and the same shape the rest of the
+        // platform uses for exactly that (`STOP_GRACE_MS`, the console's
+        // first-report grace). A minute is far longer than the window it
+        // covers and far shorter than a guest's life; the cost of waiting is
+        // one pass, and the cost of not waiting is a machine that never boots.
+        let age = velstra_cloud_model::meta::Timestamp::now()
+            .0
+            .saturating_sub(port.meta.created_at.0);
+        if age < MINTED_PORT_GRACE_MS {
             return Ok(false);
         }
         self.ports
@@ -687,6 +722,65 @@ mod a_wire_nobody_will_ever_come_back_for {
         );
     }
 
+    /// **A port younger than its own guest's write keeps its wire.**
+    ///
+    /// `Api::create` mints a guest's default port from inside the
+    /// instance-create request and writes the guest afterwards. Between those
+    /// two writes the guest is in no store at all, so the cache says gone, the
+    /// store says gone, and both are telling the truth about a guest that is
+    /// about to exist. Measured on a live cell: three guests out of three lost
+    /// their own default port a few dozen milliseconds after it was made, and
+    /// because a guest does not run until every port it names is programmed,
+    /// none of them ever booted — `HostActions: port … is not in the store yet`
+    /// for ever, on a wire nothing would ever mint again.
+    #[tokio::test]
+    async fn a_port_minted_a_moment_ago_is_not_yet_abandoned() {
+        let (controller, ports, _instances) = cell().await;
+        // Marked for a guest that is in neither the cache nor the store, which
+        // is exactly what the window looks like from here.
+        let port = a_port(&ports, Some(GUEST)).await;
+        assert!(
+            velstra_cloud_model::meta::Timestamp::now()
+                .0
+                .saturating_sub(port.meta.created_at.0)
+                < MINTED_PORT_GRACE_MS,
+            "the fixture's port has to be young for this test to mean anything"
+        );
+
+        controller.reconcile(PORT, Some(&port)).await.unwrap();
+
+        assert!(
+            ports.get(PORT).await.unwrap().is_some(),
+            "a port was collected in the window between its guest being minted \
+             a wire and the guest being written"
+        );
+    }
+
+    /// And once it is old enough, a guest that really is gone still takes its
+    /// wire with it — the grace delays the collection, it does not cancel it.
+    #[tokio::test]
+    async fn an_old_minted_port_whose_guest_never_arrived_is_still_collected() {
+        let (controller, ports, _instances) = cell().await;
+        let mut port = a_port(&ports, Some(GUEST)).await;
+        // Older than the grace, which on a real cell is a guest that was
+        // deleted rather than one that is being written.
+        port.meta.created_at = velstra_cloud_model::meta::Timestamp(
+            velstra_cloud_model::meta::Timestamp::now().0 - MINTED_PORT_GRACE_MS - 1_000,
+        );
+        ports
+            .update(&port, &Writer::controller("test"))
+            .await
+            .unwrap();
+        let port = ports.get(PORT).await.unwrap().unwrap();
+
+        controller.reconcile(PORT, Some(&port)).await.unwrap();
+
+        assert!(
+            ports.get(PORT).await.unwrap().is_none(),
+            "a wire outlived the guest it was minted for"
+        );
+    }
+
     #[tokio::test]
     async fn a_minted_port_goes_when_its_guest_does() {
         // Nobody asked for this port and nobody knows its name — it exists so a
@@ -697,7 +791,18 @@ mod a_wire_nobody_will_ever_come_back_for {
         // address, and each leaving a gateway on a bridge that outlived its
         // network.
         let (controller, ports, _instances) = cell().await;
-        let port = a_port(&ports, Some(GUEST)).await;
+        let mut port = a_port(&ports, Some(GUEST)).await;
+        // Past the grace: a port this old whose guest is in no store is one
+        // whose guest was deleted, not one whose guest is mid-write. The
+        // grace itself is pinned by the two tests above.
+        port.meta.created_at = velstra_cloud_model::meta::Timestamp(
+            velstra_cloud_model::meta::Timestamp::now().0 - MINTED_PORT_GRACE_MS - 1_000,
+        );
+        ports
+            .update(&port, &Writer::controller("test"))
+            .await
+            .unwrap();
+        let port = ports.get(PORT).await.unwrap().unwrap();
 
         controller.reconcile(PORT, Some(&port)).await.unwrap();
 

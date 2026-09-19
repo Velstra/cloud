@@ -29,6 +29,16 @@ pub fn run_update(image: &Path) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
     require_root("update")?;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all("/run/velstra-node")?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open("/run/velstra-node/slot-update.lock")?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .context("another process is updating the inactive slot")?;
     let disk = find_source_disk()?;
     let active = active_slot(&disk)?;
     let inactive = inactive_of(active);

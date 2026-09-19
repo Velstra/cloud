@@ -1531,6 +1531,41 @@ const INSTANCE_FIELDS: &[Field] = &[
         at_creation: true,
     },
     Field {
+        key: "bootVolume",
+        // Named for the choice, not for the field. "Where the root disk lives"
+        // is the question somebody actually has in front of them, and the two
+        // answers are this machine and a pool.
+        label: "Root disk on",
+        kind: Kind::Ref {
+            collection: "volumes",
+            filter_by: None,
+            spelling: Spelling::Name,
+        },
+        required: false,
+        advanced: true,
+        help: "Left empty, the root disk is a file on whichever machine runs \
+               this guest, sized by the flavor — and the guest cannot be moved \
+               to another machine, because moving a guest does not move its \
+               disk. Named, the root disk is that volume, in its pool: it is \
+               sized by the volume rather than by the flavor, it outlives the \
+               guest, and a guest whose root is in a pool both machines can \
+               reach can be moved between them.",
+        // Said out loud, because the empty case is a real choice with a real
+        // consequence and not an absence.
+        when_empty: "a file on this guest's own machine",
+        derived: false,
+        // Behind the disclosure, and the guard above is why: the common path is
+        // the five things somebody fills in every time — image, size, network,
+        // key, first-boot file — and this is not one of them. The default is
+        // right for a cell with one machine and for every guest that is never
+        // going to move, which is most of them. It is a real choice with a real
+        // consequence, so it is offered and explained; it is not a sixth box
+        // between somebody and a machine.
+        // Where a machine boots from is decided when it is made. Changing it
+        // afterwards is building a different machine.
+        at_creation: true,
+    },
+    Field {
         key: "vcpus",
         label: "vCPUs",
         kind: Kind::Number {
@@ -1899,10 +1934,9 @@ const INSTANCE_FIELDS: &[Field] = &[
         advanced: true,
         help: "Only for an instance whose storage every node can reach. One on \
                local storage that is started elsewhere is an empty machine \
-               wearing a familiar name. Nothing is moved until the node has been \
-               quiet long enough that its own agent has certainly stopped what \
-               it was running — a node with no fencing deadline is never \
-               recovered from.",
+               wearing a familiar name. Recovery requires a fencing deadline \
+               and an operator's confirmation that the host was independently \
+               fenced. Silence alone never proves that its guests stopped.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -3155,6 +3189,106 @@ const FLOATING_IP_FIELDS: &[Field] = &[
 ];
 
 /// "This node is out of service from then, for that long."
+const RELEASE_FIELDS: &[Field] = &[Field {
+    key: "url",
+    label: "Channel",
+    kind: Kind::Text {
+        placeholder: "https://github.com/Velstra/cloud/releases/download/v0.2.0/",
+        check: Check::Url,
+    },
+    required: true,
+    advanced: false,
+    help: "A directory holding the files a release publishes and their SHA256SUMS: a \
+           GitHub release's download directory, or file:///var/lib/velstra/releases/<version> \
+           for a directory copied onto the control plane. What it holds is what the release \
+           is — the version is read off the files, never typed — and the cell fetches every \
+           file onto its own disk before it is ready.",
+    when_empty: "",
+    derived: false,
+    at_creation: false,
+}];
+
+const ROLLOUT_FIELDS: &[Field] = &[
+    Field {
+        key: "release",
+        label: "Release",
+        kind: Kind::Ref {
+            collection: "releases",
+            filter_by: None,
+            // A cell-scoped root object: the bare id, like every reference to
+            // a node.
+            spelling: Spelling::Id,
+        },
+        required: true,
+        advanced: false,
+        help: "What to move the machines to. Only a release that is ready — every file \
+               fetched and verified — moves anything.",
+        when_empty: "No release is known to this cell yet. Add one under Releases: the \
+                     channel a published version was downloaded from.",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
+        key: "nodes",
+        label: "Machines",
+        kind: Kind::RefList {
+            collection: "nodes",
+            also: None,
+            spelling: Spelling::Id,
+        },
+        required: false,
+        advanced: false,
+        help: "Which machines; none means every node in the cell. One at a time, the \
+               control plane last. A machine the cell cannot update — one running the NixOS \
+               module on its own operating system — is refused by name and the rest go on.",
+        when_empty: "",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
+        key: "evacuate",
+        label: "Move guests off first",
+        kind: Kind::Switch,
+        required: false,
+        advanced: false,
+        help: "Every guest on a machine is moved to another before it is updated — live \
+               where the destination can take it. Off, its guests go down with its reboot.",
+        when_empty: "",
+        derived: false,
+        at_creation: true,
+    },
+    Field {
+        key: "maxUnavailable",
+        label: "At once",
+        kind: Kind::Number {
+            unit: "machines",
+            min: 1,
+            max: 64,
+            step: 1,
+            scale: Scale::None,
+            zero: None,
+        },
+        required: false,
+        advanced: true,
+        help: "How many machines may be out of service at the same time.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "paused",
+        label: "Paused",
+        kind: Kind::Switch,
+        required: false,
+        advanced: true,
+        help: "Finish the machine in flight and start no other. The knob to reach for at \
+               the first sign of trouble.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+];
+
 const MAINTENANCE_WINDOW_FIELDS: &[Field] = &[
     Field {
         key: "node",
@@ -4817,6 +4951,23 @@ pub const COLLECTIONS: &[Collection] = &[
                 cell: Cell::Mono,
                 width: 96,
             },
+            // How the machine was installed, and which build it runs. Beside
+            // the agent's version because that one is the crate's and says
+            // `0.1.0` for every build there has ever been; this is the stamp a
+            // rollout compares, and the kind decides what a rollout may hand
+            // the machine — an image for a slot, a package for apt, or nothing.
+            Column {
+                path: "status.installed.kind",
+                label: "Installed",
+                cell: Cell::Text,
+                width: 96,
+            },
+            Column {
+                path: "status.installed.version",
+                label: "Build",
+                cell: Cell::Mono,
+                width: 176,
+            },
             Column {
                 path: "status.lastHeartbeat",
                 label: "Heard from",
@@ -4827,7 +4978,18 @@ pub const COLLECTIONS: &[Collection] = &[
         agreements: &[],
         creatable: true,
         editable: true,
-        deletable: false,
+        // Yes, and the API is what makes it safe rather than this flag. A node
+        // holding a guest is refused by name — the refusal lists the instances
+        // — so the console offering the button does not offer a way to lose
+        // anything; it offers the only way to retire a machine that has been
+        // decommissioned.
+        //
+        // It was `false` with no reason written down, which meant a cell
+        // accumulated rows for machines that no longer exist and an operator
+        // had to reach for `curl` to remove one. A platform whose console
+        // cannot undo what its console did is a platform people stop trusting
+        // the console with.
+        deletable: true,
         explainable: false,
     },
     Collection {
@@ -4890,6 +5052,142 @@ pub const COLLECTIONS: &[Collection] = &[
                 label: "Reason",
                 cell: Cell::Text,
                 width: 260,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "releases",
+        title: "Releases",
+        singular: "release",
+        // The controller reads the channel and fetches; every step lands on the
+        // status, and the watch delivers it.
+        recheck: 0,
+        condition: "Ready",
+        group: "Hardware",
+        scope: Scope::Global,
+        audience: Audience::Operator,
+        blurb: "A build the cell can move to, and where it comes from. Name the \
+                channel a published version was downloaded from — a GitHub \
+                release's directory, or a directory copied onto the control plane \
+                — and the cell reads which build it holds, fetches every file onto \
+                its own disk and verifies each. From then on the cell is the \
+                channel for its machines: a rollout hands each node what the cell \
+                holds, and an install medium is cut from the installer here.",
+        empty: "No release is known to this cell. Add one: the channel a published \
+                version was downloaded from, and the cell fetches it.",
+        fields: RELEASE_FIELDS,
+        columns: &[
+            Column {
+                path: "status.version",
+                label: "Build",
+                cell: Cell::Mono,
+                width: 176,
+            },
+            Column {
+                path: "status.image.fetched",
+                label: "Image",
+                cell: Cell::Yes {
+                    yes: "on this cell",
+                    no: "not yet",
+                },
+                width: 104,
+            },
+            Column {
+                path: "status.package.fetched",
+                label: "Package",
+                cell: Cell::Yes {
+                    yes: "on this cell",
+                    no: "not yet",
+                },
+                width: 104,
+            },
+            Column {
+                path: "status.installer.fetched",
+                label: "Installer",
+                cell: Cell::Yes {
+                    yes: "on this cell",
+                    no: "not yet",
+                },
+                width: 104,
+            },
+            Column {
+                path: "status.checkedAt",
+                label: "Read",
+                cell: Cell::Ago,
+                width: 112,
+            },
+            Column {
+                path: "spec.url",
+                label: "Channel",
+                cell: Cell::Mono,
+                width: 300,
+            },
+        ],
+        agreements: &[],
+        creatable: true,
+        editable: true,
+        deletable: true,
+        explainable: false,
+    },
+    Collection {
+        id: "rollouts",
+        title: "Rollouts",
+        singular: "rollout",
+        recheck: 0,
+        // Ready when it is done; False with the phase as its reason otherwise,
+        // which is what makes a running rollout something to watch and a
+        // failed one something to act on.
+        condition: "Ready",
+        group: "Hardware",
+        scope: Scope::Global,
+        audience: Audience::Operator,
+        blurb: "Moving the cell's machines to a release, one at a time: taken out of \
+                service, drained if asked, handed what to run, waited for, put \
+                back. The control plane goes last. A machine that does not come \
+                back stops the rollout by name and leaves the rest as they were; \
+                one the cell cannot update is refused by name and the rest go on. \
+                Pause it and the machine in flight finishes while no other starts.",
+        empty: "Nothing is being rolled out. Pick machines on the Nodes board and \
+                press Upgrade, or make a rollout here.",
+        fields: ROLLOUT_FIELDS,
+        columns: &[
+            Column {
+                path: "spec.release",
+                label: "Release",
+                cell: Cell::Mono,
+                width: 160,
+            },
+            Column {
+                path: "status.phase",
+                label: "Phase",
+                cell: Cell::Text,
+                width: 96,
+            },
+            Column {
+                path: "status.message",
+                label: "Progress",
+                cell: Cell::Text,
+                width: 360,
+            },
+            Column {
+                path: "spec.evacuate",
+                label: "Guests",
+                cell: Cell::Yes {
+                    yes: "moved off first",
+                    no: "go down with the reboot",
+                },
+                width: 150,
+            },
+            Column {
+                path: "status.startedAt",
+                label: "Started",
+                cell: Cell::Ago,
+                width: 112,
             },
         ],
         agreements: &[],
@@ -5615,7 +5913,10 @@ pub const COLLECTIONS: &[Collection] = &[
         // pretend to hand one out.
         creatable: true,
         editable: true,
-        deletable: false,
+        // The same as nodes, and the guard matters more here: a pool still
+        // holding volumes is refused, because deleting one is deleting the
+        // thing every volume in it is written against.
+        deletable: true,
         explainable: false,
     },
     Collection {
@@ -6051,6 +6352,8 @@ mod tests {
             "users",
             "ceph-clusters",
             "maintenance-windows",
+            "releases",
+            "rollouts",
             "usage",
             "families",
             "folders",
@@ -6060,7 +6363,7 @@ mod tests {
         }
         assert_eq!(
             COLLECTIONS.len(),
-            33,
+            35,
             "a collection was added without a screen"
         );
         // This list is maintained by hand, and on 2026-08-19 it was two short:

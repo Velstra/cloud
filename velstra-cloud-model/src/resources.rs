@@ -345,6 +345,42 @@ impl Assigned for crate::backup::BackupScheduleSpec {}
 /// hold ([`Quota::devices`]), not what they are called.
 pub type DeviceClass = Resource<crate::pci::DeviceClassSpec, DeviceClassStatus>;
 
+/// A machine that has announced itself to a cell and is waiting to be let in.
+///
+/// Cell-scoped, like the node it becomes. Not project-scoped and never will
+/// be: hardware belongs to the cell, and a tenant who could approve a machine
+/// into it would be a tenant who could add themselves a hypervisor.
+pub type Enrollment =
+    Resource<crate::enrollment::EnrollmentSpec, crate::enrollment::EnrollmentStatus>;
+
+impl Observed for crate::enrollment::EnrollmentStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        // Nobody, and this is the unusual one: what is on this status came
+        // from the *machine*, at the announce, before it had any credential at
+        // all. There is no agent to name as its owner because the thing it
+        // describes is not yet part of the cell — which is the whole point of
+        // the object.
+        None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        // So the API may write it, which is the only way this object can
+        // exist. An announcement arrives from something with no credential, so
+        // the API records it on the machine's behalf; the access rule refuses
+        // every controller's status write unless the kind says no agent will
+        // ever make one. Nothing does here — an enrolment is over before there
+        // is an agent to assign.
+        true
+    }
+}
+
+impl Assigned for crate::enrollment::EnrollmentSpec {}
+
 /// A stretch of time in which one node is out of service.
 ///
 /// Cell-scoped, like the node it is about. Nothing writes its status: whether
@@ -392,6 +428,56 @@ impl Observed for DeviceClassStatus {
 }
 
 impl Assigned for crate::pci::DeviceClassSpec {}
+
+/// A build a cell can move to, and where to get it.
+///
+/// Cell-scoped: what the cell's machines run is the cell's, and a tenant who
+/// could name a channel would be a tenant who could put their own build on
+/// every hypervisor. See `docs/upgrading.md`.
+pub type Release = Resource<crate::release::ReleaseSpec, crate::release::ReleaseStatus>;
+
+impl Observed for crate::release::ReleaseStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        // The release controller reads the channel and writes what it found;
+        // no agent ever reports on a release.
+        true
+    }
+}
+
+impl Assigned for crate::release::ReleaseSpec {}
+
+/// Moving the cell's machines to a release, one at a time.
+///
+/// Cell-scoped, for the same reason a release is.
+pub type Rollout = Resource<crate::rollout::RolloutSpec, crate::rollout::RolloutStatus>;
+
+impl Observed for crate::rollout::RolloutStatus {
+    fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+    fn owner(&self) -> Option<&str> {
+        None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        // The rollout controller's, and nobody else's: the machines report on
+        // their own nodes, and the rollout reads those.
+        true
+    }
+}
+
+impl Assigned for crate::rollout::RolloutSpec {}
 
 // ---- flavors -------------------------------------------------------------
 
@@ -913,6 +999,13 @@ pub struct NodeSpec {
     /// come and go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_baseline: Option<crate::cpu::CpuLevel>,
+    /// What this machine should run, when that is not what it runs: set by a
+    /// rollout, or by hand for one machine. The agent fetches it from its own
+    /// cell, verifies it, applies it the way its kind is applied, reboots or
+    /// restarts, and reports `status.installed` again. Cleared by the rollout
+    /// once the machine is back. See `docs/upgrading.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wanted: Option<crate::release::Wanted>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1068,6 +1161,19 @@ pub struct NodeStatus {
     /// exists to forbid. Here it is what it really is: one node's report about
     /// itself. Whoever needs the aggregate computes it from these.
     pub images: Vec<String>,
+
+    /// How this machine was installed — image with A/B slots, the Debian
+    /// package, or the NixOS module — and which build it runs.
+    ///
+    /// Reported, like everything else here, because only the machine knows,
+    /// and decided from the filesystem and the partition table rather than
+    /// from a label somebody set. It is what a rollout reads to know what to
+    /// hand a node and whether it may hand it anything; `agent_version` cannot
+    /// be that, being the crate version that says `0.1.0` for every build.
+    /// Defaults to unknown, so a report from an agent older than this field is
+    /// not mistaken for a machine of some kind.
+    #[serde(default)]
+    pub installed: crate::installed::Installed,
 }
 
 /// What a running guest was actually given.
@@ -1502,6 +1608,29 @@ pub struct InstanceSpec {
     /// `projects/p1/images/sha256-…`
     pub image: String,
     pub root_disk_gib: u64,
+    /// The volume this guest boots from, instead of a disk on the machine's
+    /// own filesystem.
+    ///
+    /// Empty — the default, and what every guest before this was — means the
+    /// node writes a `root.raw` in its own state directory, sized by the
+    /// flavor. That is the right shape for a laptop cell and the wrong one for
+    /// every cell with shared storage, because **a disk on one machine's
+    /// filesystem is the reason a guest cannot move**: migration refuses
+    /// outright unless every node mounts one shared state directory, and says
+    /// so in [`crate::migration`] — "a guest stays where its disk is".
+    ///
+    /// Named, the root disk is an ordinary [`Volume`] in an ordinary pool, with
+    /// everything that follows from it: it is sized by the volume and not by
+    /// the flavor, it can be made from an image like any other volume, it
+    /// survives the guest, and a guest whose root is in a pool both machines
+    /// can reach can be moved between them without a shared filesystem.
+    ///
+    /// The volume is the guest's alone while it is named here: it may not also
+    /// be attached, and no second guest may boot from it. Two machines with the
+    /// same root disk open is the corruption an attachment's finalizer exists
+    /// to prevent, and a boot disk is no different for being first.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_volume: String,
     /// What an operator wants it to be doing. Not a command — asking twice is
     /// the same as asking once.
     pub desired_state: DesiredState,

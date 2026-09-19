@@ -49,12 +49,58 @@ pub fn seed(targets: &[&Disk], raid: Raid, answers: &Answers, crypto: &Crypto) -
     // node.env is world-readable: nothing in it is secret, and the units that
     // read it do not all run as root. The token is the secret, and it gets its
     // own file with its own mode.
+    // The certificate a join token carried, at the path the seed names for
+    // it. World-readable: a certificate, not a secret.
+    if !answers.api_ca_pem.trim().is_empty() {
+        write_with_mode(&mnt.join("api-ca.pem"), &answers.api_ca_pem, 0o644)?;
+    }
     write_with_mode(&mnt.join("node.env"), &render_node_env(answers), 0o644)?;
-    write_with_mode(
-        &mnt.join("node-token"),
-        &format!("{}\n", answers.token),
-        0o600,
-    )?;
+    // The first administrator's password, for the first machine of a cell.
+    // Its own file and mode, like the tokens: the API unit reads it into the
+    // environment at start rather than taking it on a command line.
+    if !answers.admin_password.is_empty() {
+        write_with_mode(
+            &mnt.join("bootstrap-password"),
+            &format!("{}\n", answers.admin_password),
+            0o600,
+        )?;
+    }
+    // Only the credentials this machine was actually given. A control plane
+    // that is not a hypervisor has no node token, and writing an empty file
+    // would satisfy the node agent's `ConditionPathExists` with nothing in it
+    // — a unit that starts, authenticates as nobody, and is refused for ever.
+    let mut wrote = vec!["node.env"];
+    // The root password, when one was asked for: its own file and mode, like
+    // every other secret here.
+    if !answers.root_password.is_empty() {
+        write_with_mode(
+            &mnt.join("root-password"),
+            &format!("{}\n", answers.root_password),
+            0o600,
+        )?;
+        wrote.push("root-password");
+    }
+
+    if !answers.token.is_empty() {
+        write_with_mode(
+            &mnt.join("node-token"),
+            &format!("{}\n", answers.token),
+            0o600,
+        )?;
+        wrote.push("node-token");
+    }
+    // A pool is a second agent with a second credential: the API authenticates
+    // it as `pool:<id>` and the node agent as `node:<id>`, and a node token
+    // presented by a pool agent is answered 401 for ever with the seed looking
+    // complete.
+    if !answers.pool_token.is_empty() {
+        write_with_mode(
+            &mnt.join("pool-token"),
+            &format!("{}\n", answers.pool_token),
+            0o600,
+        )?;
+        wrote.push("pool-token");
+    }
 
     if let Network::Static {
         iface,
@@ -74,25 +120,100 @@ pub fn seed(targets: &[&Disk], raid: Raid, answers: &Answers, crypto: &Crypto) -
             0o644,
         )?;
     }
-    eprintln!("seeded {} (node.env, node-token)", mnt.display());
+    eprintln!("seeded {} ({})", mnt.display(), wrote.join(", "));
     Ok(())
 }
 
-/// Render `node.env` — exactly these keys, one per line, values verbatim.
+/// Render `node.env` by handing the installer's answers to the one renderer.
+///
+/// **This used to write the file itself**, and that is the whole reason a
+/// flashed machine could only ever be a hypervisor. Six keys were written here
+/// and twenty-eight by [`crate::setup::render`]; `VELSTRA_ROLES` was among the
+/// twenty-two this one did not know about, and an absent `VELSTRA_ROLES` reads
+/// as `[hypervisor]` — correctly, for a seed written before roles existed, and
+/// silently wrong for one written yesterday by an installer that had simply
+/// never been told.
+///
+/// Nothing was ever going to notice: both renderers had tests, both passed,
+/// and each was right about the keys it knew. So there is one now, and the
+/// installer is a caller of it rather than a second author.
 ///
 /// No quoting on purpose: the wizard refused any value that would need it (see
 /// [`crate::wizard::validate_safe_value`]), so a value here is safe for
 /// systemd's `EnvironmentFile` and for a shell sourcing the file by hand.
 pub(crate) fn render_node_env(a: &Answers) -> String {
-    format!(
-        "VELSTRA_NODE={}\n\
-         VELSTRA_CELL={}\n\
-         VELSTRA_REGION={}\n\
-         VELSTRA_API_URL={}\n\
-         VELSTRA_VMM={}\n\
-         VELSTRA_HOSTNAME={}\n",
-        a.node, a.cell, a.region, a.api_url, a.vmm, a.hostname
-    )
+    crate::setup::render(&machine_from(a))
+}
+
+/// The installer's answers as the thing the rest of this platform calls a
+/// machine.
+///
+/// Every field the installer cannot answer is left empty, and `render` writes
+/// only what was answered — so a seed from here has exactly the keys a seed
+/// from `velstra-cloud-node setup` would have for the same machine.
+fn machine_from(a: &Answers) -> crate::setup::Machine {
+    crate::setup::Machine {
+        region: a.region.clone(),
+        cell: a.cell.clone(),
+        roles: a.roles.clone(),
+        hostname: a.hostname.clone(),
+        api_url: a.api_url.clone(),
+        node: a.node.clone(),
+        token: a.token.clone(),
+        vmm: a.vmm.clone(),
+        pool: a.pool.clone(),
+        pool_token: a.pool_token.clone(),
+        pool_backend: a.pool_backend.clone(),
+        listen: a.listen.clone(),
+        admin: a.admin.clone(),
+        admin_password: a.admin_password.clone(),
+        // The cell's store, named because the alternative is silent and
+        // costly: `velstra-cloud-api` defaults `--store` to `memory`, and the
+        // appliance's unit is bare — everything reaches the binary through the
+        // seed. A control plane whose seed does not name a store therefore
+        // came up on an in-memory one, alongside the etcd the image runs and
+        // does not use, and lost the whole cell on every restart of the API.
+        //
+        // `parse` has always defaulted this to the bundled etcd, so a seed
+        // written by `setup --config` carried it and one written here did not:
+        // the two writers again, disagreeing about a key only one of them knew.
+        store: if a.roles.contains(&crate::roles::Role::ControlPlane) {
+            "127.0.0.1:2379".into()
+        } else {
+            String::new()
+        },
+        api_ca_pem: a.api_ca_pem.clone(),
+        bootstrap_ceph_osds: a.ceph_osds.clone(),
+        ssh_key: a.ssh_key.clone(),
+        root_password: a.root_password.clone(),
+        // Not asked at install time. Which cards a machine holds back is a
+        // decision about what it will run, which nobody has made while they
+        // are standing in front of a disk that is about to be erased — and it
+        // is reversible afterwards with one line in the seed, where an answer
+        // given here would not have been. See `docs/setup-guide.md`.
+        passthrough: String::new(),
+        // A machine born with Ceph opens the cluster with the files the node
+        // agent writes from the cell — the same files every hypervisor gets —
+        // as the client the cell minted for them.
+        ceph_conf: if a.ceph_osds.is_empty() {
+            String::new()
+        } else {
+            format!("{}/ceph/ceph.conf", crate::setup::SEED_DIR)
+        },
+        ceph_user: if a.ceph_osds.is_empty() {
+            String::new()
+        } else {
+            "velstra".into()
+        },
+        // The seed names the file `write_seed` would have written; here the
+        // data partition is the seed directory, so the path is its root.
+        api_ca: if a.api_ca_pem.is_empty() {
+            String::new()
+        } else {
+            format!("{}/api-ca.pem", crate::setup::SEED_DIR)
+        },
+        ..Default::default()
+    }
 }
 
 /// Render the systemd-networkd unit for a static uplink.
@@ -136,25 +257,69 @@ mod tests {
             region: "eu-central".into(),
             token: "ab".repeat(32),
             vmm: "cloud-hypervisor".into(),
+            roles: vec![crate::roles::Role::Hypervisor],
+            pool: String::new(),
+            pool_token: String::new(),
+            pool_backend: String::new(),
+            listen: String::new(),
+            admin: String::new(),
+            admin_password: String::new(),
+            api_ca_pem: String::new(),
+            ceph_osds: Vec::new(),
+            ssh_key: String::new(),
+            root_password: String::new(),
         }
     }
 
     #[test]
-    fn node_env_carries_exactly_the_agreed_keys_in_order() {
+    fn node_env_carries_what_was_answered_and_nothing_else() {
         let env = render_node_env(&answers());
-        assert_eq!(
-            env,
-            "VELSTRA_NODE=node-7\n\
-             VELSTRA_CELL=cell-1\n\
-             VELSTRA_REGION=eu-central\n\
-             VELSTRA_API_URL=https://cloud.example.net\n\
-             VELSTRA_VMM=cloud-hypervisor\n\
-             VELSTRA_HOSTNAME=velstra-node\n"
-        );
+        for expected in [
+            "VELSTRA_REGION=eu-central",
+            "VELSTRA_CELL=cell-1",
+            "VELSTRA_ROLES=hypervisor",
+            "VELSTRA_HOSTNAME=velstra-node",
+            "VELSTRA_API_URL=https://cloud.example.net",
+            "VELSTRA_NODE=node-7",
+            "VELSTRA_VMM=cloud-hypervisor",
+        ] {
+            assert!(
+                env.lines().any(|l| l == expected),
+                "{expected} missing:\n{env}"
+            );
+        }
+        // Nothing this machine is not. A pool key on a hypervisor's seed would
+        // start a pool agent against a pool called nothing.
+        assert!(!env.contains("VELSTRA_POOL"), "{env}");
+        assert!(!env.contains("VELSTRA_LISTEN"), "{env}");
         // One key per line, no quoting, trailing newline — the exact shape
         // systemd's EnvironmentFile and a hand `source` both accept.
         assert!(env.ends_with('\n'));
-        assert_eq!(env.lines().count(), 6);
+        assert!(
+            env.lines().all(|l| l.contains('=') && !l.contains('"')),
+            "{env}"
+        );
+    }
+
+    /// The installer can now seed a machine that is not a hypervisor at all,
+    /// which is the thing it could not express before.
+    #[test]
+    fn an_installer_can_seed_a_control_plane_that_is_also_a_pool() {
+        let mut a = answers();
+        a.roles = vec![crate::roles::Role::ControlPlane, crate::roles::Role::Pool];
+        a.api_url = String::new();
+        a.listen = "0.0.0.0:8443".into();
+        a.pool = "local".into();
+        a.pool_backend = "ceph".into();
+        let env = render_node_env(&a);
+        assert!(env.contains("VELSTRA_ROLES=control-plane,pool"), "{env}");
+        assert!(env.contains("VELSTRA_LISTEN=0.0.0.0:8443"), "{env}");
+        assert!(env.contains("VELSTRA_POOL=local"), "{env}");
+        assert!(env.contains("VELSTRA_POOL_BACKEND=ceph"), "{env}");
+        // No hypervisor keys: this box runs no guests, and a node id it never
+        // registered would have it reporting capacity nobody asked for.
+        assert!(!env.contains("VELSTRA_NODE="), "{env}");
+        assert!(!env.contains("VELSTRA_VMM="), "{env}");
     }
 
     #[test]
@@ -170,5 +335,240 @@ mod tests {
              Gateway=192.0.2.1\n\
              DNS=192.0.2.53\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod door_tests {
+    use super::*;
+    use crate::disks::Raid;
+
+    fn base() -> Answers {
+        Answers {
+            raid: Raid::None,
+            picks: vec![0],
+            passphrase: None,
+            hostname: "horst".into(),
+            network: Network::Dhcp,
+            api_url: String::new(),
+            node: "horst".into(),
+            cell: "cell-1".into(),
+            region: "eu-central".into(),
+            token: String::new(),
+            vmm: "qemu".into(),
+            roles: vec![],
+            pool: String::new(),
+            pool_token: String::new(),
+            pool_backend: String::new(),
+            listen: String::new(),
+            admin: String::new(),
+            admin_password: String::new(),
+            api_ca_pem: String::new(),
+            ceph_osds: Vec::new(),
+            ssh_key: String::new(),
+            root_password: String::new(),
+        }
+    }
+
+    /// The first machine: all three roles, its administrator named in the
+    /// seed, its password kept out of it, and no credentials that nothing has
+    /// issued yet.
+    #[test]
+    fn the_first_machine_seeds_a_whole_cell_and_no_unissued_credential() {
+        let mut a = base();
+        a.roles = vec![
+            crate::roles::Role::ControlPlane,
+            crate::roles::Role::Hypervisor,
+            crate::roles::Role::Pool,
+        ];
+        a.listen = "0.0.0.0:8443".into();
+        a.pool = "local".into();
+        a.pool_backend = "directory".into();
+        a.admin = "admin".into();
+        a.admin_password = "correcthorsebattery".into();
+        let env = render_node_env(&a);
+        assert!(
+            env.contains("VELSTRA_ROLES=control-plane,hypervisor,pool\n"),
+            "{env}"
+        );
+        assert!(env.contains("VELSTRA_BOOTSTRAP_ADMIN=admin\n"), "{env}");
+        assert!(env.contains("VELSTRA_LISTEN=0.0.0.0:8443\n"), "{env}");
+        assert!(env.contains("VELSTRA_NODE=horst\n"), "{env}");
+        assert!(env.contains("VELSTRA_POOL=local\n"), "{env}");
+        assert!(
+            !env.contains("correcthorsebattery"),
+            "the password is not in the seed: {env}"
+        );
+        assert!(
+            !env.contains("VELSTRA_API_URL="),
+            "a control plane is the API: {env}"
+        );
+    }
+
+    /// A machine the installer wrote holds nothing back. The key exists and
+    /// is added afterwards, by hand or by configuration management; what must
+    /// not happen is an empty `VELSTRA_PASSTHROUGH=` that the binary would
+    /// have to read as "none".
+    #[test]
+    fn a_freshly_installed_machine_has_no_passthrough_key() {
+        let mut a = base();
+        a.roles = vec![crate::roles::Role::Hypervisor];
+        let env = render_node_env(&a);
+        assert!(!env.contains("VELSTRA_PASSTHROUGH"), "{env}");
+    }
+
+    /// **The seed door 1 writes has to be one the machine can read back.**
+    ///
+    /// Two halves that must agree, and nothing put them in the same test: the
+    /// wizard writes no `VELSTRA_API_URL` for a control plane — correctly,
+    /// because a control plane is the API — and the parser demanded one
+    /// anyway, for the hypervisor role that door 1 also names. Every first
+    /// machine of a cell installed from the image therefore failed its first
+    /// boot with "VELSTRA_API_URL is missing": no certificate, no API, no
+    /// console, and a banner that printed a machine with no name because it
+    /// reads the same seed through `.ok()`.
+    ///
+    /// Both halves had tests. Neither test ran the other half.
+    #[test]
+    fn the_seed_the_first_door_writes_parses_back() {
+        let mut a = base();
+        a.roles = vec![
+            crate::roles::Role::ControlPlane,
+            crate::roles::Role::Hypervisor,
+            crate::roles::Role::Pool,
+        ];
+        a.listen = "0.0.0.0:8443".into();
+        a.pool = "local".into();
+        a.pool_backend = "directory".into();
+        a.admin = "admin".into();
+        a.admin_password = "correcthorsebattery".into();
+        let env = render_node_env(&a);
+        let back = crate::setup::parse(&env).unwrap_or_else(|e| {
+            panic!("the installer wrote a seed this machine cannot read: {e:#}\n{env}")
+        });
+        assert_eq!(back.node, "horst");
+        assert!(back.roles.contains(&crate::roles::Role::ControlPlane));
+        // Named, not defaulted. The binary's own default for `--store` is
+        // `memory`, the appliance's unit passes no flags, and a cell that runs
+        // in memory loses everything the first time its API restarts — with
+        // etcd running beside it, unused, and nothing saying so.
+        assert!(
+            env.contains("VELSTRA_STORE=127.0.0.1:2379\n"),
+            "the first machine's seed does not name a store: {env}"
+        );
+        assert!(
+            back.api_url.is_empty(),
+            "a control plane is the API; ensure-tls fills this in at first boot: {:?}",
+            back.api_url
+        );
+    }
+
+    /// And the other three doors, so the same trap cannot be set again in one
+    /// of them: every seed this wizard writes is read back by the code that
+    /// runs on the machine.
+    #[test]
+    fn every_role_set_the_wizard_can_write_parses_back() {
+        use crate::roles::Role::*;
+        for roles in [
+            vec![Hypervisor],
+            vec![Pool],
+            vec![Hypervisor, Pool],
+            vec![ControlPlane],
+            vec![ControlPlane, Hypervisor],
+            vec![ControlPlane, Pool],
+            vec![ControlPlane, Hypervisor, Pool],
+        ] {
+            let mut a = base();
+            let is_cp = roles.contains(&ControlPlane);
+            a.roles = roles.clone();
+            if is_cp {
+                a.listen = "0.0.0.0:8443".into();
+                a.admin = "admin".into();
+            } else {
+                a.api_url = "https://cell-1:8443".into();
+                a.token = "ab".repeat(32);
+            }
+            if roles.contains(&Pool) {
+                a.pool = "local".into();
+                a.pool_backend = "directory".into();
+            }
+            let env = render_node_env(&a);
+            crate::setup::parse(&env).unwrap_or_else(|e| {
+                panic!("the wizard wrote a seed for {roles:?} that cannot be read: {e:#}\n{env}")
+            });
+        }
+    }
+
+    /// A joiner: the certificate rides in, and the seed names where it lands.
+    #[test]
+    fn a_joiner_seeds_the_certificate_it_was_handed() {
+        let mut a = base();
+        a.roles = vec![crate::roles::Role::Hypervisor];
+        a.api_url = "https://10.10.10.8:8443".into();
+        a.token = "ab".repeat(32);
+        a.api_ca_pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into();
+        let env = render_node_env(&a);
+        assert!(
+            env.contains("VELSTRA_API_CA=/var/lib/velstra/api-ca.pem\n"),
+            "{env}"
+        );
+        assert!(
+            env.contains("VELSTRA_API_URL=https://10.10.10.8:8443\n"),
+            "{env}"
+        );
+        assert!(env.contains("VELSTRA_VMM=qemu\n"), "{env}");
+    }
+}
+
+#[cfg(test)]
+mod born_with_ceph {
+    use super::*;
+    use crate::disks::Raid;
+
+    /// Born with Ceph: the disks travel in the seed for first boot, the pool
+    /// is the Ceph pool, and it is opened with the files the cell publishes.
+    #[test]
+    fn the_first_machine_may_be_born_with_ceph_on_its_spare_disks() {
+        let a = Answers {
+            raid: Raid::None,
+            picks: vec![0],
+            passphrase: None,
+            hostname: "horst".into(),
+            network: Network::Dhcp,
+            api_url: String::new(),
+            node: "horst".into(),
+            cell: "cell-1".into(),
+            region: "eu-central".into(),
+            token: String::new(),
+            vmm: "qemu".into(),
+            roles: vec![
+                crate::roles::Role::ControlPlane,
+                crate::roles::Role::Hypervisor,
+                crate::roles::Role::Pool,
+            ],
+            pool: "ceph".into(),
+            pool_token: String::new(),
+            pool_backend: "ceph".into(),
+            listen: "0.0.0.0:8443".into(),
+            admin: "admin".into(),
+            admin_password: "correcthorsebattery".into(),
+            api_ca_pem: String::new(),
+            ceph_osds: vec!["sdb".into(), "sdc".into()],
+            ssh_key: String::new(),
+            root_password: String::new(),
+        };
+        let env = render_node_env(&a);
+        assert!(
+            env.contains("VELSTRA_BOOTSTRAP_CEPH_OSDS=sdb,sdc\n"),
+            "{env}"
+        );
+        assert!(env.contains("VELSTRA_POOL=ceph\n"), "{env}");
+        assert!(env.contains("VELSTRA_POOL_BACKEND=ceph\n"), "{env}");
+        assert!(
+            env.contains("VELSTRA_CEPH_CONF=/var/lib/velstra/ceph/ceph.conf\n"),
+            "{env}"
+        );
+        assert!(env.contains("VELSTRA_CEPH_USER=velstra\n"), "{env}");
+        assert!(!env.contains("correcthorsebattery"), "{env}");
     }
 }

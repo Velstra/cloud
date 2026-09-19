@@ -85,11 +85,12 @@ DELETE /api/v1/projects/p1/instances/i1
 Collections, in the order the API serves them: `projects`, `users`,
 `ceph-clusters`, `instances`, `migrations`, `volumes`, `snapshots`,
 `attachments`, `networks`, `routers`, `floatingips`, `load-balancers`,
-`subnets`, `ports`, `security-groups`, `images`, `nodes`, `pools`,
+`subnets`, `ports`, `security-groups`, `images`, `nodes`, `enrollments`,
+`pools`,
 `device-classes`, `backup-targets`, `backups`, `backup-schedules`, `audit`,
 `captures`, `console-sessions`, `image-sources`, `usage`,
 `snapshot-schedules`,
-`maintenance-windows`, `operations`, `flavors`, `bgp-peers`.
+`maintenance-windows`, `releases`, `rollouts`, `operations`, `flavors`, `bgp-peers`.
 
 ### BGP peers: announcing the cell to the router in front of it
 
@@ -2102,14 +2103,15 @@ unreachable and still running every guest it holds, and starting those guests
 elsewhere then produces two of each writing to one volume — an outage turned
 into a restore from backup.
 
-So recovery rests on one mechanism: **the node's own agent stops its guests
-before anything may start them.** `nodes/<id>.spec.fenceAfterS` is how long the
-agent may fail to report before it does, decided against its own clock, needing
-nothing from anybody. The control plane then waits that long *again* before
-unplacing anything.
+Recovery requires independent fencing: the host must be powered off or isolated
+from shared storage before an operator records its current `status.lastHeartbeat`
+in the node label `velstra.io/fenced-heartbeat`. A later heartbeat invalidates
+that confirmation. The agent attempts to kill its guests after `spec.fenceAfterS`,
+but an agent crash can leave guests running, so silence alone is never proof.
+The control plane also waits for the configured deadline plus its safety margin.
+See `operations.md` for the fencing and reconciliation procedure.
 
 A node whose `fenceAfterS` is zero — the default — is **never recovered from**.
-Nothing can tell "unreachable" from "stopped", so nothing is assumed.
 
 A guest opts in with `spec.onNodeLoss: "restart"` (default `"leave"`). Only for
 one whose storage every node can reach: a guest on local storage started
@@ -2122,11 +2124,11 @@ this platform is built to prevent:
 ```
 GET /api/v1/projects/p1/instances/i1:explainRecovery
 { "node": "nodes/node-b", "recoverable": false, "why": "WaitingForFencing",
-  "detail": "nodes/node-b was last heard from 30s ago; 120s is when its guests are certainly stopped" }
+  "detail": "nodes/node-b was last heard from 30s ago; recovery requires at least 120s of silence and external fencing confirmation" }
 ```
 
 `why` is a stable token — `PolicyIsLeave`, `WaitingForFencing`,
-`NodeDoesNotFence`, `HoldsDevices`, `NotRunning`, `NotPlaced` — because the
+`NodeDoesNotFence`, `FenceNotConfirmed`, `HoldsDevices`, `NotRunning`, `NotPlaced` — because the
 reasons are four different afternoons for whoever reads them. Recovery itself
 is one write: the controller clears `spec.node`, and the scheduler then places
 the guest exactly as it would any unplaced one.
@@ -2821,6 +2823,117 @@ Three things about it are deliberate:
   speaks with is not part of running the estate. It is also refused for a name
   nobody registered, and for any kind that has no agent.
 
+**The same credential, as a file somebody can carry**, with `:joinFile` and
+`:cloudInit`. A join token is about 1.3 KB of base64; it removes every
+hand-copied fact between the control plane and an installer, and then asks
+whoever is standing at a machine to type it, at a console, where there is no
+paste buffer. These two answer with the artefact instead:
+
+```
+POST /api/v1/nodes/peter:joinFile → 200
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: attachment; filename="peter.join"
+
+# Velstra Cloud join token for node peter in cell cell-1.
+# Drop this file at velstra/join on any medium you plug into the
+# machine; the installer offers it by name. It is a credential:
+# anything holding it can register as peter.
+velstra1.…
+```
+
+```
+POST /api/v1/nodes/peter:cloudInit → 200   # a #cloud-config, filename peter-cloud-init.yaml
+```
+
+`curl -X POST … -o /mnt/velstra/join` is the intended use, which is why the
+answer is the file and not JSON wrapping it. Four things are deliberate:
+
+- **POST, not GET.** Each call mints a machine credential, and a GET that
+  minted one is a GET a browser can be made to issue from somebody else's
+  page. Same rule, same reason, as `:issueCredential` — and the same `Write`
+  permission.
+- **The file names the machine.** It will be found by somebody who did not
+  write it, possibly a year later, possibly on a stick carrying three others.
+  A naked kilobyte of base64 says nothing about which node it belongs to, and
+  installing the wrong machine is the expensive mistake here. The installer
+  reads past comment lines for exactly this reason.
+- **It is the token, not a second rendering of the seed.** The obvious
+  endpoint is "give me this node's `node.env`", and it is the wrong one:
+  `velstra-cloud-node setup --join` already turns a token into a seed, and a
+  renderer here would be a second place that has to agree about the same keys.
+  This platform has paid for that mistake four times (two seed renderers where
+  only one knew `VELSTRA_ROLES`; a bootstrap password written to one directory
+  and read from another; five keys rendered and never parsed back).
+- **cloud-init installs no package.** It writes the file 0600, runs
+  `setup --join-file`, and shreds it. Which repository a fleet takes the
+  package from is the fleet's decision; a cloud-config that pulled a binary
+  from an address this platform chose would be one nobody could audit.
+
+### Enrolment: the two doors with no token
+
+Everything else in this contract needs a bearer token. Two things do not, and
+cannot: a machine that has just booted an installer holds none.
+
+```
+POST /api/v1/enrollments:announce → 201
+{ "publicKey": "…Ed25519, base64…",
+  "seenCertificate": "9F:2C:…",
+  "reported": { "hostname": "nixos", "addresses": ["10.10.10.47"],
+                "vcpus": 16, "memoryMib": 65536,
+                "disks": ["nvme0n1"], "serial": "PT-0042" } }
+→ { "enrollment": "enrollments/m-5691f8f2b609", "id": "m-5691f8f2b609",
+    "fingerprint": "1A:2B:3C:4D:5E:6F:70:81",
+    "seenCertificate": "9F:2C:…", "phase": "Pending", "expiresAt": … }
+```
+
+The machine prints that fingerprint on its screen. The same value is on the
+enrolment's row in the console, beside what the machine said about itself. An
+operator compares the two, sets `spec.node` and `spec.roles`, and sets
+`spec.approved` — an ordinary PATCH, which needs a token like every other
+change. Then:
+
+```
+POST /api/v1/enrollments:claim → 200
+{ "id": "m-5691f8f2b609", "signature": "…Ed25519 over the claim message…" }
+→ { "target": "nodes/peter", "nodeToken": "…", "joinToken": "velstra1.…" }
+```
+
+Seven things about these two are deliberate.
+
+- **Neither grants anything by itself.** `announce` makes a *request*. Until
+  somebody names the machine and says what it is for, there is nothing to
+  claim, and `claim` says which of the two is missing rather than "no".
+- **The comparison is the authentication, both ways.** The fingerprint is
+  eight bytes of SHA-256 over the public key: only the holder of the private
+  key can produce it, and nothing on the wire can change it without changing
+  the fingerprint. The machine also reports the fingerprint of the certificate
+  it was served, and a control plane's console banner prints that same value
+  for itself — so a man in the middle has to show a certificate it holds the
+  key for, which is a different fingerprint, on the machine's own screen.
+- **The claim is signed over the enrolment's id**, as
+  `velstra-enrollment-claim:v1:<id>`. Without the id in the message one
+  machine's signature would open every row.
+- **Nobody registers themselves.** The API records *who approved* on the
+  enrolment's status — a field the platform writes and no caller can send —
+  and mints the node's credential as that person. A machine cannot create a
+  node, and the API does not act on its own behalf; it acts on the recorded
+  authority of somebody who may already create nodes, once, for the one node
+  they named. The audit line carries a human.
+- **Once.** A second claim is refused as already claimed, whether it is a
+  retry that lost its answer or somebody else holding the key. A machine that
+  lost its credential announces again.
+- **An unknown id and a wrong key answer identically** (`404`). A door open to
+  anybody must not let a stranger enumerate which machines are waiting.
+- **The open door is capped and idempotent.** The id is derived from the key,
+  so a machine that announces again lands on its own row rather than adding
+  one; past 512 unsettled rows an announcement is refused by name. This is the
+  one place in this API where a stranger can make the store grow.
+
+They are collection verbs — `enrollments:claim` with the id in the body, not
+`enrollments/<id>:claim` — because a path segment in this router is either a
+literal or a parameter and never both. The id is not a secret: the machine
+announced it and was told it, and the signature is what authorises.
+
 **A node reports status with a custom method**, AIP-136's `:reportStatus`, which
 is the one write outside the `spec`-only PATCH surface because it is a different
 caller doing a different thing:
@@ -2835,6 +2948,103 @@ If-Match: "412"                 # the revision the agent read, for a compare-and
 A person, a service account or a cell operator has no node identity and so may
 not use it: `status` is the agent's half, and the API does not get to be more
 permissive than the store.
+
+### Releases, rollouts, and the install medium
+
+A **release** is a build the cell can move to, named by its channel: a
+directory holding the artefacts CI publishes and the `SHA256SUMS` that names
+them. A GitHub release's download directory is one; so is a directory copied
+onto the control plane and named as `file:///var/lib/velstra/releases/v0.2.0`.
+Cell-scoped, and the cell operator's to add.
+
+```
+POST /api/v1/releases
+{ "id": "v0.2.0", "spec": { "url": "https://github.com/Velstra/cloud/releases/download/v0.2.0/" } }
+```
+
+The release controller reads the sums, writes what the channel offers onto the
+status — `version`, and `image`, `package` and `installer` with the digest each
+must hash to — and fetches every file into the releases directory, one per
+pass, verifying each before it is marked `fetched`. The `Ready` condition is
+True when all of them are; while it is not, its message says which file is
+being fetched, or why one was refused. A channel that carries two builds, or
+names nothing a release publishes, is refused rather than guessed at. From then
+on **the cell is the channel for its machines**: nothing on a node reaches out
+past its own control plane.
+
+```
+GET /api/v1/releases/{id}/files/{file}      # one of the release's files, verified
+```
+
+is what a node fetches — only a file the release's status names, only once it
+is fetched, and only for the cell's machines and its operators.
+
+What a node runs is `status.installed` on the node (see *Nodes*); what it
+should run is `spec.wanted`, written by a rollout or by hand:
+
+```
+PATCH /api/v1/nodes/peter
+{ "spec": { "wanted": { "release": "releases/v0.2.0", "version": "0.2.0+…",
+                        "file": "velstra-cloud_0.2.0+…_amd64.deb", "sha256": "…" } } }
+```
+
+Everything the machine needs is in it, chosen for its kind of installation, so
+the agent reads its own node and nothing else. It fetches the file from its
+cell, verifies the digest, applies it — an appliance writes the image into its
+inactive slot and reboots; a package node runs `apt-get install` and lets the
+package's `postinst` restart what runs — and reports `installed` again on the
+way back. It reports as it goes on the node's `Updating` condition: True with
+`Fetching`, `Working` or `Applied` and a sentence, False with `Failed` and the
+sentence when it could not, or `UpToDate` once it runs what it is wanted to.
+A machine that failed does not try again until it is wanted something else.
+
+A **rollout** moves machines to a release, one at a time:
+
+```
+POST /api/v1/rollouts
+{ "id": "spring", "spec": { "release": "v0.2.0", "nodes": ["peter", "paul"],
+                            "evacuate": true, "maxUnavailable": 1, "paused": false } }
+```
+
+`release` is the bare id, as every reference to a cell-scoped object is (the
+full name is accepted too); `nodes` empty means every node. The controller cordons the next machine,
+evacuates it if asked and waits until nothing is running there, writes
+`spec.wanted`, waits until the node is `Ready` on the release's version with a
+heartbeat newer than the hand-over, puts it back in service, and moves on —
+**the control plane last**, because the controller runs there and its own
+reboot ends the pass. `status.nodes[]` carries each machine's `phase`
+(`Pending`, `Refused`, `Cordoned`, `Draining`, `Applying`, `Done`, `Failed`),
+what it moved `from` and `to`, and a `message`; `status.phase` is the whole:
+`Planning` until the release is ready, then `Running`, `Paused`, `Done` or
+`Failed`. **It fails closed**: a machine that reports its apply failed, or is
+not back within 45 minutes, stops the rollout with that machine named and every
+machine not yet started left as it was. A machine the cell cannot update — the
+NixOS module on somebody's own operating system, or one that has not reported
+how it was installed — is `Refused` by name, and the rest go on. `paused: true`
+finishes the machine in flight and starts no other.
+
+The **install medium** is the last piece: the installer a release holds, cut
+for one machine.
+
+```
+POST /api/v1/nodes/{name}:installMedium     { "release": "v0.2.0" }   # optional
+→ { "url": "/api/v1/media/<ticket>", "filename": "velstra-cloud-installer_0.2.0+…_peter.iso",
+    "release": "releases/v0.2.0", "version": "0.2.0+…", "size": …, "expiresAt": … }
+GET  /api/v1/media/{ticket}                 # once, no token; streams the medium
+```
+
+The medium is the release's installer ISO, byte for byte, with the node's join
+file — the same one `:joinFile` hands out — appended after the ISO's last byte
+between two markers. Nothing in the ISO is rewritten; the installer reads past
+the end its volume descriptor declares and finds the file there, so a machine
+booted from the stick joins as that node without anything typed. `POST`,
+because it mints the node's credential, and audited as `installMedium`; the
+answer is a one-time link rather than the bytes, because two gigabytes are not
+a thing to hand a browser's `fetch()`. The link needs no token — it is the
+credential, as a console ticket is — is spent on the first `GET`, and is gone
+after ten minutes. Without `release`, the newest release whose installer is on
+this cell is used; while no release holds one, the cut is refused with
+`FAILED_PRECONDITION` and says to add one.
 
 ## Image families and where images come from
 

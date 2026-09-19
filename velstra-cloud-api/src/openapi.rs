@@ -247,6 +247,9 @@ fn base_path(kind: &str, screen: Option<&Collection>) -> (String, Vec<Value>) {
                 | "device-classes"
                 | "image-sources"
                 | "maintenance-windows"
+                | "enrollments"
+                | "releases"
+                | "rollouts"
                 | "audit"
                 | "operations"
         ),
@@ -271,6 +274,14 @@ fn collection_paths(
     let title = screen.map(|c| c.title).unwrap_or(kind);
     let (creatable, editable, deletable) = match screen {
         Some(c) => (c.creatable, c.editable, c.deletable),
+        // A collection the console has no board for still has a surface, and
+        // "everything" is the wrong guess for it. `enrollments` is the case
+        // that showed it: a machine puts itself there by announcing, nobody
+        // creates one by hand, and nobody deletes one — the sweep retires what
+        // was never answered, because a row is the record that a machine asked.
+        // A document claiming otherwise would tell an SDK to offer two calls
+        // the API refuses.
+        None if kind == "enrollments" => (false, true, false),
         None => (true, true, true),
     };
     // The console's `creatable` says whether a screen offers a blank form,
@@ -350,6 +361,7 @@ fn collection_paths(
                             "target": { "type": "string", "description": "The name the object was given." },
                             "nodeToken": { "type": "string", "description": "Only when a node was registered: the agent's bearer token, returned once and never readable again." },
                             "poolToken": { "type": "string", "description": "Only when a pool was registered: the pool agent's bearer token, returned once and never readable again." },
+                            "joinToken": { "type": "string", "description": "Only when a node or pool was registered and this API advertises an address: the whole hand-off in one string — token, cell, addresses and certificate — to paste into the installer or `velstra-cloud-node setup --join`. Shown once. See docs/joining.md." },
                         },
                     } } },
                 },
@@ -560,7 +572,47 @@ const VERBS: &[Verb] = &[
         verb: "issueCredential",
         method: "post",
         on_collection: false,
-        summary: "Mint a fresh credential for a machine that already exists; shown once. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+        summary: "Mint a fresh credential for a machine that already exists; shown once, as `nodeToken` and — when this API advertises an address — as `joinToken`, the whole hand-off in one string. The body may carry `purpose` and `expiresAt`. Issuing never revokes, so rotation has no gap: issue, install, restart the agent, then revoke the old one.",
+        query: &[],
+    },
+    Verb {
+        collection: "nodes",
+        verb: "joinFile",
+        method: "post",
+        on_collection: false,
+        summary: "The same credential as `:issueCredential`, formatted as the file the installer looks for on anything plugged into a machine. Answers `text/plain`, not JSON: `curl -X POST … -o /mnt/velstra/join` is the intended use. A comment above the token names the node and the cell, because the file will be found by somebody who did not write it. POST and not GET because it mints a credential.",
+        query: &[],
+    },
+    Verb {
+        collection: "nodes",
+        verb: "cloudInit",
+        method: "post",
+        on_collection: false,
+        summary: "The same token as a `#cloud-config` for a machine that boots Debian or Ubuntu: it writes the join file 0600, runs `velstra-cloud-node setup --join-file` against it, and shreds it. It installs no package — which repository a fleet takes one from is the fleet's decision. Answers `text/plain`.",
+        query: &[],
+    },
+    Verb {
+        collection: "nodes",
+        verb: "installMedium",
+        method: "post",
+        on_collection: false,
+        summary: "Cut an install medium for this machine: the installer ISO a release holds, with this node's join file appended after the ISO's last byte — one download, one stick, nothing typed. The body may name `release`; without it the newest release whose installer is on this cell is used. Answers a one-time link (`url`), the `filename`, the `release` and its `version`, the `size` and `expiresAt`: `GET` the link without a token within ten minutes and it streams the medium once. POST because it mints the node's credential, as `:joinFile` does; refused with `FAILED_PRECONDITION` while no release on this cell holds a verified installer.",
+        query: &[],
+    },
+    Verb {
+        collection: "enrollments",
+        verb: "announce",
+        method: "post",
+        on_collection: true,
+        summary: "A machine announcing itself to this cell, with no token — it has just booted an installer and holds none. Carries `publicKey` (Ed25519, base64), optionally `seenCertificate` and `reported`. Answers the enrolment's id and the fingerprint of the key, which the machine prints on its screen for an operator to compare. Grants nothing: an operator has to name the machine and say what it is for before anything can be claimed. Idempotent in the key, so a machine that announces again lands on its own row; capped, because it is the one door a stranger can write through.",
+        query: &[],
+    },
+    Verb {
+        collection: "enrollments",
+        verb: "claim",
+        method: "post",
+        on_collection: true,
+        summary: "A machine collecting the credential an operator approved for it, with no token. Carries `id` and `signature` — an Ed25519 signature over `velstra-enrollment-claim:v1:<id>`, made with the key the machine announced — and answers `nodeToken` and `joinToken`, once. Authorised by that signature and by the recorded approval of a person. A collection verb rather than `enrollments/<id>:claim` because a path segment in this router is either a literal or a parameter and never both; the id is not a secret.",
         query: &[],
     },
     Verb {
@@ -568,7 +620,7 @@ const VERBS: &[Verb] = &[
         verb: "issueCredential",
         method: "post",
         on_collection: false,
-        summary: "Mint a fresh credential for a pool that already exists; shown once. The body may carry `purpose` and `expiresAt`.",
+        summary: "Mint a fresh credential for a pool that already exists; shown once, as `poolToken` and — when this API advertises an address — as `joinToken`. The body may carry `purpose` and `expiresAt`.",
         query: &[],
     },
     Verb {
@@ -681,6 +733,31 @@ fn fixed_paths(paths: &mut Map<String, Value>) {
                 "properties": { "current": { "type": "string", "format": "password" }, "password": { "type": "string", "format": "password" } },
             } } } },
             "responses": { "204": { "description": "Set; every other session of the account is ended." }, "default": error_response() },
+        },
+    }));
+    paths.insert("/api/v1/media/{ticket}".into(), json!({
+        "get": {
+            "tags": ["Nodes"],
+            "summary": "Collect an install medium cut by `nodes/{name}:installMedium`, once. The ticket is the credential — the link carries no other, so a browser's plain download can fetch it — and it is spent on the way in and gone after ten minutes. Streams the ISO and then the node's join file.",
+            "operationId": "collect-medium",
+            "security": [],
+            "parameters": [path_param("ticket", "The one-time ticket the cut answered with.")],
+            "responses": {
+                "200": { "description": "The medium, as `application/octet-stream` with a `Content-Disposition` naming the file." },
+                "default": error_response(),
+            },
+        },
+    }));
+    paths.insert("/api/v1/releases/{id}/files/{file}".into(), json!({
+        "get": {
+            "tags": ["Releases"],
+            "summary": "One of a release's files, as this cell fetched and verified it — what a node fetches when told what to run. Only a file the release's status names, and only once it is recorded as fetched; a name is never a path. For the cell's machines and its operators.",
+            "operationId": "get-release-file",
+            "parameters": [path_param("id", "The release."), path_param("file", "The file, by the name the release's status gives it.")],
+            "responses": {
+                "200": { "description": "The file, as `application/octet-stream`." },
+                "default": error_response(),
+            },
         },
     }));
     paths.insert("/api/v1/users/{id}/tokens".into(), json!({

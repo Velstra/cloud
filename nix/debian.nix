@@ -108,9 +108,24 @@ let
       # cheaper than a retry loop, and etcd is what the seed says this machine
       # runs when it is the control plane.
       after = "network-online.target etcd.service";
+      # The identity directory first, the state directory as a fallback — the
+      # same order `velstra-cloud-poolagent-ceph` uses for its token, and for
+      # the same reason: both wizards write credentials beside the seed, which
+      # moved to /etc when identity was separated from state, and a machine
+      # installed before that still has its own under /var/lib.
+      #
+      # This looked only in /var/lib. `setup` and `quickstart` had been writing
+      # to /etc for as long as identity has been separate, so on a freshly
+      # quickstarted box the seed named a bootstrap administrator, the password
+      # never reached the process, and the API refused to start with
+      # "--bootstrap-admin needs --bootstrap-password" — restarting every five
+      # seconds, for ever. Nothing caught it: the setup check proves the file is
+      # written and with mode 600, and no check has ever run `quickstart`.
       exec = ''
-        /bin/sh -c 'if [ -f /var/lib/velstra/bootstrap-password ]; then \
-          VELSTRA_BOOTSTRAP_PASSWORD="$(cat /var/lib/velstra/bootstrap-password)"; \
+        /bin/sh -c 'pw=/var/lib/velstra/bootstrap-password; \
+          [ -f /etc/velstra/bootstrap-password ] && pw=/etc/velstra/bootstrap-password; \
+          if [ -f "$pw" ]; then \
+          VELSTRA_BOOTSTRAP_PASSWORD="$(cat "$pw")"; \
           export VELSTRA_BOOTSTRAP_PASSWORD; fi; \
           : "''${VELSTRA_STORE_BACKUP_DIR:=/var/lib/velstra/store-backups}"; \
           export VELSTRA_STORE_BACKUP_DIR; \
@@ -164,10 +179,27 @@ let
       #
       # `-` on each line: re-running is normal (a restart, a second start after
       # a crash) and an interface that already exists is success, not failure.
+      #
+      # Then the cards this machine holds back for guests, which the image does
+      # in a unit of its own — here it is an ExecStartPre, because it has to run
+      # before the agent reports what it sees and there is nothing else to order
+      # it against. `modprobe` is best-effort and only runs when the seed names
+      # a card: a kernel with vfio-pci built in needs none, and one that has it
+      # nowhere is a machine the line after says so about, by name, rather than
+      # a unit that refuses to start.
+      #
+      # Through `sh`, not as /usr/sbin/modprobe. A Debian container built from
+      # debian:13 without `kmod` has modprobe at no path at all, and systemd
+      # answered an absolute ExecStartPre with 203/EXEC — harmless because of
+      # the `-`, and a line that then never loads the module on the machines
+      # that do have it somewhere else. Found by installing the package in a
+      # systemd container and reading the unit's own journal.
       pre = ''
         ExecStartPre=-/usr/sbin/ip link add vmeta0 type dummy
         ExecStartPre=-/usr/sbin/ip addr add 169.254.169.254/32 dev vmeta0
         ExecStartPre=-/usr/sbin/ip link set vmeta0 up
+        ExecStartPre=-/bin/sh -c '[ -n "''${VELSTRA_PASSTHROUGH:-}" ] && modprobe vfio-pci || true'
+        ExecStartPre=${bin "velstra-cloud-passthrough"}
       '';
       exec = ''
         /bin/sh -c 'case "''${VELSTRA_VMM:-}" in \
@@ -343,7 +375,8 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     # sends the loader to the system paths, which is where Debian's libraries
     # are.
     for b in velstra-cloud-api velstra-cloud-controller velstra-cloud-nodeagent \
-             velstra-cloud-poolagent velstra-cloud-node velstra; do
+             velstra-cloud-poolagent velstra-cloud-node velstra-cloud-passthrough \
+             velstra; do
       cp ${velstra-cloud}/bin/$b "$root/usr/bin/$b"
       chmod 0755 "$root/usr/bin/$b"
       patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 \
@@ -365,7 +398,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     Priority: optional
     Architecture: ${debArch}
     Maintainer: Velstra <noreply@velstra.invalid>
-    Depends: systemd, libc6 (>= 2.39), iproute2, nftables, curl
+    Depends: systemd, libc6 (>= 2.39), iproute2, nftables, curl, zstd
     Recommends: qemu-system-x86, qemu-utils, etcd-server, etcd-client, ceph-common, velstra
     Description: Velstra Cloud — control plane, node agent and storage pool
      One package, four roles. Which of them this machine runs is decided by

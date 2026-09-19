@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+serde = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 # The tests round-trip real resources, which is the only way to prove the

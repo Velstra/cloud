@@ -1,9 +1,12 @@
 name: Release
 
 # When a `vX.Y.Z` tag is pushed (by `cargo release`), publish a GitHub release
-# whose body IS that version's CHANGELOG section, and attach the Debian package
-# built from that exact tag — because "which build am I running" is a question
-# an operator has to be able to answer without compiling anything.
+# whose body IS that version's CHANGELOG section, and attach what an operator
+# installs from: the Debian package, the installer ISO, the sealed node image
+# and a checksum file — because "which build am I running" is a question an
+# operator has to be able to answer without compiling anything, and "is this
+# the image that was published" is one they have to be able to answer before
+# they boot it.
 on:
   push:
     tags: ["v*"]
@@ -38,6 +41,11 @@ jobs:
           echo "----- release notes for $version -----"
           cat RELEASE_NOTES.md
 
+      # systemd-repart maps root inside a user namespace while building images.
+      # Ubuntu 24.04 blocks that mapping by default, including in Nix builders.
+      - name: Allow user namespaces for image construction
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
@@ -62,6 +70,54 @@ jobs:
             | grep -Fxq "$name"
           ls -l ./*.deb
 
+      # The two artefacts automated provisioning needs, and until now the two
+      # that were built on somebody's laptop and published nowhere. An
+      # operator cannot provision a machine from a package: they need the
+      # sealed image, or the medium that installs it.
+      #
+      # Built here rather than nightly-only because a release is the thing an
+      # operator downloads, and an image whose build broke three weeks ago is
+      # discovered at exactly the wrong moment. `checks.node-image-boots`
+      # proves the image works; this proves it exists.
+      - name: Build the installer ISO and the sealed node image
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          nix build .#node-iso -L --out-link result-iso
+          # The ISO derivation is a directory with the image inside it under a
+          # name nix chose. Copied out under a name that says which version it
+          # is, because a file called `velstra-cloud-node-installer.iso` in a
+          # downloads folder beside last month's is two files nobody can tell
+          # apart.
+          iso="$(find -L result-iso -name '*.iso' -type f | head -n1)"
+          test -n "$iso"
+          cp -L "$iso" "velstra-cloud-installer_${version}_amd64.iso"
+
+          nix build .#node-image -L --out-link result-image
+          img="$(readlink -f result-image)"
+          if [ -d "$img" ]; then
+            img="$(find -L result-image -type f \( -name '*.raw' -o -name '*.img' \) | head -n1)"
+          fi
+          test -n "$img"
+          # Compressed: the raw image is mostly the store and mostly
+          # compressible, and a 2 GB asset that could be 700 MB is bandwidth
+          # somebody else pays for.
+          nix run nixpkgs#zstd -- -19 -T0 --long \
+            -o "velstra-cloud-node_${version}_amd64.raw.zst" "$img"
+
+          ls -lh ./*.iso ./*.zst
+
+      # A medium written to a stick is verified before it is booted, or it is
+      # not verified at all. `sha256sum -c` against this file is the whole
+      # gesture, and it is the same one the appliance's own verity story is
+      # built on: an artefact you can prove is the one that was published.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          sha256sum ./*.deb ./*.iso ./*.zst > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,4 +126,4 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file RELEASE_NOTES.md \
             --verify-tag \
-            ./*.deb
+            ./*.deb ./*.iso ./*.zst SHA256SUMS

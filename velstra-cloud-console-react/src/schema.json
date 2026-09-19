@@ -40,6 +40,20 @@
     "atCreation": true
    },
    {
+    "key": "bootVolume",
+    "label": "Root disk on",
+    "kind": "ref",
+    "collection": "volumes",
+    "filterBy": null,
+    "spelling": "name",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "a file on this guest's own machine",
+    "help": "Left empty, the root disk is a file on whichever machine runs this guest, sized by the flavor — and the guest cannot be moved to another machine, because moving a guest does not move its disk. Named, the root disk is that volume, in its pool: it is sized by the volume rather than by the flavor, it outlives the guest, and a guest whose root is in a pool both machines can reach can be moved between them.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
     "key": "vcpus",
     "label": "vCPUs",
     "kind": "number",
@@ -317,7 +331,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Only for an instance whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Nothing is moved until the node has been quiet long enough that its own agent has certainly stopped what it was running — a node with no fencing deadline is never recovered from.",
+    "help": "Only for an instance whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Recovery requires a fencing deadline and an operator's confirmation that the host was independently fenced. Silence alone never proves that its guests stopped.",
     "derived": false,
     "atCreation": false
    },
@@ -2023,6 +2037,18 @@
     "width": 96
    },
    {
+    "path": "status.installed.kind",
+    "label": "Installed",
+    "cell": "text",
+    "width": 96
+   },
+   {
+    "path": "status.installed.version",
+    "label": "Build",
+    "cell": "mono",
+    "width": 176
+   },
+   {
     "path": "status.lastHeartbeat",
     "label": "Heard from",
     "cell": "ago",
@@ -2032,7 +2058,7 @@
   "agreements": [],
   "creatable": true,
   "editable": true,
-  "deletable": false,
+  "deletable": true,
   "explainable": false
  },
  {
@@ -2147,6 +2173,200 @@
     "label": "Reason",
     "cell": "text",
     "width": 260
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "releases",
+  "title": "Releases",
+  "singular": "release",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Hardware",
+  "scope": "global",
+  "audience": "operator",
+  "blurb": "A build the cell can move to, and where it comes from. Name the channel a published version was downloaded from — a GitHub release's directory, or a directory copied onto the control plane — and the cell reads which build it holds, fetches every file onto its own disk and verifies each. From then on the cell is the channel for its machines: a rollout hands each node what the cell holds, and an install medium is cut from the installer here.",
+  "empty": "No release is known to this cell. Add one: the channel a published version was downloaded from, and the cell fetches it.",
+  "fields": [
+   {
+    "key": "url",
+    "label": "Channel",
+    "kind": "text",
+    "placeholder": "https://github.com/Velstra/cloud/releases/download/v0.2.0/",
+    "check": "url",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "A directory holding the files a release publishes and their SHA256SUMS: a GitHub release's download directory, or file:///var/lib/velstra/releases/<version> for a directory copied onto the control plane. What it holds is what the release is — the version is read off the files, never typed — and the cell fetches every file onto its own disk before it is ready.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "status.version",
+    "label": "Build",
+    "cell": "mono",
+    "width": 176
+   },
+   {
+    "path": "status.image.fetched",
+    "label": "Image",
+    "cell": "yes",
+    "yes": "on this cell",
+    "no": "not yet",
+    "width": 104
+   },
+   {
+    "path": "status.package.fetched",
+    "label": "Package",
+    "cell": "yes",
+    "yes": "on this cell",
+    "no": "not yet",
+    "width": 104
+   },
+   {
+    "path": "status.installer.fetched",
+    "label": "Installer",
+    "cell": "yes",
+    "yes": "on this cell",
+    "no": "not yet",
+    "width": 104
+   },
+   {
+    "path": "status.checkedAt",
+    "label": "Read",
+    "cell": "ago",
+    "width": 112
+   },
+   {
+    "path": "spec.url",
+    "label": "Channel",
+    "cell": "mono",
+    "width": 300
+   }
+  ],
+  "agreements": [],
+  "creatable": true,
+  "editable": true,
+  "deletable": true,
+  "explainable": false
+ },
+ {
+  "id": "rollouts",
+  "title": "Rollouts",
+  "singular": "rollout",
+  "recheck": 0,
+  "condition": "Ready",
+  "group": "Hardware",
+  "scope": "global",
+  "audience": "operator",
+  "blurb": "Moving the cell's machines to a release, one at a time: taken out of service, drained if asked, handed what to run, waited for, put back. The control plane goes last. A machine that does not come back stops the rollout by name and leaves the rest as they were; one the cell cannot update is refused by name and the rest go on. Pause it and the machine in flight finishes while no other starts.",
+  "empty": "Nothing is being rolled out. Pick machines on the Nodes board and press Upgrade, or make a rollout here.",
+  "fields": [
+   {
+    "key": "release",
+    "label": "Release",
+    "kind": "ref",
+    "collection": "releases",
+    "filterBy": null,
+    "spelling": "id",
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "No release is known to this cell yet. Add one under Releases: the channel a published version was downloaded from.",
+    "help": "What to move the machines to. Only a release that is ready — every file fetched and verified — moves anything.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "nodes",
+    "label": "Machines",
+    "kind": "refList",
+    "collection": "nodes",
+    "spelling": "id",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Which machines; none means every node in the cell. One at a time, the control plane last. A machine the cell cannot update — one running the NixOS module on its own operating system — is refused by name and the rest go on.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "evacuate",
+    "label": "Move guests off first",
+    "kind": "switch",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Every guest on a machine is moved to another before it is updated — live where the destination can take it. Off, its guests go down with its reboot.",
+    "derived": false,
+    "atCreation": true
+   },
+   {
+    "key": "maxUnavailable",
+    "label": "At once",
+    "kind": "number",
+    "unit": "machines",
+    "min": 1,
+    "max": 64,
+    "step": 1,
+    "scale": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "How many machines may be out of service at the same time.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "paused",
+    "label": "Paused",
+    "kind": "switch",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "",
+    "help": "Finish the machine in flight and start no other. The knob to reach for at the first sign of trouble.",
+    "derived": false,
+    "atCreation": false
+   }
+  ],
+  "columns": [
+   {
+    "path": "spec.release",
+    "label": "Release",
+    "cell": "mono",
+    "width": 160
+   },
+   {
+    "path": "status.phase",
+    "label": "Phase",
+    "cell": "text",
+    "width": 96
+   },
+   {
+    "path": "status.message",
+    "label": "Progress",
+    "cell": "text",
+    "width": 360
+   },
+   {
+    "path": "spec.evacuate",
+    "label": "Guests",
+    "cell": "yes",
+    "yes": "moved off first",
+    "no": "go down with the reboot",
+    "width": 150
+   },
+   {
+    "path": "status.startedAt",
+    "label": "Started",
+    "cell": "ago",
+    "width": 112
    }
   ],
   "agreements": [],
@@ -3482,7 +3702,7 @@
   "agreements": [],
   "creatable": true,
   "editable": true,
-  "deletable": false,
+  "deletable": true,
   "explainable": false
  },
  {

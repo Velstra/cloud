@@ -456,6 +456,8 @@ jobs:
       - name: Install it
         run: |
           set -euo pipefail
+          # Runner images can carry indexes for packages the mirrors removed.
+          sudo apt-get update
           sudo apt-get install -y ./velstra-cloud.deb
           # The binaries the package promises, and they run — a package
           # whose interpreter or `Depends` floor is wrong installs cleanly and
@@ -515,6 +517,50 @@ jobs:
   #
   # If this ever needs to be per-pull-request, the answer is a self-hosted
   # runner with a persistent store, not trimming the list.
+  # The two media an operator provisions from, built on the nightly lane.
+  #
+  # Nothing else builds them. `checks.node-image-boots` boots the image, which
+  # is a stronger statement and a different one: it runs inside a VM test that
+  # constructs its own overlay. What breaks here and nowhere else is the
+  # *packaging* — a stale flake input, a renamed output attribute, an image
+  # that no longer fits its partition — and a release is the wrong moment to
+  # find that out, because the tag is already pushed.
+  #
+  # Not per pull request: two full system closures on a two-vCPU runner is tens
+  # of minutes even with the cache warm, which is the same reason the VM lane
+  # is nightly.
+  media:
+    name: installer ISO and node image
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      # systemd-repart maps root inside a user namespace while building images.
+      # Ubuntu 24.04 blocks that mapping by default, including in Nix builders.
+      - name: Allow user namespaces for image construction
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: The installer ISO
+        run: |
+          set -euo pipefail
+          nix build .#node-iso -L --out-link result-iso
+          iso="$(find -L result-iso -name '*.iso' -type f | head -n1)"
+          test -n "$iso"
+          ls -lh "$iso"
+
+      - name: The sealed node image
+        run: |
+          set -euo pipefail
+          nix build .#node-image -L --out-link result-image
+          ls -lhL result-image
+
   supply-chain:
     name: advisories, licences, SBOM
     runs-on: ubuntu-24.04
@@ -605,6 +651,12 @@ jobs:
             exit 1
           fi
 
+      # systemd-repart maps root inside a user namespace while building images.
+      # Ubuntu 24.04 blocks that mapping by default, including in Nix builders.
+      - name: Allow user namespaces for image construction
+        if: matrix.check == 'node-image-boots' || matrix.check == 'wizard'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
@@ -629,6 +681,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nixos-test-${{ matrix.check }}
-          path: /tmp/nix-build-*
+          path: |
+            /tmp/nix-build-*
+            /nix/var/nix/builds/nix-*
           retention-days: 7
           if-no-files-found: warn

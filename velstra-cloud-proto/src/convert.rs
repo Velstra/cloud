@@ -15,7 +15,7 @@
 //!   honest value — `Unknown` for a condition, `Unknown` for an instance state
 //!   — never to a plausible-looking one.
 
-use velstra_cloud_model::{ceph, cpu, meta, migration, pci, resources};
+use velstra_cloud_model::{ceph, cpu, installed, meta, migration, pci, release, resources};
 
 use crate::v1;
 
@@ -293,6 +293,7 @@ impl From<&resources::NodeSpec> for v1::NodeSpec {
             evacuate: s.evacuate,
             vcpu_overcommit: s.vcpu_overcommit,
             gateway: s.gateway,
+            wanted: s.wanted.as_ref().map(Into::into),
         }
     }
 }
@@ -307,6 +308,29 @@ impl From<&v1::NodeSpec> for resources::NodeSpec {
             evacuate: s.evacuate,
             vcpu_overcommit: s.vcpu_overcommit,
             gateway: s.gateway,
+            wanted: s.wanted.as_ref().map(Into::into),
+        }
+    }
+}
+
+impl From<&release::Wanted> for v1::Wanted {
+    fn from(w: &release::Wanted) -> Self {
+        Self {
+            release: w.release.clone(),
+            version: w.version.clone(),
+            file: w.file.clone(),
+            sha256: w.sha256.clone(),
+        }
+    }
+}
+
+impl From<&v1::Wanted> for release::Wanted {
+    fn from(w: &v1::Wanted) -> Self {
+        Self {
+            release: w.release.clone(),
+            version: w.version.clone(),
+            file: w.file.clone(),
+            sha256: w.sha256.clone(),
         }
     }
 }
@@ -398,6 +422,7 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             capacity: Some((&s.capacity).into()),
             allocated: Some((&s.allocated).into()),
             agent_version: s.agent_version.clone(),
+            installed: Some((&s.installed).into()),
             console_endpoint: s.console_endpoint.clone(),
             vmm: s.vmm.clone(),
             datapath: s.datapath.clone(),
@@ -412,6 +437,52 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             cpu: s.cpu.as_ref().map(Into::into),
             pci_devices: s.pci_devices.iter().map(Into::into).collect(),
         }
+    }
+}
+
+// ---- installed ------------------------------------------------------------
+
+impl From<&installed::Installed> for v1::Installed {
+    fn from(i: &installed::Installed) -> Self {
+        Self {
+            kind: install_kind_out(i.kind).to_string(),
+            distro: i.distro.clone(),
+            version: i.version.clone(),
+            slot: i.slot.clone(),
+        }
+    }
+}
+
+impl From<&v1::Installed> for installed::Installed {
+    fn from(i: &v1::Installed) -> Self {
+        Self {
+            kind: install_kind_in(&i.kind),
+            distro: i.distro.clone(),
+            version: i.version.clone(),
+            slot: i.slot.clone(),
+        }
+    }
+}
+
+/// The kind as a word, like `device_kind_out`: a string rather than a proto
+/// enum, so a kind this build has not heard of reads back as `Unknown` —
+/// which the model treats as "will not guess" — and not as an enum's zero
+/// value dressed up as something.
+fn install_kind_out(k: installed::InstallKind) -> &'static str {
+    match k {
+        installed::InstallKind::Unknown => "unknown",
+        installed::InstallKind::Appliance => "appliance",
+        installed::InstallKind::Package => "package",
+        installed::InstallKind::NixOs => "nixos",
+    }
+}
+
+fn install_kind_in(k: &str) -> installed::InstallKind {
+    match k {
+        "appliance" => installed::InstallKind::Appliance,
+        "package" => installed::InstallKind::Package,
+        "nixos" => installed::InstallKind::NixOs,
+        _ => installed::InstallKind::Unknown,
     }
 }
 
@@ -716,6 +787,8 @@ impl From<&ceph::NodeCeph> for v1::NodeCeph {
             cluster_hosts: c.cluster_hosts.clone(),
             address: c.address.clone(),
             ssh_pubkey: c.ssh_pubkey.clone(),
+            client_conf: c.client_conf.clone(),
+            client_keyring: c.client_keyring.clone(),
             trusts_key: c.trusts_key,
             seen: c.seen.as_ref().map(Into::into),
         }
@@ -734,6 +807,8 @@ impl From<&v1::NodeCeph> for ceph::NodeCeph {
             cluster_hosts: c.cluster_hosts.clone(),
             address: c.address.clone(),
             ssh_pubkey: c.ssh_pubkey.clone(),
+            client_conf: c.client_conf.clone(),
+            client_keyring: c.client_keyring.clone(),
             trusts_key: c.trusts_key,
             seen: c.seen.as_ref().map(Into::into),
         }
@@ -872,6 +947,7 @@ impl From<&v1::NodeStatus> for resources::NodeStatus {
             capacity: s.capacity.as_ref().map(Into::into).unwrap_or_default(),
             allocated: s.allocated.as_ref().map(Into::into).unwrap_or_default(),
             agent_version: s.agent_version.clone(),
+            installed: s.installed.as_ref().map(Into::into).unwrap_or_default(),
             console_endpoint: s.console_endpoint.clone(),
             vmm: s.vmm.clone(),
             datapath: s.datapath.clone(),
@@ -1086,6 +1162,7 @@ impl From<&resources::InstanceSpec> for v1::InstanceSpec {
             memory_mib: s.memory_mib,
             image: s.image.clone(),
             root_disk_gib: s.root_disk_gib,
+            boot_volume: s.boot_volume.clone(),
             flavor: s.flavor.clone(),
             desired_state: v1::DesiredState::from(s.desired_state) as i32,
             ports: s.ports.clone(),
@@ -1114,6 +1191,7 @@ impl From<&v1::InstanceSpec> for resources::InstanceSpec {
             memory_mib: s.memory_mib,
             image: s.image.clone(),
             root_disk_gib: s.root_disk_gib,
+            boot_volume: s.boot_volume.clone(),
             flavor: s.flavor.clone(),
             desired_state: s.desired_state().into(),
             ports: s.ports.clone(),
@@ -2002,6 +2080,7 @@ mod tests {
             meta,
             InstanceSpec {
                 flavor: None,
+                boot_volume: "projects/p1/volumes/root-1".into(),
                 volumes: Vec::new(),
                 start_order: 0,
                 start_delay_s: 0,

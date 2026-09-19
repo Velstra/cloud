@@ -209,7 +209,7 @@ pub enum Refusal {
     /// is a real feature and a large one; this is what stops its absence being
     /// discovered by watching a guest fail to arrive.
     #[error(
-        "{node} keeps guest root disks on its own filesystem, and moving a guest does not move its disk. Give both machines a shared state directory — one filesystem every node in the cell mounts — and start their agents with `--shared-state`; until then a guest stays where its disk is."
+        "{node} keeps guest root disks on its own filesystem, and moving a guest does not move its disk. Either boot the guest from a volume in a pool both machines can reach, or give both machines a shared state directory — one filesystem every node in the cell mounts — and start their agents with `--shared-state`. Until one of those is true, a guest stays where its disk is."
     )]
     RootDiskIsNotShared { node: String },
     /// The destination cannot present the CPU this guest is already running
@@ -301,19 +301,30 @@ pub fn may_migrate(
     }
 
     // Before anything about memory or CPUs, because it is the one refusal that
-    // applies to every guest this platform can currently create. A root disk is
-    // a file in the agent's state directory; a move transfers memory and not
-    // disks; so unless that directory is storage both machines reach, the guest
-    // is where its disk is and that is the end of it.
+    // applies to every guest whose root disk is a file on its own machine. A
+    // move transfers memory and not disks; so unless that directory is storage
+    // both machines reach, the guest is where its disk is and that is the end
+    // of it.
     //
     // Both ends, and the order of the checks says which is which: a destination
     // that cannot read the disk is the one that fails, but a source that keeps
     // its disks privately is the reason there is nothing to read.
-    for node in [from, to] {
-        if !node.status.shared_state {
-            return Err(Refusal::RootDiskIsNotShared {
-                node: node.meta.name.id().to_string(),
-            });
+    //
+    // A guest that boots from a **volume** is exempt, and that is the whole
+    // point of booting from one: its root disk is not in either agent's state
+    // directory, it is in a pool, and whether the destination can open it is a
+    // question about the pool rather than about the filesystem underneath the
+    // agent. The cell answers that question in one place already — a pool
+    // naming a machine can only be opened on that machine — so the check
+    // belongs there and not here, and repeating it in terms of `shared_state`
+    // would refuse exactly the arrangement this exists to allow.
+    if instance.spec.boot_volume.is_empty() {
+        for node in [from, to] {
+            if !node.status.shared_state {
+                return Err(Refusal::RootDiskIsNotShared {
+                    node: node.meta.name.id().to_string(),
+                });
+            }
         }
     }
 
@@ -821,6 +832,7 @@ mod tests {
                 labels: vec![],
                 cpu_baseline: None,
                 gateway: false,
+                wanted: None,
             },
             NodeStatus {
                 vmm: "qemu".into(),
@@ -1521,6 +1533,41 @@ mod tests {
     /// Both nodes hold the image, so nothing downstream of the disk rule fires.
     fn cached() -> Vec<String> {
         vec!["node-a".to_string(), "node-b".to_string()]
+    }
+
+    /// **A guest that boots from a volume is not tied to a filesystem.**
+    ///
+    /// The refusal above is about a root disk that is a file in the agent's own
+    /// state directory — the only kind this platform could make until now. A
+    /// guest whose root is a volume keeps it in a pool, not under either agent,
+    /// so "do both machines mount the same filesystem" is the wrong question
+    /// about it. The right one — can the destination open that pool — is
+    /// answered where pools are, and asking this one as well would refuse
+    /// exactly the arrangement booting from a volume exists to allow.
+    #[test]
+    fn a_guest_that_boots_from_a_volume_may_move_without_a_shared_filesystem() {
+        let mut guest = instance(InstanceState::Running, Some("node-a"));
+        guest.spec.boot_volume = "projects/p1/volumes/root-1".into();
+        let mut a = node("node-a", 16384, "0.1.0");
+        let mut b = node("node-b", 16384, "0.1.0");
+        // Neither machine shares anything, which is the state that stops every
+        // other guest on this cell.
+        a.status.shared_state = false;
+        b.status.shared_state = false;
+
+        assert_eq!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live),
+            Ok(()),
+            "a guest whose root disk is in a pool was told it lives on a filesystem"
+        );
+
+        // And the same guest without the volume is still refused, so the
+        // exemption is the boot volume and not something that went slack.
+        let plain = instance(InstanceState::Running, Some("node-a"));
+        assert!(matches!(
+            may_migrate(&plain, &a, &b, &cached(), MigrationMode::Live),
+            Err(Refusal::RootDiskIsNotShared { .. })
+        ));
     }
 
     #[test]

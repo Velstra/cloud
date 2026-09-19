@@ -15,8 +15,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod announce;
+mod cell;
 mod disks;
 mod install;
+mod joinfile;
 mod product;
 mod quickstart;
 mod roles;
@@ -84,6 +87,19 @@ enum Cmd {
         /// should not have to carry.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Join a cell with the token its console showed when the node was
+        /// created. One string, everything in it: cell, address, certificate,
+        /// credential. Nothing else is asked. See docs/joining.md.
+        #[arg(long, conflicts_with = "config")]
+        join: Option<String>,
+        /// Read the join token from this file instead of the command line.
+        ///
+        /// A token on a command line is in `ps` for every user on the machine
+        /// and in the shell's history afterwards. This is also the shape
+        /// configuration management wants: write the file, run the command.
+        /// The file may hold a comment above the token.
+        #[arg(long, conflicts_with = "join")]
+        join_file: Option<PathBuf>,
     },
     /// One box, one command: seed, units, and the two objects a cell needs.
     ///
@@ -114,6 +130,35 @@ enum Cmd {
         /// `control-plane`, `hypervisor` or `pool`.
         role: String,
     },
+    /// First boot of a new cell's first machine, part one: make this
+    /// machine's certificate with the addresses it actually has, and tell the
+    /// seed where it is and what to advertise. Runs before the API; a no-op
+    /// once the certificate exists.
+    EnsureTls {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: PathBuf,
+    },
+    /// First boot of a new cell's first machine, part two: the Node and Pool
+    /// objects this machine is, and their credentials. Runs after the API
+    /// answers; every step is idempotent. What `quickstart` does after it has
+    /// written the seed, for a machine that was flashed rather than set up.
+    BootstrapCell {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: PathBuf,
+    },
+    /// Apply what the seed says about logging in to this machine: the root
+    /// password, the SSH key, and closing both when it says nothing. Runs
+    /// every boot, because `/etc` here does not survive one.
+    ApplyAccess {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: PathBuf,
+    },
+    /// Write the console banner: this machine's name, its addresses, what it
+    /// runs, and where its console is.
+    Banner {
+        #[arg(long, default_value = "/var/lib/velstra")]
+        dir: PathBuf,
+    },
     /// Open the encrypted data volume at boot (a no-op on a plaintext
     /// install).
     Unlock,
@@ -137,9 +182,19 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Install { source } => install::run_install(source),
-        Cmd::Setup { dir, nixos, config } => setup::run_with(dir, nixos, config),
+        Cmd::Setup {
+            dir,
+            nixos,
+            config,
+            join,
+            join_file,
+        } => setup::run_with(dir, nixos, config, join, join_file),
         Cmd::Quickstart { dir, listen, node } => quickstart::run(dir, listen, node),
         Cmd::HasRole { role } => roles::has_role_or_exit(&role),
+        Cmd::EnsureTls { dir } => cell::ensure_tls(&dir),
+        Cmd::BootstrapCell { dir } => cell::bootstrap(&dir),
+        Cmd::ApplyAccess { dir } => cell::apply_access(&dir),
+        Cmd::Banner { dir } => cell::banner(&dir),
         Cmd::Unlock => unlock::run(),
         Cmd::Update { image } => update::run_update(&image),
     }

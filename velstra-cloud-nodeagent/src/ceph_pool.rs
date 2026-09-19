@@ -126,12 +126,7 @@ impl CephConfig {
     }
 }
 
-/// `client.velstra` and `velstra` both mean the same client to Ceph, and `rbd
-/// --id` wants the second spelling. Accepting either is not laxity: `ceph auth`
-/// prints the first, so it is what an operator copies.
-fn strip_client(user: &str) -> &str {
-    user.strip_prefix("client.").unwrap_or(user)
-}
+use crate::ceph_access::strip_client;
 
 /// A resource name as an RBD image name.
 ///

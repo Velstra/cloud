@@ -429,6 +429,78 @@ impl ApiCell {
 
 #[async_trait]
 impl CellReader for ApiCell {
+    /// Streamed to disk a frame at a time: an image is a gigabyte, and this
+    /// runs on a hypervisor whose memory belongs to the guests. The same
+    /// connection and token as every other read, so the API's ownership rule
+    /// is the one that decides whether this node may have the file.
+    async fn download(&self, path: &str, dest: &std::path::Path) -> Result<()> {
+        use http_body_util::BodyExt;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut sender, connection) = self.connect_within().await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut request = self.request(path)?;
+        request.headers_mut().insert(
+            "accept",
+            "application/octet-stream".parse().expect("a header value"),
+        );
+        let response = tokio::time::timeout(READ_TIMEOUT, sender.send_request(request))
+            .await
+            .map_err(|_| HostError::failed(format!("{path}: the API did not answer in time")))?
+            .map_err(|e| HostError::failed(format!("{path}: {e}")))?;
+        let status = response.status();
+        let mut body = response.into_body();
+        if status != StatusCode::OK {
+            let said = tokio::time::timeout(READ_TIMEOUT, body.collect())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .map(|b| {
+                    String::from_utf8_lossy(&b.to_bytes())
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            return Err(HostError::failed(format!(
+                "{path}: the API answered {status}: {said}"
+            )));
+        }
+        let mut file = tokio::fs::File::create(dest)
+            .await
+            .map_err(|e| HostError::failed(format!("{}: {e}", dest.display())))?;
+        loop {
+            // Each frame within the read timeout: a download that stalls is a
+            // failure, not a wait — the rollout has a budget and this is
+            // inside it.
+            let frame = tokio::time::timeout(READ_TIMEOUT, body.frame())
+                .await
+                .map_err(|_| {
+                    HostError::failed(format!("{path}: the download stalled part way through"))
+                })?;
+            match frame {
+                None => break,
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        file.write_all(&data).await.map_err(|e| {
+                            HostError::failed(format!("writing {}: {e}", dest.display()))
+                        })?;
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(HostError::failed(format!(
+                        "{path}: reading the download: {e}"
+                    )));
+                }
+            }
+        }
+        file.flush()
+            .await
+            .map_err(|e| HostError::failed(format!("writing {}: {e}", dest.display())))
+    }
+
     async fn instances(&self) -> Result<Vec<Instance>> {
         self.list("instances").await
     }

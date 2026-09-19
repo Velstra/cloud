@@ -38,6 +38,16 @@ struct Args {
     #[arg(long, env = "VELSTRA_STORE_BACKUP_DIR", default_value = "")]
     store_backup_dir: String,
 
+    /// Where releases are kept on this machine — what the controller beside
+    /// this API fetches into, and what this API serves a node fetching what it
+    /// was told to run, or an install medium cut for one. Empty keeps none.
+    #[arg(
+        long,
+        env = "VELSTRA_RELEASES_DIR",
+        default_value = "/var/lib/velstra/releases"
+    )]
+    releases_dir: String,
+
     /// A public key an image's `spec.signature` may verify under: Ed25519, the
     /// raw 32 bytes as base64. Repeat the flag, or separate keys with commas in
     /// the variable. Without any, every signature is refused at admission.
@@ -92,6 +102,18 @@ struct Args {
 
     #[arg(long, env = "VELSTRA_TLS_KEY")]
     tls_key: Option<String>,
+
+    /// Where a machine that wants to join should reach this API, in the order
+    /// to try: `https://10.0.0.8:8443,https://horst:8443`.
+    ///
+    /// Every one must be a name the certificate verifies for. `quickstart` and
+    /// `setup` write this from the same list they hand `rcgen`, so it is; a
+    /// hand-written value that names an address the certificate does not carry
+    /// makes a join token the joiner cannot use, and it will say so at the
+    /// first URL it tries. Empty — the default — means this API mints no join
+    /// tokens, which is right for a cell that is plaintext on loopback.
+    #[arg(long, env = "VELSTRA_ADVERTISE", value_delimiter = ',')]
+    advertise: Vec<String>,
 
     /// Bearer tokens, one per line, optionally `token subject`.
     ///
@@ -287,6 +309,25 @@ async fn main() -> anyhow::Result<()> {
     let mut api = velstra_cloud_api::Api::new(store, &args.region, &args.cell, verifier)
         .with_cell_admins(args.cell_admin.clone())
         .with_image_signing_keys(signing_keys);
+    // What to tell a joining machine. Read once: the certificate is the one
+    // this process serves, so a token minted an hour from now carries the same
+    // bytes a joiner will be shown on the wire.
+    if !args.advertise.is_empty() {
+        match args.tls_cert.as_deref().map(std::fs::read_to_string) {
+            Some(Ok(pem)) => {
+                tracing::info!(urls = ?args.advertise, "minting join tokens for these addresses");
+                api = api.with_join_facts(args.advertise.clone(), pem);
+            }
+            Some(Err(e)) => tracing::warn!(
+                error = %e,
+                "--advertise is set but the certificate could not be read, so no join tokens"
+            ),
+            None => tracing::warn!(
+                "--advertise is set but this API serves no TLS, so no join tokens: a joiner \
+                 has nothing to verify a plaintext cell against"
+            ),
+        }
+    }
     // Read once, here, so a request never touches the disk and the log says
     // at startup which console this cell is serving rather than leaving it to
     // be discovered in a browser.
@@ -302,6 +343,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if !args.store_backup_dir.is_empty() {
         api = api.with_store_backups(std::path::PathBuf::from(&args.store_backup_dir));
+    }
+    if !args.releases_dir.is_empty() {
+        api = api.with_releases_dir(std::path::PathBuf::from(&args.releases_dir));
     }
     if !args.console_ca.is_empty() {
         api = api.with_console_ca(std::path::PathBuf::from(&args.console_ca));

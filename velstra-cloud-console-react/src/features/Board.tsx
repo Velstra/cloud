@@ -28,6 +28,7 @@ import { useCollection } from "@/hooks/useCollection";
 import { Pressed } from "./Pressed";
 import { State } from "./State";
 import { Named, useAsk } from "@/features/Ask";
+import { UpgradeButton } from "@/features/Upgrade";
 import type { WatchState } from "@/api/transport";
 
 export function Board({ coll, selectedId, narrow }: { coll: Collection; selectedId?: string; narrow?: boolean }) {
@@ -256,6 +257,7 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
             <Button size="sm" variant="secondary" onClick={() => bulk("Start", { spec: { desiredState: "Running" } })}>Start</Button>
             <Button size="sm" variant="secondary" onClick={() => bulk("Stop", { spec: { desiredState: "Stopped" } })}>Stop</Button>
           </>}
+          {coll.id === "nodes" && <UpgradeButton picked={picked} onDone={() => { setSelection({}); loaded.refresh(); }} />}
           {coll.deletable && <Button size="sm" variant="destructive" onClick={() => bulk("Delete", null, true)}>Delete</Button>}
           <Button size="sm" variant="ghost" className="ml-auto" onClick={() => setSelection({})}>Clear</Button>
         </div>

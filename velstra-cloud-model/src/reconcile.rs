@@ -1348,6 +1348,16 @@ impl DivergenceReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Divergence {
     pub reason: DivergenceReason,
+    /// Whether the object has said anything at all about itself.
+    ///
+    /// `false` means it carries no conditions: nothing has ever written to it,
+    /// so there is no explanation on it to read. An alert that tells an
+    /// operator "the object's conditions say why" about one of these sends
+    /// them to an empty place — which is what happened on a live cell, where a
+    /// backup and a router both sat at `observedGeneration: 0` with no
+    /// conditions, and the only thing the platform said about either was that
+    /// sentence.
+    pub explained: bool,
     /// When this began, as closely as the object can say.
     ///
     /// A lower bound, and knowingly so: the last condition transition is when
@@ -1366,6 +1376,7 @@ pub fn divergence<S, T: Observed>(resource: &Resource<S, T>) -> Option<Divergenc
         return (!meta.finalizers.is_empty()).then(|| Divergence {
             reason: DivergenceReason::DeletionBlocked,
             since: meta.deleted_at.unwrap_or(meta.created_at),
+            explained: !resource.status.conditions().is_empty(),
         });
     }
     // Finished, so not diverging from anything. An operation that failed is a
@@ -1377,10 +1388,12 @@ pub fn divergence<S, T: Observed>(resource: &Resource<S, T>) -> Option<Divergenc
     }
     let ready = crate::meta::condition(resource.status.conditions(), "Ready");
     let since = ready.map(|c| c.last_transition).unwrap_or(meta.created_at);
+    let explained = !resource.status.conditions().is_empty();
     if !resource.converged() {
         return Some(Divergence {
             reason: DivergenceReason::Unconverged,
             since,
+            explained,
         });
     }
     match ready.map(|c| c.status) {
@@ -1388,6 +1401,7 @@ pub fn divergence<S, T: Observed>(resource: &Resource<S, T>) -> Option<Divergenc
         Some(ConditionStatus::False) => Some(Divergence {
             reason: DivergenceReason::NotReady,
             since,
+            explained,
         }),
         // Both "reported as unknown" and "never reported at all" are the same
         // thing to somebody looking at a cluster: an object nothing is looking
@@ -1395,6 +1409,7 @@ pub fn divergence<S, T: Observed>(resource: &Resource<S, T>) -> Option<Divergenc
         _ => Some(Divergence {
             reason: DivergenceReason::Unreported,
             since,
+            explained,
         }),
     }
 }
@@ -1502,6 +1517,7 @@ mod tests {
                 labels: vec![],
                 cpu_baseline: None,
                 gateway: false,
+                wanted: None,
             },
             NodeStatus {
                 shared_state: false,

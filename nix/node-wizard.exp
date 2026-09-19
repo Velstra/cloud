@@ -10,7 +10,8 @@
 # The disk number is not hardcoded: it comes from $PICK, which the test reads
 # off the wizard's own candidate listing. The control-plane URL and token come
 # from $API_URL and $TOKEN — the wizard records them for the first boot; no
-# control plane needs to be reachable during the install.
+# control plane needs to be reachable during the install. $ROLES says what the
+# machine is for, and decides which of the questions below are even asked.
 
 # Prompts are instant; the install that follows the last answer is not.
 set timeout 120
@@ -29,7 +30,14 @@ spawn velstra-cloud-node install
 # Where to install. Asked first on purpose: an operator who changes their mind
 # during the questions below has erased nothing yet.
 answer "Mode "              "1"
-answer "Select disk number" "$env(PICK)"
+# The list comes after the mode now, and the prompt says "Disk number" for a
+# single disk rather than the plural it used to say whatever the mode was.
+answer "Disk number"        "$env(PICK)"
+
+# Access to the machine itself, asked once and before the door — the question
+# is about this machine, not about how it joins a cell. `1` is "none", the
+# sealed default, which is what ships unless somebody says otherwise.
+answer "Access "            "1"
 
 # Plaintext data partition here; the encrypted flow shares the LUKS code the
 # unlock unit exercises.
@@ -38,14 +46,47 @@ answer "Encrypt the data partition" "n"
 answer "Hostname"  "node-t1"
 answer "Use DHCP"  "y"
 
-# The registration hand-off: where the control plane is, who this node is, and
-# the one-time token the operator was shown when they created the node.
-answer "Control plane URL" "$env(API_URL)"
-answer "Node name"         "node-1"
-answer "Cell "             ""
-answer "Region "           ""
-answer "Node registration token" "$env(TOKEN)"
-answer "VMM "              "2"
+# The four doors. `$DOOR` picks. Door 1 is the first machine of a cell; door 2
+# is the join token and asks nothing else; door 3 is the wizard as it was, every
+# question still asked — and the check runs all three, because door 2 is the one
+# an operator takes and door 3 is the one that proves every question still
+# exists. Behind door 4, `$ROLES` says what this box is for, so the same script
+# drives the hypervisor install this check makes today and a control-plane or
+# pool install without a second copy of the whole flow.
+#
+# Door 3 — the machine asking a cell to let it in — is not driven here: it
+# needs a control plane on the wire, which this check deliberately does not
+# have, and the half that differs from door 2 ends at the same `from_token`.
+# `checks.register` is where a live API is available.
+answer "Install as"        "$env(DOOR)"
+
+if {$env(DOOR) == 2} {
+    answer "Join token"    "$env(JOIN)"
+} elseif {$env(DOOR) == 1} {
+    # The first machine: an administrator, storage, where the API listens.
+    # The password is typed twice and never echoed; the check greps the
+    # transcript for it afterwards.
+    answer "Administrator"       ""
+    answer "Password (not echoed)" "$env(ADMIN_PASSWORD)"
+    answer "Again"               "$env(ADMIN_PASSWORD)"
+    answer "Storage "            "2"
+    answer "Disk numbers"        "$env(OSD_PICK)"
+    answer "API listen address"  ""
+    answer "Cell "               ""
+    answer "Region "             ""
+    answer "VMM "                "2"
+} else {
+    answer "Roles "            "$env(ROLES)"
+
+    # The registration hand-off: where the control plane is, who this node is,
+    # and the one-time token the operator was shown when they created the node.
+    answer "Control plane URL" "$env(API_URL)"
+    answer "Node name"         "node-1"
+    answer "Cell "             ""
+    answer "Region "           ""
+    answer "Node registration token" "$env(TOKEN)"
+    answer "VMM "              "2"
+}
 
 answer "Type YES to proceed" "YES"
 

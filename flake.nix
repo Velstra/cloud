@@ -116,6 +116,21 @@
       # Identity + sizing for the shared appliance factory. Everything here is
       # the `velstra.appliance.*` counterpart of what the installer's
       # `product.rs` hardcodes — the two must agree.
+      # The modules that make an appliance, in one place.
+      #
+      # There were two copies of this: `nixosConfigurations.node-image` and the
+      # `node-image-boots` check, which exists to prove that what ships boots.
+      # A check that assembles its own machine out of a second list proves it
+      # about a machine nobody installs — and the first thing that went wrong
+      # when the image grew the control-plane and pool roles was that the check
+      # still described the old, hypervisor-only box.
+      applianceModules = [
+        sentinel.nixosModules.applianceImage
+        self.nixosModules.node
+        self.nixosModules.controlPlane
+        self.nixosModules.pool
+      ];
+
       nodeIdentity = {
         velstra.appliance = {
           productName = "Velstra Cloud Node";
@@ -124,15 +139,40 @@
           defaultHostname = "velstra-node";
           stateDir = "/var/lib/velstra";
           unlockUnit = "velstra-node-unlock.service";
+          # Everything that reads the seed or writes the cell's state: ordered
+          # after the data partition is mounted. `nofail` on that mount means
+          # the boot does not wait for it, and a unit that started first would
+          # read no seed — and be skipped by its own role condition — or write
+          # under the mount point, onto the tmpfs the mount then hides.
           stateDirServices = [
             "velstra-node-boot"
             "velstra-cloud-nodeagent"
+            "etcd"
+            "velstra-cloud-api"
+            "velstra-cloud-controller"
+            "velstra-cloud-poolagent"
           ];
           slotTypesEnvFile = "velstra-node/slot-types.env";
-          # The node closure carries two hypervisors; roomier slots than
-          # Sentinel's. Both slots reserve this, so the disk floor is
+          # The node closure carries two hypervisors *and* all three roles:
+          # the API, the controllers, a bundled etcd, the pool agent with its
+          # Ceph client, and a QEMU built with the RBD driver. Roomier slots
+          # than Sentinel's. Both slots reserve this, so the disk floor is
           # ~2×(store+verity)+data.
-          storeSize = "4096M";
+          #
+          # 4096M was exactly not enough once the image stopped being
+          # hypervisor-only: systemd-repart measured the contents at 4G and
+          # refused with "Partition 2's contents (4G) don't fit in the
+          # partition (4G)" — which is a build failure rather than an image
+          # that boots and runs out of room, so it is the good kind of
+          # discovery. Measured closure at that point was 4.0 GiB exactly.
+          #
+          # Worth knowing before trimming this back: `pkgs.qemu_kvm` carries
+          # GTK, SDL, SPICE and gstreamer, none of which this image can use —
+          # the agent starts every guest with `-display none`. Turning those
+          # off would buy back more than Ceph cost. It is a separate change,
+          # because a hypervisor that cannot open a display is a decision, not
+          # a size tweak.
+          storeSize = "6144M";
           veritySize = "320M";
           secureBootCommonName = "Velstra Cloud Node Secure Boot";
         };
@@ -140,7 +180,59 @@
           enable = true;
           package = velstra-cloud;
           fabricAgent = fabricAgent;
+          # The image's build stamp — the same string the package carries, so
+          # a release names one version for both kinds of machine.
+          release = debVersion;
         };
+        # All three roles ship, and the machine's seed decides which of them
+        # actually runs. Every unit is gated by its own `has-role`, so a box
+        # that is only a hypervisor shows the other two as *skipped* — which
+        # systemd distinguishes from failed, and which is the difference
+        # between "this box is not a pool" and "the pool agent is broken".
+        #
+        # The image has to carry what it cannot fetch: an appliance is built
+        # once for a fleet, and which of those boxes turns out to be the
+        # control plane is answered at a console, by an installer, weeks later.
+        # Before this the sealed image could only ever be a hypervisor, so a
+        # cell built from it still needed a separately-managed Debian machine
+        # to be its own control plane and to own its storage.
+        #
+        # `seedFile` points at the writable partition rather than the usual
+        # `/etc/velstra/node.env`, because this machine's `/etc` is on the
+        # read-only verity store — there is no writing a seed there. It is the
+        # same file `velstra-cloud-node install` writes and the same one the
+        # node agent already reads, and it is per-machine here for the same
+        # reason `/etc` is per-machine everywhere else: the partition belongs to
+        # one box.
+        velstra.cloud.controlPlane = {
+          enable = true;
+          fromSeed = true;
+          seedFile = "/var/lib/velstra/node.env";
+          package = velstra-cloud;
+        };
+        velstra.cloud.pool = {
+          enable = true;
+          fromSeed = true;
+          seedFile = "/var/lib/velstra/node.env";
+          tokenFile = "/var/lib/velstra/pool-token";
+          package = velstra-cloud;
+        };
+        # The store's data on the data partition. etcd's default is
+        # `/var/lib/etcd`, and on this image `/var/lib` is the volatile root:
+        # every object in the cell lived in RAM, and the first reboot of the
+        # control plane emptied it. The nodes were gone from the list, and so
+        # was everything else — but the bootstrap password is under the state
+        # directory and survived, so the wiped cell signed the operator in and
+        # looked like a cell with no nodes rather than like a wiped machine.
+        #
+        # The unit is ordered after the mount (`stateDirServices` above), and
+        # the directory is made by root just before the store starts: the
+        # module's tmpfiles rule is not ordered after a `nofail` mount, and a
+        # directory made on the tmpfs under the mount point is one the mount
+        # then hides.
+        services.etcd.dataDir = "/var/lib/velstra/etcd";
+        systemd.services.etcd.serviceConfig.ExecStartPre =
+          "+${pkgs.coreutils}/bin/install -d -o etcd -g etcd -m 0700 /var/lib/velstra/etcd";
         system.stateVersion = "25.05";
       };
 
@@ -230,6 +322,12 @@
           pkgs.mdadm
           pkgs.cryptsetup
           pkgs.e2fsprogs
+          # `curl`, for the door where the machine asks the cell to let it in:
+          # it announces itself, reads back the certificate it was served, and
+          # polls until somebody approves. An installer carrying its own HTTP
+          # and TLS stacks to make four requests would be an installer nobody
+          # could audit for the sake of four requests.
+          pkgs.curl
         ];
       };
 
@@ -318,9 +416,7 @@
 
       nixosConfigurations.node-image = lib.nixosSystem {
         inherit system;
-        modules = [
-          sentinel.nixosModules.applianceImage
-          self.nixosModules.node
+        modules = applianceModules ++ [
           nodeIdentity
           { nixpkgs.hostPlatform = system; }
         ];
@@ -442,12 +538,20 @@
         #   nix build .#checks.x86_64-linux.node-image-boots -L
         node-image-boots = pkgs.testers.runNixOSTest {
           name = "velstra-node-image-boots";
+          # A second machine on the same network, and the only reason it is
+          # here: every assertion about the API used to be a curl on the
+          # appliance's own loopback, which passes on a machine the firewall
+          # has sealed shut. "The console is reachable" is a statement about
+          # somebody else's machine, so it is made from one.
+          nodes.client = {
+            environment.systemPackages = [ pkgs.curl ];
+          };
           nodes.machine = {
-            imports = [
-              sentinel.nixosModules.applianceImage
-              self.nixosModules.node
-              nodeIdentity
-            ];
+            imports = applianceModules ++ [ nodeIdentity ];
+            # This test seeds the distribution image directly, bypassing the
+            # installer that expands the data partition on the target disk.
+            # etcd needs room for its WAL beyond the image's 128 MiB floor.
+            velstra.appliance.dataSize = "1G";
             virtualisation = {
               directBoot.enable = false;
               mountHostNixStore = false;
@@ -461,6 +565,7 @@
           testScript =
             { nodes, ... }:
             ''
+              import json
               import os
               import subprocess
               import tempfile
@@ -517,6 +622,151 @@
                   assert src.startswith("/dev/"), src
                   machine.succeed("echo persisted > /var/lib/velstra/marker")
                   machine.succeed("grep -qx persisted /var/lib/velstra/marker")
+
+              # Everything above is a machine nobody has told anything. The
+              # half that was never proven here is the one an operator
+              # actually gets: a seed written by the installer, and a first
+              # boot that has to turn it into a cell. Seeded the way door 1
+              # seeds it, then rebooted, because the units under test are
+              # first-boot units and restarting them by hand would prove
+              # something else.
+              machine.succeed(
+                  "install -d -m 0755 /var/lib/velstra",
+                  "printf '%s\\n' "
+                  "VELSTRA_REGION=eu-central VELSTRA_CELL=cell-1"
+                  " VELSTRA_ROLES=control-plane,hypervisor,pool"
+                  " VELSTRA_NODE=node-1 VELSTRA_VMM=qemu"
+                  " VELSTRA_POOL=local VELSTRA_POOL_BACKEND=directory"
+                  " VELSTRA_STORE=127.0.0.1:2379 VELSTRA_LISTEN=0.0.0.0:8443"
+                  " VELSTRA_BOOTSTRAP_ADMIN=admin"
+                  " > /var/lib/velstra/node.env",
+                  "printf 'correcthorsebattery\\n' > /var/lib/velstra/bootstrap-password",
+                  "chmod 600 /var/lib/velstra/bootstrap-password",
+              )
+              machine.shutdown()
+              machine.start()
+              machine.wait_for_unit("multi-user.target")
+
+              with subtest("the first boot makes the cell's certificate"):
+                  machine.wait_for_unit("velstra-cell-tls.service")
+                  seed = machine.succeed("cat /var/lib/velstra/node.env")
+                  for key in ["VELSTRA_TLS_CERT=", "VELSTRA_TLS_KEY=", "VELSTRA_ADVERTISE="]:
+                      assert key in seed, f"ensure-tls wrote no {key}:\n{seed}"
+
+              with subtest("the API answers over the TLS it just made"):
+                  machine.wait_for_unit("velstra-cloud-api.service")
+                  machine.wait_for_open_port(8443)
+                  cert = "/var/lib/velstra/tls/cert.pem"
+                  machine.wait_until_succeeds(
+                      f"curl -sS --cacert {cert} https://127.0.0.1:8443/healthz"
+                  )
+
+              # The store used to live on the volatile root — etcd's default
+              # data directory — so a cell's every object lived in RAM and the
+              # first reboot of the control plane emptied it. The nodes were
+              # gone from the list; so was everything else. Proven the only
+              # way it can be: an object made, the machine rebooted, the
+              # object still there.
+              with subtest("the store is on the data partition and survives a reboot"):
+                  at = machine.succeed("findmnt -no TARGET -T /var/lib/velstra/etcd").strip()
+                  assert at == "/var/lib/velstra", f"the store writes under {at}, which a reboot empties"
+                  # The cell bootstrap makes this machine's own Node object:
+                  # the one that has to still be there afterwards.
+                  machine.wait_for_unit("velstra-cell-bootstrap.service")
+
+                  def nodes():
+                      session = json.loads(machine.succeed(
+                          f"curl -sS --cacert {cert} https://127.0.0.1:8443/api/v1/sessions"
+                          " -H 'content-type: application/json'"
+                          " -d '{\"username\":\"admin\",\"password\":\"correcthorsebattery\"}'"
+                      ))
+                      listing = json.loads(machine.succeed(
+                          f"curl -sS --cacert {cert} https://127.0.0.1:8443/api/v1/nodes"
+                          f" -H 'authorization: Bearer {session['token']}'"
+                      ))
+                      return sorted(item["meta"]["name"] for item in listing["items"])
+
+                  before = nodes()
+                  assert before, "the cell bootstrap made no node object"
+                  machine.shutdown()
+                  machine.start()
+                  machine.wait_for_unit("velstra-cloud-api.service")
+                  machine.wait_until_succeeds(
+                      f"curl -sS --cacert {cert} https://127.0.0.1:8443/healthz"
+                  )
+                  after = nodes()
+                  assert after == before, f"the reboot lost the cell's objects: {before} -> {after}"
+
+              # And from somewhere that is not this machine. The loopback curl
+              # above passed on a box whose firewall dropped every packet from
+              # the network: the API was active, listening on 0.0.0.0:8443 and
+              # unreachable, and nothing in `systemctl status` said so.
+              with subtest("and from another machine on the network"):
+                  # NIX_DISK_IMAGE is global to the driver and points at the
+                  # appliance's overlay, so the client would try to open the
+                  # same qcow2 and be refused the write lock. Taken away for
+                  # the length of its boot and put back, because `machine` is
+                  # rebooted from that same variable.
+                  overlay = os.environ.pop("NIX_DISK_IMAGE")
+                  client.start()
+                  client.wait_for_unit("multi-user.target")
+                  os.environ["NIX_DISK_IMAGE"] = overlay
+                  # The address on the test network, not the first one listed:
+                  # 10.0.2.x is QEMU's user-mode NAT, which this machine can
+                  # reach out through and nobody can reach in on — asking there
+                  # would prove nothing about a firewall.
+                  address = machine.succeed(
+                      "ip -4 -brief addr show scope global"
+                      " | awk '{print $3}' | cut -d/ -f1"
+                      " | grep -v '^10[.]0[.]2[.]' | head -n1"
+                  ).strip()
+                  assert address, "the appliance has no address on the test network"
+                  client.wait_until_succeeds(
+                      f"curl -sS -k --max-time 5 https://{address}:8443/healthz"
+                  )
+
+              with subtest("the cell has its Node and Pool, made by the machine itself"):
+                  machine.wait_for_unit("velstra-cell-bootstrap.service")
+                  machine.succeed("test -s /var/lib/velstra/node-token")
+
+              # The one thing somebody standing at the machine needs, and the
+              # reason this subtest exists: a first boot used to end at a
+              # `login:` prompt over a box whose DHCP lease nobody could read.
+              with subtest("the console says where this machine is"):
+                  machine.wait_for_unit("velstra-node-banner.service")
+                  issue = machine.succeed("cat /run/issue.d/50-velstra.issue")
+                  for want in [
+                      # The name the cell knows it by, which is what somebody
+                      # standing here is about to look for in the console.
+                      "node-1",
+                      "control-plane",
+                      "https://",
+                      # And the fingerprint of the certificate the browser is
+                      # about to warn about. The banner ran before
+                      # `velstra-cell-tls` had made one, so this line — the
+                      # reason the banner exists — was simply absent.
+                      "certificate:  sha256 ",
+                  ]:
+                      assert want in issue, f"the banner does not say {want}:\n{issue}"
+                  # And it is on the screen. Everything above is a file and a
+                  # unit state; this is the only assertion that says an
+                  # operator standing at the machine can read it — which is
+                  # the entire point, and which a check that asked units
+                  # instead of the console could not have caught. The nixpkgs
+                  # this image is pinned to does not pass agetty
+                  # `--issue-file`, so the banner was written every boot into
+                  # a directory nothing read, and the screen said `login:`.
+                  screen = machine.get_tty_text("1")
+                  assert "node-1" in screen, f"the console does not show it:\n{screen}"
+                  # And it has to be there *before* the prompt is drawn. The
+                  # banner unit and getty@tty1 are both Before=getty.target,
+                  # which orders neither against the other — so the ordering
+                  # is stated against the getty itself, and this is what says
+                  # it stayed stated.
+                  order = machine.succeed(
+                      "systemctl show velstra-node-banner.service -p Before"
+                  )
+                  assert "getty@tty1.service" in order, order
             '';
         };
 
@@ -575,6 +825,45 @@
                 cell.wait_until_succeeds(
                     f"curl -fsS {auth} {api}/nodes/node-1 | grep -q vcpus",
                     timeout=120,
+                )
+
+            with subtest("guest metadata crosses the host firewall only from a guest interface"):
+                node.succeed("nft list table inet nixos-fw")
+                # A host firewall reload must preserve agent-owned tables.
+                node.succeed("nft add table inet velstra-reload-test")
+                # A network namespace represents the guest side of the same
+                # bridge input path used by a VM. The real metadata service
+                # must answer an unknown source with 404, never guest data.
+                node.succeed(
+                    "ip netns add metadata-guest",
+                    "ip link add vbr-test type bridge",
+                    "ip addr add 10.250.0.1/24 dev vbr-test",
+                    "ip link set vbr-test up",
+                    "ip link add metadata-host type veth peer name guest0",
+                    "ip link set metadata-host master vbr-test",
+                    "ip link set metadata-host up",
+                    "ip link set guest0 netns metadata-guest",
+                    "ip -n metadata-guest link set lo up",
+                    "ip -n metadata-guest addr add 10.250.0.2/24 dev guest0",
+                    "ip -n metadata-guest link set guest0 up",
+                    "ip -n metadata-guest route add 169.254.169.254/32 via 10.250.0.1",
+                )
+                for _ in range(2):
+                    node.wait_until_succeeds(
+                        "test $(ip netns exec metadata-guest ${pkgs.curl}/bin/curl"
+                        " --noproxy '*' --max-time 5 -s -o /dev/null -w '%{http_code}'"
+                        " http://169.254.169.254/latest/meta-data/instance-id) = 404"
+                    )
+                    node.succeed("systemctl restart nftables")
+                    node.succeed("nft list table inet velstra-reload-test")
+
+                address = node.succeed(
+                    "ip -4 -o addr show dev eth1 | awk '{print $4}' | cut -d/ -f1"
+                ).strip()
+                cell.succeed(f"ip route replace 169.254.169.254/32 via {address}")
+                cell.fail(
+                    "curl --noproxy '*' --max-time 5 -s -o /dev/null"
+                    " http://169.254.169.254/latest/meta-data/instance-id"
                 )
           '';
         };
@@ -906,8 +1195,20 @@
               # vdb — the install target. Comfortably larger than the layout
               # the installer clones onto it (ESP + verity store + data);
               # sized at 8000 it was refused, correctly and by name, for being
-              # 7.8 GiB against a layout needing 8.9.
-              emptyDiskImages = [ 12000 ];
+              # 7.8 GiB against a layout needing 8.9. Raised again to 16000
+              # when the store slot grew to hold all three roles: 12000 is
+              # 11.7 GiB against a layout needing 12.9, and the installer said
+              # so rather than starting and running out.
+              #
+              # The layout is 2×(storeSize + veritySize) plus the data
+              # partition, so this number follows `nodeIdentity` — and so does
+              # the smallest disk a real node can be installed on.
+              # vdc — a spare disk, so the first-machine door has something to
+              # give Ceph. Small: it is named, never written.
+              emptyDiskImages = [
+                16000
+                4000
+              ];
             };
             environment.systemPackages = [ pkgs.expect ];
           };
@@ -932,6 +1233,11 @@
             # installer that had just printed the reason.
             status, _ = machine.execute(
                 f"API_URL=http://cell.example:8443 TOKEN={token} PICK={pick}"
+                # Door 4 now: door 3 became "ask the cell to let it in", which
+                # needs a control plane on the wire that this check does not
+                # have. The custom door — every question still asked — moved
+                # along by one.
+                f" ROLES=hypervisor DOOR=4"
                 f" expect ${./nix/node-wizard.exp} >/tmp/transcript 2>&1"
             )
             if status != 0:
@@ -951,8 +1257,19 @@
                     "VELSTRA_API_URL=http://cell.example:8443",
                     "VELSTRA_VMM=qemu",
                     "VELSTRA_HOSTNAME=node-t1",
+                    # The key the installer's own seed writer never wrote. An
+                    # absent VELSTRA_ROLES reads as `[hypervisor]`, which is
+                    # correct for a seed written before roles existed and
+                    # silently wrong for one written by an installer that was
+                    # simply never told — so a flashed machine could only ever
+                    # be a hypervisor, whatever it was installed to be.
+                    "VELSTRA_ROLES=hypervisor",
                 ]:
                     assert line in env, f"node.env is missing {line}:\n{env}"
+                # And nothing this machine is not: a pool key here would start a
+                # pool agent against a pool called nothing.
+                assert "VELSTRA_POOL" not in env, env
+                assert "VELSTRA_LISTEN" not in env, env
                 mode = machine.succeed("stat -c %a /mnt/node-token").strip()
                 assert mode == "600", f"the token file is {mode}, not 600"
                 machine.succeed(f"grep -qx {token} /mnt/node-token")
@@ -965,6 +1282,88 @@
                 parts = machine.succeed("lsblk -rno NAME /dev/vdb")
                 assert "vdb6" in parts, parts
                 machine.succeed("sgdisk -p /dev/vdb | grep -q esp")
+
+            # The door an operator actually takes. The token is built here the
+            # way the API builds it — the wire format is the contract, and a
+            # check that needed a running API to mint one would prove less
+            # about the installer and more about the network. It carries a
+            # certificate so the seed can name it; nothing verifies it here,
+            # because nothing is reached during an install.
+            with subtest("joining with a token asks for nothing but the token"):
+                machine.succeed("umount /mnt")
+                import base64, json
+                pem = "-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----\n"
+                join_token = "ab" * 32
+                blob = json.dumps({
+                    "v": 1, "region": "eu-central", "cell": "cell-1", "node": "node-2",
+                    "urls": ["https://10.0.0.8:8443", "https://cell.example:8443"],
+                    "ca": pem, "token": join_token,
+                }).encode()
+                joined = "velstra1." + base64.urlsafe_b64encode(blob).decode().rstrip("=")
+                status, _ = machine.execute(
+                    f"PICK={pick} DOOR=2 JOIN={joined} ROLES= API_URL= TOKEN="
+                    f" expect ${./nix/node-wizard.exp} >/tmp/transcript2 2>&1"
+                )
+                if status != 0:
+                    print(machine.succeed("cat -v /tmp/transcript2"))
+                    raise Exception(f"the join install did not finish: exit {status}")
+                machine.fail(f"grep -q {join_token} /tmp/transcript2")
+                machine.succeed("mount /dev/vdb6 /mnt")
+                env = machine.succeed("cat /mnt/node.env")
+                for line in [
+                    "VELSTRA_ROLES=hypervisor",
+                    "VELSTRA_NODE=node-2",
+                    "VELSTRA_CELL=cell-1",
+                    "VELSTRA_REGION=eu-central",
+                    "VELSTRA_API_URL=https://10.0.0.8:8443",
+                    "VELSTRA_API_CA=/var/lib/velstra/api-ca.pem",
+                    "VELSTRA_VMM=qemu",
+                    "VELSTRA_HOSTNAME=node-t1",
+                ]:
+                    assert line in env, f"node.env is missing {line}:\n{env}"
+                assert machine.succeed("cat /mnt/api-ca.pem") == pem, "the certificate was not seeded as given"
+                assert machine.succeed("stat -c %a /mnt/node-token").strip() == "600"
+                machine.succeed(f"grep -qx {join_token} /mnt/node-token")
+
+            # The door the first machine of a cell takes — the one that used to
+            # need a separately-managed Debian box. It asks for an administrator
+            # and storage, and everything else it can decide it decides.
+            with subtest("the first machine seeds a whole cell, born with Ceph on its spare disk"):
+                machine.succeed("umount /mnt")
+                m = re.search(r"\[(\d+)\] /dev/vdc ", listing)
+                assert m, "the candidate listing does not offer /dev/vdc:\n" + listing
+                osd_pick = m.group(1)
+                password = "correcthorsebattery"
+                status, _ = machine.execute(
+                    f"PICK={pick} DOOR=1 OSD_PICK={osd_pick} ADMIN_PASSWORD={password}"
+                    f" JOIN= ROLES= API_URL= TOKEN="
+                    f" expect ${./nix/node-wizard.exp} >/tmp/transcript3 2>&1"
+                )
+                if status != 0:
+                    print(machine.succeed("cat -v /tmp/transcript3"))
+                    raise Exception(f"the first-machine install did not finish: exit {status}")
+                machine.fail(f"grep -q {password} /tmp/transcript3")
+                machine.succeed("mount /dev/vdb6 /mnt")
+                env = machine.succeed("cat /mnt/node.env")
+                for line in [
+                    "VELSTRA_ROLES=control-plane,hypervisor,pool",
+                    "VELSTRA_NODE=node-t1",
+                    "VELSTRA_BOOTSTRAP_ADMIN=admin",
+                    "VELSTRA_LISTEN=0.0.0.0:8443",
+                    "VELSTRA_POOL=ceph",
+                    "VELSTRA_POOL_BACKEND=ceph",
+                    "VELSTRA_BOOTSTRAP_CEPH_OSDS=vdc",
+                    "VELSTRA_CEPH_CONF=/var/lib/velstra/ceph/ceph.conf",
+                    "VELSTRA_CEPH_USER=velstra",
+                    "VELSTRA_VMM=qemu",
+                ]:
+                    assert line in env, f"node.env is missing {line}:\n{env}"
+                # No credential nothing has issued: the objects are made at
+                # first boot, and their tokens with them.
+                machine.fail("test -e /mnt/node-token")
+                assert machine.succeed("stat -c %a /mnt/bootstrap-password").strip() == "600"
+                machine.succeed(f"grep -qx {password} /mnt/bootstrap-password")
+                assert password not in env, "the password is in the world-readable seed"
           '';
         };
 
@@ -1380,7 +1779,9 @@
             };
             virtualisation = {
               memorySize = 2048;
-              diskSize = 4096;
+              # Backups require 8 GiB of free target headroom in addition
+              # to the operating system and volume files.
+              diskSize = 16384;
             };
           };
           testScript = ''
@@ -1451,7 +1852,7 @@
                     f" {api}/projects/p1/backups"
                 )
                 cell.wait_until_succeeds(
-                    f"curl -fsS {auth} {api}/projects/p1/backups/b1 | grep -q '\"taken\":true'",
+                    f"curl -fsS {auth} {api}/projects/p1/backups/b1 | tee /dev/stderr | grep -q '\"taken\":true'",
                     timeout=180,
                 )
                 # Named for the backup with its slashes flattened, so a person
@@ -1521,6 +1922,7 @@
                 ./usr/bin/velstra-cloud-nodeagent \
                 ./usr/bin/velstra-cloud-poolagent \
                 ./usr/bin/velstra-cloud-node \
+                ./usr/bin/velstra-cloud-passthrough \
                 ./lib/systemd/system/velstra-cloud-api.service \
                 ./lib/systemd/system/velstra-cloud-controller.service \
                 ./lib/systemd/system/velstra-cloud-nodeagent.service \
@@ -1533,6 +1935,45 @@
                   exit 1
                 }
               done
+
+              # Every credential the wizards write has to be looked for where
+              # they write it. Both `setup` and `quickstart` put the bootstrap
+              # password beside the seed in the identity directory, and the API
+              # unit looked only in the state directory — so a freshly
+              # quickstarted box had a seed naming a bootstrap administrator, a
+              # password the process never saw, and an API that refused to start
+              # with "--bootstrap-admin needs --bootstrap-password", restarting
+              # every five seconds for ever.
+              #
+              # The setup check proves the file is written, with the right mode,
+              # and nothing proved it was read. This is that half: the unit text
+              # has to name the path the writer uses. It is a weaker statement
+              # than starting the thing, and it is the strongest one available
+              # here — `quickstart` enables units with systemctl and refuses to
+              # touch NixOS, so no VM test in this flake can run it.
+              mkdir -p units
+              dpkg-deb --fsys-tarfile "$deb" | tar -x -C units ./lib/systemd/system
+              api=units/lib/systemd/system/velstra-cloud-api.service
+              for path in /etc/velstra/bootstrap-password /var/lib/velstra/bootstrap-password; do
+                grep -q "$path" "$api" || {
+                  echo "the api unit never looks in $path for the bootstrap password," >&2
+                  echo "which is where the setup wizards write it:" >&2
+                  cat "$api" >&2
+                  exit 1
+                }
+              done
+
+              # The same shape of mistake, one program along: shipping
+              # `velstra-cloud-passthrough` and never starting it would give a
+              # Debian machine a seed that names cards, a binary that can take
+              # them, and nothing to introduce the two — so the guest that was
+              # promised a GPU would simply never get one.
+              agent=units/lib/systemd/system/velstra-cloud-nodeagent.service
+              grep -q "velstra-cloud-passthrough" "$agent" || {
+                echo "nothing on a Debian machine ever runs velstra-cloud-passthrough:" >&2
+                cat "$agent" >&2
+                exit 1
+              }
 
               # Real files, not symlinks into a /nix that is not on the target.
               # A .deb that depended on the store existing would be a Nix

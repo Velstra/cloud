@@ -37,8 +37,27 @@ in
 
     qemu = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.qemu_kvm;
-      description = "QEMU used when the seed selects `VELSTRA_VMM=qemu`.";
+      default = pkgs.qemu_kvm.override { cephSupport = true; };
+      description = ''
+        QEMU used when the seed selects `VELSTRA_VMM=qemu`.
+
+        Built with the RBD block driver, which nixpkgs leaves off
+        (`cephSupport ? false`, so no `--enable-rbd`). Without it a guest whose
+        disk is a Ceph volume cannot start at all: QEMU answers
+        `Unknown driver 'rbd'`, and the node reports a guest that will not boot
+        with no indication that the cause is which QEMU was built.
+
+        It is on by default rather than opt-in because this is the module the
+        sealed appliance uses, and an appliance is flashed long before anybody
+        knows whether that cell will have Ceph. The cost is real — an override
+        means building QEMU rather than taking the cached one — and a cell that
+        is certain it will never use Ceph can set this back to
+        `pkgs.qemu_kvm`.
+
+        Cloud Hypervisor has no equivalent: it takes a path and nothing else,
+        so `velstra-cloud-nodeagent` refuses an `rbd:` disk there by name
+        rather than handing it a path that is not one.
+      '';
     };
 
     cloudHypervisor = lib.mkOption {
@@ -79,6 +98,20 @@ in
       '';
     };
 
+    metadataInterfaces = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "vbr+"
+        "vt+"
+      ];
+      description = ''
+        Guest-facing interfaces allowed to reach 169.254.169.254:80.
+        A trailing + matches an interface prefix. Add an explicitly managed
+        guest bridge here when using custom bridge or tap names; uplinks must
+        not be included. Other ports and destinations remain filtered.
+      '';
+    };
+
     hugepages = lib.mkOption {
       type = lib.types.int;
       default = 0;
@@ -88,9 +121,28 @@ in
         are configured for hugepage backing.
       '';
     };
+
+    release = lib.mkOption {
+      type = lib.types.str;
+      default = cfg.package.version;
+      description = ''
+        The build this machine runs, written to `/etc/velstra-release` for
+        the node agent to report as `status.installed.version` — the thing a
+        rollout compares against a release. The image sets it to the release
+        stamp (`0.1.0+20260918.c571d71`); a machine running this module on
+        its own NixOS has only the crate version, which is honest: the cell
+        cannot update that machine, so nothing compares it.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    networking.nftables.enable = true;
+    # The stamp the node agent reads to say which build this is. On the
+    # image `/etc` is the sealed store, so this is the one place the build
+    # can be written and the one place it cannot be changed afterwards.
+    environment.etc."velstra-release".text = cfg.release + "\n";
+
     # The agent + installer, the hypervisors, and the disk tools the installer
     # and updater resolve by name on PATH (this repo does not pin tool paths
     # the way Sentinel's wrapped CLI does — PATH is supplied here instead).
@@ -101,19 +153,82 @@ in
         cfg.cloudHypervisor
         pkgs.gptfdisk
         pkgs.parted
+        # The node agent unpacks a release's image before writing the slot.
+        pkgs.zstd
         pkgs.cryptsetup
         pkgs.e2fsprogs
         pkgs.mdadm
+        # `lspci`. The passthrough binary reads sysfs and needs none of it;
+        # this is for the person who has installed the machine and now wants to
+        # hold a card back — they need the `vendor:device` pair to put in the
+        # seed, and the machine itself is the only place that knows it.
+        pkgs.pciutils
+        # `cephadm` and the `ceph` CLI, so an operator can add a Ceph cluster
+        # to a cell of flashed machines afterwards. The platform still installs
+        # nothing on its own — cephadm pulls the daemon containers only once
+        # somebody has asked for a cluster — but a machine with no package
+        # manager has nowhere to get cephadm from, and the image has to carry
+        # what it cannot fetch. Daemons run as containers, hence podman.
+        pkgs.ceph
       ]
       ++ lib.optional (cfg.fabricAgent != null) cfg.fabricAgent;
+    virtualisation.podman.enable = true;
+    virtualisation.containers.containersConf.settings.network.firewall_driver = "nftables";
 
     # KVM now, IOMMU-ready for the passthrough phase: the design doc's device
     # model needs `iommu=pt` and the vendor IOMMU enabled from day one, because
     # a node that must reboot to *see* its devices cannot report them. The
     # cross-vendor pair is harmless on the other vendor's hardware.
+    # The ports this machine serves, opened because NixOS closes everything by
+    # default and the appliance opened nothing.
+    #
+    # A machine came up with `velstra-cloud-api` active, listening on
+    # 0.0.0.0:8443, answering curl on its own loopback — and unreachable from
+    # the network, because every packet from outside was dropped before it got
+    # there. Nothing in `systemctl status` says "the firewall ate this", which
+    # is exactly what made it look like a broken API. Only one place in this
+    # repository had ever opened the port, and it was a test VM in `flake.nix`
+    # — so every check passed and every real machine was closed.
+    #
+    # Opened unconditionally rather than per role: which of these is
+    # *listening* is the seed's answer, made by units already gated on it, and
+    # a port with nothing behind it is refused by the kernel. A firewall that
+    # followed the seed as well would be a second place for the same fact to
+    # be wrong, which is the failure this file keeps finding.
+    networking.firewall.allowedTCPPorts = [
+      # The API, and the console it serves.
+      8443
+      # The node agent's guest consoles: a serial console in the browser is
+      # proxied from here, and an operator who cannot reach it has a guest
+      # they can only look at.
+      8447
+      # Open to a key and nothing else. `velstra-node-access` starts sshd when
+      # the seed carries one and stops it when it does not, so on a machine
+      # nobody asked for ssh this is a port with no listener.
+      22
+    ];
+
+    # Metadata is a host input packet, not forwarded tenant traffic. The
+    # guest's security-group rules cannot open the NixOS host firewall.
+    networking.firewall.extraInputRules =
+      lib.concatMapStringsSep "\n" (
+        iface:
+        let
+          pattern = if lib.hasSuffix "+" iface then lib.removeSuffix "+" iface + "*" else iface;
+        in
+        ''
+          iifname ${builtins.toJSON pattern} ip daddr 169.254.169.254 tcp dport 80 accept
+        ''
+      ) cfg.metadataInterfaces;
+
     boot.kernelModules = [
       "kvm-intel"
       "kvm-amd"
+      # What a held-back card is bound to. Present always: which cards a
+      # machine reserves is read from its seed at boot, and cannot be a kernel
+      # parameter here — this image's command line is sealed into a signed UKI,
+      # which would make it a fact about the image instead of the machine.
+      "vfio-pci"
     ];
     boot.kernelParams = [
       "intel_iommu=on"
@@ -188,6 +303,197 @@ in
       '';
     };
 
+    # Take the reserved cards away from the host, before anything can use them
+    # and before the agent reports what it sees. A seed that reserves nothing
+    # makes this a no-op that says so.
+    systemd.services.velstra-node-passthrough = {
+      description = "Bind the PCI devices this node reserves to vfio-pci";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "velstra-node-boot.service" ];
+      before = [ "velstra-cloud-nodeagent.service" ];
+      unitConfig = {
+        ConditionPathExists = "${cfg.stateDir}/node.env";
+        RequiresMountsFor = [ cfg.stateDir ];
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        EnvironmentFile = "${cfg.stateDir}/node.env";
+        ExecStart = "${cfg.package}/bin/velstra-cloud-passthrough";
+      };
+    };
+
+    # SSH, present but not started. The seed decides: `velstra-node-access`
+    # starts it when a key was seeded and stops it when one was not, so the
+    # closed default is closed on every boot rather than only the first.
+    #
+    # Host keys on the writable partition, or every reboot would present a new
+    # identity and every client would refuse to connect a second time.
+    services.openssh = {
+      enable = true;
+      startWhenNeeded = false;
+      hostKeys = [
+        {
+          type = "ed25519";
+          path = "${cfg.stateDir}/ssh/ssh_host_ed25519_key";
+        }
+      ];
+      settings = {
+        # Key only, even when a console password is set: a password that is
+        # reachable from the network is a different decision from one that is
+        # reachable by somebody standing at the machine, and the installer only
+        # asks for the second.
+        PasswordAuthentication = false;
+        KbdInteractiveAuthentication = false;
+        PermitRootLogin = "prohibit-password";
+      };
+    };
+    systemd.services.sshd.wantedBy = lib.mkForce [ ];
+    systemd.tmpfiles.rules = [ "d ${cfg.stateDir}/ssh 0700 root root -" ];
+
+    # Who may log in, from the seed, every boot — `/etc` here is a tmpfs, so a
+    # password set last week is gone by morning and the seed is the only
+    # durable statement of it.
+    systemd.services.velstra-node-access = {
+      description = "Apply what the seed says about logging in to this machine";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "velstra-node-boot.service" ];
+      before = [ "getty.target" ];
+      unitConfig.RequiresMountsFor = [ cfg.stateDir ];
+      path = [
+        pkgs.shadow
+        pkgs.systemd
+        pkgs.coreutils
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${cfg.package}/bin/velstra-cloud-node apply-access --dir ${cfg.stateDir}";
+      };
+    };
+
+    # What the screen says before anybody signs in. Every machine: a hypervisor
+    # that shows nothing leaves whoever is standing at it with no way to learn
+    # the address they need.
+    # Tell agetty to read the drop-in directories, because the nixpkgs this
+    # image is pinned to does not.
+    #
+    # `services.getty` gained `--issue-file` upstream later than the revision
+    # in `flake.lock`; here agetty is started without it and therefore reads
+    # only `/etc/issue`, which NixOS owns and builds from a static greeting.
+    # So the banner below was written to /run/issue.d/50-velstra.issue every
+    # boot and nothing ever read it — the addresses an operator came to the
+    # machine for were in a file, and the screen said `login:`. Found by a VM
+    # check that looked at the console instead of at a unit's exit status.
+    #
+    # Passed as an extra argument rather than by writing /etc/issue ourselves:
+    # /etc/issue is a store-backed symlink on this image and fighting the
+    # operating system for it would be a rule to maintain for ever. When
+    # nixpkgs moves, its own copy of this flag carries the same value and the
+    # duplicate is harmless.
+    services.getty.extraArgs = [
+      "--issue-file"
+      "/etc/issue:/etc/issue.d:/run/issue:/run/issue.d"
+    ];
+
+    systemd.services.velstra-node-banner = {
+      description = "Write the console banner (name, addresses, roles)";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-online.target" ];
+      after = [
+        "network-online.target"
+        "velstra-node-boot.service"
+        # After the certificate, or the banner has no fingerprint to print —
+        # which is most of the reason it exists. A self-signed certificate
+        # makes the browser warn, correctly, and the warning is worth
+        # something only to somebody who can check what they are agreeing to;
+        # this is the one screen that can tell them. On a machine that is not
+        # a control plane the unit is skipped by its own ExecCondition, so
+        # this costs nothing there.
+        "velstra-cell-tls.service"
+      ];
+      # Before the getty **instance**, not before `getty.target`.
+      #
+      # `getty@tty1` is itself `Before=getty.target`, so two units that are
+      # both before the target are ordered against the target and against
+      # nothing else — systemd was free to draw the login prompt first, and on
+      # a machine waiting for a DHCP lease it did. agetty reads the issue when
+      # it prints the prompt, so a banner that lands afterwards is a file
+      # nobody sees until the next prompt. Measured on real hardware: the
+      # machine came up, the screen said `login:`, and the address the banner
+      # exists to show was in a file written seconds later.
+      before = [
+        "getty@tty1.service"
+        "getty.target"
+      ];
+      unitConfig.RequiresMountsFor = [ cfg.stateDir ];
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        # A machine whose network never comes up still gets a prompt. The
+        # banner is worth waiting for and not worth waiting for ever: without
+        # this, `network-online.target` failing would hold tty1 hostage.
+        TimeoutStartSec = 45;
+        ExecStart = "${cfg.package}/bin/velstra-cloud-node banner --dir ${cfg.stateDir}";
+      };
+    };
+
+    # The first machine of a cell, brought up from its seed alone. What
+    # `quickstart` does after writing the seed on a Debian box happens here at
+    # first boot, in two halves, because a flashed machine had no API to talk
+    # to at install time and no addresses to put in a certificate.
+    #
+    # Both are gated on the seed naming the control-plane role — on every
+    # other machine they show as skipped — and both are no-ops after the first
+    # boot: `ensure-tls` keeps a certificate that exists, `bootstrap-cell`
+    # creates nothing twice. See docs/joining.md.
+    systemd.services.velstra-cell-tls = {
+      description = "Make this cell's certificate and tell the seed about it";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-online.target" ];
+      # After the network, so a DHCP lease is in the certificate; before the
+      # API, so it has one to serve.
+      after = [
+        "network-online.target"
+        "velstra-node-boot.service"
+      ];
+      before = [ "velstra-cloud-api.service" ];
+      unitConfig = {
+        ConditionPathExists = "${cfg.stateDir}/node.env";
+        RequiresMountsFor = [ cfg.stateDir ];
+      };
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role control-plane";
+        ExecStart = "${cfg.package}/bin/velstra-cloud-node ensure-tls --dir ${cfg.stateDir}";
+      };
+    };
+
+    systemd.services.velstra-cell-bootstrap = {
+      description = "Create this machine's Node and Pool objects in the cell it is";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "velstra-cloud-api.service" ];
+      after = [ "velstra-cloud-api.service" ];
+      # Not ordered before the agents: they park on the token this writes
+      # (`ConditionPathExists`), and this starts them itself once it exists —
+      # then, for a machine born with Ceph, waits for the node agent's first
+      # inventory to name the OSD disks the way the node names them.
+      unitConfig = {
+        ConditionPathExists = "${cfg.stateDir}/node.env";
+        RequiresMountsFor = [ cfg.stateDir ];
+      };
+      path = [ pkgs.curl ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role control-plane";
+        ExecStart = "${cfg.package}/bin/velstra-cloud-node bootstrap-cell --dir ${cfg.stateDir}";
+      };
+    };
+
     # The node agent. Everything identifying this node comes from the seed —
     # the image is identical across the fleet, which is what makes an image
     # update one artefact instead of one per node.
@@ -221,6 +527,21 @@ in
       ];
       serviceConfig = {
         EnvironmentFile = "${cfg.stateDir}/node.env";
+        # The seed's own answer to "is this box a hypervisor", asked the same
+        # way the control-plane and pool units ask about theirs.
+        #
+        # It mattered the moment the image stopped being hypervisor-only: a
+        # machine flashed to be nothing but a control plane has a seed and a
+        # token, so both `ConditionPathExists` above are satisfied and this
+        # agent would come up, claim the box for guests, and report capacity
+        # for a hypervisor nobody asked for.
+        #
+        # A seed with no `VELSTRA_ROLES` at all still runs it — `roles_of_seed`
+        # reads an absent key as `[hypervisor]`, because that is the only thing
+        # the installer could make before roles existed, and reading it as
+        # "nothing" would turn an upgrade into a fleet that stops running
+        # guests.
+        ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role hypervisor";
         Restart = "on-failure";
         RestartSec = 5;
       };

@@ -115,6 +115,8 @@ pub fn router(api: Api) -> Router {
         // behind a token. The page itself is markup with no data in it — it
         // carries the sign-in form, and demanding a token to fetch the form
         // that asks for one is a locked door with the key inside.
+        // What a node fetches when told what to run: the cell is its channel.
+        .route("/api/v1/releases/:id/files/:file", get(release_file))
         .layer(middleware::from_fn_with_state(api.clone(), authenticate))
         // Outside the token layer, so probes and sign-ins are counted too. A
         // request nobody can see is a request nobody can debug: before this
@@ -126,6 +128,10 @@ pub fn router(api: Api) -> Router {
         // the token every other route demands. Behind the layer it would be a
         // door whose key is on the other side of it.
         .route("/api/v1/sessions", post(sign_in))
+        // A cut install medium, collected once under its ticket — the ticket
+        // is the credential, as a console ticket is, so a browser's plain
+        // download can fetch two gigabytes without a header it cannot send.
+        .route("/api/v1/media/:ticket", get(medium))
         // Documentation, not data: the same schema the console page below
         // embeds, so it is served the way the page is — without a token.
         .route("/api/v1/openapi.json", get(openapi))
@@ -442,6 +448,97 @@ async fn list_service_tokens(
     })))
 }
 
+/// The medium a ticket names, streamed: the ISO from disk, then the trailer.
+///
+/// Streamed rather than read, because an installer is two gigabytes and this
+/// process holds the cell's state. The ticket is spent on the way in, so a
+/// link that leaks after the download is a link to nothing.
+async fn medium(State(api): State<Api>, Path(ticket): Path<String>) -> ApiResult<Response> {
+    let Some(cut) = api.take_medium(&ticket) else {
+        return Err(ApiError::not_found(
+            "a medium under that link: it was collected already or the link expired; cut it \
+             again from the node's page",
+        ));
+    };
+    let file = tokio::fs::File::open(&cut.iso)
+        .await
+        .map_err(|e| ApiError::internal(format!("opening {}: {e}", cut.iso.display())))?;
+    let mut answer = Response::new(streamed(file, cut.trailer));
+    let headers = answer.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&cut.size.to_string()) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+    if let Ok(value) =
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", cut.filename))
+    {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(answer)
+}
+
+/// One of a release's files, for the machine that was told to run it.
+async fn release_file(
+    State(api): State<Api>,
+    Extension(who): Extension<Identity>,
+    Path((release, file)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let path = api.release_file(&release, &file, &who).await?;
+    let opened = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::internal(format!("opening {}: {e}", path.display())))?;
+    let size = opened
+        .metadata()
+        .await
+        .map_err(|e| ApiError::internal(format!("{}: {e}", path.display())))?
+        .len();
+    let mut answer = Response::new(streamed(opened, Vec::new()));
+    let headers = answer.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&size.to_string()) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+    Ok(answer)
+}
+
+/// A file as a body, a megabyte at a time, with `tail` after its last byte.
+fn streamed(mut file: tokio::fs::File, tail: Vec<u8>) -> axum::body::Body {
+    use tokio::io::AsyncReadExt;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    tokio::spawn(async move {
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .send(Ok(Bytes::copy_from_slice(&buffer[..n])))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        if !tail.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(tail))).await;
+        }
+    });
+    axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
 async fn list_node_credentials(
     api: State<Api>,
     who: Extension<Identity>,
@@ -753,6 +850,27 @@ async fn authenticate(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // The two doors a machine that has just booted an installer knocks on. It
+    // holds no token and never will: `enrollments:announce` makes a request an
+    // operator has to answer, and `enrollments:claim` is authorised by a
+    // signature under the key that was announced plus the recorded approval of
+    // a person — neither reads this identity for anything.
+    //
+    // Let through *here* rather than routed outside the layer, which is where
+    // this started and cost two mistakes: a path segment in this router is
+    // either a literal or a parameter and never both, so `:` in a route is the
+    // start of a parameter and `enrollments:announce` was never the literal
+    // path it looked like — two such routes collide. And a route registered
+    // for one method shadows that path for every other method, so a `post`
+    // route under this collection answered 405 to the PATCH an operator makes
+    // to approve. Both were found by the end-to-end test rather than by
+    // reading, which is the only reason neither shipped.
+    if is_enrolment_door(&request) {
+        request
+            .extensions_mut()
+            .insert(crate::auth::Identity::new("enrollment:anonymous"));
+        return Ok(next.run(request).await);
+    }
     let identity = match (header.as_deref(), console_ticket(&request)) {
         // The header wins where there is one, so nothing about an ordinary
         // request changes and a ticket cannot be used to *widen* a session.
@@ -765,6 +883,20 @@ async fn authenticate(
     };
     request.extensions_mut().insert(identity);
     Ok(next.run(request).await)
+}
+
+/// Whether this is one of the two enrolment doors a tokenless machine uses.
+///
+/// Narrow by spelling and by method: a POST to exactly one of two paths.
+/// Anything else about an enrolment — reading the list, approving a row,
+/// turning one away — takes the ordinary door and needs a token, because those
+/// are an operator's acts.
+fn is_enrolment_door(request: &axum::extract::Request) -> bool {
+    request.method() == axum::http::Method::POST
+        && matches!(
+            request.uri().path(),
+            "/api/v1/enrollments:announce" | "/api/v1/enrollments:claim"
+        )
 }
 
 /// The session and ticket a console stream carries, and only a console stream.
@@ -1480,12 +1612,71 @@ async fn create(
         }
         // POST, and never GET: it mints a credential, and a GET that did that
         // is one a browser can be made to issue from somebody else's page.
+        Target::Verb { name, verb } if verb == "installMedium" => {
+            // `{}` cuts from the newest release with an installer; `release`
+            // names one.
+            let ask = document(&body).unwrap_or_else(|_| serde_json::json!({}));
+            let cut = api.install_medium(&name, &ask, &identity).await?;
+            return Ok((StatusCode::OK, Json(cut)).into_response());
+        }
         Target::Verb { name, verb } if verb == "issueCredential" => {
             // The body is optional: `{}` is the ordinary case, and a caller
             // may say `purpose` and `expiresAt`.
             let ask = document(&body).unwrap_or_else(|_| serde_json::json!({}));
             let issued = api.issue_credential(&name, &ask, &identity).await?;
             return Ok((StatusCode::OK, Json(issued)).into_response());
+        }
+        // The join artefacts. POST and not GET for the same reason
+        // `:issueCredential` is: each of these mints a machine credential, and
+        // a GET that minted one is a GET a browser can be made to issue from
+        // somebody else's page. `curl -X POST … -o /mnt/velstra/join` is the
+        // intended use, which is why the answer is the file and not JSON
+        // wrapping it.
+        Target::Verb { name, verb } if verb == "joinFile" || verb == "cloudInit" => {
+            let flavour = if verb == "joinFile" {
+                crate::core::JoinArtifact::File
+            } else {
+                crate::core::JoinArtifact::CloudInit
+            };
+            let text = api.join_artifact(&name, flavour, &identity).await?;
+            let mut answer = (StatusCode::OK, text).into_response();
+            answer.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            // Named, so a browser and `curl -O` both land on something an
+            // operator recognises rather than on `peter:joinFile`.
+            let filename = if verb == "joinFile" {
+                format!("{}.join", name.id())
+            } else {
+                format!("{}-cloud-init.yaml", name.id())
+            };
+            if let Ok(value) =
+                axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            {
+                answer
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_DISPOSITION, value);
+            }
+            return Ok(answer);
+        }
+        Target::CollectionVerb { verb, .. } if verb == "announce" => {
+            let announced = api
+                .announce(&document(&body).unwrap_or(serde_json::json!({})))
+                .await?;
+            return Ok((StatusCode::CREATED, Json(announced)).into_response());
+        }
+        Target::CollectionVerb { verb, .. } if verb == "claim" => {
+            let body = document(&body).unwrap_or(serde_json::json!({}));
+            let id = body
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            let name = ResourceName::parse(&format!("enrollments/{id}"))
+                .map_err(|e| ApiError::invalid(format!("that is not an enrolment id: {e}")))?;
+            let claimed = api.claim(&name, &body).await?;
+            return Ok((StatusCode::OK, Json(claimed)).into_response());
         }
         Target::Verb { name, verb } if verb == "reportStatus" => {
             let reported = api

@@ -50,7 +50,7 @@ use crate::{
 /// them. A name that is not here is a 404 rather than an empty list: an
 /// interface that answers a typo with `[]` sends somebody looking for their
 /// missing objects.
-pub const COLLECTIONS: [&str; 34] = [
+pub const COLLECTIONS: [&str; 37] = [
     "projects",
     "flavors",
     "bgp-peers",
@@ -72,6 +72,10 @@ pub const COLLECTIONS: [&str; 34] = [
     "security-groups",
     "images",
     "nodes",
+    // Beside `nodes`, because an enrolment becomes one. Served rather than
+    // hidden like `credentials`: the whole point is a list an operator reads
+    // and acts on.
+    "enrollments",
     "pools",
     "device-classes",
     "backup-targets",
@@ -84,6 +88,8 @@ pub const COLLECTIONS: [&str; 34] = [
     "usage",
     "snapshot-schedules",
     "maintenance-windows",
+    "releases",
+    "rollouts",
     "operations",
 ];
 
@@ -220,6 +226,13 @@ pub struct Created {
     /// registration answers with exactly one of them, and which one says what
     /// was registered.
     pub pool_token: Option<String>,
+    /// The whole hand-off in one string: the token above, plus where this API
+    /// answers, its certificate, and which cell and region this is.
+    ///
+    /// Present only when the API was told what to advertise (`--advertise`)
+    /// and serves TLS — a cell that is plaintext on loopback has nothing a
+    /// stranger could join. See `docs/joining.md`.
+    pub join_token: Option<String>,
 }
 
 /// The outcome of a change: the object as it now stands, and the operation
@@ -451,7 +464,18 @@ impl Scratch {
     }
 }
 
+/// What this API tells a machine that wants to join it. See `docs/joining.md`.
+struct JoinFacts {
+    urls: Vec<String>,
+    cert_pem: String,
+}
+
 struct Inner {
+    /// Where the release controller keeps what it fetched, and where the
+    /// files a node or an install medium is served from come from.
+    releases_dir: Option<std::path::PathBuf>,
+    /// Media cut for one machine each, waiting to be collected once.
+    media: std::sync::Mutex<BTreeMap<String, Medium>>,
     /// What this instance has been asked to do, for `/metrics`.
     requests: Requests,
     /// The store itself, beside the typed views over it — for the one job no
@@ -505,6 +529,9 @@ struct Inner {
     /// and nothing else can: they are not in `collections`, so there is no
     /// route, no list, no watch and no proxy hop that arrives at them.
     identity: crate::sessions::IdentityStore,
+    /// What a joining machine is told about this API, or `None` when there is
+    /// nothing to tell: no advertised address, or no certificate to verify.
+    join: Option<JoinFacts>,
     /// One allowance per caller, for **writes**.
     ///
     /// A mutex rather than anything cleverer: taking a token is a few integer
@@ -618,6 +645,112 @@ fn strongest(a: Role, b: Role) -> Role {
     if rank(&b) > rank(&a) { b } else { a }
 }
 
+/// The id of the row a public key gets.
+///
+/// Derived from the key rather than random, so a machine that re-announces —
+/// after a reboot, or because its answer was lost — lands on its own row
+/// instead of adding a second one to a list somebody has to read. Announcing
+/// in a loop costs one row.
+///
+/// Truncated to twelve hex characters: this is a name in a URL an operator
+/// sometimes types, and collision resistance is not what it is for — the key
+/// itself is stored and the signature is checked against that, so two keys
+/// landing on one id would be caught as a mismatched signature rather than as
+/// a machine let in by accident.
+fn enrollment_id(public_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(public_key.trim().as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("m-{hex}")
+}
+
+/// What an announcing machine is told.
+///
+/// Its own id, so it knows what to claim, and the two fingerprints it is about
+/// to print on its screen: its own, which an operator compares, and the one it
+/// saw on the certificate, which the operator compares against the cell's. No
+/// credential and no secret — there is nothing here worth keeping from anyone.
+fn announced_body(id: &str, status: &velstra_cloud_model::enrollment::EnrollmentStatus) -> Value {
+    serde_json::json!({
+        "enrollment": format!("enrollments/{id}"),
+        "id": id,
+        "fingerprint": status.fingerprint,
+        "seenCertificate": status.seen_certificate,
+        "phase": status.phase,
+        "expiresAt": status.expires_at.0,
+    })
+}
+
+/// Which shape of join artefact a caller asked for.
+/// How long a cut medium waits to be collected. A browser follows the link
+/// at once; ten minutes is for a `curl` somebody types.
+const MEDIUM_TTL_MS: u64 = 10 * 60 * 1000;
+
+/// A medium cut for one machine, waiting under a one-time ticket.
+pub struct Medium {
+    pub filename: String,
+    /// The installer ISO, as the release fetched it.
+    pub iso: std::path::PathBuf,
+    /// ISO plus trailer, for `Content-Length`.
+    pub size: u64,
+    /// The join file for this machine, as the bytes that follow the ISO.
+    pub trailer: Vec<u8>,
+    pub expires: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinArtifact {
+    /// The file the installer looks for on anything plugged in.
+    File,
+    /// A `#cloud-config` that writes that file and installs against it.
+    CloudInit,
+}
+
+/// The file to drop at `velstra/join` on a stick.
+///
+/// A comment line above the token, because the file will be found by somebody
+/// who did not write it — possibly a year later, possibly on a stick with
+/// three others on it — and a naked kilobyte of base64 says nothing about
+/// which machine it belongs to. The installer reads past comments for exactly
+/// this reason.
+fn join_file(node: &str, cell: &str, join: &str) -> String {
+    format!(
+        "# Velstra Cloud join token for node {node} in cell {cell}.\n\
+         # Drop this file at velstra/join on any medium you plug into the\n\
+         # machine; the installer offers it by name. It is a credential:\n\
+         # anything holding it can register as {node}.\n\
+         {join}\n"
+    )
+}
+
+/// The same token, for a machine that boots Debian or Ubuntu and runs
+/// cloud-init.
+///
+/// `write_files` and then the installer against that file — never the token on
+/// the command line, which would put it in `ps` for every user on the machine
+/// and in cloud-init's own logs. 0600 and owned by root for the same reason.
+fn cloud_config(node: &str, join: &str) -> String {
+    format!(
+        "#cloud-config\n\
+         # Velstra Cloud: make this machine node {node}.\n\
+         #\n\
+         # The package is not installed from here: which repository a fleet\n\
+         # takes it from is the fleet's decision, and a cloud-config that\n\
+         # pulled a binary from an address this platform chose would be one\n\
+         # nobody could audit. Install velstra-cloud first, by whatever means\n\
+         # you install packages, then this seeds it.\n\
+         write_files:\n\
+         \x20 - path: /etc/velstra/join\n\
+         \x20   permissions: '0600'\n\
+         \x20   owner: root:root\n\
+         \x20   content: |\n\
+         \x20     {join}\n\
+         runcmd:\n\
+         \x20 - [ velstra-cloud-node, setup, --join-file, /etc/velstra/join ]\n\
+         \x20 - [ shred, -u, /etc/velstra/join ]\n"
+    )
+}
+
 impl Api {
     pub fn new(
         store: Arc<dyn Store>,
@@ -658,6 +791,11 @@ impl Api {
             // cluster or none. Not enforced by the type — the refusal belongs
             // where it can say why, which is `create` below.
             collection!("ceph-clusters", CephClusterSpec, CephClusterStatus),
+            collection!(
+                "enrollments",
+                velstra_cloud_model::enrollment::EnrollmentSpec,
+                velstra_cloud_model::enrollment::EnrollmentStatus
+            ),
             collection!("instances", InstanceSpec, InstanceStatus),
             collection!("volumes", VolumeSpec, VolumeStatus),
             collection!("snapshots", SnapshotSpec, SnapshotStatus),
@@ -732,6 +870,16 @@ impl Api {
                 velstra_cloud_model::backup::BackupScheduleStatus
             ),
             collection!(
+                "releases",
+                velstra_cloud_model::release::ReleaseSpec,
+                velstra_cloud_model::release::ReleaseStatus
+            ),
+            collection!(
+                "rollouts",
+                velstra_cloud_model::rollout::RolloutSpec,
+                velstra_cloud_model::rollout::RolloutStatus
+            ),
+            collection!(
                 "maintenance-windows",
                 velstra_cloud_model::maintenance::MaintenanceWindowSpec,
                 velstra_cloud_model::maintenance::MaintenanceWindowStatus
@@ -742,6 +890,8 @@ impl Api {
         ]);
         Self {
             inner: Arc::new(Inner {
+                releases_dir: None,
+                media: std::sync::Mutex::new(BTreeMap::new()),
                 // Named afterwards with `with_console_dir`, if this machine
                 // has one. A cell with none serves its built-in page.
                 console: None,
@@ -756,6 +906,7 @@ impl Api {
                 placement: Placement::new(region, cell),
                 verifier: verifier.clone(),
                 identity: crate::sessions::IdentityStore::new(store.clone(), region, cell),
+                join: None,
                 limiter: std::sync::Mutex::new(velstra_cloud_model::limit::Limiter::new()),
                 // Off unless a caller asks for it: a limiter is about one
                 // tenant taking the write path from another, and a cell with
@@ -943,6 +1094,14 @@ impl Api {
         if self.may_see_machines(who) {
             return;
         }
+        // The client keyring is published on the cluster's status so every
+        // hypervisor can read it; it is still a credential, and nobody who is
+        // not an operator has a use for it.
+        if kind == "ceph-clusters"
+            && let Some(status) = document.get_mut("status").and_then(Value::as_object_mut)
+        {
+            status.remove("clientKeyring");
+        }
         // `captures` is the sixth door: the API itself writes the guest's
         // machine onto `spec.node` (it is the assignee — only the machine with
         // the disk can copy it), and the agent claims `status.node`. Both
@@ -1004,6 +1163,53 @@ impl Api {
     /// Named by the caller rather than read from the environment inside the
     /// handler, so a test can serve a console it wrote itself and two tests in
     /// the same process cannot disagree about which one this is.
+    /// Tell this API what to say to a machine that wants to join.
+    ///
+    /// `urls` are tried in order by the joiner and must be names the
+    /// certificate at `cert_pem` verifies for. They are, because the code that
+    /// writes `VELSTRA_ADVERTISE` is the code that chose the certificate's
+    /// names — one list, two consumers, and nothing here parses X.509 to check.
+    pub fn with_join_facts(mut self, urls: Vec<String>, cert_pem: String) -> Self {
+        let urls: Vec<String> = urls
+            .into_iter()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect();
+        if !urls.is_empty() && !cert_pem.trim().is_empty() {
+            Arc::get_mut(&mut self.inner)
+                .expect("with_join_facts is called before the Api is shared")
+                .join = Some(JoinFacts { urls, cert_pem });
+        }
+        self
+    }
+
+    /// The join token for a freshly issued credential, or `None` when this
+    /// API has nothing a stranger could reach.
+    fn join_token(
+        &self,
+        id: &str,
+        node_token: Option<&str>,
+        pool: Option<(&str, &str)>,
+    ) -> Option<String> {
+        let facts = self.inner.join.as_ref()?;
+        Some(
+            velstra_cloud_wire::join::JoinToken {
+                v: 1,
+                region: self.inner.placement.region.clone(),
+                cell: self.inner.placement.cell.clone(),
+                node: id.to_string(),
+                urls: facts.urls.clone(),
+                ca: facts.cert_pem.clone(),
+                token: node_token.unwrap_or_default().to_string(),
+                pool: pool.map(|(id, token)| velstra_cloud_wire::join::PoolJoin {
+                    id: id.to_string(),
+                    token: token.to_string(),
+                }),
+            }
+            .encode(),
+        )
+    }
+
     pub fn with_console_dir(mut self, dir: &std::path::Path) -> Self {
         let read = crate::console_files::Console::read(dir).map(Arc::new);
         let inner =
@@ -1038,6 +1244,15 @@ impl Api {
         let inner =
             Arc::get_mut(&mut self.inner).expect("signing keys are named before the API is shared");
         inner.image_signing_keys = keys;
+        self
+    }
+
+    /// Where releases live on this machine. See `install_medium` and
+    /// `release_file`.
+    pub fn with_releases_dir(mut self, dir: std::path::PathBuf) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("the releases dir is named before the API is shared");
+        inner.releases_dir = Some(dir);
         self
     }
 
@@ -2878,6 +3093,7 @@ impl Api {
                     target: record.target,
                     node_token: None,
                     pool_token: None,
+                    join_token: None,
                 },
                 true,
             ));
@@ -2952,6 +3168,11 @@ impl Api {
         // going too fast first — which is true, and which they discover the
         // moment they slow down.
         self.may_write_now(who)?;
+        let admission = velstra_cloud_store::Admission::read(
+            self.inner.store.as_ref(),
+            &self.inner.placement.cell,
+        )
+        .await?;
         // Authorised on the **parent**, because the object does not exist yet
         // and has no bindings of its own. Creating inside a project is a write
         // to that project; creating without one is a write to the cell.
@@ -3046,6 +3267,8 @@ impl Api {
                 .await?;
         }
         if kind == "instances" {
+            self.refuse_a_boot_volume_that_is_not_free(parent, &name, &spec)
+                .await?;
             self.refuse_a_device_this_project_was_not_given(&spec, allowed_in, who)
                 .await?;
             self.refuse_a_port_two_guests_would_share(&name, &spec)
@@ -3263,7 +3486,7 @@ impl Api {
         }
         let meta = serde_json::to_value(&meta).expect("meta always serialises");
         let created = collection
-            .create(meta, spec)
+            .create_admitted(meta, spec, admission)
             .await
             .map_err(|e| taken(e, kind, &name))?;
 
@@ -3292,11 +3515,17 @@ impl Api {
             None
         };
         self.record_change(who, "create", &name).await;
+        let join_token = match (&node_token, &pool_token) {
+            (Some(t), _) => self.join_token(name.id(), Some(t), None),
+            (None, Some(t)) => self.join_token(name.id(), None, Some((name.id(), t))),
+            (None, None) => None,
+        };
         Ok(Created {
             operation,
             target: name.to_string(),
             node_token,
             pool_token,
+            join_token,
         })
     }
 
@@ -3536,6 +3765,7 @@ impl Api {
                 let patch = crate::collection::Patch {
                     spec: Some(serde_json::json!({ "bindings": left })),
                     labels: None,
+                    status: None,
                 };
                 let Ok(collection) = self.collection(kind) else {
                     continue;
@@ -3567,6 +3797,767 @@ impl Api {
     /// into a file would otherwise take the agent down while fixing it — and it
     /// is why this is `issueCredential` rather than `rotateCredential`, which
     /// would be a name promising the other thing.
+    /// A machine announcing itself to this cell.
+    ///
+    /// ## The one unauthenticated write
+    ///
+    /// Every other write here demands a token. This one cannot: the caller is
+    /// a machine that has just booted an installer and holds nothing. So it is
+    /// bounded rather than trusted, in four ways, and each bound is the reason
+    /// the door can exist at all:
+    ///
+    /// * **It grants nothing.** The object it makes is a request. It carries
+    ///   no credential, and an operator has to name the machine and say what
+    ///   it is for before anything can be claimed.
+    /// * **It is idempotent in the machine's own key.** The id is derived from
+    ///   the public key, so a machine that reboots, or whose answer was lost,
+    ///   lands on its own row again instead of adding a second. Announcing in
+    ///   a loop costs one row.
+    /// * **It is capped.** Past
+    ///   [`velstra_cloud_model::enrollment::MAX_PENDING`] unsettled rows the
+    ///   door closes, by name. A stranger can make this collection grow, and
+    ///   this is where that stops.
+    /// * **What it says about itself decides nothing.** The reported hardware
+    ///   is shown to a person and matched against no policy.
+    ///
+    /// The authentication happens afterwards and is a person: the fingerprint
+    /// of the key is on the machine's screen and on the operator's, and the
+    /// comparison is the whole of it. See
+    /// [`velstra_cloud_model::enrollment`].
+    pub async fn announce(&self, body: &Value) -> ApiResult<Value> {
+        use velstra_cloud_model::enrollment as en;
+
+        // Snake-cased: every body reaching this crate has been through
+        // `from_wire`, which is what turns the `publicKey` a client sends into
+        // the spelling the stored form uses. Reading the camel spelling here
+        // would be reading a key that is never present.
+        let public_key = body
+            .get("public_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if public_key.is_empty() {
+            return Err(ApiError::invalid(
+                "an announcement carries the machine's public key; the fingerprint of it is what \
+                 an operator compares against the machine's own screen",
+            )
+            .at("publicKey"));
+        }
+        // A length bound before anything is decoded. This is a stranger's
+        // string on an unauthenticated door.
+        if public_key.len() > 512 {
+            return Err(ApiError::invalid(
+                "that is not a public key: one line of base64, at most 512 characters",
+            )
+            .at("publicKey"));
+        }
+        // One spelling, so a client that pads differently on its second
+        // announce lands on its own row rather than a second one. Everything
+        // below — the id, the fingerprint, the signature check — is a function
+        // of this string.
+        let public_key = en::canonical_key(public_key)
+            .map_err(|e| ApiError::invalid(e.to_string()).at("publicKey"))?;
+        let public_key = public_key.as_str();
+        let reported: en::Reported = match body.get("reported") {
+            None | Some(Value::Null) => en::Reported::default(),
+            Some(raw) => serde_json::from_value(raw.clone()).map_err(|e| {
+                ApiError::invalid(format!("reported is not what a machine reports: {e}"))
+                    .at("reported")
+            })?,
+        };
+        let seen = body
+            .get("seen_certificate")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+
+        let collection = self.collection("enrollments")?;
+        let id = enrollment_id(public_key);
+        let name = format!("enrollments/{id}");
+        let now = Timestamp::now().0;
+
+        // Its own row, if it has one. A machine that re-announces is the
+        // ordinary case — it polls, it reboots, its answer is lost — and every
+        // one of those must land here rather than on a new row.
+        if let Some(existing) = collection.get(&name).await? {
+            let spec: en::EnrollmentSpec =
+                serde_json::from_value(existing.get("spec").cloned().unwrap_or(Value::Null))
+                    .unwrap_or_default();
+            let status: en::EnrollmentStatus =
+                serde_json::from_value(existing.get("status").cloned().unwrap_or(Value::Null))
+                    .unwrap_or_default();
+            // Already through the door: say so rather than reopening it. A
+            // claimed row is a machine that is now a node, and a refused one is
+            // an answer somebody gave.
+            if status.phase == en::EnrollmentPhase::Claimed || spec.refused {
+                return Ok(announced_body(&id, &status));
+            }
+            // Otherwise this is the same machine saying it is still here: the
+            // facts it reports are refreshed and the clock is wound back on.
+            let mut fresh = en::announced(public_key, seen, reported, now);
+            fresh.cell_certificate = self.own_certificate_fingerprint();
+            fresh.phase = if spec.approved {
+                en::EnrollmentPhase::Approved
+            } else {
+                en::EnrollmentPhase::Pending
+            };
+            let written = collection
+                .report_status(
+                    &name,
+                    &serde_json::to_value(&fresh).expect("a status serialises"),
+                    None,
+                    &velstra_cloud_model::access::Writer::controller("enrollment"),
+                )
+                .await?;
+            let status: en::EnrollmentStatus =
+                serde_json::from_value(written.get("status").cloned().unwrap_or(Value::Null))
+                    .unwrap_or_default();
+            return Ok(announced_body(&id, &status));
+        }
+
+        // A new row, and the only place the cap applies: a machine that
+        // already has one is not making the collection grow.
+        let unsettled = collection
+            .list()
+            .await?
+            .iter()
+            .filter(|row| {
+                serde_json::from_value::<en::EnrollmentStatus>(
+                    row.get("status").cloned().unwrap_or(Value::Null),
+                )
+                .map(|s| !s.phase.settled())
+                .unwrap_or(false)
+            })
+            .count();
+        if unsettled >= en::MAX_PENDING {
+            return Err(ApiError::new(
+                Code::ResourceExhausted,
+                format!(
+                    "this cell is already holding {} machines waiting to be let in, which is \
+                     the most it keeps. Approve or turn away what is there; an unanswered \
+                     announcement expires by itself within the hour.",
+                    en::MAX_PENDING
+                ),
+            ));
+        }
+
+        // Built through `Meta::new`, not hand-written JSON: the name is a
+        // structured `ResourceName` in the stored form, and a bare string
+        // there is refused with a message about `spec.approved` that has
+        // nothing to do with the mistake.
+        let resource = ResourceName::parse(&name)
+            .map_err(|e| ApiError::invalid(format!("the enrolment id is not a name: {e}")))?;
+        let meta = velstra_cloud_model::meta::Meta::new(resource, self.inner.placement.clone());
+        let meta = serde_json::to_value(&meta).map_err(|e| {
+            ApiError::invalid(format!("the enrolment's metadata will not serialise: {e}"))
+        })?;
+        collection
+            .create(
+                meta,
+                serde_json::to_value(en::EnrollmentSpec::default()).expect("a spec"),
+            )
+            .await?;
+        let mut status = en::announced(public_key, seen, reported, now);
+        // What this cell actually serves, so the console can say whether the
+        // machine saw it — by arithmetic, not by asking a person to compare a
+        // second number.
+        status.cell_certificate = self.own_certificate_fingerprint();
+        let written = collection
+            .report_status(
+                &name,
+                &serde_json::to_value(&status).expect("a status serialises"),
+                None,
+                &velstra_cloud_model::access::Writer::controller("enrollment"),
+            )
+            .await?;
+        let status: en::EnrollmentStatus =
+            serde_json::from_value(written.get("status").cloned().unwrap_or(Value::Null))
+                .unwrap_or_default();
+        // And the Node it is asking to become, so it appears where an operator
+        // looks for a new machine: under Nodes, beside the others. Held out of
+        // service until somebody approves it — see `hold_a_node`.
+        if let Some(node) = self.hold_a_node(&status, &id).await {
+            let _ = collection
+                .patch(
+                    &name,
+                    &crate::collection::Patch {
+                        spec: Some(serde_json::json!({ "node": node })),
+                        labels: None,
+                        status: None,
+                    },
+                    None,
+                )
+                .await;
+        }
+        Ok(announced_body(&id, &status))
+    }
+
+    /// The fingerprint of the certificate this API serves, as the banner on
+    /// its own console prints it — SHA-256 over the DER, colon-separated hex.
+    ///
+    /// Computed from the same PEM the join token carries, so the three places
+    /// a person can see this value (the banner, the join token's `ca`, and an
+    /// enrolment's `cellCertificate`) are one value. Empty when the API was
+    /// never told its certificate, and the console reads empty as "cannot
+    /// tell" rather than as a mismatch.
+    fn own_certificate_fingerprint(&self) -> String {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let Some(facts) = self.inner.join.as_ref() else {
+            return String::new();
+        };
+        let body: String = facts
+            .cert_pem
+            .lines()
+            .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("-----END CERTIFICATE-----"))
+            .collect();
+        let Ok(der) = base64::engine::general_purpose::STANDARD.decode(body.trim()) else {
+            return String::new();
+        };
+        Sha256::digest(&der)
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    /// Make the Node a machine is asking to become, out of service.
+    ///
+    /// ## Why the object exists before anybody has said yes
+    ///
+    /// Because that is where an operator looks for a new machine. A separate
+    /// list of pending things is a second place to remember, and the first
+    /// person to use this said so: *"am besten ist es, wenn er unter den
+    /// anderen Nodes ist"*. The row shows up under Nodes with nothing heard
+    /// from it, not schedulable, and a label pointing at the enrolment that
+    /// carries the fingerprint to compare.
+    ///
+    /// ## Why that is safe on an unauthenticated door
+    ///
+    /// Four things hold it down, and the object is worth nothing without all
+    /// of them:
+    ///
+    /// * **It has no credential.** Nothing can report as this node, or read
+    ///   the cell as it, until a claim mints one — and a claim needs a
+    ///   person's approval.
+    /// * **It is not schedulable.** The scheduler will not place anything on
+    ///   it, so an unapproved row cannot receive a guest.
+    /// * **It cannot take a name that exists.** The create is allowed to fail,
+    ///   and failing is the correct outcome: a machine announcing itself as
+    ///   `horst` must not land on the control plane's own object.
+    /// * **It does not outlive the request.** The sweep deletes it with the
+    ///   enrolment when nobody answers within the hour, so a rack flashed by
+    ///   mistake tidies itself up.
+    ///
+    /// Returns the id when one was made, so the enrolment can be prefilled
+    /// with it and an operator is not asked to type a name the machine already
+    /// knows.
+    async fn hold_a_node(
+        &self,
+        status: &velstra_cloud_model::enrollment::EnrollmentStatus,
+        enrolment: &str,
+    ) -> Option<String> {
+        let id = velstra_cloud_model::enrollment::suggested_node_id(&status.reported.hostname)?;
+        let nodes = self.collection("nodes").ok()?;
+        let full = format!("nodes/{id}");
+        // Taken already: leave it entirely alone. Somebody else's machine, or
+        // this one announcing a second time after it was approved.
+        if nodes.get(&full).await.ok().flatten().is_some() {
+            return None;
+        }
+        let resource = ResourceName::parse(&full).ok()?;
+        let mut meta = velstra_cloud_model::meta::Meta::new(resource, self.inner.placement.clone());
+        // The thread between the two objects, and what the console reads to
+        // know this row is waiting rather than broken.
+        meta.labels.insert(
+            velstra_cloud_model::enrollment::AWAITING_LABEL.to_string(),
+            enrolment.to_string(),
+        );
+        nodes
+            .create(
+                serde_json::to_value(&meta).ok()?,
+                serde_json::json!({ "schedulable": false }),
+            )
+            .await
+            .ok()?;
+        Some(id)
+    }
+
+    /// A machine collecting the credential an operator approved for it.
+    ///
+    /// ## What authorises this
+    ///
+    /// Not a token — the machine still has none. Two things, both recorded
+    /// before this is called:
+    ///
+    /// * **A signature** over this enrolment's id, under the key the machine
+    ///   announced. That proves the caller is the machine whose fingerprint an
+    ///   operator compared, and not somebody who read the id off a list.
+    /// * **An operator's approval**, which carries *who* approved it. The
+    ///   credential is minted as that person, so the audit line names the
+    ///   human who made the decision rather than a service identity nobody
+    ///   can ask about.
+    ///
+    /// The second is why there is no new privilege here. A machine cannot
+    /// register itself and the API does not act on its own behalf: it acts on
+    /// the recorded authority of somebody who may already create nodes, once,
+    /// for the one node they named.
+    pub async fn claim(&self, name: &ResourceName, body: &Value) -> ApiResult<Value> {
+        use velstra_cloud_model::enrollment as en;
+
+        if name.collection() != "enrollments" {
+            return Err(ApiError::invalid(format!(
+                "a claim is made against an enrolment, and {name} is a {}",
+                name.collection()
+            )));
+        }
+        let signature = body
+            .get("signature")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if signature.is_empty() {
+            return Err(ApiError::invalid(
+                "a claim carries a signature over this enrolment's id, made with the key the \
+                 machine announced",
+            )
+            .at("signature"));
+        }
+        if signature.len() > 256 {
+            return Err(ApiError::invalid("that is not an Ed25519 signature").at("signature"));
+        }
+
+        let collection = self.collection("enrollments")?;
+        // Not found and not-yours are the same answer here, deliberately: this
+        // door is open to anybody, and one that distinguished them would let a
+        // stranger enumerate which machines have announced.
+        let unknown = || {
+            ApiError::new(
+                Code::NotFound,
+                "no machine has announced itself under that id, or this signature was not made \
+                 by the one that did",
+            )
+        };
+        let stored = collection
+            .get(&name.to_string())
+            .await?
+            .ok_or_else(unknown)?;
+        let spec: en::EnrollmentSpec =
+            serde_json::from_value(stored.get("spec").cloned().unwrap_or(Value::Null))
+                .unwrap_or_default();
+        let status: en::EnrollmentStatus =
+            serde_json::from_value(stored.get("status").cloned().unwrap_or(Value::Null))
+                .unwrap_or_default();
+
+        // The signature first, before any of the state is described back. A
+        // caller who cannot prove it holds the key learns nothing about
+        // whether the machine was approved, named, or turned away.
+        en::verify_claim(&status.public_key, name.id(), signature).map_err(|_| unknown())?;
+
+        let now = Timestamp::now().0;
+        en::claimable(&spec, &status, now).map_err(|why| match why {
+            en::NotClaimable::NotApproved => {
+                ApiError::new(Code::FailedPrecondition, why.to_string())
+            }
+            en::NotClaimable::Refused => ApiError::forbidden(why.to_string()),
+            _ => ApiError::new(Code::FailedPrecondition, why.to_string()),
+        })?;
+
+        // Whoever approved it. The credential is minted as them, so the audit
+        // trail names a person; an enrolment approved by nobody cannot be
+        // claimed, which `claimable` has already refused above.
+        if status.approved_by.trim().is_empty() {
+            // Approved with nobody recorded. `patch` writes the approver as it
+            // writes the flag, so this is a row from a build that did not — or
+            // one whose recording write was lost — and minting a credential on
+            // an authority nobody can name is the one thing this door must not
+            // do.
+            //
+            // It used to say "turn it away and let the machine announce
+            // again", which was true and useless: the operator had approved a
+            // machine and was told to start over for a reason about this
+            // platform's bookkeeping. The refusal now says what actually
+            // clears it, and approving again does — the flag is already set,
+            // the patch is still a write, and the hook records the person
+            // making it.
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                "this machine was approved before the cell recorded who approved it, and a \
+                 credential is only ever minted on a person's authority. Press Approve once \
+                 more and it goes through — the machine is still waiting and keeps its place.",
+            ));
+        }
+        // The person who approved, for the audit line — and *only* for the
+        // audit line.
+        //
+        // This used to rebuild an `Identity` from the recorded name and call
+        // `create`, `patch` and `issue_credential` as them, and every one of
+        // those refused: an identity rebuilt from a name carries no scopes,
+        // and the cell-admin authority lives in a scope a real session has.
+        // So a machine an operator had just approved was told "only a cell
+        // operator may make it" — by the platform, about the operator.
+        //
+        // The authorisation happened when the approval was written: that PATCH
+        // went through `authorize` as a real session, and this row records who
+        // it was. A claim *executes* that decision. It writes through the
+        // collections as the platform, the way the announce did, and names the
+        // person in the audit — the same shape as every controller acting on a
+        // spec somebody was allowed to write.
+        let approver = Identity::new(status.approved_by.trim().to_string());
+
+        let node_id = spec.node.trim().to_string();
+        let node = ResourceName::parse(&format!("nodes/{node_id}"))
+            .map_err(|e| ApiError::invalid(format!("the approved node name is not one: {e}")))?;
+        let nodes = self.collection("nodes")?;
+        // Created if absent, taken into service if the announcement already
+        // made it. An operator who made the Node first and then approved the
+        // machine meant one machine, not two.
+        match nodes.get(&node.to_string()).await? {
+            None => {
+                let meta = velstra_cloud_model::meta::Meta::new(
+                    node.clone(),
+                    self.inner.placement.clone(),
+                );
+                let meta = serde_json::to_value(&meta).map_err(|e| {
+                    ApiError::invalid(format!("the node's metadata will not serialise: {e}"))
+                })?;
+                nodes
+                    .create(meta, serde_json::json!({ "schedulable": true }))
+                    .await?;
+                self.record_change(&approver, "create", &node).await;
+            }
+            Some(_) => {
+                // Out of the waiting state: schedulable, and the label gone.
+                // The label is what the sweep matches on, so leaving it would
+                // mean an old enrolment expiring an hour later deletes a node
+                // that is by then running guests — quietly, and at the worst
+                // moment. Removing it here is what makes that unreachable.
+                nodes
+                    .patch(
+                        &node.to_string(),
+                        &crate::collection::Patch {
+                            spec: Some(serde_json::json!({ "schedulable": true })),
+                            labels: Some(serde_json::json!({
+                                velstra_cloud_model::enrollment::AWAITING_LABEL: Value::Null
+                            })),
+                            status: None,
+                        },
+                        None,
+                    )
+                    .await?;
+                self.record_change(&approver, "update", &node).await;
+            }
+        }
+        // The credential, minted the way `:issueCredential` mints one, without
+        // the authorisation step that call makes — for the reason above.
+        let token = self
+            .inner
+            .identity
+            .mint_agent_credential_for(
+                &node_id,
+                velstra_cloud_model::identity::AgentKind::Node,
+                None,
+                "enrolment",
+            )
+            .await?;
+        let join = self
+            .join_token(&node_id, Some(&token), None)
+            .ok_or_else(|| {
+                ApiError::invalid(
+                    "this API was not told what to advertise, so a join token would name no \
+                 address a machine could reach",
+                )
+            })?;
+        let mut issued = Map::new();
+        issued.insert("target".into(), Value::String(node.to_string()));
+        issued.insert("nodeToken".into(), Value::String(token));
+        issued.insert("joinToken".into(), Value::String(join));
+        let issued = Value::Object(issued);
+
+        // Claimed, once. Written before the answer goes out: a claim whose
+        // answer is lost must not mint a second credential, and the machine
+        // that lost it announces again rather than asking twice.
+        let mut settled = status.clone();
+        settled.phase = en::EnrollmentPhase::Claimed;
+        settled.claimed_at = Some(velstra_cloud_model::meta::Timestamp(now));
+        collection
+            .report_status(
+                &name.to_string(),
+                &serde_json::to_value(&settled).expect("a status serialises"),
+                None,
+                &velstra_cloud_model::access::Writer::controller("enrollment"),
+            )
+            .await?;
+        Ok(issued)
+    }
+
+    /// What the platform hands somebody who is about to install a machine.
+    ///
+    /// ## Why a file and not a seed
+    ///
+    /// The obvious endpoint here is "give me this node's `node.env`", and it
+    /// is the wrong one: the join token already carries every fact the cell
+    /// knows, and `velstra-cloud-node setup --join` already turns it into a
+    /// seed. A second renderer would be a second place that has to agree
+    /// about the same keys — which is the mistake this codebase has now paid
+    /// for four times over (two seed renderers and only one knowing
+    /// `VELSTRA_ROLES`; a bootstrap password written to one directory and read
+    /// from another; five keys rendered and never parsed back). So this mints
+    /// the token and formats it, and the machine's own installer is the only
+    /// thing that turns facts into a seed.
+    ///
+    /// ## What the two flavours are for
+    ///
+    /// `JoinArtifact::File` is exactly the file the installer looks for on
+    /// anything plugged in: drop it at `velstra/join` on a stick and the
+    /// wizard offers it by name. `JoinArtifact::CloudInit` is the same token
+    /// wrapped in a `#cloud-config` that writes the file and runs the
+    /// installer against it — the Debian and Ubuntu door, where the useful
+    /// artefact was never an image but the small thing cloud-init already
+    /// wants.
+    pub async fn join_artifact(
+        &self,
+        name: &ResourceName,
+        flavour: JoinArtifact,
+        who: &Identity,
+    ) -> ApiResult<String> {
+        if name.collection() != "nodes" {
+            return Err(ApiError::invalid(format!(
+                "a join file is for a node, and {name} is a {}",
+                name.collection()
+            )));
+        }
+        // The same permission as `:issueCredential`, because this *is* that —
+        // a machine credential, formatted for a stick. Somebody who may run
+        // the estate may not hand out the credential a machine speaks with.
+        self.authorize_for(who, Verb::Write, name, "nodes").await?;
+        self.get(name, who).await?;
+        let token = self
+            .inner
+            .identity
+            .mint_agent_credential_for(
+                name.id(),
+                velstra_cloud_model::identity::AgentKind::Node,
+                None,
+                // Said in the credential list, so an operator looking at three
+                // of them can tell which one went out on a stick.
+                "join file",
+            )
+            .await?;
+        let join = self
+            .join_token(name.id(), Some(&token), None)
+            .ok_or_else(|| {
+                ApiError::invalid(
+                    "this API was not told what to advertise, so a join token would name no \
+                 address a machine could reach. Start it with --advertise (or \
+                 VELSTRA_ADVERTISE); on the appliance `velstra-cell-tls` writes it.",
+                )
+            })?;
+        Ok(match flavour {
+            JoinArtifact::File => join_file(name.id(), &self.inner.placement.cell, &join),
+            JoinArtifact::CloudInit => cloud_config(name.id(), &join),
+        })
+    }
+
+    /// Cut an install medium for one machine: the installer ISO a release
+    /// holds, with this node's join file on its tail — one download, one
+    /// stick, no typing. See `velstra_cloud_wire::join::trailer`.
+    ///
+    /// Answers with a link and not with the bytes, because two gigabytes are
+    /// not a thing to hand a `fetch()` that will hold them in a browser's
+    /// memory to make a download of. The link is a one-time ticket that
+    /// `GET /api/v1/media/<ticket>` collects without a token, the way a console
+    /// ticket is — minted here on this person's authority, spent once, gone in
+    /// ten minutes. Minted, because it carries a credential: the join file is
+    /// `:joinFile`'s, and this is audited as that is.
+    pub async fn install_medium(
+        &self,
+        name: &ResourceName,
+        ask: &Value,
+        who: &Identity,
+    ) -> ApiResult<Value> {
+        use velstra_cloud_model::release::{ReleaseSpec, ReleaseStatus};
+
+        if name.collection() != "nodes" {
+            return Err(ApiError::invalid(format!(
+                "an install medium is cut for a node, and {name} is a {}",
+                name.collection()
+            )));
+        }
+        // Authorised before anything about releases is said: a caller who may
+        // not cut a medium learns nothing about what the cell holds.
+        self.authorize_for(who, Verb::Write, name, "nodes").await?;
+        self.get(name, who).await?;
+        let Some(dir) = self.inner.releases_dir.clone() else {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                "this API keeps no releases: start it with --releases-dir (VELSTRA_RELEASES_DIR). \
+                 The appliance and the package point it at /var/lib/velstra/releases.",
+            ));
+        };
+        let releases: Vec<Resource<ReleaseSpec, ReleaseStatus>> =
+            self.typed_list("", "releases").await?;
+        let asked = ask
+            .get("release")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        let release = match asked {
+            Some(named) => releases
+                .iter()
+                .find(|r| r.meta.name.to_string() == named || r.meta.name.id() == named)
+                .ok_or_else(|| ApiError::not_found(format!("release {named}")))?,
+            // Left to the cell: the newest release whose installer is here.
+            None => releases
+                .iter()
+                .filter(|r| r.status.installer.as_ref().is_some_and(|a| a.fetched))
+                .max_by_key(|r| r.meta.created_at)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        Code::FailedPrecondition,
+                        "no release on this cell holds an installer yet. Add one under Releases — \
+                         the channel a published version was downloaded from — and cut the medium \
+                         once it is ready.",
+                    )
+                })?,
+        };
+        let installer = release
+            .status
+            .installer
+            .as_ref()
+            .filter(|a| a.fetched)
+            .ok_or_else(|| {
+                ApiError::new(
+                    Code::FailedPrecondition,
+                    match &release.status.installer {
+                        None => format!(
+                            "{} names no installer; a medium is cut from the installer ISO a \
+                             release publishes",
+                            release.meta.name
+                        ),
+                        Some(_) => format!(
+                            "{} holds no installer yet: {}",
+                            release.meta.name,
+                            release.status.not_ready_because()
+                        ),
+                    },
+                )
+            })?;
+        let iso = dir.join(release.meta.name.id()).join(&installer.file);
+        let size = tokio::fs::metadata(&iso)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "{} is recorded as fetched and is not on this disk ({e}); delete the \
+                         release and add it again",
+                        installer.file
+                    ),
+                )
+            })?
+            .len();
+        // The join file exactly as `:joinFile` hands it out: authorised the
+        // same way, minted the same way.
+        let text = self.join_artifact(name, JoinArtifact::File, who).await?;
+        let trailer = velstra_cloud_wire::join::trailer(&text);
+        let now = Timestamp::now();
+        let ticket = uuid::Uuid::new_v4().to_string();
+        let filename = format!(
+            "velstra-cloud-installer_{}_{}.iso",
+            release.status.version,
+            name.id()
+        );
+        let expires = Timestamp(now.0 + MEDIUM_TTL_MS);
+        let total = size + trailer.len() as u64;
+        {
+            let mut media = self.inner.media.lock().unwrap();
+            media.retain(|_, m| m.expires > now);
+            media.insert(
+                velstra_cloud_model::console::sha256_hex(&ticket),
+                Medium {
+                    filename: filename.clone(),
+                    iso,
+                    size: total,
+                    trailer,
+                    expires,
+                },
+            );
+        }
+        self.record_change(who, "installMedium", name).await;
+        Ok(json!({
+            "url": format!("/api/v1/media/{ticket}"),
+            "filename": filename,
+            "release": release.meta.name.to_string(),
+            "version": release.status.version,
+            "size": total,
+            "expiresAt": expires.0,
+        }))
+    }
+
+    /// Collect a cut medium, once. Nothing under that ticket afterwards.
+    pub fn take_medium(&self, ticket: &str) -> Option<Medium> {
+        let now = Timestamp::now();
+        let mut media = self.inner.media.lock().unwrap();
+        media.retain(|_, m| m.expires > now);
+        media.remove(&velstra_cloud_model::console::sha256_hex(ticket))
+    }
+
+    /// Where a release's file is on this disk, for a node fetching what it was
+    /// told to run, or an operator.
+    ///
+    /// Only a file the release's own status names, and only once it is
+    /// recorded as fetched — so what is served is what was verified, and a
+    /// name is never a path.
+    pub async fn release_file(
+        &self,
+        release: &str,
+        file: &str,
+        who: &Identity,
+    ) -> ApiResult<std::path::PathBuf> {
+        use velstra_cloud_model::release::{ReleaseSpec, ReleaseStatus, safe_file_name};
+
+        let agent = who
+            .scopes
+            .iter()
+            .any(|s| s.starts_with(crate::sessions::AGENT_SCOPE_PREFIX));
+        if !agent && !self.is_operator(who) {
+            return Err(ApiError::forbidden(
+                "a release's files are for the cell's machines and its operators",
+            ));
+        }
+        if !safe_file_name(file) {
+            return Err(ApiError::invalid(
+                "that is not the name of a file in a release",
+            ));
+        }
+        let Some(dir) = self.inner.releases_dir.clone() else {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                "this API keeps no releases: it was started without --releases-dir",
+            ));
+        };
+        let releases: Vec<Resource<ReleaseSpec, ReleaseStatus>> =
+            self.typed_list("", "releases").await?;
+        let found = releases
+            .iter()
+            .find(|r| r.meta.name.id() == release)
+            .ok_or_else(|| ApiError::not_found(format!("releases/{release}")))?;
+        let named = found
+            .status
+            .artefacts()
+            .into_iter()
+            .any(|(_, a)| a.file == file && a.fetched);
+        if !named {
+            return Err(ApiError::not_found(format!(
+                "releases/{release} holds no verified file called {file}"
+            )));
+        }
+        Ok(dir.join(release).join(file))
+    }
+
     pub async fn issue_credential(
         &self,
         name: &ResourceName,
@@ -3599,7 +4590,15 @@ impl Api {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let expires_at = match ask.get("expiresAt") {
+        // `expires_at`, not `expiresAt`. Every body reaching this crate has been
+        // through `from_wire`, which is what turns the spelling a client sends
+        // into the spelling the stored form uses — so the camel read here was a
+        // read of a key that is never present. An `expiresAt` a caller sent was
+        // accepted, ignored, and the credential issued with no end at all,
+        // including the end date already in the past that the contract promises
+        // to refuse by name. Found while wiring enrolment, which reads a body
+        // the same way.
+        let expires_at = match ask.get("expires_at") {
             None | Some(Value::Null) => None,
             Some(raw) => Some(velstra_cloud_model::meta::Timestamp(
                 raw.as_u64().ok_or_else(|| {
@@ -3632,7 +4631,15 @@ impl Api {
         } else {
             "poolToken"
         };
+        let join = if kind == "nodes" {
+            self.join_token(name.id(), Some(&token), None)
+        } else {
+            self.join_token(name.id(), None, Some((name.id(), &token)))
+        };
         body.insert(field.into(), Value::String(token));
+        if let Some(join) = join {
+            body.insert("joinToken".into(), Value::String(join));
+        }
         // No `operation`: nothing converges here. A create answers with one
         // because the object it made has not settled yet; a credential is
         // finished the moment it is in the answer, and a field naming an
@@ -3649,6 +4656,11 @@ impl Api {
         who: &Identity,
     ) -> ApiResult<Changed> {
         self.may_write_now(who)?;
+        let admission = velstra_cloud_store::Admission::read(
+            self.inner.store.as_ref(),
+            &self.inner.placement.cell,
+        )
+        .await?;
         // Changing who else may is a different permission from changing
         // anything else, or an editor is an admin one request later.
         let verb = if body
@@ -3699,6 +4711,7 @@ impl Api {
         let mut patch = Patch {
             spec: body.get("spec").cloned(),
             labels: body.get("meta").and_then(|m| m.get("labels")).cloned(),
+            status: None,
         };
         if let Some(spec) = &mut patch.spec {
             if name.collection() == "folders" || name.collection() == "projects" {
@@ -3921,7 +4934,28 @@ impl Api {
             )
             .at("spec"));
         }
-        let mut document = collection.patch(&name.to_string(), &patch, expect).await?;
+        // Approving a machine records who did it — in the same write as the
+        // flag, with the identity in hand. It used to be a second write after
+        // the first had succeeded, and a machine polling for its credential
+        // landed between the two: approved, with nobody recorded, and refused
+        // in words that told the operator to press Approve again. That was
+        // the error on the installer's screen the moment after Let it in. One
+        // revision now, so there is no between.
+        //
+        // In the status rather than the spec: the status is the platform's to
+        // write, so nothing a caller sends can set this, and `claim` mints the
+        // node's credential as this person. That is what makes "the machine
+        // registered itself" untrue — it registered on the recorded authority
+        // of somebody who may already create nodes, once, for the node they
+        // named. Without it the claim would need either a privilege of its own
+        // or a service identity, and both are new trust nobody would ever
+        // question again.
+        if name.collection() == "enrollments" {
+            patch.status = self.approver_stamp(name, &patch, who).await?;
+        }
+        let mut document = collection
+            .patch_admitted(&name.to_string(), &patch, expect, admission)
+            .await?;
         self.answer(&mut document, &mut Scratch::default()).await?;
         self.record_change(who, "update", name).await;
         // A change to the spec is work somebody has asked for and nobody has
@@ -3946,6 +4980,47 @@ impl Api {
             resource: document,
             operation,
         })
+    }
+
+    /// Who is approving, as the stamp the write carries — or nothing, when
+    /// this change is not an approval or the row already names its approver.
+    ///
+    /// Written once. A second approval by somebody else does not rewrite the
+    /// authority the machine will register under — the first person to say
+    /// yes is who said it. So a row approved by a build that lost the
+    /// recording, and approved again, takes the second person: the first was
+    /// never written down, and `claim` says so and asks for exactly this.
+    async fn approver_stamp(
+        &self,
+        name: &ResourceName,
+        patch: &Patch,
+        who: &Identity,
+    ) -> ApiResult<Option<Value>> {
+        let approving = patch
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.get("approved"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !approving {
+            return Ok(None);
+        }
+        let stored = self
+            .collection("enrollments")?
+            .get(&name.to_string())
+            .await?;
+        let recorded = stored
+            .as_ref()
+            .and_then(|row| row["status"]["approved_by"].as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if !recorded.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "approved_by": who.subject,
+            "phase": velstra_cloud_model::enrollment::EnrollmentPhase::Approved,
+        })))
     }
 
     /// Report the status of an object, as the node agent that owns it.
@@ -4929,14 +6004,9 @@ impl Api {
             return Ok(());
         };
         let instance = spec.get("instance").and_then(Value::as_str).unwrap_or("");
-        let held: Vec<velstra_cloud_model::resources::Attachment> = self
-            .typed_list(parent, "attachments")
-            .await
-            .unwrap_or_default();
+        let held: Vec<velstra_cloud_model::resources::Attachment> =
+            self.typed_list(parent, "attachments").await?;
         for a in held {
-            if a.meta.is_deleting() {
-                continue;
-            }
             if a.spec.volume == volume && a.spec.instance != instance {
                 return Err(ApiError::new(
                     Code::FailedPrecondition,
@@ -6485,6 +7555,120 @@ impl Api {
                     ),
                 )
                 .at(format!("spec.{field}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// A guest's root disk is one nothing else is holding.
+    ///
+    /// Booting from a volume makes it the guest's root: the machine opens it
+    /// read-write at start and keeps it open for as long as it runs. Two
+    /// machines with the same disk open is the corruption an attachment's
+    /// finalizer exists to prevent, and a *boot* disk is no different for being
+    /// first — so the same volume may not also be attached, and no second guest
+    /// may boot from it.
+    ///
+    /// Asked at the door because every part of it is knowable there, and
+    /// because the alternative is a guest that starts, writes, and finds out
+    /// later. What is deliberately *not* asked here is whether the machine that
+    /// ends up running this guest can reach the volume's pool: at create time
+    /// there is no machine yet. That is the scheduler's question, and it is
+    /// answered where placement is decided.
+    async fn refuse_a_boot_volume_that_is_not_free(
+        &self,
+        parent: &str,
+        instance: &ResourceName,
+        spec: &Value,
+    ) -> ApiResult<()> {
+        let Some(asked) = spec.get("boot_volume").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if asked.is_empty() {
+            return Ok(());
+        }
+        // Its own project's, and said as such. A name from somewhere else is a
+        // typo far more often than it is an attempt at anything, and the
+        // sentence that helps is the one that says where it looked.
+        let home = if parent.is_empty() {
+            String::new()
+        } else {
+            parent.to_string()
+        };
+        if !asked.starts_with(&format!("{home}/volumes/")) {
+            return Err(ApiError::invalid(format!(
+                "a guest boots from a volume in its own project. `{asked}` is not one of \
+                 {home}'s."
+            ))
+            .at("spec.bootVolume"));
+        }
+
+        let Ok(volumes) = self.collection("volumes") else {
+            return Ok(());
+        };
+        if !matches!(volumes.get(asked).await, Ok(Some(_))) {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "there is no volume called `{asked}`. A guest that boots from one needs it \
+                     to exist first — make the volume, from an image if it is to be bootable, \
+                     and name it here."
+                ),
+            )
+            .at("spec.bootVolume"));
+        }
+
+        // Held by an attachment, which is the same disk open twice.
+        if let Ok(attachments) = self.collection("attachments") {
+            let held = attachments.list().await.unwrap_or_default();
+            if let Some(holder) = held.iter().find(|a| {
+                a.get("spec")
+                    .and_then(|s| s.get("volume"))
+                    .and_then(Value::as_str)
+                    == Some(asked)
+            }) {
+                let by = holder
+                    .get("meta")
+                    .and_then(|m| m.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("something");
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "`{asked}` is attached by {by}, and a root disk is opened read-write for \
+                         as long as the guest runs. Detach it first, or boot from another volume."
+                    ),
+                )
+                .at("spec.bootVolume"));
+            }
+        }
+
+        // Held by another guest's boot.
+        if let Ok(instances) = self.collection("instances") {
+            let guests = instances.list().await.unwrap_or_default();
+            if let Some(other) = guests.iter().find(|g| {
+                g.get("spec")
+                    .and_then(|s| s.get("boot_volume"))
+                    .and_then(Value::as_str)
+                    == Some(asked)
+                    && g.get("meta")
+                        .and_then(|m| m.get("name"))
+                        .and_then(Value::as_str)
+                        != Some(instance.to_string().as_str())
+            }) {
+                let by = other
+                    .get("meta")
+                    .and_then(|m| m.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("another guest");
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "{by} already boots from `{asked}`. Two machines with the same root disk \
+                         open is the way to lose what is on it."
+                    ),
+                )
+                .at("spec.bootVolume"));
             }
         }
         Ok(())
@@ -8186,6 +9370,7 @@ impl Api {
         let view = velstra_cloud_model::ha::NodeView {
             name: node_name.clone(),
             last_heartbeat: node.status.last_heartbeat,
+            fenced_heartbeat: velstra_cloud_model::ha::confirmed_heartbeat(&node.meta.labels),
             fence_after_s: node.spec.fence_after_s,
             ready: velstra_cloud_model::meta::condition(&node.status.conditions, "Ready")
                 .is_some_and(|c| c.status == velstra_cloud_model::meta::ConditionStatus::True),
@@ -8210,6 +9395,7 @@ impl Api {
                 // are four different actions and a console branches on which.
                 let token = match &why {
                     N::PolicyIsLeave => "PolicyIsLeave",
+                    N::FenceNotConfirmed { .. } => "FenceNotConfirmed",
                     N::NotQuietLongEnough { .. } => "WaitingForFencing",
                     N::NodeDoesNotFence { .. } => "NodeDoesNotFence",
                     N::HoldsDevices { .. } => "HoldsDevices",
@@ -8682,7 +9868,7 @@ impl Api {
     {
         let collection = self.collection(kind)?;
         collection
-            .list()
+            .list_strict()
             .await?
             .into_iter()
             .filter(|document| under(document, parent))
@@ -9180,6 +10366,11 @@ pub fn created_body(created: &Created) -> Value {
     if let Some(token) = &created.pool_token {
         body.insert("poolToken".into(), Value::String(token.clone()));
     }
+    // The whole hand-off in one string, when this API can be reached at all.
+    // See docs/joining.md.
+    if let Some(join) = &created.join_token {
+        body.insert("joinToken".into(), Value::String(join.clone()));
+    }
     Value::Object(body)
 }
 
@@ -9618,4 +10809,82 @@ fn refuse_an_unusable_image_source(spec: &Value) -> ApiResult<()> {
         };
         ApiError::invalid(e.to_string()).at(field)
     })
+}
+
+/// The two artefacts are formatting, and formatting is where a file nobody can
+/// use comes from.
+#[cfg(test)]
+mod join_artifacts {
+    use super::*;
+
+    const TOKEN: &str = "velstra1.eyJ2IjoxfQ";
+
+    /// The installer reads past comments, so the file says which machine it is
+    /// for — it will be found by somebody who did not write it, possibly on a
+    /// stick with three others.
+    #[test]
+    fn the_file_says_which_machine_it_is_for() {
+        let text = join_file("peter", "cell-1", TOKEN);
+        assert!(text.contains("node peter"), "{text}");
+        assert!(text.contains("cell cell-1"), "{text}");
+        assert!(text.contains(TOKEN), "{text}");
+        // And that it is one, because a kilobyte of base64 on a stick in a
+        // drawer is otherwise indistinguishable from junk.
+        assert!(text.to_lowercase().contains("credential"), "{text}");
+        // On a line of its own: the installer tries each line before it tries
+        // the whole tail, and a token sharing a line with a comment marker
+        // would only ever be found by the slow path.
+        assert!(
+            text.lines().any(|l| l.trim() == TOKEN),
+            "the token shares its line: {text}"
+        );
+    }
+
+    /// cloud-init never sees the token on a command line: an argument is in
+    /// `ps` for every user on the machine, and this one registers a node.
+    #[test]
+    fn cloud_init_writes_a_file_and_never_an_argument() {
+        let text = cloud_config("peter", TOKEN);
+        assert!(text.starts_with("#cloud-config\n"), "{text}");
+        assert!(text.contains("write_files:"), "{text}");
+        assert!(text.contains("--join-file"), "{text}");
+        assert!(
+            !text.contains(&format!("--join, {TOKEN}")),
+            "the token reached a command line: {text}"
+        );
+        // 0600 and root, and gone afterwards: the file exists for the length
+        // of one boot, and in between it is a credential.
+        assert!(text.contains("'0600'"), "{text}");
+        assert!(text.contains("owner: root:root"), "{text}");
+        assert!(text.contains("shred"), "{text}");
+    }
+
+    /// Byte for byte, because cloud-init failing to parse this is a machine
+    /// that boots, does nothing, and says so only in its own log — and because
+    /// this exact text was checked through a YAML parser once, which is a thing
+    /// a test cannot do without taking a dependency for it. Pinning the output
+    /// is how that one check keeps counting.
+    #[test]
+    fn the_cloud_config_is_the_yaml_that_was_checked() {
+        let want = concat!(
+            "#cloud-config\n",
+            "# Velstra Cloud: make this machine node peter.\n",
+            "#\n",
+            "# The package is not installed from here: which repository a fleet\n",
+            "# takes it from is the fleet's decision, and a cloud-config that\n",
+            "# pulled a binary from an address this platform chose would be one\n",
+            "# nobody could audit. Install velstra-cloud first, by whatever means\n",
+            "# you install packages, then this seeds it.\n",
+            "write_files:\n",
+            "  - path: /etc/velstra/join\n",
+            "    permissions: '0600'\n",
+            "    owner: root:root\n",
+            "    content: |\n",
+            "      velstra1.eyJ2IjoxfQ\n",
+            "runcmd:\n",
+            "  - [ velstra-cloud-node, setup, --join-file, /etc/velstra/join ]\n",
+            "  - [ shred, -u, /etc/velstra/join ]\n",
+        );
+        assert_eq!(cloud_config("peter", TOKEN), want);
+    }
 }

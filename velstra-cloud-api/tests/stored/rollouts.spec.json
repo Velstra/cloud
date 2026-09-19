@@ -1,0 +1,7 @@
+{
+  "evacuate": false,
+  "max_unavailable": 1,
+  "nodes": [],
+  "paused": false,
+  "release": ""
+}

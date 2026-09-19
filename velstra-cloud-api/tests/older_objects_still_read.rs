@@ -105,6 +105,11 @@ fn cases() -> &'static [Case] {
             velstra_cloud_model::ceph::CephClusterStatus
         ),
         (
+            "enrollments",
+            velstra_cloud_model::enrollment::EnrollmentSpec,
+            velstra_cloud_model::enrollment::EnrollmentStatus
+        ),
+        (
             "console-sessions",
             velstra_cloud_model::console::ConsoleSessionSpec,
             velstra_cloud_model::console::ConsoleSessionStatus
@@ -158,6 +163,16 @@ fn cases() -> &'static [Case] {
             "migrations",
             velstra_cloud_model::migration::MigrationSpec,
             velstra_cloud_model::migration::MigrationStatus
+        ),
+        (
+            "releases",
+            velstra_cloud_model::release::ReleaseSpec,
+            velstra_cloud_model::release::ReleaseStatus
+        ),
+        (
+            "rollouts",
+            velstra_cloud_model::rollout::RolloutSpec,
+            velstra_cloud_model::rollout::RolloutStatus
         ),
         (
             "networks",
