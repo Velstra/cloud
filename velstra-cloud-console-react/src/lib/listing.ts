@@ -50,7 +50,7 @@ export async function projectNames(): Promise<string[]> {
 export async function listEvery(c: Collection, project: string, query: Record<string, unknown> = {}): Promise<Listed> {
   if (project !== ALL || c.scope !== "project") return pages(c, project, query);
   const names = await projectNames();
-  const each = await Promise.all(names.map((p) => pages(c, p, query).catch(() => ({ rows: [], revision: "", truncated: false }))));
+  const each = await Promise.all(names.map((p) => pages(c, p, query)));
   return {
     rows: each.flatMap((x) => x.rows),
     revision: each.find((x) => x.revision)?.revision ?? "",

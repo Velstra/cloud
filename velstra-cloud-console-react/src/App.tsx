@@ -3,7 +3,7 @@ import { collectionChanged } from "@/hooks/useCollection";
 // Wiring: sign in, sweep the census the rail and the inbox are drawn from,
 // and route between the overview and a board with its detail pane beside it.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AskProvider } from "@/features/Ask";
@@ -13,7 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { call, setToken, token, whenSessionEnds } from "@/api/transport";
 import { verdict } from "@/lib/model";
-import { ALL, SCHEMA, collection } from "@/lib/schema";
+import { ALL, SCHEMA, collection, routeId } from "@/lib/schema";
 import { useRoute, go } from "@/app/router";
 import { getState, setState, useStore } from "@/app/store";
 import { Shell, type Census } from "@/app/Shell";
@@ -22,19 +22,21 @@ import { lazy, Suspense } from "react";
 const Topology = lazy(() => import("@/features/Topology").then((m) => ({ default: m.Topology })));
 import { Board } from "@/features/Board";
 import { Detail } from "@/features/Detail";
-import { Form } from "@/features/Form";
+import { Form as ResourceForm } from "@/features/Form";
 import { Overview } from "@/features/Overview";
 import { Me } from "@/features/Me";
 import { Spend } from "@/features/Spend";
 import { Pressed } from "@/features/Pressed";
 import { toast } from "sonner";
 import { MintedBox, hasMinted, type Minted } from "@/features/Join";
+import { Cloud, Eye, EyeOff } from "lucide-react";
 
 export default function App() {
   const who = useStore((s) => s.who);
   const project = useStore((s) => s.project);
   const route = useRoute();
   const [census, setCensus] = useState<Census>({});
+  const sweepId = useRef(0);
   // A registration's credential, held on screen until it is copied. It is
   // shown once by the API — only a digest is kept — so the page must not move
   // on by itself the way every other create does.
@@ -81,6 +83,7 @@ export default function App() {
 
   const sweep = useCallback(async () => {
     if (!who) return;
+    const request = ++sweepId.current;
     const out: Census = {};
     const all: CensusRows = {};
     // Records — audit entries, usage readings — are facts about the past, not
@@ -112,10 +115,17 @@ export default function App() {
         missing[c.id] = (e as Error).message;
       }
     }));
+    if (request !== sweepId.current || getState().project !== project || getState().who !== who) return;
     setCensusStore({ rows: all, missing, truncated });
     setCensus(out);
   }, [who, project]);
-  useEffect(() => { sweep(); }, [sweep]);
+  useEffect(() => {
+    setCensus({});
+    setCensusStore({ rows: {}, missing: {}, truncated: [], sweptAt: 0 });
+    void sweep();
+    const timer = setInterval(() => { if (!document.hidden) void sweep(); }, 15000);
+    return () => { ++sweepId.current; clearInterval(timer); };
+  }, [sweep]);
 
   if (!who) return <SignIn />;
 
@@ -132,14 +142,14 @@ export default function App() {
         ) : route.view === "map" ? (
           <Suspense fallback={<p className="p-8 text-sm" style={{ color: "var(--text-muted)" }}>Drawing the map…</p>}><Topology /></Suspense>
         ) : route.view !== "board" || !coll ? (
-          <div className="h-full overflow-y-auto px-8 py-6"><Overview /></div>
+          <div className="h-full overflow-y-auto px-4 py-5 md:px-7 md:py-6"><Overview onRefresh={sweep} /></div>
         ) : (
-          <ResizablePanelGroup orientation="horizontal" className="h-full">
-            <ResizablePanel defaultSize={route.id || route.mode === "new" ? "62%" : "100%"} minSize="35%">
+          <ResizablePanelGroup orientation="horizontal" className="resource-workspace h-full" data-detail={!!(route.id || route.mode === "new")}>
+            <ResizablePanel defaultSize={route.id || route.mode === "new" ? "42%" : "100%"} minSize="28%">
               <div className="flex h-full flex-col px-6 py-5">
                 <div className="mb-3 flex items-baseline gap-3">
                   <h1 className="text-[26px] font-bold leading-tight" style={{ color: "var(--text-strong)" }}>{coll.title}</h1>
-                  <p className="truncate text-sm" style={{ color: "var(--text-muted)" }}>{coll.blurb}</p>
+                  <details className="relative text-xs text-muted-foreground"><summary>About</summary><p className="absolute right-0 top-6 z-20 w-72 rounded-lg border border-border bg-popover p-3 shadow-lg">{coll.blurb}</p></details>
                 </div>
                 <div className="min-h-0 flex-1"><Board coll={coll} selectedId={route.id} narrow={!!(route.id || route.mode === "new")} /></div>
               </div>
@@ -147,13 +157,12 @@ export default function App() {
             {(route.id || route.mode === "new") && (
               <>
                 <ResizableHandle withHandle />
-                <ResizablePanel defaultSize="38%" minSize="26%">
+                <ResizablePanel defaultSize="58%" minSize="40%">
                   <div className="h-full border-l" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
                     {route.mode === "new" ? (
                       <div className="h-full overflow-y-auto">
                         <div className="border-b px-5 py-4" style={{ borderColor: "var(--border)" }}>
                           <h2 className="text-lg font-semibold" style={{ color: "var(--text-strong)" }}>New {coll.singular}</h2>
-                          <p className="text-xs" style={{ color: "var(--text-faint)" }}>{coll.blurb}</p>
                         </div>
                         <div className="px-5 py-4">
                           {minted && minted.coll === coll.id ? (
@@ -167,7 +176,7 @@ export default function App() {
                               </div>
                             </div>
                           ) : (
-                          <Form coll={coll}
+                          <ResourceForm coll={coll}
                             onDone={(r, answer) => {
                               const id = r.meta.name.split("/").pop()!;
                               sweep(); collectionChanged(coll.id);
@@ -180,8 +189,8 @@ export default function App() {
                                 setMinted({ coll: coll.id, id, minted: answer });
                                 return;
                               }
-                              toast(`${id} created.`, { description: "The platform is making it; this page follows along." });
-                              go({ view: "board", coll: coll.id, id });
+                              toast.success(`${id} created`, { description: "Tracking deployment status." });
+                              go({ view: "board", coll: coll.id, id: routeId(coll, r, project) });
                             }}
                             onCancel={() => go({ view: "board", coll: coll.id })} />
                           )}
@@ -204,18 +213,20 @@ export default function App() {
 }
 
 function SignIn() {
-  const [u, setU] = useState("operator");
+  const [u, setU] = useState("");
   const [p, setP] = useState("");
   const [err, setErr] = useState("");
+  const [visible, setVisible] = useState(false);
   return (
     <div className="flex h-full items-center justify-center" style={{ background: "var(--bg-app)" }}>
-      <form className="w-[26rem] rounded-[6px] border p-6" style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      <form noValidate className="arrive-up mx-4 w-full max-w-[26rem] rounded-2xl border p-8" style={{ background: "var(--surface)", borderColor: "var(--border)" }}
         onSubmit={(e) => e.preventDefault()}>
-        <h1 className="mb-1 text-xl font-bold" style={{ color: "var(--text-strong)" }}>Velstra <span style={{ color: "var(--product)" }}>Cloud</span></h1>
-        <p className="mb-5 text-sm" style={{ color: "var(--text-muted)" }}>Sign in to the cell.</p>
+        <span className="mb-5 grid size-11 place-items-center rounded-xl bg-primary text-primary-foreground"><Cloud className="size-6" /></span>
+        <h1 className="mb-1 text-2xl font-semibold tracking-tight" style={{ color: "var(--text-strong)" }}>Velstra <span style={{ color: "var(--product)" }}>Cloud</span></h1>
+        <p className="mb-6 text-sm" style={{ color: "var(--text-muted)" }}>Sign in to your workspace.</p>
         <div className="grid gap-4">
-          <div className="grid gap-1.5"><Label htmlFor="u">Username</Label><Input id="u" value={u} onChange={(e) => setU(e.target.value)} autoFocus /></div>
-          <div className="grid gap-1.5"><Label htmlFor="p">Passphrase</Label><Input id="p" type="password" value={p} onChange={(e) => setP(e.target.value)} /></div>
+          <div className="grid gap-1.5"><Label htmlFor="u">Username</Label><Input id="u" autoComplete="username" value={u} onChange={(e) => setU(e.target.value)} autoFocus /></div>
+          <div className="grid gap-1.5"><Label htmlFor="p">Password</Label><div className="relative"><Input id="p" autoComplete="current-password" type={visible ? "text" : "password"} value={p} onChange={(e) => setP(e.target.value)} className="pr-10" /><Button type="button" variant="ghost" size="icon-sm" className="absolute right-1 top-0.5" aria-label={visible ? "Hide password" : "Show password"} onClick={() => setVisible(!visible)}>{visible ? <EyeOff /> : <Eye />}</Button></div></div>
           {err && <p className="text-sm" role="alert" style={{ color: "var(--failing)" }}>{err}</p>}
           <Pressed type="submit" onPress={async () => {
             setErr("");
@@ -230,7 +241,6 @@ function SignIn() {
               const mine = Object.keys(projects); if (!w.cellAdmin && mine.length && !projects[getState().project]) setState({ project: mine[0] });
             } catch (e) { setErr((e as Error).message || "That was not accepted."); }
           }}>Sign in</Pressed>
-          <Button type="button" variant="ghost" size="sm" onClick={() => setP("a test operator passphrase")}>Use the test passphrase</Button>
         </div>
       </form>
     </div>

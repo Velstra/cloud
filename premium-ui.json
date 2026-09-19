@@ -1,0 +1,12 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": [
+    "velstra-cloud-console-react/src"
+  ],
+  "locale": "en",
+  "canonicalMap": "UX-CONTRACT.md",
+  "ownership": {
+    "Select/Listbox": "native",
+    "Date": "native"
+  }
+}

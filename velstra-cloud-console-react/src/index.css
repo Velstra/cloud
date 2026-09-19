@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "@fontsource-variable/geist";
 
 /* The Velstra Cloud tokens, carried over unchanged from
    velstra-cloud-console/src/assets/tokens.css and light.css — including
@@ -20,7 +21,7 @@
   --color-signal-500: #2e96c4;
   --color-signal-600: #2179a1;
 
-  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-sans: "Geist Variable", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 
   --radius-xs: 3px;
@@ -125,6 +126,30 @@ body {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
 }
+
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--surface-sunken); }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: var(--surface-sunken); }
+*::-webkit-scrollbar-thumb { background: var(--border-strong); border: 2px solid var(--surface-sunken); border-radius: 8px; }
+*::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+*::-webkit-scrollbar-thumb:active { background: var(--brand); }
+button:not(:disabled), a, summary, [role="button"]:not([aria-disabled="true"]) { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+textarea { resize: none; }
+.overview-panel { border: 1px solid var(--border); background: var(--surface); border-radius: 12px; overflow: hidden; }
+.overview-panel h2 { font-size: 14px; font-weight: 600; color: var(--text-strong); }
+.resource-tile { transition: border-color var(--dur-fast), background-color var(--dur-fast); }
+.resource-tile:hover { border-color: var(--brand); background: var(--surface-hover); }
+@media (forced-colors: active) { * { scrollbar-color: auto; } }
+@media (max-width: 767px) {
+  .resource-workspace[data-detail="true"] > [data-slot="resizable-panel"]:first-child,
+  .resource-workspace[data-detail="true"] > [data-slot="resizable-handle"] { display: none !important; }
+  .resource-workspace[data-detail="true"] > [data-slot="resizable-panel"]:last-child { flex: 1 1 100% !important; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
+:root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 
 /* ---- motion ---------------------------------------------------------------
    Every movement here answers one of three questions: where did this come

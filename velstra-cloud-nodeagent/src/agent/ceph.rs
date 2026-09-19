@@ -261,7 +261,9 @@ impl Agent {
         if conf.is_empty() || keyring.is_empty() {
             return;
         }
-        for (name, contents, mode) in [("ceph.conf", conf, 0o644), ("keyring", keyring, 0o600)] {
+        let conf = client_conf_with_keyring(conf, &dir.join("keyring"));
+        // Install credentials before publishing the configuration that uses them.
+        for (name, contents, mode) in [("keyring", keyring, 0o600), ("ceph.conf", &conf, 0o644)] {
             let path = dir.join(name);
             if tokio::fs::read_to_string(&path).await.ok().as_deref() == Some(contents.as_str()) {
                 continue;
@@ -302,5 +304,39 @@ impl Agent {
              cell-wide collection reads as empty and the whole Ceph deployment will quietly do \
              nothing"
         );
+    }
+}
+
+/// Ceph does not search next to an explicitly named configuration file for its
+/// keyring. Bind the managed client to the credential installed on this node.
+fn client_conf_with_keyring(conf: &str, keyring: &std::path::Path) -> String {
+    let path = keyring
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!(
+        "{}\n[client.velstra]\n\tkeyring = \"{}\"\n",
+        conf.trim_end(),
+        path
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::client_conf_with_keyring;
+
+    #[test]
+    fn managed_client_uses_its_installed_keyring() {
+        let conf = client_conf_with_keyring(
+            "[global]\nmon_host = 10.0.0.1\n",
+            Path::new("/var/lib/custom ceph/keyring"),
+        );
+        assert_eq!(
+            conf,
+            "[global]\nmon_host = 10.0.0.1\n[client.velstra]\n\tkeyring = \"/var/lib/custom ceph/keyring\"\n"
+        );
+        assert!(!conf.contains("client.admin"));
     }
 }

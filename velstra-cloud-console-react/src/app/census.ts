@@ -27,8 +27,8 @@ export type Census = {
 let census: Census = { rows: {}, missing: {}, truncated: [], sweptAt: 0 };
 const listeners = new Set<() => void>();
 
-export function setCensus(next: Omit<Census, "sweptAt">) {
-  census = { ...next, sweptAt: Date.now() };
+export function setCensus(next: Omit<Census, "sweptAt"> & { sweptAt?: number }) {
+  census = { ...next, sweptAt: next.sweptAt ?? Date.now() };
   for (const l of listeners) l();
 }
 

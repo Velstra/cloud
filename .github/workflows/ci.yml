@@ -203,6 +203,10 @@ jobs:
       - name: Drive the console in a real browser
         run: velstra-cloud-console/tests/console/run.sh
 
+      - name: Exercise the React console
+        working-directory: velstra-cloud-console-react
+        run: npm ci && npm run test:browser
+
   guests:
     name: a guest really boots
     runs-on: ubuntu-24.04

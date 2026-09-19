@@ -195,7 +195,7 @@ export function Ceph({ r, coll, reload }: { r: Resource; coll: Collection; reloa
       </div>
 
       <div>
-        <Heading>Pools · {present.length}/{pools.length} present</Heading>
+        <Heading>Pools · {pools.filter((p) => present.includes(p.pool)).length}/{pools.length} managed</Heading>
         <div className="min-w-0 overflow-x-auto">
           <table className="w-full text-xs">
             <thead><tr style={{ color: "var(--text-faint)" }}><Th>Pool</Th><Th>Replicas</Th><Th right>PGs</Th><Th right>Stored</Th><Th right>Objects</Th><Th right>Room left</Th></tr></thead>
@@ -208,7 +208,7 @@ export function Ceph({ r, coll, reload }: { r: Resource; coll: Collection; reloa
                   <tr key={name} className="border-t" style={{ borderColor: "var(--border-subtle)" }}>
                     <td className="py-1.5 font-mono">
                       <span className="mr-2 inline-block size-2 rounded-full align-middle" style={{ background: is ? "var(--dot-settled)" : "var(--dot-failing)" }} />
-                      {name}{!p && <span style={{ color: "var(--text-faint)" }}> · not in the spec</span>}{p && !is && <span style={{ color: "var(--text-faint)" }}> · asked for, not present</span>}
+                      {name}{!p && <span style={{ color: "var(--text-faint)" }}> · unmanaged</span>}{p && !is && <span style={{ color: "var(--text-faint)" }}> · asked for, not present</span>}
                     </td>
                     <td className="py-1.5" style={{ color: (s?.size ?? p?.size ?? 1) <= 1 ? "var(--drifting)" : undefined }}>
                       {s?.size ?? p?.size ?? "—"}× · min {s?.minSize ?? p?.minSize ?? "—"}

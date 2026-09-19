@@ -1,242 +1,86 @@
-// The landing: what needs attention across every collection, ranked by what it
-// means; the cell's capacity as meters; and what happened last. Nothing here
-// is a second list — every row is the object, one click away.
-
 import { useEffect, useMemo, useState } from "react";
+import { Activity, ArrowUpRight, CheckCircle2, Database, HardDrive, Layers3, Network, Plus, RefreshCw, Server, TriangleAlert } from "lucide-react";
 import { call } from "@/api/transport";
-import { listEvery, projectNames } from "@/lib/listing";
-import { ago, idOf, nameOf, verdict, VERDICT_ORDER, type Resource, type Verdict } from "@/lib/model";
-import { ALL, SCHEMA, basePath, navigable, type Collection } from "@/lib/schema";
+import { useCensus } from "@/app/census";
 import { useStore } from "@/app/store";
-import { QuotaBars, useQuota } from "./Quota";
+import { ago, attentionName, bytes, idOf, nameOf, verdict, VERDICT_ORDER, type Resource } from "@/lib/model";
+import { ALL, SCHEMA, collection, routeId } from "@/lib/schema";
+import { href } from "@/app/router";
+import { useCan } from "@/lib/iam";
 import { State } from "./State";
 import { Pressed } from "./Pressed";
-import { lazy, Suspense } from "react";
-const VerdictChart = lazy(() => import("./VerdictChart").then((m) => ({ default: m.VerdictChart })));
+import { QuotaBars, useQuota } from "./Quota";
 
-type Row = { coll: Collection; r: Resource; kind: Verdict };
-
-export function Overview() {
-  const project = useStore((s) => s.project);
+export function Overview({ onRefresh }: { onRefresh: () => Promise<void> }) {
+  const { rows, missing, truncated, sweptAt } = useCensus();
   const who = useStore((s) => s.who);
-  const [census, setCensus] = useState<Record<string, { rows: Resource[]; error?: string }>>({});
-  // Whether the sweep has finished once. Without it an empty census — nothing
-  // read yet, or every read refused — rendered as the green "Everything has
-  // settled", which is an all-clear over no data and the one sentence on this
-  // screen somebody acts on.
-  const [swept, setSwept] = useState(false);
-  const [kind, setKind] = useState<Verdict | null>(null);
+  const project = useStore((s) => s.project);
+  const can = useCan();
   const quota = useQuota(project);
-
-  const sweep = async () => {
-    // What this person can actually read. A tenant sweeping `migrations` got a
-    // 403 and a permanent red "unreadable" row on their own landing page, for
-    // a collection the platform never meant them to have.
-    const targets = navigable(!!who?.cellAdmin)
-      .filter((c) => c.condition !== "" && c.id !== "audit" && c.id !== "usage");
-    const out: typeof census = {};
-    await Promise.all(targets.map(async (c) => {
-      try {
-        out[c.id] = { rows: (await listEvery(c, project)).rows };
-      } catch (e) { out[c.id] = { rows: [], error: (e as Error).message }; }
-    }));
-    // The last few audit entries, asked for as a few — never the whole log.
-    try {
-      const audit = SCHEMA.find((c) => c.id === "audit")!;
-      // Across every project the log is read for the first one only: eight
-      // lines of one project beat a page per project nobody asked for.
-      const a = await call("list:audit", "GET", basePath(audit, project === ALL && audit.scope === "project" ? (await projectNames())[0] ?? project : project), { pageSize: 8 });
-      out.audit = { rows: (a.items ?? []).slice(0, 8) };
-    } catch { /* the board says why */ }
-    setCensus(out);
-    setSwept(true);
-  };
-  useEffect(() => { setSwept(false); sweep(); }, [project, who?.cellAdmin]);
-
-  const attention = useMemo<Row[]>(() => {
-    const rows: Row[] = [];
-    for (const c of SCHEMA) for (const r of census[c.id]?.rows ?? []) {
-      const k = verdict(r, c).kind;
-      if (k !== "settled") rows.push({ coll: c, r, kind: k });
-    }
-    return rows.sort((a, b) => VERDICT_ORDER[a.kind] - VERDICT_ORDER[b.kind] || nameOf(a.r).localeCompare(nameOf(b.r)));
-  }, [census]);
-  const counts = attention.reduce<Partial<Record<Verdict, number>>>((m, x) => { m[x.kind] = (m[x.kind] ?? 0) + 1; return m; }, {});
-  const shown = kind ? attention.filter((x) => x.kind === kind) : attention;
-  const unreadable = Object.entries(census).filter(([, v]) => v.error);
-  const nodes = census.nodes?.rows ?? [];
-  const instancesColl = SCHEMA.find((c) => c.id === "instances");
-  // Newest first: the machine somebody just made is the one they came to look
-  // at. Ten of them, and a link for the rest — a landing page is not a board.
-  const machines = [...(census.instances?.rows ?? [])]
-    .sort((a, b) => Number(b.meta.createdAt ?? 0) - Number(a.meta.createdAt ?? 0))
-    .slice(0, 10);
-  const audit = (census.audit?.rows ?? []).slice(0, 8);
-
-  return (
-    <div className="arrive-up grid gap-6">
-      <header className="flex items-end gap-4">
-        <div>
-          <h1 className="text-[32px] font-bold leading-tight" style={{ color: "var(--text-strong)" }}>Overview</h1>
-          <p className="text-sm" style={{ color: "var(--text-muted)" }}>
-            {who?.cellAdmin ? "What needs attention, what the machines look like, and what happened last." : "What needs attention, your machines, and what happened last."}
-          </p>
-        </div>
-        <div className="ml-auto"><Pressed size="sm" variant="secondary" onPress={sweep}>Refresh</Pressed></div>
-      </header>
-
-      {project !== ALL && quota.q && (
-        <section className="rounded-[6px] border px-5 py-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-          <div className="mb-3 flex items-baseline gap-2">
-            <h2 className="text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)" }}>Limits and use · {project}</h2>
-            <a href={`#/c/projects/${encodeURIComponent(project)}`} className="ml-auto text-xs hover:underline" style={{ color: "var(--brand)" }}>All limits →</a>
-          </div>
-          <QuotaBars q={quota.q} compact />
+  const [audit, setAudit] = useState<Resource[]>([]);
+  const [auditError, setAuditError] = useState("");
+  useEffect(() => {
+    let current = true;
+    setAudit([]); setAuditError("");
+    call("list:audit", "GET", "/api/v1/audit", { pageSize: 6, orderBy: "createdAt desc" })
+      .then((a) => { if (current) setAudit(a.items ?? []); })
+      .catch(() => { if (current) setAuditError("Activity is unavailable. Refresh to retry."); });
+    return () => { current = false; };
+  }, [project, who?.subject, sweptAt]);
+  const attention = useMemo(() => SCHEMA.flatMap((coll) => coll.condition === "" ? [] :
+    (rows[coll.id] ?? []).filter((r) => verdict(r, coll).kind !== "settled").map((r) => ({ coll, r })))
+    .sort((a, b) => VERDICT_ORDER[verdict(a.r, a.coll).kind] - VERDICT_ORDER[verdict(b.r, b.coll).kind]), [rows]);
+  const incomplete = Object.keys(missing).length > 0 || truncated.length > 0;
+  const link = (coll: string, r: Resource) => href({ view: "board", coll, id: routeId(collection(coll)!, r, project) });
+  const nodes = rows.nodes ?? [];
+  const machines = [...(rows.instances ?? [])].sort((a, b) => Number(b.meta.createdAt ?? 0) - Number(a.meta.createdAt ?? 0)).slice(0, 6);
+  const tiles = who?.cellAdmin
+    ? [{ id: "nodes", title: "Hosts", Icon: Server }, { id: "instances", title: "Instances", Icon: Layers3 }, { id: "networks", title: "Networks", Icon: Network }, { id: "ceph-clusters", title: "Ceph clusters", Icon: Database }]
+    : [{ id: "instances", title: "Instances", Icon: Layers3 }, { id: "volumes", title: "Volumes", Icon: HardDrive }, { id: "networks", title: "Networks", Icon: Network }, { id: "snapshots", title: "Snapshots", Icon: Database }];
+  return <div className="arrive-up mx-auto grid max-w-[1600px] gap-5 pb-6">
+    <header className="flex flex-wrap items-center justify-between gap-3">
+      <div><p className="mb-1 text-xs font-medium text-muted-foreground">{who?.cellAdmin ? "Infrastructure" : "Workspace"} / {project === ALL ? "All projects" : project}</p>
+        <h1 className="text-[30px] font-semibold tracking-tight text-foreground">{who?.cellAdmin ? "Cloud overview" : "Your workspace"}</h1></div>
+      <div className="flex items-center gap-2"><Pressed variant="outline" onPress={onRefresh}><RefreshCw className="size-4" />Refresh</Pressed>
+        {can("write", "instances") && <a href="#/c/instances/new" className="inline-flex h-8 items-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground hover:opacity-90"><Plus className="size-4" />Create instance</a>}</div>
+    </header>
+    <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">{tiles.map(({ id, title, Icon }) => {
+      const coll = collection(id); if (!coll) return null;
+      const resources = rows[id] ?? [];
+      const ready = resources.filter((r) => verdict(r, coll).kind === "settled").length;
+      const known = sweptAt > 0 && !missing[id];
+      return <a key={id} href={href({ view: "board", coll: id })} className="resource-tile overview-panel grid gap-4 p-4">
+        <span className="flex items-center justify-between text-sm text-muted-foreground"><span className="inline-flex items-center gap-2"><Icon className="size-4 text-primary" />{title}</span><ArrowUpRight className="size-3.5" /></span>
+        <span className="flex flex-wrap items-baseline justify-between gap-2"><strong className="text-3xl font-semibold tabular-nums tracking-tight">{known ? `${truncated.includes(id) ? "≥ " : ""}${resources.length}` : "—"}</strong><span className="text-xs text-muted-foreground">{known ? `${ready} ready` : sweptAt ? "Unavailable" : "Loading…"}</span></span>
+      </a>;
+    })}</div>
+    <section className="overview-panel" aria-label="Health">
+      <div className="flex flex-wrap items-center gap-3 px-5 py-4">
+        {attention.length || incomplete ? <TriangleAlert className="size-5 text-[var(--drifting)]" /> : <CheckCircle2 className="size-5 text-[var(--settled)]" />}
+        <div className="flex-1"><h2>{!sweptAt ? "Checking resources…" : incomplete ? "Some status data is unavailable" : attention.length ? `${attention.length} resources need attention` : "All resources are ready"}</h2><p className="mt-0.5 text-xs text-muted-foreground">{sweptAt ? `Last checked ${ago(sweptAt)}` : "Waiting for the first inventory read"}</p></div>
+      </div>
+      {incomplete && <p role="status" className="border-t border-border px-5 py-3 text-xs text-[var(--drifting)]">{Object.keys(missing).map((id) => `${collection(id)?.title ?? id}: unavailable`).concat(truncated.map((id) => `${collection(id)?.title ?? id}: partial inventory`)).join(" · ")}</p>}
+      {attention.slice(0, 6).map(({ coll, r }) => <a key={nameOf(r)} href={link(coll.id, r)} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-border px-5 py-3 hover:bg-accent"><span className="min-w-0"><span className="block truncate text-sm font-medium">{attentionName(r, coll)}</span><span className="block truncate text-xs text-muted-foreground">{coll.singular} · {verdict(r, coll).detail || "Waiting for an update"}</span></span><State of={r} coll={coll} /></a>)}
+      {attention.length > 6 && <p className="px-5 py-3 text-xs text-muted-foreground">{attention.length - 6} more in the attention inbox</p>}
+    </section>
+    <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.6fr)_minmax(280px,1fr)]">
+      <div className="grid min-w-0 gap-5">
+        <section className="overview-panel"><div className="flex items-center justify-between border-b border-border px-5 py-4"><h2>Instances</h2><a className="text-xs text-primary hover:underline" href="#/c/instances">View all →</a></div>
+          {!sweptAt || missing.instances ? <p className="p-5 text-sm text-muted-foreground">{missing.instances ? "Instances are unavailable. Refresh to retry." : "Loading instances…"}</p> : !machines.length ? <div className="p-5"><p className="text-sm text-muted-foreground">Your first instance starts here.</p>{can("write", "instances") && <a className="mt-2 inline-block text-sm text-primary hover:underline" href="#/c/instances/new">Create instance →</a>}</div> : machines.map((r) => <a key={nameOf(r)} href={link("instances", r)} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-5 py-3 last:border-0 hover:bg-accent"><span className="min-w-0"><span className="block truncate text-sm font-medium">{idOf(r)}</span><span className="text-xs text-muted-foreground">{r.spec?.vcpus ?? "—"} vCPU · {bytes(Number(r.spec?.memoryMib ?? 0) * 1024 ** 2)}</span></span><State of={r} coll={collection("instances")} /></a>)}
         </section>
-      )}
-
-      <section className="rounded-[6px] border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-        <div className="flex flex-wrap items-center gap-2 border-b px-5 py-3" style={{ borderColor: "var(--border-subtle)" }}>
-          <h2 className="text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)" }}>Attention</h2>
-          {attention.length > 0 && <>
-            <span className="text-xs" style={{ color: "var(--text-faint)" }}>{attention.length} not settled —</span>
-            {(Object.keys(counts) as Verdict[]).sort((a, b) => VERDICT_ORDER[a] - VERDICT_ORDER[b]).map((k) => (
-              <button key={k} aria-pressed={kind === k} onClick={() => setKind(kind === k ? null : k)}
-                className="inline-flex items-center gap-1.5 rounded-[3px] border px-2 py-0.5 text-xs font-medium"
-                style={{ background: "var(--surface-sunken)", borderColor: kind === k ? "var(--focus-ring)" : "var(--border)" }}>
-                <span className="size-[7px] rounded-full" style={{ background: k === "unreported" ? "var(--text-faint)" : `var(--dot-${k})` }} />
-                {counts[k]} {k}
-              </button>
-            ))}
-          </>}
-        </div>
-        {!swept ? (
-          <p className="px-5 py-4 text-sm" style={{ color: "var(--text-muted)" }}>Reading the cell…</p>
-        ) : !attention.length && !unreadable.length ? (
-          <p className="px-5 py-4 text-sm"><span style={{ color: "var(--settled)" }}>● Everything has settled.</span> <span style={{ color: "var(--text-muted)" }}>Nothing is drifting or failing.</span></p>
-        ) : (
-          <ul>
-            {shown.map(({ coll, r, kind: k }) => {
-              const v = verdict(r, coll);
-              return (
-                <li key={nameOf(r)}>
-                  <a href={`#/c/${coll.id}/${encodeURIComponent(idOf(r))}`}
-                    className="grid grid-cols-[minmax(0,1fr)_150px_minmax(0,2fr)] items-center gap-4 border-b px-5 py-2.5 text-[13px] hover:bg-[var(--surface-hover)] focus-visible:bg-[var(--surface-hover)] focus-visible:outline-none"
-                    style={{ borderColor: "var(--border-subtle)", boxShadow: `inset 3px 0 0 var(--${k === "unreported" ? "border-strong" : "dot-" + k})` }}>
-                    <span className="truncate font-mono" style={{ color: "var(--text-strong)" }}>{coll.id}/{idOf(r)}</span>
-                    <State of={r} coll={coll} />
-                    <span className="truncate text-xs" style={{ color: "var(--text-muted)" }}>{coll.singular}{v.detail ? ` — ${v.detail}` : ""}</span>
-                  </a>
-                </li>
-              );
-            })}
-            {unreadable.map(([id, v]) => (
-              <li key={id} className="grid grid-cols-[minmax(0,1fr)_150px_minmax(0,2fr)] gap-4 border-b px-5 py-2.5 text-[13px]" style={{ borderColor: "var(--border-subtle)", boxShadow: "inset 3px 0 0 var(--dot-failing)" }}>
-                <span className="font-mono">{id}</span><span style={{ color: "var(--failing)" }}>● unreadable</span>
-                <span className="truncate text-xs" style={{ color: "var(--text-muted)" }}>{v.error}</span>
-              </li>
-            ))}
-          </ul>
-        )}
+        {who?.cellAdmin && <section className="overview-panel"><div className="flex items-center justify-between border-b border-border px-5 py-4"><h2>Host capacity</h2><a href="#/c/nodes" className="text-xs text-primary hover:underline">Manage hosts →</a></div>
+          <div className="grid gap-3 p-4 sm:grid-cols-2">{nodes.slice(0, 6).map((n) => {
+            const cap = n.status?.capacity ?? {}; const used = n.status?.allocated ?? {};
+            return <a key={nameOf(n)} href={link("nodes", n)} className="resource-tile rounded-lg border border-border p-3"><span className="mb-3 flex flex-wrap items-center justify-between gap-2"><span className="truncate text-xs font-medium">{idOf(n)}</span><State of={n} coll={collection("nodes")} /></span>
+              {["vcpus", "memoryMib"].map((k) => {const value = Number(cap[k]) ? Math.min(100, Number(used[k] ?? 0) / Number(cap[k]) * 100) : 0; return <div key={k} className="mt-2"><div className="mb-1 flex justify-between text-[11px] text-muted-foreground"><span>{k === "vcpus" ? "CPU" : "Memory"}</span><span>{cap[k] ? `${Math.round(value)}%` : "Unknown"}</span></div><div role="meter" aria-label={k === "vcpus" ? "CPU allocation" : "Memory allocation"} aria-valuenow={value} aria-valuemin={0} aria-valuemax={100} className="h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary" style={{ width: `${value}%` }} /></div></div>;})}
+            </a>;
+          })}{!nodes.length && <p className="text-sm text-muted-foreground">{missing.nodes ? "Hosts are unavailable." : "No hosts reported."}</p>}</div>
+        </section>}
+        {project !== ALL && quota.q && <section className="overview-panel p-5"><h2 className="mb-4">Project limits</h2><QuotaBars q={quota.q} compact /></section>}
+      </div>
+      <section className="overview-panel"><div className="flex items-center gap-2 border-b border-border px-5 py-4"><Activity className="size-4 text-primary" /><h2>Recent activity</h2></div>
+        {auditError ? <p role="status" className="p-5 text-sm text-muted-foreground">{auditError}</p> : !audit.length ? <p className="p-5 text-sm text-muted-foreground">No activity to show.</p> : <ol>{audit.map((r) => {const s = r.spec ?? {}; const verbs: Record<string, string> = {create: "Created", update: "Updated", delete: "Deleted"}; const action = s.kind === "changed" ? (verbs[String(s.verb)] ?? s.verb) : s.kind === "signed-in" ? "Signed in" : s.kind === "signed-out" ? "Signed out" : "Access refused"; return <li key={nameOf(r)} className="border-b border-border px-5 py-3 last:border-0"><p className="break-words text-sm">{action}{s.target ? ` ${String(s.target).split("/").pop()}` : ""}</p><p className="mt-1 text-xs text-muted-foreground"><span>{s.subject || "System"}</span><span title={new Date(Number(s.at ?? r.meta.createdAt)).toLocaleString()}> · {ago(s.at ?? r.meta.createdAt)}</span></p></li>;})}</ol>}
       </section>
-
-      <section className="rounded-[6px] border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-        <h2 className="border-b px-5 py-3 text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)", borderColor: "var(--border-subtle)" }}>Where things stand, by collection</h2>
-        <Suspense fallback={<div className="h-[220px]" />}><VerdictChart census={census} /></Suspense>
-      </section>
-
-      {/* A customer's own inventory, which is what a cloud's landing page is
-          for. This screen told them what was *wrong* and what their limits
-          were, and never once showed them their machines — so "where is my
-          server and how do I reach it" took a click into a board. Operators
-          get the cell below instead; they have a fleet, not an inventory. */}
-      {!who?.cellAdmin && (
-        <section className="rounded-[6px] border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-          <div className="flex flex-wrap items-center gap-2 border-b px-5 py-3" style={{ borderColor: "var(--border-subtle)" }}>
-            <h2 className="text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)" }}>Your machines</h2>
-            <span className="text-xs" style={{ color: "var(--text-faint)" }}>
-              {machines.length ? `${machines.filter((m) => m.status?.state === "Running").length} of ${machines.length} running` : ""}
-            </span>
-            <a href="#/c/instances" className="ml-auto text-xs hover:underline" style={{ color: "var(--brand)" }}>All machines →</a>
-          </div>
-          {!swept ? (
-            <p className="px-5 py-4 text-sm" style={{ color: "var(--text-muted)" }}>Reading your machines…</p>
-          ) : !machines.length ? (
-            <div className="px-5 py-6">
-              <p className="text-sm" style={{ color: "var(--text-muted)" }}>No machines yet.</p>
-              <a href="#/c/instances/new"
-                className="mt-3 inline-flex h-8 items-center rounded-[4px] px-3 text-sm font-medium"
-                style={{ background: "var(--brand)", color: "var(--on-brand, #08131b)" }}>
-                Start your first one
-              </a>
-            </div>
-          ) : (
-            <ul>
-              {machines.map((m) => {
-                const v = verdict(m, instancesColl!);
-                const address = (m.status as any)?.addresses?.[0];
-                return (
-                  <li key={nameOf(m)}>
-                    <a href={`#/c/instances/${encodeURIComponent(idOf(m))}`}
-                      className="grid grid-cols-[minmax(0,1.4fr)_130px_minmax(0,1fr)_minmax(0,1fr)] items-center gap-4 border-b px-5 py-2.5 text-[13px] hover:bg-[var(--surface-hover)] focus-visible:bg-[var(--surface-hover)] focus-visible:outline-none"
-                      style={{ borderColor: "var(--border-subtle)", boxShadow: v.kind === "settled" ? undefined : `inset 3px 0 0 var(--dot-${v.kind === "unreported" ? "muted" : v.kind})` }}>
-                      <span className="truncate font-medium" style={{ color: "var(--text-strong)" }}>{idOf(m)}</span>
-                      <State of={m} coll={instancesColl} />
-                      <span className="truncate font-mono text-xs" style={{ color: address ? "var(--text-body)" : "var(--text-faint)" }}>
-                        {address ?? "no address yet"}
-                      </span>
-                      <span className="truncate text-xs" style={{ color: "var(--text-muted)" }}>
-                        {(m.spec as any)?.vcpus ?? "?"} vCPU · {Math.round(((m.spec as any)?.memoryMib ?? 0) / 1024)} GiB
-                      </span>
-                    </a>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </section>
-      )}
-
-      {who?.cellAdmin && nodes.length > 0 && (
-        <section className="rounded-[6px] border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-          <h2 className="border-b px-5 py-3 text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)", borderColor: "var(--border-subtle)" }}>The cell</h2>
-          <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-4">
-            {nodes.map((n) => {
-              const cap = (n.status as any)?.capacity ?? {}; const used = (n.status as any)?.allocated ?? {};
-              const pct = (k: string) => cap[k] ? Math.min(100, Math.round(100 * (Number(used[k] ?? 0) / Number(cap[k])))) : 0;
-              return (
-                <a key={nameOf(n)} href={`#/c/nodes/${encodeURIComponent(idOf(n))}`} className="grid gap-2 rounded-[4px] border p-3 hover:bg-[var(--surface-hover)]" style={{ borderColor: "var(--border-subtle)" }}>
-                  <div className="flex items-center justify-between"><span className="font-mono text-sm" style={{ color: "var(--text-strong)" }}>{idOf(n)}</span><State of={n} coll={SCHEMA.find((c) => c.id === "nodes")} /></div>
-                  {["vcpus", "memoryMib"].map((k) => (
-                    <div key={k} className="grid gap-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
-                      <div className="flex justify-between"><span>{k === "vcpus" ? "vCPU" : "Memory"}</span><span className="font-mono">{pct(k)}%</span></div>
-                      <div className="h-1.5 rounded-full" style={{ background: "var(--surface-sunken)" }}>
-                        <div className="h-1.5 rounded-full" style={{ width: pct(k) + "%", background: pct(k) > 90 ? "var(--dot-failing)" : pct(k) > 75 ? "var(--dot-drifting)" : "var(--text-faint)" }} />
-                      </div>
-                    </div>
-                  ))}
-                </a>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {audit.length > 0 && (
-        <section className="rounded-[6px] border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-          <h2 className="border-b px-5 py-3 text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)", borderColor: "var(--border-subtle)" }}>What happened last</h2>
-          <ul>
-            {audit.map((a) => (
-              <li key={nameOf(a)} className="grid grid-cols-[110px_minmax(0,1fr)_120px] gap-4 border-b px-5 py-2 text-xs" style={{ borderColor: "var(--border-subtle)" }}>
-                <span className="font-mono" style={{ color: "var(--text-faint)" }}>{ago((a.spec as any)?.at ?? a.meta.createdAt)}</span>
-                <span className="truncate" style={{ color: "var(--text-body)" }}>{String((a.spec as any)?.summary ?? (a.spec as any)?.action ?? idOf(a))}</span>
-                <span className="truncate font-mono" style={{ color: "var(--text-muted)" }}>{String((a.spec as any)?.who ?? "")}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
     </div>
-  );
+  </div>;
 }
-

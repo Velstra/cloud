@@ -77,7 +77,7 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
     }
   }, [c, project, labels, key]);
 
-  useEffect(() => { previous.current = new Map(); refresh(); }, [refresh]);
+  useEffect(() => { previous.current = new Map(); refresh(); return () => { ++run.current; }; }, [refresh]);
 
   useEffect(() => {
     if (!c) return;
@@ -154,13 +154,13 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
   // watch event either. Between the two, that board was frozen from the moment
   // it loaded.
   const busy = state.rows.some((r) => c && verdict(r, c).busy);
-  const ticking = !!c && (busy || c.recheck > 0);
+  const ticking = !!c && (busy || c.recheck > 0 || !streamable || live !== "live");
   useEffect(() => {
     if (!c || !ticking) return;
-    const every = Math.max(3, c.recheck || 5) * 1000;
-    const t = setInterval(() => { refresh(); }, every);
+    const every = Math.max(3, c.recheck || (busy ? 5 : 15)) * 1000;
+    const t = setInterval(() => { if (!document.hidden) refresh(); }, every);
     return () => clearInterval(t);
-  }, [c, ticking, refresh]);
+  }, [c, ticking, busy, refresh]);
 
   return { ...state, refresh, busy, live };
 }

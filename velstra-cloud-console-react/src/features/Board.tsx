@@ -8,7 +8,7 @@ import {
   getCoreRowModel, getFilteredRowModel, getSortedRowModel, useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDown, ArrowUp, Columns3, Search } from "lucide-react";
+import { ArrowDown, ArrowUp, Columns3, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -93,7 +93,7 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
       cell: (x: { getValue: () => unknown }) => <span className="font-mono text-xs" style={{ color: "var(--text-muted)" }}>{String(x.getValue() ?? "")}</span>,
     }] : []),
     {
-      id: "verdict", accessorFn: (r: Resource) => VERDICT_ORDER[verdict(r, coll).kind], header: "Convergence", size: 160,
+      id: "verdict", accessorFn: (r: Resource) => VERDICT_ORDER[verdict(r, coll).kind], header: "Status", size: 160,
       cell: ({ row }: { row: { original: Resource } }) => <State of={row.original} coll={coll} />,
     }] : []),
     // The one column that tells rows apart: the first that carries a word or
@@ -202,8 +202,9 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
       <div className="flex flex-wrap items-center gap-2 pb-3">
         <div className="relative">
           <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2" style={{ color: "var(--text-faint)" }} />
-          <Input id="boardfilter" placeholder="Filter rows  /" className="h-8 w-56 pl-7 text-xs"
+          <Input id="boardfilter" aria-label="Filter rows" placeholder="Filter rows  /" className="h-8 w-56 pl-7 pr-8 text-xs"
             value={globalFilter} onChange={(e) => setGlobalFilter(e.target.value)} />
+          {globalFilter && <button aria-label="Clear row filter" className="absolute right-2 top-2" onClick={() => { setGlobalFilter(""); document.getElementById("boardfilter")?.focus(); }}><X className="size-4" /></button>}
         </div>
         <Input placeholder="labels: env=prod, tier=web" className="h-8 w-56 text-xs" value={labels}
           onChange={(e) => setLabels(e.target.value)} />
@@ -274,12 +275,12 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
                 {hg.headers.map((h) => (
                   <th key={h.id} style={{ width: h.getSize(), borderColor: "var(--border)" }}
                     className="border-b px-4 py-2.5 text-left text-[12px] font-medium"
-                    onClick={h.column.getCanSort() ? h.column.getToggleSortingHandler() : undefined}>
-                    <span className="inline-flex cursor-pointer select-none items-center gap-1" style={{ color: "var(--text-muted)" }}>
+                    aria-sort={h.column.getCanSort() ? h.column.getIsSorted() === "asc" ? "ascending" : h.column.getIsSorted() === "desc" ? "descending" : "none" : undefined}>
+                    {h.column.getCanSort() ? <button className="inline-flex select-none items-center gap-1 text-muted-foreground" onClick={h.column.getToggleSortingHandler()}>
                       {flexRender(h.column.columnDef.header, h.getContext())}
                       {h.column.getIsSorted() === "asc" && <ArrowUp className="size-3" />}
                       {h.column.getIsSorted() === "desc" && <ArrowDown className="size-3" />}
-                    </span>
+                    </button> : flexRender(h.column.columnDef.header, h.getContext())}
                   </th>
                 ))}
               </tr>
@@ -321,7 +322,7 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
         )}
       </div>
       <p className="pt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-        {visible.length} of {loaded.rows.length} · revision {loaded.revision || "—"} · <Live state={loaded.live} /> · j/k move, Enter opens, Space picks, / filters
+        {visible.length} of {loaded.rows.length} · <Live state={loaded.live} /><span className="float-right hidden lg:inline" title="j/k move · Enter opens · Space selects · / filters">Keyboard shortcuts ⌨</span>
         {loaded.truncated && <span style={{ color: "var(--drifting)" }}> · this list did not finish — narrow it with a filter or labels</span>}
       </p>
     </div>

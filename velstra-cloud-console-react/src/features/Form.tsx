@@ -3,7 +3,7 @@
 // a row editor over their JSON shape rather than a bespoke mask each, which
 // is honest about what this build knows and keeps them editable.
 
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { cloneElement, isValidElement, createContext, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -21,6 +21,7 @@ import { Pressed } from "@/features/Pressed";
 import { z } from "zod";
 import { check, crossCheck } from "@/lib/checks";
 import { entry } from "@/registry";
+import { useAsk } from "./Ask";
 
 type Values = Record<string, any>;
 
@@ -95,7 +96,7 @@ const initial = (c: Collection, r?: Resource): Values => {
   const v: Values = {};
   for (const f of c.fields) {
     const cur = readAt(r?.spec, f.key);
-    v[f.key] = cur !== undefined ? cur
+    v[f.key] = cur != null ? cur
       : f.kind === "switch" ? false
       : /List$/.test(f.kind) ? []
       : f.kind === "number" ? "" : "";
@@ -103,9 +104,10 @@ const initial = (c: Collection, r?: Resource): Values => {
   return v;
 };
 
-export function Form({ coll, existing, onDone, onCancel }: {
+export function Form({ coll, existing: received, onDone, onCancel }: {
   coll: Collection; existing?: Resource; onDone: (r: Resource, answer?: unknown) => void; onCancel: () => void;
 }) {
+  const [existing] = useState(received);
   const storeProject = useStore((s) => s.project);
   // The project this form writes to: an existing object's own, or — when the
   // picker says every project — the one chosen at the top of the form.
@@ -127,6 +129,14 @@ export function Form({ coll, existing, onDone, onCancel }: {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [problem, setProblem] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const ask = useAsk();
+  const submitting = useRef(false);
+  const formRef = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    if (!problem) return;
+    const invalid = formRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]');
+    (invalid?.matches("fieldset") ? invalid.querySelector<HTMLElement>("input,button,textarea,select") : invalid)?.focus();
+  }, [problem, errors]);
 
   const fields = coll.fields.filter((f) => !f.derived && (existing ? !f.atCreation || true : true));
   const basic = fields.filter((f) => !f.advanced);
@@ -208,7 +218,7 @@ export function Form({ coll, existing, onDone, onCancel }: {
     return [f.key, v];
   }))), [fields]);
 
-  const submit = async () => {
+  const performSubmit = async () => {
     setProblem(""); setErrors({});
     if (!existing && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(id.trim())) { setProblem(id.trim() ? "A name is lowercase letters, digits and dashes, up to 63." : "A name is still needed."); return; }
     if (flavorField && !sized) { setErrors({ [flavorField.key]: "Pick a flavor, or set a custom size under advanced settings." }); setProblem("A size is still needed: pick a flavor, or set vCPUs and memory under advanced settings."); return; }
@@ -256,6 +266,11 @@ export function Form({ coll, existing, onDone, onCancel }: {
     // Flat until here, because that is what the controls and the error mapping
     // below speak; nested exactly once, on the way out.
     const body = nest(spec);
+    if (coll.id === "ceph-clusters") {
+      const added = (body.osds ?? []).filter((disk: { node: string; device: string }) =>
+        !(existing?.spec?.osds ?? []).some((old: { node: string; device: string }) => old.node === disk.node && old.device === disk.device));
+      if (added.length && !await ask({ title: `Erase ${added.length} disks for Ceph?`, body: added.map((disk: { node: string; device: string }) => `${disk.node}: ${disk.device}`).join(", ") + ". All data on these disks will be permanently removed.", confirmLabel: "Erase and configure", tone: "danger" })) return;
+    }
     // `meta.labels`, which is where the API takes them. Sent at the top level
     // they were accepted and dropped: the object was made, the form said
     // "saved", and every label anybody typed into this console went nowhere.
@@ -270,9 +285,16 @@ export function Form({ coll, existing, onDone, onCancel }: {
         // The revision this edit was read at goes in `If-Match`, not in the
         // body — the API refuses `meta.revision` from a client — so a colleague's
         // change in between is refused here rather than overwritten.
+        const latest: Resource = await call(`get:${coll.id}`, "GET",
+          `${basePath(coll, project)}/${encodeURIComponent(idOf(existing))}`);
+        const labelsOf = (r: Resource) => JSON.stringify(Object.entries(r.meta.labels ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+        if (latest.meta.deletedAt || latest.meta.generation !== existing.meta.generation || labelsOf(latest) !== labelsOf(existing)) {
+          setProblem("This resource changed while you were editing. Reopen the form to review the latest values before saving.");
+          return;
+        }
         saved = await call(`patch:${coll.id}`, "PATCH",
           `${basePath(coll, project)}/${encodeURIComponent(idOf(existing))}`,
-          undefined, { spec: body, meta: meta() }, existing.meta.revision ? { "if-match": String(existing.meta.revision) } : undefined);
+          undefined, { spec: body, meta: meta() }, latest.meta.revision ? { "if-match": String(latest.meta.revision) } : undefined);
       } else {
         const name = coll.scope === "project"
           ? `projects/${project}/${coll.id}/${id.trim()}` : `${coll.id}/${id.trim()}`;
@@ -302,11 +324,16 @@ export function Form({ coll, existing, onDone, onCancel }: {
     // resource does not carry them. This page dropped them on the floor.
     onDone(saved, created);
   };
+  const submit = async () => {
+    if (submitting.current) return;
+    submitting.current = true;
+    try { await performSubmit(); } finally { submitting.current = false; }
+  };
 
   return (
     <FormProject.Provider value={project}>
     <FormValues.Provider value={values}>
-    <form className="grid gap-5" onSubmit={(e) => { e.preventDefault(); submit(); }}>
+    <form ref={formRef} noValidate className="grid gap-5" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
       {!existing && storeProject === ALL && coll.scope === "project" && (
         <Row label="Project" help="Every project is on the board; this one gets the new object." error={!project && problem ? "Still needed." : undefined}>
           <select value={project} onChange={(e) => setFormProject(e.target.value)} autoFocus
@@ -326,7 +353,7 @@ export function Form({ coll, existing, onDone, onCancel }: {
           error={errors[f.key]} locked={!!existing && f.atCreation} />
       ))}
       <Row label="Labels" help="`key=value`, separated by commas. Every board filters on them, and placement rules can require one.">
-        <Input value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="env=prod, tier=web" className="font-mono text-xs" />
+        <Input value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="env=prod, tier=web" className="resize-none font-mono text-xs" />
       </Row>
       {advanced.length > 0 && (
         <div>
@@ -381,14 +408,17 @@ function labelsFrom(raw: string): Record<string, string> | null {
 function Row({ label, help, error, children }: {
   label: string; help?: string; error?: string; children: React.ReactNode;
 }) {
-  return (
-    <div className="grid gap-1.5">
-      <Label className="text-[13px]" style={{ color: "var(--text-strong)" }}>{label}</Label>
-      {children}
-      {error ? <p className="text-xs" style={{ color: "var(--failing)" }}>{error}</p>
-        : help ? <p className="text-xs" style={{ color: "var(--text-faint)" }}>{help.replace(/\*\*(.+?)\*\*/g, "$1").replace(/`(.+?)`/g, "$1")}</p> : null}
-    </div>
-  );
+  const id = useId();
+  const direct = isValidElement<Record<string, unknown>>(children) &&
+    (children.type === Input || ["input", "select", "textarea"].includes(String(children.type)));
+  const description = error ? `${id}-error` : undefined;
+  const control = direct ? cloneElement(children as React.ReactElement<Record<string, unknown>>, {
+    id, "aria-invalid": !!error || undefined, "aria-describedby": description,
+  }) : children;
+  const helpContent = <>{error && <p id={`${id}-error`} className="text-xs text-destructive">{error}</p>}
+    {help && <details className="text-xs text-muted-foreground"><summary className="w-fit hover:text-foreground">Help with {label.replace(" *", "").toLowerCase()}</summary><p className="mt-1.5 leading-relaxed">{help.replace(/\*\*(.+?)\*\*/g, "$1").replace(/`(.+?)`/g, "$1")}</p></details>}</>;
+  return direct ? <div className="grid gap-1.5"><Label htmlFor={id} className="text-[13px] text-foreground">{label}</Label>{control}{helpContent}</div>
+    : <fieldset aria-invalid={!!error || undefined} aria-describedby={description} className="grid min-w-0 gap-1.5"><legend className="mb-1.5 text-[13px] font-medium text-foreground">{label}</legend>{children}{helpContent}</fieldset>;
 }
 
 function FieldRow({ f, coll, value, onChange, error, locked }: {
@@ -407,7 +437,7 @@ function FieldRow({ f, coll, value, onChange, error, locked }: {
       return (
         <Row label={label} help={help} error={error}>
           <div className="flex items-center gap-3">
-            <Switch checked={!!value} onCheckedChange={onChange} disabled={locked} />
+            <Switch aria-label={f.label} checked={!!value} onCheckedChange={onChange} disabled={locked} />
             <span className="text-xs" style={{ color: "var(--text-muted)" }}>{value ? "on" : "off"}</span>
           </div>
         </Row>
@@ -416,7 +446,7 @@ function FieldRow({ f, coll, value, onChange, error, locked }: {
       return (
         <Row label={label} help={help} error={error}>
           <Select value={value || ""} onValueChange={onChange} disabled={locked}>
-            <SelectTrigger><SelectValue placeholder={f.whenEmpty || "Choose…"} /></SelectTrigger>
+            <SelectTrigger aria-label={f.label} aria-invalid={!!error || undefined}><SelectValue placeholder={f.whenEmpty || "Choose…"} /></SelectTrigger>
             <SelectContent>
               {(f.options ?? []).map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
             </SelectContent>
@@ -440,14 +470,14 @@ function FieldRow({ f, coll, value, onChange, error, locked }: {
     case "lines":
       return (
         <Row label={label} help={help} error={error}>
-          <Textarea {...common} rows={5} value={value ?? ""} onChange={(e) => onChange(e.target.value)} className="font-mono text-xs" />
+          <Textarea {...common} rows={5} value={value ?? ""} onChange={(e) => onChange(e.target.value)} className="resize-none font-mono text-xs" />
         </Row>
       );
     case "textList":
       return (
         <Row label={label} help={help ?? "One per line."} error={error}>
           <Textarea {...common} rows={3} value={(value ?? []).join("\n")}
-            onChange={(e) => onChange(e.target.value.split("\n").map((s) => s.trim()).filter(Boolean))} className="font-mono text-xs" />
+            onChange={(e) => onChange(e.target.value.split("\n").map((s) => s.trim()).filter(Boolean))} className="resize-none font-mono text-xs" />
         </Row>
       );
     case "ref":
@@ -536,12 +566,19 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
   const filterBy = "filterBy" in f ? f.filterBy : null;
   const want = filterBy ? narrowedBy?.[filterBy] : undefined;
   const [options, setOptions] = useState<{ id: string; name: string; spec: any }[]>([]);
+  const [optionError, setOptionError] = useState("");
+  const [loadingOptions, setLoadingOptions] = useState(false);
   useEffect(() => {
-    if (!target || (target.scope === "project" && (!project || project === ALL))) { setOptions([]); return; }
+    let current = true;
+    setOptions([]); setOptionError("");
+    if (!target || (target.scope === "project" && (!project || project === ALL))) { setLoadingOptions(false); return; }
+    setLoadingOptions(true);
     call(`list:${target.id}`, "GET", basePath(target, project), { pageSize: 200 })
-      .then((a) => setOptions((a.items ?? []).map((r: Resource) =>
-        ({ id: idOf(r), name: r.meta.name, spec: r.spec }))))
-      .catch(() => setOptions([]));
+      .then((a) => { if (current) setOptions((a.items ?? []).map((r: Resource) =>
+        ({ id: idOf(r), name: r.meta.name, spec: r.spec }))); })
+      .catch(() => { if (current) setOptionError("Could not load options. Reopen this form to retry."); })
+      .finally(() => { if (current) setLoadingOptions(false); });
+    return () => { current = false; };
   }, [target, project]);
   const spell = (o: { id: string; name: string }) => (f.spelling === "name" ? o.name : o.id);
   // Nothing at all before the other field is chosen, rather than everything:
@@ -568,7 +605,7 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
         })}
         {!offered.length && (
           <span className="text-xs" style={{ color: "var(--text-faint)" }}>
-            {filterBy && !want ? `Choose a ${filterBy} first.` : "Nothing to pick from yet."}
+            {loadingOptions ? "Loading…" : optionError || (filterBy && !want ? `Choose a ${filterBy} first.` : "Nothing to pick from yet.")}
           </span>
         )}
       </div>
@@ -576,10 +613,10 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
   }
   return (
     <Select value={value || ""} onValueChange={onChange} disabled={disabled}>
-      <SelectTrigger>
+      <SelectTrigger aria-label={f.label}>
         <SelectValue placeholder={
           filterBy && !want ? `Choose a ${filterBy} first…`
-            : f.whenEmpty || `Pick a ${target?.singular ?? "value"}…`
+            : loadingOptions ? "Loading…" : optionError || (target?.scope === "project" && (!project || project === ALL) ? "Choose a project first…" : !offered.length ? `No ${target?.title.toLowerCase() ?? "options"} available` : `Choose a ${target?.singular ?? "value"}…`)
         } />
       </SelectTrigger>
       <SelectContent>

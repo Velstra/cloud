@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:browser": "npm run build && node tests/operations.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
