@@ -31,6 +31,7 @@ use crate::{
 };
 
 const WHO: &str = "rollout";
+const OWNER: &str = "velstra.io/rollout-owner";
 
 /// One edit of a node's spec, decided by the plan.
 type Change = Box<dyn Fn(&mut NodeSpec) + Send>;
@@ -66,7 +67,7 @@ impl RolloutController {
 
     /// One write on one node, as the plan decided it. Nothing is written when
     /// the node already reads that way, so a repeated plan is free.
-    async fn apply(&self, action: &Action, nodes: &[Node]) -> Result<()> {
+    async fn apply(&self, action: &Action, owner: &str) -> Result<()> {
         let (id, change): (&str, Change) = match action {
             Action::Cordon(n) => (n, Box::new(|s| s.schedulable = false)),
             Action::Evacuate(n) => (n, Box::new(|s| s.evacuate = true)),
@@ -83,15 +84,37 @@ impl RolloutController {
                 }),
             ),
         };
-        let Some(node) = nodes.iter().find(|n| n.meta.name.id() == id) else {
+        let Some(node) = self.nodes.get(&format!("nodes/{id}")).await? else {
             return Ok(());
         };
+        let owns = node
+            .meta
+            .labels
+            .get(OWNER)
+            .is_some_and(|held| held == owner);
+        if !owns
+            && (!matches!(action, Action::Cordon(_))
+                || node.meta.labels.contains_key(OWNER)
+                || !node.spec.schedulable
+                || node.spec.evacuate)
+        {
+            return Err(crate::Error::Refused(format!(
+                "{id} has a maintenance state owned outside {owner}"
+            )));
+        }
         let mut next = node.clone();
         change(&mut next.spec);
-        if next.spec == node.spec {
+        if matches!(action, Action::Release(_)) {
+            next.meta.labels.remove(OWNER);
+        } else {
+            next.meta.labels.insert(OWNER.into(), owner.into());
+        }
+        if next.spec == node.spec && next.meta.labels == node.meta.labels {
             return Ok(());
         }
-        next.meta.generation += 1;
+        if next.spec != node.spec {
+            next.meta.generation += 1;
+        }
         self.nodes.update(&next, &Writer::controller(WHO)).await?;
         info!(node = id, ?action, "written for the rollout");
         Ok(())
@@ -180,7 +203,28 @@ impl Reconciler for RolloutController {
         let instances = self.instances.list().await?;
         let fleet: Vec<Seen> = nodes
             .iter()
-            .map(|n| seen(n, &instances, self.control_plane.as_deref()))
+            .map(|n| {
+                let mut view = seen(n, &instances, self.control_plane.as_deref());
+                // A crash after the cordon but before rollout status was saved
+                // must not mistake our own cordon for an operator's lock.
+                if n.meta
+                    .labels
+                    .get(OWNER)
+                    .is_some_and(|owner| owner == &rollout.meta.name.to_string())
+                {
+                    view.schedulable = true;
+                    // Draining still needs its real value to avoid another write.
+                    if !rollout
+                        .status
+                        .nodes
+                        .iter()
+                        .any(|row| row.node == view.node && row.phase.in_flight())
+                    {
+                        view.evacuating = false;
+                    }
+                }
+                view
+            })
             .collect();
         let plan = rollout::plan(
             &rollout.spec,
@@ -193,7 +237,7 @@ impl Reconciler for RolloutController {
             Timestamp::now(),
         );
         for action in &plan.actions {
-            self.apply(action, &nodes).await?;
+            self.apply(action, &rollout.meta.name.to_string()).await?;
         }
         let mut next = rollout.clone();
         next.status = plan.status;
@@ -404,6 +448,37 @@ mod tests {
             paul.spec.schedulable && paul.spec.wanted.is_none(),
             "back in service, wanting nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cordon_survives_a_crash_before_rollout_status_is_written() {
+        let b = bench().await;
+        b.controller
+            .apply(&Action::Cordon("paul".into()), "rollouts/spring")
+            .await
+            .unwrap();
+        let r = pass(&b).await;
+        assert_eq!(row(&r, "paul").phase, NodePhase::Cordoned);
+        let r = pass(&b).await;
+        assert_eq!(row(&r, "paul").phase, NodePhase::Applying);
+    }
+
+    #[tokio::test]
+    async fn another_owner_cannot_release_a_nodes_maintenance() {
+        let b = bench().await;
+        b.controller
+            .apply(&Action::Cordon("paul".into()), "rollouts/other")
+            .await
+            .unwrap();
+        assert!(
+            b.controller
+                .apply(&Action::Release("paul".into()), "rollouts/spring")
+                .await
+                .is_err()
+        );
+        let node = b.nodes.get("nodes/paul").await.unwrap().unwrap();
+        assert!(!node.spec.schedulable);
+        assert_eq!(node.meta.labels.get(OWNER).unwrap(), "rollouts/other");
     }
 
     /// A machine that reports its apply failed stops the rollout, and the

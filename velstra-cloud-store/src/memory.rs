@@ -147,6 +147,67 @@ impl Store for MemoryStore {
         Ok(Revision(inner.revision))
     }
 
+    async fn put_admitted(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        expect: Expect,
+        admission: &crate::Admission,
+    ) -> Result<Revision> {
+        let mut inner = self.inner.lock().unwrap();
+        let actual = inner
+            .data
+            .get(&admission.key)
+            .map(|e| e.revision)
+            .unwrap_or(Revision(0));
+        if actual != admission.revision {
+            return Err(StoreError::Conflict {
+                key: admission.key.clone(),
+                expected: admission.revision,
+                actual,
+            });
+        }
+        let current = inner.data.get(key).map(|e| e.revision);
+        match (expect, current) {
+            (Expect::Absent, Some(_)) => {
+                return Err(StoreError::Exists {
+                    key: key.to_string(),
+                });
+            }
+            (Expect::Revision(want), Some(actual)) if want != actual => {
+                return Err(StoreError::Conflict {
+                    key: key.to_string(),
+                    expected: want,
+                    actual,
+                });
+            }
+            (Expect::Revision(want), None) => {
+                return Err(StoreError::Conflict {
+                    key: key.to_string(),
+                    expected: want,
+                    actual: Revision(0),
+                });
+            }
+            _ => {}
+        }
+        inner.revision += 1;
+        let entry = Entry {
+            key: key.to_string(),
+            value,
+            revision: Revision(inner.revision),
+        };
+        inner.data.insert(key.to_string(), entry.clone());
+        Self::publish(&mut inner, Event::Put(entry));
+        let marker = Entry {
+            key: admission.key.clone(),
+            value: Vec::new(),
+            revision: Revision(inner.revision),
+        };
+        inner.data.insert(admission.key.clone(), marker.clone());
+        Self::publish(&mut inner, Event::Put(marker));
+        Ok(Revision(inner.revision))
+    }
+
     async fn delete(&self, key: &str, expect: Expect) -> Result<Revision> {
         let mut inner = self.inner.lock().unwrap();
         let current = match inner.data.get(key) {

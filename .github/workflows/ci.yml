@@ -456,6 +456,8 @@ jobs:
       - name: Install it
         run: |
           set -euo pipefail
+          # Runner images can carry indexes for packages the mirrors removed.
+          sudo apt-get update
           sudo apt-get install -y ./velstra-cloud.deb
           # The binaries the package promises, and they run — a package
           # whose interpreter or `Depends` floor is wrong installs cleanly and

@@ -331,7 +331,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Only for an instance whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Nothing is moved until the node has been quiet long enough that its own agent has certainly stopped what it was running — a node with no fencing deadline is never recovered from.",
+    "help": "Only for an instance whose storage every node can reach. One on local storage that is started elsewhere is an empty machine wearing a familiar name. Recovery requires a fencing deadline and an operator's confirmation that the host was independently fenced. Silence alone never proves that its guests stopped.",
     "derived": false,
     "atCreation": false
    },

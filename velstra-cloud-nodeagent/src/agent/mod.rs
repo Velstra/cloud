@@ -928,7 +928,7 @@ impl Agent {
              stopping its guests so they cannot run twice"
         );
         for instance in running {
-            if let Err(e) = self.vmm.stop(&instance).await {
+            if let Err(e) = self.vmm.kill(&instance).await {
                 // Reported and carried on. A guest that will not stop is worse
                 // than one that will, and the remaining ones are still worth
                 // stopping — leaving them running because a neighbour was
@@ -1376,56 +1376,20 @@ impl Agent {
             }
         }
 
-        // A guest with no instance anywhere in the cell. Nothing will ever ask
-        // for it to be stopped: the delete pipeline stops a guest while its
-        // record is still there, and once the record is gone no pass looks at
-        // the guest again. Found live as a QEMU that outlived its instance by
-        // two days, holding a tap for a port that no longer existed — which the
-        // tap sweep below then tried to remove, and was refused, every pass,
-        // for ever ("Device or resource busy").
-        //
-        // **Only guests this agent's own state directory holds.** The list
-        // above is this node's share and never was the cell — `CellReader`
-        // says so in one line ("the instances this node holds or has been
-        // given"), and the comment that used to sit here claimed otherwise.
-        // On that false premise the sweep reads as "an instance nobody's books
-        // mention", and what it actually means is "an instance *I* was not
-        // handed" — which is every other agent's guest on the same machine.
-        //
-        // Found by running a second agent on a live node, exactly as
-        // `--tap-prefix` and `--bridge-prefix` invite ("two agents on one
-        // machine need two"): it stopped the first agent's guest within
-        // seconds of starting, and the guest's own agent had to bring it back.
-        //
-        // `host.disks` is read from this agent's `run_dir`, so it is precisely
-        // "guests I made". The case this sweep exists for — a QEMU that
-        // outlived its instance by two days — is one of those, so nothing it
-        // was written to catch escapes.
-        //
-        // The list read failing returns early above, so an unreadable store
-        // never looks like an empty one.
+        // Missing records can follow a store restore or a schema rollback.
+        // Preserve the workloads and report them for operator reconciliation;
+        // only the explicit deletion pipeline may destroy a guest.
         let known: BTreeSet<String> = instances.iter().map(|i| i.meta.name.to_string()).collect();
+        let mut has_unknown_guest = false;
         for name in host.vms.keys() {
             if known.contains(name) || !host.disks.contains(name) {
                 continue;
             }
-            // Said once, now that a kill is terminal: the guest stops being
-            // observed, so this line stops repeating. It used to be every pass
-            // for as long as the node ran — 1055 an hour for twelve days on a
-            // live node — which is the shape of a warning nobody can act on and
-            // everybody learns to scroll past.
+            has_unknown_guest = true;
+            // An absent object may be a restored snapshot or an unreadable
+            // newer schema. Neither is an instruction to destroy a workload.
             tracing::warn!(instance = %name,
-                "stopping a guest of mine whose instance is gone from my share of the cell; \
-                 its disk is left behind and is an operator's to reclaim");
-            // `kill`, not `stop`: the graceful path asks over the monitor, and
-            // an orphan whose directory was deleted has no monitor left to ask
-            // — its unit is the only handle that still works.
-            if let Err(e) = self.vmm.kill(name).await {
-                tracing::warn!(instance = %name, error = %e, "the orphaned guest would not stop");
-                pass.failures += 1;
-            } else {
-                pass.actions += 1;
-            }
+                "guest has no readable instance in this node's share; preserving it for operator reconciliation");
         }
 
         match self.cell.attachments().await {
@@ -1505,7 +1469,9 @@ impl Agent {
         // port object. Once the guest stops concerning this node (the
         // migration record is gone), its tap does too.
         for (port_name, _tap) in taps.clone() {
-            if in_my_share.contains(port_name.as_str()) {
+            // Without the instance record we cannot identify its ports.
+            // Preserve the wire as well until the inventory is reconciled.
+            if has_unknown_guest || in_my_share.contains(port_name.as_str()) {
                 continue;
             }
             // A deleting port's teardown is the owner path's below — it is the

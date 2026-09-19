@@ -23,6 +23,7 @@ macro_rules! cases {
 }
 
 cases! {
+    admission_is_atomic,
     a_revision_moves_forward_and_never_repeats,
     an_object_round_trips_through_create_read_update_delete,
     a_stale_writer_is_refused_rather_than_winning,

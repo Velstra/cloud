@@ -56,6 +56,7 @@ pub struct TypedStore<S, T> {
     store: std::sync::Arc<dyn Store>,
     cell: String,
     kind: &'static str,
+    admission: Option<crate::Admission>,
     _marker: PhantomData<(S, T)>,
 }
 
@@ -65,6 +66,7 @@ impl<S, T> Clone for TypedStore<S, T> {
             store: self.store.clone(),
             cell: self.cell.clone(),
             kind: self.kind,
+            admission: self.admission.clone(),
             _marker: PhantomData,
         }
     }
@@ -80,7 +82,20 @@ where
             store,
             cell: cell.to_string(),
             kind,
+            admission: None,
             _marker: PhantomData,
+        }
+    }
+
+    pub fn with_admission(mut self, admission: Option<crate::Admission>) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    async fn put(&self, key: &str, bytes: Vec<u8>, expect: Expect) -> crate::Result<Revision> {
+        match &self.admission {
+            Some(admission) => self.store.put_admitted(key, bytes, expect, admission).await,
+            None => self.store.put(key, bytes, expect).await,
         }
     }
 
@@ -154,6 +169,16 @@ where
             .into_iter()
             .filter_map(|e| self.decoded_or_complained(&e.value, e.revision))
             .collect())
+    }
+
+    /// Admission must not treat an unreadable holder as free capacity.
+    pub async fn list_strict(&self) -> Result<Vec<Resource<S, T>>> {
+        self.store
+            .list(&self.prefix())
+            .await?
+            .into_iter()
+            .map(|e| self.decode(&e.value, e.revision))
+            .collect()
     }
 
     /// [`Self::decode`], turning a failure into a log line and a `None`.
@@ -266,7 +291,7 @@ where
         judge_create(writer)?;
         let key = self.key(&resource.meta.name.to_string());
         let bytes = serde_json::to_vec(resource).expect("a resource always serialises");
-        Ok(self.store.put(&key, bytes, Expect::Absent).await?)
+        Ok(self.put(&key, bytes, Expect::Absent).await?)
     }
 
     /// Write, as `writer`, refusing anything that changes the other party's
@@ -325,7 +350,6 @@ where
 
         let bytes = serde_json::to_vec(next).expect("a resource always serialises");
         Ok(self
-            .store
             .put(&key, bytes, Expect::Revision(next.meta.revision))
             .await?)
     }

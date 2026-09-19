@@ -71,6 +71,15 @@ impl Store for Counting {
     async fn put(&self, key: &str, value: Vec<u8>, expect: Expect) -> Result<Revision, StoreError> {
         self.inner.put(key, value, expect).await
     }
+    async fn put_admitted(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        expect: Expect,
+        admission: &velstra_cloud_store::Admission,
+    ) -> Result<Revision, StoreError> {
+        self.inner.put_admitted(key, value, expect, admission).await
+    }
     async fn delete(&self, key: &str, expect: Expect) -> Result<Revision, StoreError> {
         self.inner.delete(key, expect).await
     }

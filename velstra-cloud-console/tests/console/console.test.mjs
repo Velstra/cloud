@@ -2707,9 +2707,8 @@ await test("several guests can be stopped at once, and every refusal is named", 
   // A board without a bulk action offers no picker column at all: a column of
   // checkboxes over a board with nothing to do with them is a control that
   // does nothing.
-  // Nodes are neither created nor deleted from here — a machine joins a cell
-  // by being registered — so there is nothing a selection of them could do.
-  await open(page, "nodes");
+  // Nodes now have a bulk upgrade action; migrations deliberately have none.
+  await open(page, "migrations");
   const boxes = await page.evaluate(`document.querySelectorAll("[data-picks]").length`);
   equal(boxes, 0, "a board with no bulk action still offered a selection column");
 });

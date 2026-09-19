@@ -6526,3 +6526,50 @@ async fn a_cell_nobody_can_reach_mints_no_join_token() {
     assert!(made.body["nodeToken"].is_string());
     assert!(made.body.get("joinToken").is_none(), "{}", made.body);
 }
+
+#[tokio::test]
+async fn deleting_an_attachment_does_not_free_its_volume_before_release() {
+    use velstra_cloud_model::resources::{
+        AttachmentSpec, AttachmentStatus, NODE_RELEASE_FINALIZER,
+    };
+    let h = Harness::new();
+    h.disk("p1", "v1").await;
+    h.instance("p1", "i1", json!({"node": "node-a"})).await;
+    h.instance("p1", "i2", json!({"node": "node-b"})).await;
+    let first = h
+        .post(
+            "projects/p1/attachments",
+            json!({"id": "a1", "spec": {
+                "volume": "projects/p1/volumes/v1", "instance": "projects/p1/instances/i1"
+            }}),
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    let attachments: TypedStore<AttachmentSpec, AttachmentStatus> =
+        TypedStore::new(h.store.clone(), "cell-1", "attachments");
+    let mut held = attachments
+        .get("projects/p1/attachments/a1")
+        .await
+        .unwrap()
+        .unwrap();
+    held.meta.add_finalizer(NODE_RELEASE_FINALIZER);
+    held.meta.deleted_at = Some(velstra_cloud_model::meta::Timestamp::now());
+    attachments
+        .update(&held, &Writer::controller("test"))
+        .await
+        .unwrap();
+    let second = h
+        .post(
+            "projects/p1/attachments",
+            json!({"id": "a2", "spec": {
+                "volume": "projects/p1/volumes/v1", "instance": "projects/p1/instances/i2"
+            }}),
+        )
+        .await;
+    assert_eq!(
+        second.error_code(),
+        "FAILED_PRECONDITION",
+        "{}",
+        second.body
+    );
+}

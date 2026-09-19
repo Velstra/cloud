@@ -3168,6 +3168,11 @@ impl Api {
         // going too fast first — which is true, and which they discover the
         // moment they slow down.
         self.may_write_now(who)?;
+        let admission = velstra_cloud_store::Admission::read(
+            self.inner.store.as_ref(),
+            &self.inner.placement.cell,
+        )
+        .await?;
         // Authorised on the **parent**, because the object does not exist yet
         // and has no bindings of its own. Creating inside a project is a write
         // to that project; creating without one is a write to the cell.
@@ -3481,7 +3486,7 @@ impl Api {
         }
         let meta = serde_json::to_value(&meta).expect("meta always serialises");
         let created = collection
-            .create(meta, spec)
+            .create_admitted(meta, spec, admission)
             .await
             .map_err(|e| taken(e, kind, &name))?;
 
@@ -4651,6 +4656,11 @@ impl Api {
         who: &Identity,
     ) -> ApiResult<Changed> {
         self.may_write_now(who)?;
+        let admission = velstra_cloud_store::Admission::read(
+            self.inner.store.as_ref(),
+            &self.inner.placement.cell,
+        )
+        .await?;
         // Changing who else may is a different permission from changing
         // anything else, or an editor is an admin one request later.
         let verb = if body
@@ -4943,7 +4953,9 @@ impl Api {
         if name.collection() == "enrollments" {
             patch.status = self.approver_stamp(name, &patch, who).await?;
         }
-        let mut document = collection.patch(&name.to_string(), &patch, expect).await?;
+        let mut document = collection
+            .patch_admitted(&name.to_string(), &patch, expect, admission)
+            .await?;
         self.answer(&mut document, &mut Scratch::default()).await?;
         self.record_change(who, "update", name).await;
         // A change to the spec is work somebody has asked for and nobody has
@@ -5992,14 +6004,9 @@ impl Api {
             return Ok(());
         };
         let instance = spec.get("instance").and_then(Value::as_str).unwrap_or("");
-        let held: Vec<velstra_cloud_model::resources::Attachment> = self
-            .typed_list(parent, "attachments")
-            .await
-            .unwrap_or_default();
+        let held: Vec<velstra_cloud_model::resources::Attachment> =
+            self.typed_list(parent, "attachments").await?;
         for a in held {
-            if a.meta.is_deleting() {
-                continue;
-            }
             if a.spec.volume == volume && a.spec.instance != instance {
                 return Err(ApiError::new(
                     Code::FailedPrecondition,
@@ -9363,6 +9370,7 @@ impl Api {
         let view = velstra_cloud_model::ha::NodeView {
             name: node_name.clone(),
             last_heartbeat: node.status.last_heartbeat,
+            fenced_heartbeat: velstra_cloud_model::ha::confirmed_heartbeat(&node.meta.labels),
             fence_after_s: node.spec.fence_after_s,
             ready: velstra_cloud_model::meta::condition(&node.status.conditions, "Ready")
                 .is_some_and(|c| c.status == velstra_cloud_model::meta::ConditionStatus::True),
@@ -9387,6 +9395,7 @@ impl Api {
                 // are four different actions and a console branches on which.
                 let token = match &why {
                     N::PolicyIsLeave => "PolicyIsLeave",
+                    N::FenceNotConfirmed { .. } => "FenceNotConfirmed",
                     N::NotQuietLongEnough { .. } => "WaitingForFencing",
                     N::NodeDoesNotFence { .. } => "NodeDoesNotFence",
                     N::HoldsDevices { .. } => "HoldsDevices",
@@ -9859,7 +9868,7 @@ impl Api {
     {
         let collection = self.collection(kind)?;
         collection
-            .list()
+            .list_strict()
             .await?
             .into_iter()
             .filter(|document| under(document, parent))

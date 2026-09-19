@@ -509,3 +509,45 @@ pub async fn paging_an_empty_collection_is_one_empty_page(store: &impl Store, ce
         "an empty collection promised a page that cannot exist"
     );
 }
+
+/// Two API replicas validated the same inventory. Only one may commit, and
+/// a refused resource write must not consume the admission watermark.
+pub async fn admission_is_atomic(store: &dyn Store, cell: &str) {
+    let a_key = format!("/{cell}/volumes/a");
+    let b_key = format!("/{cell}/volumes/b");
+    let c_key = format!("/{cell}/volumes/c");
+    let prefix = format!("/{cell}/volumes/");
+    let first = velstra_cloud_store::Admission::read(store, cell)
+        .await
+        .unwrap();
+    let second = velstra_cloud_store::Admission::read(store, cell)
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        store.put_admitted(&a_key, vec![1], Expect::Absent, &first),
+        store.put_admitted(&b_key, vec![2], Expect::Absent, &second)
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert_eq!(store.list(&prefix).await.unwrap().len(), 1);
+    let current = velstra_cloud_store::Admission::read(store, cell)
+        .await
+        .unwrap();
+    let existing = if a.is_ok() { &a_key } else { &b_key };
+    assert!(
+        store
+            .put_admitted(existing, vec![3], Expect::Absent, &current)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        velstra_cloud_store::Admission::read(store, cell)
+            .await
+            .unwrap()
+            .revision,
+        current.revision
+    );
+    store
+        .put_admitted(&c_key, vec![4], Expect::Absent, &current)
+        .await
+        .unwrap();
+}

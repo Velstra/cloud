@@ -238,8 +238,6 @@ impl<F: Fetch> Reconciler for ReleaseController<F> {
             return Ok(());
         }
         let mut next = release.clone();
-        next.status.observed_generation = release.meta.generation;
-
         // The channel, read when it has not been or the spec changed.
         let unread = release.status.version.is_empty()
             || release.status.observed_generation != release.meta.generation;
@@ -247,6 +245,25 @@ impl<F: Fetch> Reconciler for ReleaseController<F> {
             return self.status.write(release, &next).await.map(|_| ());
         }
 
+        next.status.observed_generation = release.meta.generation;
+        // `fetched` is an observation about this host, not durable evidence
+        // that another replica still has the file after a failover or restore.
+        for slot in [
+            &mut next.status.image,
+            &mut next.status.package,
+            &mut next.status.installer,
+        ] {
+            if let Some(artefact) = slot
+                && artefact.fetched
+                && !tokio::fs::try_exists(
+                    self.dir.join(release.meta.name.id()).join(&artefact.file),
+                )
+                .await
+                .unwrap_or(false)
+            {
+                artefact.fetched = false;
+            }
+        }
         // One file that is not here yet.
         let pending: Vec<Artefact> = next
             .status
@@ -692,5 +709,40 @@ mod tests {
         assert!(!dir.join("local").exists());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&channel_dir);
+    }
+    #[tokio::test]
+    async fn a_failed_changed_channel_never_reuses_the_previous_ready_generation() {
+        let deb = b"package";
+        let iso = b"installer";
+        let sums = format!("{}  {DEB}\n{}  {ISO}\n", sha256(deb), sha256(iso));
+        let b = bench("changed-channel", channel(deb, iso, &sums)).await;
+        pass(&b).await;
+        let mut ready = pass(&b).await;
+        assert!(ready.status.is_ready());
+        ready.spec.url = "https://missing.example".into();
+        ready.meta.generation += 1;
+        b.store
+            .update(&ready, &Writer::controller("test"))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let failed = pass(&b).await;
+            assert!(!failed.status.is_ready());
+            assert_ne!(failed.status.observed_generation, failed.meta.generation);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_release_files_are_downloaded_again_after_a_failover() {
+        let deb = b"package";
+        let iso = b"installer";
+        let sums = format!("{}  {DEB}\n{}  {ISO}\n", sha256(deb), sha256(iso));
+        let b = bench("lost-file", channel(deb, iso, &sums)).await;
+        pass(&b).await;
+        assert!(pass(&b).await.status.is_ready());
+        let file = b.dir.join("v0.2.0").join(DEB);
+        std::fs::remove_file(&file).unwrap();
+        assert!(pass(&b).await.status.is_ready());
+        assert_eq!(std::fs::read(&file).unwrap(), deb);
     }
 }

@@ -52,6 +52,20 @@ is. A tag makes that revision a real one instead of `dirty`.
 
 ### Fixed
 
+- Require heartbeat-scoped external fencing confirmation before recovering
+  guests, force-stop guests during self-fencing, and preserve unknown guests
+  during recovery from a restored store.
+- Serialize API admission with atomic store transactions so concurrent quota
+  and exclusive-volume checks cannot both succeed. Keep deleting attachments
+  exclusive until their finalizers finish.
+- Persist update attempts across reboot and rollback, prevent overlapping
+  updates, preserve operator maintenance, and pin rollout targets.
+- Retry failed release-channel reads and restore missing local artefacts.
+- Write credentials and snapshots with private permissions from creation,
+  recover interrupted quickstart enrollment, and keep curl secrets off argv.
+- Wire the documented NixOS API TLS options and update rustls to 0.23.45.
+
+
 - **A rebooted control plane kept its cell.** On the sealed image the store
   wrote to etcd's default `/var/lib/etcd`, which is the volatile root: every
   object in the cell lived in RAM, and the first reboot of the control plane

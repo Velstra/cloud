@@ -843,9 +843,31 @@ pub(crate) fn write_secret(path: &Path, contents: &str) -> Result<()> {
 }
 
 pub(crate) fn write_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
-    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("setting the mode on {}", path.display()))
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    // A private temporary file avoids both a permissive creation window and
+    // truncating a live credential if the process dies midway through a write.
+    let parent = path.parent().context("the file has no parent directory")?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let tmp = parent.join(format!(".seed-{}-{nonce}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("writing {}", path.display()))
 }
 
 /// What the cell says about the machine holding this token.

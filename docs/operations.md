@@ -20,6 +20,11 @@ machine): the failure this exists for is that disk dying.
 
 ## Restoring the store
 
+Before restoring, stop the node and pool agents throughout the cell as well as
+the API and controllers. Their managed guests run in independent units and
+continue running. If a fencing deadline is configured, fence affected hosts
+externally before permitting recovery; do not rely on a stopped agent to fence.
+
 On a fresh or repaired control-plane machine:
 
 ```
@@ -38,11 +43,14 @@ On the sealed image the store's data directory is **`/var/lib/velstra/etcd`**
 empty — and the snapshots are beside it under `/var/lib/velstra/store-backups`.
 Substitute that path above; `etcdutl` and `etcd` are on the image.
 
-What comes back is the cell as of the snapshot: up to an hour of writes are
-gone, which for this platform means *asks*, not machines — a guest created in
-that hour is still running on its node, and the node agent's next resync
-reports it against an instance object that no longer exists. Delete or
-re-create such objects deliberately; nothing does it for you.
+What comes back is the cell as of the snapshot, with up to an hour of object
+changes missing. Reconcile the restored inventory with the machines before
+restarting their agents. An agent preserves a local guest whose instance is
+absent or unreadable and logs it for operator reconciliation; it never infers a
+deletion request from that absence. Restore its instance record deliberately or
+stop the orphan explicitly after identifying its unit and disks. Existing
+objects still reconcile to their restored specifications, so inventory review
+is necessary even though absent objects no longer trigger automatic kills.
 
 Two things restore does **not** bring back, by design:
 
@@ -123,11 +131,22 @@ decides what happens:
   `0`, the default, never fences.
 * `instance.spec.onNodeLoss` — `leave` (default) strands the guest until the
   node returns; `restart` lets the cell start it elsewhere **once the node is
-  provably fenced** (silent for `fenceAfterS` plus margin).
+  externally fenced** and the deadline plus margin has elapsed.
 
-The safe pairing for machines that flap (laptops, Wi-Fi) is the default. The
-available pairing for real servers on real power is `fenceAfterS: 120` and
-`onNodeLoss: restart` on the guests that may move.
+For recovery after a host outage:
+
+1. Cordon the node and fence it through an independent power-management or
+   storage-fencing path. Keep the host fenced until its old workloads have been
+   reconciled; do not boot it into an isolated, stale copy of the cell.
+2. Read `status.lastHeartbeat` from `GET /api/v1/nodes/<id>` after fencing.
+3. As a cell operator, PATCH that node with
+   `{"meta":{"labels":{"velstra.io/fenced-heartbeat":"<lastHeartbeat in milliseconds>"}}}`.
+4. With `fenceAfterS` configured and `onNodeLoss: "restart"`, recovery may proceed
+   after the deadline and margin. A later heartbeat invalidates the confirmation.
+
+This is operator-confirmed recovery, not unattended hardware fencing. Automate
+the confirmation only through an independent fencer that has verified success;
+never set the label merely because a heartbeat expired.
 
 
 ## Announcing the cell over BGP
@@ -197,3 +216,19 @@ knowing when reading a cluster by hand: a pool with `size: 1` needs
 `set`; and `ceph-volume` refuses a whole disk that carries a partition table,
 so a disk that was something else has to be wiped (`wipefs -a`) before it can
 be an OSD.
+
+## Replicated control planes and release storage
+
+The bundled etcd is a single-member development/small-cell default and is a
+single point of failure. For an HA cell, run an independently managed etcd
+quorum and configure every API/controller replica with its endpoints.
+
+All API and controller replicas must mount the **same durable release directory**
+at `VELSTRA_RELEASES_DIR` (default `/var/lib/velstra/releases`). Release readiness
+is shared in etcd, while downloads are served from this directory. A controller
+re-fetches missing artifacts after disk loss; a replica with an unrelated local
+directory cannot serve another replica's files. Back up or replicate this
+storage separately from the etcd snapshots.
+
+Snapshots are created with mode 0600 inside a mode-0700 directory. Preserve
+these permissions on remote backup storage: snapshots contain private cell data.
