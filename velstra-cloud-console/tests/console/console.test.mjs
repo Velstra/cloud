@@ -368,6 +368,7 @@ await test("a drifting object shows the gap, and the reason for it", async () =>
   await open(page, "instances");
   const it = await pick("drifting instance", ofKind("drifting"));
   await openRow(page, it.id);
+  await page.evaluate(`document.getElementById("technical")?.click()`);
   const g = await gens(it.id);
   const text = await sheetText(page);
   // "Drifting" is the class; the word on the sheet says what is under way
@@ -409,6 +410,7 @@ await test("a failed placement shows the rejection chain per node", async () => 
   const answer = await (await api("/api/v1/" + it.name + ":explainPlacement")).json().catch(() => null);
   if (!answer || answer.error) skip("this API does not answer :explainPlacement");
   await openRow(page, it.id);
+  await page.evaluate(`document.getElementById("placementdetail")?.click()`);
   await sleep(800);
   const text = await sheetText(page);
   check(answer.placed ? /Placed on/.test(text) : /Not placed/.test(text),
@@ -2088,6 +2090,7 @@ await test("editing a guest keeps the image it was built from, and still saves",
   await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
   await open(page, "instances");
   await openRow(page, "web-1");
+  await page.evaluate(`document.getElementById("instancehistory")?.click()`);
   await page.evaluate(`document.getElementById("editbtn").click()`);
   await sleep(800);
   const seen = await page.evaluate(`({
@@ -2718,12 +2721,13 @@ await test("several guests can be stopped at once, and every refusal is named", 
 await test("an object's sheet shows what was asked of it, refusals included", async () => {
   await open(page, "instances");
   await openRow(page, "web-1");
+  await page.evaluate(`document.getElementById("instancehistory").click()`);
   const said = await waitFor(page, `(() => {
     const box = document.getElementById("history");
     return box && !box.textContent.includes("Asking") ? box.textContent : null;
   })()`);
 
-  check(said.includes("create"), `the change that made it is not there: ${said}`);
+  check(said.includes("Created"), `the change that made it is not there: ${said}`);
   check(said.includes("alice"), `who asked is not there: ${said}`);
   // A change that was accepted and then failed is not a change that happened.
   check(said.includes("the node refused the change"), `a failure is not shown: ${said}`);
@@ -2915,6 +2919,9 @@ await test("a pool can be declared before its agent exists, and is handed its to
     const id = document.getElementById("f-id");
     id.value = "nvme-2";
     id.dispatchEvent(new Event("input"));
+    const target = document.getElementById("f-backendTarget");
+    target.value = "tenant-nvme";
+    target.dispatchEvent(new Event("input"));
     document.getElementById("submitform").click();
   })()`);
 
@@ -2929,6 +2936,8 @@ await test("a pool can be declared before its agent exists, and is handed its to
   // into `velstra-cloud-node setup` is a token in the wrong file.
   check(shown.panel.includes("/etc/velstra/pool-token"),
     `the panel does not say where a pool token goes: ${shown.panel}`);
+  check(shown.panel.includes("VELSTRA_POOL_BACKEND=ceph") && shown.panel.includes("tenant-nvme"),
+    `the panel does not carry the selected Ceph backend: ${shown.panel}`);
   await page.evaluate(`document.getElementById("tokendone").click()`);
 
   const row = await waitFor(page, `(() => {

@@ -88,6 +88,12 @@ const WORD: Record<Entry["kind"], string> = {
   refused: "refused",
 };
 
+const readable = (verb: string) => ({
+  create: "Created", update: "Updated", patch: "Updated", delete: "Deletion requested",
+  start: "Started", stop: "Stopped", restart: "Restarted", migrate: "Migration requested",
+  attach: "Attached", detach: "Detached",
+}[verb.toLowerCase()] ?? verb.replace(/^./, (c) => c.toUpperCase()));
+
 export function History({ r }: { r: Resource }) {
   const name = nameOf(r);
   const [entries, setEntries] = useState<Entry[] | null>(null);
@@ -136,9 +142,9 @@ export function History({ r }: { r: Resource }) {
           style={{ borderColor: "var(--border-subtle)", borderLeft: `3px solid ${TONE[e.kind]}` }}
         >
           <p className="text-sm" style={{ color: "var(--text-body)" }}>
-            <span className="font-medium">{e.who}</span> · {e.what} ·{" "}
+            <span className="font-medium">{readable(e.what)}</span>{" "}
             <span style={{ color: e.kind === "refused" ? "var(--failing)" : "var(--text-faint)" }}>
-              {WORD[e.kind]}
+              · {WORD[e.kind]}
             </span>
           </p>
           {e.detail && (
@@ -147,7 +153,7 @@ export function History({ r }: { r: Resource }) {
             </p>
           )}
           <p className="font-mono text-[11px]" style={{ color: "var(--text-faint)" }}>
-            {e.at ? ago(e.at) : "—"}
+            {e.who} · {e.at ? ago(e.at) : "—"}
           </p>
         </li>
       ))}

@@ -240,6 +240,10 @@ async fn register_pool(store: Arc<dyn Store>, id: &str) {
             Placement::new(REGION, CELL),
         ),
         PoolSpec {
+            scope: Default::default(),
+            backend: Default::default(),
+            backend_target: String::new(),
+            thin_pool: String::new(),
             accepting: true,
             node: String::new(),
             labels: vec!["dev".to_string()],

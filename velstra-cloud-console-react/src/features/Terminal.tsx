@@ -91,6 +91,14 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
         )}
         <span className="ml-auto">{Number(r.status?.consoleBytes ?? 0).toLocaleString()} bytes written so far</span>
       </div>
+      {String(r.status?.consoleTail ?? "") ? (
+        <details className="rounded-md border border-border p-2 text-xs">
+          <summary className="cursor-pointer font-medium">Raw boot log · {Number(r.status?.consoleBytes ?? 0).toLocaleString()} bytes</summary>
+          <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-black p-3 font-mono text-[11px] text-zinc-100">{String(r.status?.consoleTail)}</pre>
+        </details>
+      ) : state === "closed" ? (
+        <p className="text-xs text-muted-foreground">No captured output yet. Attach for the live serial console; enable Console while editing the VM to retain a tail.</p>
+      ) : null}
       <div ref={host} className="h-[280px] overflow-hidden rounded-[4px] border"
         style={{ borderColor: "var(--border)", background: "var(--ink-950, #080c11)", display: state === "closed" && !term.current ? "none" : "block" }} />
     </div>

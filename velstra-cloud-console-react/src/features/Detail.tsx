@@ -65,7 +65,9 @@ export function Detail({ coll, id, mode, onChanged }: {
 
   const v = verdict(r, coll);
   const diffs = disagreements(r, coll);
-  const actions = objectActions(coll.id, !!who?.cellAdmin);
+  const allActions = objectActions(coll.id, !!who?.cellAdmin);
+  const diagnostics = allActions.filter((a) => /explain/i.test(a.id));
+  const actions = allActions.filter((a) => !/explain/i.test(a.id));
   const custom = entry(coll.id);
   const here = projectOf(nameOf(r)) ?? project;
   const mayOperate = can("operate", coll, here); const mayWrite = can("write", coll, here);
@@ -152,25 +154,26 @@ export function Detail({ coll, id, mode, onChanged }: {
         </Section>
       )}
 
-      {Object.keys(answers).length > 0 && (
-        <Section label="Answers" sub="what the last actions said">
-          {Object.entries(answers).map(([k, a]) => (
-            <div key={k} className="mb-3 rounded-[4px] border p-3" style={{ borderColor: "var(--border-subtle)" }}>
-              <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-faint)" }}>{actions.find((x) => x.id === k)?.label ?? k}</div>
-              <Explain answer={a} />
-            </div>
-          ))}
-        </Section>
-      )}
-
       {custom.panels?.map((p) => (
         <Section key={p.id} label={p.title}>{p.render(r, coll, load)}</Section>
       ))}
 
+      {diagnostics.length > 0 && <details className="rounded-lg border border-border p-3">
+        <summary className="text-sm font-medium">Additional information</summary>
+        <div className="mt-3 grid gap-3">
+          <div className="flex flex-wrap gap-2">{diagnostics.map((a) => <Pressed key={a.id} size="sm" variant="secondary" title={a.summary} onPress={async () => {
+            try {
+              const answer = await call(a.id, a.method, a.path.replace("{project}", projectOf(nameOf(r)) ?? project).replace(/\{(name|id)\}/, encodeURIComponent(idOf(r))), undefined, a.needsBody ? {} : undefined);
+              setAnswers((s) => ({ ...s, [a.id]: answer }));
+            } catch (e) { toast.error((e as Error).message); }
+          }}>{a.label.replace(/^Explain /, "Show ")}</Pressed>)}</div>
+          {Object.entries(answers).filter(([k]) => diagnostics.some((a) => a.id === k)).map(([k, a]) => <div key={k} className="rounded-[4px] border p-3" style={{ borderColor: "var(--border-subtle)" }}><Explain answer={a} /></div>)}
+        </div>
+      </details>}
       <details className="rounded-lg border border-border p-3"><summary className="text-sm font-medium">Activity history</summary><div className="mt-3"><History r={r} /></div></details>
-      <details className="rounded-lg border border-border p-3"><summary className="text-sm font-medium">Dependencies</summary><div className="mt-3"><Suspense fallback={<p className="text-xs text-muted-foreground">Loading dependencies…</p>}><Relations r={r} coll={coll} /></Suspense></div></details>
+      <details className="rounded-lg border border-border p-3"><summary className="text-sm font-medium">Related resources</summary><div className="mt-3"><Suspense fallback={<p className="text-xs text-muted-foreground">Loading related resources…</p>}><Relations r={r} coll={coll} /></Suspense></div></details>
 
-      <Tabs defaultValue="spec" className="flex w-full flex-col gap-1">
+      <details className="rounded-lg border border-border p-3"><summary className="text-sm font-medium">Technical details</summary><Tabs defaultValue="spec" className="mt-3 flex w-full flex-col gap-1">
         <TabsList>
           <TabsTrigger value="spec">Specification</TabsTrigger>
           <TabsTrigger value="status">Status</TabsTrigger>
@@ -179,7 +182,7 @@ export function Detail({ coll, id, mode, onChanged }: {
         <TabsContent value="spec"><KeyValues obj={r.spec ?? {}} refs={coll} /></TabsContent>
         <TabsContent value="status"><KeyValues obj={r.status ?? {}} /></TabsContent>
         <TabsContent value="meta"><KeyValues obj={r.meta as any} /></TabsContent>
-      </Tabs>
+      </Tabs></details>
     </Pane>
   );
 }

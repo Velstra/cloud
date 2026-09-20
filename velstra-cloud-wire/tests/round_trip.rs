@@ -235,6 +235,7 @@ fn every_resource_survives_its_own_wire() {
                 pool: "velstra-volumes".into(),
                 size: 3,
                 min_size: 2,
+                delete: false,
             }],
             paused: true,
         },

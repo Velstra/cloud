@@ -281,6 +281,10 @@ async fn a_cluster_that_cannot_be_reached_is_reported_rather_than_read_as_empty(
     let registered: velstra_cloud_model::resources::Pool = Resource::new(
         meta(&format!("pools/{POOL}")),
         velstra_cloud_model::resources::PoolSpec {
+            scope: Default::default(),
+            backend: Default::default(),
+            backend_target: String::new(),
+            thin_pool: String::new(),
             accepting: true,
             node: String::new(),
             labels: Vec::new(),

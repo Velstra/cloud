@@ -21,8 +21,8 @@ use velstra_cloud_model::{
     access::Writer,
     meta::{Condition, ConditionStatus, Placement, Timestamp, set_condition},
     resources::{
-        POOL_RELEASE_FINALIZER, Pool, PoolSpec, PoolStatus, Snapshot, SnapshotSpec, SnapshotStatus,
-        Volume, VolumeSpec, VolumeStatus,
+        POOL_RELEASE_FINALIZER, Pool, PoolBackend, PoolSpec, PoolStatus, Snapshot, SnapshotSpec,
+        SnapshotStatus, Volume, VolumeSpec, VolumeStatus,
     },
     storage::{
         SeenInPool, SeenSnapshot, SnapshotAction, VolumeAction, VolumeSource, reconcile_snapshot,
@@ -496,6 +496,19 @@ impl PoolAgent {
                 return pass;
             }
         };
+
+        // A declarative pool must never be served by a different backend. Do
+        // this before walking volumes: reporting the mismatch after an LVM
+        // agent had already provisioned a volume meant the warning described
+        // data that had just been written to the wrong place.
+        if let Ok(Some(stored)) = self.cell.pool(&self.config.pool).await
+            && let Some(expected) = expected_backend(stored.spec.backend)
+            && expected != seen.backend
+        {
+            self.backend_mismatch(&stored, expected, &seen.backend, &mut pass)
+                .await;
+            return pass;
+        }
 
         let volumes = match self.cell.volumes().await {
             Ok(volumes) => volumes,
@@ -1516,20 +1529,62 @@ impl PoolAgent {
         next.status.allocated_gib = allocated;
         next.status.agent_version = self.config.agent_version.clone();
         next.status.last_heartbeat = Timestamp::now();
+        let expected = expected_backend(stored.spec.backend);
+        let mismatch = expected.filter(|expected| *expected != seen.backend);
+        set_condition(
+            &mut next.status.conditions,
+            if let Some(expected) = mismatch {
+                Condition::new(
+                    "Ready",
+                    ConditionStatus::False,
+                    "BackendMismatch",
+                    &format!(
+                        "this pool asks for {expected}, but its agent is serving {}",
+                        seen.backend
+                    ),
+                    stored.meta.generation,
+                )
+            } else {
+                Condition::new(
+                    "Ready",
+                    ConditionStatus::True,
+                    "Ready",
+                    "the pool agent is running and answering",
+                    stored.meta.generation,
+                )
+            },
+        );
+        reporting::report(
+            &self.pools,
+            self.sink.as_ref(),
+            &stored,
+            next,
+            &self.writer,
+            pass,
+        )
+        .await;
+    }
+
+    async fn backend_mismatch(&self, stored: &Pool, expected: &str, actual: &str, pass: &mut Pass) {
+        let mut next = stored.clone();
+        next.status.observed_generation = stored.meta.generation;
+        next.status.backend = actual.to_string();
+        next.status.agent_version = self.config.agent_version.clone();
+        next.status.last_heartbeat = Timestamp::now();
         set_condition(
             &mut next.status.conditions,
             Condition::new(
                 "Ready",
-                ConditionStatus::True,
-                "Ready",
-                "the pool agent is running and answering",
+                ConditionStatus::False,
+                "BackendMismatch",
+                &format!("this pool asks for {expected}, but its agent is serving {actual}"),
                 stored.meta.generation,
             ),
         );
         reporting::report(
             &self.pools,
             self.sink.as_ref(),
-            &stored,
+            stored,
             next,
             &self.writer,
             pass,
@@ -1583,6 +1638,15 @@ impl PoolAgent {
             pass,
         )
         .await;
+    }
+}
+
+fn expected_backend(backend: PoolBackend) -> Option<&'static str> {
+    match backend {
+        PoolBackend::External => None,
+        PoolBackend::Ceph => Some("ceph"),
+        PoolBackend::Directory => Some("directory"),
+        PoolBackend::Lvm => Some("lvm"),
     }
 }
 
@@ -2270,6 +2334,10 @@ mod tests {
                     Placement::new("eu", "cell-1"),
                 ),
                 PoolSpec {
+                    scope: Default::default(),
+                    backend: Default::default(),
+                    backend_target: String::new(),
+                    thin_pool: String::new(),
                     accepting: true,
                     node: String::new(),
                     labels: vec![],
@@ -2624,6 +2692,36 @@ mod tests {
                 .iter()
                 .any(|c| c.kind == "Ready" && c.status == ConditionStatus::True)
         );
+    }
+
+    #[tokio::test]
+    async fn a_pool_agent_on_the_wrong_backend_writes_no_volume() {
+        let (cell, agent) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        let mut pool = cell.pools.get("pools/pool-a").await.unwrap().unwrap();
+        pool.spec.backend = PoolBackend::Ceph;
+        pool.meta.generation += 1;
+        cell.pools
+            .update(&pool, &Writer::controller("test"))
+            .await
+            .unwrap();
+        cell.volume("pool-a", 100).await;
+
+        agent.resync().await;
+
+        assert!(
+            !cell.fake.has(VOLUME),
+            "the fake backend received a Ceph pool's volume"
+        );
+        let pool = cell.pools.get("pools/pool-a").await.unwrap().unwrap();
+        let ready = pool
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.kind == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, ConditionStatus::False);
+        assert_eq!(ready.reason, "BackendMismatch");
     }
 
     #[tokio::test]

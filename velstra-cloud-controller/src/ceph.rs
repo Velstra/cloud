@@ -266,6 +266,11 @@ impl Reconciler for CephController {
                 "Expanding",
                 format!("waiting for the pool {}", pool.pool),
             ),
+            CephStep::DeletePool { pool } => (
+                ConditionStatus::Unknown,
+                "RemovingPool",
+                format!("removing empty Ceph pool {pool}"),
+            ),
         };
 
         if phase == CephPhase::Ready && cluster.status.phase != CephPhase::Ready {
@@ -349,6 +354,7 @@ mod tests {
                 pool: "velstra-volumes".into(),
                 size: 3,
                 min_size: 2,
+                delete: false,
             }],
             ..CephClusterSpec::default()
         }

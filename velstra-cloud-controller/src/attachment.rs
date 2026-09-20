@@ -636,6 +636,10 @@ mod telling_the_node_where_the_bytes_are {
         let object = velstra_cloud_model::Resource::new(
             meta("pools/rbd"),
             velstra_cloud_model::resources::PoolSpec {
+                scope: Default::default(),
+                backend: Default::default(),
+                backend_target: String::new(),
+                thin_pool: String::new(),
                 accepting: true,
                 volume_ceiling,
                 ..Default::default()

@@ -135,7 +135,7 @@ function renderRail() {
   // walking one thing that has no board, no columns and no condition.
   const attention = unsettledEverywhere().length;
   rail.appendChild(el("button.railhome" + (view.coll === null && view.home ? ".on" : ""),
-    { type: "button", id: "railhome", onclick: () => showOverview() },
+    { type: "button", id: "railhome", title: "Overview", "data-short": "OV", onclick: () => showOverview() },
     el("span", "Overview"),
     attention
       ? el("span.state.drifting", mark("drifting"), String(attention))
@@ -148,14 +148,16 @@ function renderRail() {
     // expecting one would trip over it.
     if (g.name === "Network") {
       rail.appendChild(el("button.railhome" + (view.map ? ".on" : ""),
-        { type: "button", id: "railmap", onclick: () => showTopology() },
+        { type: "button", id: "railmap", title: "Network map", "data-short": "NM",
+          onclick: () => showTopology() },
         el("span", "Map"), el("span.n", "")));
     }
     for (const c of g.items) {
       const seen = census[c.id];
       const unsettled = seen ? seen.unsettled : 0;
       rail.appendChild(el("button.railitem" + (view.coll && view.coll.id === c.id ? ".on" : ""),
-        { type: "button", "data-collection": c.id, onclick: () => show(c.id) },
+        { type: "button", title: c.title, "data-short": c.title.slice(0, 2).toUpperCase(),
+          "data-collection": c.id, onclick: () => show(c.id) },
         el("span", c.title),
         // A count is shown when it is known and a drift count when there is
         // one. Amber here means exactly what it means everywhere else.
@@ -171,7 +173,8 @@ function renderRail() {
     // Not a `.railitem`: it has no board and no census, like the map.
     if (g.name === "Access" && !(session.who && session.who.cellAdmin)) {
       rail.appendChild(el("button.railhome",
-        { type: "button", id: "railmembers", onclick: () => openMyProject() },
+        { type: "button", id: "railmembers", title: "Members", "data-short": "ME",
+          onclick: () => openMyProject() },
         el("span", "Members"), el("span.n", "")));
     }
   }

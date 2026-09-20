@@ -40,7 +40,7 @@ export default function App() {
   // A registration's credential, held on screen until it is copied. It is
   // shown once by the API — only a digest is kept — so the page must not move
   // on by itself the way every other create does.
-  const [minted, setMinted] = useState<{ coll: string; id: string; minted: Minted } | null>(null);
+  const [minted, setMinted] = useState<{ coll: string; id: string; minted: Minted; resource: import("@/lib/model").Resource } | null>(null);
 
   useEffect(() => {
     if (!token()) return;
@@ -170,7 +170,7 @@ export default function App() {
                               <p className="text-sm" style={{ color: "var(--text-body)" }}>
                                 <span className="font-medium" style={{ color: "var(--text-strong)" }}>{minted.id}</span> is registered. This is what the machine joins with.
                               </p>
-                              <MintedBox minted={minted.minted} what={`the ${coll.singular}`} />
+                              <MintedBox minted={minted.minted} what={`the ${coll.singular}`} resource={minted.resource} />
                               <div>
                                 <Pressed size="sm" onPress={() => { const id = minted.id; setMinted(null); go({ view: "board", coll: coll.id, id }); }}>I have copied it</Pressed>
                               </div>
@@ -186,7 +186,7 @@ export default function App() {
                                 // machine joins with, and the object's page
                                 // cannot show it later. Stay until it is
                                 // copied.
-                                setMinted({ coll: coll.id, id, minted: answer });
+                                setMinted({ coll: coll.id, id, minted: answer, resource: r });
                                 return;
                               }
                               toast.success(`${id} created`, { description: "Tracking deployment status." });

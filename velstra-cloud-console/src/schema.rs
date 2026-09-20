@@ -757,7 +757,8 @@ const CEPH_FIELDS: &[Field] = &[
         // The consequence of each number, not what each number is called. "Size
         // is the replica count" is a definition; "min size is where writes stop"
         // is the thing that happens at three in the morning.
-        help: "Where volumes are stored. Copies is how many of every object \
+        help: "Where volumes are stored. Remove marks an existing pool for deletion; \
+               Ceph refuses it while it contains any objects. Copies is how many of every object \
                exist; below the floor the pool refuses writes rather than \
                holding data it cannot protect — so a floor equal to the copies \
                means one node rebooting stops writing.",
@@ -3849,8 +3850,71 @@ const LOAD_BALANCER_FIELDS: &[Field] = &[
 /// operator decides whether it takes new work, and the agent reports the rest.
 const POOL_FIELDS: &[Field] = &[
     Field {
+        key: "scope",
+        label: "Reach",
+        kind: Kind::Choice {
+            options: &[
+                choice("Global", "Global"),
+                choice("Region", "Region"),
+                choice("Machine", "Machine"),
+            ],
+        },
+        required: true,
+        advanced: false,
+        help: "Choose where workloads may reach these bytes. Machine storage stays tied to the selected node.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "backend",
+        label: "Backend",
+        kind: Kind::Choice {
+            options: &[
+                choice("Ceph", "Ceph"),
+                choice("Directory", "Directory"),
+                choice("Lvm", "LVM"),
+                choice("External", "External"),
+            ],
+        },
+        required: true,
+        advanced: false,
+        help: "The storage implementation the pool agent must use.",
+        when_empty: "",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "backendTarget",
+        label: "Storage target",
+        kind: Kind::Text {
+            placeholder: "tenant-volumes, /srv/velstra, or vg0",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        help: "For Ceph, the RBD pool; for Directory, the absolute path; for LVM, the volume group.",
+        when_empty: "configured by the agent",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
+        key: "thinPool",
+        label: "LVM thin pool",
+        kind: Kind::Text {
+            placeholder: "velstra-thin",
+            check: Check::None,
+        },
+        required: false,
+        advanced: true,
+        help: "Optional thin pool inside the selected volume group. Used only by the LVM backend.",
+        when_empty: "thick LVM volumes",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
         key: "node",
-        label: "On one machine",
+        label: "Machine",
         kind: Kind::Ref {
             collection: "nodes",
             filter_by: None,
@@ -3889,7 +3953,7 @@ const POOL_FIELDS: &[Field] = &[
             check: Check::Id,
         },
         required: false,
-        advanced: false,
+        advanced: true,
         help: "What a volume's placement matches on.",
         when_empty: "",
         derived: false,
@@ -3903,7 +3967,7 @@ const POOL_FIELDS: &[Field] = &[
             check: Check::None,
         },
         required: false,
-        advanced: false,
+        advanced: true,
         help: "Projects allowed to create volumes in this pool. Leave empty or use * for every project. Removing a project stops new placement and leaves its existing volumes untouched.",
         when_empty: "all projects",
         derived: false,

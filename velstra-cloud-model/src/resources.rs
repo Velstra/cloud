@@ -2438,8 +2438,40 @@ pub const SNAPSHOT_SOURCE_FINALIZER: &str = "snapshot.velstra.io/source";
 /// promise about how often. What this catches is a pool with *no* agent at all.
 pub const POOL_SILENT_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoolScope {
+    #[default]
+    Global,
+    Region,
+    Machine,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoolBackend {
+    /// A legacy or externally configured agent declares its backend through
+    /// status. Existing pool objects deserialize to this value.
+    #[default]
+    External,
+    Ceph,
+    Directory,
+    Lvm,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PoolSpec {
+    /// How widely the bytes can be reached. Machine scope requires `node`;
+    /// global and region storage may be scheduled across machines.
+    #[serde(default)]
+    pub scope: PoolScope,
+    /// The backend an agent must claim for this pool.
+    #[serde(default)]
+    pub backend: PoolBackend,
+    /// Backend-specific destination: an RBD pool, directory, or volume group.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backend_target: String,
+    /// Optional LVM thin pool inside `backend_target`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thin_pool: String,
     /// False drains the pool: nothing new is provisioned into it, what exists
     /// stays. A spec change rather than a command, so a restart cannot lose it
     /// half way.
@@ -2518,8 +2550,8 @@ pub struct PoolStatus {
     pub observed_generation: u64,
     pub conditions: Vec<Condition>,
     /// What the agent found itself running — `lvm`, `zfs`, `ceph`, `directory`.
-    /// Observed rather than declared: an operator writing `zfs` over an LVM pool
-    /// would be describing a world that does not exist.
+    /// Kept beside `spec.backend`: the spec is the requested implementation,
+    /// while this value proves what the process actually opened.
     pub backend: String,
     pub capacity_gib: u64,
     /// Counted from the volumes this pool holds, never tracked as a running

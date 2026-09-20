@@ -148,7 +148,13 @@ impl Agent {
         // is fine that all of them do. Nothing is written to the cluster: both
         // commands are idempotent reads of state the bootstrap made.
         if daemons.0 {
-            let pools: Vec<String> = cluster.spec.pools.iter().map(|p| p.pool.clone()).collect();
+            let pools: Vec<String> = cluster
+                .spec
+                .pools
+                .iter()
+                .filter(|p| !p.delete)
+                .map(|p| p.pool.clone())
+                .collect();
             match self.cephadm.client_config(&pools).await {
                 Ok((conf, keyring)) => {
                     if let Some(mine) = host.ceph.as_mut() {

@@ -185,10 +185,12 @@ function keystroke(event) {
 /// minute, so a sheet that attached whenever it was rendered would burn a
 /// session every time somebody glanced at a machine — and hold a guest's serial
 /// line against nobody watching it.
-function consoleSection(host, coll, id) {
+function consoleSection(host, coll, id, resource) {
   let close = null;
   const screenHost = el("div");
   const button = btn("Attach", { quiet: true });
+  const tail = String(pick(statusOf(resource), "consoleTail") || "");
+  const total = Number(pick(statusOf(resource), "consoleBytes") || 0);
 
   const stop = () => {
     if (close) close();
@@ -207,6 +209,12 @@ function consoleSection(host, coll, id) {
   };
 
   host.appendChild(button);
+  if (tail) {
+    host.appendChild(folded("bootlog", "Boot log" + (total ? " · " + bytes(total) : ""),
+      "Hide boot log", el("pre.logblock.consolelog", tail)));
+  } else {
+    host.appendChild(el("p.faint", "No captured output yet. Attach for the live serial console; enable Console in Edit to retain a tail while the guest runs."));
+  }
   host.appendChild(screenHost);
   // A sheet that is closed with a socket open leaves a session attached against
   // a guest nobody is watching, and the ticket cannot be reused.

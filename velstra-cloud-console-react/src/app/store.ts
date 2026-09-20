@@ -17,6 +17,7 @@ type State = {
   recents: string[];        // "collection/id"
   views: Record<string, { sorting: unknown; visibility: Record<string, boolean>; filter: string; labels: string }>;
   railCollapsed: Record<string, boolean>;
+  railCompact: boolean;
 };
 
 import { ALL } from "@/lib/schema";
@@ -40,6 +41,7 @@ let state: State = {
   recents: [],
   views: {},
   railCollapsed: {},
+  railCompact: false,
   ...load(),
 };
 state.who = null;
@@ -51,8 +53,8 @@ export const getState = () => state;
 
 export function setState(patch: Partial<State>) {
   state = { ...state, ...patch };
-  const { project, theme, density, motion, recents, views, railCollapsed } = state;
-  try { localStorage.setItem(KEY, JSON.stringify({ project, theme, density, motion, recents, views, railCollapsed })); } catch { /* private mode */ }
+  const { project, theme, density, motion, recents, views, railCollapsed, railCompact } = state;
+  try { localStorage.setItem(KEY, JSON.stringify({ project, theme, density, motion, recents, views, railCollapsed, railCompact })); } catch { /* private mode */ }
   applyTheme(state.theme);
   document.documentElement.dataset.density = state.density;
   document.documentElement.dataset.motion = state.motion;

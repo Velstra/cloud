@@ -220,6 +220,16 @@ function folded(id, shut, open, body) {
   return el("div.specfold", toggle, deeper);
 }
 
+function lazyFolded(id, shut, open, load) {
+  const host = el("div", el("p.faint", "Open to load details."));
+  const fold = folded(id, shut, open, host);
+  let loaded = false;
+  fold.querySelector("button").addEventListener("click", () => {
+    if (!loaded) { loaded = true; load(host); }
+  });
+  return fold;
+}
+
 /// How many entries a list may have before it is folded.
 ///
 /// A node reports about a hundred CPU flags, and printed in full they *are* the
@@ -730,13 +740,18 @@ async function historyInto(host, name) {
     // mistake the loop below used to make.
     const { operations, refusals: audit } = await historyOf(name);
     const lines = [];
+    const readable = (verb) => ({
+      create: "Created", update: "Updated", patch: "Updated", delete: "Deletion requested",
+      start: "Started", stop: "Stopped", restart: "Restarted", migrate: "Migration requested",
+      attach: "Attached", detach: "Detached",
+    })[String(verb).toLowerCase()] || String(verb || "Change").replace(/^./, (c) => c.toUpperCase());
     for (const o of operations) {
       const s = statusOf(o);
       const at = pick(s, "finishedAt") || pick(meta(o), "createdAt");
       lines.push({
         at: Number(at || 0),
         kind: pick(s, "error") ? "failing" : pick(s, "done") ? "settled" : "drifting",
-        what: String(pick(spec(o), "verb") || "change"),
+        what: readable(pick(spec(o), "verb")),
         who: String(pick(spec(o), "requestedBy") || "—"),
         detail: String(pick(s, "error") || (pick(s, "done") ? "" : "still running")),
       });
@@ -750,11 +765,11 @@ async function historyInto(host, name) {
       // refused by admin — changed it". A change gets the verb alone and the
       // settled mark; only `refused` keeps the word and the failing one.
       const refused = String(pick(spec(a), "kind") || "").toLowerCase() === "refused";
-      const verb = String(pick(spec(a), "verb") || "?");
+      const verb = String(pick(spec(a), "verb") || "change");
       lines.push({
         at: Number(pick(meta(a), "createdAt") || 0),
         kind: refused ? "failing" : "settled",
-        what: refused ? verb + " refused" : verb,
+        what: refused ? readable(verb) + " · refused" : readable(verb),
         who: String(pick(spec(a), "subject") || "—"),
         // `detail`, which is the field an audit record actually has — and it
         // holds the *same sentence* the person was given, not a paraphrase of
@@ -1424,12 +1439,6 @@ function renderSheet(coll, r) {
   // Placement is a statement about the machine room, and the API refuses the
   // verb to anybody who cannot see machines — so the button only exists where
   // pressing it answers.
-  if (coll.explainable && session.who && session.who.cellAdmin) {
-    acts.appendChild(btn("Explain placement", {
-    id: "explainbtn",
-    onclick: () => explainInto($("explain"), coll, r),
-  }));
-  }
   // A password is not a field on this sheet and cannot be: the platform stores
   // a hash and cannot show one. Setting it is therefore an *action*, next to the
   // others, rather than a control that would have to render a value it has no
@@ -1520,7 +1529,7 @@ function renderSheet(coll, r) {
   if (coll.id === "instances") {
     const host = el("div", { id: "instanceconsole" });
     panel.appendChild(spread("Console", host, "the guest's serial line"));
-    consoleSection(host, coll, idOf(r));
+    consoleSection(host, coll, idOf(r), r);
     // The display goes to its own page rather than into this column: a
     // framebuffer at sheet width is a postage stamp, and unlike the serial
     // console — whose last lines are useful at any size — a screen you cannot
@@ -1530,14 +1539,27 @@ function renderSheet(coll, r) {
     id: "screenbtn",
     onclick: () => { closeSheet(); showScreen(nameOf(r)); },
   }));
+    host.appendChild(el("a.btn", {
+      id: "screennewtab",
+      href: "#screen/" + nameOf(r),
+      target: "_blank",
+      rel: "noopener",
+    }, "Screen in new tab"));
   }
 
   const pairs = agreementTable(coll, r);
   if (pairs) panel.appendChild(spread("Asked vs is", pairs, "the two halves side by side"));
 
-  panel.appendChild(spread("Specification", specTable(coll, r), "what was asked for"));
-  panel.appendChild(spread("Observation", statusTable(r), "what the owner reports"));
-  panel.appendChild(spread("Conditions", conditionsTable(r)));
+  const technical = el("div",
+    spread("Specification", specTable(coll, r), "what was asked for"),
+    spread("Observation", statusTable(r), "what the owner reports"),
+    spread("Conditions", conditionsTable(r)),
+    spread("Object", metaTable(r)));
+  if (coll.id === "instances") {
+    panel.appendChild(folded("technical", "Technical details", "Hide technical details", technical));
+  } else {
+    panel.appendChild(technical);
+  }
 
   // What this tenant has left, on the object the allowance belongs to.
   if (coll.id === "projects") {
@@ -1583,20 +1605,18 @@ function renderSheet(coll, r) {
   }
 
   if (coll.explainable && session.who && session.who.cellAdmin) {
-    const host = el("div", { id: "explain" });
-    panel.appendChild(spread("Placement", host));
-    // An object that is not settled is the one somebody is looking at because
-    // it went wrong, so the answer is fetched rather than offered behind a
-    // button they have to find.
-    if (verdict(r, coll.condition).kind !== "settled") explainInto(host, coll, r);
-    else fill(host, el("p.faint", "Placed. Ask for the chain if you want to see what was rejected."));
+    panel.appendChild(lazyFolded("placementdetail", "Placement details", "Hide placement details",
+      (host) => explainInto(host, coll, r)));
   }
 
   // What has happened to this thing. Last, because it is the question asked
   // second — after "what is it doing now", which is everything above.
   const history = el("div", { id: "history" });
-  panel.appendChild(spread("History", history, "what was asked of it, and by whom"));
-  historyInto(history, nameOf(r));
-
-  panel.appendChild(spread("Object", metaTable(r)));
+  if (coll.id === "instances") {
+    panel.appendChild(lazyFolded("instancehistory", "Activity history", "Hide activity history",
+      (host) => { host.id = "history"; historyInto(host, nameOf(r)); }));
+  } else {
+    panel.appendChild(spread("History", history, "what was asked of it, and by whom"));
+    historyInto(history, nameOf(r));
+  }
 }

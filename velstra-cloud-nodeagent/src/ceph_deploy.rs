@@ -105,7 +105,8 @@ fn step_for(me: &str, step: &CephStep, observed: &CephObserved) -> Option<CephSt
         CephStep::AddHost { .. }
         | CephStep::AddMonitor { .. }
         | CephStep::AddOsd { .. }
-        | CephStep::CreatePool { .. } => admin_node(observed).as_deref() == Some(me),
+        | CephStep::CreatePool { .. }
+        | CephStep::DeletePool { .. } => admin_node(observed).as_deref() == Some(me),
         // Nothing to do, or nothing anybody can do.
         CephStep::Settled | CephStep::Paused | CephStep::Blocked { .. } => false,
     };
@@ -245,6 +246,10 @@ pub async fn perform(
         CephStep::CreatePool { pool } => {
             tracing::info!(pool = %pool.pool, "creating the pool");
             admin.create_pool(pool).await
+        }
+        CephStep::DeletePool { pool } => {
+            tracing::warn!(pool, "removing an explicitly deleted empty pool");
+            admin.delete_pool(pool).await
         }
         CephStep::Settled | CephStep::Paused | CephStep::Blocked { .. } => Ok(()),
     }
@@ -608,6 +613,7 @@ mod tests {
                 pool: "velstra-volumes".into(),
                 size: 3,
                 min_size: 2,
+                delete: false,
             }],
             ..CephClusterSpec::default()
         }

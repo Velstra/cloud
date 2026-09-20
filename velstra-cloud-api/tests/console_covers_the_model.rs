@@ -169,6 +169,7 @@ mod complete {
                 pool: "volumes".into(),
                 size: 3,
                 min_size: 2,
+                delete: false,
             }],
             paused: true,
         }
