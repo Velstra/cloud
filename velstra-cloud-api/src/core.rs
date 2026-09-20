@@ -26,7 +26,7 @@ use velstra_cloud_model::{
         set_condition,
     },
     migration::{Migration, MigrationSpec, MigrationStatus, may_migrate, migration_condition},
-    reconcile::place,
+    reconcile::{TargetView, kind_of, operation_condition, operation_progress, place},
     resources::{
         AttachmentSpec, AttachmentStatus, FloatingIpSpec, FloatingIpStatus, ImageSpec, ImageStatus,
         Instance, InstanceSpec, InstanceStatus, NetworkSpec, NetworkStatus, Node, NodeSpec,
@@ -5909,29 +5909,70 @@ impl Api {
         if document.get("status").and_then(|s| s.get("done")).is_none() {
             return Ok(());
         }
-        let wanted = document["spec"]["target_generation"].as_u64().unwrap_or(0);
-        let (done, error) = match ResourceName::parse(target) {
+        let spec: OperationSpec = serde_json::from_value(document["spec"].clone())?;
+        let view = match ResourceName::parse(target) {
             Ok(name) => match self.collection(name.collection()) {
                 Ok(collection) => match collection.get(target).await? {
-                    Some(object) => {
-                        let observed = object["status"]["observed_generation"]
-                            .as_u64()
-                            .unwrap_or(0);
-                        (observed >= wanted, None)
+                    Some(mut object) => {
+                        // Some status is an aggregate computed on read rather
+                        // than a second stored copy. A security group's
+                        // `Applied` condition is the important case: looking
+                        // only at its stored, deliberately empty status leaves
+                        // every operation about it working forever.
+                        let mut scratch = Scratch::default();
+                        self.answer_security_group(&mut object, &mut scratch)
+                            .await?;
+                        self.answer_port(&mut object).await?;
+                        let kind = kind_of(target);
+                        if kind == "ports"
+                            && object["spec"]["node"].as_str().is_none_or(str::is_empty)
+                        {
+                            TargetView::Unwatched
+                        } else {
+                            let conditions: Vec<Condition> =
+                                serde_json::from_value(object["status"]["conditions"].clone())
+                                    .unwrap_or_default();
+                            let settled = conditions
+                                .iter()
+                                .find(|condition| condition.kind == operation_condition(kind));
+                            let observed_generation = object["status"]["observed_generation"]
+                                .as_u64()
+                                .unwrap_or(0);
+                            TargetView::Present {
+                                observed_generation,
+                                ready: settled
+                                    .map(|condition| condition.status)
+                                    // An observed generation is itself a
+                                    // successful acknowledgement for older
+                                    // agents that did not yet publish a
+                                    // condition. Zero still means nobody has
+                                    // answered.
+                                    .unwrap_or(if observed_generation > 0 {
+                                        ConditionStatus::True
+                                    } else {
+                                        ConditionStatus::Unknown
+                                    }),
+                                reason: settled
+                                    .map(|condition| condition.reason.clone())
+                                    .unwrap_or_default(),
+                                message: settled
+                                    .map(|condition| condition.message.clone())
+                                    .unwrap_or_default(),
+                            }
+                        }
                     }
                     // The object is gone. Whatever this operation was waiting
                     // for will not happen, and saying so is better than a
                     // client waiting forever on an object nobody will report.
-                    None => (true, Some(format!("{target} no longer exists"))),
+                    None => TargetView::Gone,
                 },
-                Err(e) => (true, Some(e.message)),
+                Err(_) => TargetView::Gone,
             },
-            Err(e) => (true, Some(e.to_string())),
+            Err(_) => TargetView::Gone,
         };
-        document["status"]["done"] = Value::Bool(done);
-        if let Some(error) = error {
-            document["status"]["error"] = Value::String(error);
-        }
+        let progress = operation_progress(&spec, &view);
+        document["status"]["done"] = Value::Bool(progress.done);
+        document["status"]["error"] = progress.error.map(Value::String).unwrap_or(Value::Null);
         Ok(())
     }
 

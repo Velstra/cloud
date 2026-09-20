@@ -23,22 +23,24 @@ use tracing::debug;
 use velstra_cloud_model::{
     Condition, ConditionStatus,
     meta::{ResourceName, Timestamp, condition, set_condition},
-    reconcile::{TargetView, operation_progress},
-    resources::{Operation, OperationSpec, OperationStatus},
+    reconcile::{TargetView, operation_condition, operation_progress},
+    resources::{Operation, OperationSpec, OperationStatus, PortSpec, PortStatus},
+    security::group_condition,
 };
-use velstra_cloud_store::{Expect, Store, key_for, prefix_for};
+use velstra_cloud_store::{Expect, Store, TypedStore, key_for, prefix_for};
 
 use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
 
 /// Collections an operation can be about. A watch on each, so an operation
 /// finishes when its target does rather than when the resync comes round.
-const TARGET_KINDS: [&str; 6] = [
+const TARGET_KINDS: [&str; 7] = [
     "instances",
     "volumes",
     "attachments",
     "networks",
     "subnets",
     "ports",
+    "security-groups",
 ];
 
 /// How long a finished operation is kept.
@@ -99,7 +101,38 @@ impl OperationsController {
         let Ok(peek) = serde_json::from_slice::<Peek>(&entry.value) else {
             return Ok(TargetView::Gone);
         };
-        let ready = condition(&peek.status.conditions, "Ready");
+        let kind = name.collection();
+        let computed;
+        let ready = if kind == "security-groups" {
+            let ports: TypedStore<PortSpec, PortStatus> =
+                TypedStore::new(self.store.clone(), &self.cell, "ports");
+            let ports = ports.list().await?;
+            let naming: Vec<_> = ports
+                .iter()
+                .filter(|port| {
+                    port.spec
+                        .security_groups
+                        .iter()
+                        .any(|group| group == target)
+                })
+                .collect();
+            let referenced = naming.len();
+            let carried: Vec<_> = naming
+                .into_iter()
+                .filter(|port| port.status.node.is_some())
+                .map(|port| {
+                    (
+                        port.meta.name.to_string(),
+                        port.status.programmed
+                            && port.status.observed_generation >= port.meta.generation,
+                    )
+                })
+                .collect();
+            computed = group_condition(peek.meta.generation, &carried, referenced);
+            Some(&computed)
+        } else {
+            condition(&peek.status.conditions, operation_condition(kind))
+        };
         // Nothing holds it, so nothing will report on it — the same answer the
         // model gives for a kind nobody reports on, reached one object at a
         // time because for a port it depends on whether it is in use. Left out,
@@ -110,8 +143,20 @@ impl OperationsController {
             return Ok(TargetView::Unwatched);
         }
         Ok(TargetView::Present {
-            observed_generation: peek.status.observed_generation,
-            ready: ready.map(|c| c.status).unwrap_or(ConditionStatus::Unknown),
+            observed_generation: if kind == "security-groups"
+                && ready.is_some_and(|condition| condition.status == ConditionStatus::True)
+            {
+                peek.meta.generation
+            } else {
+                peek.status.observed_generation
+            },
+            ready: ready
+                .map(|c| c.status)
+                .unwrap_or(if peek.status.observed_generation > 0 {
+                    ConditionStatus::True
+                } else {
+                    ConditionStatus::Unknown
+                }),
             reason: ready.map(|c| c.reason.clone()).unwrap_or_default(),
             message: ready.map(|c| c.message.clone()).unwrap_or_default(),
         })
@@ -121,6 +166,7 @@ impl OperationsController {
 /// Every resource, seen through the fields that are the same on all of them.
 #[derive(Deserialize)]
 struct Peek {
+    meta: PeekMeta,
     status: PeekStatus,
     /// Enough of the spec to answer "is anybody going to report on this".
     ///
@@ -130,6 +176,12 @@ struct Peek {
     /// got to yet — so the one field that distinguishes them is read here.
     #[serde(default)]
     spec: PeekSpec,
+}
+
+#[derive(Default, Deserialize)]
+struct PeekMeta {
+    #[serde(default)]
+    generation: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -277,6 +329,7 @@ mod tests {
     use velstra_cloud_model::{
         meta::{Meta, Placement},
         resources::{InstanceSpec, InstanceState, InstanceStatus, Resource},
+        security::{SecurityGroupSpec, SecurityGroupStatus},
     };
     use velstra_cloud_store::{MemoryStore, TypedStore};
 
@@ -286,6 +339,7 @@ mod tests {
         raw: Arc<MemoryStore>,
         operations: TypedStore<OperationSpec, OperationStatus>,
         instances: TypedStore<InstanceSpec, InstanceStatus>,
+        groups: TypedStore<SecurityGroupSpec, SecurityGroupStatus>,
     }
 
     fn fixture() -> (Fixture, OperationsController) {
@@ -293,6 +347,7 @@ mod tests {
         let f = Fixture {
             operations: TypedStore::new(raw.clone(), "cell-1", "operations"),
             instances: TypedStore::new(raw.clone(), "cell-1", "instances"),
+            groups: TypedStore::new(raw.clone(), "cell-1", "security-groups"),
             raw: raw.clone(),
         };
         let controller = OperationsController::new(
@@ -474,6 +529,68 @@ mod tests {
             .unwrap();
         let done = f.reload().await;
         assert!(done.status.done);
+        assert!(done.status.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_security_group_operation_uses_its_computed_applied_state() {
+        let (f, controller) = fixture();
+        let group = Resource::new(
+            Meta::new(
+                ResourceName::parse("projects/p1/security-groups/web").unwrap(),
+                Placement::new("eu", "cell-1"),
+            ),
+            SecurityGroupSpec::default(),
+            SecurityGroupStatus::default(),
+        );
+        f.groups
+            .create(
+                &group,
+                &velstra_cloud_model::access::Writer::controller("operations"),
+            )
+            .await
+            .unwrap();
+        let op = Resource::new(
+            Meta::new(
+                ResourceName::parse("projects/p1/operations/op-group").unwrap(),
+                Placement::new("eu", "cell-1"),
+            ),
+            OperationSpec {
+                target: group.meta.name.to_string(),
+                target_generation: group.meta.generation,
+                verb: "create".into(),
+                requested_by: "someone".into(),
+            },
+            OperationStatus::default(),
+        );
+        f.operations
+            .create(
+                &op,
+                &velstra_cloud_model::access::Writer::controller("operations"),
+            )
+            .await
+            .unwrap();
+        let op = f
+            .operations
+            .get("projects/p1/operations/op-group")
+            .await
+            .unwrap()
+            .unwrap();
+
+        controller
+            .reconcile("projects/p1/operations/op-group", Some(&op))
+            .await
+            .unwrap();
+        let done = f
+            .operations
+            .get("projects/p1/operations/op-group")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            done.status.done,
+            "an unreferenced group is already in force"
+        );
         assert!(done.status.error.is_none());
     }
 

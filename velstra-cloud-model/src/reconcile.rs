@@ -1184,6 +1184,25 @@ pub fn kind_of(name: &str) -> &str {
     parts.next().unwrap_or("")
 }
 
+/// The condition that says work on this kind has settled.
+///
+/// Most resources use `Ready`; the handful whose result has a more precise
+/// name must still be interpreted the same way by the API and the operations
+/// controller. Keeping that vocabulary here prevents a network (`Mirrored`) or
+/// security group (`Applied`) from waiting forever for a condition it will
+/// never publish.
+pub fn operation_condition(kind: &str) -> &'static str {
+    match kind {
+        "networks" => "Mirrored",
+        "security-groups" => "Applied",
+        "image-sources" => "Checked",
+        "migrations" => "Moved",
+        "routers" => "Routed",
+        "floatingips" => "Allocated",
+        _ => "Ready",
+    }
+}
+
 /// Whether anything in this platform ever writes a status on objects of this
 /// kind.
 ///
@@ -2598,6 +2617,9 @@ mod tests {
         // which is the safe direction.
         assert_eq!(kind_of("nonsense"), "");
         assert!(!nobody_reports_on(""));
+        assert_eq!(operation_condition("security-groups"), "Applied");
+        assert_eq!(operation_condition("networks"), "Mirrored");
+        assert_eq!(operation_condition("instances"), "Ready");
     }
 
     #[test]

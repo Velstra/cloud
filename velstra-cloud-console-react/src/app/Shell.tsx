@@ -9,7 +9,7 @@
 // it is a drive to a desk.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bell, ChevronDown, ChevronRight, Command as Cmd, LogOut, Menu, Moon, Rows3, Search, Sun, UserRound, Box, Database, Network, Server, Shield, Activity, LayoutDashboard, Workflow, Cloud, X, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { Bell, ChevronDown, ChevronRight, Command as Cmd, LogOut, Menu, Moon, Rows3, Search, Sun, UserRound, Box, Database, Network, Server, LayoutDashboard, Workflow, Cloud, X, PanelLeftClose, PanelLeftOpen, Monitor, HardDrive, Link, Waypoints, Cable, ShieldCheck, RadioTower, Library, Disc3, MoveRight, CalendarClock, Package, RefreshCcw, CalendarSync, Camera, CloudUpload, ArchiveRestore, CalendarDays, ScrollText, Cpu, Gauge, Radio, Route, Globe2, Scale, ChartNoAxesColumn, ListChecks, Users, Blocks, KeyRound, FolderTree, Building2, type LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator,
@@ -247,9 +247,22 @@ export function Shell({ census, onSweep, children }: {
   );
 }
 
+const collectionIcons: Record<string, LucideIcon> = {
+  instances: Monitor, volumes: HardDrive, attachments: Link, networks: Waypoints,
+  subnets: Network, ports: Cable, "security-groups": ShieldCheck, "image-sources": RadioTower,
+  families: Library, images: Disc3, migrations: MoveRight, nodes: Server,
+  "maintenance-windows": CalendarClock, releases: Package, rollouts: RefreshCcw,
+  "snapshot-schedules": CalendarSync, captures: Camera, "backup-targets": CloudUpload,
+  backups: ArchiveRestore, "backup-schedules": CalendarDays, audit: ScrollText,
+  "device-classes": Cpu, flavors: Gauge, "bgp-peers": Radio, routers: Route,
+  floatingips: Globe2, "load-balancers": Scale, pools: Database, usage: ChartNoAxesColumn,
+  operations: ListChecks, users: Users, "ceph-clusters": Blocks, roles: KeyRound,
+  folders: FolderTree, projects: Building2,
+};
+
 function RailLink({ active, to, label, badge, compact = false }: { active: boolean; to: string; label: string; badge?: React.ReactNode; compact?: boolean }) {
-  const group = SCHEMA.find((c) => c.title === label)?.group;
-  const Icon = label === "Overview" ? LayoutDashboard : label === "Map" ? Workflow : group === "Storage" ? Database : group === "Network" ? Network : group === "Hardware" ? Server : group === "Access" ? Shield : group === "Records" ? Activity : Box;
+  const resource = SCHEMA.find((c) => c.title === label);
+  const Icon = label === "Overview" ? LayoutDashboard : label === "Map" ? Workflow : resource ? collectionIcons[resource.id] ?? Box : label === "Spend" ? ChartNoAxesColumn : Box;
   return (
     <a href={to} aria-current={active ? "page" : undefined} title={compact ? label : undefined}
       className={`my-0.5 flex items-center rounded-lg py-2 text-[13px] transition-colors hover:bg-[var(--surface-hover)] focus-visible:outline-none focus-visible:ring-[3px] ${compact ? "justify-center px-2" : "gap-2.5 px-2.5"}`}
