@@ -43,6 +43,7 @@ use std::{
     time::Duration,
 };
 
+use serde_json::Value;
 use velstra_cloud_model::ceph::{CephPoolSpec, NodeCeph};
 
 use crate::host::{HostError, Result};
@@ -376,6 +377,25 @@ pub fn create_pool_argv(pool: &CephPoolSpec) -> Vec<Vec<String>> {
     argv
 }
 
+fn pool_objects(raw: &str, wanted: &str) -> Result<u64> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|e| HostError::failed(format!("reading `ceph df detail`: {e}")))?;
+    let pools = value
+        .get("pools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| HostError::failed("`ceph df detail` did not contain a pools list"))?;
+    let pool = pools
+        .iter()
+        .find(|pool| pool.get("name").and_then(Value::as_str) == Some(wanted))
+        .ok_or_else(|| HostError::failed(format!("Ceph did not report pool {wanted}")))?;
+    pool.get("stats")
+        .and_then(|stats| stats.get("objects"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            HostError::failed(format!("Ceph did not report the object count for {wanted}"))
+        })
+}
+
 /// What `ceph orch ps --format json` says is running on this host.
 #[derive(serde::Deserialize)]
 struct Daemon {
@@ -596,6 +616,68 @@ impl CephAdmin {
         Ok(())
     }
 
+    /// Delete a pool only after Ceph proves it contains no objects.
+    ///
+    /// Ceph has a cluster-wide deletion interlock. Preserve its previous value
+    /// and restore it even when deletion fails, otherwise one failed reconcile
+    /// leaves every later manual pool deletion unlocked.
+    pub async fn delete_pool(&self, pool: &str) -> Result<()> {
+        let df = self
+            .ceph(&[
+                "df".into(),
+                "detail".into(),
+                "--format".into(),
+                "json".into(),
+            ])
+            .await?;
+        let objects = pool_objects(&String::from_utf8_lossy(&df), pool)?;
+        if objects != 0 {
+            return Err(HostError::failed(format!(
+                "refusing to delete Ceph pool {pool}: it still contains {objects} object(s)"
+            )));
+        }
+
+        let prior = self
+            .ceph(&[
+                "config".into(),
+                "get".into(),
+                "mon".into(),
+                "mon_allow_pool_delete".into(),
+            ])
+            .await?;
+        let prior = String::from_utf8_lossy(&prior).trim().to_string();
+        self.ceph(&[
+            "config".into(),
+            "set".into(),
+            "mon".into(),
+            "mon_allow_pool_delete".into(),
+            "true".into(),
+        ])
+        .await?;
+        let deletion = self
+            .ceph(&[
+                "osd".into(),
+                "pool".into(),
+                "delete".into(),
+                pool.into(),
+                pool.into(),
+                "--yes-i-really-really-mean-it".into(),
+            ])
+            .await;
+        let restore = self
+            .ceph(&[
+                "config".into(),
+                "set".into(),
+                "mon".into(),
+                "mon_allow_pool_delete".into(),
+                prior,
+            ])
+            .await;
+        deletion?;
+        restore?;
+        Ok(())
+    }
+
     pub async fn add_osd(&self, host: &str, device: &str) -> Result<()> {
         self.ceph(&add_osd_argv(host, device)).await.map(|_| ())
     }
@@ -813,6 +895,7 @@ mod tests {
             pool: "velstra-volumes".into(),
             size: 3,
             min_size: 2,
+            delete: false,
         };
         let commands = create_pool_argv(&pool);
         let flat: Vec<String> = commands.iter().map(|c| c.join(" ")).collect();
@@ -829,6 +912,14 @@ mod tests {
             flat.iter().any(|c| c.contains("application enable")),
             "{flat:?}"
         );
+    }
+
+    #[test]
+    fn deletion_reads_the_object_count_from_the_named_pool() {
+        let df = r#"{"pools":[{"name":"empty","stats":{"objects":0}},{"name":"used","stats":{"objects":7}}]}"#;
+        assert_eq!(pool_objects(df, "empty").unwrap(), 0);
+        assert_eq!(pool_objects(df, "used").unwrap(), 7);
+        assert!(pool_objects(df, "missing").is_err());
     }
 
     /// Only daemons actually running count.

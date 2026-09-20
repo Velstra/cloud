@@ -383,16 +383,20 @@ A pool is not a machine — several nodes reach one Ceph pool, one node may expo
 three volume groups — so it is its own role and its own module.
 
 Same two halves as a node, same order: **Pools → New pool** in the console (or a
-`POST` to `/api/v1/pools`), then give the machine the `pool` role with that id
-in its seed.
+`POST` to `/api/v1/pools`), choose its reach and backend, then give the machine
+the `pool` role with that id in its seed. Ceph names an RBD pool; Directory names
+an absolute path; LVM names a volume group and, optionally, its thin pool. Local
+Directory and LVM pools must name the one machine that holds their bytes.
 
 The id has to match. Every volume is written against it, and a mismatch is a
 pool that claims nothing and volumes that are never provisioned — quietly.
 Creating the object before writing the seed is what stops that, which is why it
 is worth the extra step rather than letting an agent invent one.
 
-Unlike a node, a pool is handed no token: its agent authenticates with one you
-supply (`velstra.cloud.pool.tokenFile`, or `--api-token-file`).
+A pool receives its own token once when it is created. The console keeps that
+token on screen with the matching environment for the selected backend; write
+it to the configured token file before starting the agent. The API stores only
+its digest, so a lost token must be minted again from the pool's page.
 
 ---
 

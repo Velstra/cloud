@@ -322,6 +322,10 @@ impl Harness {
             // not taking work, and then the fixture was the first thing to say
             // so.
             velstra_cloud_model::resources::PoolSpec {
+                scope: Default::default(),
+                backend: Default::default(),
+                backend_target: String::new(),
+                thin_pool: String::new(),
                 accepting: true,
                 ..Default::default()
             },
@@ -3937,6 +3941,10 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
             Placement::new("eu-central", "cell-1"),
         ),
         velstra_cloud_model::resources::PoolSpec {
+            scope: Default::default(),
+            backend: Default::default(),
+            backend_target: String::new(),
+            thin_pool: String::new(),
             accepting: true,
             node: String::new(),
             labels: vec![],
@@ -4578,6 +4586,10 @@ async fn a_volume_naming_a_pool_that_is_not_there_is_refused_while_somebody_is_a
                     velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
                 ),
                 velstra_cloud_model::resources::PoolSpec {
+                    scope: Default::default(),
+                    backend: Default::default(),
+                    backend_target: String::new(),
+                    thin_pool: String::new(),
                     accepting: true,
                     ..Default::default()
                 },
@@ -4981,6 +4993,10 @@ async fn a_volume_with_no_pool_named_is_put_somewhere_rather_than_nowhere() {
                 velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
             ),
             velstra_cloud_model::resources::PoolSpec {
+                scope: Default::default(),
+                backend: Default::default(),
+                backend_target: String::new(),
+                thin_pool: String::new(),
                 accepting,
                 node: String::new(),
                 labels: Vec::new(),
@@ -5827,6 +5843,10 @@ async fn a_disk_on_another_machine_is_refused_with_both_machines_named() {
             velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
         ),
         velstra_cloud_model::resources::PoolSpec {
+            scope: Default::default(),
+            backend: Default::default(),
+            backend_target: String::new(),
+            thin_pool: String::new(),
             accepting: true,
             // The whole point of the fixture: this pool's bytes are on one host.
             node: "node-a".into(),
@@ -6023,6 +6043,10 @@ async fn a_volume_is_refused_into_a_pool_that_is_being_drained() {
             velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
         ),
         velstra_cloud_model::resources::PoolSpec {
+            scope: Default::default(),
+            backend: Default::default(),
+            backend_target: String::new(),
+            thin_pool: String::new(),
             accepting: false,
             ..Default::default()
         },
@@ -6064,6 +6088,10 @@ async fn a_pool_project_grant_is_enforced_for_named_and_automatic_placement() {
             velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
         ),
         velstra_cloud_model::resources::PoolSpec {
+            scope: Default::default(),
+            backend: Default::default(),
+            backend_target: String::new(),
+            thin_pool: String::new(),
             accepting: true,
             projects: vec!["projects/p2".into()],
             ..Default::default()
@@ -6134,6 +6162,10 @@ async fn a_volume_is_refused_into_a_pool_no_agent_has_reported_on_lately() {
             velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
         ),
         velstra_cloud_model::resources::PoolSpec {
+            scope: Default::default(),
+            backend: Default::default(),
+            backend_target: String::new(),
+            thin_pool: String::new(),
             accepting: true,
             ..Default::default()
         },

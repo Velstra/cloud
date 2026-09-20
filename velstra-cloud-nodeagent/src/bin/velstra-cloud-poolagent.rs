@@ -68,7 +68,11 @@ struct Args {
     /// Where volumes live, for the directory backend. Copies live in
     /// `snapshots/` underneath it, and the whole directory belongs to the
     /// platform.
-    #[arg(long, default_value = "/var/lib/velstra/pool")]
+    #[arg(
+        long,
+        env = "VELSTRA_POOL_DIR",
+        default_value = "/var/lib/velstra/pool"
+    )]
     dir: PathBuf,
 
     /// Where an image named by a volume is found. The same directory a node

@@ -453,6 +453,17 @@ pub struct CephPoolSpec {
     /// writes rather than accepting data it cannot protect.
     #[serde(default = "default_min_size")]
     pub min_size: u32,
+    /// Remove this pool from Ceph.
+    ///
+    /// Deletion is explicit rather than inferred from a missing row: losing a
+    /// form value or applying an older manifest must never destroy storage.
+    /// The node agent refuses a pool that still contains objects.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_size() -> u32 {
@@ -628,6 +639,8 @@ pub enum CephStep {
     AddOsd { node: String, device: String },
     /// Create this pool.
     CreatePool { pool: CephPoolSpec },
+    /// Delete an explicitly marked, empty pool.
+    DeletePool { pool: String },
     /// Something is asked for that cannot be done, with the reason.
     ///
     /// **It halts what is left**, and that is a consequence of one step per
@@ -933,8 +946,22 @@ pub fn next_step(spec: &CephClusterSpec, observed: &CephObserved) -> CephStep {
         }
     }
 
+    // Explicit removals precede additions. A missing row is deliberately not
+    // a deletion request: declarative omission is too easy to produce by an
+    // old client, a partial manifest or a failed form load.
+    for pool in spec.pools.iter().filter(|pool| pool.delete) {
+        if observed.pools.contains(&pool.pool) {
+            return CephStep::DeletePool {
+                pool: pool.pool.clone(),
+            };
+        }
+    }
+
     // 5. Pools, once there is somewhere to put them.
     for pool in &spec.pools {
+        if pool.delete {
+            continue;
+        }
         if !observed.pools.contains(&pool.pool) {
             if observed.nodes.iter().all(|n| n.osd_devices.is_empty()) {
                 return CephStep::Blocked {
@@ -1268,6 +1295,7 @@ mod tests {
                 pool: "velstra-volumes".into(),
                 size: 3,
                 min_size: 2,
+                delete: false,
             }],
             ..CephClusterSpec::default()
         }
@@ -1394,6 +1422,29 @@ mod tests {
 
         assert_eq!(next_step(&spec, &observed), CephStep::Settled);
         assert_eq!(phase_of(&spec, &observed), CephPhase::Ready);
+    }
+
+    #[test]
+    fn pool_deletion_is_explicit_and_settles_after_ceph_removes_it() {
+        let mut spec = spec();
+        spec.pools[0].delete = true;
+        let mut observed = seen(
+            vec![
+                node("a", true, &["/dev/disk/by-id/one"]),
+                node("b", true, &["/dev/disk/by-id/two"]),
+                node("c", true, &[]),
+            ],
+            &["velstra-volumes"],
+            true,
+        );
+        assert_eq!(
+            next_step(&spec, &observed),
+            CephStep::DeletePool {
+                pool: "velstra-volumes".into()
+            }
+        );
+        observed.pools.clear();
+        assert_eq!(next_step(&spec, &observed), CephStep::Settled);
     }
 
     /// A pool asked for before any disk is blocked, not created.

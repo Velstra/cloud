@@ -10,6 +10,7 @@ import type { Resource } from "@/lib/model";
 import type { Collection, Field } from "@/lib/schema";
 import operations from "@/api/operations.json";
 import { lazy, Suspense } from "react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 const Terminal = lazy(() => import("@/features/Terminal").then((m) => ({ default: m.Terminal })));
 const Screen = lazy(() => import("@/features/Screen").then((m) => ({ default: m.Screen })));
 const CloudInit = lazy(() => import("@/features/CloudInit").then((m) => ({ default: m.CloudInit })));
@@ -28,6 +29,15 @@ const GrantsEditor = lazy(() => import("@/features/Members").then((m) => ({ defa
 const Quota = lazy(() => import("@/features/Quota").then((m) => ({ default: m.Quota })));
 const Account = lazy(() => import("@/features/Account").then((m) => ({ default: m.Account })));
 const UserQuick = lazy(() => import("@/features/Account").then((m) => ({ default: m.UserQuick })));
+
+function GuestAccess({ r, c }: { r: Resource; c: Collection }) {
+  return <Tabs defaultValue="console" className="grid gap-3">
+    <TabsList className="w-fit"><TabsTrigger value="console">Console</TabsTrigger><TabsTrigger value="screen">Screen</TabsTrigger><TabsTrigger value="network">Network</TabsTrigger></TabsList>
+    <TabsContent value="console"><Suspense fallback={loading("the terminal")}><Terminal r={r} coll={c} /></Suspense></TabsContent>
+    <TabsContent value="screen"><Suspense fallback={loading("the screen")}><Screen r={r} coll={c} /></Suspense></TabsContent>
+    <TabsContent value="network"><Suspense fallback={loading("the addresses")}><Connect r={r} /></Suspense></TabsContent>
+  </Tabs>;
+}
 
 export type Action = {
   id: string;           // operationId
@@ -51,7 +61,7 @@ export type Panel = {
 // from, which sentences to refuse with — and so the disk picker was two text
 // boxes and one paraphrased warning while the schema carried seven refusals,
 // a minimum size and the wording, all pinned by a test in the API crate.
-export type FieldEditor = (p: { f: Field; value: any; onChange: (v: any) => void; disabled: boolean }) => ReactNode;
+export type FieldEditor = (p: { f: Field; value: any; onChange: (v: any) => void; disabled: boolean; existing?: Resource }) => ReactNode;
 
 type Entry = {
   cells?: Record<string, (r: Resource) => ReactNode>;
@@ -140,16 +150,8 @@ register("instances", {
   quick: (r, c, reload) => <Suspense fallback={null}><InstanceQuick r={r} c={c} reload={reload} /></Suspense>,
   panels: [
     {
-      id: "connect", title: "Connect", sub: "its addresses, and the line that logs in",
-      render: (r) => <Suspense fallback={loading("the addresses")}><Connect r={r} /></Suspense>,
-    },
-    {
-      id: "screen", title: "Screen", sub: "the guest's display, over VNC",
-      render: (r, c) => <Suspense fallback={loading("the screen")}><Screen r={r} coll={c} /></Suspense>,
-    },
-    {
-      id: "console", title: "Console", sub: "the guest's serial line — attach to read and type",
-      render: (r, c) => <Suspense fallback={loading("the terminal")}><Terminal r={r} coll={c} /></Suspense>,
+      id: "access", title: "Access", sub: "console, display and network",
+      render: (r, c) => <GuestAccess r={r} c={c} />,
     },
   ],
   fieldEditors: {

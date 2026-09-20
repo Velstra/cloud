@@ -9,7 +9,7 @@
 // it is a drive to a desk.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bell, ChevronDown, ChevronRight, Command as Cmd, LogOut, Menu, Moon, Rows3, Search, Sun, UserRound, Box, Database, Network, Server, Shield, Activity, LayoutDashboard, Workflow, Cloud, X } from "lucide-react";
+import { Bell, ChevronDown, ChevronRight, Command as Cmd, LogOut, Menu, Moon, Rows3, Search, Sun, UserRound, Box, Database, Network, Server, Shield, Activity, LayoutDashboard, Workflow, Cloud, X, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator,
@@ -39,6 +39,7 @@ export function Shell({ census, onSweep, children }: {
   const theme = useStore((s) => s.theme);
   const density = useStore((s) => s.density);
   const collapsed = useStore((s) => s.railCollapsed);
+  const compact = useStore((s) => s.railCompact);
   const [paletteOpen, setPaletteOpen] = useState(false);
   // Not persisted: which way the drawer was left on a phone is not a
   // preference, it is where the last tap put it.
@@ -85,17 +86,21 @@ export function Shell({ census, onSweep, children }: {
       <aside
         id="rail"
         data-open={railOpen}
-        className="flex w-[232px] shrink-0 flex-col border-r max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:-translate-x-full max-md:transition-transform max-md:data-[open=true]:translate-x-0"
+        className={`flex shrink-0 flex-col border-r transition-[width] max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:w-[232px] max-md:-translate-x-full max-md:transition-transform max-md:data-[open=true]:translate-x-0 ${compact ? "w-16" : "w-[232px]"}`}
         style={{ background: "var(--sidebar-bg)", borderColor: "var(--border)" }}
       >
-        <div className="flex items-center gap-2.5 px-4 pb-4 pt-5 text-[17px] font-semibold tracking-tight" style={{ color: "var(--text-strong)" }}>
-          <span className="grid size-8 place-items-center rounded-lg bg-primary text-primary-foreground"><Cloud className="size-5" /></span>Velstra <span style={{ color: "var(--product)" }}>Cloud</span>
+        <div className={`flex items-center gap-2.5 pb-4 pt-5 text-[17px] font-semibold tracking-tight ${compact ? "justify-center px-2" : "px-4"}`} style={{ color: "var(--text-strong)" }}>
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground"><Cloud className="size-5" /></span>
+          {!compact && <><span>Velstra <span style={{ color: "var(--product)" }}>Cloud</span></span><span className="ml-auto" /></>}
+          <Tooltip><TooltipTrigger render={<Button size="icon" variant="ghost" className="hidden size-7 md:inline-flex" aria-label={compact ? "Expand navigation" : "Collapse navigation"} onClick={() => setState({ railCompact: !compact })} />}>
+            {compact ? <PanelLeftOpen className="size-4" /> : <PanelLeftClose className="size-4" />}
+          </TooltipTrigger><TooltipContent>{compact ? "Expand navigation" : "Collapse navigation"}</TooltipContent></Tooltip>
         </div>
-        <button onClick={() => setPaletteOpen(true)} className="mx-3 mb-3 flex items-center gap-2 rounded-[4px] border px-2.5 py-1.5 text-xs"
+        {!compact && <><button onClick={() => setPaletteOpen(true)} className="mx-3 mb-3 flex items-center gap-2 rounded-[4px] border px-2.5 py-1.5 text-xs"
           style={{ borderColor: "var(--border)", color: "var(--text-muted)", background: "var(--surface-sunken)" }}>
           <Search className="size-3.5" /> Jump to… <kbd className="ml-auto rounded border px-1 font-mono text-[10px]" style={{ borderColor: "var(--border-strong)" }}>⌘K</kbd>
         </button>
-        <div className="relative mx-3 mb-3"><Search className="absolute left-2.5 top-2.5 size-3.5 text-muted-foreground" /><input ref={navInput} aria-label="Filter navigation" value={navQuery} onChange={(e) => setNavQuery(e.target.value)} placeholder="Find a section" className="h-9 w-full rounded-lg border border-border bg-background pl-8 pr-7 text-xs" />{navQuery && <button aria-label="Clear navigation filter" onClick={() => { setNavQuery(""); navInput.current?.focus(); }} className="absolute right-2 top-2.5"><X className="size-3.5" /></button>}</div>
+        <div className="relative mx-3 mb-3"><Search className="absolute left-2.5 top-2.5 size-3.5 text-muted-foreground" /><input ref={navInput} aria-label="Filter navigation" value={navQuery} onChange={(e) => setNavQuery(e.target.value)} placeholder="Find a section" className="h-9 w-full rounded-lg border border-border bg-background pl-8 pr-7 text-xs" />{navQuery && <button aria-label="Clear navigation filter" onClick={() => { setNavQuery(""); navInput.current?.focus(); }} className="absolute right-2 top-2.5"><X className="size-3.5" /></button>}</div></>}
         {/* A link followed from in here closes the drawer, on the click that
             caused it rather than on the route it produced. Without this,
             tapping a collection on a phone loads the board underneath a rail
@@ -107,9 +112,9 @@ export function Shell({ census, onSweep, children }: {
             if ((e.target as HTMLElement).closest("a")) setRailOpen(false);
           }}
         >
-          <RailLink active={route.view === "overview"} to={href({ view: "overview" })} label="Overview"
+          <RailLink compact={compact} active={route.view === "overview"} to={href({ view: "overview" })} label="Overview"
             badge={attention.length ? <Badge n={attention.length} tone={failing ? "failing" : "drifting"} /> : null} />
-          <RailLink active={route.view === "map"} to={href({ view: "map" })} label="Map" />
+          {!compact && <RailLink compact={compact} active={route.view === "map"} to={href({ view: "map" })} label="Map" />}
           {groups(!!who?.cellAdmin).map((g) => {
             const items = g.items.filter((c) => (who?.cellAdmin || c.scope === "project") && (!navQuery || c.title.toLowerCase().includes(navQuery.toLowerCase())));
             if (!items.length) return null;
@@ -117,27 +122,29 @@ export function Shell({ census, onSweep, children }: {
             const expanded = !!navQuery || (expandedSections[g.name] ?? items.some((c) => c.id === current?.id && !primarySections.has(c.id)));
             const shown = expanded ? items : items.filter((c) => primarySections.has(c.id));
             return (
-              <div key={g.name} className="mt-3">
+              <div key={g.name} className={compact ? "mt-1" : "mt-3"}>
+                {!compact && <>
                 <button aria-expanded={open} onClick={() => setState({ railCollapsed: { ...collapsed, [g.name]: open } })}
                   className="flex w-full items-center gap-1 px-2 pb-1 text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)" }}>
                   {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />} {g.name}
                   {!open && <span className="ml-auto font-mono text-[10px] normal-case tracking-normal">{items.reduce((n, c) => n + (census[c.id]?.unsettled.length ?? 0), 0) || ""}</span>}
                 </button>
-                <div className="fold" data-closed={!open}><div>
+                </>}
+                <div className="fold" data-closed={!compact && !open}><div>
                   {shown.map((c) => {
                     const seen = census[c.id]; const un = seen?.unsettled.length ?? 0;
                     return (
-                      <RailLink key={c.id} active={current?.id === c.id} to={href({ view: "board", coll: c.id })} label={c.title}
+                      <RailLink compact={compact} key={c.id} active={current?.id === c.id} to={href({ view: "board", coll: c.id })} label={c.title}
                         badge={un ? <Badge n={un} tone={seen!.unsettled.some((r) => verdict(r, c).kind === "failing") ? "failing" : "drifting"} />
                           : <span className="font-mono text-[11px]" style={{ color: "var(--text-faint)" }}>{seen ? seen.total : ""}</span>} />
                     );
                   })}
-                  {!navQuery && items.some((c) => !primarySections.has(c.id)) && <button className="ml-8 mt-1 text-xs text-muted-foreground hover:text-foreground" aria-expanded={!!expanded} onClick={() => setExpandedSections((old) => ({ ...old, [g.name]: !expanded }))}>{expanded ? "Show less" : `More (${items.length - shown.length})`}</button>}
+                  {!compact && !navQuery && items.some((c) => !primarySections.has(c.id)) && <button className="ml-8 mt-1 text-xs text-muted-foreground hover:text-foreground" aria-expanded={!!expanded} onClick={() => setExpandedSections((old) => ({ ...old, [g.name]: !expanded }))}>{expanded ? "Show less" : `More (${items.length - shown.length})`}</button>}
                   {/* The bill belongs with the readings it is summed from —
                       one group, evidence and total. It is not a collection, so
                       the schema cannot put it here and this does. */}
                   {g.items.some((c) => c.id === "usage") && (
-                    <RailLink active={route.view === "spend"} to={href({ view: "spend" })} label="Spend" />
+                    <RailLink compact={compact} active={route.view === "spend"} to={href({ view: "spend" })} label="Spend" />
                   )}
                 </div></div>
               </div>
@@ -240,14 +247,14 @@ export function Shell({ census, onSweep, children }: {
   );
 }
 
-function RailLink({ active, to, label, badge }: { active: boolean; to: string; label: string; badge?: React.ReactNode }) {
+function RailLink({ active, to, label, badge, compact = false }: { active: boolean; to: string; label: string; badge?: React.ReactNode; compact?: boolean }) {
   const group = SCHEMA.find((c) => c.title === label)?.group;
   const Icon = label === "Overview" ? LayoutDashboard : label === "Map" ? Workflow : group === "Storage" ? Database : group === "Network" ? Network : group === "Hardware" ? Server : group === "Access" ? Shield : group === "Records" ? Activity : Box;
   return (
-    <a href={to} aria-current={active ? "page" : undefined}
-      className="my-0.5 flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] transition-colors hover:bg-[var(--surface-hover)] focus-visible:outline-none focus-visible:ring-[3px]"
+    <a href={to} aria-current={active ? "page" : undefined} title={compact ? label : undefined}
+      className={`my-0.5 flex items-center rounded-lg py-2 text-[13px] transition-colors hover:bg-[var(--surface-hover)] focus-visible:outline-none focus-visible:ring-[3px] ${compact ? "justify-center px-2" : "gap-2.5 px-2.5"}`}
       style={{ background: active ? "color-mix(in srgb, var(--brand) 16%, transparent)" : undefined, color: active ? "var(--text-strong)" : "var(--text-body)" }}>
-      <Icon className="size-4 shrink-0 text-muted-foreground" /><span className="flex-1">{label}</span>{badge}
+      <Icon className="size-4 shrink-0 text-muted-foreground" />{!compact && <><span className="flex-1">{label}</span>{badge}</>}
     </a>
   );
 }

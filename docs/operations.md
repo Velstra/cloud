@@ -204,6 +204,12 @@ while it does so. Then create one Velstra `pools` object and run one Ceph pool
 agent for that RBD pool. The two names are intentionally separate: for example,
 Velstra pool `archive` can serve RBD pool `tenant-archive`.
 
+Removing an RBD pool is explicit: edit the Ceph cluster and mark that pool for
+removal. The agent first asks Ceph for its object count and refuses deletion
+unless it is zero; merely omitting a pool from an older manifest never destroys
+it. Once Ceph reports it absent, the removal is settled and the console offers
+to remove the completed row from the spec.
+
 The Velstra pool's **Projects** field limits new placement. Empty or `*` means
 every project; `projects/team-a` and `projects/team-b` make it available only to
 those projects. Both an explicitly named pool and the cell's automatic choice

@@ -270,10 +270,22 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
     // Flat until here, because that is what the controls and the error mapping
     // below speak; nested exactly once, on the way out.
     const body = nest(spec);
+    if (coll.id === "pools") {
+      const backend = String(body.backend ?? "External");
+      const scope = String(body.scope ?? "Global");
+      if (backend !== "External" && !String(body.backendTarget ?? "").trim()) {
+        setProblem(`Choose the ${backend === "Ceph" ? "Ceph pool" : backend === "Lvm" ? "volume group" : "directory"}.`);
+        return;
+      }
+      if (scope === "Machine" && !String(body.node ?? "").trim()) { setProblem("Choose the machine that holds this pool."); return; }
+      if (["Directory", "Lvm"].includes(backend) && scope !== "Machine") { setProblem(`${backend} storage is local to one machine. Set Reach to Machine.`); return; }
+    }
     if (coll.id === "ceph-clusters") {
       const added = (body.osds ?? []).filter((disk: { node: string; device: string }) =>
         !(existing?.spec?.osds ?? []).some((old: { node: string; device: string }) => old.node === disk.node && old.device === disk.device));
       if (added.length && !await ask({ title: `Erase ${added.length} disks for Ceph?`, body: added.map((disk: { node: string; device: string }) => `${disk.node}: ${disk.device}`).join(", ") + ". All data on these disks will be permanently removed.", confirmLabel: "Erase and configure", tone: "danger" })) return;
+      const removed = (body.pools ?? []).filter((pool: { pool: string; delete?: boolean }) => pool.delete && !(existing?.spec?.pools ?? []).some((old: { pool: string; delete?: boolean }) => old.pool === pool.pool && old.delete));
+      if (removed.length && !await ask({ title: `Delete ${removed.length} Ceph pool${removed.length === 1 ? "" : "s"}?`, body: removed.map((pool: { pool: string }) => pool.pool).join(", ") + ". Ceph will refuse any pool that still contains objects.", confirmLabel: "Delete empty pools", tone: "danger" })) return;
     }
     // `meta.labels`, which is where the API takes them. Sent at the top level
     // they were accepted and dropped: the object was made, the form said
@@ -353,7 +365,7 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
         </Row>
       )}
       {basic.map((f) => (
-        <FieldRow key={f.key} f={f} coll={coll} value={values[f.key]} onChange={(v) => set(f.key, v)}
+        <FieldRow key={f.key} f={f} coll={coll} existing={existing} value={values[f.key]} onChange={(v) => set(f.key, v)}
           error={errors[f.key]} locked={!!existing && f.atCreation} />
       ))}
       <Row label="Labels" help="`key=value`, separated by commas. Every board filters on them, and placement rules can require one.">
@@ -368,7 +380,7 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
           {showAdvanced && (
             <div className="mt-4 grid gap-5">
               {advanced.map((f) => (
-                <FieldRow key={f.key} f={f} coll={coll} value={values[f.key]} onChange={(v) => set(f.key, v)}
+                <FieldRow key={f.key} f={f} coll={coll} existing={existing} value={values[f.key]} onChange={(v) => set(f.key, v)}
                   error={errors[f.key]} locked={!!existing && f.atCreation} />
               ))}
             </div>
@@ -425,8 +437,8 @@ function Row({ label, help, error, children }: {
     : <fieldset aria-invalid={!!error || undefined} aria-describedby={description} className="grid min-w-0 gap-1.5"><legend className="mb-1.5 text-[13px] font-medium text-foreground">{label}</legend>{children}{helpContent}</fieldset>;
 }
 
-function FieldRow({ f, coll, value, onChange, error, locked }: {
-  f: Field; coll: Collection; value: any; onChange: (v: any) => void; error?: string; locked: boolean;
+function FieldRow({ f, coll, existing, value, onChange, error, locked }: {
+  f: Field; coll: Collection; existing?: Resource; value: any; onChange: (v: any) => void; error?: string; locked: boolean;
 }) {
   const label = f.label + (f.required ? " *" : "");
   const help = locked ? "Answered once, when the object was made." : f.help;
@@ -434,7 +446,7 @@ function FieldRow({ f, coll, value, onChange, error, locked }: {
 
   // A field the registry knows better than the schema does.
   const editor = entry(coll.id).fieldEditors?.[f.key];
-  if (editor) return <Row label={label} help={help} error={error}>{editor({ f, value, onChange, disabled: locked })}</Row>;
+  if (editor) return <Row label={label} help={help} error={error}>{editor({ f, value, onChange, disabled: locked, existing })}</Row>;
 
   switch (f.kind) {
     case "switch":

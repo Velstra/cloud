@@ -8,6 +8,7 @@
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import type { Resource } from "@/lib/model";
 
 type Row = Record<string, any>;
 const Cell = ({ label, children }: { label: string; children: React.ReactNode }) => (
@@ -95,18 +96,32 @@ export function ListenerList({ value, onChange, disabled }: { value: Row[]; onCh
 }
 
 /** A Ceph cluster's pools: the RBD name, and how many copies. */
-export function PoolList({ value, onChange, disabled }: { value: Row[]; onChange: (v: unknown) => void; disabled: boolean }) {
+export function PoolList({ value, onChange, disabled, existing }: { value: Row[]; onChange: (v: unknown) => void; disabled: boolean; existing?: Resource }) {
+  const rows = value ?? [];
+  const existingNames = new Set(((existing?.spec?.pools ?? []) as Row[]).map((pool) => String(pool.pool)));
   return (
-    <Rows value={value} onChange={onChange} disabled={disabled} addLabel="Add a pool"
-      columns="minmax(0,1.4fr) minmax(0,0.8fr) minmax(0,0.8fr) auto"
-      add={() => ({ pool: "", size: 3, minSize: 2 })}
-      render={(row, set) => (
-        <>
-          <Cell label="Pool"><Input disabled={disabled} className="font-mono text-sm" placeholder="velstra-volumes" value={row.pool ?? ""} onChange={(e) => set({ pool: e.target.value })} /></Cell>
-          <Cell label="Copies"><Input disabled={disabled} type="number" className="text-sm" value={row.size ?? ""} onChange={(e) => set({ size: num(e.target.value) })} /></Cell>
-          <Cell label="Least, to serve"><Input disabled={disabled} type="number" className="text-sm" value={row.minSize ?? ""} onChange={(e) => set({ minSize: num(e.target.value) })} /></Cell>
-        </>
-      )} />
+    <div className="grid gap-2">
+      {rows.map((row, i) => {
+        const set = (patch: Row) => onChange(rows.map((r, j) => j === i ? { ...r, ...patch } : r));
+        const removing = row.delete === true;
+        const removed = removing && !!existing && !((existing.status?.poolsPresent ?? []) as string[]).includes(String(row.pool));
+        return <div key={`${row.pool}-${i}`} className="grid items-end gap-2 rounded-md border border-border p-2"
+          style={{ gridTemplateColumns: "minmax(0,1.4fr) minmax(0,0.8fr) minmax(0,0.8fr) auto" }}>
+          <Cell label="Pool"><Input disabled={disabled || removing} className="font-mono text-sm" placeholder="velstra-volumes" value={row.pool ?? ""} onChange={(e) => set({ pool: e.target.value })} /></Cell>
+          <Cell label="Copies"><Input disabled={disabled || removing} type="number" className="text-sm" value={row.size ?? ""} onChange={(e) => set({ size: num(e.target.value) })} /></Cell>
+          <Cell label="Least, to serve"><Input disabled={disabled || removing} type="number" className="text-sm" value={row.minSize ?? ""} onChange={(e) => set({ minSize: num(e.target.value) })} /></Cell>
+          <div className="flex items-center gap-2">
+            {removing && <span className="text-xs" style={{ color: removed ? "var(--settled)" : "var(--drifting)" }}>{removed ? "Removed" : "Will delete"}</span>}
+            <Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={() => {
+              if (removed) onChange(rows.filter((_, j) => j !== i));
+              else if (existingNames.has(String(row.pool))) set({ delete: !removing });
+              else onChange(rows.filter((_, j) => j !== i));
+            }}>{removed ? "Remove row" : removing ? "Keep" : "Remove"}</Button>
+          </div>
+        </div>;
+      })}
+      <div><Button type="button" variant="secondary" size="sm" disabled={disabled}
+        onClick={() => onChange([...rows, { pool: "", size: 3, minSize: 2 }])}>Add a pool</Button></div>
+    </div>
   );
 }
-

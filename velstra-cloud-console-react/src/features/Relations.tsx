@@ -1,14 +1,12 @@
 // What this object depends on, and what depends on it — as chips you can
-// follow, and as a small drawn neighbourhood when there is enough of it to be
-// worth drawing. The blast-radius question ("if I delete this, what breaks?")
+// follow. The blast-radius question ("if I delete this, what breaks?")
 // is the "used by" half, and it is answered by the schema's own references.
 
 import { useMemo } from "react";
-import { ReactFlow, Background, type Edge as FlowEdge, type Node as FlowNode } from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
+import type { Node as FlowNode } from "@xyflow/react";
 import { idOf, nameOf, verdict, type Resource } from "@/lib/model";
 import type { Collection } from "@/lib/schema";
-import { buildGraph, neighbourhood, type Graph } from "@/lib/graph";
+import { buildGraph, type Graph } from "@/lib/graph";
 import { useCensus, whole, whyNotWhole } from "@/app/census";
 import { State } from "./State";
 
@@ -49,7 +47,6 @@ export function Relations({ r }: { r: Resource; coll: Collection }) {
           This neighbourhood is drawn from an incomplete sweep. {why}
         </p>
       )}
-      {deps.length + users.length >= 2 && <Neighbourhood g={g} name={me} />}
     </div>
   );
 }
@@ -78,32 +75,6 @@ function Strip({ title, edges, pick, g, empty }: {
           })}
         </ul>
       )}
-    </div>
-  );
-}
-
-/** The object and its immediate neighbours, laid out in rings. */
-function Neighbourhood({ g, name }: { g: Graph; name: string }) {
-  const { names, edges } = useMemo(() => neighbourhood(g, name, 1), [g, name]);
-  const others = [...names].filter((n) => n !== name);
-  const nodes: FlowNode[] = [
-    flowNode(g, name, 0, 0, true),
-    ...others.map((n, i) => {
-      const a = (i / others.length) * Math.PI * 2 - Math.PI / 2;
-      return flowNode(g, n, Math.cos(a) * 190, Math.sin(a) * 110, false);
-    }),
-  ];
-  const flow: FlowEdge[] = edges.map((e, i) => ({
-    id: String(i), source: e.from, target: e.to, label: e.label,
-    style: { stroke: "var(--border-strong)" }, labelStyle: { fill: "var(--text-faint)", fontSize: 10 },
-    labelBgStyle: { fill: "var(--surface)" },
-  }));
-  return (
-    <div className="h-[260px] overflow-hidden rounded-[6px] border" style={{ borderColor: "var(--border)", background: "var(--surface-sunken)" }}>
-      <ReactFlow nodes={nodes} edges={flow} fitView fitViewOptions={{ padding: 0.25 }} nodesDraggable={false} nodesConnectable={false}
-        proOptions={{ hideAttribution: true }} onNodeClick={(_, n) => { const t = g.nodes.get(n.id); if (t) location.hash = `#/c/${t.coll.id}/${encodeURIComponent(idOf(t.r))}`; }}>
-        <Background color="var(--border-subtle)" gap={18} />
-      </ReactFlow>
     </div>
   );
 }

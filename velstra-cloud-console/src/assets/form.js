@@ -916,12 +916,18 @@ function blankPool(f) {
 function renderPoolList(form, f, host, setErr) {
   if (!Array.isArray(form.values[f.key])) form.values[f.key] = [];
   const pools = form.values[f.key];
+  for (const pool of pools) {
+    if (!("__existing" in pool)) {
+      Object.defineProperty(pool, "__existing", { value: true, enumerable: false });
+    }
+  }
   clear(host);
 
   const commit = () => {
     form.values[f.key] = pools;
     let bad = "";
     for (const p of pools) {
+      if (p.delete) continue;
       if (!p.pool) bad = "a pool needs a name";
       else if (CHECKS.id(p.pool)) bad = "a pool's name is " + CHECKS.id(p.pool);
       else if (Number(p.size) < 1 || Number(p.minSize) < 1) bad = "a pool keeps at least one copy and writes at least one";
@@ -935,25 +941,40 @@ function renderPoolList(form, f, host, setErr) {
 
   pools.forEach((p, i) => {
     const name = el("input", { type: "text", value: p.pool || "", placeholder: "volumes",
-      spellcheck: "false", "aria-label": "pool name" });
+      spellcheck: "false", "aria-label": "pool name", disabled: p.delete ? "" : null });
     name.addEventListener("input", () => {
       p.pool = name.value;
       name.classList.toggle("bad", !!(name.value && CHECKS.id(name.value)));
       commit();
     });
-    const copies = el("input", { type: "number", min: "1", max: "10", value: String(p.size), "aria-label": "copies" });
+    const copies = el("input", { type: "number", min: "1", max: "10", value: String(p.size),
+      "aria-label": "copies", disabled: p.delete ? "" : null });
     copies.addEventListener("input", () => { p.size = Number(copies.value); commit(); });
-    const floor = el("input", { type: "number", min: "1", max: "10", value: String(p.minSize), "aria-label": "write floor" });
+    const floor = el("input", { type: "number", min: "1", max: "10", value: String(p.minSize),
+      "aria-label": "write floor", disabled: p.delete ? "" : null });
     floor.addEventListener("input", () => { p.minSize = Number(floor.value); commit(); });
     host.appendChild(el("div.row", name,
       el("span.lab", "copies"), copies,
       el("span.lab", "floor"), floor,
-      btn("−", { "aria-label": "remove", onclick: () => { pools.splice(i, 1); redraw(); } })));
+      p.delete ? el("span.state.drifting", mark("drifting"), "will be removed") : null,
+      btn(p.delete ? "Undo" : "Remove", {
+        "aria-label": p.delete ? "keep pool" : "remove pool",
+        onclick: () => {
+          if (p.__existing) p.delete = !p.delete;
+          else pools.splice(i, 1);
+          redraw();
+        },
+      })));
   });
 
   host.appendChild(btn("Add" + (pools.length ? " another" : " a pool"), {
     id: "addpool",
-    onclick: () => { pools.push(blankPool(f)); redraw(); },
+    onclick: () => {
+      const pool = blankPool(f);
+      Object.defineProperty(pool, "__existing", { value: false, enumerable: false });
+      pools.push(pool);
+      redraw();
+    },
   }));
 }
 
@@ -1673,6 +1694,20 @@ function defaults(coll) {
   return out;
 }
 
+function poolRequestError(values) {
+  const backend = String(values.backend || "External");
+  if (backend !== "External" && !String(values.backendTarget || "").trim()) {
+    return "Choose the " + (backend === "Ceph" ? "Ceph pool" : backend === "Lvm" ? "volume group" : "directory") + ".";
+  }
+  if (String(values.scope || "Global") === "Machine" && !String(values.node || "").trim()) {
+    return "Choose the machine that holds this pool.";
+  }
+  if (["Directory", "Lvm"].includes(backend) && String(values.scope || "Global") !== "Machine") {
+    return backend + " storage is local to one machine. Set Reach to Machine.";
+  }
+  return "";
+}
+
 /// `opts` is how one create differs from another — a title, values decided
 /// before the dialog opened, a picker the platform answers for. Everything else
 /// about creating is the same for every collection, which is why there is one
@@ -1694,6 +1729,10 @@ function openCreate(coll, opts = {}) {
     candidates: opts.candidates,
     locked: opts.locked,
     async onSubmit(f) {
+      if (coll.id === "pools") {
+        const problem = poolRequestError(f.values);
+        if (problem) throw new Error(problem);
+      }
       const id = f.values.__id;
       // `__scope` is the form's, not the object's: it decides the address the
       // create goes to and must not travel in the body as if it were a field.
@@ -1714,7 +1753,7 @@ function openCreate(coll, opts = {}) {
         // in the caller's next statement, not in a task — so the panel is
         // opened from a timer that runs after it.
         const kind = answer.nodeToken ? "node" : "pool";
-        setTimeout(() => showAgentToken(id, minted, kind), 0);
+        setTimeout(() => showAgentToken(id, minted, kind, body.spec || {}), 0);
         return;
       }
       toast(answer && answer.operation
@@ -1799,14 +1838,25 @@ function openCreate(coll, opts = {}) {
 /// The command is here rather than in a document because this is the moment it
 /// is needed: the token is on the screen, the node id is known, and the URL is
 /// the one this console is talking to.
-function showAgentToken(id, token, kind) {
+function showAgentToken(id, token, kind, requested = {}) {
   // Two agents, two ways in. A node's token is what the setup wizard is asked
   // for; a pool's is a file its agent reads, because a pool is not a machine
   // being installed — it is a store on one that already exists, and the
   // machine may not be this cell's at all.
+  const backend = String(pick(requested, "backend") || "External").toLowerCase();
+  const target = String(pick(requested, "backendTarget") || "");
+  const thin = String(pick(requested, "thinPool") || "");
+  const backendEnv = backend === "ceph"
+    ? "VELSTRA_POOL_BACKEND=ceph\nVELSTRA_CEPH_POOL=" + target
+    : backend === "lvm"
+      ? "VELSTRA_POOL_BACKEND=lvm\nVELSTRA_LVM_GROUP=" + target + (thin ? "\nVELSTRA_LVM_THIN_POOL=" + thin : "")
+      : backend === "directory"
+        ? "VELSTRA_POOL_BACKEND=directory\nVELSTRA_POOL_DIR=" + target
+        : "# Keep the backend already configured for this agent";
   const line = kind === "node"
     ? "sudo velstra-cloud-node setup   # node id: " + id + ", control plane: " + location.origin
-    : "sudo install -m 600 /dev/stdin /etc/velstra/pool-token   # paste it, then Ctrl-D\n" +
+    : "# /etc/velstra/pool.env\nVELSTRA_POOL=" + id + "\n" + backendEnv + "\n\n" +
+      "sudo install -m 600 /dev/stdin /etc/velstra/pool-token   # paste it, then Ctrl-D\n" +
       "sudo systemctl restart velstra-cloud-poolagent";
   // Its own dialog, opened after the form's has closed — the form closes on a
   // successful submit, so filling that one would put a credential into a panel
@@ -1869,6 +1919,10 @@ function openEdit(coll, r) {
     // agent had let go and the other would not take it.
     locked: coll.fields.filter((f) => f.atCreation).map((f) => f.key),
     async onSubmit(f) {
+      if (coll.id === "pools") {
+        const problem = poolRequestError(f.values);
+        if (problem) throw new Error(problem);
+      }
       // The whole spec, merged over what was read, so a field this console does
       // not know about is not dropped by an edit that never touched it. The
       // clear set is this edit's answer to the other half of that: a field the

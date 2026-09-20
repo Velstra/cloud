@@ -374,7 +374,7 @@
             "type": "boolean"
           },
           "pools": {
-            "description": "Where volumes are stored. Copies is how many of every object exist; below the floor the pool refuses writes rather than holding data it cannot protect — so a floor equal to the copies means one node rebooting stops writing.",
+            "description": "Where volumes are stored. Remove marks an existing pool for deletion; Ceph refuses it while it contains any objects. Copies is how many of every object exist; below the floor the pool refuses writes rather than holding data it cannot protect — so a floor equal to the copies means one node rebooting stops writing.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -1523,6 +1523,20 @@
             "description": "Turning this off drains the pool: nothing new is provisioned into it, what it holds stays.",
             "type": "boolean"
           },
+          "backend": {
+            "description": "The storage implementation the pool agent must use.",
+            "enum": [
+              "Ceph",
+              "Directory",
+              "Lvm",
+              "External"
+            ],
+            "type": "string"
+          },
+          "backendTarget": {
+            "description": "For Ceph, the RBD pool; for Directory, the absolute path; for LVM, the volume group.",
+            "type": "string"
+          },
           "labels": {
             "description": "What a volume's placement matches on.",
             "items": {
@@ -1541,6 +1555,19 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "scope": {
+            "description": "Choose where workloads may reach these bytes. Machine storage stays tied to the selected node.",
+            "enum": [
+              "Global",
+              "Region",
+              "Machine"
+            ],
+            "type": "string"
+          },
+          "thinPool": {
+            "description": "Optional thin pool inside the selected volume group. Used only by the LVM backend.",
+            "type": "string"
           },
           "volumeCeiling.iops": {
             "description": "The most any one volume in this pool may take. A volume that names nothing of its own gets this; one that asks for more is brought down to it. Left empty there is no ceiling.",
@@ -1562,6 +1589,10 @@
             "x-unit": "MiB/s"
           }
         },
+        "required": [
+          "scope",
+          "backend"
+        ],
         "type": "object"
       },
       "Port": {

@@ -3568,8 +3568,88 @@
   "empty": "No storage has been declared. A pool is where volumes live: the object is made here and the agent that claims it reports the backend, the capacity and what is used.",
   "fields": [
    {
+    "key": "scope",
+    "label": "Reach",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Global",
+      "label": "Global"
+     },
+     {
+      "value": "Region",
+      "label": "Region"
+     },
+     {
+      "value": "Machine",
+      "label": "Machine"
+     }
+    ],
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "Choose where workloads may reach these bytes. Machine storage stays tied to the selected node.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "backend",
+    "label": "Backend",
+    "kind": "choice",
+    "options": [
+     {
+      "value": "Ceph",
+      "label": "Ceph"
+     },
+     {
+      "value": "Directory",
+      "label": "Directory"
+     },
+     {
+      "value": "Lvm",
+      "label": "LVM"
+     },
+     {
+      "value": "External",
+      "label": "External"
+     }
+    ],
+    "required": true,
+    "advanced": false,
+    "whenEmpty": "",
+    "help": "The storage implementation the pool agent must use.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "backendTarget",
+    "label": "Storage target",
+    "kind": "text",
+    "placeholder": "tenant-volumes, /srv/velstra, or vg0",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "configured by the agent",
+    "help": "For Ceph, the RBD pool; for Directory, the absolute path; for LVM, the volume group.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
+    "key": "thinPool",
+    "label": "LVM thin pool",
+    "kind": "text",
+    "placeholder": "velstra-thin",
+    "check": "none",
+    "required": false,
+    "advanced": true,
+    "whenEmpty": "thick LVM volumes",
+    "help": "Optional thin pool inside the selected volume group. Used only by the LVM backend.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
     "key": "node",
-    "label": "On one machine",
+    "label": "Machine",
     "kind": "ref",
     "collection": "nodes",
     "filterBy": null,
@@ -3599,7 +3679,7 @@
     "placeholder": "ssd",
     "check": "id",
     "required": false,
-    "advanced": false,
+    "advanced": true,
     "whenEmpty": "",
     "help": "What a volume's placement matches on.",
     "derived": false,
@@ -3612,7 +3692,7 @@
     "placeholder": "projects/team-a",
     "check": "none",
     "required": false,
-    "advanced": false,
+    "advanced": true,
     "whenEmpty": "all projects",
     "help": "Projects allowed to create volumes in this pool. Leave empty or use * for every project. Removing a project stops new placement and leaves its existing volumes untouched.",
     "derived": false,
@@ -4091,7 +4171,7 @@
     "required": false,
     "advanced": true,
     "whenEmpty": "",
-    "help": "Where volumes are stored. Copies is how many of every object exist; below the floor the pool refuses writes rather than holding data it cannot protect — so a floor equal to the copies means one node rebooting stops writing.",
+    "help": "Where volumes are stored. Remove marks an existing pool for deletion; Ceph refuses it while it contains any objects. Copies is how many of every object exist; below the floor the pool refuses writes rather than holding data it cannot protect — so a floor equal to the copies means one node rebooting stops writing.",
     "derived": false,
     "atCreation": false
    },

@@ -454,6 +454,20 @@ function closePalette() {
 
 $("jump").addEventListener("click", openPalette);
 
+const railCompact = localStorage.getItem("velstra-rail-compact") === "true";
+document.documentElement.classList.toggle("rail-compact", railCompact);
+const syncRailToggle = () => {
+  const compact = document.documentElement.classList.contains("rail-compact");
+  $("railtoggle").textContent = compact ? "Expand" : "Collapse";
+  $("railtoggle").setAttribute("aria-label", compact ? "Expand navigation" : "Collapse navigation");
+};
+syncRailToggle();
+$("railtoggle").addEventListener("click", () => {
+  const compact = document.documentElement.classList.toggle("rail-compact");
+  localStorage.setItem("velstra-rail-compact", String(compact));
+  syncRailToggle();
+});
+
 // The drawer. On a narrow screen the rail is off-canvas and this is the only
 // way in; picking anything in it puts it away again, because the pick *was*
 // the errand.

@@ -30,9 +30,19 @@ export function hasMinted(a: unknown): a is Minted {
 const copy = (value: string) => navigator.clipboard?.writeText(value).then(() => toast("Copied."));
 
 /** What a freshly registered machine is told, laid out to be copied. */
-export function MintedBox({ minted, what }: { minted: Minted; what: string }) {
+export function MintedBox({ minted, what, resource }: { minted: Minted; what: string; resource?: Resource }) {
   const join = minted.joinToken;
   const bare = minted.nodeToken ?? minted.poolToken;
+  const spec = resource?.spec ?? {};
+  const backend = String(spec.backend ?? "External").toLowerCase();
+  const target = String(spec.backendTarget ?? "");
+  const setup = minted.poolToken ? [
+    `VELSTRA_POOL=${idOf(resource ?? ({ meta: { name: minted.target ?? "pool" } } as Resource))}`,
+    backend === "ceph" ? `VELSTRA_POOL_BACKEND=ceph\nVELSTRA_CEPH_POOL=${target}`
+      : backend === "lvm" ? `VELSTRA_POOL_BACKEND=lvm\nVELSTRA_LVM_GROUP=${target}${spec.thinPool ? `\nVELSTRA_LVM_THIN_POOL=${spec.thinPool}` : ""}`
+        : backend === "directory" ? `VELSTRA_POOL_BACKEND=directory\nVELSTRA_POOL_DIR=${target}`
+          : "# Keep the backend already configured for this agent",
+  ].join("\n") : "";
   return (
     <div className="grid gap-2 rounded-[4px] border p-3" style={{ borderColor: "var(--drifting)", background: "var(--surface-sunken)" }}>
       <div className="text-xs" style={{ color: "var(--drifting)" }}>
@@ -60,6 +70,7 @@ export function MintedBox({ minted, what }: { minted: Minted; what: string }) {
           <code className="break-all font-mono text-xs" style={{ color: "var(--text-body)" }}>{bare}</code>
         </div>
       )}
+      {setup && <div className="grid gap-1"><div className="text-[11px] font-semibold uppercase tracking-[0.07em]" style={{ color: "var(--text-muted)" }}>Pool agent configuration</div><pre className="overflow-x-auto rounded bg-background p-2 font-mono text-xs">{setup}</pre></div>}
     </div>
   );
 }
@@ -172,7 +183,7 @@ export function JoinTokenButton({ r, c }: { r: Resource; c: Collection }) {
           />
         </>
       )}
-      {minted && <div className="basis-full"><MintedBox minted={minted} what={`the ${noun}`} /></div>}
+      {minted && <div className="basis-full"><MintedBox minted={minted} what={`the ${noun}`} resource={r} /></div>}
     </>
   );
 }
