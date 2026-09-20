@@ -337,18 +337,24 @@ pub async fn observe_node(
     // Everything below needs the admin keyring, so a node that is not an admin
     // fails here and reports nothing — which is correct, and is why the reader
     // takes a union.
-    if let Ok(pools) = admin.pools().await {
+    // These are independent views of the same cluster.  Asking serially made
+    // four unavailable-manager timeouts hold up the whole compute agent for
+    // two minutes, including migrations and heartbeats.  One slow manager now
+    // costs one bounded probe window.
+    let (pools, hosts, key, seen) =
+        tokio::join!(admin.pools(), admin.hosts(), admin.pubkey(), admin.seen(),);
+    if let Ok(pools) = pools {
         me.pools = pools;
     }
-    if let Ok(hosts) = admin.hosts().await {
+    if let Ok(hosts) = hosts {
         me.cluster_hosts = hosts;
     }
-    if let Ok(key) = admin.pubkey().await {
+    if let Ok(key) = key {
         me.ssh_pubkey = key;
     }
     // Health, fill, the OSD table: what Ceph says rather than what was made.
     // Same rule as the three above — kept if it came, nothing if it did not.
-    me.seen = admin.seen().await.ok();
+    me.seen = seen.ok();
     me.trusts_key = trusts(&admin.authorized_keys, cluster_key).await;
     me
 }

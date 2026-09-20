@@ -39,5 +39,14 @@ pub use tonic::Status;
 /// client, and a type that only forwarded to it would be one more thing to read
 /// before finding out it does nothing.
 pub async fn connect(endpoint: &str) -> Result<Connected, tonic::transport::Error> {
-    Client::connect(endpoint.to_string()).await
+    // Fabric is part of a reconciliation pass, so an unreachable daemon must
+    // become a reported failure instead of stopping heartbeats, migrations and
+    // every unrelated guest action on the node.  The channel timeout applies
+    // to each RPC made through the returned client as well as bounding setup.
+    let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())?
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .connect()
+        .await?;
+    Ok(Client::new(channel))
 }

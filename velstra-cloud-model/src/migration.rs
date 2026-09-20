@@ -720,6 +720,50 @@ pub fn migration_condition(
             at,
         );
     }
+    if migration.spec.mode == MigrationMode::Reboot {
+        if let Some(copy) = instance
+            .status
+            .conditions
+            .iter()
+            .find(|condition| condition.reason == "CopyingDisk")
+        {
+            return Condition::new(
+                "Moved",
+                ConditionStatus::Unknown,
+                "CopyingDisk",
+                &copy.message,
+                at,
+            );
+        }
+        let (reason, message) = match instance.status.node.as_deref() {
+            Some(node) if node == migration.spec.from_node => (
+                "StoppingSource",
+                format!(
+                    "stopping on {} before the handover",
+                    migration.spec.from_node
+                ),
+            ),
+            Some(node) if node == migration.spec.to_node => (
+                "StartingDestination",
+                format!("starting on {}", migration.spec.to_node),
+            ),
+            None if instance.spec.node.as_deref() == Some(migration.spec.to_node.as_str()) => (
+                "StartingDestination",
+                format!(
+                    "{} has claimed the guest and is starting it",
+                    migration.spec.to_node
+                ),
+            ),
+            _ => (
+                "HandingOver",
+                format!(
+                    "{} has stopped the guest; waiting for {} to claim it",
+                    migration.spec.from_node, migration.spec.to_node
+                ),
+            ),
+        };
+        return Condition::new("Moved", ConditionStatus::Unknown, reason, &message, at);
+    }
     if !migration.status.receiver_ready {
         return Condition::new(
             "Moved",
@@ -1503,6 +1547,38 @@ mod tests {
         let done = migration_condition(&m, Some(&arrived_instance), 5);
         assert_eq!(done.status, ConditionStatus::True);
         assert!(arrived(&m, &arrived_instance));
+    }
+
+    #[test]
+    fn a_reboot_move_reports_its_handover_instead_of_waiting_for_a_receiver() {
+        let mut m = migration("node-b");
+        m.spec.mode = MigrationMode::Reboot;
+        let mut i = instance(InstanceState::Running, Some("node-a"));
+
+        let stopping = migration_condition(&m, Some(&i), 0);
+        assert_eq!(stopping.reason, "StoppingSource");
+        assert!(stopping.message.contains("node-a"), "{}", stopping.message);
+
+        i.status.node = None;
+        let handover = migration_condition(&m, Some(&i), 1);
+        assert_eq!(handover.reason, "HandingOver");
+        assert!(handover.message.contains("node-b"), "{}", handover.message);
+
+        i.spec.node = Some("node-b".into());
+        let starting = migration_condition(&m, Some(&i), 2);
+        assert_eq!(starting.reason, "StartingDestination");
+        assert!(starting.message.contains("claimed"), "{}", starting.message);
+
+        i.status.conditions.push(Condition::new(
+            "Ready",
+            ConditionStatus::Unknown,
+            "CopyingDisk",
+            "Copying local root disk to the destination",
+            i.meta.generation,
+        ));
+        let copying = migration_condition(&m, Some(&i), 3);
+        assert_eq!(copying.reason, "CopyingDisk");
+        assert!(copying.message.contains("local root disk"));
     }
 
     #[test]

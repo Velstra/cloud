@@ -38,11 +38,16 @@
 //! cluster can say, and a mock that agreed with itself would be worse than the
 //! gap it hides.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use velstra_cloud_model::ceph::{CephPoolSpec, NodeCeph};
 
 use crate::host::{HostError, Result};
+
+const CEPH_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How this agent runs Ceph's own tools.
 #[derive(Clone, Debug)]
@@ -473,14 +478,30 @@ impl CephAdmin {
     }
 
     pub(crate) async fn ceph(&self, args: &[String]) -> Result<Vec<u8>> {
+        self.ceph_with_timeout(args, CEPH_COMMAND_TIMEOUT).await
+    }
+
+    async fn ceph_with_timeout(&self, args: &[String], limit: Duration) -> Result<Vec<u8>> {
         // Bounded, because a node that has a `ceph.conf` but no keyring —
         // every non-admin node — would otherwise sit in each question for
         // the CLI's own default of minutes, once per question, once per pass.
-        let out = tokio::process::Command::new(&self.ceph)
+        // `--connect-timeout` only bounds the initial connection. Ceph's
+        // orchestrator can accept it and then never answer, which used to stop
+        // the entire node-agent pass, including heartbeats and migrations.
+        let mut command = tokio::process::Command::new(&self.ceph);
+        command
             .arg("--connect-timeout=15")
             .args(args)
-            .output()
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(limit, command.output())
             .await
+            .map_err(|_| {
+                HostError::failed(format!(
+                    "`ceph {}` did not finish within {} seconds",
+                    args.join(" "),
+                    limit.as_secs_f32()
+                ))
+            })?
             .map_err(|e| HostError::failed(format!("running `ceph {}`: {e}", args.join(" "))))?;
         if out.status.success() {
             return Ok(out.stdout);
@@ -631,6 +652,27 @@ mod tests {
             !admin.installed().await.installed,
             "a missing executable is unavailable"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stuck_ceph_command_cannot_stop_the_agent_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("ceph-stuck-{}", std::process::id()));
+        std::fs::write(&path, "#!/bin/sh\nsleep 10\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let admin = CephAdmin {
+            ceph: path.to_string_lossy().into_owned(),
+            ..CephAdmin::default()
+        };
+
+        let started = std::time::Instant::now();
+        let error = admin
+            .ceph_with_timeout(&host_ls_argv(), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.to_string().contains("did not finish"), "{error}");
+        std::fs::remove_file(path).unwrap();
     }
 
     /// A one-node cluster is a legitimate thing to build, and without

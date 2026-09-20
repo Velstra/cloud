@@ -153,26 +153,52 @@ impl QemuVmm {
     /// paths, which must ask the *incoming* VMM even while the outgoing one is
     /// still answering on its own socket.
     async fn qmp_at(&self, socket: &Path, command: &str, arguments: Value) -> Result<Value> {
-        let socket = socket.to_path_buf();
-        let stream = tokio::net::UnixStream::connect(&socket)
-            .await
-            .map_err(|e| {
-                HostError::failed(format!("{} is not answering: {e}", socket.display()))
-            })?;
-        let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read).lines();
-
-        // The greeting comes first, unasked. Then capabilities negotiation,
-        // which QEMU requires before it will accept anything else.
-        let _greeting = lines.next_line().await?;
-        ask(&mut write, &json!({ "execute": "qmp_capabilities" })).await?;
-        answer(&mut lines, "qmp_capabilities").await?;
-        ask(
-            &mut write,
-            &json!({ "execute": command, "arguments": arguments }),
+        self.qmp_at_with_timeout(
+            socket,
+            command,
+            arguments,
+            std::time::Duration::from_secs(5),
         )
-        .await?;
-        answer(&mut lines, command).await
+        .await
+    }
+
+    async fn qmp_at_with_timeout(
+        &self,
+        socket: &Path,
+        command: &str,
+        arguments: Value,
+        limit: std::time::Duration,
+    ) -> Result<Value> {
+        let socket = socket.to_path_buf();
+        tokio::time::timeout(limit, async {
+            let stream = tokio::net::UnixStream::connect(&socket)
+                .await
+                .map_err(|e| {
+                    HostError::failed(format!("{} is not answering: {e}", socket.display()))
+                })?;
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+
+            // The greeting comes first, unasked. Then capabilities negotiation,
+            // which QEMU requires before it will accept anything else.
+            let _greeting = lines.next_line().await?;
+            ask(&mut write, &json!({ "execute": "qmp_capabilities" })).await?;
+            answer(&mut lines, "qmp_capabilities").await?;
+            ask(
+                &mut write,
+                &json!({ "execute": command, "arguments": arguments }),
+            )
+            .await?;
+            answer(&mut lines, command).await
+        })
+        .await
+        .map_err(|_| {
+            HostError::failed(format!(
+                "{} did not answer {command} within {} seconds",
+                socket.display(),
+                limit.as_secs_f32()
+            ))
+        })?
     }
 
     /// **Untested:** needs a live QEMU. Whether a transfer this node started is
@@ -1397,6 +1423,34 @@ mod tests {
             timeout_s: 3600,
             connections: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn an_unresponsive_monitor_cannot_stop_the_agent_pass() {
+        let dir = std::env::temp_dir().join(format!("qmp-stuck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("qmp.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let vmm = QemuVmm::new(layout());
+
+        let started = std::time::Instant::now();
+        let error = vmm
+            .qmp_at_with_timeout(
+                &socket,
+                "query-status",
+                json!({}),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// **A guest that boots from a volume boots that volume, not a local file.**

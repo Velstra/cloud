@@ -21,7 +21,10 @@ use velstra_cloud_model::{
     ceph::{CephClusterSpec, CephClusterStatus},
     identity::{UserSpec, UserStatus},
     loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
-    meta::{Meta, Placement, ResourceName, Revision, Timestamp, set_condition},
+    meta::{
+        Condition, ConditionStatus, Meta, Placement, ResourceName, Revision, Timestamp,
+        set_condition,
+    },
     migration::{Migration, MigrationSpec, MigrationStatus, may_migrate, migration_condition},
     reconcile::place,
     resources::{
@@ -92,6 +95,12 @@ pub const COLLECTIONS: [&str; 37] = [
     "rollouts",
     "operations",
 ];
+
+fn migration_node_is_silent(node: &Node, now: Timestamp) -> bool {
+    node.status.last_heartbeat.0 == 0
+        || node.status.last_heartbeat.age(now).as_millis()
+            > u128::from(velstra_cloud_model::ceph::NODE_STALE_AFTER_MS)
+}
 
 /// A bare folder id becomes the full name.
 ///
@@ -5894,6 +5903,27 @@ impl Api {
         let age = migration.meta.created_at.age(Timestamp::now()).as_secs();
 
         let mut condition = migration_condition(&migration, instance.as_ref(), age);
+        // A dead or wedged destination cannot report a receiver failure of its
+        // own. Use the node heartbeat to turn an otherwise vague
+        // "not listening yet" into the actual operator action while the move
+        // is still recoverable.
+        if condition.status == ConditionStatus::Unknown {
+            if let Some(destination) = self.node(&migration.spec.to_node).await? {
+                if migration_node_is_silent(&destination, Timestamp::now()) {
+                    condition = Condition::new(
+                        "Moved",
+                        ConditionStatus::Unknown,
+                        "DestinationUnreachable",
+                        &format!(
+                            "{} has not reported within the last {} seconds",
+                            migration.spec.to_node,
+                            velstra_cloud_model::ceph::NODE_STALE_AFTER_MS / 1000
+                        ),
+                        migration.meta.generation,
+                    );
+                }
+            }
+        }
         // A computed condition has no stored moment it changed, so `Condition`
         // stamps the moment it was built — which is the moment of *this read*.
         // An interface showing "changed just now" over a transfer that stalled
@@ -9132,6 +9162,16 @@ impl Api {
             )
             .at("spec.toNode")
         })?;
+        if migration_node_is_silent(&destination, Timestamp::now()) {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{instance_name} cannot move to {to}: {to} has not reported within the last {} seconds",
+                    velstra_cloud_model::ceph::NODE_STALE_AFTER_MS / 1000
+                ),
+            )
+            .at("spec.toNode"));
+        }
 
         let cached = self
             .image_cached_on(&instance.spec.image, &mut Scratch::default())
@@ -9480,6 +9520,7 @@ impl Api {
             .image_cached_on(&instance.spec.image, &mut Scratch::default())
             .await?;
 
+        let now = Timestamp::now();
         let destinations: Vec<Value> = nodes
             .iter()
             .map(|to| {
@@ -9492,6 +9533,17 @@ impl Api {
                 // not: a cold move crosses processors a live one cannot, so a
                 // fleet of unlike machines was being told its guests could not
                 // move at all when every one of them could, with a restart.
+                if migration_node_is_silent(to, now) {
+                    return json!({
+                        "node": id,
+                        "allowed": false,
+                        "why": "DestinationUnreachable",
+                        "detail": format!(
+                            "{id} has not reported within the last {} seconds",
+                            velstra_cloud_model::ceph::NODE_STALE_AFTER_MS / 1000
+                        )
+                    });
+                }
                 let verdict = may_migrate(&instance, source, to, &cached, mode);
                 let d = velstra_cloud_proto::convert::destination_of(id, verdict.as_ref().err());
                 json!({ "node": d.node, "allowed": d.allowed, "why": d.why, "detail": d.detail })

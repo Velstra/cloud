@@ -1758,6 +1758,67 @@ async fn explain_migration_gives_every_node_a_verdict() {
 }
 
 #[tokio::test]
+async fn a_silent_destination_is_not_offered_or_given_a_migration() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let name = running_guest(&h).await;
+    let mut silent = h.nodes().get("nodes/node-b").await.unwrap().unwrap();
+    silent.status.last_heartbeat = velstra_cloud_model::meta::Timestamp(
+        velstra_cloud_model::meta::Timestamp::now().0
+            - velstra_cloud_model::ceph::NODE_STALE_AFTER_MS
+            - 1,
+    );
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "nodes", "nodes/node-b"),
+            serde_json::to_vec(&silent).unwrap(),
+            velstra_cloud_store::Expect::Revision(silent.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    let answer = h.get(&format!("{name}:explainMigration")).await;
+    let destination = answer.body["destinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["node"] == json!("node-b"))
+        .unwrap();
+    assert_eq!(destination["allowed"], json!(false));
+    assert_eq!(destination["why"], json!("DestinationUnreachable"));
+    assert!(
+        destination["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not reported")
+    );
+
+    let refused = h
+        .post(
+            "projects/p1/migrations",
+            json!({ "id": "m1", "spec": {
+                "instance": name,
+                "toNode": "node-b"
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.field(), "spec.toNode");
+    assert!(refused.body.to_string().contains("has not reported"));
+    assert!(
+        h.get("projects/p1/migrations").await.body["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn a_migration_takes_its_source_from_the_instance() {
     let h = Harness::new();
     two_nodes(&h).await;
@@ -1940,6 +2001,41 @@ async fn what_a_migration_is_doing_is_computed_when_it_is_read() {
         stored.status.conditions.is_empty(),
         "the condition was stored, and a stored one can go stale: {:?}",
         stored.status.conditions
+    );
+}
+
+#[tokio::test]
+async fn a_migration_explains_when_its_destination_stops_reporting() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+    migrate(&h).await;
+
+    let mut destination = h.nodes().get("nodes/node-b").await.unwrap().unwrap();
+    destination.status.last_heartbeat = velstra_cloud_model::meta::Timestamp(
+        velstra_cloud_model::meta::Timestamp::now().0
+            - velstra_cloud_model::ceph::NODE_STALE_AFTER_MS
+            - 1,
+    );
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "nodes", "nodes/node-b"),
+            serde_json::to_vec(&destination).unwrap(),
+            velstra_cloud_store::Expect::Revision(destination.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    let read = h.get("projects/p1/migrations/m1").await;
+    let condition = moved(&read.body).expect("a stalled migration explains why");
+    assert_eq!(condition["reason"], json!("DestinationUnreachable"));
+    assert_eq!(condition["status"], json!("Unknown"));
+    assert!(
+        condition["message"]
+            .as_str()
+            .unwrap()
+            .contains("has not reported"),
+        "{condition}"
     );
 }
 

@@ -179,7 +179,9 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
       toast(`${idOf(r)} is moving to ${to}${mode === "Reboot" ? " with a reboot" : ""}.`); setPlan(null); look(); reload();
     } catch (e) { toast.error((e as Error).message); }
   };
-  const offers = plan ? plan.live.map((d) => {
+  const unavailable = (d: Destination) => ["DestinationDraining", "DestinationUnreachable"].includes(d.why)
+    || /not accepting work|has not reported/i.test(`${d.why} ${d.detail ?? ""}`);
+  const offers = plan ? plan.live.filter((d) => !unavailable(d)).map((d) => {
     const cold = plan.reboot.find((x) => x.node === d.node);
     return d.allowed ? { node: d.node, mode: "Live" as const, why: "" }
       : cold?.allowed ? { node: d.node, mode: "Reboot" as const, why: d.detail || humanise(d.why) }
@@ -188,15 +190,19 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
 
   return (
     <>
-      {moves.map((m) => (
-        <Pressed key={nameOf(m)} size="sm" variant="secondary" title={`${idOf(m)} — abandon it; the guest keeps running where it is`} onPress={async () => {
+      {moves.map((m) => {
+        const movement = (m.status?.conditions ?? []).find((c: { kind: string }) => c.kind === "Moved");
+        const progress = m.status?.transferredMib ? `${m.status.transferredMib} MiB copied`
+          : m.status?.receiverReady ? "receiver ready"
+          : movement?.message || `waiting for ${m.spec?.toNode} to prepare the receiver`;
+        return <Pressed key={nameOf(m)} size="sm" variant="secondary" title={`${idOf(m)} — abandon it; the guest keeps running where it is`} onPress={async () => {
           if (!(await ask({ title: `Abandon the move of ${idOf(r)} to ${m.spec?.toNode}?`, body: `Cancel the transfer. A stopped guest can restart on ${m.spec?.fromNode ?? r.status?.node ?? "its source node"}; an incomplete disk copy is not used to start a destination guest.`, confirmLabel: "Abandon", tone: "danger" }))) return;
           try { await call("delete:migrations", "DELETE", `${basePath(migs, project)}/${encodeURIComponent(idOf(m))}`); toast("Move abandoned."); look(); }
           catch (e) { toast.error((e as Error).message); }
         }}>
-          <ArrowRightLeft className="size-3.5" /> Moving to {m.spec?.toNode}{m.spec?.mode === "Reboot" ? " with a reboot" : ""}{m.status?.transferredMib ? ` · ${m.status.transferredMib} MiB copied` : m.status?.receiverReady ? " · receiver ready" : " · preparing"} — abandon
-        </Pressed>
-      ))}
+          <ArrowRightLeft className="size-3.5" /> Moving to {m.spec?.toNode}{m.spec?.mode === "Reboot" ? " with a reboot" : ""} · {progress} — abandon
+        </Pressed>;
+      })}
       {moves.length === 0 && (
         <DropdownMenu onOpenChange={(open) => { if (open) { setPlan(null); explain(); } }}>
           <DropdownMenuTrigger render={<Button size="sm" variant="secondary" title="Move the running guest to another machine, live" />}><ArrowRightLeft className="size-3.5" /> Migrate ▾</DropdownMenuTrigger>

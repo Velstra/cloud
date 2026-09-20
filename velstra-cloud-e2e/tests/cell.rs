@@ -722,8 +722,8 @@ async fn a_running_guest_moves_to_another_node_and_nobody_is_ever_in_two_places(
         "a receiver was left listening, holding memory on a node that is now running the guest"
     );
 
-    // And what the API says about it is computed from where the guest is, so it
-    // cannot be the last thing a dead agent managed to write.
+    // And what the API says preserves the destination's completion receipt, so
+    // a later return migration cannot make this finished request look open.
     let (_, document) = cell.get("/api/v1/projects/p1/migrations/m1").await;
     let moved = document["status"]["conditions"]
         .as_array()
@@ -731,7 +731,7 @@ async fn a_running_guest_moves_to_another_node_and_nobody_is_ever_in_two_places(
         .expect("a migration says what it did")
         .clone();
     assert_eq!(moved["status"], "True", "{moved}");
-    assert_eq!(moved["reason"], "Arrived", "{moved}");
+    assert_eq!(moved["reason"], "Completed", "{moved}");
 
     // A settled cell writes nothing, and a finished migration is part of what
     // "settled" means — otherwise every resync pays for every guest ever moved.
