@@ -238,6 +238,7 @@ mod tests {
             },
             NodeStatus {
                 shared_state: false,
+                local_migration_targets: vec!["node-b".into()],
                 vmm: "qemu".into(),
                 datapath: "local-network".into(),
                 console_tls: true,
