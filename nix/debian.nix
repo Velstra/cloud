@@ -408,7 +408,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     Architecture: ${debArch}
     Maintainer: Velstra <noreply@velstra.invalid>
     Depends: systemd, libc6 (>= 2.39), iproute2, nftables, curl, zstd, kmod, genisoimage
-    Recommends: qemu-system-x86, qemu-utils, etcd-server, etcd-client, ceph-common, velstra
+    Recommends: qemu-system-x86, qemu-utils, etcd-server, etcd-client, ceph-common, cephadm, podman, velstra
     Description: Velstra Cloud — control plane, node agent and storage pool
      One package, four roles. Which of them this machine runs is decided by
      \`velstra-cloud-node setup\`, which writes /etc/velstra/node.env; every
