@@ -62,6 +62,7 @@ let
       exec,
       pre ? "",
       after ? "network-online.target",
+      guard ? roleGuard role,
     }:
     ''
       [Unit]
@@ -87,7 +88,7 @@ let
       # would inherit a hypervisor's pool. `migrate-seed` in postinst moves an
       # older machine's seed here, so there is exactly one file to read.
       EnvironmentFile=-/etc/velstra/node.env
-      ${pre}${roleGuard role}ExecStart=${exec}
+      ${pre}${guard}ExecStart=${exec}
 
       [Install]
       WantedBy=multi-user.target
@@ -167,6 +168,13 @@ let
     # continuations into a single line, where a `#` would swallow the rest.
     "velstra-cloud-nodeagent.service" = unit {
       role = "hypervisor";
+      # A control plane still reports its own health and may later gain the
+      # Compute or Storage role from the API. Keeping the agent behind the old
+      # install-time `hypervisor` role made that change disappear at the next
+      # package rollout, leaving the node in Creating forever.
+      guard = ''
+        ExecCondition=/bin/sh -c '${bin "velstra-cloud-node"} has-role hypervisor || ${bin "velstra-cloud-node"} has-role control-plane'
+      '';
       description = "Velstra Cloud node agent";
       # The metadata address, which the agent binds and treats as fatal — a cell
       # whose guests silently get no metadata is worse than a node that says so
@@ -203,11 +211,11 @@ let
         ExecStartPre=${bin "velstra-cloud-passthrough"}
       '';
       exec = ''
-        /bin/sh -c 'case "''${VELSTRA_VMM:-}" in \
+        /bin/sh -c 'kind="''${VELSTRA_VMM:-qemu}"; case "$kind" in \
           qemu) vmm=/usr/bin/qemu-system-x86_64 ;; \
           cloud-hypervisor) vmm=/usr/bin/cloud-hypervisor ;; \
           fake) vmm= ;; \
-          *) echo "node.env sets VELSTRA_VMM=''${VELSTRA_VMM:-} — expected qemu, cloud-hypervisor or fake" >&2; exit 1 ;; \
+          *) echo "node.env sets VELSTRA_VMM=$kind — expected qemu, cloud-hypervisor or fake" >&2; exit 1 ;; \
         esac; \
           tok=/var/lib/velstra/node-token; \
           [ -f /etc/velstra/node-token ] && tok=/etc/velstra/node-token; \
@@ -219,7 +227,7 @@ let
         exec ${bin "velstra-cloud-nodeagent"} \
           --node "$VELSTRA_NODE" --cell "$VELSTRA_CELL" --region "$VELSTRA_REGION" \
           --api "$VELSTRA_API_URL" --api-token-file "$tok" \
-          --vmm "$VELSTRA_VMM" ''${vmm:+--vmm-binary "$vmm"} \
+          --vmm "$kind" ''${vmm:+--vmm-binary "$vmm"} \
           --state-dir /var/lib/velstra \
           ''${VELSTRA_CONSOLE_LISTEN:+--console-listen "$VELSTRA_CONSOLE_LISTEN"} \
           ''${VELSTRA_CONSOLE_ADVERTISE:+--console-advertise "$VELSTRA_CONSOLE_ADVERTISE"} \
