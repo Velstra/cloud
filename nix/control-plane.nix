@@ -114,6 +114,21 @@ in
           Disable when the cell has its own etcd, and set `endpoints`.
         '';
       };
+      caFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "CA PEM used to verify TLS etcd endpoints.";
+      };
+      certFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "Client certificate PEM for mutual TLS to etcd.";
+      };
+      keyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Runtime path to the client private key for mutual TLS to etcd.";
+      };
     };
 
     tokenFile = lib.mkOption {
@@ -283,6 +298,14 @@ in
         message = "velstra.cloud.controlPlane: set tlsCert and tlsKey together.";
       }
       {
+        assertion = cfg.fromSeed || (cfg.store.certFile == null) == (cfg.store.keyFile == null);
+        message = "velstra.cloud.controlPlane.store: set certFile and keyFile together.";
+      }
+      {
+        assertion = cfg.fromSeed || cfg.store.certFile == null || cfg.store.caFile != null;
+        message = "velstra.cloud.controlPlane.store: client identity requires caFile.";
+      }
+      {
         assertion =
           cfg.fromSeed
           || (cfg.bootstrapAdmin.username == null) == (cfg.bootstrapAdmin.passwordFile == null);
@@ -337,6 +360,12 @@ in
       // lib.optionalAttrs cfg.fromSeed {
         EnvironmentFile = "-${cfg.seedFile}";
         ExecCondition = "${cfg.package}/bin/velstra-cloud-node has-role control-plane";
+      };
+      environment = lib.optionalAttrs (!cfg.fromSeed && cfg.store.caFile != null) {
+        VELSTRA_STORE_CA = toString cfg.store.caFile;
+      } // lib.optionalAttrs (!cfg.fromSeed && cfg.store.certFile != null) {
+        VELSTRA_STORE_CERT = toString cfg.store.certFile;
+        VELSTRA_STORE_KEY = toString cfg.store.keyFile;
       };
       script =
         if cfg.fromSeed then
@@ -432,6 +461,12 @@ in
           ++ lib.optional (cfg.alerts.mailTo != [ ]) "--alert-mail-from ${lib.escapeShellArg cfg.alerts.mailFrom}"
           ++ lib.optional (cfg.alerts.mailTo != [ ]) "--alert-sendmail ${lib.escapeShellArg cfg.alerts.sendmail}"
         );
+      };
+      environment = lib.optionalAttrs (!cfg.fromSeed && cfg.store.caFile != null) {
+        VELSTRA_STORE_CA = toString cfg.store.caFile;
+      } // lib.optionalAttrs (!cfg.fromSeed && cfg.store.certFile != null) {
+        VELSTRA_STORE_CERT = toString cfg.store.certFile;
+        VELSTRA_STORE_KEY = toString cfg.store.keyFile;
       };
     };
   };

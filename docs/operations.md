@@ -252,8 +252,20 @@ addresses still receive no metadata from the node agent.
 ## Replicated control planes and release storage
 
 The bundled etcd is a single-member development/small-cell default and is a
-single point of failure. For an HA cell, run an independently managed etcd
-quorum and configure every API/controller replica with its endpoints.
+single point of failure. For an HA cell, declare the complete odd quorum and
+run [`deploy/control-plane/reconcile.sh`](../deploy/control-plane/README.md)
+from the hardware deployment pipeline. It snapshots the live store, admits
+missing members idempotently, writes the complete membership and client
+endpoint set to every replica, rolls the services, and removes a voter it
+admitted when that join fails. A running member absent from the inventory is a
+hard error rather than an implicit destructive removal.
+
+Production etcd endpoints should use mutual TLS. Set `VELSTRA_STORE_CA` for a
+private CA and `VELSTRA_STORE_CERT` plus `VELSTRA_STORE_KEY` for the API and
+controller client identity; the reconciler writes these from its per-member
+mTLS inventory. Certificate and key must be set together, and a client identity
+without a CA is refused. Plaintext membership requires the reconciler's
+explicit `etcd.allowPlaintext=true` setting and is intended for isolated labs.
 
 All API and controller replicas must mount the **same durable release directory**
 at `VELSTRA_RELEASES_DIR` (default `/var/lib/velstra/releases`). Release readiness
