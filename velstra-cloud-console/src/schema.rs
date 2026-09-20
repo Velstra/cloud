@@ -120,6 +120,10 @@ pub enum Kind {
     },
     /// One of a fixed set, shown as a segmented control when short.
     Choice { options: &'static [Choice] },
+    /// Independent answers from a fixed set. Used where a machine may run
+    /// more than one service, so an operator cannot accidentally invent a
+    /// role the installer does not know how to apply.
+    ChoiceList { options: &'static [Choice] },
     /// One of the objects that exist, fetched live. `filter_by` narrows the
     /// options to those whose named spec field matches this form's value for
     /// the same field — a subnet picker showing only subnets of the chosen
@@ -457,6 +461,8 @@ pub struct Column {
 pub enum Cell {
     /// Language: the UI face.
     Text,
+    /// A short list, joined for a compact board cell.
+    TextList,
     /// A machine value: tabular mono, so digits line up down the column.
     Mono,
     Number {
@@ -2906,6 +2912,23 @@ const IMAGE_FIELDS: &[Field] = &[
 
 const NODE_FIELDS: &[Field] = &[
     Field {
+        key: "roles",
+        label: "Machine roles",
+        kind: Kind::ChoiceList {
+            options: &[
+                choice("control-plane", "Control plane"),
+                choice("compute", "Compute"),
+                choice("storage", "Storage"),
+            ],
+        },
+        required: false,
+        advanced: false,
+        help: "Control planes remain visible here but do not receive instances. Adding Compute makes the node eligible only after its compute agent reports Ready.",
+        when_empty: "Compute (legacy node)",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
         key: "schedulable",
         label: "Accepts work",
         kind: Kind::Switch,
@@ -4963,16 +4986,22 @@ pub const COLLECTIONS: &[Collection] = &[
         group: "Hardware",
         scope: Scope::Global,
         audience: Audience::Operator,
-        blurb: "Hypervisors. The spec is what an operator decided about one; \
+        blurb: "Every machine in the cell: control planes, compute nodes and storage nodes. The spec is what an operator decided about one; \
                 the status is what its agent last reported. Adding one here \
                 creates the object and mints its registration token — shown \
                 once, because the platform keeps a hash and cannot show it \
                 again.",
-        empty: "No machines are registered yet. A node is a hypervisor: adding one \
+        empty: "No machines are registered yet. Adding one \
                 makes the object and mints the token its agent signs in with, \
                 shown once and never again.",
         fields: NODE_FIELDS,
         columns: &[
+            Column {
+                path: "spec.roles",
+                label: "Roles",
+                cell: Cell::TextList,
+                width: 156,
+            },
             Column {
                 path: "spec.schedulable",
                 label: "Accepts work",

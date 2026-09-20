@@ -1874,9 +1874,34 @@
   "group": "Hardware",
   "scope": "global",
   "audience": "operator",
-  "blurb": "Hypervisors. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token — shown once, because the platform keeps a hash and cannot show it again.",
-  "empty": "No machines are registered yet. A node is a hypervisor: adding one makes the object and mints the token its agent signs in with, shown once and never again.",
+  "blurb": "Every machine in the cell: control planes, compute nodes and storage nodes. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token — shown once, because the platform keeps a hash and cannot show it again.",
+  "empty": "No machines are registered yet. Adding one makes the object and mints the token its agent signs in with, shown once and never again.",
   "fields": [
+   {
+    "key": "roles",
+    "label": "Machine roles",
+    "kind": "choiceList",
+    "options": [
+     {
+      "value": "control-plane",
+      "label": "Control plane"
+     },
+     {
+      "value": "compute",
+      "label": "Compute"
+     },
+     {
+      "value": "storage",
+      "label": "Storage"
+     }
+    ],
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "Compute (legacy node)",
+    "help": "Control planes remain visible here but do not receive instances. Adding Compute makes the node eligible only after its compute agent reports Ready.",
+    "derived": false,
+    "atCreation": false
+   },
    {
     "key": "schedulable",
     "label": "Accepts work",
@@ -1987,6 +2012,12 @@
    }
   ],
   "columns": [
+   {
+    "path": "spec.roles",
+    "label": "Roles",
+    "cell": "textList",
+    "width": 156
+   },
    {
     "path": "spec.schedulable",
     "label": "Accepts work",

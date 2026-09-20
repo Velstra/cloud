@@ -901,10 +901,37 @@ pub type Project = Resource<ProjectSpec, ProjectStatus>;
 
 // ---- node ----------------------------------------------------------------
 
-/// A hypervisor. Its `spec` is what an operator decides about it (may it take
-/// work, is it being drained); its `status` is what the agent reports.
+/// A machine in the cell. Its `spec` is what an operator decides about it
+/// (which services it runs, may it take work, is it being drained); its
+/// `status` is what its agent reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeRole {
+    /// Runs the API and controllers. Membership itself remains reconciled by
+    /// the control-plane deployment, never by a node token.
+    ControlPlane,
+    /// Runs guests and may become a placement or migration destination.
+    Compute,
+    /// Hosts storage services for the cell.
+    Storage,
+}
+
+impl NodeRole {
+    pub const ALL: [Self; 3] = [Self::ControlPlane, Self::Compute, Self::Storage];
+}
+
+/// A machine in the cell. Its `spec` is what an operator decides about it
+/// (which services it runs, may it take work, is it being drained); its
+/// `status` is what its agent reports.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSpec {
+    /// The services this machine is meant to run.
+    ///
+    /// An absent list is a node written before roles existed. Those nodes were
+    /// all hypervisors, so it deliberately retains the Compute meaning rather
+    /// than making an upgrade drain a working fleet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<NodeRole>,
     /// False drains the node: nothing new is placed, what runs keeps running.
     /// Draining is a spec change, not a command, so a controller restart cannot
     /// lose it half way.
@@ -1006,6 +1033,13 @@ pub struct NodeSpec {
     /// once the machine is back. See `docs/upgrading.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wanted: Option<crate::release::Wanted>,
+}
+
+impl NodeSpec {
+    /// Whether this object may ever host a guest.
+    pub fn runs_guests(&self) -> bool {
+        self.roles.is_empty() || self.roles.contains(&NodeRole::Compute)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

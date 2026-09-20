@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
@@ -469,6 +470,12 @@ function FieldRow({ f, coll, existing, value, onChange, error, locked }: {
           </Select>
         </Row>
       );
+    case "choiceList":
+      return (
+        <Row label={label} help={help} error={error}>
+          <ChoiceList f={f} value={value} onChange={onChange} disabled={locked} />
+        </Row>
+      );
     case "number":
       return (
         <Row label={label} help={help} error={error}>
@@ -523,6 +530,42 @@ function FieldRow({ f, coll, existing, value, onChange, error, locked }: {
         </Row>
       );
   }
+}
+
+const CHOICE_HELP: Record<string, string> = {
+  "control-plane": "Runs the API and cluster controllers.",
+  compute: "Accepts virtual machines when the node is ready and uncordoned.",
+  storage: "May host storage services and disks.",
+};
+
+/** A short role list, not a row of visually identical action pills. */
+function ChoiceList({ f, value, onChange, disabled }: {
+  f: FieldOf<"choiceList">; value: any; onChange: (v: string[]) => void; disabled: boolean;
+}) {
+  const selected: string[] = Array.isArray(value) ? value : [];
+  return (
+    <div className="divide-y overflow-hidden rounded-[4px] border" style={{ borderColor: "var(--border)" }}>
+      {f.options.map((option) => {
+        const chosen = selected.includes(option.value);
+        return (
+          <label key={option.value}
+            className="flex min-h-12 cursor-pointer items-center gap-3 px-3 py-2 transition-colors has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring/50"
+            style={{ background: chosen ? "var(--surface-hover)" : "var(--surface)" }}>
+            <Checkbox checked={chosen} disabled={disabled} aria-label={option.label}
+              onCheckedChange={(checked) => onChange(checked
+                ? [...selected, option.value]
+                : selected.filter((item) => item !== option.value))} />
+            <span className="min-w-0">
+              <span className="block text-sm font-medium">{option.label}</span>
+              <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
+                {CHOICE_HELP[option.value] ?? "Assigned to this machine."}
+              </span>
+            </span>
+          </label>
+        );
+      })}
+    </div>
+  );
 }
 
 /**

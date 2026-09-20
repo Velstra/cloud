@@ -60,6 +60,7 @@ pub async fn create_node(store: &Arc<dyn Store>, id: &str) {
     let node = Resource::new(
         meta(&format!("nodes/{id}")),
         NodeSpec {
+            roles: vec![],
             evacuate: false,
             vcpu_overcommit: 0,
             fence_after_s: 0,

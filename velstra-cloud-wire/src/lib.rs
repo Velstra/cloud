@@ -227,6 +227,7 @@ mod tests {
         let node = Resource::new(
             meta,
             NodeSpec {
+                roles: vec![],
                 evacuate: false,
                 vcpu_overcommit: 0,
                 fence_after_s: 0,

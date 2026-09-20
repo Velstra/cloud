@@ -171,6 +171,11 @@ fn field_schema(f: &Field) -> Value {
             "type": "string",
             "enum": options.iter().map(|o| o.value).collect::<Vec<_>>(),
         }),
+        Kind::ChoiceList { options } => json!({
+            "type": "array",
+            "items": { "type": "string", "enum": options.iter().map(|o| o.value).collect::<Vec<_>>() },
+            "uniqueItems": true,
+        }),
         Kind::Ref { collection, .. } => json!({
             "type": "string",
             "description": format!("The name of a `{collection}` object."),

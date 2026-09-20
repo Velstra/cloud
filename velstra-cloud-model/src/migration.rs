@@ -271,7 +271,7 @@ pub fn may_migrate(
             state: instance.status.state,
         });
     }
-    if !to.spec.schedulable {
+    if !to.spec.runs_guests() || !to.spec.schedulable {
         return Err(Refusal::DestinationDraining {
             node: to_id.to_string(),
         });
@@ -864,6 +864,7 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             NodeSpec {
+                roles: vec![],
                 evacuate: false,
                 vcpu_overcommit: 0,
                 fence_after_s: 0,

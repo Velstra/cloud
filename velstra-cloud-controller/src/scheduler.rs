@@ -360,6 +360,7 @@ mod tests {
                     Placement::new("eu", "cell-1"),
                 ),
                 NodeSpec {
+                    roles: vec![],
                     evacuate: false,
                     vcpu_overcommit: 0,
                     fence_after_s: 0,

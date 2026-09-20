@@ -305,6 +305,15 @@ select {
   background: var(--brand); color: var(--on-brand); font-weight: var(--fw-medium);
 }
 
+.choice-list { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.choice-check {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 9px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  color: var(--text); cursor: pointer;
+}
+.choice-check:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.choice-check input { accent-color: var(--accent); }
+
 /* A name that can be followed says so by being a link, and by nothing else —
    no icon, no chevron. */
 button.link {

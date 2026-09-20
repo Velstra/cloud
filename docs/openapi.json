@@ -1397,7 +1397,7 @@
       },
       "NodeSpec": {
         "additionalProperties": true,
-        "description": "Hypervisors. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token — shown once, because the platform keeps a hash and cannot show it again.",
+        "description": "Every machine in the cell: control planes, compute nodes and storage nodes. The spec is what an operator decided about one; the status is what its agent last reported. Adding one here creates the object and mints its registration token — shown once, because the platform keeps a hash and cannot show it again.",
         "properties": {
           "cpuBaseline": {
             "description": "Present the same CPU as other nodes so instances can migrate between them. Those already running keep the CPU they started with and adopt this one when they next restart.",
@@ -1431,6 +1431,19 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "roles": {
+            "description": "Control planes remain visible here but do not receive instances. Adding Compute makes the node eligible only after its compute agent reports Ready.",
+            "items": {
+              "enum": [
+                "control-plane",
+                "compute",
+                "storage"
+              ],
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
           },
           "schedulable": {
             "description": "Turning this off drains the node: nothing new is placed, what runs keeps running.",

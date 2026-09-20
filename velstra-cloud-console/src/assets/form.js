@@ -357,6 +357,23 @@ function fieldControl(form, f) {
       }
       break;
     }
+    case "choiceList": {
+      const values = Array.isArray(current) ? current.slice() : [];
+      const list = el("div.choice-list", { id });
+      for (const o of f.options || []) {
+        const input = el("input", { type: "checkbox", value: o.value,
+          checked: values.includes(o.value) ? "" : null });
+        input.addEventListener("change", () => {
+          const next = new Set(values);
+          if (input.checked) next.add(o.value); else next.delete(o.value);
+          values.splice(0, values.length, ...next);
+          commit(values.slice(), list);
+        });
+        list.appendChild(el("label.choice-check", input, el("span", {}, o.label)));
+      }
+      box.appendChild(list);
+      break;
+    }
     case "ref": {
       const s = el("select", { id });
       s.appendChild(el("option", { value: "" }, f.required ? "Choose…" : "— none —"));
@@ -1684,6 +1701,7 @@ function defaults(coll) {
   for (const f of coll.fields) {
     if (f.kind === "switch") out[f.key] = f.key === "schedulable";
     else if (f.kind === "choice" && f.options.length) out[f.key] = f.options[0].value;
+    else if (f.kind === "choiceList" && f.options.length) out[f.key] = [f.options[1] ? f.options[1].value : f.options[0].value];
     else if (f.kind === "number" && !f.advanced) out[f.key] = f.min;
   }
   if (coll.id === "volumes") out.sizeGib = 10;
