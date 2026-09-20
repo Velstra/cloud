@@ -16,6 +16,7 @@ export type Field =
   | { kind: "text"; advanced: boolean; atCreation: boolean; check: string; derived: boolean; help: string; key: string; label: string; placeholder: string; required: boolean; whenEmpty: string }
   | { kind: "switch"; advanced: boolean; atCreation: boolean; derived: boolean; help: string; key: string; label: string; required: boolean; whenEmpty: string }
   | { kind: "ruleList"; advanced: boolean; atCreation: boolean; derived: boolean; help: string; key: string; label: string; remoteCollection: string; required: boolean; whenEmpty: string }
+  | { kind: "choiceList"; advanced: boolean; atCreation: boolean; derived: boolean; help: string; key: string; label: string; options: { label: string; value: string }[]; required: boolean; whenEmpty: string }
   | { kind: "moment"; advanced: boolean; atCreation: boolean; defaultInMinutes: number; derived: boolean; help: string; key: string; label: string; required: boolean; whenEmpty: string }
   | { kind: "listenerList"; advanced: boolean; atCreation: boolean; derived: boolean; help: string; key: string; label: string; required: boolean; whenEmpty: string }
   | { kind: "diskList"; advanced: boolean; atCreation: boolean; collection: string; derived: boolean; help: string; key: string; label: string; minGib: number; refusals: { kind: string; text: string }[]; required: boolean; tooSmall: string; unknown: string; warning: string; whenEmpty: string }
@@ -31,4 +32,5 @@ export type Column =
   | { cell: "yes"; label: string; no: string; path: string; width: number; yes: string }
   | { cell: "count"; label: string; path: string; width: number }
   | { cell: "ago"; label: string; path: string; width: number }
+  | { cell: "textList"; label: string; path: string; width: number }
 ;
