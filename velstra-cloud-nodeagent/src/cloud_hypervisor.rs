@@ -1500,6 +1500,7 @@ mod tests {
             boot_volume: None,
             nics: vec![],
             cpu_baseline: None,
+            cloud_init: None,
         };
         let err = vmm
             .prepare_receiver(&request, MigrationMode::Live)
@@ -1630,6 +1631,7 @@ mod tests {
                 },
             ],
             cpu_baseline: None,
+            cloud_init: None,
         };
         let args = words(&vmm_args(
             &Layout::default(),

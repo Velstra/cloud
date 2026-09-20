@@ -24,7 +24,8 @@
 //! user-data.
 //!
 //! The same document is also served at the three flat **NoCloud** paths
-//! (`/meta-data`, `/user-data`, `/network-config`), and the reason is one
+//! (`/meta-data`, `/user-data`, `/network-config`) and written to the local
+//! cidata seed attached at first boot. The reason is one
 //! specific gap rather than a wish to support everything: the EC2 surface has
 //! no key for a gateway and no key for a resolver — an AWS guest learns both
 //! from DHCP and there is nowhere in that shape to put them. A guest that wants

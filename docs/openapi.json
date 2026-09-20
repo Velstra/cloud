@@ -1535,6 +1535,13 @@
             "description": "The name of a `nodes` object. The machine this pool's bytes are on, where that is one machine. Leave it empty for storage every node can reach — a Ceph pool, an NFS mount — which is what the platform assumes when nothing is said. A directory or an LVM group is on one host, and until the object said so the platform would put a volume there, schedule the guest that needs it somewhere else, and let the attach fail with a path the tenant cannot act on.",
             "type": "string"
           },
+          "projects": {
+            "description": "Projects allowed to create volumes in this pool. Leave empty or use * for every project. Removing a project stops new placement and leaves its existing volumes untouched.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "volumeCeiling.iops": {
             "description": "The most any one volume in this pool may take. A volume that names nothing of its own gets this; one that asks for more is brought down to it. Left empty there is no ceiling.",
             "maximum": 10000000,

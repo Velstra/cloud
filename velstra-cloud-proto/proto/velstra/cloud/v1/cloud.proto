@@ -727,6 +727,9 @@ enum ImageState {
 message ImageStatus {
   uint64 observed_generation = 1;
   repeated Condition conditions = 2;
+  string verified_digest = 3;
+  string verified_source_url = 4;
+  uint64 verified_size_bytes = 5;
   // Which nodes hold a copy is computed from each node's own report, never
   // stored here: an aggregate is not a fact anybody owns. See NodeStatus.images.
 }

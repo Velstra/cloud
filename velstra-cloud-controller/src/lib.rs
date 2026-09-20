@@ -35,6 +35,7 @@ pub mod election;
 pub mod enrollment;
 pub mod evacuation;
 pub mod floating_ip;
+pub mod image;
 pub mod imagesource;
 pub mod instance;
 pub mod load_balancer;

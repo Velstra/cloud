@@ -121,6 +121,36 @@ impl QemuVmm {
         self.layout.dir(instance).join("incoming-qmp.sock")
     }
 
+    async fn write_cloud_init_seed(&self, request: &VmRequest) -> Result<()> {
+        let Some(seed) = &request.cloud_init else {
+            return Ok(());
+        };
+        let dir = self.layout.dir(&request.instance);
+        let source = dir.join("cloud-init");
+        std::fs::create_dir_all(&source)?;
+        std::fs::write(source.join("meta-data"), &seed.meta_data)?;
+        std::fs::write(source.join("user-data"), &seed.user_data)?;
+        std::fs::write(source.join("network-config"), &seed.network_config)?;
+        let output = dir.join("seed.iso.new");
+        let final_path = dir.join("seed.iso");
+        let _ = std::fs::remove_file(&output);
+        let result = tokio::process::Command::new("genisoimage")
+            .args(["-quiet", "-volid", "cidata", "-joliet", "-rock", "-output"])
+            .arg(&output)
+            .arg(&source)
+            .output()
+            .await
+            .map_err(|e| HostError::failed(format!("could not run genisoimage: {e}")))?;
+        if !result.status.success() {
+            return Err(HostError::failed(format!(
+                "genisoimage could not build the cloud-init seed: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            )));
+        }
+        std::fs::rename(output, final_path)?;
+        Ok(())
+    }
+
     /// Which of the two VMMs is this guest's, right now. The ordinary pair wins
     /// when both are there, which is the state during a transfer: the guest is
     /// still the outgoing one until it is not.
@@ -622,6 +652,7 @@ impl Vmm for QemuVmm {
     async fn start(&self, request: &VmRequest) -> Result<()> {
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
+        self.write_cloud_init_seed(request).await?;
         let monitor = self.monitor(&request.instance);
 
         // Reconciliation may ask for a start from a status observation that
@@ -834,6 +865,7 @@ impl Vmm for QemuVmm {
         }
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
+        self.write_cloud_init_seed(request).await?;
         // A guest booting from a volume keeps its root disk in a pool, not on
         // this filesystem, and the receiver opens it by the same place the
         // sender did — which is the arrangement that makes the move possible
@@ -1204,6 +1236,13 @@ fn qemu_args(
         // a window.
         "-device".into(),
         "VGA".into(),
+        // Give systemd and guest agents a real local AF_VSOCK identity. Stock
+        // Debian queries it during early boot; without a vsock device it logs
+        // `Failed to query local AF_VSOCK CID` even though the kernel keeps
+        // booting. The CID is stable across restart and migration because it is
+        // derived from the resource name, and never uses the reserved 0..=2.
+        "-device".into(),
+        format!("vhost-vsock-pci,guest-cid={}", vsock_cid(&request.instance)).into(),
         // Where the guest's cloud-init is told to look.
         //
         // This platform serves NoCloud (`/meta-data`, `/user-data`) and EC2
@@ -1218,20 +1257,17 @@ fn qemu_args(
         // want of host keys cloud-init would have generated. Every guest this
         // platform ever started from a public image was that guest.
         //
-        // `ds=nocloud;s=<url>` in the SMBIOS system serial is the documented way
-        // to say it (cloud-init 21.3 and later), and it is preferred over the
+        // `ds=nocloud-net;s=<url>` in the SMBIOS system serial is the fallback
+        // for old requests which carry no local seed. New requests attach a
+        // cidata drive below so that first-boot network config is available
+        // before the guest has network access. The explicit hint is preferred
+        // over the
         // alternative — claiming to be Amazon EC2 or OpenStack in DMI so that
         // ds-identify guesses right — because this platform is neither, and a
         // guest that believes it is on EC2 makes decisions on that basis.
         //
         // The trailing slash is load-bearing: cloud-init appends `meta-data` and
         // `user-data` to it.
-        "-smbios".into(),
-        format!(
-            "type=1,serial=ds=nocloud;s=http://{}/",
-            crate::metadata::ADDRESS
-        )
-        .into(),
         "-smp".into(),
         request.vcpus.to_string().into(),
         "-m".into(),
@@ -1274,6 +1310,26 @@ fn qemu_args(
         "-vnc".into(),
         format!("unix:{}", layout.vnc_socket(&request.instance).display()).into(),
     ];
+    if request.cloud_init.is_none() {
+        args.push("-smbios".into());
+        args.push(
+            format!(
+                "type=1,serial=ds=nocloud-net;s=http://{}/",
+                crate::metadata::ADDRESS
+            )
+            .into(),
+        );
+    }
+    if request.cloud_init.is_some() {
+        args.push("-drive".into());
+        args.push(
+            format!(
+                "file={},format=raw,if=virtio,readonly=on",
+                layout.dir(&request.instance).join("seed.iso").display()
+            )
+            .into(),
+        );
+    }
     // Passed-through hardware. `vfio-pci` is the only device model here:
     // whole-device passthrough is all this platform offers, and a mediated
     // device would need a `sysfsdev` this build has nothing to fill in with.
@@ -1332,6 +1388,13 @@ fn qemu_args(
         args.push(incoming.into());
     }
     args
+}
+
+fn vsock_cid(instance: &str) -> u32 {
+    let hash = instance.bytes().fold(2_166_136_261u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    });
+    3 + hash % (u32::MAX - 3)
 }
 
 /// What to set before a transfer starts.
@@ -1465,6 +1528,7 @@ mod tests {
                 },
             ],
             cpu_baseline: None,
+            cloud_init: None,
         }
     }
 
@@ -1666,7 +1730,7 @@ mod tests {
             .map(|w| w[1].clone())
             .unwrap_or_else(|| panic!("no datasource hint at all: {args:?}"));
         // The serial, because that is the field ds-identify reads.
-        assert!(hint.starts_with("type=1,serial=ds=nocloud;"), "{hint}");
+        assert!(hint.starts_with("type=1,serial=ds=nocloud-net;"), "{hint}");
         // The address the DHCP responder hands out, from the same constant, so
         // the two cannot drift apart.
         assert!(
@@ -1676,6 +1740,47 @@ mod tests {
         // The trailing slash is load-bearing: cloud-init appends `meta-data`
         // and `user-data` to it, and without it they land a directory up.
         assert!(hint.ends_with('/'), "{hint}");
+    }
+
+    #[test]
+    fn first_boot_networking_arrives_on_a_local_seed_drive() {
+        let layout = layout();
+        let mut request = request();
+        request.cloud_init = Some(crate::host::CloudInitSeed {
+            meta_data: "instance-id: i1\n".into(),
+            user_data: String::new(),
+            network_config: "version: 2\n".into(),
+        });
+        let args = words(&qemu_args(
+            &layout,
+            &request,
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let drive = args
+            .windows(2)
+            .find(|words| words[0] == "-drive" && words[1].contains("seed.iso"))
+            .map(|words| words[1].clone())
+            .expect("a seed drive");
+        assert!(drive.contains("seed.iso"), "{drive}");
+        assert!(drive.contains("readonly=on"), "{drive}");
+        assert!(drive.contains("if=virtio"), "{drive}");
+        let root = args
+            .windows(2)
+            .position(|words| words[0] == "-drive" && words[1].contains("root.raw"))
+            .expect("root drive");
+        let seed = args
+            .windows(2)
+            .position(|words| words[0] == "-drive" && words[1].contains("seed.iso"))
+            .expect("seed drive");
+        assert!(root < seed, "root disk must remain the first virtio disk");
+        assert!(
+            !args.iter().any(|word| word == "-smbios"),
+            "the remote datasource must not override the local seed: {args:?}"
+        );
+        assert!(args.windows(2).any(|words| {
+            words[0] == "-device" && words[1].starts_with("vhost-vsock-pci,guest-cid=")
+        }));
     }
 
     /// The console is a socket now, and the log did not stop being a log.

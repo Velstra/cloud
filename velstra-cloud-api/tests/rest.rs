@@ -1668,6 +1668,25 @@ async fn running_guest(h: &Harness) -> String {
         )
         .await
         .unwrap();
+    let mut verified = image
+        .get("projects/p1/images/sha256-abc")
+        .await
+        .unwrap()
+        .unwrap();
+    verified.status.observed_generation = verified.meta.generation;
+    verified.status.verified_digest = verified.spec.digest.clone();
+    verified.status.verified_source_url = verified.spec.source_url.clone();
+    velstra_cloud_model::meta::set_condition(
+        &mut verified.status.conditions,
+        Condition::ready(verified.meta.generation),
+    );
+    image
+        .update(
+            &verified,
+            &velstra_cloud_model::access::Writer::controller("image-verifier"),
+        )
+        .await
+        .unwrap();
 
     let name = h
         .instance(
@@ -3921,6 +3940,7 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
             accepting: true,
             node: String::new(),
             labels: vec![],
+            projects: vec![],
             volume_ceiling: Default::default(),
         },
         velstra_cloud_model::resources::PoolStatus {
@@ -4964,6 +4984,7 @@ async fn a_volume_with_no_pool_named_is_put_somewhere_rather_than_nowhere() {
                 accepting,
                 node: String::new(),
                 labels: Vec::new(),
+                projects: Vec::new(),
                 volume_ceiling: Default::default(),
             },
             velstra_cloud_model::resources::PoolStatus {
@@ -5810,6 +5831,7 @@ async fn a_disk_on_another_machine_is_refused_with_both_machines_named() {
             // The whole point of the fixture: this pool's bytes are on one host.
             node: "node-a".into(),
             labels: Vec::new(),
+            projects: Vec::new(),
             volume_ceiling: Default::default(),
         },
         velstra_cloud_model::resources::PoolStatus {
@@ -6030,6 +6052,63 @@ async fn a_volume_is_refused_into_a_pool_that_is_being_drained() {
         .unwrap_or_default();
     assert!(message.contains("drained"), "{message}");
     assert!(message.contains("`old`"), "{message}");
+}
+
+#[tokio::test]
+async fn a_pool_project_grant_is_enforced_for_named_and_automatic_placement() {
+    let h = Harness::new();
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+    let restricted = velstra_cloud_model::resources::Resource::new(
+        velstra_cloud_model::meta::Meta::new(
+            "pools/restricted".parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: true,
+            projects: vec!["projects/p2".into()],
+            ..Default::default()
+        },
+        velstra_cloud_model::resources::PoolStatus {
+            backend: "ceph".into(),
+            capacity_gib: 1000,
+            ..Default::default()
+        },
+    );
+    h.pools().create(&restricted, &writer).await.unwrap();
+
+    let named = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "named", "spec": { "sizeGib": 1, "pool": "restricted" } }),
+        )
+        .await;
+    assert_eq!(named.status, StatusCode::BAD_REQUEST, "{:?}", named.body);
+    assert_eq!(named.body["error"]["field"], "spec.pool");
+    assert!(
+        named.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not admit")
+    );
+
+    let automatic = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "automatic", "spec": { "sizeGib": 1 } }),
+        )
+        .await;
+    assert_eq!(
+        automatic.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        automatic.body
+    );
+    assert!(
+        automatic.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no storage pool is accepting")
+    );
 }
 
 /// **A pool nobody is watching does not get one either.**

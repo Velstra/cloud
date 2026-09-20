@@ -3237,6 +3237,7 @@ impl Api {
             // behind for a guest that was never created. A check that has
             // everything it needs belongs at the first point it has it.
             self.refuse_a_retired_image(kind, &spec).await?;
+            self.refuse_an_unverified_image(kind, &spec).await?;
             // The named size becomes numbers before anything reads them —
             // quota counts vCPUs, the scheduler reads memory — and the
             // hand-sizing rule runs on the settled spec.
@@ -3295,7 +3296,13 @@ impl Api {
                 .await?;
         }
         if kind == "volumes" || kind == "backups" {
-            self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
+            let project = if kind == "volumes" {
+                name.project()
+            } else {
+                None
+            };
+            self.refuse_a_pool_this_cell_does_not_have(project, &spec)
+                .await?;
         }
         if matches!(kind, "instances" | "attachments")
             && spec
@@ -3386,12 +3393,14 @@ impl Api {
         if kind == "volumes" {
             self.settle_volume_source(&name, &mut spec).await?;
             self.refuse_a_retired_image(kind, &spec).await?;
+            self.refuse_an_unverified_image(kind, &spec).await?;
             // After the source, on purpose: a clone inherits the pool holding
             // its snapshot, and a choice made before that would put the copy in
             // a different pool from the bytes it is cloned from. Only a volume
             // that still names none gets one chosen.
-            self.settle_volume_pool(&mut spec).await?;
-            self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
+            self.settle_volume_pool(name.project(), &mut spec).await?;
+            self.refuse_a_pool_this_cell_does_not_have(name.project(), &spec)
+                .await?;
         }
         if kind == "ceph-clusters" {
             self.refuse_a_second_ceph_cluster(&name).await?;
@@ -3671,6 +3680,61 @@ impl Api {
         } else {
             "spec.sourceImage"
         }))
+    }
+
+    /// Do not discover a bad checksum while a guest or volume is already being
+    /// created. The image controller streams the bytes as soon as the image is
+    /// published and records the answer on the image itself.
+    async fn refuse_an_unverified_image(&self, kind: &str, spec: &Value) -> ApiResult<()> {
+        let field = if kind == "instances" {
+            "image"
+        } else {
+            "source_image"
+        };
+        let Some(named) = spec
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            return Ok(());
+        };
+        let Ok(name) = ResourceName::parse(named) else {
+            return Ok(());
+        };
+        let Ok(image) = self.typed::<ImageSpec, ImageStatus>(&name).await else {
+            return Ok(());
+        };
+        let ready = image
+            .status
+            .conditions
+            .iter()
+            .find(|condition| condition.kind == "Ready");
+        match ready {
+            Some(condition) if condition.status == ConditionStatus::True => Ok(()),
+            Some(condition) if condition.status == ConditionStatus::False => Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{named} failed its content check: {}. Correct or replace the image before using it.",
+                    condition.message
+                ),
+            )
+            .at(if kind == "instances" {
+                "spec.image"
+            } else {
+                "spec.sourceImage"
+            })),
+            _ => Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{named} is still verifying its downloaded bytes against its digest. Try again when the image is Ready."
+                ),
+            )
+            .at(if kind == "instances" {
+                "spec.image"
+            } else {
+                "spec.sourceImage"
+            })),
+        }
     }
 
     /// An image may only be replaced by an image.
@@ -8752,7 +8816,7 @@ impl Api {
         Ok(())
     }
 
-    async fn settle_volume_pool(&self, spec: &mut Value) -> ApiResult<()> {
+    async fn settle_volume_pool(&self, project: Option<&str>, spec: &mut Value) -> ApiResult<()> {
         let named = spec.get("pool").and_then(Value::as_str).unwrap_or_default();
         if !named.is_empty() {
             return Ok(());
@@ -8760,7 +8824,13 @@ impl Api {
         let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
         let chosen = pools
             .iter()
-            .filter(|p| p.spec.accepting && p.meta.deleted_at.is_none())
+            .filter(|p| {
+                p.spec.accepting
+                    && p.meta.deleted_at.is_none()
+                    && project.is_none_or(|project| {
+                        velstra_cloud_model::resources::pool_allows_project(&p.spec, project)
+                    })
+            })
             .max_by_key(|p| p.status.capacity_gib.saturating_sub(p.status.allocated_gib));
         let Some(pool) = chosen else {
             return Err(ApiError::new(
@@ -8775,7 +8845,11 @@ impl Api {
         Ok(())
     }
 
-    async fn refuse_a_pool_this_cell_does_not_have(&self, spec: &Value) -> ApiResult<()> {
+    async fn refuse_a_pool_this_cell_does_not_have(
+        &self,
+        project: Option<&str>,
+        spec: &Value,
+    ) -> ApiResult<()> {
         let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
             return Ok(());
         };
@@ -8785,6 +8859,17 @@ impl Api {
         let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
         let ids: Vec<String> = pools.iter().map(|p| p.meta.name.id().to_string()).collect();
         if let Some(pool) = pools.iter().find(|p| p.meta.name.id() == asked) {
+            if let Some(project) = project
+                && !velstra_cloud_model::resources::pool_allows_project(&pool.spec, project)
+            {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "`{asked}` does not admit new volumes from projects/{project}. Nothing was created: grant that project on the pool or leave the pool empty so the cell chooses an allowed one."
+                    ),
+                )
+                .at("spec.pool"));
+            }
             // The pool exists — does it have the room? Refused here, before a
             // byte moves, for the same reason a migration is: the far end
             // refusing after the object exists is the same refusal, later and
@@ -10716,6 +10801,9 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     if kind == "networks" {
         return check_network(spec, document);
     }
+    if kind == "pools" {
+        return check_pool_projects(spec);
+    }
     if kind != "security-groups" {
         return Ok(());
     }
@@ -10736,6 +10824,34 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
         velstra_cloud_model::security::programmable(&parsed).map_err(|e| {
             ApiError::new(Code::FailedPrecondition, e.to_string()).at(format!("spec.rules[{i}]"))
         })?;
+    }
+    Ok(())
+}
+
+fn check_pool_projects(spec: &Value) -> ApiResult<()> {
+    let Some(projects) = spec.get("projects").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, project) in projects.iter().enumerate() {
+        let Some(raw) = project.as_str() else {
+            continue;
+        };
+        if raw == "*" {
+            continue;
+        }
+        let full = if raw.starts_with("projects/") {
+            raw.to_string()
+        } else {
+            format!("projects/{raw}")
+        };
+        let valid = ResourceName::parse(&full)
+            .is_ok_and(|name| name.collection() == "projects" && name.parent().is_none());
+        if !valid {
+            return Err(ApiError::invalid(format!(
+                "`{raw}` is not a project; use a project id, `projects/<id>`, or `*`"
+            ))
+            .at(format!("spec.projects[{index}]")));
+        }
     }
     Ok(())
 }

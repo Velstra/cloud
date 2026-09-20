@@ -3896,6 +3896,20 @@ const POOL_FIELDS: &[Field] = &[
         at_creation: false,
     },
     Field {
+        key: "projects",
+        label: "Projects",
+        kind: Kind::TextList {
+            placeholder: "projects/team-a",
+            check: Check::None,
+        },
+        required: false,
+        advanced: false,
+        help: "Projects allowed to create volumes in this pool. Leave empty or use * for every project. Removing a project stops new placement and leaves its existing volumes untouched.",
+        when_empty: "all projects",
+        derived: false,
+        at_creation: false,
+    },
+    Field {
         key: "volumeCeiling.iops",
         label: "Ceiling — IOPS",
         kind: Kind::Number {

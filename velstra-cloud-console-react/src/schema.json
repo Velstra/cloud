@@ -3606,6 +3606,19 @@
     "atCreation": false
    },
    {
+    "key": "projects",
+    "label": "Projects",
+    "kind": "textList",
+    "placeholder": "projects/team-a",
+    "check": "none",
+    "required": false,
+    "advanced": false,
+    "whenEmpty": "all projects",
+    "help": "Projects allowed to create volumes in this pool. Leave empty or use * for every project. Removing a project stops new placement and leaves its existing volumes untouched.",
+    "derived": false,
+    "atCreation": false
+   },
+   {
     "key": "volumeCeiling.iops",
     "label": "Ceiling — IOPS",
     "kind": "number",

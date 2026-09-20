@@ -48,8 +48,8 @@ use velstra_cloud_model::{
     reconcile::{Action, instance_condition, reconcile_attachment, reconcile_instance},
     resources::{
         Attachment, AttachmentSpec, AttachmentStatus, ImageSpec, Instance, InstanceSpec,
-        InstanceStatus, NODE_RELEASE_FINALIZER, NetworkSpec, NodeSpec, NodeStatus, Port, PortSpec,
-        PortStatus,
+        InstanceStatus, NODE_RELEASE_FINALIZER, Network, NetworkSpec, NodeSpec, NodeStatus, Port,
+        PortSpec, PortStatus,
     },
     security::{ResolvedRule, SecurityGroup, SecurityGroupSpec, effective_rules_with, members_in},
 };
@@ -57,8 +57,9 @@ use velstra_cloud_store::{Store, TypedStore};
 
 use crate::{
     cell::{CellReader, StoreCell},
+    guests,
     guests::GuestRegistry,
-    host::{Datapath, HostState, Nic, ProgrammedPort, VmRequest, Vmm},
+    host::{CloudInitSeed, Datapath, HostState, Nic, ProgrammedPort, VmRequest, Vmm},
 };
 
 mod ceph;
@@ -385,6 +386,7 @@ pub(super) struct CellView<'a> {
     /// port would be the same answer fetched many times. It also replaces a
     /// second read this pass used to make when it described guests.
     pub networks: &'a BTreeMap<String, NetworkSpec>,
+    pub network_objects: &'a BTreeMap<String, Network>,
     /// The segments those networks are cut into — where a port's address, mask
     /// and gateway come from.
     ///
@@ -1243,10 +1245,10 @@ impl Agent {
             }
         };
 
-        let networks = match self.cell.networks().await {
+        let network_objects = match self.cell.networks().await {
             Ok(list) => list
                 .into_iter()
-                .map(|n| (n.meta.name.to_string(), n.spec))
+                .map(|n| (n.meta.name.to_string(), n))
                 .collect::<BTreeMap<_, _>>(),
             Err(e) => {
                 // A port whose segment cannot be read is a port that must not be
@@ -1264,6 +1266,10 @@ impl Agent {
                 return;
             }
         };
+        let networks = network_objects
+            .iter()
+            .map(|(name, network)| (name.clone(), network.spec.clone()))
+            .collect::<BTreeMap<_, _>>();
 
         // The same read `refresh_guests` used to make on its own, moved up so the
         // pass that *creates* a wire can also make its far end. A segment that
@@ -1341,6 +1347,7 @@ impl Agent {
             ports: &ports,
             groups: &groups,
             networks: &networks,
+            network_objects: &network_objects,
             subnets: &subnets,
             images: &images,
             instances: &instances,
@@ -2197,6 +2204,7 @@ impl Agent {
                     // than in an agent's journal.
                     Err(why) => return Err(why),
                 };
+                let cloud_init = self.cloud_init_seed(instance, ports, taps, cell).await;
                 match self.vm_request(
                     instance,
                     taps,
@@ -2207,6 +2215,7 @@ impl Agent {
                         devices,
                         boot_disk,
                     },
+                    cloud_init,
                 ) {
                     Ok(request) => self.vmm.start(&request).await,
                     Err(why) => Err(crate::host::HostError::failed(why)),
@@ -2237,6 +2246,7 @@ impl Agent {
         // which bytes that is.
         image_digest: &str,
         resolved: Resolved,
+        cloud_init: Option<CloudInitSeed>,
     ) -> Result<VmRequest, String> {
         let mut wanted = Vec::with_capacity(instance.spec.ports.len());
         for port in &instance.spec.ports {
@@ -2267,6 +2277,38 @@ impl Agent {
             // booted with, and adopts this one the next time it starts.
             cpu_baseline: resolved.baseline,
             devices: resolved.devices,
+            cloud_init,
+        })
+    }
+
+    async fn cloud_init_seed(
+        &self,
+        instance: &Instance,
+        ports: &BTreeMap<String, Port>,
+        taps: &BTreeMap<String, String>,
+        cell: &CellView<'_>,
+    ) -> Option<CloudInitSeed> {
+        let floating = self.cell.floating_ips().await.unwrap_or_default();
+        let public = guests::public_addresses(
+            &floating,
+            self.localnet.is_some() || self.datapath.datapath_name() == "fabric",
+        );
+        guests::derive(
+            &[instance],
+            ports,
+            cell.subnets,
+            cell.network_objects,
+            taps,
+            &public,
+        )
+        .into_iter()
+        .next()
+        .and_then(|view| {
+            crate::metadata::render_network_config(&view).map(|network_config| CloudInitSeed {
+                meta_data: crate::metadata::render_meta_data(&view),
+                user_data: view.user_data.unwrap_or_default(),
+                network_config,
+            })
         })
     }
 

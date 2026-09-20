@@ -123,6 +123,7 @@ async fn a_directly_booted_kernel_runs_and_says_so() {
         boot_volume: None,
         nics: vec![],
         cpu_baseline: None,
+        cloud_init: None,
     };
 
     // A disk is still made and attached: nothing boots from it here, but the

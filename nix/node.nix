@@ -163,6 +163,7 @@ in
         # hold a card back — they need the `vendor:device` pair to put in the
         # seed, and the machine itself is the only place that knows it.
         pkgs.pciutils
+        pkgs.cdrkit
         # `cephadm` and the `ceph` CLI, so an operator can add a Ceph cluster
         # to a cell of flashed machines afterwards. The platform still installs
         # nothing on its own — cephadm pulls the daemon containers only once

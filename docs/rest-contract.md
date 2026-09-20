@@ -1395,12 +1395,12 @@ configuration:
 /latest/user-data                      instance.spec.userData
 ```
 
-The same facts are served at the three flat NoCloud paths — `/meta-data`,
-`/user-data` and `/network-config` — for an image told `ds=nocloud-net`. The
-reason for both is one gap rather than a wish to support everything: the EC2
-shape has no key for a gateway and none for a resolver (an AWS guest learns both
-from DHCP), and `network-config` is netplan, which can say them. Both renderings
-come from one document, so they cannot disagree.
+The same facts are written to a read-only NoCloud `cidata` drive — `meta-data`,
+`user-data` and `network-config` — and remain available at the three flat HTTP
+paths. The local seed is required for first boot: a guest cannot fetch the
+network configuration that gives it networking over a network it does not have
+yet. The HTTP service remains useful after that first configuration. Both
+renderings come from one document, so they cannot disagree.
 
 `network-config` matches interfaces by MAC and states addresses rather than
 `dhcp4: true`, so a guest whose DHCP client is slow, disabled or replaced still
@@ -3092,9 +3092,9 @@ POST /api/v1/image-sources
 ```
 
 `format` says what the bytes are, and is required unless the filename settles
-it. Only `.qcow2` settles it: nothing here ever fetches the image — that is the
-whole reason a source costs a few kilobytes a pass — and the name lies, because
-Ubuntu ships qcow2 under `.img`. A source that can say neither reads
+it. Only `.qcow2` settles it: the source check learns the digest without reading
+the image, and the filename lies because Ubuntu ships qcow2 under `.img`. A
+source that can say neither reads
 `Checked=False` with `Unusable` and the sentence on its own object, rather than
 publishing an image a node will refuse to make a disk from.
 
@@ -3113,8 +3113,12 @@ with two different trust models, and conflating them is the hazard:
 * **the digest** is learned over `https://` with the certificate checked, and
   anything else is refused at this door — whoever can rewrite that answer chooses
   what every new guest in the cell boots;
-* **the bytes** are then fetched by the node over whatever scheme the URL names,
-  including plain `http://`, because a wrong byte gives a wrong digest and fails.
+* **the bytes** are streamed by the image verifier as soon as the image object
+  is created, over whatever scheme the URL names, including plain `http://`.
+  `Ready=True/Verified` is written only after the declared digest and, when
+  present, size match. A guest or volume cannot use the image while this is
+  pending or after it fails. Nodes still verify their own downloads, so the
+  early check improves feedback without making the controller a trust anchor.
 
 `keep` is retention, and it takes away only what it is safe to take: versions
 this source published, past the newest `keep`, that **nothing names** — no

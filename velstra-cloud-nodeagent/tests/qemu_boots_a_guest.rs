@@ -160,6 +160,7 @@ async fn a_stock_cloud_image_boots_and_says_so() {
         boot_volume: None,
         nics: vec![],
         cpu_baseline: None,
+        cloud_init: None,
     };
 
     // The image, published the way a pulled one is: under the name

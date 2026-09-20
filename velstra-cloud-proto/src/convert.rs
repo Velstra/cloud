@@ -1052,6 +1052,9 @@ impl From<&resources::ImageStatus> for v1::ImageStatus {
         Self {
             observed_generation: s.observed_generation,
             conditions: conditions_out(&s.conditions),
+            verified_digest: s.verified_digest.clone(),
+            verified_source_url: s.verified_source_url.clone(),
+            verified_size_bytes: s.verified_size_bytes,
         }
     }
 }
@@ -1061,6 +1064,9 @@ impl From<&v1::ImageStatus> for resources::ImageStatus {
         Self {
             observed_generation: s.observed_generation,
             conditions: conditions_in(&s.conditions),
+            verified_digest: s.verified_digest.clone(),
+            verified_source_url: s.verified_source_url.clone(),
+            verified_size_bytes: s.verified_size_bytes,
         }
     }
 }

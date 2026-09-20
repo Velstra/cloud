@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use serde_json::json;
 use velstra_cloud_api::{Api, Identity, StaticTokenVerifier, TokenVerifier};
-use velstra_cloud_model::meta::ResourceName;
-use velstra_cloud_store::{MemoryStore, Store};
+use velstra_cloud_model::{Writer, meta::ResourceName};
+use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
 const OPS: &str = "ops";
 
@@ -22,8 +22,8 @@ fn who() -> Identity {
 async fn cell() -> Api {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
-    let api =
-        Api::new(store, "eu-central", "cell-1", verifier).with_cell_admins(vec![OPS.to_string()]);
+    let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
+        .with_cell_admins(vec![OPS.to_string()]);
     api.create(
         "",
         "projects",
@@ -55,6 +55,22 @@ async fn cell() -> Api {
         )
         .await
         .unwrap();
+        let images: TypedStore<
+            velstra_cloud_model::resources::ImageSpec,
+            velstra_cloud_model::resources::ImageStatus,
+        > = TypedStore::new(store.clone(), "cell-1", "images");
+        let mut image = images.get(&format!("images/{id}")).await.unwrap().unwrap();
+        image.status.observed_generation = image.meta.generation;
+        image.status.verified_digest = image.spec.digest.clone();
+        image.status.verified_source_url = image.spec.source_url.clone();
+        velstra_cloud_model::meta::set_condition(
+            &mut image.status.conditions,
+            velstra_cloud_model::Condition::ready(image.meta.generation),
+        );
+        images
+            .update(&image, &Writer::controller("image-verifier"))
+            .await
+            .unwrap();
     }
     api
 }

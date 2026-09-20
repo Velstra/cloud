@@ -213,6 +213,17 @@ pub struct VmRequest {
     /// been made: a class is what an instance asks for and what the scheduler
     /// places on, and a VMM needs the one device it is to attach.
     pub devices: Vec<String>,
+    /// A local NoCloud seed, attached as a read-only configuration drive.
+    /// Networking lives here so a guest does not need networking in order to
+    /// fetch the configuration that gives it networking.
+    pub cloud_init: Option<CloudInitSeed>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CloudInitSeed {
+    pub meta_data: String,
+    pub user_data: String,
+    pub network_config: String,
 }
 
 /// One NIC, as the host has to build it.

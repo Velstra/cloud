@@ -239,6 +239,19 @@ impl Cell {
             )
             .await
             .unwrap();
+        let mut image = self.images.get(name).await.unwrap().unwrap();
+        image.status.observed_generation = image.meta.generation;
+        image.status.verified_digest = image.spec.digest.clone();
+        image.status.verified_source_url = image.spec.source_url.clone();
+        image.status.verified_size_bytes = image.spec.size_bytes;
+        set_condition(
+            &mut image.status.conditions,
+            Condition::ready(image.meta.generation),
+        );
+        self.images
+            .update(&image, &Writer::controller("image-verifier"))
+            .await
+            .unwrap();
     }
 
     async fn add_node(&self, id: &str, vcpus: u32, memory_mib: u64) {

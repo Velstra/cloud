@@ -945,6 +945,7 @@ impl Agent {
         // has already pointed the attachment at this node; if it has not yet,
         // this says so rather than building a receiver with the wrong disk.
         let boot_disk = self.boot_disk_for(instance).await?;
+        let cloud_init = self.cloud_init_seed(instance, &ports, &taps, cell).await;
         let request = self.vm_request(
             instance,
             &taps,
@@ -958,6 +959,7 @@ impl Agent {
                 devices,
                 boot_disk,
             },
+            cloud_init,
         )?;
         self.vmm
             .prepare_receiver(&request, mode)

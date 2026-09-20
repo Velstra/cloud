@@ -569,8 +569,11 @@ survives_the_wire!(
     resources::ImageStatus {
         observed_generation: 2,
         conditions: vec![a_condition()],
+        verified_digest: "sha256:abc".into(),
+        verified_source_url: "https://example.invalid/image".into(),
+        verified_size_bytes: 42,
     },
-    { observed_generation, conditions }
+    { observed_generation, conditions, verified_digest, verified_source_url, verified_size_bytes }
 );
 
 // ---- instance -------------------------------------------------------------
@@ -1090,6 +1093,9 @@ whole_object_survives!(
     resources::ImageStatus {
         observed_generation: 2,
         conditions: vec![a_condition()],
+        verified_digest: "sha256:abc".into(),
+        verified_source_url: "https://example.invalid/image".into(),
+        verified_size_bytes: 42,
     }
 );
 

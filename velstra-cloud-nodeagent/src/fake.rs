@@ -1096,6 +1096,7 @@ mod tests {
             boot_volume: None,
             nics: vec![],
             cpu_baseline: None,
+            cloud_init: None,
         }
     }
 

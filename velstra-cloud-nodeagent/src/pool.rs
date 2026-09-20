@@ -2273,6 +2273,7 @@ mod tests {
                     accepting: true,
                     node: String::new(),
                     labels: vec![],
+                    projects: vec![],
                     volume_ceiling: Default::default(),
                 },
                 PoolStatus::default(),

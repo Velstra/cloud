@@ -415,6 +415,7 @@ async fn a_receiver_that_outlived_its_transfer_is_taken_down() {
         boot_volume: None,
         nics: vec![],
         cpu_baseline: None,
+        cloud_init: None,
     };
     // A receive process that did not exit when its transfer did: the guest is
     // here and something is still listening for it.
