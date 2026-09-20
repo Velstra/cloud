@@ -310,6 +310,7 @@ survives_the_wire!(
     resources::NodeSpec,
     v1::NodeSpec,
     resources::NodeSpec {
+        roles: vec![resources::NodeRole::ControlPlane, resources::NodeRole::Compute],
         // `NodeSpec::default()` is *not* schedulable — the derived zero value,
         // which is also the safe direction for a node nobody has vouched for.
         schedulable: true,
@@ -328,7 +329,7 @@ survives_the_wire!(
             sha256: "ab".repeat(32),
         }),
     },
-    { schedulable, labels, cpu_baseline, fence_after_s, evacuate, vcpu_overcommit, gateway, wanted }
+    { roles, schedulable, labels, cpu_baseline, fence_after_s, evacuate, vcpu_overcommit, gateway, wanted }
 );
 
 survives_the_wire!(
@@ -1017,6 +1018,7 @@ whole_object_survives!(
     resources::Node,
     v1::Node,
     resources::NodeSpec {
+        roles: vec![],
         evacuate: false,
         vcpu_overcommit: 0,
         fence_after_s: 0,

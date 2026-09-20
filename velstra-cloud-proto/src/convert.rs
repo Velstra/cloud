@@ -294,6 +294,15 @@ impl From<&resources::NodeSpec> for v1::NodeSpec {
             vcpu_overcommit: s.vcpu_overcommit,
             gateway: s.gateway,
             wanted: s.wanted.as_ref().map(Into::into),
+            roles: s
+                .roles
+                .iter()
+                .map(|r| match r {
+                    resources::NodeRole::ControlPlane => "control-plane".to_string(),
+                    resources::NodeRole::Compute => "compute".to_string(),
+                    resources::NodeRole::Storage => "storage".to_string(),
+                })
+                .collect(),
         }
     }
 }
@@ -309,6 +318,16 @@ impl From<&v1::NodeSpec> for resources::NodeSpec {
             vcpu_overcommit: s.vcpu_overcommit,
             gateway: s.gateway,
             wanted: s.wanted.as_ref().map(Into::into),
+            roles: s
+                .roles
+                .iter()
+                .filter_map(|r| match r.as_str() {
+                    "control-plane" => Some(resources::NodeRole::ControlPlane),
+                    "compute" => Some(resources::NodeRole::Compute),
+                    "storage" => Some(resources::NodeRole::Storage),
+                    _ => None,
+                })
+                .collect(),
         }
     }
 }

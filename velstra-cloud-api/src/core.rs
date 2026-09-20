@@ -102,6 +102,25 @@ fn migration_node_is_silent(node: &Node, now: Timestamp) -> bool {
             > u128::from(velstra_cloud_model::ceph::NODE_STALE_AFTER_MS)
 }
 
+/// The API's names for a machine's desired services. The installer keeps its
+/// historical seed names (`hypervisor` and `pool`); the cell object uses the
+/// shorter names shown to an operator.
+fn enrollment_node_roles(
+    spec: &velstra_cloud_model::enrollment::EnrollmentSpec,
+) -> Vec<&'static str> {
+    let mut roles = Vec::new();
+    if spec.is_control_plane {
+        roles.push("control-plane");
+    }
+    if spec.runs_guests {
+        roles.push("compute");
+    }
+    if spec.serves_storage {
+        roles.push("storage");
+    }
+    roles
+}
+
 /// A bare folder id becomes the full name.
 ///
 /// Two spellings reach this field and both are somebody being reasonable. The
@@ -4297,7 +4316,13 @@ impl Api {
                     ApiError::invalid(format!("the node's metadata will not serialise: {e}"))
                 })?;
                 nodes
-                    .create(meta, serde_json::json!({ "schedulable": true }))
+                    .create(
+                        meta,
+                        serde_json::json!({
+                            "roles": enrollment_node_roles(&spec),
+                            "schedulable": spec.runs_guests,
+                        }),
+                    )
                     .await?;
                 self.record_change(&approver, "create", &node).await;
             }
@@ -4311,7 +4336,10 @@ impl Api {
                     .patch(
                         &node.to_string(),
                         &crate::collection::Patch {
-                            spec: Some(serde_json::json!({ "schedulable": true })),
+                            spec: Some(serde_json::json!({
+                                "roles": enrollment_node_roles(&spec),
+                                "schedulable": spec.runs_guests,
+                            })),
                             labels: Some(serde_json::json!({
                                 velstra_cloud_model::enrollment::AWAITING_LABEL: Value::Null
                             })),

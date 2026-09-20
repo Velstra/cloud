@@ -156,6 +156,7 @@ fn node(id: &str) -> Node {
     let mut n = Resource::new(
         meta(&format!("nodes/{id}")),
         NodeSpec {
+            roles: vec![],
             evacuate: false,
             vcpu_overcommit: 0,
             fence_after_s: 0,

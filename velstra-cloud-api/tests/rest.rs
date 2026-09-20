@@ -975,6 +975,7 @@ async fn explain_placement_answers_with_the_chain_of_rejections() {
             Placement::new("eu-central", "cell-1"),
         ),
         NodeSpec {
+            roles: vec![],
             evacuate: false,
             vcpu_overcommit: 0,
             fence_after_s: 0,
@@ -1569,6 +1570,7 @@ async fn two_nodes(h: &Harness) {
                 Placement::new("eu-central", "cell-1"),
             ),
             NodeSpec {
+                roles: vec![],
                 evacuate: false,
                 vcpu_overcommit: 0,
                 fence_after_s: 0,
@@ -1629,6 +1631,7 @@ async fn two_nodes(h: &Harness) {
             Placement::new("eu-central", "cell-1"),
         ),
         NodeSpec {
+            roles: vec![],
             evacuate: false,
             vcpu_overcommit: 0,
             fence_after_s: 0,
@@ -2183,6 +2186,7 @@ async fn a_destination_without_the_image_is_refused_with_the_sentence() {
             Placement::new("eu-central", "cell-1"),
         ),
         NodeSpec {
+            roles: vec![],
             evacuate: false,
             vcpu_overcommit: 0,
             fence_after_s: 0,
@@ -3088,6 +3092,7 @@ async fn a_ceph_cluster_naming_a_disk_that_is_not_free_is_refused_with_the_reaso
             Placement::new("eu-central", "cell-1"),
         ),
         NodeSpec {
+            roles: vec![],
             evacuate: false,
             vcpu_overcommit: 0,
             fence_after_s: 0,

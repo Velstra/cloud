@@ -288,11 +288,47 @@ async fn the_node_exists_from_the_announcement_and_is_out_of_service() {
     assert_eq!(status, StatusCode::OK, "{issued}");
     let (_, node) = send(&router, "GET", "nodes/peter-box", Value::Null).await;
     assert_eq!(node["spec"]["schedulable"], json!(true), "{node}");
+    assert_eq!(node["spec"]["roles"], json!(["compute"]), "{node}");
     assert_eq!(
         node["meta"]["labels"]["velstra.io/awaiting-approval"],
         Value::Null,
         "a node in service still carries the waiting label: {node}"
     );
+}
+
+/// A control-plane-only enrolment must be visible to operators without being
+/// offered to the scheduler as a guest destination.
+#[tokio::test]
+async fn a_control_plane_enrolment_is_registered_but_never_schedulable() {
+    let router = api();
+    let (pair, public) = keypair();
+    let (_, announced) = anon(
+        &router,
+        "POST",
+        "enrollments:announce",
+        announcement(&public),
+    )
+    .await;
+    let id = announced["id"].as_str().unwrap().to_string();
+    send(
+        &router,
+        "PATCH",
+        &format!("enrollments/{id}"),
+        json!({ "spec": { "isControlPlane": true, "approved": true } }),
+    )
+    .await;
+    let (status, _) = anon(
+        &router,
+        "POST",
+        "enrollments:claim",
+        json!({ "id": &id, "signature": sign_claim(&pair, &id) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, node) = send(&router, "GET", "nodes/peter-box", Value::Null).await;
+    assert_eq!(node["spec"]["roles"], json!(["control-plane"]), "{node}");
+    assert_eq!(node["spec"]["schedulable"], json!(false), "{node}");
 }
 
 /// A machine that calls itself what every unflashed image calls itself does

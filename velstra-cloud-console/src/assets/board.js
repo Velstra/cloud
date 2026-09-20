@@ -396,6 +396,9 @@ function cell(r, col) {
       td.className = "num";
       td.appendChild(document.createTextNode(String((raw || []).length)));
       break;
+    case "textList":
+      td.appendChild(document.createTextNode(Array.isArray(raw) && raw.length ? raw.join(", ") : "Compute (legacy)"));
+      break;
     case "yes":
       // Neutral on purpose: being attached or encrypted is what a thing is,
       // not a verdict on it, and the four signal colours are not spent here.

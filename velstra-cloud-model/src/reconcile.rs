@@ -543,6 +543,13 @@ pub fn place(
 
     for node in nodes {
         let id = node.meta.name.id().to_string();
+        if !node.spec.runs_guests() {
+            rejected.push(Explanation {
+                node: id,
+                why: Rejected::Unschedulable,
+            });
+            continue;
+        }
         if !node.spec.schedulable {
             rejected.push(Explanation {
                 node: id,
@@ -844,7 +851,12 @@ pub fn headroom(
         // `largestFit`, and `largestFit` is the number a tenant is told they
         // can start — a promise the scheduler would then refuse.
         let out_of_service = closed.iter().any(|c| c.node == node.meta.name.id());
-        if !ready || !node.spec.schedulable || node.spec.evacuate || out_of_service {
+        if !node.spec.runs_guests()
+            || !ready
+            || !node.spec.schedulable
+            || node.spec.evacuate
+            || out_of_service
+        {
             out.unusable_nodes += 1;
             continue;
         }
@@ -1529,6 +1541,7 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             NodeSpec {
+                roles: vec![],
                 evacuate: false,
                 vcpu_overcommit: 0,
                 fence_after_s: 0,

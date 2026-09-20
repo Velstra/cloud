@@ -276,6 +276,7 @@ async fn register_node(store: Arc<dyn Store>, id: &str) {
             Placement::new(REGION, CELL),
         ),
         NodeSpec {
+            roles: vec![],
             evacuate: false,
             vcpu_overcommit: 0,
             fence_after_s: 0,

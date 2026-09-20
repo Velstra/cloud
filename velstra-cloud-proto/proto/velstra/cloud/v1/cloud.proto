@@ -334,6 +334,9 @@ message NodeSpec {
   // it, chosen for this machine's kind of installation. Absent when the
   // machine is wanted as it is.
   Wanted wanted = 8;
+  // Services this machine is intended to run: `control-plane`, `compute` and
+  // `storage`. An empty list is a legacy compute node.
+  repeated string roles = 9;
 }
 
 // What a node should run, chosen for it. See `docs/upgrading.md`.

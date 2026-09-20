@@ -212,6 +212,7 @@ mod tests {
                 Placement::new("eu", "cell-1"),
             ),
             NodeSpec {
+                roles: vec![],
                 evacuate: false,
                 fence_after_s,
                 vcpu_overcommit: 0,
