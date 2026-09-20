@@ -429,6 +429,7 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             console_tls: s.console_tls,
             balancers: s.balancers.clone(),
             shared_state: s.shared_state,
+            local_migration_targets: s.local_migration_targets.clone(),
             fetching: s.fetching.clone(),
             last_heartbeat: millis(s.last_heartbeat),
             images: s.images.clone(),
@@ -954,6 +955,7 @@ impl From<&v1::NodeStatus> for resources::NodeStatus {
             console_tls: s.console_tls,
             balancers: s.balancers.clone(),
             shared_state: s.shared_state,
+            local_migration_targets: s.local_migration_targets.clone(),
             fetching: s.fetching.clone(),
             last_heartbeat: timestamp(s.last_heartbeat),
             images: s.images.clone(),
@@ -1861,6 +1863,7 @@ impl From<&migration::MigrationStatus> for v1::MigrationStatus {
             receiver_url: s.receiver_url.clone(),
             receiver_ready: s.receiver_ready,
             transferred_mib: s.transferred_mib,
+            completed_at: s.completed_at.map(|at| at.0),
         }
     }
 }
@@ -1874,6 +1877,7 @@ impl From<&v1::MigrationStatus> for migration::MigrationStatus {
             receiver_url: s.receiver_url.clone(),
             receiver_ready: s.receiver_ready,
             transferred_mib: s.transferred_mib,
+            completed_at: s.completed_at.map(meta::Timestamp),
         }
     }
 }

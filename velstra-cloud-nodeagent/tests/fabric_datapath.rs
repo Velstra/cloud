@@ -698,6 +698,76 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
         .unprogram(PORT)
         .await
         .expect("tearing down an already-torn-down port was an error");
+
+    // A migration reuses the port identity and policy on another host. A late
+    // source cleanup must preserve both, including the bound security group.
+    client
+        .add_host(pb::HostSpec {
+            id: "node-b".into(),
+            vtep: "127.0.0.2".into(),
+            underlay_iface: "lo".into(),
+            underlay_mac: "02:00:00:00:00:02".into(),
+            encap: 0,
+            srv6_locator: String::new(),
+            udp_port: 0,
+            underlay_mtu: 0,
+        })
+        .await
+        .unwrap();
+    client
+        .add_security_group(pb::SecurityGroupSpec {
+            name: group.clone(),
+            default_action: pb::Action::Drop as i32,
+            drop_icmp: false,
+            stateful: true,
+            blocklist: Vec::new(),
+            rules: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let moved = client
+        .create_port(pb::CreatePortRequest {
+            network: VNI_2,
+            host: "node-b".into(),
+            tap: tap.clone(),
+            ip: "10.30.0.9".into(),
+            policy: None,
+            mac: Some("02:ab:cd:ef:00:09".into()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    client
+        .bind_port_security_group(pb::BindPortSecurityGroupRequest {
+            port_id: moved.id.clone(),
+            group: Some(group.clone()),
+        })
+        .await
+        .unwrap();
+    datapath
+        .unprogram(PORT)
+        .await
+        .expect("source cleanup must preserve the destination policy");
+    assert!(
+        client
+            .list_ports(pb::ListPortsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .ports
+            .iter()
+            .any(|p| p.id == moved.id)
+    );
+    assert!(
+        client
+            .list_security_groups(pb::ListSecurityGroupsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .groups
+            .iter()
+            .any(|g| g.name == group)
+    );
 }
 
 /// A node that states an SRv6 locator is served an SRv6 overlay, end to end

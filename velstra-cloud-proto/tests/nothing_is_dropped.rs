@@ -350,6 +350,7 @@ survives_the_wire!(
     v1::NodeStatus,
     resources::NodeStatus {
         shared_state: true,
+        local_migration_targets: vec!["node-b".into()],
         vmm: "qemu".into(),
         datapath: "fabric".into(),
         console_tls: true,
@@ -497,7 +498,7 @@ survives_the_wire!(
     {
         observed_generation, conditions, capacity, allocated, agent_version,
         console_endpoint, last_heartbeat, images, devices, ceph, cpu, pci_devices,
-        vmm, datapath, console_tls, balancers, fetching, shared_state, installed,
+        vmm, datapath, console_tls, balancers, fetching, shared_state, local_migration_targets, installed,
     }
 );
 
@@ -927,8 +928,9 @@ survives_the_wire!(
         receiver_url: Some("tcp:10.0.0.2:4900".into()),
         receiver_ready: true,
         transferred_mib: 2048,
+        completed_at: Some(meta::Timestamp(42)),
     },
-    { observed_generation, conditions, node, receiver_url, receiver_ready, transferred_mib }
+    { observed_generation, conditions, node, receiver_url, receiver_ready, transferred_mib, completed_at }
 );
 
 // ---- the whole objects ----------------------------------------------------
@@ -1023,6 +1025,7 @@ whole_object_survives!(
     },
     resources::NodeStatus {
         shared_state: false,
+        local_migration_targets: vec![],
         vmm: "qemu".into(),
         datapath: "fabric".into(),
         console_tls: true,
@@ -1342,6 +1345,7 @@ whole_object_survives!(
         receiver_url: Some("tcp:10.0.0.2:4900".into()),
         receiver_ready: true,
         transferred_mib: 2048,
+        completed_at: Some(meta::Timestamp(42)),
     }
 );
 

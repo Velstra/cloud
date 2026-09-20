@@ -446,7 +446,7 @@ impl Storage for CephPool {
                 stored,
             } => {
                 let parent = rbd_name(image);
-                if !self.image_is_clonable(&parent).await? {
+                if !self.image_present(image).await? {
                     // Bring it in, if this machine has the bytes. The import is
                     // idempotent and verifies the digest in the name, so doing
                     // it here is the same act an operator would have performed
@@ -757,8 +757,37 @@ impl CephPool {
         // this one is about to be, and removing it is safe for that reason.
         let _ = self.rbd(&["rm", &staged]).await;
 
-        self.rbd(&["import", &file.to_string_lossy(), &staged])
-            .await?;
+        // RBD stores guest sectors, not a qcow2 container. Verify the original
+        // artifact above, then convert only the bytes used for import.
+        static IMPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let raw = file.with_extension(format!(
+            "ceph-import-{}-{}.raw",
+            std::process::id(),
+            IMPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        struct Temporary(std::path::PathBuf);
+        impl Drop for Temporary {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let mut cleanup = None;
+        let converted = crate::hostfs::looks_like_qcow2(file);
+        if converted {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&raw)
+                .map_err(|e| HostError::failed(format!("creating temporary image: {e}")))?;
+            cleanup = Some(Temporary(raw.clone()));
+            crate::hostfs::convert_to_raw(file, &raw).await?;
+        }
+        let input = if converted { raw.as_path() } else { file };
+        let imported = self
+            .rbd(&["import", &input.to_string_lossy(), &staged])
+            .await;
+        drop(cleanup);
+        imported?;
         self.rbd(&[
             "snap",
             "create",

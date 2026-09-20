@@ -131,6 +131,12 @@ impl Agent {
         // deciding whether a guest can move reads a fact rather than a
         // configuration file it has no access to.
         next.status.shared_state = self.config.shared_state;
+        next.status.local_migration_targets = self
+            .config
+            .disk_transfer
+            .as_ref()
+            .map(|c| c.peers.keys().cloned().collect())
+            .unwrap_or_default();
         next.status.last_heartbeat = if heartbeat_due {
             Timestamp::now()
         } else {

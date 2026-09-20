@@ -1052,6 +1052,9 @@ pub struct NodeStatus {
     /// to hang.
     #[serde(default)]
     pub shared_state: bool,
+    /// Explicit SSH destinations available for cold local-root-disk transfers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_migration_targets: Vec<String>,
     /// Which virtual machine monitor this node runs its guests under.
     ///
     /// `qemu` or `cloud-hypervisor`, reported rather than configured from here:

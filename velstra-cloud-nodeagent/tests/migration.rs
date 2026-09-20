@@ -310,6 +310,20 @@ async fn a_migration_that_has_happened_costs_nothing_to_reconcile() {
     assert!(!migration.status.receiver_ready);
     assert!(migration.status.receiver_url.is_none());
 
+    // The port controller follows the observed instance owner. The source
+    // has released its address; give the destination permission to report it.
+    let mut port = read_port(&cell.store, PORT_A).await;
+    port.spec.node = Some(DESTINATION.into());
+    port.meta.generation += 1;
+    ports(&cell.store)
+        .update(
+            &port,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+    cell.destination.resync().await;
+
     // The property that makes the resync interval a matter of taste, on both
     // sides of a finished migration.
     for round in 0..2 {
@@ -375,6 +389,7 @@ async fn a_receiver_that_outlived_its_transfer_is_taken_down() {
         image: IMAGE.to_string(),
         root_disk_gib: 20,
         boot_disk: None,
+        boot_volume: None,
         nics: vec![],
         cpu_baseline: None,
     };
@@ -760,13 +775,12 @@ async fn a_cold_move_takes_the_sources_tap_and_hands_the_port_over() {
     cell.destination.resync().await;
     assert!(cell.destination_vmm.is_running(I1));
 
-    // While the migration record is open, the source's share still names the
-    // guest and its wire is left alone — tearing it down mid-handover would be
-    // a different bug.
+    // Ownership moved, so the source must release the address even while the
+    // completed migration remains available as history.
     cell.source.resync().await;
     assert!(
-        cell.source_datapath.is_programmed(PORT_A),
-        "the source dropped the wire while the migration was still open"
+        !cell.source_datapath.is_programmed(PORT_A),
+        "the source retained the address after handing the guest over"
     );
 
     // The record removed, the guest stops concerning the source — and the tap
@@ -809,4 +823,47 @@ async fn a_cold_move_takes_the_sources_tap_and_hands_the_port_over() {
         port.status
     );
     assert!(port.status.programmed, "{:?}", port.status);
+}
+
+#[tokio::test]
+async fn a_missing_local_disk_never_releases_the_source() {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use velstra_cloud_nodeagent::{
+        AgentConfig,
+        disk_transfer::{Config, Peer},
+    };
+    let mut cell = two_nodes_in(MigrationMode::Reboot, MigrationStatus::default()).await;
+    let mut config = AgentConfig::new(SOURCE, REGION, CELL);
+    config.disk_transfer = Some(Config {
+        identity_file: "/nonexistent/migration-key".into(),
+        known_hosts_file: "/nonexistent/known-hosts".into(),
+        peers: BTreeMap::from([(
+            DESTINATION.into(),
+            Peer {
+                host: "127.0.0.1".into(),
+                user: "migration".into(),
+                run_dir: "/tmp/unused".into(),
+            },
+        )]),
+    });
+    cell.source = Agent::new(
+        cell.store.clone(),
+        config,
+        Arc::new(cell.source_vmm.clone()),
+        Arc::new(cell.source_datapath.clone()),
+    );
+    for _ in 0..3 {
+        cell.source.resync().await;
+    }
+    let instance = read_instance(&cell.store, I1).await;
+    assert_eq!(instance.status.node.as_deref(), Some(SOURCE));
+    assert!(!cell.destination_vmm.is_running(I1));
+    assert!(
+        instance
+            .status
+            .conditions
+            .iter()
+            .any(|c| c.message.contains("local root disk is missing"))
+    );
 }

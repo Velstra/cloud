@@ -1879,6 +1879,29 @@ async fn migrate(h: &Harness) {
 }
 
 #[tokio::test]
+async fn a_second_migration_waits_for_the_destinations_completion_receipt() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+    migrate(&h).await;
+    let duplicate = h
+        .post(
+            "projects/p1/migrations",
+            json!({"id":"m2", "spec":{
+                "instance":"projects/p1/instances/i1", "toNode":"node-b"
+            }}),
+        )
+        .await;
+    assert_eq!(
+        duplicate.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        duplicate.body
+    );
+    assert!(duplicate.body.to_string().contains("still active"));
+}
+
+#[tokio::test]
 async fn what_a_migration_is_doing_is_computed_when_it_is_read() {
     // `Moved` is a judgement over the whole dance, not a fact anybody owns —
     // the same shape as an operation's `done`. Stored, it would be a second

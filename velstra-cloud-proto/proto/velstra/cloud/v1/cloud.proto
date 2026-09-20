@@ -418,6 +418,7 @@ message NodeStatus {
   // decides what a rollout may hand the machine, and a guess here would be a
   // slot written onto a disk that has none.
   Installed installed = 19;
+  repeated string local_migration_targets = 20;
 }
 
 // One PCI device, as the node holding it sees it.
@@ -1726,6 +1727,7 @@ message MigrationStatus {
   bool receiver_ready = 5;
   // Progress, never a state.
   uint64 transferred_mib = 6;
+  optional uint64 completed_at = 7;
 }
 
 message Migration {

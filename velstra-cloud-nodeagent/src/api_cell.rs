@@ -429,6 +429,14 @@ impl ApiCell {
 
 #[async_trait]
 impl CellReader for ApiCell {
+    async fn port(&self, name: &str) -> Result<Option<Port>> {
+        self.get_one(name).await
+    }
+
+    async fn attachment(&self, name: &str) -> Result<Option<Attachment>> {
+        self.get_one(name).await
+    }
+
     /// Streamed to disk a frame at a time: an image is a gigabyte, and this
     /// runs on a hypervisor whose memory belongs to the guests. The same
     /// connection and token as every other read, so the API's ownership rule
@@ -717,6 +725,33 @@ fn message_of(body: &[u8]) -> Option<String> {
 /// The same client, reading the storage half.
 #[async_trait]
 impl crate::cell::PoolReader for ApiCell {
+    async fn images(&self) -> Result<Vec<Image>> {
+        self.list("images").await
+    }
+
+    async fn wake(&self) -> tokio::sync::mpsc::Receiver<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let me = Arc::new(Self {
+            base: self.base.clone(),
+            authority: self.authority.clone(),
+            token: self.token.clone(),
+            who: self.who.clone(),
+            parent: self.parent.clone(),
+            tls: self.tls.clone(),
+        });
+        for kind in ["volumes", "snapshots", "backups"] {
+            let client = me.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tx.closed() => {},
+                    _ = client.follow(kind, tx.clone()) => {},
+                }
+            });
+        }
+        rx
+    }
+
     async fn volumes(&self) -> Result<Vec<velstra_cloud_model::resources::Volume>> {
         self.list("volumes").await
     }

@@ -14,6 +14,9 @@ const streams = new Set();
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   if (path.startsWith('/api/')) {
+    if (req.method === 'GET' && path === '/api/v1/images') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({items:[{meta:{name:'images/catalogue-boot'},spec:{family:'TestOS',version:'1',format:'Raw'}}]})); return; }
+    if (req.method === 'GET' && path === '/api/v1/flavors') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({items:[{meta:{name:'flavors/test-size'},spec:{vcpus:2,memoryMib:4096,rootDiskGib:10}}]})); return; }
+    if (req.method === 'GET' && path === '/api/v1/flavors/test-size') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({meta:{name:'flavors/test-size'},spec:{vcpus:2,memoryMib:4096,rootDiskGib:10}})); return; }
     if (req.method === 'POST' && path.endsWith(':console')) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ session: 'test-session', ticket: 'one-time-fixture', readOnly: viewer, encrypted: true })); return; }
     if (viewer && path === '/api/v1/sessions/current') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ subject: 'viewer', cellAdmin: false, projects: { p1: 'viewer' } })); return; }
     if (req.method === 'POST' && path.endsWith('/networks')) creates++;
@@ -71,6 +74,21 @@ try {
   await click(b, 'Create');
   await wait(b, '!!document.querySelector("form [role=alert]")');
   assert.equal(await b.evaluate('document.activeElement.getAttribute("placeholder")'), 'subnet-1', 'focus missing name');
+  await b.goto(url + '#/c/volumes/new'); await wait(b, '!!document.querySelector("form")');
+  await fill(b, 'form select', 'p1');
+  await wait(b, `!document.querySelector('[aria-label="From image"]')?.innerText.includes("Loading")`);
+  await b.evaluate(`document.querySelector('[aria-label="From image"]').click()`);
+  await wait(b, 'document.body.innerText.includes("TestOS · 1 · catalogue")');
+  await b.key('Escape');
+  await b.goto(url + '#/c/instances/new'); await wait(b, '!!document.querySelector("form")');
+  await b.evaluate(`document.querySelector('[aria-label="Flavor"]').click()`);
+  await wait(b, `[...document.querySelectorAll('[role=option]')].some(e=>e.innerText==='test-size')`);
+  await b.evaluate(`[...document.querySelectorAll('[role=option]')].find(e=>e.innerText==='test-size').click()`);
+  await b.evaluate(`[...document.querySelectorAll('button')].find(e=>e.innerText.includes('advanced settings')).click()`);
+  await wait(b, `document.querySelectorAll('form input[type=number]')[2]?.value === '10'`);
+  await fill(b, 'form input[type=number]', '1');
+  await wait(b, `!document.querySelector('[aria-label="Flavor"]').innerText.includes('test-size')`);
+  assert.equal(await b.evaluate(`document.querySelector('form input[type=number]').value`), '1', 'custom size survives clearing the flavor');
   await b.goto(url + '#/c/projects/p1/edit');
   await wait(b, '!!document.querySelector("form")');
   await click(b, 'Save');

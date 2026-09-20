@@ -434,3 +434,67 @@ async fn observing_costs_one_snapshot_listing_per_volume() {
         cluster.recorded()
     );
 }
+
+#[tokio::test]
+async fn qcow2_import_publishes_guest_sectors_and_removes_temporary_image() {
+    if std::process::Command::new("qemu-img")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP: qemu-img is required for the image conversion integration test");
+        return;
+    }
+    let cluster = Cluster::new("qcow2-import");
+    let raw = cluster.dir.join("source.raw");
+    let qcow = cluster.dir.join("source.qcow2");
+    let mut bytes = vec![0u8; 1024 * 1024];
+    bytes[512..524].copy_from_slice(b"guest-sector");
+    std::fs::write(&raw, &bytes).unwrap();
+    assert!(
+        std::process::Command::new("qemu-img")
+            .args(["convert", "-f", "raw", "-O", "qcow2"])
+            .arg(&raw)
+            .arg(&qcow)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let script = cluster.dir.join("record");
+    let original = std::fs::read_to_string(&script).unwrap();
+    std::fs::write(
+        &script,
+        original.replace(
+            "exit 0\n",
+            &format!(
+                "if [ \"$verb\" = import ]; then cp \"$2\" '{}/imported.raw'; fi\nexit 0\n",
+                cluster.dir.display()
+            ),
+        ),
+    )
+    .unwrap();
+    let digest = velstra_cloud_nodeagent::hostfs::hash_file(
+        &qcow,
+        velstra_cloud_model::images::Algorithm::Sha256,
+    )
+    .await
+    .unwrap();
+    assert!(
+        cluster
+            .storage()
+            .import_image("images/test", &format!("sha256:{digest}"), &qcow)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read(cluster.dir.join("imported.raw")).unwrap(),
+        bytes
+    );
+    assert!(!std::fs::read_dir(&cluster.dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("ceph-import")
+    }));
+}

@@ -9080,6 +9080,22 @@ impl Api {
             ApiError::invalid("a migration names the instance to move").at("spec.instance")
         })?;
         let instance: Instance = self.typed(&name).await?;
+        let pending: Vec<Migration> = self
+            .typed_list(
+                &name.parent().map(|p| p.to_string()).unwrap_or_default(),
+                "migrations",
+            )
+            .await?;
+        if let Some(active) = pending.iter().find(|m| {
+            m.spec.instance == instance_name
+                && !m.meta.is_deleting()
+                && m.status.completed_at.is_none()
+        }) {
+            return Err(ApiError::new(Code::FailedPrecondition,
+                format!("{} is still active; wait for completion or cancel it before starting another migration", active.meta.name))
+                .at("spec.instance"));
+        }
+
         let Some(from) = instance.status.node.clone().filter(|n| !n.is_empty()) else {
             return Err(ApiError::new(
                 Code::FailedPrecondition,

@@ -7,10 +7,10 @@
 //! whether the guest is on the old node, the new one, or both.
 //!
 //! So there is no such state. A migration is a **resource**: an ask that one
-//! instance should be running on a different node. Every value in its status is
-//! something a node can see on itself right now, and whether it is finished is
-//! *computed* from where the instance actually runs — never stored, so it can
-//! never disagree with the world.
+//! instance should be running on a different node. Progress is computed from
+//! current ownership and receiver observations. The destination records a
+//! completion receipt after it owns a running guest; that historical fact keeps
+//! retained requests inert when the guest is moved again.
 //!
 //! # Who writes what
 //!
@@ -127,6 +127,10 @@ pub struct MigrationStatus {
     /// What the source last reported having transferred, for an operator
     /// watching a large guest move. Progress, never a state.
     pub transferred_mib: u64,
+    /// Receipt recorded by the destination after it owns a running guest.
+    /// Retained requests must not move the guest again after a later migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<crate::meta::Timestamp>,
 }
 
 impl Observed for MigrationStatus {
@@ -179,37 +183,10 @@ pub enum Refusal {
     /// without the image cannot start the receiver.
     #[error("{node} does not have {image}")]
     DestinationLacksImage { node: String, image: String },
-    /// The guest's root disk is a file on the machine it is running on, and
-    /// nothing here moves one.
-    ///
-    /// **The largest gap between this feature and a working one**, and it was
-    /// invisible until two nodes were stood up and asked for a move. A live
-    /// migration transfers memory. It does not transfer disks. The destination
-    /// builds its receiver by starting the guest's own VMM with `-incoming`, and
-    /// QEMU opens the root disk at start — before anything arrives — so a
-    /// destination without one answers
-    ///
-    /// ```text
-    /// projects/p1/instances/g1 has no root disk on this node
-    /// ```
-    ///
-    /// once a pass, for ever, while the migration sits there saying nothing.
-    /// `Reboot` mode is no better: it stops the guest and starts it on the
-    /// destination, where its disk is not either.
-    ///
-    /// A node whose state directory is storage every node reaches — one NFS
-    /// mount, one Ceph filesystem — is a node where all of this works, and the
-    /// only party that can know that is the operator. So the agent is told, and
-    /// says so in `NodeStatus.shared_state`. Both ends have to say it: the
-    /// source's disk has to be readable from the destination, and it is the
-    /// destination that opens it.
-    ///
-    /// Refused at the door with the reason, rather than accepted and left to
-    /// hang. What is *not* here — copying the disk across as part of the move —
-    /// is a real feature and a large one; this is what stops its absence being
-    /// discovered by watching a guest fail to arrive.
+    /// A local root disk needs either shared storage or a configured cold-copy
+    /// peer. Live migration alone transports memory, not the local disk.
     #[error(
-        "{node} keeps guest root disks on its own filesystem, and moving a guest does not move its disk. Either boot the guest from a volume in a pool both machines can reach, or give both machines a shared state directory — one filesystem every node in the cell mounts — and start their agents with `--shared-state`. Until one of those is true, a guest stays where its disk is."
+        "{node} keeps guest root disks on its own filesystem. Configure a disk-transfer peer and use Reboot mode, boot from shared storage, or mount a shared state directory on both nodes and enable `--shared-state`."
     )]
     RootDiskIsNotShared { node: String },
     /// The destination cannot present the CPU this guest is already running
@@ -318,7 +295,13 @@ pub fn may_migrate(
     // naming a machine can only be opened on that machine — so the check
     // belongs there and not here, and repeating it in terms of `shared_state`
     // would refuse exactly the arrangement this exists to allow.
-    if instance.spec.boot_volume.is_empty() {
+    let copies_local_root = mode == MigrationMode::Reboot
+        && from
+            .status
+            .local_migration_targets
+            .iter()
+            .any(|n| n == to_id);
+    if instance.spec.boot_volume.is_empty() && !copies_local_root {
         for node in [from, to] {
             if !node.status.shared_state {
                 return Err(Refusal::RootDiskIsNotShared {
@@ -572,6 +555,11 @@ pub fn reconcile_destination(
     receiver_listening: bool,
     here: bool,
 ) -> Vec<DestinationAction> {
+    // A newer migration may now own a receiver for this same instance.
+    // Historical requests must neither prepare nor tear down that receiver.
+    if migration.status.completed_at.is_some() {
+        return Vec::new();
+    }
     // Whether the guest is **on this machine**, read from the machine — the same
     // source of truth `reconcile_source` uses, and for a sharper reason here.
     //
@@ -620,6 +608,9 @@ pub fn reconcile_destination(
 /// not from the store, because that is the one fact the source is the authority
 /// on.
 pub fn reconcile_source(migration: &Migration, here: bool) -> Vec<SourceAction> {
+    if migration.status.completed_at.is_some() {
+        return Vec::new();
+    }
     if migration.meta.is_deleting() {
         return if here {
             vec![SourceAction::Cancel {
@@ -674,34 +665,24 @@ pub fn arrived(migration: &Migration, instance: &Instance) -> bool {
         && instance.status.state == InstanceState::Running
 }
 
-/// What a migration is doing — **computed on read, never stored.**
-///
-/// This started as a condition a controller wrote, and that was wrong for a
-/// reason worth recording: the destination owns this object's status from the
-/// moment it claims it, so a controller writing here would be the second writer
-/// on one status — the exact thing invariant 1 forbids. The first instinct is a
-/// carve-out for conditions. The right answer is that `Moved` was never a fact
-/// anybody owns.
-///
-/// It is a *judgement over the whole dance* — a pure function of the migration
-/// and the instance — and this platform already has the precedent: an
-/// operation's `done` is computed from its target's convergence and never
-/// stored, so it cannot disagree with the object it describes. `Moved` is the
-/// same shape, and being computed buys the case a stored condition handles
-/// worst: a migration whose destination agent is dead reports the timeout
-/// correctly, because nothing has to be running to write it down.
-///
-/// `age_s` is how long the migration has existed. The caller has the clock; this
-/// function stays pure.
-///
-/// What *is* stored in `status.conditions` is only what the destination can say
-/// about itself — that it could not bind a receiver, say. Never this.
+/// Current progress until the destination records its completion receipt.
+/// Completion is a historical fact: a later move or deletion of the instance
+/// does not reopen this request. Only the destination writes that receipt.
 pub fn migration_condition(
     migration: &Migration,
     instance: Option<&Instance>,
     age_s: u64,
 ) -> Condition {
     let at = migration.meta.generation;
+    if migration.status.completed_at.is_some() {
+        return Condition::new(
+            "Moved",
+            ConditionStatus::True,
+            "Completed",
+            &format!("migration to {} completed", migration.spec.to_node),
+            at,
+        );
+    }
     let Some(instance) = instance else {
         return Condition::new(
             "Moved",
@@ -777,6 +758,7 @@ pub fn migration_condition(
 /// runs, and moving it later would leave a guest nobody is assigned.
 pub fn should_reassign(migration: &Migration, instance: &Instance) -> bool {
     !migration.meta.is_deleting()
+        && migration.status.completed_at.is_none()
         && instance.status.node.is_none()
         && instance.spec.node.as_deref() == Some(migration.spec.from_node.as_str())
 }
@@ -1452,6 +1434,29 @@ mod tests {
     }
 
     #[test]
+    fn completed_migrations_stay_finished_after_a_return_move() {
+        let mut m = migration("node-b");
+        m.status.completed_at = Some(Timestamp(42));
+        let mut returned = instance(InstanceState::Running, Some("node-a"));
+        assert!(reconcile_source(&m, true).is_empty());
+        assert!(reconcile_destination(&m, Some(&returned), false, false).is_empty());
+        assert!(
+            reconcile_destination(&m, Some(&returned), true, false).is_empty(),
+            "history must not tear down a newer request's receiver"
+        );
+        assert_eq!(
+            migration_condition(&m, Some(&returned), 99999).status,
+            ConditionStatus::True
+        );
+        returned.status.node = None;
+        assert!(!should_reassign(&m, &returned));
+        assert_eq!(
+            migration_condition(&m, None, 99999).status,
+            ConditionStatus::True
+        );
+    }
+
+    #[test]
     fn the_assignment_moves_at_exactly_one_moment() {
         let m = migration("node-b");
         let mut i = instance(InstanceState::Running, Some("node-a"));
@@ -1616,6 +1621,23 @@ mod tests {
             may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot),
             Err(Refusal::RootDiskIsNotShared { .. })
         ));
+    }
+
+    #[test]
+    fn configured_disk_copy_only_allows_cold_moves_to_the_named_peer() {
+        let guest = instance(InstanceState::Running, Some("node-a"));
+        let mut a = node("node-a", 16384, "0.1.0");
+        let mut b = node("node-b", 16384, "0.1.0");
+        a.status.shared_state = false;
+        b.status.shared_state = false;
+        a.status.local_migration_targets = vec!["node-b".into()];
+        assert!(may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot).is_ok());
+        assert!(matches!(
+            may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live),
+            Err(Refusal::RootDiskIsNotShared { .. })
+        ));
+        a.status.local_migration_targets = vec!["node-c".into()];
+        assert!(may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot).is_err());
     }
 
     #[test]

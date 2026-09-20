@@ -242,15 +242,8 @@ impl QemuVmm {
     ///   "qdev": "/machine/peripheral/projects_p1_volumes_data/virtio-backend",
     ///   "inserted": { "node-name": "projects_p1_volumes_data" } }
     /// ```
-    ///
-    /// `device` is empty for anything added this way, and `qdev` is a QOM path
-    /// with the id buried in the middle of it. Reading `qdev` first dropped every
-    /// entry on the floor, which left `attached` false and had the agent plug the
-    /// same disk in once a pass for ever — `Duplicate nodes with node-name='…'`,
-    /// while the guest ran with the disk perfectly well attached.
-    ///
-    /// Best-effort: a VMM that will not answer is a VMM whose guest is in
-    /// trouble for larger reasons, and the pass has plenty else to report.
+    /// Device IDs preserve the resource name; block node names must fit in
+    /// QEMU's 31-byte limit. Older guests identify their volumes by node name.
     async fn open_volumes(&self, instance: &str) -> Vec<(String, String)> {
         let Ok(answer) = self.qmp(instance, "query-block", json!({})).await else {
             return Vec::new();
@@ -258,19 +251,7 @@ impl QemuVmm {
         let Some(devices) = answer.as_array() else {
             return Vec::new();
         };
-        devices
-            .iter()
-            .filter_map(|d| {
-                let id = d
-                    .get("inserted")
-                    .and_then(|i| i.get("node-name"))
-                    .and_then(|v| v.as_str())?;
-                // The root disk and anything else QEMU named for itself
-                // (`#block156`) are not ours, and `from_qmp_id` says so.
-                let volume = crate::hostfs::from_qmp_id(id)?;
-                Some((volume, id.to_string()))
-            })
-            .collect()
+        devices.iter().filter_map(volume_from_block).collect()
     }
 
     /// What every disk this guest holds has moved, added up.
@@ -636,6 +617,14 @@ impl Vmm for QemuVmm {
         // because this is a stop and not a delete.
         let _ = self.qmp(instance, "quit", json!({})).await;
         hostfs::stop_unit(self.layout.scope, &self.unit(instance)).await;
+        hostfs::stop_unit(self.layout.scope, &self.incoming_unit(instance)).await;
+        if hostfs::unit_is_active(self.layout.scope, &self.unit(instance)).await
+            || hostfs::unit_is_active(self.layout.scope, &self.incoming_unit(instance)).await
+        {
+            return Err(HostError::failed(
+                "the guest process is still active after stopping it",
+            ));
+        }
         // And the sockets go, because a socket file outlives the process
         // listening on it and `observe` reads its presence as "a VMM was asked
         // for here".
@@ -679,6 +668,7 @@ impl Vmm for QemuVmm {
     ) -> Result<String> {
         // Not `slug`: QEMU refuses `~` in a node-name. See `hostfs::qmp_id`.
         let id = crate::hostfs::qmp_id(volume);
+        let node = block_node_name(volume);
         // `qcow2` for a file, because that is what the directory pool writes and
         // opening a qcow2 as `raw` hands the guest the image header as its first
         // sector. Ceph names itself.
@@ -696,7 +686,7 @@ impl Vmm for QemuVmm {
             instance,
             "blockdev-add",
             json!({
-                "node-name": id,
+                "node-name": node,
                 "driver": driver,
                 "read-only": read_only,
                 "file": file,
@@ -706,7 +696,7 @@ impl Vmm for QemuVmm {
         self.qmp(
             instance,
             "device_add",
-            json!({ "driver": "virtio-blk-pci", "drive": id, "id": id }),
+            json!({ "driver": "virtio-blk-pci", "drive": node, "id": id }),
         )
         .await?;
         // The ceiling, if there is one. `block_set_io_throttle` rather than
@@ -735,9 +725,10 @@ impl Vmm for QemuVmm {
     /// **Untested:** unplugs the device and drops the block node behind it.
     async fn close_volume(&self, instance: &str, volume: &str) -> Result<()> {
         let id = crate::hostfs::qmp_id(volume);
+        let node = block_node_name(volume);
         self.qmp(instance, "device_del", json!({ "id": id }))
             .await?;
-        self.qmp(instance, "blockdev-del", json!({ "node-name": id }))
+        self.qmp(instance, "blockdev-del", json!({ "node-name": node }))
             .await
             .map(|_| ())
     }
@@ -1012,6 +1003,36 @@ fn levels_listed(listing: &str) -> bool {
         .all(|l| listing.contains(&l.to_string()))
 }
 
+/// QEMU block node names are limited to 31 bytes. Keep short historical IDs
+/// stable and use a deterministic digest for longer resource names.
+fn block_node_name(volume: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let id = crate::hostfs::qmp_id(volume);
+    if id.len() <= 31 {
+        id
+    } else {
+        format!("v{:x}", Sha256::digest(volume.as_bytes()))[..31].to_string()
+    }
+}
+
+fn volume_from_block(block: &serde_json::Value) -> Option<(String, String)> {
+    let device = block.get("device").and_then(|v| v.as_str()).into_iter();
+    let qdev = block
+        .get("qdev")
+        .and_then(|v| v.as_str())
+        .into_iter()
+        .flat_map(|path| path.split('/'));
+    let node = block
+        .get("inserted")
+        .and_then(|i| i.get("node-name"))
+        .and_then(|v| v.as_str())
+        .into_iter();
+    device
+        .chain(qdev)
+        .chain(node)
+        .find_map(|id| crate::hostfs::from_qmp_id(id).map(|volume| (volume, id.to_string())))
+}
+
 /// The `-drive` the guest boots from.
 ///
 /// Two shapes, and the difference is where the disk lives rather than what the
@@ -1032,15 +1053,30 @@ fn boot_drive(request: &VmRequest, layout: &Layout) -> OsString {
         )
         .into();
     };
+    let identity = request
+        .boot_volume
+        .as_deref()
+        .map(|v| {
+            format!(
+                ",id={},node-name={}",
+                crate::hostfs::qmp_id(v),
+                block_node_name(v)
+            )
+        })
+        .unwrap_or_default();
     if let Some(rbd) = crate::ceph_access::split(place) {
-        return format!("{},format=raw,if=virtio", layout.ceph.drive_options(&rbd)).into();
+        return format!(
+            "{},format=raw,if=virtio{identity}",
+            layout.ceph.drive_options(&rbd)
+        )
+        .into();
     }
     let format = if place.ends_with(".qcow2") {
         "qcow2"
     } else {
         "raw"
     };
-    format!("file={place},format={format},if=virtio").into()
+    format!("file={place},format={format},if=virtio{identity}").into()
 }
 
 fn qemu_args(
@@ -1331,6 +1367,7 @@ mod tests {
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
             boot_disk: None,
+            boot_volume: None,
             nics: vec![
                 Nic {
                     tap: "vt-a".into(),
@@ -1369,6 +1406,19 @@ mod tests {
     /// the machine it was made on, because moving a guest does not move its
     /// disk. A command line that named `root.raw` anyway would hand somebody an
     /// empty local disk with their volume alongside it as a second drive.
+    #[test]
+    fn boot_volume_keeps_its_observable_resource_identity() {
+        let mut wants = request();
+        wants.boot_disk = Some("rbd:tenant-volumes/projects~p1~volumes~root".into());
+        wants.boot_volume = Some("projects/p1/volumes/root".into());
+        let drive = boot_drive(&wants, &layout()).to_string_lossy().into_owned();
+        assert!(drive.contains("node-name=projects_p1_volumes_root"));
+        assert_eq!(
+            crate::hostfs::from_qmp_id("projects_p1_volumes_root").as_deref(),
+            Some("projects/p1/volumes/root")
+        );
+    }
+
     #[test]
     fn a_guest_with_a_boot_volume_boots_it() {
         let mut wants = request();
@@ -1858,25 +1908,31 @@ mod what_query_block_really_answers {
                       "file": "/var/lib/velstra/pool/projects~p1~volumes~data.qcow2" } }
     ]"##;
 
-    /// The reading `open_volumes` does, on the answer above.
-    ///
-    /// A copy of the filter rather than a call, because `open_volumes` needs a
-    /// live QMP socket. What it protects is the part that was wrong: which field
-    /// carries the id.
     fn volumes(answer: &serde_json::Value) -> Vec<(String, String)> {
         answer
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|d| {
-                let id = d
-                    .get("inserted")
-                    .and_then(|i| i.get("node-name"))
-                    .and_then(|v| v.as_str())?;
-                let volume = crate::hostfs::from_qmp_id(id)?;
-                Some((volume, id.to_string()))
-            })
+            .filter_map(super::volume_from_block)
             .collect()
+    }
+
+    #[test]
+    fn long_volume_names_keep_their_identity_with_short_block_nodes() {
+        let name = "projects/long-project-name/volumes/a-long-root-volume-name";
+        let id = crate::hostfs::qmp_id(name);
+        let node = super::block_node_name(name);
+        assert_eq!(node.len(), 31);
+        assert_ne!(node, super::block_node_name(&format!("{name}-other")));
+        for block in [
+            serde_json::json!({"device": id, "inserted": {"node-name": node}}),
+            serde_json::json!({"device": "", "qdev": format!("/machine/peripheral/{id}/virtio-backend"), "inserted": {"node-name": node}}),
+        ] {
+            assert_eq!(
+                super::volume_from_block(&block),
+                Some((name.into(), id.clone()))
+            );
+        }
     }
 
     #[test]

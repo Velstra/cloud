@@ -153,6 +153,10 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
   const set = (k: string, v: unknown) => {
     setValues((s) => {
       const next = { ...s, [k]: v };
+      if (["vcpus", "memoryMib", "rootDiskGib"].includes(k)) {
+        const flavor = fields.find((field) => field.kind === "ref" && field.collection === "flavors");
+        if (flavor) next[flavor.key] = "";
+      }
       const f = coll.fields.find((x) => x.key === k);
       const bad = crossCheck(coll.id, next);
       setErrors((e) => {
@@ -177,7 +181,7 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
     const id = String(chosen).split("/").pop()!;
     call("get:flavors", "GET", `/api/v1/flavors/${encodeURIComponent(id)}`).then((fl) => {
       const spec = fl?.spec ?? {};
-      setValues((s) => ({ ...s,
+      setValues((s) => s[flavorField!.key] !== chosen ? s : ({ ...s,
         ...(spec.vcpus != null ? { vcpus: spec.vcpus } : {}),
         ...(spec.memoryMib != null ? { memoryMib: spec.memoryMib } : {}),
         ...(spec.rootDiskGib != null ? { rootDiskGib: spec.rootDiskGib } : {}),
@@ -573,8 +577,10 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
     setOptions([]); setOptionError("");
     if (!target || (target.scope === "project" && (!project || project === ALL))) { setLoadingOptions(false); return; }
     setLoadingOptions(true);
-    call(`list:${target.id}`, "GET", basePath(target, project), { pageSize: 200 })
-      .then((a) => { if (current) setOptions((a.items ?? []).map((r: Resource) =>
+    const paths = target.id === "images"
+      ? [basePath(target, project), "/api/v1/images"] : [basePath(target, project)];
+    Promise.all(paths.map((path) => call(`list:${target.id}`, "GET", path, { pageSize: 200 })))
+      .then((answers) => { if (current) setOptions(answers.flatMap((a) => a.items ?? []).map((r: Resource) =>
         ({ id: idOf(r), name: r.meta.name, spec: r.spec }))); })
       .catch(() => { if (current) setOptionError("Could not load options. Reopen this form to retry."); })
       .finally(() => { if (current) setLoadingOptions(false); });
@@ -620,7 +626,8 @@ function RefPicker({ f, value, onChange, disabled, multiple }: {
         } />
       </SelectTrigger>
       <SelectContent>
-        {offered.map((o) => <SelectItem key={o.id} value={spell(o)}>{o.id}</SelectItem>)}
+        {!f.required && <SelectItem value="">{target?.id === "flavors" ? "Custom size" : "None"}</SelectItem>}
+        {offered.map((o) => <SelectItem key={o.name} value={spell(o)}>{target?.id === "images" ? [o.spec.family || o.id, o.spec.version, o.name.startsWith("projects/") ? "project" : "catalogue"].filter(Boolean).join(" · ") : o.id}</SelectItem>)}
       </SelectContent>
     </Select>
   );

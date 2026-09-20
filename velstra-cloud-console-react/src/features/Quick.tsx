@@ -168,7 +168,7 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
     const from = plan?.from ?? r.status?.node ?? "?";
     const said = mode === "Live"
       ? `Memory is copied while it runs and it pauses only for the last pages. If the move fails it stays on ${from}.`
-      : `It is stopped on ${from} and started on ${to} — a minute or so of downtime, and anything unsaved inside it is lost.`;
+      : `The guest shuts down on ${from} and restarts on ${to}. Local storage is copied while it is stopped; downtime depends on disk size and transfer speed. Save your work first.`;
     const asked = mode === "Live"
       ? `Move ${idOf(r)} from ${from} to ${to}, live?`
       : `Move ${idOf(r)} from ${from} to ${to} with a reboot?`;
@@ -190,7 +190,7 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
     <>
       {moves.map((m) => (
         <Pressed key={nameOf(m)} size="sm" variant="secondary" title={`${idOf(m)} — abandon it; the guest keeps running where it is`} onPress={async () => {
-          if (!(await ask({ title: `Abandon the move of ${idOf(r)} to ${m.spec?.toNode}?`, body: `The guest keeps running on ${m.spec?.fromNode ?? r.status?.node ?? "its node"}; what was copied is thrown away.`, confirmLabel: "Abandon", tone: "danger" }))) return;
+          if (!(await ask({ title: `Abandon the move of ${idOf(r)} to ${m.spec?.toNode}?`, body: `Cancel the transfer. A stopped guest can restart on ${m.spec?.fromNode ?? r.status?.node ?? "its source node"}; an incomplete disk copy is not used to start a destination guest.`, confirmLabel: "Abandon", tone: "danger" }))) return;
           try { await call("delete:migrations", "DELETE", `${basePath(migs, project)}/${encodeURIComponent(idOf(m))}`); toast("Move abandoned."); look(); }
           catch (e) { toast.error((e as Error).message); }
         }}>
@@ -198,7 +198,7 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
         </Pressed>
       ))}
       {moves.length === 0 && (
-        <DropdownMenu onOpenChange={(open) => { if (open && !plan) explain(); }}>
+        <DropdownMenu onOpenChange={(open) => { if (open) { setPlan(null); explain(); } }}>
           <DropdownMenuTrigger render={<Button size="sm" variant="secondary" title="Move the running guest to another machine, live" />}><ArrowRightLeft className="size-3.5" /> Migrate ▾</DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="min-w-[24rem]">
             {!plan && <DropdownMenuItem disabled>Asking which machines could take it…</DropdownMenuItem>}
@@ -206,7 +206,7 @@ function Migrate({ r, reload }: { r: Resource; reload: () => void }) {
               <DropdownMenuItem key={o.node} disabled={!o.mode} onClick={() => o.mode && start(o.node, o.mode)}>
                 <span className="grid gap-0.5">
                   <span><span className="font-mono">{o.node}</span>
-                    <span style={{ color: o.mode === "Live" ? "var(--settled)" : o.mode ? "var(--drifting)" : "var(--text-faint)" }}> · {o.mode === "Live" ? "live, no downtime" : o.mode ? "with a reboot — stopped here, started there" : "cannot take it"}</span></span>
+                    <span style={{ color: o.mode === "Live" ? "var(--settled)" : o.mode ? "var(--drifting)" : "var(--text-faint)" }}> · {o.mode === "Live" ? "live, brief pause" : o.mode ? "with a reboot — stopped here, started there" : "cannot take it"}</span></span>
                   {o.why && <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>{o.mode ? "not live: " : ""}{o.why}</span>}
                 </span>
               </DropdownMenuItem>
