@@ -466,7 +466,8 @@ async fn a_paused_cluster_stops_the_node_from_acting() {
 }
 
 /// The step after the cluster exists is placing the monitors, and it is run by
-/// the node holding the keyring — naming the whole set, every time.
+/// the node holding the keyring — naming the whole set when Ceph has not yet
+/// accepted it.
 #[tokio::test]
 async fn the_admin_node_places_the_monitors_as_a_set() {
     let store = store();
@@ -510,6 +511,7 @@ async fn the_admin_node_places_the_monitors_as_a_set() {
         "list-units",
         "ceph-4f3a@mon.a.service loaded active running Ceph mon.a\n",
     );
+    recorder.answers("orch", "[]");
     recorder.trusts(KEY);
     agent(store.clone(), "a", recorder.tools()).resync().await;
     let argv = recorder.recorded();

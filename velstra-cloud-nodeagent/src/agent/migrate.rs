@@ -172,12 +172,14 @@ impl Agent {
             let Ok(Some(current)) = self.cell.instance(&name).await else {
                 continue;
             };
-            // A reboot on a later host ends earlier migration requests. Retained
-            // history must not send the guest away again after it returns.
+            // A reboot on a later host ends earlier migration requests. A
+            // restart on this source while the request is still open is a
+            // recovery and must be allowed to continue the same migration.
             if current
                 .status
                 .started_at
                 .is_some_and(|at| at > migration.meta.created_at)
+                && current.status.node.as_deref() != Some(self.config.node.as_str())
             {
                 continue;
             }
@@ -188,10 +190,11 @@ impl Agent {
                         && m.status.completed_at.is_none()
                         && m.spec.instance == name
                         && m.spec.from_node == self.config.node
-                        && current
+                        && (current
                             .status
                             .started_at
                             .is_none_or(|at| at <= m.meta.created_at)
+                            || current.status.node.as_deref() == Some(self.config.node.as_str()))
                 })
                 .count();
             if active > 1 {
@@ -209,6 +212,27 @@ impl Agent {
                 .get(&name)
                 .map(|vm| vm.state == InstanceState::Running)
                 .unwrap_or(false);
+            let failed_here = host
+                .vms
+                .get(&name)
+                .is_some_and(|vm| vm.state == InstanceState::Failed);
+
+            // A failed VMM is still positive evidence that the guest is on
+            // this source. In particular, QEMU may be alive after its QMP
+            // socket pathname was lost: it cannot be managed or migrated, but
+            // it has not arrived on the destination either. Let the ordinary
+            // instance reconciliation restart that known-local guest first.
+            // Treating it like an absent guest freezes the very repair that
+            // would let the migration continue; treating it like a handover
+            // would release ownership without ever transferring the guest.
+            if failed_here {
+                moving.trouble.insert(
+                    name,
+                    "the source guest failed while migration was pending; it is being restarted automatically"
+                        .into(),
+                );
+                continue;
+            }
 
             // A guest this node reported as running, that is now not running
             // here, is one this node may not start again while a transfer of it

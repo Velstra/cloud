@@ -236,6 +236,29 @@ async fn a_failed_send_leaves_the_guest_running_where_it_was() {
 }
 
 #[tokio::test]
+async fn a_failed_source_guest_repairs_itself_before_migration_continues() {
+    let cell = two_nodes(MigrationStatus::default()).await;
+    cell.destination_listens().await;
+    cell.source_vmm.crash(I1);
+
+    let repaired = cell.source.resync().await;
+
+    assert_eq!(repaired.actions, 1, "{repaired:?}");
+    assert!(cell.source_vmm.is_running(I1));
+    assert!(!cell.destination_vmm.is_running(I1));
+    assert_eq!(cell.source_vmm.count(Fault::Start, I1), 2);
+    let instance = read_instance(&cell.store, I1).await;
+    assert_eq!(instance.status.node.as_deref(), Some(SOURCE));
+    assert_eq!(instance.status.state, InstanceState::Running);
+
+    // The next pass resumes the pending migration without an operator having
+    // to cancel it, restart the guest, or submit a second request.
+    cell.source.resync().await;
+    assert!(!cell.source_vmm.is_running(I1));
+    assert!(cell.destination_vmm.is_running(I1));
+}
+
+#[tokio::test]
 async fn a_finished_send_is_reported_by_letting_go_and_by_nothing_else() {
     let cell = two_nodes(MigrationStatus::default()).await;
     cell.destination_listens().await;

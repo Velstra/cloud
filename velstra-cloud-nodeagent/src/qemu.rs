@@ -421,9 +421,19 @@ impl Vmm for QemuVmm {
                 // was told `Stopped`, the console was empty, and the reason
                 // existed only in the unit's journal. Found live, from a CPU
                 // baseline this platform advised.
-                if let Some(why) =
+                let ordinary_active =
+                    hostfs::unit_is_active(self.layout.scope, &self.unit(&instance)).await;
+                let incoming_active =
+                    hostfs::unit_is_active(self.layout.scope, &self.incoming_unit(&instance)).await;
+                let failure = if ordinary_active || incoming_active {
+                    Some(
+                        "the guest process is active but its QMP monitor socket is missing; it will be restarted automatically"
+                            .to_string(),
+                    )
+                } else {
                     hostfs::unit_failure(self.layout.scope, &self.unit(&instance)).await
-                {
+                };
+                if let Some(why) = failure {
                     host.vms.insert(
                         instance,
                         VmObservation {
@@ -613,6 +623,50 @@ impl Vmm for QemuVmm {
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
         let monitor = self.monitor(&request.instance);
+
+        // Reconciliation may ask for a start from a status observation that
+        // raced with QEMU or with another pass. Never unlink the control socket
+        // of a healthy process: QEMU keeps the listening file descriptor, but
+        // once its pathname is removed there is no way to reconnect and every
+        // later migration stalls without moving a byte.
+        let ordinary_unit = self.unit(&request.instance);
+        let incoming_unit = self.incoming_unit(&request.instance);
+        let ordinary_active = hostfs::unit_is_active(self.layout.scope, &ordinary_unit).await;
+        let incoming_active = hostfs::unit_is_active(self.layout.scope, &incoming_unit).await;
+
+        if ordinary_active && self.run_state_at(&monitor).await.is_some() {
+            return Ok(());
+        }
+        if incoming_active {
+            let incoming_monitor = self.incoming_monitor(&request.instance);
+            if self
+                .run_state_at(&incoming_monitor)
+                .await
+                .is_some_and(|state| state != "inmigrate")
+            {
+                return Ok(());
+            }
+        }
+
+        for unit in [
+            ordinary_active.then_some(ordinary_unit),
+            incoming_active.then_some(incoming_unit),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // An active VMM whose monitor is missing or no longer answers
+            // cannot be managed or migrated. Replace it in one bounded,
+            // observable operation so desired-state reconciliation repairs the
+            // fault without an operator having to restart the guest by hand.
+            hostfs::stop_unit(self.layout.scope, &unit).await;
+            if hostfs::unit_is_active(self.layout.scope, &unit).await {
+                return Err(HostError::failed(format!(
+                    "{} is active but its monitor is not answering, and {unit} did not stop",
+                    request.instance,
+                )));
+            }
+        }
         // A socket left by a dead VMM would stop the new one binding.
         let _ = std::fs::remove_file(&monitor);
         hostfs::systemd_run(
@@ -771,6 +825,12 @@ impl Vmm for QemuVmm {
     async fn prepare_receiver(&self, request: &VmRequest, _mode: MigrationMode) -> Result<String> {
         if let Some(receiver) = self.observe_receiver(&request.instance).await {
             return Ok(receiver.url);
+        }
+        if hostfs::unit_is_active(self.layout.scope, &self.incoming_unit(&request.instance)).await {
+            return Err(HostError::failed(format!(
+                "the receiver for {} is active but its monitor is not answering",
+                request.instance
+            )));
         }
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;

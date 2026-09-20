@@ -244,6 +244,52 @@ pub fn apply_mon_argv(hosts: &[String]) -> Vec<String> {
     ]
 }
 
+pub fn mon_service_argv() -> Vec<String> {
+    vec![
+        "orch".into(),
+        "ls".into(),
+        "--service_name".into(),
+        "mon".into(),
+        "--format".into(),
+        "json".into(),
+    ]
+}
+
+#[derive(serde::Deserialize)]
+struct ServiceRow {
+    #[serde(default)]
+    placement: ServicePlacement,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ServicePlacement {
+    #[serde(default)]
+    hosts: Vec<String>,
+}
+
+pub fn parse_mon_hosts(json: &str) -> Result<Vec<String>> {
+    let rows: Vec<ServiceRow> = serde_json::from_str(json).map_err(|e| {
+        HostError::failed(format!(
+            "`ceph orch ls --service_name mon` did not answer with json: {e}"
+        ))
+    })?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|row| row.placement.hosts)
+        .unwrap_or_default())
+}
+
+fn same_hosts(left: &[String], right: &[String]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    left.dedup();
+    right.sort_unstable();
+    right.dedup();
+    left == right
+}
+
 /// The argv for making an OSD of one device.
 ///
 /// **This erases the device.** The safety is upstream of here, in
@@ -555,6 +601,17 @@ impl CephAdmin {
     }
 
     pub async fn apply_monitors(&self, hosts: &[String]) -> Result<()> {
+        // `orch apply` is declarative, but it is not a harmless status read
+        // while cephadm is still converging: submitting the same placement on
+        // every agent pass can restart the deployment timer and eventually
+        // trip systemd's start limit on every monitor. The service spec is the
+        // durable acknowledgement that Ceph accepted the desired set; daemon
+        // liveness is observed separately.
+        let current = self.ceph(&mon_service_argv()).await?;
+        let current = parse_mon_hosts(&String::from_utf8_lossy(&current))?;
+        if same_hosts(&current, hosts) {
+            return Ok(());
+        }
         self.ceph(&apply_mon_argv(hosts)).await.map(|_| ())
     }
 
@@ -717,7 +774,8 @@ mod tests {
         assert_eq!(split[at + 1], "10.1.0.0/24");
     }
 
-    /// Monitor placement is declarative: the whole set, every time.
+    /// Monitor placement is declarative and compared without depending on
+    /// Ceph's order before it is submitted again.
     #[test]
     fn monitors_are_placed_as_a_set_rather_than_one_at_a_time() {
         let argv = apply_mon_argv(&["a".into(), "b".into(), "c".into()]);
@@ -725,6 +783,15 @@ mod tests {
         // Which means asking twice with the same set is asking once — the same
         // level-triggered property the rest of the platform has.
         assert_eq!(argv, apply_mon_argv(&["a".into(), "b".into(), "c".into()]));
+
+        let reported = r#"[{"placement":{"hosts":["c","a","b"]}}]"#;
+        let current = parse_mon_hosts(reported).unwrap();
+        assert!(same_hosts(&current, &["a".into(), "b".into(), "c".into()]));
+        assert!(!same_hosts(&current, &["a".into(), "b".into()]));
+        assert_eq!(
+            mon_service_argv(),
+            ["orch", "ls", "--service_name", "mon", "--format", "json"]
+        );
     }
 
     #[test]

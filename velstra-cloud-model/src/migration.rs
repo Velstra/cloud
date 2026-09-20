@@ -720,6 +720,19 @@ pub fn migration_condition(
             at,
         );
     }
+    if instance.status.node.as_deref() == Some(migration.spec.from_node.as_str()) {
+        if let Some(failure) = instance.status.conditions.iter().find(|condition| {
+            condition.kind == "HostActions" && condition.status == ConditionStatus::False
+        }) {
+            return Condition::new(
+                "Moved",
+                ConditionStatus::Unknown,
+                "SourceError",
+                &failure.message,
+                at,
+            );
+        }
+    }
     if migration.spec.mode == MigrationMode::Reboot {
         if let Some(copy) = instance
             .status
@@ -1579,6 +1592,24 @@ mod tests {
         let copying = migration_condition(&m, Some(&i), 3);
         assert_eq!(copying.reason, "CopyingDisk");
         assert!(copying.message.contains("local root disk"));
+    }
+
+    #[test]
+    fn a_source_failure_is_visible_on_the_migration() {
+        let m = migration("node-b");
+        let mut i = instance(InstanceState::Running, Some("node-a"));
+        i.status.conditions.push(Condition::new(
+            "HostActions",
+            ConditionStatus::False,
+            "HostError",
+            "the QMP monitor is not answering",
+            i.meta.generation,
+        ));
+
+        let condition = migration_condition(&m, Some(&i), 1);
+        assert_eq!(condition.status, ConditionStatus::Unknown);
+        assert_eq!(condition.reason, "SourceError");
+        assert!(condition.message.contains("QMP monitor"));
     }
 
     #[test]
