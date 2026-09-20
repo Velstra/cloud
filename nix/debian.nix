@@ -198,6 +198,7 @@ let
         ExecStartPre=-/usr/sbin/ip link add vmeta0 type dummy
         ExecStartPre=-/usr/sbin/ip addr add 169.254.169.254/32 dev vmeta0
         ExecStartPre=-/usr/sbin/ip link set vmeta0 up
+        ExecStartPre=/bin/sh -c 'modprobe vhost_vsock'
         ExecStartPre=-/bin/sh -c '[ -n "''${VELSTRA_PASSTHROUGH:-}" ] && modprobe vfio-pci || true'
         ExecStartPre=${bin "velstra-cloud-passthrough"}
       '';
@@ -398,7 +399,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     Priority: optional
     Architecture: ${debArch}
     Maintainer: Velstra <noreply@velstra.invalid>
-    Depends: systemd, libc6 (>= 2.39), iproute2, nftables, curl, zstd, genisoimage
+    Depends: systemd, libc6 (>= 2.39), iproute2, nftables, curl, zstd, kmod, genisoimage
     Recommends: qemu-system-x86, qemu-utils, etcd-server, etcd-client, ceph-common, velstra
     Description: Velstra Cloud — control plane, node agent and storage pool
      One package, four roles. Which of them this machine runs is decided by

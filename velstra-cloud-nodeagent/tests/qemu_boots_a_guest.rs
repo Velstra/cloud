@@ -44,6 +44,10 @@ fn can_run() -> Option<PathBuf> {
         eprintln!("skipping: no systemd-run");
         return None;
     }
+    if !PathBuf::from("/dev/vhost-vsock").exists() {
+        eprintln!("skipping: no /dev/vhost-vsock (load vhost_vsock)");
+        return None;
+    }
     let Some(image) = image() else {
         eprintln!("skipping: no guest image (set VELSTRA_TEST_IMAGE)");
         return None;
