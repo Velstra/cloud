@@ -1112,6 +1112,34 @@ async fn an_operation_is_done_when_the_target_has_caught_up() {
     assert!(finished.body["status"]["error"].is_null());
 }
 
+#[tokio::test]
+async fn operations_use_the_targets_actual_settlement_contract() {
+    let h = Harness::new();
+
+    let flavor = h
+        .post(
+            "flavors",
+            json!({
+                "id": "small",
+                "spec": { "vcpus": 1, "memoryMib": 1024, "rootDiskGib": 8 }
+            }),
+        )
+        .await;
+    let flavor_operation = flavor.body["operation"].as_str().unwrap();
+    assert_eq!(h.get(flavor_operation).await.body["status"]["done"], true);
+
+    let group = h
+        .post(
+            "projects/p1/security-groups",
+            json!({ "id": "web", "spec": { "rules": [] } }),
+        )
+        .await;
+    let group_operation = group.body["operation"].as_str().unwrap();
+    let finished = h.get(group_operation).await;
+    assert_eq!(finished.body["status"]["done"], true, "{}", finished.body);
+    assert!(finished.body["status"]["error"].is_null());
+}
+
 // ---- authentication ------------------------------------------------------
 
 #[tokio::test]

@@ -44,6 +44,7 @@ const login = async (b) => { await b.goto(url); await fill(b, '#u', 'operator');
 try {
   const b = await browser({width: 1440, height: 1000}); pages.push(b); await login(b);
   await wait(b, 'document.body.innerText.includes("Cloud overview")');
+  assert.ok(await b.evaluate(`(()=>{const networks=document.querySelector('#rail a[href="#/c/networks"] svg');const subnets=document.querySelector('#rail a[href="#/c/subnets"] svg');return !!networks && !!subnets && networks.innerHTML!==subnets.innerHTML})()`), 'collections in one section use distinct icons');
   await fill(b, '[aria-label="Filter navigation"]', 'ceph');
   await b.evaluate('document.querySelector("[aria-label=\\"Clear navigation filter\\"]").click()');
   assert.equal(await b.evaluate('document.activeElement.getAttribute("aria-label")'), 'Filter navigation');
