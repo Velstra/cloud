@@ -174,11 +174,7 @@ struct Args {
     )]
     api_token_file: PathBuf,
 
-    /// How often the pool is re-read and reconciled.
-    ///
-    /// Slower than a node's, and there is no watch at all: storage work is
-    /// measured in seconds to minutes, so the latency a watch would buy is lost
-    /// in the noise of a copy.
+    /// Periodic reconciliation fallback; watched changes are handled immediately.
     #[arg(long, default_value = "30")]
     resync_secs: u64,
 }

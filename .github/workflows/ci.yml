@@ -220,9 +220,12 @@ jobs:
       # virtualization as unsupported-but-present: if a future image drops it,
       # this job goes red rather than quietly falling back to software
       # emulation, and the answer is then a self-hosted runner.
-      - name: Let this user open /dev/kvm
+      - name: Let this user open KVM and VSOCK
         run: |
           set -euo pipefail
+          sudo modprobe vhost_vsock
+          test -c /dev/vhost-vsock
+          sudo chmod 0666 /dev/vhost-vsock
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules

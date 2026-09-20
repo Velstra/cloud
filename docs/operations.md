@@ -174,7 +174,7 @@ config on our side already says `no bgp ebgp-requires-policy` because the
 network statements *are* the policy).
 
 
-## A Ceph pool for the cell
+## Ceph pools for the cell
 
 Two units serve pools on one machine: `velstra-cloud-poolagent` for its local
 disks and `velstra-cloud-poolagent-ceph` for the cluster. The second does
@@ -197,6 +197,18 @@ Bringing one up, in the order the platform expects:
    --backend ceph`. The image lands in the image pool with a protected
    `@base` snapshot, and every volume made from it is an `rbd clone` — no
    bytes move, and "which nodes hold this image" stops being a question.
+
+More RBD pools use the same sequence. Add the RBD pool on the Ceph object's
+**Pools** field first; the Ceph controller creates it and reports `Expanding`
+while it does so. Then create one Velstra `pools` object and run one Ceph pool
+agent for that RBD pool. The two names are intentionally separate: for example,
+Velstra pool `archive` can serve RBD pool `tenant-archive`.
+
+The Velstra pool's **Projects** field limits new placement. Empty or `*` means
+every project; `projects/team-a` and `projects/team-b` make it available only to
+those projects. Both an explicitly named pool and the cell's automatic choice
+enforce the list. Removing a project is a drain of access: its existing volumes
+stay and new ones are refused or placed elsewhere.
 
 **A pool object with no agent is a black hole, and the cell now says so.**
 Steps 3 and 4 are easy to leave half-done — the `pools` object exists, the

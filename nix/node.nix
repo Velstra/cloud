@@ -163,6 +163,7 @@ in
         # hold a card back — they need the `vendor:device` pair to put in the
         # seed, and the machine itself is the only place that knows it.
         pkgs.pciutils
+        pkgs.cdrkit
         # `cephadm` and the `ceph` CLI, so an operator can add a Ceph cluster
         # to a cell of flashed machines afterwards. The platform still installs
         # nothing on its own — cephadm pulls the daemon containers only once
@@ -224,6 +225,10 @@ in
     boot.kernelModules = [
       "kvm-intel"
       "kvm-amd"
+      # QEMU gives every guest a stable AF_VSOCK CID. Loading the transport at
+      # boot makes /dev/vhost-vsock a node capability rather than an accident
+      # of whichever guest or administrator happened to ask for it first.
+      "vhost_vsock"
       # What a held-back card is bound to. Present always: which cards a
       # machine reserves is read from its seed at boot, and cannot be a kernel
       # parameter here — this image's command line is sealed into a signed UKI,

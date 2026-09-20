@@ -204,7 +204,7 @@ struct Args {
     /// machine, which is what an in-place VMM upgrade is. Nothing on the
     /// machine can tell which of its addresses its peers route to, so it is
     /// stated rather than guessed at.
-    #[arg(long)]
+    #[arg(long, env = "VELSTRA_MIGRATION_ADDRESS")]
     migration_address: Option<String>,
 
     /// This machine's state directory is storage every node in the cell reaches.
@@ -221,6 +221,10 @@ struct Args {
     /// rather than leaving it to hang.
     #[arg(long)]
     shared_state: bool,
+
+    /// JSON with pinned SSH peers for cold local-root-disk migration.
+    #[arg(long, env = "VELSTRA_DISK_TRANSFER_CONFIG")]
+    disk_transfer_config: Option<PathBuf>,
 
     /// The first port a receiver may bind. One arriving guest needs one port.
     #[arg(long, default_value = "4900")]
@@ -557,6 +561,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig::new(&args.node, &args.region, &args.cell);
     config.resync = Duration::from_secs(args.resync_secs);
     config.shared_state = args.shared_state;
+    config.disk_transfer = args
+        .disk_transfer_config
+        .as_deref()
+        .map(velstra_cloud_nodeagent::disk_transfer::Config::read)
+        .transpose()?;
     // The same place the VMM is told to look (see `Layout.ceph` above).
     config.ceph_client_dir = Some(args.state_dir.join("ceph"));
     config.updates_dir = args.state_dir.join("updates");

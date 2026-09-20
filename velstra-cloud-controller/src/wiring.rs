@@ -279,6 +279,20 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
             "no image-source loop: this cell will not rotate images by itself"
         ),
     }
+    match crate::image::HttpVerifier::new() {
+        Ok(verifier) => {
+            let images = TypedStore::new(store.clone(), id, "images");
+            spawn!(
+                "image",
+                crate::image::ImageController::new(
+                    StatusWriter::new(store.clone(), id, "images", "image-verifier"),
+                    Arc::new(verifier),
+                ),
+                images
+            );
+        }
+        Err(why) => warn!(error = %why, "no image verification loop"),
+    }
     spawn!(
         "operations",
         OperationsController::new(

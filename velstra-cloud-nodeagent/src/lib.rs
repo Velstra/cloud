@@ -105,3 +105,5 @@ pub use host::{
 pub use hostfs::{Boot, Layout, Scope};
 pub use pool::{FakePool, PoolAgent, PoolConfig, PoolState, Storage};
 pub use qemu::QemuVmm;
+
+pub mod disk_transfer;

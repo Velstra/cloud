@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use velstra_cloud_api::{Api, Code, Filter, Identity, StaticTokenVerifier, TokenVerifier};
 use velstra_cloud_model::{
     access::Writer,
@@ -29,7 +29,52 @@ fn name(text: &str) -> ResourceName {
 }
 
 /// Two tenants: ada admins `p1`, bob admins `p2`, and neither is an operator.
-async fn cell() -> Api {
+struct TestApi {
+    api: Api,
+    store: Arc<dyn Store>,
+}
+
+impl std::ops::Deref for TestApi {
+    type Target = Api;
+
+    fn deref(&self) -> &Self::Target {
+        &self.api
+    }
+}
+
+impl TestApi {
+    async fn create(
+        &self,
+        parent: &str,
+        kind: &str,
+        body: &Value,
+        who: &Identity,
+    ) -> velstra_cloud_api::ApiResult<velstra_cloud_api::core::Created> {
+        let made = self.api.create(parent, kind, body, who).await?;
+        if kind == "images" {
+            let images: TypedStore<
+                velstra_cloud_model::resources::ImageSpec,
+                velstra_cloud_model::resources::ImageStatus,
+            > = TypedStore::new(self.store.clone(), "cell-1", "images");
+            if let Some(mut image) = images.get(&made.target).await.unwrap() {
+                image.status.observed_generation = image.meta.generation;
+                image.status.verified_digest = image.spec.digest.clone();
+                image.status.verified_source_url = image.spec.source_url.clone();
+                velstra_cloud_model::meta::set_condition(
+                    &mut image.status.conditions,
+                    velstra_cloud_model::Condition::ready(image.meta.generation),
+                );
+                images
+                    .update(&image, &Writer::controller("image-verifier"))
+                    .await
+                    .unwrap();
+            }
+        }
+        Ok(made)
+    }
+}
+
+async fn cell() -> TestApi {
     cell_and_store().await.0
 }
 
@@ -39,7 +84,7 @@ async fn cell() -> Api {
 /// pool reports through its own writes rather than through the API — so the
 /// tests about *following a reference into another project* need to reach past
 /// the API to set up the thing being reached for.
-async fn cell_and_store() -> (Api, Arc<dyn Store>) {
+async fn cell_and_store() -> (TestApi, Arc<dyn Store>) {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
     let api = Api::new(store.clone(), "eu-central", "cell-1", verifier)
@@ -81,7 +126,13 @@ async fn cell_and_store() -> (Api, Arc<dyn Store>) {
         .await
         .expect("an operator creates a project");
     }
-    (api, store)
+    (
+        TestApi {
+            api,
+            store: store.clone(),
+        },
+        store,
+    )
 }
 
 /// The person whose request was refused can read the sentence explaining it.

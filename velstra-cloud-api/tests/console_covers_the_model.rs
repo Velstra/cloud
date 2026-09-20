@@ -907,6 +907,9 @@ mod settled {
         ImageStatus {
             observed_generation: 1,
             conditions: vec![],
+            verified_digest: "sha256:abc".into(),
+            verified_source_url: "https://example.invalid/image".into(),
+            verified_size_bytes: 42,
         }
     }
 

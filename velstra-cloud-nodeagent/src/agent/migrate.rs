@@ -78,6 +78,7 @@ pub(super) struct Moving {
     pub stalled: BTreeSet<String>,
     /// Why a transfer could not be started, per instance.
     pub trouble: BTreeMap<String, String>,
+    pub progress: BTreeMap<String, String>,
 }
 
 impl Agent {
@@ -111,7 +112,10 @@ impl Agent {
         moving: &mut Moving,
     ) {
         for migration in migrations {
-            if migration.spec.to_node != self.config.node || migration.meta.is_deleting() {
+            if migration.spec.to_node != self.config.node
+                || migration.meta.is_deleting()
+                || migration.status.completed_at.is_some()
+            {
                 continue;
             }
             // A cold move is not an arrival: nothing is coming over a wire, and
@@ -148,19 +152,87 @@ impl Agent {
         pass: &mut Pass,
     ) -> Moving {
         let mut moving = Moving::default();
+        self.disk_copies.lock().unwrap().retain(|uid, task| {
+            let keep = migrations
+                .iter()
+                .any(|m| m.meta.uid == *uid && !m.meta.is_deleting());
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
         for migration in migrations {
             if migration.spec.from_node != self.config.node
                 || migration.spec.to_node == self.config.node
+                || migration.status.completed_at.is_some()
             {
                 continue;
             }
             let name = migration.spec.instance.clone();
+            let Ok(Some(current)) = self.cell.instance(&name).await else {
+                continue;
+            };
+            // A reboot on a later host ends earlier migration requests. A
+            // restart on this source while the request is still open is a
+            // recovery and must be allowed to continue the same migration.
+            if current
+                .status
+                .started_at
+                .is_some_and(|at| at > migration.meta.created_at)
+                && current.status.node.as_deref() != Some(self.config.node.as_str())
+            {
+                continue;
+            }
+            let active = migrations
+                .iter()
+                .filter(|m| {
+                    !m.meta.is_deleting()
+                        && m.status.completed_at.is_none()
+                        && m.spec.instance == name
+                        && m.spec.from_node == self.config.node
+                        && (current
+                            .status
+                            .started_at
+                            .is_none_or(|at| at <= m.meta.created_at)
+                            || current.status.node.as_deref() == Some(self.config.node.as_str()))
+                })
+                .count();
+            if active > 1 {
+                moving.stalled.insert(name.clone());
+                moving.trouble.insert(
+                    name,
+                    "Multiple migration requests target this instance; cancel the duplicates"
+                        .into(),
+                );
+                continue;
+            }
             let here = host.vms.contains_key(&name);
             let running_here = host
                 .vms
                 .get(&name)
                 .map(|vm| vm.state == InstanceState::Running)
                 .unwrap_or(false);
+            let failed_here = host
+                .vms
+                .get(&name)
+                .is_some_and(|vm| vm.state == InstanceState::Failed);
+
+            // A failed VMM is still positive evidence that the guest is on
+            // this source. In particular, QEMU may be alive after its QMP
+            // socket pathname was lost: it cannot be managed or migrated, but
+            // it has not arrived on the destination either. Let the ordinary
+            // instance reconciliation restart that known-local guest first.
+            // Treating it like an absent guest freezes the very repair that
+            // would let the migration continue; treating it like a handover
+            // would release ownership without ever transferring the guest.
+            if failed_here {
+                moving.trouble.insert(
+                    name,
+                    "the source guest failed while migration was pending; it is being restarted automatically"
+                        .into(),
+                );
+                continue;
+            }
 
             // A guest this node reported as running, that is now not running
             // here, is one this node may not start again while a transfer of it
@@ -215,11 +287,14 @@ impl Agent {
             // and so `spec.node` never moved and no migration could finish — even
             // with the guest already running on the destination.
             let still_here = match self.vmm.observe().await {
-                Ok(fresh) => fresh
-                    .vms
-                    .get(&name)
-                    .map(|vm| vm.state == InstanceState::Running)
-                    .unwrap_or(false),
+                Ok(fresh) => {
+                    fresh.sending.contains(&name)
+                        || fresh
+                            .vms
+                            .get(&name)
+                            .map(|vm| vm.state == InstanceState::Running)
+                            .unwrap_or(false)
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "could not re-read this machine after sending");
                     pass.failures += 1;
@@ -269,6 +344,52 @@ impl Agent {
                 _ => continue,
             }
 
+            // A completed sender may leave a stopped VMM holding its disks.
+            // Close that process before handing storage ownership to another node.
+            if let Err(e) = self.vmm.kill(&name).await {
+                moving.trouble.insert(name.clone(), e.to_string());
+                continue;
+            }
+
+            if migration.spec.mode == MigrationMode::Reboot
+                && !self.config.shared_state
+                && self.config.disk_transfer.is_some()
+                && stored
+                    .as_ref()
+                    .is_some_and(|i| i.spec.boot_volume.is_empty())
+            {
+                match self.copy_local_root(migration).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        moving.progress.insert(
+                            name.clone(),
+                            "Copying local root disk to the destination".into(),
+                        );
+                        continue;
+                    }
+                    Err(why) => {
+                        moving.trouble.insert(name.clone(), why);
+                        continue;
+                    }
+                }
+            }
+
+            // Release the source's address before the destination advertises it.
+            // The VM has stopped and any local disks have been copied already.
+            let mut released_ports = true;
+            if let Some(instance) = &stored {
+                for port in &instance.spec.ports {
+                    if let Err(e) = self.datapath.unprogram(port).await {
+                        moving.trouble.insert(name.clone(), e.to_string());
+                        released_ports = false;
+                        break;
+                    }
+                }
+            }
+            if !released_ports {
+                continue;
+            }
+
             // Not gated on `receiver_ready`. It reads as "is the far end ready to
             // receive", and a transfer that has *completed* turns it back off —
             // the receiver is not listening any more, it is running the guest. So
@@ -293,6 +414,57 @@ impl Agent {
             }
         }
         moving
+    }
+
+    async fn copy_local_root(&self, migration: &Migration) -> Result<bool, String> {
+        let uid = &migration.meta.uid;
+        let finished = {
+            let mut tasks = self.disk_copies.lock().unwrap();
+            match tasks.get(uid) {
+                Some(task) if task.is_finished() => tasks.remove(uid),
+                Some(_) => return Ok(false),
+                None => None,
+            }
+        };
+        if let Some(task) = finished {
+            task.await.map_err(|e| e.to_string())??;
+            // Re-read the ask after a long copy; cancellation must not hand over the guest.
+            let current = self.cell.migrations().await.map_err(|e| e.to_string())?;
+            if !current
+                .iter()
+                .any(|m| m.meta.uid == *uid && !m.meta.is_deleting() && m.spec == migration.spec)
+            {
+                return Err("migration changed or was cancelled during disk transfer".into());
+            }
+            return Ok(true);
+        }
+        let config = self
+            .config
+            .disk_transfer
+            .clone()
+            .ok_or("local disk transfer is not configured")?;
+        if !config.peers.contains_key(&migration.spec.to_node) {
+            return Err("destination has no configured disk-transfer peer".into());
+        }
+        let source = self
+            .vmm
+            .disk_path(&migration.spec.instance)
+            .ok_or("local root disk is missing")?;
+        let m = migration.clone();
+        let task = tokio::spawn(async move {
+            config
+                .copy(
+                    &m.spec.to_node,
+                    &m.spec.instance,
+                    &m.meta.uid,
+                    &source,
+                    m.spec.timeout_s,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        });
+        self.disk_copies.lock().unwrap().insert(uid.clone(), task);
+        Ok(false)
     }
 
     /// Do one thing, and say whether anything was done.
@@ -475,7 +647,7 @@ impl Agent {
     ) {
         let mine: Vec<&Migration> = migrations
             .iter()
-            .filter(|m| m.spec.to_node == self.config.node)
+            .filter(|m| m.spec.to_node == self.config.node && m.status.completed_at.is_none())
             .collect();
 
         // A receiver with no migration behind it belongs to nobody. It happens
@@ -607,6 +779,17 @@ impl Agent {
             let mut next = migration.clone();
             next.status.node = Some(self.config.node.clone());
             next.status.observed_generation = migration.meta.generation;
+            if next.status.completed_at.is_none()
+                && instance
+                    .as_ref()
+                    .is_some_and(|i| velstra_cloud_model::migration::arrived(migration, i))
+                && fresh
+                    .vms
+                    .get(&name)
+                    .is_some_and(|vm| vm.state == InstanceState::Running)
+            {
+                next.status.completed_at = Some(velstra_cloud_model::meta::Timestamp::now());
+            }
             next.status.receiver_url = receiver.map(|r| r.url.clone());
             next.status.receiver_ready = receiver.is_some();
             // Zero when nothing is listening any more, because that is what
@@ -687,7 +870,7 @@ impl Agent {
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        if !host.disks.contains(name) {
+        if instance.spec.boot_volume.is_empty() && !host.disks.contains(name) {
             let image_format = cell
                 .images
                 .get(&instance.spec.image)
@@ -707,6 +890,20 @@ impl Agent {
                 .map_err(|e| e.to_string())?;
         }
 
+        let mut ports = ports.clone();
+        // Node-scoped lists still assign these ports to the source. Read only
+        // the incoming guest's ports explicitly before preparing its receiver.
+        for name in &instance.spec.ports {
+            if !ports.contains_key(name) {
+                let port = self
+                    .cell
+                    .port(name)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("{name} is not in the store yet"))?;
+                ports.insert(name.clone(), port);
+            }
+        }
         let mut taps = taps.clone();
         for port in &instance.spec.ports {
             if taps.contains_key(port) {
@@ -724,10 +921,10 @@ impl Agent {
                     stored.spec.network
                 ));
             };
-            let rules = self.rules_for(&stored.spec, groups, ports);
+            let rules = self.rules_for(&stored.spec, groups, &ports);
             let tap = self
                 .datapath
-                .program(port, &stored.spec, network, &rules)
+                .prepare_incoming(port, &stored.spec, network, &rules)
                 .await
                 .map_err(|e| e.to_string())?;
             taps.insert(port.clone(), tap);
@@ -748,10 +945,11 @@ impl Agent {
         // has already pointed the attachment at this node; if it has not yet,
         // this says so rather than building a receiver with the wrong disk.
         let boot_disk = self.boot_disk_for(instance).await?;
+        let cloud_init = self.cloud_init_seed(instance, &ports, &taps, cell).await;
         let request = self.vm_request(
             instance,
             &taps,
-            ports,
+            &ports,
             cell.images
                 .get(&instance.spec.image)
                 .map(|i| i.digest.as_str())
@@ -761,6 +959,7 @@ impl Agent {
                 devices,
                 boot_disk,
             },
+            cloud_init,
         )?;
         self.vmm
             .prepare_receiver(&request, mode)

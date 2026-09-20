@@ -237,32 +237,32 @@ impl Reconciler for CephController {
             ),
             CephStep::Blocked { why } => (ConditionStatus::False, "Blocked", why.clone()),
             CephStep::Bootstrap { node } => (
-                ConditionStatus::False,
+                ConditionStatus::Unknown,
                 "Bootstrapping",
                 format!("waiting for {node} to create the cluster"),
             ),
             CephStep::TrustKey { node, .. } => (
-                ConditionStatus::False,
+                ConditionStatus::Unknown,
                 "Expanding",
                 format!("waiting for {node} to trust the cluster's SSH key"),
             ),
             CephStep::AddHost { node, address, .. } => (
-                ConditionStatus::False,
+                ConditionStatus::Unknown,
                 "Expanding",
                 format!("waiting for {node} to be added to the cluster at {address}"),
             ),
             CephStep::AddMonitor { node } => (
-                ConditionStatus::False,
+                ConditionStatus::Unknown,
                 "Expanding",
                 format!("waiting for a monitor on {node}"),
             ),
             CephStep::AddOsd { node, device } => (
-                ConditionStatus::False,
+                ConditionStatus::Unknown,
                 "Expanding",
                 format!("waiting for {node} to make an OSD of {device}"),
             ),
             CephStep::CreatePool { pool } => (
-                ConditionStatus::False,
+                ConditionStatus::Unknown,
                 "Expanding",
                 format!("waiting for the pool {}", pool.pool),
             ),
@@ -415,7 +415,7 @@ mod tests {
             .iter()
             .find(|c| c.kind == READY)
             .expect("a Ready condition");
-        assert_eq!(ready.status, ConditionStatus::False);
+        assert_eq!(ready.status, ConditionStatus::Unknown);
         assert!(ready.message.contains('a'), "{}", ready.message);
     }
 

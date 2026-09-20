@@ -121,6 +121,36 @@ impl QemuVmm {
         self.layout.dir(instance).join("incoming-qmp.sock")
     }
 
+    async fn write_cloud_init_seed(&self, request: &VmRequest) -> Result<()> {
+        let Some(seed) = &request.cloud_init else {
+            return Ok(());
+        };
+        let dir = self.layout.dir(&request.instance);
+        let source = dir.join("cloud-init");
+        std::fs::create_dir_all(&source)?;
+        std::fs::write(source.join("meta-data"), &seed.meta_data)?;
+        std::fs::write(source.join("user-data"), &seed.user_data)?;
+        std::fs::write(source.join("network-config"), &seed.network_config)?;
+        let output = dir.join("seed.iso.new");
+        let final_path = dir.join("seed.iso");
+        let _ = std::fs::remove_file(&output);
+        let result = tokio::process::Command::new("genisoimage")
+            .args(["-quiet", "-volid", "cidata", "-joliet", "-rock", "-output"])
+            .arg(&output)
+            .arg(&source)
+            .output()
+            .await
+            .map_err(|e| HostError::failed(format!("could not run genisoimage: {e}")))?;
+        if !result.status.success() {
+            return Err(HostError::failed(format!(
+                "genisoimage could not build the cloud-init seed: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            )));
+        }
+        std::fs::rename(output, final_path)?;
+        Ok(())
+    }
+
     /// Which of the two VMMs is this guest's, right now. The ordinary pair wins
     /// when both are there, which is the state during a transfer: the guest is
     /// still the outgoing one until it is not.
@@ -153,26 +183,52 @@ impl QemuVmm {
     /// paths, which must ask the *incoming* VMM even while the outgoing one is
     /// still answering on its own socket.
     async fn qmp_at(&self, socket: &Path, command: &str, arguments: Value) -> Result<Value> {
-        let socket = socket.to_path_buf();
-        let stream = tokio::net::UnixStream::connect(&socket)
-            .await
-            .map_err(|e| {
-                HostError::failed(format!("{} is not answering: {e}", socket.display()))
-            })?;
-        let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read).lines();
-
-        // The greeting comes first, unasked. Then capabilities negotiation,
-        // which QEMU requires before it will accept anything else.
-        let _greeting = lines.next_line().await?;
-        ask(&mut write, &json!({ "execute": "qmp_capabilities" })).await?;
-        answer(&mut lines, "qmp_capabilities").await?;
-        ask(
-            &mut write,
-            &json!({ "execute": command, "arguments": arguments }),
+        self.qmp_at_with_timeout(
+            socket,
+            command,
+            arguments,
+            std::time::Duration::from_secs(5),
         )
-        .await?;
-        answer(&mut lines, command).await
+        .await
+    }
+
+    async fn qmp_at_with_timeout(
+        &self,
+        socket: &Path,
+        command: &str,
+        arguments: Value,
+        limit: std::time::Duration,
+    ) -> Result<Value> {
+        let socket = socket.to_path_buf();
+        tokio::time::timeout(limit, async {
+            let stream = tokio::net::UnixStream::connect(&socket)
+                .await
+                .map_err(|e| {
+                    HostError::failed(format!("{} is not answering: {e}", socket.display()))
+                })?;
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+
+            // The greeting comes first, unasked. Then capabilities negotiation,
+            // which QEMU requires before it will accept anything else.
+            let _greeting = lines.next_line().await?;
+            ask(&mut write, &json!({ "execute": "qmp_capabilities" })).await?;
+            answer(&mut lines, "qmp_capabilities").await?;
+            ask(
+                &mut write,
+                &json!({ "execute": command, "arguments": arguments }),
+            )
+            .await?;
+            answer(&mut lines, command).await
+        })
+        .await
+        .map_err(|_| {
+            HostError::failed(format!(
+                "{} did not answer {command} within {} seconds",
+                socket.display(),
+                limit.as_secs_f32()
+            ))
+        })?
     }
 
     /// **Untested:** needs a live QEMU. Whether a transfer this node started is
@@ -242,15 +298,8 @@ impl QemuVmm {
     ///   "qdev": "/machine/peripheral/projects_p1_volumes_data/virtio-backend",
     ///   "inserted": { "node-name": "projects_p1_volumes_data" } }
     /// ```
-    ///
-    /// `device` is empty for anything added this way, and `qdev` is a QOM path
-    /// with the id buried in the middle of it. Reading `qdev` first dropped every
-    /// entry on the floor, which left `attached` false and had the agent plug the
-    /// same disk in once a pass for ever — `Duplicate nodes with node-name='…'`,
-    /// while the guest ran with the disk perfectly well attached.
-    ///
-    /// Best-effort: a VMM that will not answer is a VMM whose guest is in
-    /// trouble for larger reasons, and the pass has plenty else to report.
+    /// Device IDs preserve the resource name; block node names must fit in
+    /// QEMU's 31-byte limit. Older guests identify their volumes by node name.
     async fn open_volumes(&self, instance: &str) -> Vec<(String, String)> {
         let Ok(answer) = self.qmp(instance, "query-block", json!({})).await else {
             return Vec::new();
@@ -258,19 +307,7 @@ impl QemuVmm {
         let Some(devices) = answer.as_array() else {
             return Vec::new();
         };
-        devices
-            .iter()
-            .filter_map(|d| {
-                let id = d
-                    .get("inserted")
-                    .and_then(|i| i.get("node-name"))
-                    .and_then(|v| v.as_str())?;
-                // The root disk and anything else QEMU named for itself
-                // (`#block156`) are not ours, and `from_qmp_id` says so.
-                let volume = crate::hostfs::from_qmp_id(id)?;
-                Some((volume, id.to_string()))
-            })
-            .collect()
+        devices.iter().filter_map(volume_from_block).collect()
     }
 
     /// What every disk this guest holds has moved, added up.
@@ -414,9 +451,19 @@ impl Vmm for QemuVmm {
                 // was told `Stopped`, the console was empty, and the reason
                 // existed only in the unit's journal. Found live, from a CPU
                 // baseline this platform advised.
-                if let Some(why) =
+                let ordinary_active =
+                    hostfs::unit_is_active(self.layout.scope, &self.unit(&instance)).await;
+                let incoming_active =
+                    hostfs::unit_is_active(self.layout.scope, &self.incoming_unit(&instance)).await;
+                let failure = if ordinary_active || incoming_active {
+                    Some(
+                        "the guest process is active but its QMP monitor socket is missing; it will be restarted automatically"
+                            .to_string(),
+                    )
+                } else {
                     hostfs::unit_failure(self.layout.scope, &self.unit(&instance)).await
-                {
+                };
+                if let Some(why) = failure {
                     host.vms.insert(
                         instance,
                         VmObservation {
@@ -605,7 +652,52 @@ impl Vmm for QemuVmm {
     async fn start(&self, request: &VmRequest) -> Result<()> {
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
+        self.write_cloud_init_seed(request).await?;
         let monitor = self.monitor(&request.instance);
+
+        // Reconciliation may ask for a start from a status observation that
+        // raced with QEMU or with another pass. Never unlink the control socket
+        // of a healthy process: QEMU keeps the listening file descriptor, but
+        // once its pathname is removed there is no way to reconnect and every
+        // later migration stalls without moving a byte.
+        let ordinary_unit = self.unit(&request.instance);
+        let incoming_unit = self.incoming_unit(&request.instance);
+        let ordinary_active = hostfs::unit_is_active(self.layout.scope, &ordinary_unit).await;
+        let incoming_active = hostfs::unit_is_active(self.layout.scope, &incoming_unit).await;
+
+        if ordinary_active && self.run_state_at(&monitor).await.is_some() {
+            return Ok(());
+        }
+        if incoming_active {
+            let incoming_monitor = self.incoming_monitor(&request.instance);
+            if self
+                .run_state_at(&incoming_monitor)
+                .await
+                .is_some_and(|state| state != "inmigrate")
+            {
+                return Ok(());
+            }
+        }
+
+        for unit in [
+            ordinary_active.then_some(ordinary_unit),
+            incoming_active.then_some(incoming_unit),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // An active VMM whose monitor is missing or no longer answers
+            // cannot be managed or migrated. Replace it in one bounded,
+            // observable operation so desired-state reconciliation repairs the
+            // fault without an operator having to restart the guest by hand.
+            hostfs::stop_unit(self.layout.scope, &unit).await;
+            if hostfs::unit_is_active(self.layout.scope, &unit).await {
+                return Err(HostError::failed(format!(
+                    "{} is active but its monitor is not answering, and {unit} did not stop",
+                    request.instance,
+                )));
+            }
+        }
         // A socket left by a dead VMM would stop the new one binding.
         let _ = std::fs::remove_file(&monitor);
         hostfs::systemd_run(
@@ -636,6 +728,14 @@ impl Vmm for QemuVmm {
         // because this is a stop and not a delete.
         let _ = self.qmp(instance, "quit", json!({})).await;
         hostfs::stop_unit(self.layout.scope, &self.unit(instance)).await;
+        hostfs::stop_unit(self.layout.scope, &self.incoming_unit(instance)).await;
+        if hostfs::unit_is_active(self.layout.scope, &self.unit(instance)).await
+            || hostfs::unit_is_active(self.layout.scope, &self.incoming_unit(instance)).await
+        {
+            return Err(HostError::failed(
+                "the guest process is still active after stopping it",
+            ));
+        }
         // And the sockets go, because a socket file outlives the process
         // listening on it and `observe` reads its presence as "a VMM was asked
         // for here".
@@ -679,6 +779,7 @@ impl Vmm for QemuVmm {
     ) -> Result<String> {
         // Not `slug`: QEMU refuses `~` in a node-name. See `hostfs::qmp_id`.
         let id = crate::hostfs::qmp_id(volume);
+        let node = block_node_name(volume);
         // `qcow2` for a file, because that is what the directory pool writes and
         // opening a qcow2 as `raw` hands the guest the image header as its first
         // sector. Ceph names itself.
@@ -696,7 +797,7 @@ impl Vmm for QemuVmm {
             instance,
             "blockdev-add",
             json!({
-                "node-name": id,
+                "node-name": node,
                 "driver": driver,
                 "read-only": read_only,
                 "file": file,
@@ -706,7 +807,7 @@ impl Vmm for QemuVmm {
         self.qmp(
             instance,
             "device_add",
-            json!({ "driver": "virtio-blk-pci", "drive": id, "id": id }),
+            json!({ "driver": "virtio-blk-pci", "drive": node, "id": id }),
         )
         .await?;
         // The ceiling, if there is one. `block_set_io_throttle` rather than
@@ -735,9 +836,10 @@ impl Vmm for QemuVmm {
     /// **Untested:** unplugs the device and drops the block node behind it.
     async fn close_volume(&self, instance: &str, volume: &str) -> Result<()> {
         let id = crate::hostfs::qmp_id(volume);
+        let node = block_node_name(volume);
         self.qmp(instance, "device_del", json!({ "id": id }))
             .await?;
-        self.qmp(instance, "blockdev-del", json!({ "node-name": id }))
+        self.qmp(instance, "blockdev-del", json!({ "node-name": node }))
             .await
             .map(|_| ())
     }
@@ -755,8 +857,15 @@ impl Vmm for QemuVmm {
         if let Some(receiver) = self.observe_receiver(&request.instance).await {
             return Ok(receiver.url);
         }
+        if hostfs::unit_is_active(self.layout.scope, &self.incoming_unit(&request.instance)).await {
+            return Err(HostError::failed(format!(
+                "the receiver for {} is active but its monitor is not answering",
+                request.instance
+            )));
+        }
         let dir = self.layout.dir(&request.instance);
         std::fs::create_dir_all(&dir)?;
+        self.write_cloud_init_seed(request).await?;
         // A guest booting from a volume keeps its root disk in a pool, not on
         // this filesystem, and the receiver opens it by the same place the
         // sender did — which is the arrangement that makes the move possible
@@ -1012,6 +1121,36 @@ fn levels_listed(listing: &str) -> bool {
         .all(|l| listing.contains(&l.to_string()))
 }
 
+/// QEMU block node names are limited to 31 bytes. Keep short historical IDs
+/// stable and use a deterministic digest for longer resource names.
+fn block_node_name(volume: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let id = crate::hostfs::qmp_id(volume);
+    if id.len() <= 31 {
+        id
+    } else {
+        format!("v{:x}", Sha256::digest(volume.as_bytes()))[..31].to_string()
+    }
+}
+
+fn volume_from_block(block: &serde_json::Value) -> Option<(String, String)> {
+    let device = block.get("device").and_then(|v| v.as_str()).into_iter();
+    let qdev = block
+        .get("qdev")
+        .and_then(|v| v.as_str())
+        .into_iter()
+        .flat_map(|path| path.split('/'));
+    let node = block
+        .get("inserted")
+        .and_then(|i| i.get("node-name"))
+        .and_then(|v| v.as_str())
+        .into_iter();
+    device
+        .chain(qdev)
+        .chain(node)
+        .find_map(|id| crate::hostfs::from_qmp_id(id).map(|volume| (volume, id.to_string())))
+}
+
 /// The `-drive` the guest boots from.
 ///
 /// Two shapes, and the difference is where the disk lives rather than what the
@@ -1032,15 +1171,30 @@ fn boot_drive(request: &VmRequest, layout: &Layout) -> OsString {
         )
         .into();
     };
+    let identity = request
+        .boot_volume
+        .as_deref()
+        .map(|v| {
+            format!(
+                ",id={},node-name={}",
+                crate::hostfs::qmp_id(v),
+                block_node_name(v)
+            )
+        })
+        .unwrap_or_default();
     if let Some(rbd) = crate::ceph_access::split(place) {
-        return format!("{},format=raw,if=virtio", layout.ceph.drive_options(&rbd)).into();
+        return format!(
+            "{},format=raw,if=virtio{identity}",
+            layout.ceph.drive_options(&rbd)
+        )
+        .into();
     }
     let format = if place.ends_with(".qcow2") {
         "qcow2"
     } else {
         "raw"
     };
-    format!("file={place},format={format},if=virtio").into()
+    format!("file={place},format={format},if=virtio{identity}").into()
 }
 
 fn qemu_args(
@@ -1082,6 +1236,13 @@ fn qemu_args(
         // a window.
         "-device".into(),
         "VGA".into(),
+        // Give systemd and guest agents a real local AF_VSOCK identity. Stock
+        // Debian queries it during early boot; without a vsock device it logs
+        // `Failed to query local AF_VSOCK CID` even though the kernel keeps
+        // booting. The CID is stable across restart and migration because it is
+        // derived from the resource name, and never uses the reserved 0..=2.
+        "-device".into(),
+        format!("vhost-vsock-pci,guest-cid={}", vsock_cid(&request.instance)).into(),
         // Where the guest's cloud-init is told to look.
         //
         // This platform serves NoCloud (`/meta-data`, `/user-data`) and EC2
@@ -1096,20 +1257,17 @@ fn qemu_args(
         // want of host keys cloud-init would have generated. Every guest this
         // platform ever started from a public image was that guest.
         //
-        // `ds=nocloud;s=<url>` in the SMBIOS system serial is the documented way
-        // to say it (cloud-init 21.3 and later), and it is preferred over the
+        // `ds=nocloud-net;s=<url>` in the SMBIOS system serial is the fallback
+        // for old requests which carry no local seed. New requests attach a
+        // cidata drive below so that first-boot network config is available
+        // before the guest has network access. The explicit hint is preferred
+        // over the
         // alternative — claiming to be Amazon EC2 or OpenStack in DMI so that
         // ds-identify guesses right — because this platform is neither, and a
         // guest that believes it is on EC2 makes decisions on that basis.
         //
         // The trailing slash is load-bearing: cloud-init appends `meta-data` and
         // `user-data` to it.
-        "-smbios".into(),
-        format!(
-            "type=1,serial=ds=nocloud;s=http://{}/",
-            crate::metadata::ADDRESS
-        )
-        .into(),
         "-smp".into(),
         request.vcpus.to_string().into(),
         "-m".into(),
@@ -1152,6 +1310,26 @@ fn qemu_args(
         "-vnc".into(),
         format!("unix:{}", layout.vnc_socket(&request.instance).display()).into(),
     ];
+    if request.cloud_init.is_none() {
+        args.push("-smbios".into());
+        args.push(
+            format!(
+                "type=1,serial=ds=nocloud-net;s=http://{}/",
+                crate::metadata::ADDRESS
+            )
+            .into(),
+        );
+    }
+    if request.cloud_init.is_some() {
+        args.push("-drive".into());
+        args.push(
+            format!(
+                "file={},format=raw,if=virtio,readonly=on",
+                layout.dir(&request.instance).join("seed.iso").display()
+            )
+            .into(),
+        );
+    }
     // Passed-through hardware. `vfio-pci` is the only device model here:
     // whole-device passthrough is all this platform offers, and a mediated
     // device would need a `sysfsdev` this build has nothing to fill in with.
@@ -1210,6 +1388,13 @@ fn qemu_args(
         args.push(incoming.into());
     }
     args
+}
+
+fn vsock_cid(instance: &str) -> u32 {
+    let hash = instance.bytes().fold(2_166_136_261u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    });
+    3 + hash % (u32::MAX - 3)
 }
 
 /// What to set before a transfer starts.
@@ -1331,6 +1516,7 @@ mod tests {
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
             boot_disk: None,
+            boot_volume: None,
             nics: vec![
                 Nic {
                     tap: "vt-a".into(),
@@ -1342,6 +1528,7 @@ mod tests {
                 },
             ],
             cpu_baseline: None,
+            cloud_init: None,
         }
     }
 
@@ -1362,6 +1549,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_unresponsive_monitor_cannot_stop_the_agent_pass() {
+        let dir = std::env::temp_dir().join(format!("qmp-stuck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("qmp.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let vmm = QemuVmm::new(layout());
+
+        let started = std::time::Instant::now();
+        let error = vmm
+            .qmp_at_with_timeout(
+                &socket,
+                "query-status",
+                json!({}),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// **A guest that boots from a volume boots that volume, not a local file.**
     ///
     /// The whole point of booting from a volume is that the root disk is not on
@@ -1369,6 +1584,19 @@ mod tests {
     /// the machine it was made on, because moving a guest does not move its
     /// disk. A command line that named `root.raw` anyway would hand somebody an
     /// empty local disk with their volume alongside it as a second drive.
+    #[test]
+    fn boot_volume_keeps_its_observable_resource_identity() {
+        let mut wants = request();
+        wants.boot_disk = Some("rbd:tenant-volumes/projects~p1~volumes~root".into());
+        wants.boot_volume = Some("projects/p1/volumes/root".into());
+        let drive = boot_drive(&wants, &layout()).to_string_lossy().into_owned();
+        assert!(drive.contains("node-name=projects_p1_volumes_root"));
+        assert_eq!(
+            crate::hostfs::from_qmp_id("projects_p1_volumes_root").as_deref(),
+            Some("projects/p1/volumes/root")
+        );
+    }
+
     #[test]
     fn a_guest_with_a_boot_volume_boots_it() {
         let mut wants = request();
@@ -1502,7 +1730,7 @@ mod tests {
             .map(|w| w[1].clone())
             .unwrap_or_else(|| panic!("no datasource hint at all: {args:?}"));
         // The serial, because that is the field ds-identify reads.
-        assert!(hint.starts_with("type=1,serial=ds=nocloud;"), "{hint}");
+        assert!(hint.starts_with("type=1,serial=ds=nocloud-net;"), "{hint}");
         // The address the DHCP responder hands out, from the same constant, so
         // the two cannot drift apart.
         assert!(
@@ -1512,6 +1740,47 @@ mod tests {
         // The trailing slash is load-bearing: cloud-init appends `meta-data`
         // and `user-data` to it, and without it they land a directory up.
         assert!(hint.ends_with('/'), "{hint}");
+    }
+
+    #[test]
+    fn first_boot_networking_arrives_on_a_local_seed_drive() {
+        let layout = layout();
+        let mut request = request();
+        request.cloud_init = Some(crate::host::CloudInitSeed {
+            meta_data: "instance-id: i1\n".into(),
+            user_data: String::new(),
+            network_config: "version: 2\n".into(),
+        });
+        let args = words(&qemu_args(
+            &layout,
+            &request,
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let drive = args
+            .windows(2)
+            .find(|words| words[0] == "-drive" && words[1].contains("seed.iso"))
+            .map(|words| words[1].clone())
+            .expect("a seed drive");
+        assert!(drive.contains("seed.iso"), "{drive}");
+        assert!(drive.contains("readonly=on"), "{drive}");
+        assert!(drive.contains("if=virtio"), "{drive}");
+        let root = args
+            .windows(2)
+            .position(|words| words[0] == "-drive" && words[1].contains("root.raw"))
+            .expect("root drive");
+        let seed = args
+            .windows(2)
+            .position(|words| words[0] == "-drive" && words[1].contains("seed.iso"))
+            .expect("seed drive");
+        assert!(root < seed, "root disk must remain the first virtio disk");
+        assert!(
+            !args.iter().any(|word| word == "-smbios"),
+            "the remote datasource must not override the local seed: {args:?}"
+        );
+        assert!(args.windows(2).any(|words| {
+            words[0] == "-device" && words[1].starts_with("vhost-vsock-pci,guest-cid=")
+        }));
     }
 
     /// The console is a socket now, and the log did not stop being a log.
@@ -1858,25 +2127,31 @@ mod what_query_block_really_answers {
                       "file": "/var/lib/velstra/pool/projects~p1~volumes~data.qcow2" } }
     ]"##;
 
-    /// The reading `open_volumes` does, on the answer above.
-    ///
-    /// A copy of the filter rather than a call, because `open_volumes` needs a
-    /// live QMP socket. What it protects is the part that was wrong: which field
-    /// carries the id.
     fn volumes(answer: &serde_json::Value) -> Vec<(String, String)> {
         answer
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|d| {
-                let id = d
-                    .get("inserted")
-                    .and_then(|i| i.get("node-name"))
-                    .and_then(|v| v.as_str())?;
-                let volume = crate::hostfs::from_qmp_id(id)?;
-                Some((volume, id.to_string()))
-            })
+            .filter_map(super::volume_from_block)
             .collect()
+    }
+
+    #[test]
+    fn long_volume_names_keep_their_identity_with_short_block_nodes() {
+        let name = "projects/long-project-name/volumes/a-long-root-volume-name";
+        let id = crate::hostfs::qmp_id(name);
+        let node = super::block_node_name(name);
+        assert_eq!(node.len(), 31);
+        assert_ne!(node, super::block_node_name(&format!("{name}-other")));
+        for block in [
+            serde_json::json!({"device": id, "inserted": {"node-name": node}}),
+            serde_json::json!({"device": "", "qdev": format!("/machine/peripheral/{id}/virtio-backend"), "inserted": {"node-name": node}}),
+        ] {
+            assert_eq!(
+                super::volume_from_block(&block),
+                Some((name.into(), id.clone()))
+            );
+        }
     }
 
     #[test]

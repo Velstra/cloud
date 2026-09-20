@@ -819,11 +819,16 @@ fn vmm_args(layout: &Layout, request: &VmRequest, socket: &std::path::Path) -> V
         // turned away in `start`, with the reason, rather than handed over as
         // a filename that was never one.
         format!(
-            "path={}",
+            "path={}{}",
             request
                 .boot_disk
                 .clone()
-                .unwrap_or_else(|| layout.disk(&request.instance).display().to_string())
+                .unwrap_or_else(|| layout.disk(&request.instance).display().to_string()),
+            request
+                .boot_volume
+                .as_deref()
+                .map(|v| format!(",id={}", hostfs::slug(v)))
+                .unwrap_or_default()
         )
         .into(),
         // To a file, always: a guest that will not boot is the one with the most
@@ -1492,8 +1497,10 @@ mod tests {
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
             boot_disk: None,
+            boot_volume: None,
             nics: vec![],
             cpu_baseline: None,
+            cloud_init: None,
         };
         let err = vmm
             .prepare_receiver(&request, MigrationMode::Live)
@@ -1612,6 +1619,7 @@ mod tests {
             image: "projects/p1/images/sha256-abc".into(),
             root_disk_gib: 20,
             boot_disk: None,
+            boot_volume: None,
             nics: vec![
                 Nic {
                     tap: "vt-a".into(),
@@ -1623,6 +1631,7 @@ mod tests {
                 },
             ],
             cpu_baseline: None,
+            cloud_init: None,
         };
         let args = words(&vmm_args(
             &Layout::default(),

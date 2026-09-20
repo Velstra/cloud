@@ -60,6 +60,12 @@ use crate::host::{HostError, Result};
 /// API and get the ones this pool holds or has been given.
 #[async_trait]
 pub trait PoolReader: Send + Sync + 'static {
+    /// Changes are hints; the periodic reconciliation remains the fallback.
+    async fn wake(&self) -> tokio::sync::mpsc::Receiver<()> {
+        let (_, rx) = tokio::sync::mpsc::channel(1);
+        rx
+    }
+
     async fn volumes(&self) -> Result<Vec<velstra_cloud_model::resources::Volume>>;
     async fn snapshots(&self) -> Result<Vec<velstra_cloud_model::resources::Snapshot>>;
     /// The copies asked for, and the targets they go to.
@@ -142,6 +148,28 @@ impl StorePool {
 
 #[async_trait]
 impl PoolReader for StorePool {
+    async fn wake(&self) -> tokio::sync::mpsc::Receiver<()> {
+        let from = self.volumes.revision().await.ok();
+        let mut streams = vec![
+            self.volumes.watch(from),
+            self.snapshots.watch(from),
+            self.backups.watch(from),
+        ];
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    event = futures_lite_select(&mut streams) => {
+                        if event.is_none() { return; }
+                        let _ = tx.try_send(());
+                    }
+                }
+            }
+        });
+        rx
+    }
+
     async fn volumes(&self) -> Result<Vec<velstra_cloud_model::resources::Volume>> {
         self.volumes.list().await.map_err(|e| failed("volumes", e))
     }
@@ -182,7 +210,23 @@ pub trait CellReader: Send + Sync + 'static {
     /// The instances this node holds or has been given.
     async fn instances(&self) -> Result<Vec<Instance>>;
     async fn attachments(&self) -> Result<Vec<Attachment>>;
+    /// A migration receiver needs the source's boot attachment before ownership moves.
+    async fn attachment(&self, name: &str) -> Result<Option<Attachment>> {
+        Ok(self
+            .attachments()
+            .await?
+            .into_iter()
+            .find(|a| a.meta.name.to_string() == name))
+    }
+
     async fn ports(&self) -> Result<Vec<Port>>;
+    async fn port(&self, name: &str) -> Result<Option<Port>> {
+        Ok(self
+            .ports()
+            .await?
+            .into_iter()
+            .find(|p| p.meta.name.to_string() == name))
+    }
     /// Migrations with this node at either end.
     async fn migrations(&self) -> Result<Vec<Migration>>;
 

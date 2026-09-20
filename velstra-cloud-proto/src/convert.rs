@@ -429,6 +429,7 @@ impl From<&resources::NodeStatus> for v1::NodeStatus {
             console_tls: s.console_tls,
             balancers: s.balancers.clone(),
             shared_state: s.shared_state,
+            local_migration_targets: s.local_migration_targets.clone(),
             fetching: s.fetching.clone(),
             last_heartbeat: millis(s.last_heartbeat),
             images: s.images.clone(),
@@ -954,6 +955,7 @@ impl From<&v1::NodeStatus> for resources::NodeStatus {
             console_tls: s.console_tls,
             balancers: s.balancers.clone(),
             shared_state: s.shared_state,
+            local_migration_targets: s.local_migration_targets.clone(),
             fetching: s.fetching.clone(),
             last_heartbeat: timestamp(s.last_heartbeat),
             images: s.images.clone(),
@@ -1050,6 +1052,9 @@ impl From<&resources::ImageStatus> for v1::ImageStatus {
         Self {
             observed_generation: s.observed_generation,
             conditions: conditions_out(&s.conditions),
+            verified_digest: s.verified_digest.clone(),
+            verified_source_url: s.verified_source_url.clone(),
+            verified_size_bytes: s.verified_size_bytes,
         }
     }
 }
@@ -1059,6 +1064,9 @@ impl From<&v1::ImageStatus> for resources::ImageStatus {
         Self {
             observed_generation: s.observed_generation,
             conditions: conditions_in(&s.conditions),
+            verified_digest: s.verified_digest.clone(),
+            verified_source_url: s.verified_source_url.clone(),
+            verified_size_bytes: s.verified_size_bytes,
         }
     }
 }
@@ -1861,6 +1869,7 @@ impl From<&migration::MigrationStatus> for v1::MigrationStatus {
             receiver_url: s.receiver_url.clone(),
             receiver_ready: s.receiver_ready,
             transferred_mib: s.transferred_mib,
+            completed_at: s.completed_at.map(|at| at.0),
         }
     }
 }
@@ -1874,6 +1883,7 @@ impl From<&v1::MigrationStatus> for migration::MigrationStatus {
             receiver_url: s.receiver_url.clone(),
             receiver_ready: s.receiver_ready,
             transferred_mib: s.transferred_mib,
+            completed_at: s.completed_at.map(meta::Timestamp),
         }
     }
 }

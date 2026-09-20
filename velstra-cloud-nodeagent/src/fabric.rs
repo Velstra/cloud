@@ -510,6 +510,21 @@ impl Datapath for FabricDatapath {
         same_rules(there, &wanted)
     }
 
+    async fn prepare_incoming(
+        &self,
+        port: &str,
+        _spec: &PortSpec,
+        network: &NetworkSpec,
+        rules: &[ResolvedRule],
+    ) -> Result<String> {
+        translate_all(rules)?;
+        // The source still owns the address. An unadvertised tap is enough for
+        // QEMU's receiver; normal reconciliation activates it after handover.
+        self.taps
+            .program(port, &PortSpec::default(), network, &[])
+            .await
+    }
+
     async fn program(
         &self,
         port: &str,
@@ -640,6 +655,12 @@ impl Datapath for FabricDatapath {
                 })
                 .await
                 .map_err(|e| HostError::failed(format!("removing {port} from the fabric: {e}")))?;
+        }
+
+        // A completed migration may already have bound this group on the
+        // destination. Source cleanup must not remove the destination's policy.
+        if ports.iter().any(|p| p.tap == tap && p.host != self.host) {
+            return Ok(());
         }
 
         // After the port and never before: the fabric refuses to remove a group

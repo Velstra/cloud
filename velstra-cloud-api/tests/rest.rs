@@ -1668,6 +1668,25 @@ async fn running_guest(h: &Harness) -> String {
         )
         .await
         .unwrap();
+    let mut verified = image
+        .get("projects/p1/images/sha256-abc")
+        .await
+        .unwrap()
+        .unwrap();
+    verified.status.observed_generation = verified.meta.generation;
+    verified.status.verified_digest = verified.spec.digest.clone();
+    verified.status.verified_source_url = verified.spec.source_url.clone();
+    velstra_cloud_model::meta::set_condition(
+        &mut verified.status.conditions,
+        Condition::ready(verified.meta.generation),
+    );
+    image
+        .update(
+            &verified,
+            &velstra_cloud_model::access::Writer::controller("image-verifier"),
+        )
+        .await
+        .unwrap();
 
     let name = h
         .instance(
@@ -1754,6 +1773,67 @@ async fn explain_migration_gives_every_node_a_verdict() {
     assert!(
         tiny["detail"].as_str().unwrap().contains("4096 MiB"),
         "the numbers behind the refusal are the answer: {tiny}"
+    );
+}
+
+#[tokio::test]
+async fn a_silent_destination_is_not_offered_or_given_a_migration() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    let name = running_guest(&h).await;
+    let mut silent = h.nodes().get("nodes/node-b").await.unwrap().unwrap();
+    silent.status.last_heartbeat = velstra_cloud_model::meta::Timestamp(
+        velstra_cloud_model::meta::Timestamp::now().0
+            - velstra_cloud_model::ceph::NODE_STALE_AFTER_MS
+            - 1,
+    );
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "nodes", "nodes/node-b"),
+            serde_json::to_vec(&silent).unwrap(),
+            velstra_cloud_store::Expect::Revision(silent.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    let answer = h.get(&format!("{name}:explainMigration")).await;
+    let destination = answer.body["destinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["node"] == json!("node-b"))
+        .unwrap();
+    assert_eq!(destination["allowed"], json!(false));
+    assert_eq!(destination["why"], json!("DestinationUnreachable"));
+    assert!(
+        destination["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not reported")
+    );
+
+    let refused = h
+        .post(
+            "projects/p1/migrations",
+            json!({ "id": "m1", "spec": {
+                "instance": name,
+                "toNode": "node-b"
+            }}),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.field(), "spec.toNode");
+    assert!(refused.body.to_string().contains("has not reported"));
+    assert!(
+        h.get("projects/p1/migrations").await.body["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -1879,6 +1959,29 @@ async fn migrate(h: &Harness) {
 }
 
 #[tokio::test]
+async fn a_second_migration_waits_for_the_destinations_completion_receipt() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+    migrate(&h).await;
+    let duplicate = h
+        .post(
+            "projects/p1/migrations",
+            json!({"id":"m2", "spec":{
+                "instance":"projects/p1/instances/i1", "toNode":"node-b"
+            }}),
+        )
+        .await;
+    assert_eq!(
+        duplicate.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        duplicate.body
+    );
+    assert!(duplicate.body.to_string().contains("still active"));
+}
+
+#[tokio::test]
 async fn what_a_migration_is_doing_is_computed_when_it_is_read() {
     // `Moved` is a judgement over the whole dance, not a fact anybody owns —
     // the same shape as an operation's `done`. Stored, it would be a second
@@ -1917,6 +2020,41 @@ async fn what_a_migration_is_doing_is_computed_when_it_is_read() {
         stored.status.conditions.is_empty(),
         "the condition was stored, and a stored one can go stale: {:?}",
         stored.status.conditions
+    );
+}
+
+#[tokio::test]
+async fn a_migration_explains_when_its_destination_stops_reporting() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+    migrate(&h).await;
+
+    let mut destination = h.nodes().get("nodes/node-b").await.unwrap().unwrap();
+    destination.status.last_heartbeat = velstra_cloud_model::meta::Timestamp(
+        velstra_cloud_model::meta::Timestamp::now().0
+            - velstra_cloud_model::ceph::NODE_STALE_AFTER_MS
+            - 1,
+    );
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "nodes", "nodes/node-b"),
+            serde_json::to_vec(&destination).unwrap(),
+            velstra_cloud_store::Expect::Revision(destination.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    let read = h.get("projects/p1/migrations/m1").await;
+    let condition = moved(&read.body).expect("a stalled migration explains why");
+    assert_eq!(condition["reason"], json!("DestinationUnreachable"));
+    assert_eq!(condition["status"], json!("Unknown"));
+    assert!(
+        condition["message"]
+            .as_str()
+            .unwrap()
+            .contains("has not reported"),
+        "{condition}"
     );
 }
 
@@ -3802,6 +3940,7 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
             accepting: true,
             node: String::new(),
             labels: vec![],
+            projects: vec![],
             volume_ceiling: Default::default(),
         },
         velstra_cloud_model::resources::PoolStatus {
@@ -4845,6 +4984,7 @@ async fn a_volume_with_no_pool_named_is_put_somewhere_rather_than_nowhere() {
                 accepting,
                 node: String::new(),
                 labels: Vec::new(),
+                projects: Vec::new(),
                 volume_ceiling: Default::default(),
             },
             velstra_cloud_model::resources::PoolStatus {
@@ -5691,6 +5831,7 @@ async fn a_disk_on_another_machine_is_refused_with_both_machines_named() {
             // The whole point of the fixture: this pool's bytes are on one host.
             node: "node-a".into(),
             labels: Vec::new(),
+            projects: Vec::new(),
             volume_ceiling: Default::default(),
         },
         velstra_cloud_model::resources::PoolStatus {
@@ -5911,6 +6052,63 @@ async fn a_volume_is_refused_into_a_pool_that_is_being_drained() {
         .unwrap_or_default();
     assert!(message.contains("drained"), "{message}");
     assert!(message.contains("`old`"), "{message}");
+}
+
+#[tokio::test]
+async fn a_pool_project_grant_is_enforced_for_named_and_automatic_placement() {
+    let h = Harness::new();
+    let writer = velstra_cloud_model::access::Writer::controller("test");
+    let restricted = velstra_cloud_model::resources::Resource::new(
+        velstra_cloud_model::meta::Meta::new(
+            "pools/restricted".parse().unwrap(),
+            velstra_cloud_model::meta::Placement::new("eu-central", "cell-1"),
+        ),
+        velstra_cloud_model::resources::PoolSpec {
+            accepting: true,
+            projects: vec!["projects/p2".into()],
+            ..Default::default()
+        },
+        velstra_cloud_model::resources::PoolStatus {
+            backend: "ceph".into(),
+            capacity_gib: 1000,
+            ..Default::default()
+        },
+    );
+    h.pools().create(&restricted, &writer).await.unwrap();
+
+    let named = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "named", "spec": { "sizeGib": 1, "pool": "restricted" } }),
+        )
+        .await;
+    assert_eq!(named.status, StatusCode::BAD_REQUEST, "{:?}", named.body);
+    assert_eq!(named.body["error"]["field"], "spec.pool");
+    assert!(
+        named.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not admit")
+    );
+
+    let automatic = h
+        .post(
+            "projects/p1/volumes",
+            json!({ "id": "automatic", "spec": { "sizeGib": 1 } }),
+        )
+        .await;
+    assert_eq!(
+        automatic.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        automatic.body
+    );
+    assert!(
+        automatic.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no storage pool is accepting")
+    );
 }
 
 /// **A pool nobody is watching does not get one either.**

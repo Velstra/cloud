@@ -770,7 +770,7 @@ const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
 
 /// What a file's first bytes say it is, which is not always what somebody
 /// declared it to be.
-fn looks_like_qcow2(path: &Path) -> bool {
+pub(crate) fn looks_like_qcow2(path: &Path) -> bool {
     use std::io::Read;
     let mut head = [0u8; 4];
     matches!(
@@ -781,7 +781,7 @@ fn looks_like_qcow2(path: &Path) -> bool {
 
 /// `qemu-img convert -O raw`, which is the only sane way to read qcow2 —
 /// doing it here would be reimplementing a disk format.
-async fn convert_to_raw(from: &Path, to: &Path) -> Result<()> {
+pub(crate) async fn convert_to_raw(from: &Path, to: &Path) -> Result<()> {
     let out = tokio::process::Command::new("qemu-img")
         .args(["convert", "-O", "raw"])
         .arg(from)
@@ -1233,15 +1233,24 @@ pub async fn stop_unit(scope: Scope, unit: &str) {
 /// restart, an upgrade, or a takeover by a different binary, the command line
 /// is still there and the memory is not.
 pub fn url_in(command: &str) -> Option<String> {
-    command
-        .split(|c: char| c.is_whitespace() || c == '"' || c == ';')
-        .find_map(|token| {
-            // The URL may be the whole argument (`-incoming tcp:0:4900`) or the
-            // value half of one (`receiver_url=tcp:10.0.0.2:4901`), so this
-            // looks inside the token rather than at its start.
-            let scheme = token.find("unix:").or_else(|| token.find("tcp:"))?;
-            Some(token[scheme..].trim_end_matches([',', '}']).to_string())
-        })
+    let mut tokens = command.split(|c: char| c.is_whitespace() || c == '"' || c == ';');
+    while let Some(token) = tokens.next() {
+        let value = if let Some(value) = token.strip_prefix("receiver_url=") {
+            Some(value)
+        } else if matches!(token, "-incoming" | "receive-migration") {
+            tokens
+                .next()
+                .map(|v| v.strip_prefix("receiver_url=").unwrap_or(v))
+        } else {
+            None
+        };
+        if let Some(value) = value
+            && (value.starts_with("tcp:") || value.starts_with("unix:"))
+        {
+            return Some(value.trim_end_matches([',', '}']).to_string());
+        }
+    }
+    None
 }
 
 /// A port in this node's migration range that nothing is already using.
@@ -1590,6 +1599,12 @@ mod tests {
         let qemu = "{ path=/usr/bin/qemu-system-x86_64 ; argv[]=-m 2048 -incoming tcp:0:4900 }";
         assert_eq!(url_in(qemu).as_deref(), Some("tcp:0:4900"));
         assert_eq!(port_of("tcp:0:4900"), Some(4900));
+        let actual = "{ path=/usr/bin/qemu-system-x86_64 ; argv[]=qemu -qmp unix:/run/incoming-qmp.sock,server=on,wait=off -vnc unix:/run/vnc.sock -incoming tcp:0:4903 ; }";
+        assert_eq!(url_in(actual).as_deref(), Some("tcp:0:4903"));
+        assert_eq!(
+            url_in("qemu -qmp unix:/run/qmp.sock,server=on,wait=off"),
+            None
+        );
 
         // A unit that is not a receiver says nothing, rather than something
         // that would be sent to.

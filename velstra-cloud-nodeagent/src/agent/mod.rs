@@ -48,8 +48,8 @@ use velstra_cloud_model::{
     reconcile::{Action, instance_condition, reconcile_attachment, reconcile_instance},
     resources::{
         Attachment, AttachmentSpec, AttachmentStatus, ImageSpec, Instance, InstanceSpec,
-        InstanceStatus, NODE_RELEASE_FINALIZER, NetworkSpec, NodeSpec, NodeStatus, Port, PortSpec,
-        PortStatus,
+        InstanceStatus, NODE_RELEASE_FINALIZER, Network, NetworkSpec, NodeSpec, NodeStatus, Port,
+        PortSpec, PortStatus,
     },
     security::{ResolvedRule, SecurityGroup, SecurityGroupSpec, effective_rules_with, members_in},
 };
@@ -57,8 +57,9 @@ use velstra_cloud_store::{Store, TypedStore};
 
 use crate::{
     cell::{CellReader, StoreCell},
+    guests,
     guests::GuestRegistry,
-    host::{Datapath, HostState, Nic, ProgrammedPort, VmRequest, Vmm},
+    host::{CloudInitSeed, Datapath, HostState, Nic, ProgrammedPort, VmRequest, Vmm},
 };
 
 mod ceph;
@@ -123,6 +124,7 @@ pub struct AgentConfig {
     /// Whether this machine's state directory is storage every node reaches.
     /// Told, never worked out — see the flag's own documentation.
     pub shared_state: bool,
+    pub disk_transfer: Option<crate::disk_transfer::Config>,
     /// The keys an image's signature must verify under before this node fetches
     /// it. Judged here as well as at the API, because a node's copy of the
     /// cell is what it acts on, and a store written around the API is still a
@@ -165,6 +167,7 @@ impl AgentConfig {
             console_endpoint: String::new(),
             console_tls: false,
             shared_state: false,
+            disk_transfer: None,
             image_signing_keys: Vec::new(),
             require_signed_images: false,
             // A month. Long enough that a base image booted now and then is
@@ -383,6 +386,7 @@ pub(super) struct CellView<'a> {
     /// port would be the same answer fetched many times. It also replaces a
     /// second read this pass used to make when it described guests.
     pub networks: &'a BTreeMap<String, NetworkSpec>,
+    pub network_objects: &'a BTreeMap<String, Network>,
     /// The segments those networks are cut into — where a port's address, mask
     /// and gateway come from.
     ///
@@ -494,6 +498,7 @@ pub struct Agent {
     /// right — level-triggered, and a power button pressed twice costs nothing
     /// where pressing it four times a second for ever does.
     handover_asked: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    disk_copies: std::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<Result<(), String>>>>,
     /// This node's fencing deadline, as last read from its own object.
     ///
     /// Cached rather than read when it is needed, and that is the whole design:
@@ -560,6 +565,7 @@ impl Agent {
             warned_about_node: AtomicBool::new(false),
             sink: None,
             handover_asked: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            disk_copies: std::sync::Mutex::new(BTreeMap::new()),
             last_report: AtomicU64::new(velstra_cloud_model::meta::Timestamp::now().0),
             names: crate::dns::Names::new(),
             fence_after_s: AtomicU32::new(0),
@@ -836,14 +842,48 @@ impl Agent {
             .attachments()
             .await
             .map_err(|e| format!("could not read this cell's attachments: {e}"))?;
-        let Some(mine) = attachments
-            .iter()
+        let mine = match attachments
+            .into_iter()
             .find(|a| a.spec.instance == name && a.spec.volume == instance.spec.boot_volume)
-        else {
-            return Err(format!(
-                "{} boots from {} and nothing has attached it here yet",
-                name, instance.spec.boot_volume
-            ));
+        {
+            Some(mine) => mine,
+            None => {
+                let volume =
+                    velstra_cloud_model::meta::ResourceName::parse(&instance.spec.boot_volume)
+                        .map_err(|e| e.to_string())?;
+                let parent = instance
+                    .meta
+                    .name
+                    .parent()
+                    .ok_or("instance has no project")?;
+                let attachment = format!(
+                    "{parent}/attachments/{}-{}",
+                    instance.meta.name.id(),
+                    volume.id()
+                );
+                let mine = self
+                    .cell
+                    .attachment(&attachment)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "{} boots from {} and nothing has attached it yet",
+                            name, instance.spec.boot_volume
+                        )
+                    })?;
+                if mine.spec.instance != name
+                    || mine.spec.volume != instance.spec.boot_volume
+                    || mine.meta.is_deleting()
+                {
+                    return Err("boot attachment does not match the instance".into());
+                }
+                // Only shared RBD may be opened before the source releases it.
+                if crate::ceph_access::split(&mine.spec.at).is_none() {
+                    return Err("the boot disk is not shared Ceph storage".into());
+                }
+                mine
+            }
         };
         if mine.spec.at.is_empty() {
             return Err(format!(
@@ -1205,10 +1245,10 @@ impl Agent {
             }
         };
 
-        let networks = match self.cell.networks().await {
+        let network_objects = match self.cell.networks().await {
             Ok(list) => list
                 .into_iter()
-                .map(|n| (n.meta.name.to_string(), n.spec))
+                .map(|n| (n.meta.name.to_string(), n))
                 .collect::<BTreeMap<_, _>>(),
             Err(e) => {
                 // A port whose segment cannot be read is a port that must not be
@@ -1226,6 +1266,10 @@ impl Agent {
                 return;
             }
         };
+        let networks = network_objects
+            .iter()
+            .map(|(name, network)| (name.clone(), network.spec.clone()))
+            .collect::<BTreeMap<_, _>>();
 
         // The same read `refresh_guests` used to make on its own, moved up so the
         // pass that *creates* a wire can also make its far end. A segment that
@@ -1262,22 +1306,13 @@ impl Agent {
             }
         };
 
-        let instances = match self.cell.instances().await {
+        let mut instances = match self.cell.instances().await {
             Ok(instances) => instances,
             Err(e) => {
                 tracing::error!(error = %e, "could not list instances");
                 pass.failures += 1;
                 return;
             }
-        };
-
-        let cell = CellView {
-            ports: &ports,
-            groups: &groups,
-            networks: &networks,
-            subnets: &subnets,
-            images: &images,
-            instances: &instances,
         };
 
         let migrations = match self.cell.migrations().await {
@@ -1288,6 +1323,36 @@ impl Agent {
                 return;
             }
         };
+        for migration in migrations.iter().filter(|m| {
+            !m.meta.is_deleting()
+                && m.status.completed_at.is_none()
+                && m.spec.to_node == self.config.node
+        }) {
+            if !instances
+                .iter()
+                .any(|i| i.meta.name.to_string() == migration.spec.instance)
+            {
+                match self.cell.instance(&migration.spec.instance).await {
+                    Ok(Some(instance)) => instances.push(instance),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not read incoming instance");
+                        pass.failures += 1;
+                        return;
+                    }
+                }
+            }
+        }
+        let cell = CellView {
+            ports: &ports,
+            groups: &groups,
+            networks: &networks,
+            network_objects: &network_objects,
+            subnets: &subnets,
+            images: &images,
+            instances: &instances,
+        };
+
         // Sending comes first in the pass because a send that lands changes
         // what the instance loop below is looking at: the guest is gone from
         // this machine, and the only right thing to do about that is to report
@@ -1441,23 +1506,23 @@ impl Agent {
             .collect();
         // Every port of every guest that concerns this node — assigned here,
         // still reported here, or named by an open migration with this node at
-        // either end. A migration names both ends on purpose: the source keeps
-        // its half of the wire standing until the record is gone, and the
-        // destination may program its half before the guest lands.
+        // either end. The source releases its wire at handover; the destination
+        // may prepare its wire before the guest lands.
         let me = self.config.node.as_str();
         let in_my_share: BTreeSet<&str> = instances
             .iter()
             .filter(|i| {
-                i.spec.node.as_deref() == Some(me)
-                    || i.status.node.as_deref() == Some(me)
-                    || migrations.iter().any(|m| {
-                        // A record on its way out no longer holds the wire
-                        // open — asking for the migration's deletion is the
-                        // gesture that lets the source's half go.
-                        !m.meta.is_deleting()
-                            && m.spec.instance == i.meta.name.to_string()
-                            && (m.spec.from_node == me || m.spec.to_node == me)
-                    })
+                !moving.released.contains(&i.meta.name.to_string())
+                    && (i.spec.node.as_deref() == Some(me)
+                        || i.status.node.as_deref() == Some(me)
+                        || migrations.iter().any(|m| {
+                            // Only an unfinished arrival reserves a wire.
+                            // Historical requests must not retain source ports.
+                            !m.meta.is_deleting()
+                                && m.spec.instance == i.meta.name.to_string()
+                                && m.status.completed_at.is_none()
+                                && m.spec.to_node == me
+                        }))
             })
             .flat_map(|i| i.spec.ports.iter().map(String::as_str))
             .collect();
@@ -1709,7 +1774,7 @@ impl Agent {
                         (None, _) => false,
                     })
                     .collect::<Vec<_>>(),
-                host.disks.contains(&name),
+                !stored.spec.boot_volume.is_empty() || host.disks.contains(&name),
                 // And how big it actually is, so a growth the API accepted and
                 // the quota charged for reaches the disk.
                 host.disk_gib.get(&name).copied(),
@@ -1837,12 +1902,27 @@ impl Agent {
             outcome = Err(why.clone());
         }
 
-        let ready = instance_condition(&next);
-        set_condition(&mut next.status.conditions, ready);
-        set_condition(
-            &mut next.status.conditions,
-            host_condition(&outcome, acted_on),
-        );
+        if let Some(progress) = moving.progress.get(&name).filter(|_| outcome.is_ok()) {
+            for kind in ["Ready", "HostActions"] {
+                set_condition(
+                    &mut next.status.conditions,
+                    velstra_cloud_model::meta::Condition::new(
+                        kind,
+                        velstra_cloud_model::meta::ConditionStatus::Unknown,
+                        "CopyingDisk",
+                        progress,
+                        acted_on,
+                    ),
+                );
+            }
+        } else {
+            let ready = instance_condition(&next);
+            set_condition(&mut next.status.conditions, ready);
+            set_condition(
+                &mut next.status.conditions,
+                host_condition(&outcome, acted_on),
+            );
+        }
         set_condition(
             &mut next.status.conditions,
             release_condition(released, stored.meta.is_deleting(), acted_on),
@@ -2124,6 +2204,7 @@ impl Agent {
                     // than in an agent's journal.
                     Err(why) => return Err(why),
                 };
+                let cloud_init = self.cloud_init_seed(instance, ports, taps, cell).await;
                 match self.vm_request(
                     instance,
                     taps,
@@ -2134,6 +2215,7 @@ impl Agent {
                         devices,
                         boot_disk,
                     },
+                    cloud_init,
                 ) {
                     Ok(request) => self.vmm.start(&request).await,
                     Err(why) => Err(crate::host::HostError::failed(why)),
@@ -2164,6 +2246,7 @@ impl Agent {
         // which bytes that is.
         image_digest: &str,
         resolved: Resolved,
+        cloud_init: Option<CloudInitSeed>,
     ) -> Result<VmRequest, String> {
         let mut wanted = Vec::with_capacity(instance.spec.ports.len());
         for port in &instance.spec.ports {
@@ -2186,12 +2269,46 @@ impl Agent {
             image: image_digest.to_string(),
             root_disk_gib: instance.spec.root_disk_gib,
             boot_disk: resolved.boot_disk,
+            boot_volume: (!instance.spec.boot_volume.is_empty())
+                .then(|| instance.spec.boot_volume.clone()),
             nics: wanted,
             // What this guest is to be given, as declared on this node right
             // now. A guest already running is unaffected: it keeps the CPU it
             // booted with, and adopts this one the next time it starts.
             cpu_baseline: resolved.baseline,
             devices: resolved.devices,
+            cloud_init,
+        })
+    }
+
+    async fn cloud_init_seed(
+        &self,
+        instance: &Instance,
+        ports: &BTreeMap<String, Port>,
+        taps: &BTreeMap<String, String>,
+        cell: &CellView<'_>,
+    ) -> Option<CloudInitSeed> {
+        let floating = self.cell.floating_ips().await.unwrap_or_default();
+        let public = guests::public_addresses(
+            &floating,
+            self.localnet.is_some() || self.datapath.datapath_name() == "fabric",
+        );
+        guests::derive(
+            &[instance],
+            ports,
+            cell.subnets,
+            cell.network_objects,
+            taps,
+            &public,
+        )
+        .into_iter()
+        .next()
+        .and_then(|view| {
+            crate::metadata::render_network_config(&view).map(|network_config| CloudInitSeed {
+                meta_data: crate::metadata::render_meta_data(&view),
+                user_data: view.user_data.unwrap_or_default(),
+                network_config,
+            })
         })
     }
 
@@ -2418,6 +2535,24 @@ impl Agent {
     }
 
     async fn attachment_pass(&self, stored: &Attachment, host: &HostState, pass: &mut Pass) {
+        if stored.spec.node != self.config.node {
+            let volume = &stored.spec.volume;
+            if host.volumes.contains_key(volume) {
+                if let Err(e) = self.vmm.close_volume(&stored.spec.instance, volume).await {
+                    tracing::warn!(%e, %volume, "could not release a moved attachment");
+                    pass.failures += 1;
+                    return;
+                }
+                // Observe on the next pass; never hand over an open handle.
+                return;
+            }
+            let mut next = stored.clone();
+            next.status.node = None;
+            next.status.attached = false;
+            next.status.device = None;
+            self.report(&self.attachments, stored, next, pass).await;
+            return;
+        }
         let acted_on = stored.meta.generation;
         let volume = stored.spec.volume.clone();
         let mut host = host.clone();

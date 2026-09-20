@@ -1093,8 +1093,10 @@ mod tests {
             image: "sha256:abc".into(),
             root_disk_gib: 10,
             boot_disk: None,
+            boot_volume: None,
             nics: vec![],
             cpu_baseline: None,
+            cloud_init: None,
         }
     }
 

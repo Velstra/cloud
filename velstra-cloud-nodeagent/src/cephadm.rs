@@ -38,11 +38,16 @@
 //! cluster can say, and a mock that agreed with itself would be worse than the
 //! gap it hides.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use velstra_cloud_model::ceph::{CephPoolSpec, NodeCeph};
 
 use crate::host::{HostError, Result};
+
+const CEPH_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How this agent runs Ceph's own tools.
 #[derive(Clone, Debug)]
@@ -237,6 +242,52 @@ pub fn apply_mon_argv(hosts: &[String]) -> Vec<String> {
         "mon".into(),
         format!("--placement={}", hosts.join(",")),
     ]
+}
+
+pub fn mon_service_argv() -> Vec<String> {
+    vec![
+        "orch".into(),
+        "ls".into(),
+        "--service_name".into(),
+        "mon".into(),
+        "--format".into(),
+        "json".into(),
+    ]
+}
+
+#[derive(serde::Deserialize)]
+struct ServiceRow {
+    #[serde(default)]
+    placement: ServicePlacement,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ServicePlacement {
+    #[serde(default)]
+    hosts: Vec<String>,
+}
+
+pub fn parse_mon_hosts(json: &str) -> Result<Vec<String>> {
+    let rows: Vec<ServiceRow> = serde_json::from_str(json).map_err(|e| {
+        HostError::failed(format!(
+            "`ceph orch ls --service_name mon` did not answer with json: {e}"
+        ))
+    })?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|row| row.placement.hosts)
+        .unwrap_or_default())
+}
+
+fn same_hosts(left: &[String], right: &[String]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    left.dedup();
+    right.sort_unstable();
+    right.dedup();
+    left == right
 }
 
 /// The argv for making an OSD of one device.
@@ -473,14 +524,30 @@ impl CephAdmin {
     }
 
     pub(crate) async fn ceph(&self, args: &[String]) -> Result<Vec<u8>> {
+        self.ceph_with_timeout(args, CEPH_COMMAND_TIMEOUT).await
+    }
+
+    async fn ceph_with_timeout(&self, args: &[String], limit: Duration) -> Result<Vec<u8>> {
         // Bounded, because a node that has a `ceph.conf` but no keyring —
         // every non-admin node — would otherwise sit in each question for
         // the CLI's own default of minutes, once per question, once per pass.
-        let out = tokio::process::Command::new(&self.ceph)
+        // `--connect-timeout` only bounds the initial connection. Ceph's
+        // orchestrator can accept it and then never answer, which used to stop
+        // the entire node-agent pass, including heartbeats and migrations.
+        let mut command = tokio::process::Command::new(&self.ceph);
+        command
             .arg("--connect-timeout=15")
             .args(args)
-            .output()
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(limit, command.output())
             .await
+            .map_err(|_| {
+                HostError::failed(format!(
+                    "`ceph {}` did not finish within {} seconds",
+                    args.join(" "),
+                    limit.as_secs_f32()
+                ))
+            })?
             .map_err(|e| HostError::failed(format!("running `ceph {}`: {e}", args.join(" "))))?;
         if out.status.success() {
             return Ok(out.stdout);
@@ -534,6 +601,17 @@ impl CephAdmin {
     }
 
     pub async fn apply_monitors(&self, hosts: &[String]) -> Result<()> {
+        // `orch apply` is declarative, but it is not a harmless status read
+        // while cephadm is still converging: submitting the same placement on
+        // every agent pass can restart the deployment timer and eventually
+        // trip systemd's start limit on every monitor. The service spec is the
+        // durable acknowledgement that Ceph accepted the desired set; daemon
+        // liveness is observed separately.
+        let current = self.ceph(&mon_service_argv()).await?;
+        let current = parse_mon_hosts(&String::from_utf8_lossy(&current))?;
+        if same_hosts(&current, hosts) {
+            return Ok(());
+        }
         self.ceph(&apply_mon_argv(hosts)).await.map(|_| ())
     }
 
@@ -633,6 +711,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_stuck_ceph_command_cannot_stop_the_agent_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("ceph-stuck-{}", std::process::id()));
+        std::fs::write(&path, "#!/bin/sh\nsleep 10\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let admin = CephAdmin {
+            ceph: path.to_string_lossy().into_owned(),
+            ..CephAdmin::default()
+        };
+
+        let started = std::time::Instant::now();
+        let error = admin
+            .ceph_with_timeout(&host_ls_argv(), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.to_string().contains("did not finish"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// A one-node cluster is a legitimate thing to build, and without
     /// `--single-host-defaults` it comes up warning for ever about a rule that
     /// cannot be satisfied.
@@ -675,7 +774,8 @@ mod tests {
         assert_eq!(split[at + 1], "10.1.0.0/24");
     }
 
-    /// Monitor placement is declarative: the whole set, every time.
+    /// Monitor placement is declarative and compared without depending on
+    /// Ceph's order before it is submitted again.
     #[test]
     fn monitors_are_placed_as_a_set_rather_than_one_at_a_time() {
         let argv = apply_mon_argv(&["a".into(), "b".into(), "c".into()]);
@@ -683,6 +783,15 @@ mod tests {
         // Which means asking twice with the same set is asking once — the same
         // level-triggered property the rest of the platform has.
         assert_eq!(argv, apply_mon_argv(&["a".into(), "b".into(), "c".into()]));
+
+        let reported = r#"[{"placement":{"hosts":["c","a","b"]}}]"#;
+        let current = parse_mon_hosts(reported).unwrap();
+        assert!(same_hosts(&current, &["a".into(), "b".into(), "c".into()]));
+        assert!(!same_hosts(&current, &["a".into(), "b".into()]));
+        assert_eq!(
+            mon_service_argv(),
+            ["orch", "ls", "--service_name", "mon", "--format", "json"]
+        );
     }
 
     #[test]

@@ -44,6 +44,10 @@ fn can_run() -> Option<PathBuf> {
         eprintln!("skipping: no systemd-run");
         return None;
     }
+    if !PathBuf::from("/dev/vhost-vsock").exists() {
+        eprintln!("skipping: no /dev/vhost-vsock (load vhost_vsock)");
+        return None;
+    }
     let Some(image) = image() else {
         eprintln!("skipping: no guest image (set VELSTRA_TEST_IMAGE)");
         return None;
@@ -157,8 +161,10 @@ async fn a_stock_cloud_image_boots_and_says_so() {
         image: format!("projects/p1/images/sha256-{digest}"),
         root_disk_gib: 1,
         boot_disk: None,
+        boot_volume: None,
         nics: vec![],
         cpu_baseline: None,
+        cloud_init: None,
     };
 
     // The image, published the way a pulled one is: under the name

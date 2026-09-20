@@ -272,6 +272,19 @@ impl Reconciler for DiskController {
             }
         }
 
+        // Ownership follows the guest only after the destination actually claims it.
+        // The old node closes its handle before the new node claims the attachment.
+        for attachment in &mine {
+            if !attachment.meta.is_deleting() && attachment.spec.node != node {
+                let mut next = attachment.clone();
+                next.spec.node = node.clone();
+                next.meta.generation += 1;
+                self.attachments
+                    .update(&next, &Writer::controller(WHO))
+                    .await?;
+            }
+        }
+
         // Taken off the list: detach. Only ours — an attachment somebody made by
         // hand is theirs, and removing it would be a detach nobody asked for.
         for existing in &mine {
@@ -663,6 +676,19 @@ mod boot_volume_tests {
     /// says so on the attachment, once one exists. So the boot volume is
     /// attached by the same rule as every other disk, and it is not in
     /// `spec.volumes` because it is not a disk somebody adds and removes.
+    #[tokio::test]
+    async fn attachments_follow_observed_guest_ownership_after_migration() {
+        let (disk, attachments, instances) = cell().await;
+        let mut guest = booted_from(&instances, "projects/p1/volumes/root-1", &[]).await;
+        disk.reconcile(GUEST, Some(&guest)).await.unwrap();
+        guest.spec.node = Some("nodes/n2".into());
+        disk.reconcile(GUEST, Some(&guest)).await.unwrap();
+        assert_eq!(attachments.list().await.unwrap()[0].spec.node, "nodes/n1");
+        guest.status.node = Some("nodes/n2".into());
+        disk.reconcile(GUEST, Some(&guest)).await.unwrap();
+        assert_eq!(attachments.list().await.unwrap()[0].spec.node, "nodes/n2");
+    }
+
     #[tokio::test]
     async fn the_boot_volume_is_attached_like_any_other_disk() {
         let (disk, attachments, instances) = cell().await;

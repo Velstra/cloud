@@ -191,6 +191,8 @@ pub struct VmRequest {
     /// that boots from one is not tied to this machine's filesystem, which is
     /// the whole reason to do it.
     pub boot_disk: Option<String>,
+    /// Resource identity for observing the boot volume without hot-plugging it again.
+    pub boot_volume: Option<String>,
     /// The guest's NICs, in the order the instance's ports are declared. The
     /// order is the guest's NIC order, and a guest that finds its addresses on
     /// the wrong NIC after a restart is an outage with no error message.
@@ -211,6 +213,17 @@ pub struct VmRequest {
     /// been made: a class is what an instance asks for and what the scheduler
     /// places on, and a VMM needs the one device it is to attach.
     pub devices: Vec<String>,
+    /// A local NoCloud seed, attached as a read-only configuration drive.
+    /// Networking lives here so a guest does not need networking in order to
+    /// fetch the configuration that gives it networking.
+    pub cloud_init: Option<CloudInitSeed>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CloudInitSeed {
+    pub meta_data: String,
+    pub user_data: String,
+    pub network_config: String,
 }
 
 /// One NIC, as the host has to build it.
@@ -518,6 +531,17 @@ pub trait Datapath: Send + Sync + 'static {
     /// the VNI — and its MTU, and neither is derivable from a resource name. The
     /// fake and the tap-only datapath ignore it; the one that programs an
     /// overlay cannot.
+    /// Prepare the receiver's wire without taking the source's network identity.
+    async fn prepare_incoming(
+        &self,
+        port: &str,
+        spec: &PortSpec,
+        network: &NetworkSpec,
+        rules: &[ResolvedRule],
+    ) -> Result<String> {
+        self.program(port, spec, network, rules).await
+    }
+
     async fn program(
         &self,
         port: &str,

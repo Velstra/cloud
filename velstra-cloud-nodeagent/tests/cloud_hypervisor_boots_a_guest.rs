@@ -120,8 +120,10 @@ async fn a_directly_booted_kernel_runs_and_says_so() {
         image: "projects/p1/images/netboot".into(),
         root_disk_gib: 1,
         boot_disk: None,
+        boot_volume: None,
         nics: vec![],
         cpu_baseline: None,
+        cloud_init: None,
     };
 
     // A disk is still made and attached: nothing boots from it here, but the

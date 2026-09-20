@@ -434,29 +434,33 @@ impl PoolAgent {
         &self.config.pool
     }
 
-    /// Resync on a timer until `shutdown` completes.
-    ///
-    /// No watch, unlike the node agent, and that is a considered difference
-    /// rather than a gap: storage work is measured in seconds to minutes, so the
-    /// latency a watch buys is lost in the noise of an `lvcreate`. When it stops
-    /// being true, the seam is here and nothing else changes.
+    /// Reconcile changes promptly, with a periodic fallback for missed events.
     pub async fn run(&self, shutdown: impl std::future::Future<Output = ()> + Send) {
+        let mut wake = self.cell.wake().await;
+        let mut watching = true;
         let mut ticker = tokio::time::interval(self.config.resync);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
-                _ = ticker.tick() => {
-                    let pass = self.resync().await;
-                    if pass.failures > 0 || pass.refused > 0 {
-                        tracing::warn!(
-                            pool = %self.config.pool,
-                            failures = pass.failures,
-                            refused = pass.refused,
-                            "a pool pass did not go cleanly"
-                        );
+                _ = ticker.tick() => {},
+                event = wake.recv(), if watching => {
+                    if event.is_none() {
+                        watching = false;
+                        continue;
                     }
                 }
+            }
+            while wake.try_recv().is_ok() {}
+            let pass = self.resync().await;
+            if pass.failures > 0 || pass.refused > 0 {
+                tracing::warn!(
+                    pool = %self.config.pool,
+                    failures = pass.failures,
+                    refused = pass.refused,
+                    "a pool pass did not go cleanly"
+                );
             }
         }
     }
@@ -2269,6 +2273,7 @@ mod tests {
                     accepting: true,
                     node: String::new(),
                     labels: vec![],
+                    projects: vec![],
                     volume_ceiling: Default::default(),
                 },
                 PoolStatus::default(),
@@ -2353,6 +2358,34 @@ mod tests {
                 .unwrap()
                 .unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn new_volume_is_claimed_and_provisioned_without_waiting_for_resync() {
+        let (cell, mut agent) = cell("pool-a");
+        cell.register_pool("pool-a").await;
+        agent.config.resync = Duration::from_secs(3600);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            agent
+                .run(async {
+                    let _ = stopped.await;
+                })
+                .await;
+        });
+        // Let the initial empty sweep finish before creating work.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cell.volume("pool-a", 1).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cell.reload().await.status.provisioned {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("volume waited for the hourly reconciliation timer");
+        let _ = stop.send(());
+        task.await.unwrap();
+        assert!(cell.fake.has(VOLUME));
     }
 
     #[tokio::test]

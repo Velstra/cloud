@@ -21,7 +21,10 @@ use velstra_cloud_model::{
     ceph::{CephClusterSpec, CephClusterStatus},
     identity::{UserSpec, UserStatus},
     loadbalancer::{LoadBalancerSpec, LoadBalancerStatus},
-    meta::{Meta, Placement, ResourceName, Revision, Timestamp, set_condition},
+    meta::{
+        Condition, ConditionStatus, Meta, Placement, ResourceName, Revision, Timestamp,
+        set_condition,
+    },
     migration::{Migration, MigrationSpec, MigrationStatus, may_migrate, migration_condition},
     reconcile::place,
     resources::{
@@ -92,6 +95,12 @@ pub const COLLECTIONS: [&str; 37] = [
     "rollouts",
     "operations",
 ];
+
+fn migration_node_is_silent(node: &Node, now: Timestamp) -> bool {
+    node.status.last_heartbeat.0 == 0
+        || node.status.last_heartbeat.age(now).as_millis()
+            > u128::from(velstra_cloud_model::ceph::NODE_STALE_AFTER_MS)
+}
 
 /// A bare folder id becomes the full name.
 ///
@@ -3228,6 +3237,7 @@ impl Api {
             // behind for a guest that was never created. A check that has
             // everything it needs belongs at the first point it has it.
             self.refuse_a_retired_image(kind, &spec).await?;
+            self.refuse_an_unverified_image(kind, &spec).await?;
             // The named size becomes numbers before anything reads them —
             // quota counts vCPUs, the scheduler reads memory — and the
             // hand-sizing rule runs on the settled spec.
@@ -3286,7 +3296,13 @@ impl Api {
                 .await?;
         }
         if kind == "volumes" || kind == "backups" {
-            self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
+            let project = if kind == "volumes" {
+                name.project()
+            } else {
+                None
+            };
+            self.refuse_a_pool_this_cell_does_not_have(project, &spec)
+                .await?;
         }
         if matches!(kind, "instances" | "attachments")
             && spec
@@ -3377,12 +3393,14 @@ impl Api {
         if kind == "volumes" {
             self.settle_volume_source(&name, &mut spec).await?;
             self.refuse_a_retired_image(kind, &spec).await?;
+            self.refuse_an_unverified_image(kind, &spec).await?;
             // After the source, on purpose: a clone inherits the pool holding
             // its snapshot, and a choice made before that would put the copy in
             // a different pool from the bytes it is cloned from. Only a volume
             // that still names none gets one chosen.
-            self.settle_volume_pool(&mut spec).await?;
-            self.refuse_a_pool_this_cell_does_not_have(&spec).await?;
+            self.settle_volume_pool(name.project(), &mut spec).await?;
+            self.refuse_a_pool_this_cell_does_not_have(name.project(), &spec)
+                .await?;
         }
         if kind == "ceph-clusters" {
             self.refuse_a_second_ceph_cluster(&name).await?;
@@ -3662,6 +3680,61 @@ impl Api {
         } else {
             "spec.sourceImage"
         }))
+    }
+
+    /// Do not discover a bad checksum while a guest or volume is already being
+    /// created. The image controller streams the bytes as soon as the image is
+    /// published and records the answer on the image itself.
+    async fn refuse_an_unverified_image(&self, kind: &str, spec: &Value) -> ApiResult<()> {
+        let field = if kind == "instances" {
+            "image"
+        } else {
+            "source_image"
+        };
+        let Some(named) = spec
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            return Ok(());
+        };
+        let Ok(name) = ResourceName::parse(named) else {
+            return Ok(());
+        };
+        let Ok(image) = self.typed::<ImageSpec, ImageStatus>(&name).await else {
+            return Ok(());
+        };
+        let ready = image
+            .status
+            .conditions
+            .iter()
+            .find(|condition| condition.kind == "Ready");
+        match ready {
+            Some(condition) if condition.status == ConditionStatus::True => Ok(()),
+            Some(condition) if condition.status == ConditionStatus::False => Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{named} failed its content check: {}. Correct or replace the image before using it.",
+                    condition.message
+                ),
+            )
+            .at(if kind == "instances" {
+                "spec.image"
+            } else {
+                "spec.sourceImage"
+            })),
+            _ => Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{named} is still verifying its downloaded bytes against its digest. Try again when the image is Ready."
+                ),
+            )
+            .at(if kind == "instances" {
+                "spec.image"
+            } else {
+                "spec.sourceImage"
+            })),
+        }
     }
 
     /// An image may only be replaced by an image.
@@ -5894,6 +5967,27 @@ impl Api {
         let age = migration.meta.created_at.age(Timestamp::now()).as_secs();
 
         let mut condition = migration_condition(&migration, instance.as_ref(), age);
+        // A dead or wedged destination cannot report a receiver failure of its
+        // own. Use the node heartbeat to turn an otherwise vague
+        // "not listening yet" into the actual operator action while the move
+        // is still recoverable.
+        if condition.status == ConditionStatus::Unknown {
+            if let Some(destination) = self.node(&migration.spec.to_node).await? {
+                if migration_node_is_silent(&destination, Timestamp::now()) {
+                    condition = Condition::new(
+                        "Moved",
+                        ConditionStatus::Unknown,
+                        "DestinationUnreachable",
+                        &format!(
+                            "{} has not reported within the last {} seconds",
+                            migration.spec.to_node,
+                            velstra_cloud_model::ceph::NODE_STALE_AFTER_MS / 1000
+                        ),
+                        migration.meta.generation,
+                    );
+                }
+            }
+        }
         // A computed condition has no stored moment it changed, so `Condition`
         // stamps the moment it was built — which is the moment of *this read*.
         // An interface showing "changed just now" over a transfer that stalled
@@ -8722,7 +8816,7 @@ impl Api {
         Ok(())
     }
 
-    async fn settle_volume_pool(&self, spec: &mut Value) -> ApiResult<()> {
+    async fn settle_volume_pool(&self, project: Option<&str>, spec: &mut Value) -> ApiResult<()> {
         let named = spec.get("pool").and_then(Value::as_str).unwrap_or_default();
         if !named.is_empty() {
             return Ok(());
@@ -8730,7 +8824,13 @@ impl Api {
         let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
         let chosen = pools
             .iter()
-            .filter(|p| p.spec.accepting && p.meta.deleted_at.is_none())
+            .filter(|p| {
+                p.spec.accepting
+                    && p.meta.deleted_at.is_none()
+                    && project.is_none_or(|project| {
+                        velstra_cloud_model::resources::pool_allows_project(&p.spec, project)
+                    })
+            })
             .max_by_key(|p| p.status.capacity_gib.saturating_sub(p.status.allocated_gib));
         let Some(pool) = chosen else {
             return Err(ApiError::new(
@@ -8745,7 +8845,11 @@ impl Api {
         Ok(())
     }
 
-    async fn refuse_a_pool_this_cell_does_not_have(&self, spec: &Value) -> ApiResult<()> {
+    async fn refuse_a_pool_this_cell_does_not_have(
+        &self,
+        project: Option<&str>,
+        spec: &Value,
+    ) -> ApiResult<()> {
         let Some(asked) = spec.get("pool").and_then(Value::as_str) else {
             return Ok(());
         };
@@ -8755,6 +8859,17 @@ impl Api {
         let pools: Vec<Resource<PoolSpec, PoolStatus>> = self.typed_list("", "pools").await?;
         let ids: Vec<String> = pools.iter().map(|p| p.meta.name.id().to_string()).collect();
         if let Some(pool) = pools.iter().find(|p| p.meta.name.id() == asked) {
+            if let Some(project) = project
+                && !velstra_cloud_model::resources::pool_allows_project(&pool.spec, project)
+            {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "`{asked}` does not admit new volumes from projects/{project}. Nothing was created: grant that project on the pool or leave the pool empty so the cell chooses an allowed one."
+                    ),
+                )
+                .at("spec.pool"));
+            }
             // The pool exists — does it have the room? Refused here, before a
             // byte moves, for the same reason a migration is: the far end
             // refusing after the object exists is the same refusal, later and
@@ -9080,6 +9195,22 @@ impl Api {
             ApiError::invalid("a migration names the instance to move").at("spec.instance")
         })?;
         let instance: Instance = self.typed(&name).await?;
+        let pending: Vec<Migration> = self
+            .typed_list(
+                &name.parent().map(|p| p.to_string()).unwrap_or_default(),
+                "migrations",
+            )
+            .await?;
+        if let Some(active) = pending.iter().find(|m| {
+            m.spec.instance == instance_name
+                && !m.meta.is_deleting()
+                && m.status.completed_at.is_none()
+        }) {
+            return Err(ApiError::new(Code::FailedPrecondition,
+                format!("{} is still active; wait for completion or cancel it before starting another migration", active.meta.name))
+                .at("spec.instance"));
+        }
+
         let Some(from) = instance.status.node.clone().filter(|n| !n.is_empty()) else {
             return Err(ApiError::new(
                 Code::FailedPrecondition,
@@ -9116,6 +9247,16 @@ impl Api {
             )
             .at("spec.toNode")
         })?;
+        if migration_node_is_silent(&destination, Timestamp::now()) {
+            return Err(ApiError::new(
+                Code::FailedPrecondition,
+                format!(
+                    "{instance_name} cannot move to {to}: {to} has not reported within the last {} seconds",
+                    velstra_cloud_model::ceph::NODE_STALE_AFTER_MS / 1000
+                ),
+            )
+            .at("spec.toNode"));
+        }
 
         let cached = self
             .image_cached_on(&instance.spec.image, &mut Scratch::default())
@@ -9464,6 +9605,7 @@ impl Api {
             .image_cached_on(&instance.spec.image, &mut Scratch::default())
             .await?;
 
+        let now = Timestamp::now();
         let destinations: Vec<Value> = nodes
             .iter()
             .map(|to| {
@@ -9476,6 +9618,17 @@ impl Api {
                 // not: a cold move crosses processors a live one cannot, so a
                 // fleet of unlike machines was being told its guests could not
                 // move at all when every one of them could, with a restart.
+                if migration_node_is_silent(to, now) {
+                    return json!({
+                        "node": id,
+                        "allowed": false,
+                        "why": "DestinationUnreachable",
+                        "detail": format!(
+                            "{id} has not reported within the last {} seconds",
+                            velstra_cloud_model::ceph::NODE_STALE_AFTER_MS / 1000
+                        )
+                    });
+                }
                 let verdict = may_migrate(&instance, source, to, &cached, mode);
                 let d = velstra_cloud_proto::convert::destination_of(id, verdict.as_ref().err());
                 json!({ "node": d.node, "allowed": d.allowed, "why": d.why, "detail": d.detail })
@@ -10648,6 +10801,9 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
     if kind == "networks" {
         return check_network(spec, document);
     }
+    if kind == "pools" {
+        return check_pool_projects(spec);
+    }
     if kind != "security-groups" {
         return Ok(());
     }
@@ -10668,6 +10824,34 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
         velstra_cloud_model::security::programmable(&parsed).map_err(|e| {
             ApiError::new(Code::FailedPrecondition, e.to_string()).at(format!("spec.rules[{i}]"))
         })?;
+    }
+    Ok(())
+}
+
+fn check_pool_projects(spec: &Value) -> ApiResult<()> {
+    let Some(projects) = spec.get("projects").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, project) in projects.iter().enumerate() {
+        let Some(raw) = project.as_str() else {
+            continue;
+        };
+        if raw == "*" {
+            continue;
+        }
+        let full = if raw.starts_with("projects/") {
+            raw.to_string()
+        } else {
+            format!("projects/{raw}")
+        };
+        let valid = ResourceName::parse(&full)
+            .is_ok_and(|name| name.collection() == "projects" && name.parent().is_none());
+        if !valid {
+            return Err(ApiError::invalid(format!(
+                "`{raw}` is not a project; use a project id, `projects/<id>`, or `*`"
+            ))
+            .at(format!("spec.projects[{index}]")));
+        }
     }
     Ok(())
 }

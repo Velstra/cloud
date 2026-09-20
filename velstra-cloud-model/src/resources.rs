@@ -167,14 +167,14 @@ impl Observed for crate::images::ImageSourceStatus {
     fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
-    fn written_by_the_platform(&self) -> bool {
-        true
-    }
     /// The image controller, which is a controller and not an agent — nothing
     /// assigns a source to a machine, and what it reports is the result of
     /// asking the network a question, not of running anything.
     fn owner(&self) -> Option<&str> {
         None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        true
     }
 }
 
@@ -1052,6 +1052,9 @@ pub struct NodeStatus {
     /// to hang.
     #[serde(default)]
     pub shared_state: bool,
+    /// Explicit SSH destinations available for cold local-root-disk transfers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_migration_targets: Vec<String>,
     /// Which virtual machine monitor this node runs its guests under.
     ///
     /// `qemu` or `cloud-hypervisor`, reported rather than configured from here:
@@ -1572,6 +1575,16 @@ impl ImageState {
 pub struct ImageStatus {
     pub observed_generation: u64,
     pub conditions: Vec<Condition>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verified_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verified_source_url: String,
+    #[serde(default, skip_serializing_if = "zero_u64")]
+    pub verified_size_bytes: u64,
+}
+
+fn zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Observed for ImageStatus {
@@ -1583,6 +1596,9 @@ impl Observed for ImageStatus {
     }
     fn owner(&self) -> Option<&str> {
         None
+    }
+    fn written_by_the_platform(&self) -> bool {
+        true
     }
 }
 
@@ -2429,6 +2445,14 @@ pub struct PoolSpec {
     /// half way.
     pub accepting: bool,
     pub labels: Vec<String>,
+    /// Projects allowed to place new volumes in this pool.
+    ///
+    /// Entries may be written as `p1` or `projects/p1`. An empty list keeps
+    /// the historical cell-wide behaviour; `*` explicitly allows every
+    /// project. Existing volumes are deliberately unaffected when a grant is
+    /// removed, so tightening access never turns into data loss.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
     /// The machine this pool's bytes are on, where that is one machine.
     ///
     /// Empty means every node can reach it, which is true of a network pool and
@@ -2460,6 +2484,33 @@ pub struct PoolSpec {
     /// second reason.
     #[serde(default)]
     pub volume_ceiling: crate::throttle::Limits,
+}
+
+/// Whether a pool admits new storage owned by `project`.
+pub fn pool_allows_project(pool: &PoolSpec, project: &str) -> bool {
+    if pool.projects.is_empty() {
+        return true;
+    }
+    let project = project.strip_prefix("projects/").unwrap_or(project);
+    pool.projects
+        .iter()
+        .any(|entry| entry == "*" || entry.strip_prefix("projects/").unwrap_or(entry) == project)
+}
+
+#[cfg(test)]
+mod pool_access_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_pool_grant_is_compatible_and_an_explicit_one_is_enforced() {
+        let mut pool = PoolSpec::default();
+        assert!(pool_allows_project(&pool, "p1"));
+        pool.projects = vec!["projects/p1".into()];
+        assert!(pool_allows_project(&pool, "p1"));
+        assert!(!pool_allows_project(&pool, "p2"));
+        pool.projects = vec!["*".into()];
+        assert!(pool_allows_project(&pool, "projects/p2"));
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

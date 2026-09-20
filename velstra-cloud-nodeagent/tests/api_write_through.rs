@@ -244,6 +244,25 @@ async fn a_pool_reads_its_own_object_and_its_share_through_the_api() {
     // spelling — `capacity_gib`, not `capacityGib`.
     assert_eq!(after["status"]["backend"], "lvm");
     assert_eq!(after["status"]["capacity_gib"], 500);
+    api.create(
+        "",
+        "images",
+        &json!({ "id": "test-image", "spec": {
+            "digest": format!("sha256:{}", "a".repeat(64)), "format": "Raw",
+            "source_url": "https://example.com/image.raw", "state": "Active", "size_bytes": 1024
+        }}),
+        &Identity::new(OPERATOR),
+    )
+    .await
+    .unwrap();
+    let images = velstra_cloud_nodeagent::cell::PoolReader::images(&client)
+        .await
+        .unwrap();
+    assert_eq!(
+        images.len(),
+        1,
+        "pool agents must resolve image digests through the API"
+    );
 }
 
 /// The source of a migration reads the instance where its answers live.
@@ -284,4 +303,28 @@ async fn a_node_reads_a_moving_instance_through_the_api_and_not_a_placeholder() 
         .expect("a missing instance is an answer")
         .is_none()
     );
+}
+
+#[tokio::test]
+async fn a_receiver_can_read_a_source_port_missing_from_its_scoped_list() {
+    let (base, token, api) = api_with_a_node("node-b").await;
+    api.create(
+        "projects/p1",
+        "ports",
+        &json!({"id": "moving-port", "spec": {
+            "node": "node-a", "network": "projects/p1/networks/private",
+            "mac": "02:00:00:00:00:01"
+        }}),
+        &Identity::new(OPERATOR),
+    )
+    .await
+    .unwrap();
+    let client = ApiCell::for_node(&base, &token, "node-b").unwrap();
+    assert!(client.ports().await.unwrap().is_empty());
+    let port = client
+        .port("projects/p1/ports/moving-port")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(port.spec.node.as_deref(), Some("node-a"));
 }
