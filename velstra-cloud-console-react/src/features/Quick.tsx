@@ -4,11 +4,12 @@
 // a small edit of a spec, or one object made — so they are written here as the
 // edits they are, with the wait spelled out where one is needed.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { ArrowRightLeft, Copy, Play, Power, RotateCw } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { call } from "@/api/transport";
 import { humanise, idOf, nameOf, type Resource } from "@/lib/model";
@@ -288,6 +289,80 @@ export function NodeQuick({ r, c, reload }: { r: Resource; c: Collection; reload
       <JoinTokenButton r={r} c={c} />
       <InstallMediumButton node={idOf(r)} />
     </>
+  );
+}
+
+/** Service assignments that live on another resource but belong on a node's
+ * page when an operator decides what this machine should do. Ceph keeps its
+ * monitor set on the cluster object, so the console updates that single source
+ * of truth instead of inventing a second `ceph-monitor` node role. */
+export function NodeServices({ r }: { r: Resource }) {
+  const project = useStore((s) => s.project);
+  const node = idOf(r);
+  const ceph = coll("ceph-clusters");
+  const [clusters, setClusters] = useState<Resource[] | null>(null);
+  const [busy, setBusy] = useState("");
+
+  const load = useCallback(() => all(project, "ceph-clusters")
+    .then(setClusters)
+    .catch((e) => { setClusters([]); toast.error((e as Error).message); }), [project]);
+  useEffect(() => { void load(); }, [load, r.meta.generation]);
+
+  const setMonitor = async (cluster: Resource, enabled: boolean) => {
+    const key = idOf(cluster);
+    setBusy(key);
+    try {
+      const latest = await fresh(project, ceph, key);
+      const monitors: string[] = latest.spec?.monitors ?? [];
+      const next = enabled
+        ? [...new Set([...monitors, node])]
+        : monitors.filter((candidate) => candidate !== node);
+      await patch(project, latest, ceph, { monitors: next });
+      toast(enabled
+        ? `${node} is being added to the Ceph monitor quorum.`
+        : `${node} is being removed from the Ceph monitor quorum.`);
+      await load();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const roles: string[] = r.spec?.roles?.length ? r.spec.roles : ["compute"];
+  return (
+    <div className="grid gap-4">
+      <div>
+        <p className="text-xs font-medium uppercase tracking-wide" style={{ color: "var(--text-muted)" }}>Machine roles</p>
+        <p className="mt-1 text-sm">{roles.map(humanise).join(" · ")}</p>
+        <p className="mt-1 text-xs" style={{ color: "var(--text-muted)" }}>Use Edit to add or remove Control plane, Compute and Storage.</p>
+      </div>
+      <div>
+        <p className="text-xs font-medium uppercase tracking-wide" style={{ color: "var(--text-muted)" }}>Ceph services</p>
+        {clusters === null && <p className="mt-2 text-xs" style={{ color: "var(--text-faint)" }}>Loading…</p>}
+        {clusters?.length === 0 && <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>No Ceph cluster exists in this cell.</p>}
+        {!!clusters?.length && (
+          <div className="mt-2 divide-y overflow-hidden rounded-[4px] border" style={{ borderColor: "var(--border)" }}>
+            {clusters.map((cluster) => {
+              const enabled = (cluster.spec?.monitors ?? []).includes(node);
+              return (
+                <label key={nameOf(cluster)} className="flex min-h-12 cursor-pointer items-center gap-3 px-3 py-2"
+                  style={{ background: enabled ? "var(--surface-hover)" : "var(--surface)" }}>
+                  <Checkbox checked={enabled} disabled={busy === idOf(cluster)} aria-label={`Ceph monitor for ${idOf(cluster)}`}
+                    onCheckedChange={(checked) => void setMonitor(cluster, !!checked)} />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium">Ceph monitor · {idOf(cluster)}</span>
+                    <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
+                      {busy === idOf(cluster) ? "Applying…" : enabled ? "Participates in quorum." : "Add this machine to the monitor quorum."}
+                    </span>
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
