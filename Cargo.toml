@@ -42,7 +42,7 @@ base64 = "0.22"
 # adds a verifier, not a dependency.
 ring = "0.17"
 clap = { version = "4", features = ["derive", "env"] }
-etcd-client = "0.19"
+etcd-client = { version = "0.19", features = ["tls"] }
 futures = "0.3"
 # `rustls-tls-webpki-roots` is not enough on its own here: the node a console
 # stream goes to presents a certificate signed by the cell's own CA, not by a

@@ -22,8 +22,8 @@ use std::sync::{
 
 use async_trait::async_trait;
 use etcd_client::{
-    Client, Compare, CompareOp, EventType, GetOptions, KeyValue, ResponseHeader, Txn, TxnOp,
-    TxnOpResponse, TxnResponse, WatchOptions,
+    Certificate, Client, Compare, CompareOp, EventType, GetOptions, Identity, KeyValue,
+    ResponseHeader, TlsOptions, Txn, TxnOp, TxnOpResponse, TxnResponse, WatchOptions,
 };
 use tokio::sync::mpsc;
 use velstra_cloud_model::meta::Revision;
@@ -70,17 +70,56 @@ const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// sit silently in a connect.
 const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn options() -> etcd_client::ConnectOptions {
+fn options() -> Result<etcd_client::ConnectOptions> {
     // Deliberately **not** `with_timeout`: that applies per request, and a
     // watch is a request that is meant to last for hours. The deadline is
     // applied to the calls that should finish, in `bounded` below.
-    etcd_client::ConnectOptions::new()
+    let mut options = etcd_client::ConnectOptions::new()
         .with_connect_timeout(CONNECT_DEADLINE)
         // A dead peer that never sends a FIN leaves the connection looking
         // healthy for as long as the kernel is willing to wait. The pings are
         // what turn that into an error the caller can act on.
         .with_keep_alive(std::time::Duration::from_secs(15), CALL_DEADLINE)
-        .with_keep_alive_while_idle(true)
+        .with_keep_alive_while_idle(true);
+
+    let ca = std::env::var_os("VELSTRA_STORE_CA");
+    let cert = std::env::var_os("VELSTRA_STORE_CERT");
+    let key = std::env::var_os("VELSTRA_STORE_KEY");
+    if cert.is_some() != key.is_some() {
+        return Err(StoreError::Backend(
+            "VELSTRA_STORE_CERT and VELSTRA_STORE_KEY must be set together".into(),
+        ));
+    }
+    if let Some(path) = ca {
+        let pem = std::fs::read(&path).map_err(|e| {
+            StoreError::Backend(format!(
+                "the store CA {} could not be read: {e}",
+                std::path::Path::new(&path).display()
+            ))
+        })?;
+        let mut tls = TlsOptions::new().ca_certificate(Certificate::from_pem(pem));
+        if let (Some(cert), Some(key)) = (cert, key) {
+            let cert_pem = std::fs::read(&cert).map_err(|e| {
+                StoreError::Backend(format!(
+                    "the store client certificate {} could not be read: {e}",
+                    std::path::Path::new(&cert).display()
+                ))
+            })?;
+            let key_pem = std::fs::read(&key).map_err(|e| {
+                StoreError::Backend(format!(
+                    "the store client key {} could not be read: {e}",
+                    std::path::Path::new(&key).display()
+                ))
+            })?;
+            tls = tls.identity(Identity::from_pem(cert_pem, key_pem));
+        }
+        options = options.with_tls(tls);
+    } else if cert.is_some() {
+        return Err(StoreError::Backend(
+            "VELSTRA_STORE_CERT and VELSTRA_STORE_KEY require VELSTRA_STORE_CA".into(),
+        ));
+    }
+    Ok(options)
 }
 
 /// Run one store call under [`CALL_DEADLINE`].
@@ -109,7 +148,7 @@ impl EtcdStore {
     /// zero — which would replay the entire history — or from "now", which
     /// would race.
     pub async fn connect<E: AsRef<str>, S: AsRef<[E]>>(endpoints: S) -> Result<Self> {
-        let client = Client::connect(endpoints, Some(options()))
+        let client = Client::connect(endpoints, Some(options()?))
             .await
             .map_err(backend)?;
         let store = Self {

@@ -1,0 +1,35 @@
+{
+  "cell": "cell-1",
+  "region": "eu-central",
+  "ssh": {
+    "user": "root",
+    "privateKey": "/secure/path/control-plane-deploy-key"
+  },
+  "etcd": {
+    "scheme": "https",
+    "ca": "/secure/path/etcd-ca.pem"
+  },
+  "controlPlanes": [
+    {
+      "name": "cp01",
+      "address": "10.42.0.10",
+      "sshAddress": "10.42.0.10",
+      "etcdCertificate": "/secure/path/cp01-etcd.pem",
+      "etcdPrivateKey": "/secure/path/cp01-etcd-key.pem"
+    },
+    {
+      "name": "cp02",
+      "address": "10.42.0.11",
+      "sshAddress": "10.42.0.11",
+      "etcdCertificate": "/secure/path/cp02-etcd.pem",
+      "etcdPrivateKey": "/secure/path/cp02-etcd-key.pem"
+    },
+    {
+      "name": "cp03",
+      "address": "10.42.0.12",
+      "sshAddress": "10.42.0.12",
+      "etcdCertificate": "/secure/path/cp03-etcd.pem",
+      "etcdPrivateKey": "/secure/path/cp03-etcd-key.pem"
+    }
+  ]
+}
