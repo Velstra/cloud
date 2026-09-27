@@ -4,6 +4,9 @@
 Velstra control planes. The hardware provisioner installs the Velstra package,
 writes `/etc/velstra/node.env` with the `control-plane` role and valid TLS
 material, then runs the reconciler from an administration host.
+The current runner targets Debian/Ubuntu systemd installations using
+`/etc/default/etcd` and the `etcd` service account. NixOS service configuration
+is declarative and requires a separate deployment integration.
 
 ```sh
 cp deploy/control-plane/inventory.example.json /secure/velstra-cell.json
@@ -32,7 +35,7 @@ Every run:
 1. verifies every target already has a control-plane seed and required tools;
 2. refuses an inventory that silently omits a running etcd member;
 3. saves an etcd snapshot before changing membership;
-4. admits missing members idempotently and writes the same complete cluster
+4. admits missing members as non-voting learners, waits for catch-up, promotes them idempotently and writes the same complete cluster
    manifest to every control plane;
 5. removes any member admitted by this run if its etcd or API startup fails;
 6. publishes all client endpoints into every control-plane seed and rolls API
@@ -48,3 +51,18 @@ The reconciler does not create or copy API private keys. Certificate issuance
 and secret delivery belong to the hardware provisioner or secret manager and
 must complete before admission. This also means a failed certificate delivery
 cannot leave a new voting member whose API will never start.
+API readiness uses certificate verification against `api.caPath` from the
+inventory (default `/etc/velstra/api-ca.pem` on each target). Deliver that CA
+before admission; the API certificate must cover the target's `address`.
+
+The provisioner must leave a joining member's `/var/lib/etcd/default` empty.
+Debian may start a standalone etcd during package installation; stop it and
+back up/verify its database before preparing the joining node. The reconciler
+refuses an existing data directory on a node absent from the current membership,
+and never erases it. etcd identities are owned by the `etcd` service account;
+the deployment runner uses root for client-key access. Configuration changes
+restart etcd before readiness is checked.
+
+Set `VELSTRA_DEPLOY_KNOWN_HOSTS` to a deployment-specific SSH known-hosts file
+when addresses are reused. Populate it using fingerprints verified through the
+provisioner's trusted console; strict host-key checking stays enabled.

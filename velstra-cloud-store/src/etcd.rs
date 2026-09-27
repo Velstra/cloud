@@ -139,6 +139,43 @@ async fn bounded<T>(what: &str, call: impl std::future::Future<Output = Result<T
     }
 }
 
+/// Replay reads while the balanced channel removes an unavailable endpoint.
+/// The caller's single CALL_DEADLINE bounds the whole retry sequence. Mutations
+/// deliberately do not use this: a lost write response may already be committed.
+async fn retry_read<T, F, Fut>(mut read: F) -> std::result::Result<T, etcd_client::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, etcd_client::Error>>,
+{
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        match read().await {
+            Err(error) if transient_read_error(&error) => {
+                tracing::warn!(error = %error, "retrying an unavailable etcd read");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(1));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn transient_read_error(error: &etcd_client::Error) -> bool {
+    match error {
+        // gRPC's stable wire codes: DEADLINE_EXCEEDED = 4, UNAVAILABLE = 14.
+        etcd_client::Error::GRpcStatus(status) => matches!(status.code() as i32, 4 | 14),
+        etcd_client::Error::TransportError(_) => true,
+        etcd_client::Error::IoError(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut
+        ),
+        _ => false,
+    }
+}
+
 impl EtcdStore {
     /// Connect and learn where the store currently is.
     ///
@@ -171,12 +208,12 @@ impl EtcdStore {
 impl Store for EtcdStore {
     async fn get(&self, key: &str) -> Result<Option<Entry>> {
         bounded("get", async {
-            let response = self
-                .client
-                .kv_client()
-                .get(key, None)
-                .await
-                .map_err(backend)?;
+            let response = retry_read(|| {
+                let mut kv = self.client.kv_client();
+                async move { kv.get(key, None).await }
+            })
+            .await
+            .map_err(backend)?;
             self.observe(response.header());
             response.kvs().first().map(entry).transpose()
         })
@@ -196,7 +233,7 @@ impl Store for EtcdStore {
             // Key order is what makes this work at all, and it is the same order on
             // both backends: etcd compares keys as bytes, which is how Rust orders
             // the `String` keys the memory store holds.
-            let mut kv = self.client.kv_client();
+            let kv = self.client.kv_client();
             let end = range_end(prefix);
             let mut start = prefix.as_bytes().to_vec();
             let mut pinned: Option<i64> = None;
@@ -208,7 +245,14 @@ impl Store for EtcdStore {
                 if let Some(revision) = pinned {
                     options = options.with_revision(revision);
                 }
-                let response = kv.get(start, Some(options)).await.map_err(backend)?;
+                let response = retry_read(|| {
+                    let mut client = kv.clone();
+                    let start = start.clone();
+                    let options = options.clone();
+                    async move { client.get(start, Some(options)).await }
+                })
+                .await
+                .map_err(backend)?;
                 let revision = self.observe(response.header());
                 for kv in response.kvs() {
                     entries.push(entry(kv)?);
@@ -240,7 +284,7 @@ impl Store for EtcdStore {
             // revision held across client round trips is one etcd may compact
             // underneath the caller, and the price of that promise is answering
             // `410 Gone` to somebody whose token merely got old.
-            let mut kv = self.client.kv_client();
+            let kv = self.client.kv_client();
             let start = match after {
                 // Strictly after: the resume key is the last one already delivered,
                 // and etcd ranges are inclusive at the start. Appending the zero byte
@@ -256,7 +300,14 @@ impl Store for EtcdStore {
             let options = GetOptions::new()
                 .with_range(range_end(prefix))
                 .with_limit(limit as i64);
-            let response = kv.get(start, Some(options)).await.map_err(backend)?;
+            let response = retry_read(|| {
+                let mut client = kv.clone();
+                let start = start.clone();
+                let options = options.clone();
+                async move { client.get(start, Some(options)).await }
+            })
+            .await
+            .map_err(backend)?;
             self.observe(response.header());
             let entries = response
                 .kvs()
@@ -562,12 +613,12 @@ impl Store for EtcdStore {
             // An empty transaction is the cheapest thing that returns a header and
             // nothing else. It compares nothing and writes nothing, so it does not
             // move the revision it reports.
-            let response = self
-                .client
-                .kv_client()
-                .txn(Txn::new())
-                .await
-                .map_err(backend)?;
+            let response = retry_read(|| {
+                let mut kv = self.client.kv_client();
+                async move { kv.txn(Txn::new()).await }
+            })
+            .await
+            .map_err(backend)?;
             Ok(self.observe(response.header()))
         })
         .await
@@ -627,4 +678,56 @@ fn key_string(bytes: &[u8]) -> Result<String> {
 
 fn backend(e: etcd_client::Error) -> StoreError {
     StoreError::Backend(e.to_string())
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_recovers_after_transport_failure() {
+        let mut attempts = 0;
+        let result = retry_read(|| {
+            attempts += 1;
+            std::future::ready(if attempts == 1 {
+                Err(etcd_client::Error::IoError(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                )))
+            } else {
+                Ok(42)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_read_is_not_retried() {
+        let mut attempts = 0;
+        let result = retry_read(|| {
+            attempts += 1;
+            std::future::ready(Err::<(), _>(etcd_client::Error::InvalidArgs(
+                "bad range".into(),
+            )))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn outage_respects_the_call_deadline() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            retry_read(|| {
+                std::future::ready(Err::<(), _>(etcd_client::Error::IoError(
+                    std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                )))
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+    }
 }
