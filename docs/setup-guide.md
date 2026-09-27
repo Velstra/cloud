@@ -368,6 +368,14 @@ per disk). The deployment blocks by name until `cephadm` is on the named
 nodes; the appliance image carries it, and a Debian node gets it with
 `apt install cephadm`.
 
+Keep the cluster image and host-side `ceph-common`/`librbd` clients compatible.
+A floating cephadm image tag can introduce an authentication format the host
+packages cannot read (for example, Squid 19.2.6 with 19.2.3 clients). Pin the
+cluster image and provision compatible clients; never downgrade authentication
+to work around this. A matching `cephadm shell` CLI can manage the cluster, but
+it does not upgrade the native RBD library QEMU uses. Validate both before
+placing workloads on a new cluster.
+
 Nothing is copied onto the hypervisors. Once a monitor is up, the cell
 publishes the client configuration — a minimal `ceph.conf` and a
 `client.velstra` keyring with read/write on the platform's pools — on the

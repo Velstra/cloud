@@ -96,6 +96,22 @@ pub fn my_step(me: &str, cluster: &CephCluster, nodes: &[Node]) -> Option<CephSt
     )
 }
 
+/// Reconcile placement even when cephadm already started every requested monitor.
+/// Its bootstrap default can also place monitors on compute hosts; daemon
+/// presence alone is not an acknowledgement of the requested service placement.
+pub fn owns_monitor_placement(me: &str, cluster: &CephCluster, nodes: &[Node]) -> bool {
+    if cluster.spec.paused || cluster.spec.monitors.is_empty() {
+        return false;
+    }
+    let observed = observe(nodes);
+    admin_node(&observed).as_deref() == Some(me)
+        && cluster
+            .spec
+            .monitors
+            .iter()
+            .all(|m| observed.hosts.contains(m))
+}
+
 /// Whether `me` is the one to carry out `step`.
 fn step_for(me: &str, step: &CephStep, observed: &CephObserved) -> Option<CephStep> {
     let mine = match step {
@@ -519,6 +535,27 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn monitor_placement_is_reconciled_after_automatic_daemon_creation() {
+        let mut object = cluster(three_node());
+        let mut nodes = vec![
+            node("a", reachable("a", true, &[])),
+            node("b", reachable("b", true, &[])),
+            node("c", reachable("c", true, &[])),
+        ];
+        assert!(owns_monitor_placement("a", &object, &nodes));
+        assert!(!owns_monitor_placement("b", &object, &nodes));
+        nodes[0].status.last_heartbeat = velstra_cloud_model::meta::Timestamp(0);
+        assert!(owns_monitor_placement("b", &object, &nodes));
+        object.spec.paused = true;
+        assert!(!owns_monitor_placement("b", &object, &nodes));
+        object.spec.paused = false;
+        for n in &mut nodes {
+            n.status.ceph.as_mut().unwrap().cluster_hosts = vec!["a".into()];
+        }
+        assert!(!owns_monitor_placement("b", &object, &nodes));
+    }
 
     fn disk(path: &str, state: DeviceUse) -> BlockDevice {
         BlockDevice {

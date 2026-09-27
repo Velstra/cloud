@@ -19,7 +19,10 @@ use velstra_cloud_model::ceph::CephStep;
 
 use super::{Agent, Pass};
 use crate::{
-    ceph_deploy::{my_step, observe_node, perform, published_key, running_daemons, spec_names},
+    ceph_deploy::{
+        my_step, observe_node, owns_monitor_placement, perform, published_key, running_daemons,
+        spec_names,
+    },
     host::HostState,
 };
 
@@ -203,6 +206,14 @@ impl Agent {
             // freshly started agent, and a node that judged *itself* dead would
             // refuse to take work it is plainly able to do.
             me.status.last_heartbeat = velstra_cloud_model::meta::Timestamp::now();
+        }
+
+        if owns_monitor_placement(&self.config.node, cluster, &nodes)
+            && let Err(e) = self.cephadm.apply_monitors(&cluster.spec.monitors).await
+        {
+            tracing::warn!(error = %e, "could not reconcile Ceph monitor placement");
+            pass.failures += 1;
+            return;
         }
 
         let Some(step) = my_step(&self.config.node, cluster, &nodes) else {
