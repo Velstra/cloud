@@ -419,10 +419,10 @@ serves them on different ports for different audiences:
 | Config service | `VELSTRA_FABRIC_CONTROL` | the eBPF agent on each node | say what this host should be running |
 
 Pointing either at the other's port gets `unimplemented`, which is a confusing
-way to learn this. Worth knowing before you widen anything: fabric binds the
-orchestrator to **localhost** by default and offers mTLS on the config service
-only — so giving every hypervisor a route to the orchestrator is a real
-decision, because that channel can reconfigure any node in the cell.
+way to learn this. Fabric binds the orchestrator to **localhost** by default.
+Its TLS settings protect both channels; with a client CA, orchestrator writes
+are authorized by client-certificate identity. Configure these before exposing
+the orchestrator beyond loopback.
 
 On the control plane:
 
@@ -439,6 +439,25 @@ VELSTRA_FABRIC_VTEP=10.0.0.7          # what other hosts send frames to
 VELSTRA_FABRIC_UNDERLAY=eth1          # the interface that address is on
 VELSTRA_FABRIC_SRV6_LOCATOR=fc00:0:1::/64   # optional; empty stays VXLAN
 ```
+
+For a TLS-protected orchestrator, use `https://` and deliver trust material to
+each Cloud controller/node-agent service through its environment:
+
+```sh
+VELSTRA_FABRIC=https://fabric.cell-1:50052
+VELSTRA_FABRIC_CA=/etc/velstra/fabric/ca.pem
+VELSTRA_FABRIC_CERT=/etc/velstra/fabric/client.pem
+VELSTRA_FABRIC_KEY=/etc/velstra/fabric/client.key
+```
+
+The certificate and private key must be supplied together; the identity needs
+a CA, and credentials on an `http://` endpoint are rejected. Keys should be
+readable only by the service account. The Fabric data-plane agent has its own
+TLS configuration; these variables configure the Cloud orchestrator client.
+Authentication does not grant authorization: the controller's `--admin-cn`
+policy must permit the operations that each identity performs. In particular,
+Cloud's port programming currently creates security groups, an admin-only
+Fabric operation; a host-scoped identity alone cannot complete that workflow.
 
 The VTEP address is stated rather than derived: nothing on a machine can tell
 which of its addresses its peers route to, and picking one would pick wrong on
