@@ -676,9 +676,8 @@ in
       # orchestrator under that id, and a config fetched under a second name
       # would be a config for a host nobody registered.
       script = ''
-        exec ${cfg.fabricAgent}/bin/velstra run \
-          --controller "$VELSTRA_FABRIC_CONTROL" \
-          --node-id "$VELSTRA_NODE"
+        export VELSTRA_FABRIC_AGENT_BINARY=${cfg.fabricAgent}/bin/velstra
+        exec ${pkgs.runtimeShell} ${./fabric-agent-start.sh}
       '';
     };
 

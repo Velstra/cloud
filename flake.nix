@@ -1145,6 +1145,23 @@
                 # to: the orchestrator is told about this host under that id.
                 assert "--node-id node-1" in argv, argv
 
+            with subtest("HTTPS fabric passes a separate data-plane identity"):
+                node.succeed(
+                    f"printf '{seed}VELSTRA_FABRIC=https://fab:50052\n"
+                    "VELSTRA_FABRIC_CONTROL=https://fab:50051\n"
+                    "VELSTRA_FABRIC_AGENT_CA=/run/fabric-ca.pem\n"
+                    "VELSTRA_FABRIC_AGENT_CERT=/run/fabric-node.pem\n"
+                    "VELSTRA_FABRIC_AGENT_KEY=/run/fabric-node.key\n'"
+                    " > /var/lib/velstra/node.env"
+                )
+                node.succeed("systemctl restart velstra-fabric-agent.service")
+                node.wait_for_unit("velstra-fabric-agent.service")
+                argv = node.succeed("cat /run/fabric-agent-argv").strip()
+                assert "--controller https://fab:50051" in argv, argv
+                assert "--tls-ca /run/fabric-ca.pem" in argv, argv
+                assert "--tls-cert /run/fabric-node.pem" in argv, argv
+                assert "--tls-key /run/fabric-node.key" in argv, argv
+
             with subtest("the node agent is given the overlay too"):
                 # The other half of the same seed. Without these the agent keeps
                 # its default datapath — real taps, nothing programmed — and a
@@ -1923,6 +1940,7 @@
                 ./usr/bin/velstra-cloud-poolagent \
                 ./usr/bin/velstra-cloud-node \
                 ./usr/bin/velstra-cloud-passthrough \
+                ./usr/lib/velstra-cloud/fabric-agent-start \
                 ./lib/systemd/system/velstra-cloud-api.service \
                 ./lib/systemd/system/velstra-cloud-controller.service \
                 ./lib/systemd/system/velstra-cloud-nodeagent.service \
@@ -2094,27 +2112,60 @@
               #
               # A cell with no fabric is a legitimate way to run — it is what
               # every cell did before the data plane had a unit at all — and the
-              # agent is a package this one only recommends. So on a hypervisor
-              # whose seed names no fabric, and on one where `velstra` was never
-              # installed, this must read as "not for this machine" rather than
-              # as a service that failed. Both are ExecCondition, which systemd
-              # records as skipped.
+              # Fabric's executable also has the name `velstra`, which this
+              # package already uses for Cloud's CLI. A PATH lookup would find
+              # the wrong program and claim that the data plane is installed.
+              # The gate must instead require an explicit Fabric binary path.
               dpkg-deb --fsys-tarfile "$deb" | tar -xO ./lib/systemd/system/velstra-fabric-agent.service > fab
               grep -q "ExecCondition=.*has-role hypervisor" fab || {
                 echo "the fabric unit is not conditional on the hypervisor role:" >&2
                 cat fab >&2
                 exit 1
               }
-              grep -q "VELSTRA_FABRIC_CONTROL" fab || {
-                echo "the fabric unit would start on a node whose cell has no fabric:" >&2
+              grep -q '/usr/lib/velstra-cloud/fabric-agent-start --check' fab || {
+                echo "the fabric unit does not check the explicit agent path:" >&2
                 cat fab >&2
                 exit 1
               }
-              grep -q "command -v velstra" fab || {
-                echo "the fabric unit does not check that the agent is installed:" >&2
+              grep -q 'ExecStart=/usr/lib/velstra-cloud/fabric-agent-start' fab || {
+                echo "the fabric unit does not use the checked agent path:" >&2
                 cat fab >&2
                 exit 1
               }
+              dpkg-deb --fsys-tarfile "$deb" | tar -xO ./usr/lib/velstra-cloud/fabric-agent-start > fabric-start
+              chmod +x fabric-start
+              if VELSTRA_FABRIC_AGENT_BINARY="$PWD/missing" VELSTRA_FABRIC_CONTROL=https://fab:50051 ./fabric-start --check > fabric-out 2>&1; then
+                echo "Cloud's CLI was mistaken for a Fabric agent" >&2
+                exit 1
+              fi
+              grep -q 'not installed' fabric-out
+              cat > fabric-fake <<'FAKE'
+              #!/bin/sh
+              printf '%s\n' "$@" > fabric-argv
+              FAKE
+              chmod +x fabric-fake
+              VELSTRA_FABRIC_AGENT_BINARY="$PWD/fabric-fake" \
+                VELSTRA_FABRIC_CONTROL=https://fab:50051 VELSTRA_NODE=node-1 \
+                VELSTRA_FABRIC_AGENT_CA=/run/ca.pem \
+                VELSTRA_FABRIC_AGENT_CERT=/run/node.pem \
+                VELSTRA_FABRIC_AGENT_KEY=/run/node.key ./fabric-start
+              for want in '--controller' 'https://fab:50051' '--tls-ca' '/run/ca.pem' '--tls-cert' '/run/node.pem' '--tls-key' '/run/node.key'; do
+                grep -qx -- "$want" fabric-argv
+              done
+              if VELSTRA_FABRIC_AGENT_BINARY="$PWD/fabric-fake" \
+                VELSTRA_FABRIC_CONTROL=https://fab:50051 VELSTRA_NODE=node-1 \
+                ./fabric-start > fabric-out 2>&1; then
+                echo "HTTPS fabric started without a client identity" >&2
+                exit 1
+              fi
+              grep -q 'requires VELSTRA_FABRIC_AGENT_CA' fabric-out
+              if VELSTRA_FABRIC_AGENT_BINARY="$PWD/fabric-fake" \
+                VELSTRA_FABRIC_CONTROL=http://fab:50051 VELSTRA_NODE=node-1 \
+                VELSTRA_FABRIC_AGENT_CA=/run/ca.pem ./fabric-start > fabric-out 2>&1; then
+                echo "Fabric client credentials were accepted over HTTP" >&2
+                exit 1
+              fi
+              grep -q 'fabric client credentials require HTTPS' fabric-out
               # It must load before the node agent asks the orchestrator to turn
               # a tap into a tenant port: a port programmed against a data plane
               # that is not up yet is a guest with a wire and no rules.

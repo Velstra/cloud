@@ -308,11 +308,11 @@ let
   # fabric named in the seed. A cell without a fabric is a real way to run, and
   # on such a machine this must read as "not for this box", not as a failure.
   #
-  # And its binary is not ours. `velstra` is the fabric agent; this package
-  # does not ship it, because vendoring somebody else's eBPF data plane into a
-  # Debian package would make its kernel compatibility our problem. It is a
-  # `Recommends:`, and the condition below means an operator who has not
-  # installed it gets a skipped unit rather than a red one.
+  # And its binary is not ours. Cloud's CLI is also named `velstra`, so looking
+  # that name up in PATH falsely finds the wrong executable. The Fabric agent
+  # has an explicit, operator-owned path instead. A missing binary skips the
+  # unit, while a configured HTTPS connection without its own client identity
+  # fails visibly rather than falling back to plaintext.
   fabricUnit = ''
     [Unit]
     Description=Velstra Fabric data plane (eBPF/XDP)
@@ -327,8 +327,8 @@ let
     RuntimeDirectory=velstra
     RuntimeDirectoryMode=0700
     EnvironmentFile=-/etc/velstra/node.env
-    ${roleGuard "hypervisor"}ExecCondition=/bin/sh -c 'command -v velstra >/dev/null || { echo "the fabric agent (velstra) is not installed; tenant networks here separate no traffic"; exit 1; }; grep -qE "^VELSTRA_FABRIC_CONTROL=." /etc/velstra/node.env || { echo "no VELSTRA_FABRIC_CONTROL in the seed: this cell has no data plane"; exit 1; }'
-    ExecStart=/bin/sh -c 'exec velstra run --controller "$VELSTRA_FABRIC_CONTROL" --node-id "$VELSTRA_NODE"'
+    ${roleGuard "hypervisor"}ExecCondition=/usr/lib/velstra-cloud/fabric-agent-start --check
+    ExecStart=/usr/lib/velstra-cloud/fabric-agent-start
     AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
     CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
     NoNewPrivileges=true
@@ -354,7 +354,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
   }
   ''
     root=$PWD/pkg
-    mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/lib/systemd/system" \
+    mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/velstra-cloud" "$root/lib/systemd/system" \
              "$root/var/lib/velstra" "$root/usr/share/doc/velstra-cloud" \
              "$root/usr/share/velstra-cloud/console"
     # Where a machine keeps who it is: its seed and its agent tokens. Shipped
@@ -362,6 +362,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     # pool token in all find it there, on a fresh install too. 0700 because a
     # token in it is a credential.
     install -d -m 0700 "$root/etc/velstra"
+    install -m 0755 ${./fabric-agent-start.sh} "$root/usr/lib/velstra-cloud/fabric-agent-start"
 
     # The binaries, copied rather than symlinked into the store — and then
     # pointed at Debian's own dynamic linker, which is the half that was
@@ -408,7 +409,7 @@ pkgs.runCommand "velstra-cloud_${version}_${debArch}.deb"
     Architecture: ${debArch}
     Maintainer: Velstra <noreply@velstra.invalid>
     Depends: systemd, libc6 (>= 2.39), iproute2, nftables, curl, zstd, kmod, genisoimage
-    Recommends: qemu-system-x86, qemu-utils, etcd-server, etcd-client, ceph-common, cephadm, podman, velstra
+    Recommends: qemu-system-x86, qemu-utils, etcd-server, etcd-client, ceph-common, cephadm, podman
     Description: Velstra Cloud — control plane, node agent and storage pool
      One package, four roles. Which of them this machine runs is decided by
      \`velstra-cloud-node setup\`, which writes /etc/velstra/node.env; every

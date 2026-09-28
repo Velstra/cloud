@@ -467,6 +467,26 @@ policy must permit the operations that each identity performs. In particular,
 Cloud's port programming currently creates security groups, an admin-only
 Fabric operation; a host-scoped identity alone cannot complete that workflow.
 
+The Fabric data-plane agent connects to the separate config service. Give it
+its own certificate with a node-scoped CN matching `VELSTRA_NODE`, not the
+Cloud orchestrator's admin identity. On a Debian or NixOS node, add these to
+the node environment when `VELSTRA_FABRIC_CONTROL` uses HTTPS:
+
+```sh
+VELSTRA_FABRIC_AGENT_CA=/etc/velstra/fabric/ca.pem
+VELSTRA_FABRIC_AGENT_CERT=/etc/velstra/fabric/node.pem
+VELSTRA_FABRIC_AGENT_KEY=/etc/velstra/fabric/node.key
+```
+
+The unit rejects an HTTPS endpoint missing any of these values, and refuses to
+send client credentials to an HTTP endpoint. Keep the private key readable only
+by the Fabric service. On Debian, install the Fabric data-plane executable as
+`/usr/local/libexec/velstra-fabric-agent`, or set
+`VELSTRA_FABRIC_AGENT_BINARY` in the node environment to another absolute path.
+The Cloud package already installs its own CLI as `/usr/bin/velstra`; that name
+must not be used to discover the Fabric executable. NixOS uses the explicit
+`velstra.cloud.node.fabricAgent` package path.
+
 The VTEP address is stated rather than derived: nothing on a machine can tell
 which of its addresses its peers route to, and picking one would pick wrong on
 every host with more than one interface. The locator is the same argument one
@@ -482,7 +502,7 @@ On NixOS the unit comes with the node module once you give it the agent:
 velstra.cloud.node.fabricAgent = pkgs.velstra;   # the fabric agent
 ```
 
-On Debian the agent is a `Recommends:` — install the `velstra` package, then
+On Debian install the Fabric executable at the explicit path above, then
 `systemctl enable --now velstra-fabric-agent`. Either way the unit skips itself
 on a machine whose seed names no fabric, and says so in the journal rather than
 turning red.
