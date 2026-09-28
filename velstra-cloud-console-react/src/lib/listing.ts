@@ -34,16 +34,22 @@ export async function pages(c: Collection, project: string, query: Record<string
 }
 
 let known: { at: number; names: string[] } | null = null;
+let loadingNames: Promise<string[]> | null = null;
 
 /** Every project's id, kept for a little while: the fan-out below asks for
  *  it once per sweep, not once per collection. */
 export async function projectNames(): Promise<string[]> {
   if (known && Date.now() - known.at < 15_000) return known.names;
-  const projects = SCHEMA.find((c) => c.id === "projects")!;
-  const { rows } = await pages(projects, "");
-  const names = rows.map((r) => r.meta.name.split("/").pop() ?? r.meta.name);
-  known = { at: Date.now(), names };
-  return names;
+  if (!loadingNames) {
+    loadingNames = (async () => {
+      const projects = SCHEMA.find((c) => c.id === "projects")!;
+      const { rows } = await pages(projects, "");
+      const names = rows.map((r) => r.meta.name.split("/").pop() ?? r.meta.name);
+      known = { at: Date.now(), names };
+      return names;
+    })().finally(() => { loadingNames = null; });
+  }
+  return loadingNames;
 }
 
 /** The collection as the picker means it: one project, or all of them. */

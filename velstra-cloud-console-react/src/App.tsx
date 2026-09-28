@@ -37,6 +37,7 @@ export default function App() {
   const route = useRoute();
   const [census, setCensus] = useState<Census>({});
   const sweepId = useRef(0);
+  const runningSweep = useRef<{ who: typeof who; project: string } | null>(null);
   // A registration's credential, held on screen until it is copied. It is
   // shown once by the API — only a digest is kept — so the page must not move
   // on by itself the way every other create does.
@@ -83,41 +84,51 @@ export default function App() {
 
   const sweep = useCallback(async () => {
     if (!who) return;
-    const request = ++sweepId.current;
-    const out: Census = {};
-    const all: CensusRows = {};
-    // Records — audit entries, usage readings — are facts about the past, not
-    // objects anybody manages, and a cell keeps hundreds of thousands of them.
-    // The census counts what converges; those two are read where they are shown.
-    // Everything this person can read, including the plumbing: the map and the
-    // relations panel are drawn from it, and a port that is not in the census
-    // is a wire missing from the picture. What it does *not* sweep is what the
-    // API would refuse — a tenant's census used to ask for `migrations` and
-    // `nodes` and count two silent 403s as "nothing there".
-    const mine = SCHEMA.filter((c) =>
-      (who.cellAdmin ? c.audience !== undefined : c.audience !== "operator")
-      && c.id !== "audit" && c.id !== "usage");
-    // What could not be read, and what was cut short — kept, not swallowed.
-    // The relations panel puts a claim beside the Delete button that is only
-    // true of a sweep that saw everything, and it cannot tell whether this was
-    // one unless the sweep says so.
-    const missing: Record<string, string> = {};
-    const truncated: string[] = [];
-    await Promise.all(mine.map(async (c) => {
-      try {
-        const page = await listEvery(c, project);
-        all[c.id] = page.rows;
-        if (page.truncated) truncated.push(c.id);
-        out[c.id] = { total: page.rows.length, unsettled: c.condition === "" ? [] : page.rows.filter((r) => verdict(r, c).kind !== "settled") };
-      } catch (e) {
-        // The board says why when it is opened — and until somebody opens it,
-        // this is the only record that the question was asked and not answered.
-        missing[c.id] = (e as Error).message;
-      }
-    }));
-    if (request !== sweepId.current || getState().project !== project || getState().who !== who) return;
-    setCensusStore({ rows: all, missing, truncated });
-    setCensus(out);
+    // A full inventory can take longer than the refresh interval on a busy
+    // cell. Let it finish instead of repeatedly invalidating it before the
+    // dashboard has ever received a complete first read.
+    if (runningSweep.current?.who === who && runningSweep.current.project === project) return;
+    const run = { who, project };
+    runningSweep.current = run;
+    try {
+      const request = ++sweepId.current;
+      const out: Census = {};
+      const all: CensusRows = {};
+      // Records — audit entries, usage readings — are facts about the past, not
+      // objects anybody manages, and a cell keeps hundreds of thousands of them.
+      // The census counts what converges; those two are read where they are shown.
+      // Everything this person can read, including the plumbing: the map and the
+      // relations panel are drawn from it, and a port that is not in the census
+      // is a wire missing from the picture. What it does *not* sweep is what the
+      // API would refuse — a tenant's census used to ask for `migrations` and
+      // `nodes` and count two silent 403s as "nothing there".
+      const mine = SCHEMA.filter((c) =>
+        (who.cellAdmin ? c.audience !== undefined : c.audience !== "operator")
+        && c.id !== "audit" && c.id !== "usage");
+      // What could not be read, and what was cut short — kept, not swallowed.
+      // The relations panel puts a claim beside the Delete button that is only
+      // true of a sweep that saw everything, and it cannot tell whether this was
+      // one unless the sweep says so.
+      const missing: Record<string, string> = {};
+      const truncated: string[] = [];
+      await Promise.all(mine.map(async (c) => {
+        try {
+          const page = await listEvery(c, project);
+          all[c.id] = page.rows;
+          if (page.truncated) truncated.push(c.id);
+          out[c.id] = { total: page.rows.length, unsettled: c.condition === "" ? [] : page.rows.filter((r) => verdict(r, c).kind !== "settled") };
+        } catch (e) {
+          // The board says why when it is opened — and until somebody opens it,
+          // this is the only record that the question was asked and not answered.
+          missing[c.id] = (e as Error).message;
+        }
+      }));
+      if (request !== sweepId.current || getState().project !== project || getState().who !== who) return;
+      setCensusStore({ rows: all, missing, truncated });
+      setCensus(out);
+    } finally {
+      if (runningSweep.current === run) runningSweep.current = null;
+    }
   }, [who, project]);
   useEffect(() => {
     setCensus({});
