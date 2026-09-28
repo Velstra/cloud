@@ -41,6 +41,19 @@ Every run:
 6. publishes all client endpoints into every control-plane seed and rolls API
    and controller replicas one at a time;
 7. requires every etcd endpoint and every API/controller replica to be ready.
+8. registers each control plane as an unschedulable Cloud node, installs only
+   that node's agent credential, and waits for a fresh heartbeat.
+
+Set `api.nodeRegistration` in the inventory to perform step 8. Its `url`
+addresses one reachable control-plane API during deployment, and `agentUrl`
+is the HA API address that node agents use afterwards. Both must be HTTPS and
+covered by the CA named in `ca`. `adminTokenFile` is an owner-only local file
+containing a short-lived cloud-admin session token. The runner never passes
+this token to a node. Existing node credentials are preserved on repeated
+runs; a missing node object with an existing local credential stops the
+deployment for inspection. Without registration settings, the reconciler
+requires every control plane to already have a running, credentialed agent
+and fails rather than claiming a complete cluster while nodes are absent.
 
 Existing members are never removed merely because the inventory changed. For a
 planned replacement, add the new member and converge first. Remove the retired

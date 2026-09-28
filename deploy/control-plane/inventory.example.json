@@ -9,6 +9,15 @@
     "scheme": "https",
     "ca": "/secure/path/etcd-ca.pem"
   },
+  "api": {
+    "caPath": "/etc/velstra/api-ca.pem",
+    "nodeRegistration": {
+      "url": "https://cp01.example.net:8443",
+      "ca": "/secure/path/api-ca.pem",
+      "adminTokenFile": "/secure/path/deployment-admin-token",
+      "agentUrl": "https://cloud-api.internal.example.net:8443"
+    }
+  },
   "controlPlanes": [
     {
       "name": "cp01",

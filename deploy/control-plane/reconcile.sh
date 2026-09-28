@@ -35,7 +35,7 @@ ssh_key=${VELSTRA_DEPLOY_SSH_KEY:-$(jq -r '.ssh.privateKey // empty' "$inventory
 }
 ssh_opts=(-F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -i "$ssh_key")
 if [[ -n "${VELSTRA_DEPLOY_KNOWN_HOSTS:-}" ]]; then
-  ssh_opts+=(-o "UserKnownHostsFile=$VELSTRA_DEPLOY_KNOWN_HOSTS")
+  ssh_opts+=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$VELSTRA_DEPLOY_KNOWN_HOSTS")
 fi
 
 field() {
@@ -250,6 +250,23 @@ curl --cacert $api_ca_path -fsS https://localhost:8443/readyz >/dev/null
 systemctl restart velstra-cloud-controller
 REMOTE
 done < <(jq -r '.controlPlanes[].name' "$inventory")
+
+# Membership and serving API replicas have converged. A later agent
+# registration error is retryable; removing healthy voters here would turn an
+# identity problem into a quorum problem and strand a partly registered node.
+added_members=()
+if jq -e '.api.nodeRegistration != null' "$inventory" >/dev/null; then
+  echo "== register control-plane node agents =="
+  python3 "$here/register-nodes.py" "$inventory"
+else
+  echo "== verify control-plane node agents =="
+  while IFS= read -r name; do
+    remote "$name" "${root}systemctl is-active --quiet velstra-cloud-nodeagent && (${root}test -s /etc/velstra/node-token || ${root}test -s /var/lib/velstra/node-token)" || {
+      echo "$name has no running, credentialed node agent; configure api.nodeRegistration" >&2
+      exit 1
+    }
+  done < <(jq -r '.controlPlanes[].name' "$inventory")
+fi
 
 echo "== verify quorum and replicas =="
 health_endpoints=$store_endpoints
