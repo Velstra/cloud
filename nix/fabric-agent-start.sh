@@ -12,6 +12,7 @@ if [ -z "${VELSTRA_FABRIC_CONTROL:-}" ]; then
   echo 'no VELSTRA_FABRIC_CONTROL in the seed: this cell has no data plane' >&2
   exit 1
 fi
+: "${VELSTRA_FABRIC_UNDERLAY:?Fabric requires the underlay interface for tunnel decapsulation}"
 if [ ! -x "$agent" ]; then
   echo "Fabric data-plane agent is not installed at $agent" >&2
   exit 1
@@ -20,7 +21,8 @@ if [ "${1:-}" = --check ]; then
   exit 0
 fi
 
-set -- run --controller "$VELSTRA_FABRIC_CONTROL" --node-id "$VELSTRA_NODE"
+set -- run --controller "$VELSTRA_FABRIC_CONTROL" --node-id "$VELSTRA_NODE" \
+  --iface "$VELSTRA_FABRIC_UNDERLAY"
 case "$VELSTRA_FABRIC_CONTROL" in
   https://*)
     : "${VELSTRA_FABRIC_AGENT_CA:?HTTPS fabric requires VELSTRA_FABRIC_AGENT_CA}" \

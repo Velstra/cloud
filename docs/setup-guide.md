@@ -448,6 +448,10 @@ VELSTRA_FABRIC_UNDERLAY=eth1          # the interface that address is on
 VELSTRA_FABRIC_SRV6_LOCATOR=fc00:0:1::/64   # optional; empty stays VXLAN
 ```
 
+The Fabric agent attaches to `VELSTRA_FABRIC_UNDERLAY` as well as tenant taps.
+Without the underlay attachment, remote hosts cannot decapsulate incoming
+traffic even when their ports report as programmed.
+
 For a TLS-protected orchestrator, use `https://` and deliver trust material to
 each Cloud controller/node-agent service through its environment:
 

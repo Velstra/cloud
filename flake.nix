@@ -1144,11 +1144,13 @@
                 # The cell's node id, not the hostname the agent would default
                 # to: the orchestrator is told about this host under that id.
                 assert "--node-id node-1" in argv, argv
+                assert "--iface eth1" in argv, f"underlay must receive tunneled traffic: {argv}"
 
             with subtest("HTTPS fabric passes a separate data-plane identity"):
                 node.succeed(
                     f"printf '{seed}VELSTRA_FABRIC=https://fab:50052\n"
                     "VELSTRA_FABRIC_CONTROL=https://fab:50051\n"
+                    "VELSTRA_FABRIC_UNDERLAY=eth1\n"
                     "VELSTRA_FABRIC_AGENT_CA=/run/fabric-ca.pem\n"
                     "VELSTRA_FABRIC_AGENT_CERT=/run/fabric-node.pem\n"
                     "VELSTRA_FABRIC_AGENT_KEY=/run/fabric-node.key\n'"
@@ -2134,7 +2136,7 @@
               }
               dpkg-deb --fsys-tarfile "$deb" | tar -xO ./usr/lib/velstra-cloud/fabric-agent-start > fabric-start
               chmod +x fabric-start
-              if VELSTRA_FABRIC_AGENT_BINARY="$PWD/missing" VELSTRA_FABRIC_CONTROL=https://fab:50051 ./fabric-start --check > fabric-out 2>&1; then
+              if VELSTRA_FABRIC_AGENT_BINARY="$PWD/missing" VELSTRA_FABRIC_CONTROL=https://fab:50051 VELSTRA_FABRIC_UNDERLAY=eth1 ./fabric-start --check > fabric-out 2>&1; then
                 echo "Cloud's CLI was mistaken for a Fabric agent" >&2
                 exit 1
               fi
@@ -2144,23 +2146,30 @@
               printf '%s\n' "$@" > fabric-argv
               FAKE
               chmod +x fabric-fake
-              VELSTRA_FABRIC_AGENT_BINARY="$PWD/fabric-fake" \
+              if VELSTRA_FABRIC_AGENT_BINARY="$PWD/fabric-fake" \
                 VELSTRA_FABRIC_CONTROL=https://fab:50051 VELSTRA_NODE=node-1 \
+                ./fabric-start > fabric-out 2>&1; then
+                echo "Fabric started without an underlay receive interface" >&2
+                exit 1
+              fi
+              grep -q 'requires the underlay interface' fabric-out
+              VELSTRA_FABRIC_AGENT_BINARY="$PWD/fabric-fake" \
+                VELSTRA_FABRIC_CONTROL=https://fab:50051 VELSTRA_FABRIC_UNDERLAY=eth1 VELSTRA_NODE=node-1 \
                 VELSTRA_FABRIC_AGENT_CA=/run/ca.pem \
                 VELSTRA_FABRIC_AGENT_CERT=/run/node.pem \
                 VELSTRA_FABRIC_AGENT_KEY=/run/node.key ./fabric-start
-              for want in '--controller' 'https://fab:50051' '--tls-ca' '/run/ca.pem' '--tls-cert' '/run/node.pem' '--tls-key' '/run/node.key'; do
+              for want in '--controller' 'https://fab:50051' '--iface' 'eth1' '--tls-ca' '/run/ca.pem' '--tls-cert' '/run/node.pem' '--tls-key' '/run/node.key'; do
                 grep -qx -- "$want" fabric-argv
               done
               if VELSTRA_FABRIC_AGENT_BINARY="$PWD/fabric-fake" \
-                VELSTRA_FABRIC_CONTROL=https://fab:50051 VELSTRA_NODE=node-1 \
+                VELSTRA_FABRIC_CONTROL=https://fab:50051 VELSTRA_FABRIC_UNDERLAY=eth1 VELSTRA_NODE=node-1 \
                 ./fabric-start > fabric-out 2>&1; then
                 echo "HTTPS fabric started without a client identity" >&2
                 exit 1
               fi
               grep -q 'requires VELSTRA_FABRIC_AGENT_CA' fabric-out
               if VELSTRA_FABRIC_AGENT_BINARY="$PWD/fabric-fake" \
-                VELSTRA_FABRIC_CONTROL=http://fab:50051 VELSTRA_NODE=node-1 \
+                VELSTRA_FABRIC_CONTROL=http://fab:50051 VELSTRA_FABRIC_UNDERLAY=eth1 VELSTRA_NODE=node-1 \
                 VELSTRA_FABRIC_AGENT_CA=/run/ca.pem ./fabric-start > fabric-out 2>&1; then
                 echo "Fabric client credentials were accepted over HTTP" >&2
                 exit 1
