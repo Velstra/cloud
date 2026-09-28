@@ -236,7 +236,7 @@ struct Args {
     /// Certificates for an encrypted transfer. Only used over TCP — both VMMs
     /// refuse TLS over a unix socket, and there is no network between the two
     /// ends of one of those.
-    #[arg(long)]
+    #[arg(long, env = "VELSTRA_MIGRATION_TLS_DIR")]
     migration_tls_dir: Option<PathBuf>,
 
     /// Boot every guest from this kernel, with the host supplying the command
