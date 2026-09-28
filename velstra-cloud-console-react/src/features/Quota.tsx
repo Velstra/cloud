@@ -28,13 +28,13 @@ export function QuotaBars({ q, compact }: { q: Answer; compact?: boolean }) {
   const l = q.largestStartable;
   return (
     <div className="grid gap-3">
-      <div className={`grid gap-x-6 gap-y-2 ${compact ? "grid-cols-2 lg:grid-cols-4" : "grid-cols-1 md:grid-cols-2"}`}>
+      <div className={`grid gap-x-6 gap-y-2 ${compact ? "grid-cols-2 min-[2000px]:grid-cols-4" : "grid-cols-1 md:grid-cols-2"}`}>
         {dims.map((d) => {
           const p = d.unlimited || !d.limit ? null : Math.min(100, Math.round((d.used / d.limit) * 100));
           const colour = d.exhausted ? "var(--failing)" : p != null && p >= 80 ? "var(--drifting)" : "var(--brand)";
           return (
             <div key={d.name} className="grid gap-1 text-xs">
-              <div className="flex items-baseline justify-between">
+              <div className="flex flex-wrap items-baseline justify-between gap-x-2">
                 <span style={{ color: "var(--text-muted)" }}>{label(d.name)}</span>
                 <span className="font-mono tabular-nums" style={{ color: d.exhausted ? "var(--failing)" : "var(--text-body)" }}>
                   {fmt(d.name, d.used)}{d.unlimited ? <span style={{ color: "var(--text-faint)" }}> · no limit</span> : <span style={{ color: "var(--text-faint)" }}> / {fmt(d.name, d.limit)}{p != null ? ` · ${p}%` : ""}</span>}

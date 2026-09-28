@@ -162,6 +162,35 @@ impl Agent {
             keep
         });
         for migration in migrations {
+            // A cold move leaves a private root-disk copy behind on its source.
+            // Keep that copy until the destination has recorded completion, so
+            // an interrupted handover can still recover here. After the receipt,
+            // reclaim it only if this node no longer owns or runs the guest.
+            if migration.spec.from_node == self.config.node
+                && migration.spec.mode == MigrationMode::Reboot
+                && !self.config.shared_state
+                && migration.status.completed_at.is_some()
+                && host.disks.contains(&migration.spec.instance)
+                && !host
+                    .vms
+                    .get(&migration.spec.instance)
+                    .is_some_and(|vm| vm.state == InstanceState::Running)
+                && let Ok(Some(current)) = self.cell.instance(&migration.spec.instance).await
+                && current
+                    .status
+                    .node
+                    .as_deref()
+                    .is_some_and(|node| node != self.config.node)
+                && current.spec.node.as_deref() != Some(self.config.node.as_str())
+            {
+                match self.vmm.delete(&migration.spec.instance).await {
+                    Ok(()) => pass.actions += 1,
+                    Err(error) => {
+                        tracing::warn!(instance = %migration.spec.instance, %error, "could not reclaim migrated source disk");
+                        pass.failures += 1;
+                    }
+                }
+            }
             if migration.spec.from_node != self.config.node
                 || migration.spec.to_node == self.config.node
                 || migration.status.completed_at.is_some()

@@ -9,16 +9,21 @@ import { browser } from '../../velstra-cloud-console/tests/console/harness.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const fake = spawn(process.execPath, [fileURLToPath(new URL('../../velstra-cloud-console/tests/console/fake-api.mjs', import.meta.url))], { env: { ...process.env, FAKE_PORT: '0' }, stdio: ['ignore', 'pipe', 'inherit'] });
 const fakePort = await new Promise((resolve, reject) => { let text = ''; fake.stdout.on('data', (data) => { text += data; const m = /listening (\d+)/.exec(text); if (m) resolve(Number(m[1])); }); fake.on('exit', () => reject(new Error('Fixture exited'))); });
-let viewer = false, refuseDetail = false, creates = 0, consoleMessages = 0;
+let viewer = false, projectAdmin = false, refuseDetail = false, creates = 0, consoleMessages = 0, projectLists = 0;
 const streams = new Set();
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   if (path.startsWith('/api/')) {
+    if (req.method === 'GET' && path === '/api/v1/projects') {
+      projectLists++;
+      if (projectLists === 1) await new Promise((r) => setTimeout(r, 200));
+    }
     if (req.method === 'GET' && path === '/api/v1/images') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({items:[{meta:{name:'images/catalogue-boot'},spec:{family:'TestOS',version:'1',format:'Raw'}}]})); return; }
     if (req.method === 'GET' && path === '/api/v1/flavors') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({items:[{meta:{name:'flavors/test-size'},spec:{vcpus:2,memoryMib:4096,rootDiskGib:10}}]})); return; }
     if (req.method === 'GET' && path === '/api/v1/flavors/test-size') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({meta:{name:'flavors/test-size'},spec:{vcpus:2,memoryMib:4096,rootDiskGib:10}})); return; }
     if (req.method === 'POST' && path.endsWith(':console')) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ session: 'test-session', ticket: 'one-time-fixture', readOnly: viewer, encrypted: true })); return; }
     if (viewer && path === '/api/v1/sessions/current') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ subject: 'viewer', cellAdmin: false, projects: { p1: 'viewer' } })); return; }
+    if (projectAdmin && path === '/api/v1/sessions/current') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ subject: 'project-admin', cellAdmin: false, projects: { p1: 'admin' } })); return; }
     if (req.method === 'POST' && path.endsWith('/networks')) creates++;
     if (refuseDetail && req.method === 'GET' && path.endsWith('/networks/browser-network')) { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'Temporarily unavailable' } })); return; }
     const upstream = request({ hostname: '127.0.0.1', port: fakePort, path: req.url, method: req.method, headers: req.headers }, (answer) => { res.writeHead(answer.statusCode, answer.headers); answer.pipe(res); });
@@ -44,6 +49,8 @@ const login = async (b) => { await b.goto(url); await fill(b, '#u', 'operator');
 try {
   const b = await browser({width: 1440, height: 1000}); pages.push(b); await login(b);
   await wait(b, 'document.body.innerText.includes("Cloud overview")');
+  await wait(b, '!document.body.innerText.includes("Checking resources")');
+  assert.ok(projectLists <= 3, `concurrent first inventory reads must share their project lookup (got ${projectLists})`);
   assert.ok(await b.evaluate(`(()=>{const networks=document.querySelector('#rail a[href="#/c/networks"] svg');const subnets=document.querySelector('#rail a[href="#/c/subnets"] svg');return !!networks && !!subnets && networks.innerHTML!==subnets.innerHTML})()`), 'collections in one section use distinct icons');
   await fill(b, '[aria-label="Filter navigation"]', 'ceph');
   await b.evaluate('document.querySelector("[aria-label=\\"Clear navigation filter\\"]").click()');
@@ -126,7 +133,14 @@ try {
   await mobile.type('z'); await new Promise(r=>setTimeout(r,150));
   assert.equal(consoleMessages, 2, 'viewer console must not transmit input');
   assert.deepEqual(mobile.thrown, [], 'no mobile browser exceptions');
-  console.log('PASS: admin CRUD, duplicate prevention, project routing, failed refresh recovery, validation focus, reduced motion, viewer permissions, binary console output, reattachment, read-only input and mobile detail');
+  viewer = false; projectAdmin = true;
+  const memberAdmin = await browser({width: 1440, height: 900}); pages.push(memberAdmin); await login(memberAdmin);
+  await wait(memberAdmin, `document.body.innerText.includes('Manage members')`);
+  await memberAdmin.evaluate(`[...document.querySelectorAll('a')].find(x=>x.textContent.includes('Manage members')).click()`);
+  await wait(memberAdmin, `document.body.innerText.includes('Save members')`);
+  assert.equal(await memberAdmin.evaluate(`[...document.querySelectorAll('button')].some(x=>x.innerText==='New project')`), false, 'project admin cannot create global projects');
+  assert.deepEqual(memberAdmin.thrown, [], 'no project-admin browser exceptions');
+  console.log('PASS: admin CRUD, duplicate prevention, project routing, failed refresh recovery, validation focus, reduced motion, viewer and project-admin permissions, binary console output, reattachment, read-only input and mobile detail');
 } finally {
   for (const b of pages) b.close();
   for (const socket of streams) socket.destroy();

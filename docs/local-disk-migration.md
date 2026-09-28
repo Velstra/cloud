@@ -33,7 +33,11 @@ peer separately if guests should move in both directions.
 Only named peers appear in the node's `localMigrationTargets`. The migration
 API allows local root copies only in `Reboot` mode. Select that mode in the
 instance's Migrate menu. Configure `VELSTRA_MIGRATION_ADDRESS` separately for
-live transfers of guests using shared storage.
+live transfers of guests using shared storage. When that address is reachable
+over TCP, set `VELSTRA_MIGRATION_TLS_DIR` to the node's provisioned migration
+certificate directory as well. The packaged node-agent service reads both
+values from `/etc/velstra/node.env`; do not expose a live migration listener
+before the peer certificates and trust are installed on both hosts.
 
 The source retains ownership until rsync succeeds. Sparse data is preserved,
 checksums determine which content differs, and the incoming file is synced and

@@ -52,6 +52,13 @@ export function useCan() {
     if (!who) return false;
     if (who.cellAdmin) return true;
     const c = typeof coll === "string" ? SCHEMA.find((x) => x.id === coll) : coll;
+    // A project has a global API path, but a project admin may manage the
+    // membership of their own project. This needs an explicit project id: a
+    // binding is never permission to create or list other projects.
+    if (c?.id === "projects") {
+      const held = project ? who.projects?.[project] : undefined;
+      return verb === "read" ? !!held : verb === "administer" && held === "admin";
+    }
     // Objects outside every project are the cell operator's.
     if (c && c.scope !== "project") return false;
     const p = project ?? picked;

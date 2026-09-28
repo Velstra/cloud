@@ -33,7 +33,10 @@ ssh_key=${VELSTRA_DEPLOY_SSH_KEY:-$(jq -r '.ssh.privateKey // empty' "$inventory
   echo "set ssh.privateKey or VELSTRA_DEPLOY_SSH_KEY to a readable private key" >&2
   exit 1
 }
-ssh_opts=(-F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$ssh_key")
+ssh_opts=(-F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -i "$ssh_key")
+if [[ -n "${VELSTRA_DEPLOY_KNOWN_HOSTS:-}" ]]; then
+  ssh_opts+=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$VELSTRA_DEPLOY_KNOWN_HOSTS")
+fi
 
 field() {
   jq -er --arg name "$1" --arg field "$2" \
@@ -43,13 +46,13 @@ remote() {
   local host
   host=$(field "$1" sshAddress)
   shift
-  ssh -n "${ssh_opts[@]}" "$ssh_user@$host" "$@"
+  ssh -n "${ssh_opts[@]}" "$ssh_user@$host" "set -e; $*"
 }
 remote_stdin() {
   local host
   host=$(field "$1" sshAddress)
   shift
-  ssh "${ssh_opts[@]}" "$ssh_user@$host" "$@"
+  ssh "${ssh_opts[@]}" "$ssh_user@$host" "set -e; $*"
 }
 copy_to() {
   local host=$1 source=$2 target=$3
@@ -63,6 +66,8 @@ root=$(as_root)
 
 leader=$(jq -r '.controlPlanes[0].name' "$inventory")
 leader_address=$(field "$leader" address)
+api_ca_path=$(jq -r '.api.caPath // "/etc/velstra/api-ca.pem"' "$inventory")
+[[ "$api_ca_path" =~ ^/[A-Za-z0-9_./-]+$ ]] || { echo "invalid api.caPath" >&2; exit 1; }
 etcd_scheme=$(jq -r '.etcd.scheme // "https"' "$inventory")
 case "$etcd_scheme" in
   https) ;;
@@ -76,7 +81,7 @@ case "$etcd_scheme" in
 esac
 store_endpoints=$(jq -r --arg scheme "$etcd_scheme" '[.controlPlanes[] | $scheme + "://" + .address + ":2379"] | join(",")' "$inventory")
 cluster=$(jq -r --arg scheme "$etcd_scheme" '[.controlPlanes[] | .name + "=" + $scheme + "://" + .address + ":2380"] | join(",")' "$inventory")
-etcdctl="ETCDCTL_API=3"
+etcdctl="${root}env ETCDCTL_API=3"
 if [[ "$etcd_scheme" == https ]]; then
   etcd_ca=$(jq -er '.etcd.ca' "$inventory")
   [[ -s "$etcd_ca" ]] || { echo "missing etcd CA: $etcd_ca" >&2; exit 1; }
@@ -93,11 +98,13 @@ rollback_added_members() {
     remote "$name" "${root}systemctl stop etcd" >/dev/null 2>&1 || true
   done
 }
-trap rollback_added_members ERR INT TERM
+trap 'rc=$?; if (( rc != 0 )); then rollback_added_members; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "== preflight =="
 while IFS= read -r node; do
-  remote "$node" "command -v etcdctl >/dev/null && command -v curl >/dev/null && test -s /etc/velstra/node.env && grep -Eq '^VELSTRA_ROLES=.*control-plane' /etc/velstra/node.env"
+  remote "$node" "id etcd >/dev/null && command -v etcdctl >/dev/null && command -v curl >/dev/null && test -s $api_ca_path && test -s /etc/velstra/node.env && grep -Eq '^VELSTRA_ROLES=.*control-plane' /etc/velstra/node.env"
 done < <(jq -r '.controlPlanes[].name' "$inventory")
 
 if [[ "$etcd_scheme" == https ]]; then
@@ -113,7 +120,7 @@ if [[ "$etcd_scheme" == https ]]; then
     copy_to "$node" "$etcd_ca" /tmp/velstra-etcd-ca.pem
     copy_to "$node" "$node_cert" /tmp/velstra-etcd-cert.pem
     copy_to "$node" "$node_key" /tmp/velstra-etcd-key.pem
-    remote "$node" "${root}install -d -o root -g root -m 0700 /etc/velstra/etcd; ${root}install -o root -g root -m 0644 /tmp/velstra-etcd-ca.pem /etc/velstra/etcd/ca.pem; ${root}install -o root -g root -m 0644 /tmp/velstra-etcd-cert.pem /etc/velstra/etcd/cert.pem; ${root}install -o root -g root -m 0600 /tmp/velstra-etcd-key.pem /etc/velstra/etcd/key.pem; rm -f /tmp/velstra-etcd-{ca,cert,key}.pem"
+    remote "$node" "${root}install -d -o etcd -g etcd -m 0700 /etc/velstra/etcd; ${root}install -o etcd -g etcd -m 0644 /tmp/velstra-etcd-ca.pem /etc/velstra/etcd/ca.pem; ${root}install -o etcd -g etcd -m 0644 /tmp/velstra-etcd-cert.pem /etc/velstra/etcd/cert.pem; ${root}install -o etcd -g etcd -m 0600 /tmp/velstra-etcd-key.pem /etc/velstra/etcd/key.pem; rm -f /tmp/velstra-etcd-{ca,cert,key}.pem"
   done < <(jq -r '.controlPlanes[] | [.name,.etcdCertificate,.etcdPrivateKey] | @tsv' "$inventory")
 fi
 
@@ -131,6 +138,18 @@ while IFS=$'\t' read -r member_name peer; do
   fi
 done < <(jq -r '.members[] | [.name, .peerURLs[0]] | @tsv' <<<"$members")
 
+# Package installation may have already initialized a standalone etcd database.
+# Never silently reuse or erase that identity when admitting a new member.
+while IFS=$'\t' read -r name address; do
+  peer="$etcd_scheme://$address:2380"
+  if ! jq -e --arg peer "$peer" 'any(.members[]; .peerURLs | index($peer))' <<<"$members" >/dev/null; then
+    if ! remote "$name" "${root}test ! -d /var/lib/etcd/default/member"; then
+      echo "$name has an existing etcd data directory but is not a member of this cluster; provision a clean data directory after backing up and verifying the old store" >&2
+      exit 1
+    fi
+  fi
+done < <(jq -r '.controlPlanes[] | [.name,.address] | @tsv' "$inventory")
+
 echo "== snapshot before membership changes =="
 remote "$leader" "${root}mkdir -p /var/lib/velstra/store-backups; snap=/tmp/pre-control-plane-join-\$(date +%s%N).db; $etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 snapshot save \"\$snap\" >/dev/null; ${root}mv \"\$snap\" /var/lib/velstra/store-backups/"
 
@@ -140,7 +159,16 @@ while IFS=$'\t' read -r name address; do
   members=$(remote "$leader" "$etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 member list -w json")
   existing_id=$(jq -r --arg peer "$peer" '.members[]? | select(.peerURLs | index($peer)) | .ID // empty' <<<"$members")
   if [[ -z "$existing_id" ]]; then
-    remote "$leader" "$etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 member add '$name' --peer-urls='$peer' -w json" >/dev/null
+    # A just-promoted member may need a short period before etcd's strict
+    # reconfiguration health gate admits the next learner. A lost response is
+    # also possible: inspect membership before every retry to avoid duplicates.
+    for attempt in $(seq 1 15); do
+      if remote "$leader" "$etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 member add '$name' --learner --peer-urls='$peer' -w json" >/dev/null; then break; fi
+      members=$(remote "$leader" "$etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 member list -w json")
+      if jq -e --arg peer "$peer" 'any(.members[]; .peerURLs | index($peer))' <<<"$members" >/dev/null; then break; fi
+      (( attempt < 15 )) || { echo "could not admit learner $name" >&2; exit 1; }
+      sleep 2
+    done
     # JSON represents the uint64 member ID as a decimal number, while
     # `member remove` accepts the hexadecimal spelling printed by the normal
     # member list. Keep that exact spelling so rollback really can remove a
@@ -149,6 +177,12 @@ while IFS=$'\t' read -r name address; do
     [[ -n "${added_members[$name]}" ]]
   fi
 
+  members_for_start=$(remote "$leader" "$etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 member list -w json")
+  initial_cluster=$(jq -r --argjson members "$members_for_start" --arg scheme "$etcd_scheme" '
+    [.controlPlanes[] | . as $node |
+      select(any($members.members[]; .peerURLs | index($scheme + "://" + $node.address + ":2380"))) |
+      .name + "=" + $scheme + "://" + .address + ":2380"] | join(",")
+  ' "$inventory")
   env_file=$(mktemp)
   cat >"$env_file" <<EOF
 ETCD_NAME=$name
@@ -157,7 +191,7 @@ ETCD_LISTEN_PEER_URLS=$peer
 ETCD_INITIAL_ADVERTISE_PEER_URLS=$peer
 ETCD_LISTEN_CLIENT_URLS=$etcd_scheme://127.0.0.1:2379,$etcd_scheme://$address:2379
 ETCD_ADVERTISE_CLIENT_URLS=$etcd_scheme://$address:2379
-ETCD_INITIAL_CLUSTER=$cluster
+ETCD_INITIAL_CLUSTER=$initial_cluster
 ETCD_INITIAL_CLUSTER_STATE=existing
 ETCD_INITIAL_CLUSTER_TOKEN=velstra-cloud
 ETCD_AUTO_COMPACTION_MODE=periodic
@@ -178,7 +212,18 @@ EOF
   fi
   copy_to "$name" "$env_file" /tmp/velstra-etcd.env
   rm -f "$env_file"
-  remote "$name" "${root}install -o root -g root -m 0644 /tmp/velstra-etcd.env /etc/default/etcd; rm -f /tmp/velstra-etcd.env; ${root}systemctl enable --now etcd; for i in \$(seq 1 30); do $etcdctl etcdctl --endpoints=$etcd_scheme://$address:2379 endpoint health >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1"
+  remote "$name" "${root}install -o root -g root -m 0644 /tmp/velstra-etcd.env /etc/default/etcd; rm -f /tmp/velstra-etcd.env; ${root}systemctl enable etcd; timeout 45s ${root}systemctl restart etcd; for i in \$(seq 1 30); do $etcdctl etcdctl --command-timeout=1s --endpoints=$etcd_scheme://$address:2379 endpoint status >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1"
+  # A learner catches up without changing quorum. Promotion can be refused
+  # until its Raft log is current; retry only that bounded, idempotent step.
+  member_id=$(remote "$leader" "$etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 member list | awk -F, -v peer='$peer' '\$4 ~ peer { gsub(/ /, \"\", \$1); print \$1 }'")
+  learner=$(remote "$leader" "$etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 member list -w json" | jq -r --arg peer "$peer" '.members[] | select(.peerURLs | index($peer)) | .isLearner // false')
+  if [[ "$learner" == true ]]; then
+    for attempt in $(seq 1 60); do
+      if remote "$leader" "$etcdctl etcdctl --endpoints=$etcd_scheme://$leader_address:2379 member promote '$member_id'"; then break; fi
+      (( attempt < 60 )) || { echo "learner $name did not catch up" >&2; exit 1; }
+      sleep 1
+    done
+  fi
 done < <(jq -r '.controlPlanes[] | [.name,.address] | @tsv' "$inventory")
 
 echo "== publish all client endpoints and roll control-plane services =="
@@ -186,6 +231,7 @@ while IFS= read -r name; do
   remote_stdin "$name" "${root}bash -s" <<REMOTE
 set -euo pipefail
 seed=/etc/velstra/node.env
+sed -i 's|^ETCD_INITIAL_CLUSTER=.*|ETCD_INITIAL_CLUSTER=$cluster|' /etc/default/etcd
 tmp=\$(mktemp)
 awk '!/^VELSTRA_STORE=/ && !/^VELSTRA_STORE_CA=/ && !/^VELSTRA_STORE_CERT=/ && !/^VELSTRA_STORE_KEY=/' "\$seed" >"\$tmp"
 printf '%s\n' 'VELSTRA_STORE=$store_endpoints' >>"\$tmp"
@@ -199,20 +245,37 @@ install -o root -g root -m 0644 "\$tmp" "\$seed"
 rm -f "\$tmp"
 systemctl enable velstra-cloud-api velstra-cloud-controller
 systemctl restart velstra-cloud-api
-for i in \$(seq 1 30); do curl -kfsS https://localhost:8443/readyz >/dev/null 2>&1 && break; sleep 1; done
-curl -kfsS https://localhost:8443/readyz >/dev/null
+for i in \$(seq 1 30); do curl --cacert $api_ca_path -fsS https://localhost:8443/readyz >/dev/null 2>&1 && break; sleep 1; done
+curl --cacert $api_ca_path -fsS https://localhost:8443/readyz >/dev/null
 systemctl restart velstra-cloud-controller
 REMOTE
 done < <(jq -r '.controlPlanes[].name' "$inventory")
+
+# Membership and serving API replicas have converged. A later agent
+# registration error is retryable; removing healthy voters here would turn an
+# identity problem into a quorum problem and strand a partly registered node.
+added_members=()
+if jq -e '.api.nodeRegistration != null' "$inventory" >/dev/null; then
+  echo "== register control-plane node agents =="
+  python3 "$here/register-nodes.py" "$inventory"
+else
+  echo "== verify control-plane node agents =="
+  while IFS= read -r name; do
+    remote "$name" "${root}systemctl is-active --quiet velstra-cloud-nodeagent && (${root}test -s /etc/velstra/node-token || ${root}test -s /var/lib/velstra/node-token)" || {
+      echo "$name has no running, credentialed node agent; configure api.nodeRegistration" >&2
+      exit 1
+    }
+  done < <(jq -r '.controlPlanes[].name' "$inventory")
+fi
 
 echo "== verify quorum and replicas =="
 health_endpoints=$store_endpoints
 remote "$leader" "$etcdctl etcdctl --endpoints=$health_endpoints endpoint health"
 while IFS=$'\t' read -r name address; do
-  remote "$name" "curl -kfsS https://localhost:8443/readyz >/dev/null; systemctl is-active --quiet velstra-cloud-controller"
+  remote "$name" "curl --cacert $api_ca_path -fsS https://localhost:8443/readyz >/dev/null; systemctl is-active --quiet velstra-cloud-controller"
   echo "$name ($address) is ready"
 done < <(jq -r '.controlPlanes[] | [.name,.address] | @tsv' "$inventory")
 
 added_members=()
-trap - ERR INT TERM
+trap - EXIT INT TERM
 echo "control-plane cluster converged"

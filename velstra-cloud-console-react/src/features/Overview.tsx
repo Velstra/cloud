@@ -48,16 +48,17 @@ export function Overview({ onRefresh }: { onRefresh: () => Promise<void> }) {
       const coll = collection(id); if (!coll) return null;
       const resources = rows[id] ?? [];
       const ready = resources.filter((r) => verdict(r, coll).kind === "settled").length;
+      const running = id === "instances" ? resources.filter((r) => r.status?.state === "Running").length : 0;
       const known = sweptAt > 0 && !missing[id];
       return <a key={id} href={href({ view: "board", coll: id })} className="resource-tile overview-panel grid gap-4 p-4">
         <span className="flex items-center justify-between text-sm text-muted-foreground"><span className="inline-flex items-center gap-2"><Icon className="size-4 text-primary" />{title}</span><ArrowUpRight className="size-3.5" /></span>
-        <span className="flex flex-wrap items-baseline justify-between gap-2"><strong className="text-3xl font-semibold tabular-nums tracking-tight">{known ? `${truncated.includes(id) ? "≥ " : ""}${resources.length}` : "—"}</strong><span className="text-xs text-muted-foreground">{known ? `${ready} ready` : sweptAt ? "Unavailable" : "Loading…"}</span></span>
+        <span className="flex flex-wrap items-baseline justify-between gap-2"><strong className="text-3xl font-semibold tabular-nums tracking-tight">{known ? `${truncated.includes(id) ? "≥ " : ""}${resources.length}` : "—"}</strong><span className="text-xs text-muted-foreground">{known ? id === "instances" ? `${running} running` : `${ready} ready` : sweptAt ? "Unavailable" : "Loading…"}</span></span>
       </a>;
     })}</div>
     <section className="overview-panel" aria-label="Health">
       <div className="flex flex-wrap items-center gap-3 px-5 py-4">
         {attention.length || incomplete ? <TriangleAlert className="size-5 text-[var(--drifting)]" /> : <CheckCircle2 className="size-5 text-[var(--settled)]" />}
-        <div className="flex-1"><h2>{!sweptAt ? "Checking resources…" : incomplete ? "Some status data is unavailable" : attention.length ? `${attention.length} resources need attention` : "All resources are ready"}</h2><p className="mt-0.5 text-xs text-muted-foreground">{sweptAt ? `Last checked ${ago(sweptAt)}` : "Waiting for the first inventory read"}</p></div>
+        <div className="flex-1"><h2>{!sweptAt ? "Checking resources…" : incomplete ? "Some status data is unavailable" : attention.length ? `${attention.length} resources need attention` : "No resource issues reported"}</h2><p className="mt-0.5 text-xs text-muted-foreground">{sweptAt ? `Last checked ${ago(sweptAt)}` : "Waiting for the first inventory read"}</p></div>
       </div>
       {incomplete && <p role="status" className="border-t border-border px-5 py-3 text-xs text-[var(--drifting)]">{Object.keys(missing).map((id) => `${collection(id)?.title ?? id}: unavailable`).concat(truncated.map((id) => `${collection(id)?.title ?? id}: partial inventory`)).join(" · ")}</p>}
       {attention.slice(0, 6).map(({ coll, r }) => <a key={nameOf(r)} href={link(coll.id, r)} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-border px-5 py-3 hover:bg-accent"><span className="min-w-0"><span className="block truncate text-sm font-medium">{attentionName(r, coll)}</span><span className="block truncate text-xs text-muted-foreground">{coll.singular} · {verdict(r, coll).detail || "Waiting for an update"}</span></span><State of={r} coll={coll} /></a>)}
@@ -76,7 +77,7 @@ export function Overview({ onRefresh }: { onRefresh: () => Promise<void> }) {
             </a>;
           })}{!nodes.length && <p className="text-sm text-muted-foreground">{missing.nodes ? "Hosts are unavailable." : "No hosts reported."}</p>}</div>
         </section>}
-        {project !== ALL && quota.q && <section className="overview-panel p-5"><h2 className="mb-4">Project limits</h2><QuotaBars q={quota.q} compact /></section>}
+        {project !== ALL && quota.q && <section className="overview-panel p-5"><div className="mb-4 flex items-center justify-between gap-3"><h2>Project limits</h2>{!who?.cellAdmin && who?.projects?.[project] === "admin" && <a href={href({ view: "board", coll: "projects", id: project })} className="text-xs text-primary hover:underline">Manage members →</a>}</div><QuotaBars q={quota.q} compact /></section>}
       </div>
       <section className="overview-panel"><div className="flex items-center gap-2 border-b border-border px-5 py-4"><Activity className="size-4 text-primary" /><h2>Recent activity</h2></div>
         {auditError ? <p role="status" className="p-5 text-sm text-muted-foreground">{auditError}</p> : !audit.length ? <p className="p-5 text-sm text-muted-foreground">No activity to show.</p> : <ol>{audit.map((r) => {const s = r.spec ?? {}; const verbs: Record<string, string> = {create: "Created", update: "Updated", delete: "Deleted"}; const action = s.kind === "changed" ? (verbs[String(s.verb)] ?? s.verb) : s.kind === "signed-in" ? "Signed in" : s.kind === "signed-out" ? "Signed out" : "Access refused"; return <li key={nameOf(r)} className="border-b border-border px-5 py-3 last:border-0"><p className="break-words text-sm">{action}{s.target ? ` ${String(s.target).split("/").pop()}` : ""}</p><p className="mt-1 text-xs text-muted-foreground"><span>{s.subject || "System"}</span><span title={new Date(Number(s.at ?? r.meta.createdAt)).toLocaleString()}> · {ago(s.at ?? r.meta.createdAt)}</span></p></li>;})}</ol>}

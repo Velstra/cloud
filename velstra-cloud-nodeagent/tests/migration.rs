@@ -672,6 +672,33 @@ async fn a_cold_move_stops_the_guest_here_and_starts_it_there() {
     let landed = read_instance(&cell.store, I1).await;
     assert_eq!(landed.status.node.as_deref(), Some(DESTINATION));
     assert_eq!(landed.status.state, InstanceState::Running);
+
+    // Arrival alone is not enough to discard the source copy: the receipt is
+    // what distinguishes a completed move from one that still needs rollback.
+    let mut completed = read_migration(&cell.store, M1).await;
+    completed.status.completed_at = None;
+    migrations(&cell.store)
+        .update(
+            &completed,
+            &velstra_cloud_model::access::Writer::agent(DESTINATION),
+        )
+        .await
+        .unwrap();
+    assert!(cell.source_vmm.observe().await.unwrap().disks.contains(I1));
+    cell.source.resync().await;
+    assert!(cell.source_vmm.observe().await.unwrap().disks.contains(I1));
+    let mut completed = read_migration(&cell.store, M1).await;
+    completed.status.completed_at = Some(velstra_cloud_model::meta::Timestamp::now());
+    migrations(&cell.store)
+        .update(
+            &completed,
+            &velstra_cloud_model::access::Writer::agent(DESTINATION),
+        )
+        .await
+        .unwrap();
+    cell.source.resync().await;
+    assert!(!cell.source_vmm.observe().await.unwrap().disks.contains(I1));
+    assert!(cell.destination_vmm.is_running(I1));
 }
 
 /// The destination does not start it while the source still has it.

@@ -570,3 +570,38 @@ async fn a_snapshot_is_written_whole_and_restorable_in_shape() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An unreachable advertised endpoint must not make healthy reads fail.
+/// This checks the transport boundary, not multi-member quorum semantics.
+#[tokio::test]
+async fn reads_survive_an_unreachable_endpoint() {
+    let etcd = etcd_or_skip!();
+    let healthy = etcd.store().await;
+    healthy
+        .put("/failover/probe", b"durable".to_vec(), Expect::Absent)
+        .await
+        .unwrap();
+    let unused = TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable = format!("http://{}", unused.local_addr().unwrap());
+    drop(unused);
+    let store = EtcdStore::connect([unavailable, etcd.endpoint()])
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        assert_eq!(
+            store.get("/failover/probe").await.unwrap().unwrap().value,
+            b"durable"
+        );
+        assert_eq!(store.list("/failover/").await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_page("/failover/", None, 10)
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        store.revision().await.unwrap();
+    }
+}

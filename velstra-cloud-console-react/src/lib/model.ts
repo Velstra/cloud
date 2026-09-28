@@ -71,7 +71,15 @@ export function verdict(r: Resource, c?: Collection): {
   if (obs === 0) return fresh ? { kind: "unreported", word: "Creating", busy: true } : { kind: "unreported", word: "Not reported" };
   if (obs < gen) return { kind: "drifting", word: underway(r) || "Applying", busy: true, reason: ready?.reason };
   if (!ready) return { kind: "unreported", word: "Not reported" };
-  if (ready.status === "True") return { kind: "settled", word: "Settled" };
+  if (ready.status === "True") {
+    // An instance's Ready condition means the hypervisor applied the request.
+    // It does not prove that the guest OS has booted or passed a health check.
+    const instanceState = r.status?.state;
+    if (c?.id === "instances" && (instanceState === "Running" || instanceState === "Stopped")) {
+      return { kind: "settled", word: instanceState };
+    }
+    return { kind: "settled", word: "Settled" };
+  }
   return { kind: "drifting", word: underway(r) || "Applying", busy: true, reason: ready.reason, detail: ready.message };
 }
 
