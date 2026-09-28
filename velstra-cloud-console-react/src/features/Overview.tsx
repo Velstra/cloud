@@ -48,16 +48,17 @@ export function Overview({ onRefresh }: { onRefresh: () => Promise<void> }) {
       const coll = collection(id); if (!coll) return null;
       const resources = rows[id] ?? [];
       const ready = resources.filter((r) => verdict(r, coll).kind === "settled").length;
+      const running = id === "instances" ? resources.filter((r) => r.status?.state === "Running").length : 0;
       const known = sweptAt > 0 && !missing[id];
       return <a key={id} href={href({ view: "board", coll: id })} className="resource-tile overview-panel grid gap-4 p-4">
         <span className="flex items-center justify-between text-sm text-muted-foreground"><span className="inline-flex items-center gap-2"><Icon className="size-4 text-primary" />{title}</span><ArrowUpRight className="size-3.5" /></span>
-        <span className="flex flex-wrap items-baseline justify-between gap-2"><strong className="text-3xl font-semibold tabular-nums tracking-tight">{known ? `${truncated.includes(id) ? "≥ " : ""}${resources.length}` : "—"}</strong><span className="text-xs text-muted-foreground">{known ? `${ready} ready` : sweptAt ? "Unavailable" : "Loading…"}</span></span>
+        <span className="flex flex-wrap items-baseline justify-between gap-2"><strong className="text-3xl font-semibold tabular-nums tracking-tight">{known ? `${truncated.includes(id) ? "≥ " : ""}${resources.length}` : "—"}</strong><span className="text-xs text-muted-foreground">{known ? id === "instances" ? `${running} running` : `${ready} ready` : sweptAt ? "Unavailable" : "Loading…"}</span></span>
       </a>;
     })}</div>
     <section className="overview-panel" aria-label="Health">
       <div className="flex flex-wrap items-center gap-3 px-5 py-4">
         {attention.length || incomplete ? <TriangleAlert className="size-5 text-[var(--drifting)]" /> : <CheckCircle2 className="size-5 text-[var(--settled)]" />}
-        <div className="flex-1"><h2>{!sweptAt ? "Checking resources…" : incomplete ? "Some status data is unavailable" : attention.length ? `${attention.length} resources need attention` : "All resources are ready"}</h2><p className="mt-0.5 text-xs text-muted-foreground">{sweptAt ? `Last checked ${ago(sweptAt)}` : "Waiting for the first inventory read"}</p></div>
+        <div className="flex-1"><h2>{!sweptAt ? "Checking resources…" : incomplete ? "Some status data is unavailable" : attention.length ? `${attention.length} resources need attention` : "No resource issues reported"}</h2><p className="mt-0.5 text-xs text-muted-foreground">{sweptAt ? `Last checked ${ago(sweptAt)}` : "Waiting for the first inventory read"}</p></div>
       </div>
       {incomplete && <p role="status" className="border-t border-border px-5 py-3 text-xs text-[var(--drifting)]">{Object.keys(missing).map((id) => `${collection(id)?.title ?? id}: unavailable`).concat(truncated.map((id) => `${collection(id)?.title ?? id}: partial inventory`)).join(" · ")}</p>}
       {attention.slice(0, 6).map(({ coll, r }) => <a key={nameOf(r)} href={link(coll.id, r)} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-border px-5 py-3 hover:bg-accent"><span className="min-w-0"><span className="block truncate text-sm font-medium">{attentionName(r, coll)}</span><span className="block truncate text-xs text-muted-foreground">{coll.singular} · {verdict(r, coll).detail || "Waiting for an update"}</span></span><State of={r} coll={coll} /></a>)}
