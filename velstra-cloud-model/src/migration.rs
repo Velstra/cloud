@@ -319,7 +319,10 @@ pub fn may_migrate(
             want: format!("{} MiB", instance.spec.memory_mib),
         });
     }
-    if !image_cached_on.iter().any(|n| n == to_id) {
+    // A cold move that copies the local root disk carries the complete boot
+    // image with that disk. Requiring a second cached image on the destination
+    // refuses a transfer that already supplies its own bytes.
+    if !copies_local_root && !image_cached_on.iter().any(|n| n == to_id) {
         return Err(Refusal::DestinationLacksImage {
             node: to_id.to_string(),
             image: instance.spec.image.clone(),
@@ -1740,6 +1743,10 @@ mod tests {
         b.status.shared_state = false;
         a.status.local_migration_targets = vec!["node-b".into()];
         assert!(may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot).is_ok());
+        assert!(
+            may_migrate(&guest, &a, &b, &[], MigrationMode::Reboot).is_ok(),
+            "the copied root disk includes the image; the destination needs no separate cache"
+        );
         assert!(matches!(
             may_migrate(&guest, &a, &b, &cached(), MigrationMode::Live),
             Err(Refusal::RootDiskIsNotShared { .. })
