@@ -444,9 +444,14 @@ impl Storage for CephPool {
             Origin::Image {
                 name: image,
                 stored,
+                digest,
+                source,
             } => {
                 let parent = rbd_name(image);
                 if !self.image_present(image).await? {
+                    if let Some(dir) = &self.config.images {
+                        crate::pool::image_on_disk(dir, image, stored, digest, source).await?;
+                    }
                     // Bring it in, if this machine has the bytes. The import is
                     // idempotent and verifies the digest in the name, so doing
                     // it here is the same act an operator would have performed

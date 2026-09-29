@@ -385,27 +385,19 @@ impl Storage for LvmPool {
             // opening `projects/p1/images/…` as a file, which is nothing on
             // any machine. It is resolved to the file the node wrote, under
             // the image's digest.
-            Origin::Image { name, stored } => {
-                let Some(stored) = stored else {
-                    return Err(HostError::failed(format!(
-                        "{name} carries no digest this pool could read, so there is no file to \
-                         copy from"
-                    )));
-                };
+            Origin::Image {
+                name,
+                stored,
+                digest,
+                source,
+            } => {
                 let Some(dir) = &self.config.images else {
                     return Err(HostError::failed(format!(
                         "this LVM pool was not told where images live on this machine, so it \
                          cannot make a volume from {name}"
                     )));
                 };
-                let from = dir.join(stored);
-                if !from.exists() {
-                    return Err(HostError::failed(format!(
-                        "{name} is not on this machine, so nothing can be copied from it — \
-                         looked in {}. The node agent fetches an image when a guest needs it.",
-                        from.display()
-                    )));
-                }
+                let from = crate::pool::image_on_disk(dir, name, stored, digest, source).await?;
                 self.create_lv(&lv, gib).await?;
                 match self.write_into(&from.to_string_lossy(), &device).await {
                     Ok(()) => Ok(()),

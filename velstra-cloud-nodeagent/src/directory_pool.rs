@@ -379,27 +379,19 @@ impl Storage for DirectoryPool {
             // that guest finds nothing. The convert writes the partial and the
             // rename publishes it, so there is no moment at which the name exists
             // and the bytes do not.
-            Origin::Image { name, stored } => {
+            Origin::Image {
+                name,
+                stored,
+                digest,
+                source,
+            } => {
                 // By what the node calls it on disk — its digest — and not by
                 // the resource name with its slashes flattened, which is what
                 // this looked for and no node has ever written. A first-class
                 // operation failed here every time, with a sentence naming a
                 // path nothing would ever create.
-                let Some(stored) = stored else {
-                    return Err(HostError::failed(format!(
-                        "{name} carries no digest this pool could read, so there is no file to \
-                         copy from. An image says which bytes it is; one that does not cannot be \
-                         cloned."
-                    )));
-                };
-                let from = self.images.join(stored);
-                if !from.exists() {
-                    return Err(HostError::failed(format!(
-                        "{name} is not on this machine, so nothing can be copied from it — \
-                         looked in {}. The node agent fetches an image when a guest needs it.",
-                        from.display()
-                    )));
-                }
+                let from =
+                    crate::pool::image_on_disk(&self.images, name, stored, digest, source).await?;
                 self.atomically(
                     &path,
                     vec![
