@@ -29,6 +29,7 @@ def main(inventory_path):
             fail(f'api.nodeRegistration.{field} is required')
     url = registration['url'].rstrip('/')
     agent_url = registration['agentUrl'].rstrip('/')
+    agent_ca_path = inventory['api'].get('caPath', '/etc/velstra/api-ca.pem')
     if not url.startswith('https://') or not agent_url.startswith('https://'):
         fail('control-plane registration requires HTTPS API and agent URLs')
     token_path = Path(registration['adminTokenFile'])
@@ -76,11 +77,20 @@ def main(inventory_path):
         present = remote(node, 'sh -c "if test -s /etc/velstra/node-token || test -s /var/lib/velstra/node-token; then echo present; else echo missing; fi"')
         if present.returncode != 0 or present.stdout.strip() not in ('present', 'missing'):
             fail(f'{name}: cannot inspect local node credential over SSH')
-        code, _ = request('GET', '/nodes/' + name, expected=(200, 404))
+        code, current = request('GET', '/nodes/' + name, expected=(200, 404))
+        if code == 200:
+            spec = current.get('spec', {})
+            roles = spec.get('roles') or []
+            if 'control-plane' not in roles:
+                request('PATCH', '/nodes/' + name,
+                        {'spec': {'roles': [*roles, 'control-plane']}},
+                        expected=(200,))
         if present.stdout.strip() == 'missing':
             if code == 404:
                 _, issued = request('POST', '/nodes',
-                                    {'id': name, 'spec': {'schedulable': False}},
+                                    {'id': name, 'spec': {
+                                        'schedulable': False,
+                                        'roles': ['control-plane']}},
                                     expected=(202,))
             else:
                 _, issued = request('POST', '/nodes/' + name + ':issueCredential',
@@ -92,24 +102,38 @@ def main(inventory_path):
                              input_text=token + '\n')
             if written.returncode:
                 fail(f'{name}: could not deliver node credential over SSH')
-            configured = remote(node, 'bash -s', input_text='''set -euo pipefail
+        elif code == 404:
+            fail(f'{name}: agent credential exists but node object is missing; inspect before minting another identity')
+
+        # Reconcile the endpoint on every run. A freshly joined control plane
+        # may start against a bootstrap API, then switch to the HA address;
+        # leaving the first URL in node.env strands its heartbeat on failure.
+        configured = remote(node, 'bash -s', input_text='''set -euo pipefail
 test -s /etc/velstra/node.env
 grep -Eq '^VELSTRA_ROLES=.*control-plane' /etc/velstra/node.env
+curl --max-time 10 --cacert '''+shlex.quote(agent_ca_path)+' '+shlex.quote(agent_url+'/readyz')+''' >/dev/null
 python3 - '''+shlex.quote(agent_url)+''' <<'PY'
 from pathlib import Path
 import sys
 path=Path('/etc/velstra/node.env')
-lines=[line for line in path.read_text().splitlines() if not line.startswith('VELSTRA_API_URL=')]
-lines.append('VELSTRA_API_URL='+sys.argv[1])
-path.write_text('\\n'.join(lines)+'\\n')
+lines=path.read_text().splitlines()
+wanted='VELSTRA_API_URL='+sys.argv[1]
+if wanted not in lines or sum(line.startswith('VELSTRA_API_URL=') for line in lines) != 1:
+    lines=[line for line in lines if not line.startswith('VELSTRA_API_URL=')]
+    lines.append(wanted)
+    path.write_text('\\n'.join(lines)+'\\n')
+    Path('/run/velstra-agent-endpoint-changed').touch()
 PY
+if test -e /run/velstra-agent-endpoint-changed; then
+  rm -f /run/velstra-agent-endpoint-changed
+  systemctl restart velstra-cloud-nodeagent
+else
+  systemctl is-active --quiet velstra-cloud-nodeagent || systemctl restart velstra-cloud-nodeagent
+fi
 systemctl enable velstra-cloud-nodeagent >/dev/null
-systemctl restart velstra-cloud-nodeagent
 ''')
-            if configured.returncode:
-                fail(f'{name}: could not start the credentialed node agent')
-        elif code == 404:
-            fail(f'{name}: agent credential exists but node object is missing; inspect before minting another identity')
+        if configured.returncode:
+            fail(f'{name}: could not configure the credentialed node agent')
         if remote(node, 'systemctl is-active --quiet velstra-cloud-nodeagent').returncode:
             fail(f'{name}: node agent is not running')
         for attempt in range(20):

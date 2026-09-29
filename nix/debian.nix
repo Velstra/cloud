@@ -220,7 +220,8 @@ let
           tok=/var/lib/velstra/node-token; \
           [ -f /etc/velstra/node-token ] && tok=/etc/velstra/node-token; \
         fab=; \
-        if [ -n "''${VELSTRA_FABRIC:-}" ]; then \
+        if [ -n "''${VELSTRA_FABRIC_VTEP:-}" ] || [ -n "''${VELSTRA_FABRIC_UNDERLAY:-}" ] || { [ -n "''${VELSTRA_FABRIC:-}" ] && ${bin "velstra-cloud-node"} has-role hypervisor; }; then \
+          [ -n "''${VELSTRA_FABRIC:-}" ] && [ -n "''${VELSTRA_FABRIC_VTEP:-}" ] && [ -n "''${VELSTRA_FABRIC_UNDERLAY:-}" ] || { echo "Fabric datapath requires endpoint, VTEP and underlay" >&2; exit 1; }; \
           fab="--datapath fabric --fabric $VELSTRA_FABRIC --fabric-vtep $VELSTRA_FABRIC_VTEP --fabric-underlay $VELSTRA_FABRIC_UNDERLAY"; \
           [ -n "''${VELSTRA_FABRIC_SRV6_LOCATOR:-}" ] && fab="$fab --fabric-srv6-locator $VELSTRA_FABRIC_SRV6_LOCATOR"; \
         fi; \

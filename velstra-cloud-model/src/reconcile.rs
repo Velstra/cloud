@@ -11,7 +11,7 @@
 //! resume, because nothing was ever "in progress".
 
 use crate::{
-    meta::{Condition, ConditionStatus, Meta, Timestamp},
+    meta::{Condition, ConditionStatus, Meta, Timestamp, condition},
     resources::{
         Attachment, Capacity, DesiredState, Instance, InstanceState, NODE_RELEASE_FINALIZER, Node,
         Observed, OperationSpec, Quota, Resource, Volume,
@@ -894,6 +894,21 @@ pub fn instance_condition(instance: &Instance) -> Condition {
             instance.status.observed_generation,
         );
     }
+    // A stopped guest can be a successful intermediate observation while its
+    // disk, ports or start order are still being prepared. Report an actual
+    // host action error when the agent has one for this generation; a mere
+    // mismatch must not finish a create operation as failed before the VM runs.
+    if let Some(failure) = condition(&instance.status.conditions, "HostActions")
+        .filter(|c| c.observed_generation >= at_generation && c.status == ConditionStatus::False)
+    {
+        return Condition::new(
+            "Ready",
+            ConditionStatus::False,
+            &failure.reason,
+            &failure.message,
+            at_generation,
+        );
+    }
     match (instance.spec.desired_state, instance.status.state) {
         (DesiredState::Running, InstanceState::Running) => Condition::ready(at_generation),
         (DesiredState::Stopped, InstanceState::Stopped) => Condition::new(
@@ -917,11 +932,14 @@ pub fn instance_condition(instance: &Instance) -> Condition {
             "no node has reported on this instance",
             at_generation,
         ),
-        (want, is) => Condition::new(
+        (want, _) => Condition::new(
             "Ready",
-            ConditionStatus::False,
-            "WrongState",
-            &format!("wanted {want:?}, the node reports {is:?}"),
+            ConditionStatus::Unknown,
+            match want {
+                DesiredState::Running => "Starting",
+                DesiredState::Stopped => "Stopping",
+            },
+            "the node is applying the requested power state",
             at_generation,
         ),
     }
@@ -2338,6 +2356,31 @@ mod tests {
         let c = instance_condition(&i);
         assert_eq!(c.status, ConditionStatus::Unknown);
         assert_eq!(c.reason, "Converging");
+    }
+
+    #[test]
+    fn a_stopped_guest_waiting_to_start_is_not_a_failed_create() {
+        let mut i = super::tests::inst("projects/p1/instances/i1");
+        i.status.observed_generation = i.meta.generation;
+        i.status.state = InstanceState::Stopped;
+        let c = instance_condition(&i);
+        assert_eq!(c.status, ConditionStatus::Unknown);
+        assert_eq!(c.reason, "Starting");
+
+        set_condition(
+            &mut i.status.conditions,
+            Condition::new(
+                "HostActions",
+                ConditionStatus::False,
+                "ActionFailed",
+                "disk creation failed",
+                i.meta.generation,
+            ),
+        );
+        let c = instance_condition(&i);
+        assert_eq!(c.status, ConditionStatus::False);
+        assert_eq!(c.reason, "ActionFailed");
+        assert_eq!(c.message, "disk creation failed");
     }
 
     #[test]

@@ -554,7 +554,19 @@ impl CephAdmin {
         // `--connect-timeout` only bounds the initial connection. Ceph's
         // orchestrator can accept it and then never answer, which used to stop
         // the entire node-agent pass, including heartbeats and migrations.
-        let mut command = tokio::process::Command::new(&self.ceph);
+        // The host's ceph-common may lag behind the image cephadm selected for
+        // this cluster. In particular, an older client can reject the admin
+        // keyring written by a newer image before it ever contacts a monitor.
+        // Use the cluster image's client for the default installation. Keep an
+        // explicit client path for tests and installations that provide their
+        // own compatible binary.
+        let mut command = if self.ceph == "ceph" {
+            let mut command = tokio::process::Command::new(&self.cephadm);
+            command.args(["shell", "--", "ceph"]);
+            command
+        } else {
+            tokio::process::Command::new(&self.ceph)
+        };
         command
             .arg("--connect-timeout=15")
             .args(args)
@@ -766,6 +778,24 @@ mod tests {
         assert!(!diagnostic.contains("secret"));
         assert!(diagnostic.contains("version compatibility"));
         assert!(diagnostic.contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn default_client_uses_the_cluster_image() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("cephadm-client-{}", std::process::id()));
+        std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let admin = CephAdmin {
+            cephadm: path.to_string_lossy().into_owned(),
+            ..CephAdmin::default()
+        };
+        let output = admin.ceph(&pubkey_argv()).await.unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "shell\n--\nceph\n--connect-timeout=15\ncephadm\nget-pub-key\n"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
