@@ -27,7 +27,7 @@ use velstra_cloud_model::{
 };
 use velstra_cloud_store::TypedStore;
 
-use crate::{Result, runner::Reconciler, status::StatusWriter};
+use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
 
 const WHO: &str = "network";
 
@@ -122,6 +122,17 @@ impl Reconciler for NetworkController {
 
     fn name(&self) -> &'static str {
         "network"
+    }
+
+    fn related(&self) -> Vec<Related> {
+        // A network can be declared before its subnet. Wake that network as
+        // soon as the subnet arrives or changes; otherwise its first
+        // Unmirrorable result survives until the five-minute resync, even
+        // though the operator has already supplied the missing range.
+        vec![Related::of::<SubnetSpec, SubnetStatus>(
+            self.subnets.prefix(),
+            |subnet| vec![subnet.spec.network.clone()],
+        )]
     }
 
     async fn reconcile(&self, name: &str, object: Option<&Network>) -> Result<()> {
@@ -319,8 +330,35 @@ mod tests {
     use velstra_cloud_store::{MemoryStore, Store};
 
     use super::*;
+    use crate::runner::{Changed, Wake};
 
     const CELL: &str = "cell-1";
+
+    #[test]
+    fn subnet_creation_wakes_its_network_without_waiting_for_resync() {
+        let (store, _, subnets) = stores();
+        let controller = NetworkController::new(store, CELL, subnets, None);
+        let subnet = Resource::new(
+            meta("projects/p1/subnets/blue-v4"),
+            SubnetSpec {
+                network: "projects/p1/networks/blue".into(),
+                cidr: "10.20.0.0/24".into(),
+                gateway: "10.20.0.1".into(),
+                ..Default::default()
+            },
+            SubnetStatus::default(),
+        );
+        let bytes = serde_json::to_vec(&subnet).unwrap();
+        let relation = controller.related().remove(0);
+        assert_eq!(relation.prefix, "/cell-1/subnets/");
+        assert_eq!(
+            (relation.wake)(Changed {
+                name: "projects/p1/subnets/blue-v4",
+                value: Some(&bytes),
+            }),
+            Wake::These(vec!["projects/p1/networks/blue".into()]),
+        );
+    }
 
     fn stores() -> (
         Arc<dyn Store>,
