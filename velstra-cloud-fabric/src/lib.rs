@@ -77,6 +77,14 @@ fn tls_config(
     if ca.is_some() && !endpoint.starts_with("https://") {
         return Err("fabric TLS credentials require an https:// endpoint".into());
     }
+    if endpoint.starts_with("https://") {
+        // Tonic can bring both rustls crypto backends into a final binary.
+        // Without an explicit process default, constructing its TLS channel
+        // panics. The Cloud API and node agent already choose ring; do it here
+        // as well so a controller's first Fabric reconcile cannot exit its
+        // whole process when HTTPS is enabled.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let Some(ca) = ca else {
         return Ok(endpoint.starts_with("https://").then(ClientTlsConfig::new));
     };
@@ -134,5 +142,15 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn https_channel_construction_has_a_crypto_provider() {
+        let tls = tls_config("https://127.0.0.1:50052", None, None, None)
+            .unwrap()
+            .unwrap();
+        tonic::transport::Endpoint::from_static("https://127.0.0.1:50052")
+            .tls_config(tls)
+            .expect("HTTPS Fabric client construction must not panic");
     }
 }

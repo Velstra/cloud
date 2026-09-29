@@ -268,10 +268,16 @@ async fn main() {
         "controllers running"
     );
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("stopping"),
-        _ = tasks.join_next() => error!("a controller stopped on its own"),
-    }
+    let failed = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("stopping");
+            false
+        },
+        result = tasks.join_next() => {
+            error!(?result, "a controller stopped on its own");
+            true
+        },
+    };
     let _ = stop.send(true);
     tasks.shutdown().await;
     // Awaited, not aborted: the campaign releases the lease on its way out, so a
@@ -280,6 +286,11 @@ async fn main() {
     // crash to the rest of the cell.
     if let Some(election) = election {
         let _ = election.await;
+    }
+    // A worker panic used to take the whole process down with exit status 0.
+    // systemd's Restart=on-failure then left every controller off indefinitely.
+    if failed {
+        std::process::exit(1);
     }
 }
 

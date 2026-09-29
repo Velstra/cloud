@@ -345,6 +345,10 @@ rather than pretending TCG proved the same thing.
   pointed at a controller nobody named would be a promise nothing keeps. A node
   whose seed has no fabric skips the unit rather than failing it — running a
   cell with no overlay is a real choice, and the skip says so in the journal.
+  Debian also needs the separate Fabric executable at
+  `/usr/local/libexec/velstra-fabric-agent` (or an absolute
+  `VELSTRA_FABRIC_AGENT_BINARY`); `/usr/bin/velstra` is Cloud's CLI. An HTTPS
+  config service needs the data-plane agent's own CA and client certificate.
 - **Update channel**: slot writer shipped, signed channel not yet (above).
 - **Sentinel input**: pinned to the public repository, so the flake evaluates
   for anybody — it used to point at a sibling checkout by absolute path, which
