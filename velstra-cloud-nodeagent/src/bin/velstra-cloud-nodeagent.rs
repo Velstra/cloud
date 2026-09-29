@@ -195,7 +195,7 @@ struct Args {
     /// What this node offers for guest disks, in GiB. Reported to the
     /// scheduler; not derivable from `std`, so it is stated rather than
     /// guessed at.
-    #[arg(long, default_value = "0")]
+    #[arg(long, env = "VELSTRA_DISK_GIB", default_value = "0")]
     disk_gib: u64,
 
     /// The address other nodes reach this one at to move a guest here.
