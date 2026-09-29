@@ -197,7 +197,10 @@ pub fn reconcile_instance(
         return actions;
     }
 
-    if !image_cached {
+    // A boot volume already contains the guest's boot bytes. It neither needs
+    // an image download nor necessarily has an image resource at all.
+    let image_ready = !instance.spec.boot_volume.is_empty() || image_cached;
+    if !image_ready {
         actions.push(Action::PullImage {
             digest: instance.spec.image.clone(),
         });
@@ -226,7 +229,7 @@ pub fn reconcile_instance(
     // Everything above must be in place before the guest runs. Asking for a VM
     // whose image is still downloading is how a start ends up "failed" for a
     // reason that was only ever a race.
-    let ready_to_run = image_cached
+    let ready_to_run = image_ready
         && disk_present
         && instance
             .spec
@@ -1703,6 +1706,21 @@ mod tests {
             actions,
             vec![Action::StartVm {
                 instance: "projects/p1/instances/i1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_boot_volume_starts_without_a_separate_image_cache() {
+        let mut instance = inst("projects/p1/instances/from-volume");
+        instance.spec.image.clear();
+        instance.spec.boot_volume = "projects/p1/volumes/boot".into();
+        instance.spec.ports.clear();
+        let actions = reconcile_instance(&instance, false, &[], true, None, StartGate::Go, now());
+        assert_eq!(
+            actions,
+            vec![Action::StartVm {
+                instance: instance.meta.name.to_string()
             }]
         );
     }

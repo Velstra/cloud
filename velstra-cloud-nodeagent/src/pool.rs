@@ -177,6 +177,12 @@ impl Copies {
         velstra_cloud_model::images::stored_name(&object.spec.digest)
     }
 
+    fn image(&self, name: &str) -> Option<&velstra_cloud_model::resources::Image> {
+        self.images
+            .iter()
+            .find(|image| image.meta.name.to_string() == name)
+    }
+
     fn path_of(&self, backup: &str) -> Option<String> {
         let backup = self
             .backups
@@ -228,10 +234,44 @@ pub enum Origin<'a> {
     Image {
         name: &'a str,
         stored: Option<&'a str>,
+        digest: Option<&'a str>,
+        source: Option<&'a str>,
     },
     Snapshot(&'a str),
     /// A file on this machine — a backup on a target that is mounted here.
     File(&'a str),
+}
+
+/// Fetch an image before a pool reads it. The node and pool agents share the
+/// same content-addressed cache and the same digest verification path.
+pub async fn image_on_disk(
+    dir: &std::path::Path,
+    name: &str,
+    stored: Option<&str>,
+    digest: Option<&str>,
+    source: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let Some(stored) = stored else {
+        return Err(HostError::failed(format!(
+            "{name} carries no digest this pool could read, so there is no image to copy"
+        )));
+    };
+    let path = dir.join(stored);
+    if !path.exists() {
+        let (Some(digest), Some(source)) = (digest, source) else {
+            return Err(HostError::failed(format!(
+                "{name} is not cached at {} and its source is unavailable",
+                path.display()
+            )));
+        };
+        let layout = crate::hostfs::Layout {
+            image_dir: dir.to_path_buf(),
+            incoming_dir: dir.join("incoming"),
+            ..Default::default()
+        };
+        crate::hostfs::fetch_image(&layout, name, digest, source).await?;
+    }
+    Ok(path)
 }
 
 /// Where one backup's bytes go inside a target.
@@ -1453,10 +1493,15 @@ impl PoolAgent {
                     // Resolved here and nowhere else, exactly as a backup is:
                     // it takes the image object and this pool has one, while a
                     // backend has neither.
-                    VolumeSource::Image(image) => Origin::Image {
-                        name: image,
-                        stored: stored.as_deref(),
-                    },
+                    VolumeSource::Image(image) => {
+                        let object = copies.image(image);
+                        Origin::Image {
+                            name: image,
+                            stored: stored.as_deref(),
+                            digest: object.map(|object| object.spec.digest.as_str()),
+                            source: object.map(|object| object.spec.source_url.as_str()),
+                        }
+                    }
                     VolumeSource::Snapshot(snapshot) => Origin::Snapshot(snapshot),
                     VolumeSource::Backup(backup) => {
                         let Some(path) = copies.path_of(backup) else {
@@ -1986,6 +2031,49 @@ mod tests {
     use super::*;
 
     const VOLUME: &str = "projects/p1/volumes/data-1";
+
+    #[tokio::test]
+    async fn a_pool_fetches_and_verifies_an_uncached_image_before_using_it() {
+        let root = std::env::temp_dir().join(format!(
+            "velstra-pool-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.img");
+        std::fs::write(&source, b"abc").unwrap();
+        let digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let stored = digest.replace(':', "-");
+        let cache = root.join("cache");
+        let url = format!("file://{}", source.display());
+        let result = image_on_disk(
+            &cache,
+            "images/test",
+            Some(&stored),
+            Some(digest),
+            Some(&url),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&result).unwrap(), b"abc");
+        std::fs::remove_file(source).unwrap();
+        assert_eq!(
+            image_on_disk(
+                &cache,
+                "images/test",
+                Some(&stored),
+                Some(digest),
+                Some(&url)
+            )
+            .await
+            .unwrap(),
+            result
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     struct Cell {
         volumes: TypedStore<VolumeSpec, VolumeStatus>,

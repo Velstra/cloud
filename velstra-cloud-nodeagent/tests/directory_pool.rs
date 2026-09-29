@@ -134,6 +134,8 @@ async fn a_volume_from_an_image_has_the_image_in_it_before_it_exists() {
         Origin::Image {
             name: image,
             stored: Some(&stored),
+            digest: None,
+            source: None,
         },
         None,
     )
@@ -176,12 +178,14 @@ async fn an_image_that_is_not_here_is_refused_rather_than_left_blank() {
             Origin::Image {
                 name: "projects/p1/images/nothing-here",
                 stored: Some("sha256-nope"),
+                digest: None,
+                source: None,
             },
             None,
         )
         .await
         .expect_err("a volume was made from an image that is not on this machine");
-    assert!(err.to_string().contains("not on this machine"), "{err}");
+    assert!(err.to_string().contains("not cached"), "{err}");
     // And it says where it looked, which is the difference between a bug
     // report and a fix.
     assert!(err.to_string().contains("sha256-nope"), "{err}");
@@ -397,6 +401,8 @@ async fn an_image_with_no_digest_is_refused_by_name() {
             Origin::Image {
                 name: "projects/p1/images/handmade",
                 stored: None,
+                digest: None,
+                source: None,
             },
             None,
         )
