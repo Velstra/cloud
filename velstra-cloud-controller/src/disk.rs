@@ -273,8 +273,16 @@ impl Reconciler for DiskController {
         }
 
         // Ownership follows the guest only after the destination actually claims it.
+        // This includes attachments created through the API: the minted label
+        // controls lifecycle, not whether an attached disk follows its guest.
         // The old node closes its handle before the new node claims the attachment.
-        for attachment in &mine {
+        for attachment in self
+            .attachments
+            .list()
+            .await?
+            .into_iter()
+            .filter(|a| a.spec.instance == name)
+        {
             if !attachment.meta.is_deleting() && attachment.spec.node != node {
                 let mut next = attachment.clone();
                 next.spec.node = node.clone();
@@ -687,6 +695,41 @@ mod boot_volume_tests {
         guest.status.node = Some("nodes/n2".into());
         disk.reconcile(GUEST, Some(&guest)).await.unwrap();
         assert_eq!(attachments.list().await.unwrap()[0].spec.node, "nodes/n2");
+    }
+
+    #[tokio::test]
+    async fn an_api_attachment_follows_its_guest_after_migration() {
+        let (disk, attachments, instances) = cell().await;
+        let mut guest = booted_from(&instances, "", &[]).await;
+        attachments
+            .create(
+                &Resource::new(
+                    meta("projects/p1/attachments/manual-data"),
+                    AttachmentSpec {
+                        volume: "projects/p1/volumes/data".into(),
+                        instance: GUEST.into(),
+                        node: "nodes/n1".into(),
+                        at: "rbd:pool/data".into(),
+                        read_only: false,
+                        limits: Default::default(),
+                    },
+                    AttachmentStatus::default(),
+                ),
+                &Writer::controller("test"),
+            )
+            .await
+            .unwrap();
+
+        guest.spec.node = Some("nodes/n2".into());
+        disk.reconcile(GUEST, Some(&guest)).await.unwrap();
+        assert_eq!(attachments.list().await.unwrap()[0].spec.node, "nodes/n1");
+
+        guest.status.node = Some("nodes/n2".into());
+        disk.reconcile(GUEST, Some(&guest)).await.unwrap();
+        let moved = attachments.list().await.unwrap();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].spec.node, "nodes/n2");
+        assert!(!moved[0].meta.is_deleting());
     }
 
     #[tokio::test]
