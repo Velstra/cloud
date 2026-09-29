@@ -877,7 +877,9 @@ impl Agent {
             .images
             .get(&instance.spec.image)
             .and_then(|i| crate::hostfs::stored_as(&i.digest));
-        if !want.is_some_and(|name| host.images.contains(&name)) {
+        if instance.spec.boot_volume.is_empty()
+            && !want.is_some_and(|name| host.images.contains(&name))
+        {
             // The destination fetches from the registered source, the same way
             // an ordinary pass does. A guest cannot arrive onto a node that
             // cannot obtain its image, and finding that out here — before a

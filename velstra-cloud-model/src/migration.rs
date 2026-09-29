@@ -322,7 +322,10 @@ pub fn may_migrate(
     // A cold move that copies the local root disk carries the complete boot
     // image with that disk. Requiring a second cached image on the destination
     // refuses a transfer that already supplies its own bytes.
-    if !copies_local_root && !image_cached_on.iter().any(|n| n == to_id) {
+    if instance.spec.boot_volume.is_empty()
+        && !copies_local_root
+        && !image_cached_on.iter().any(|n| n == to_id)
+    {
         return Err(Refusal::DestinationLacksImage {
             node: to_id.to_string(),
             image: instance.spec.image.clone(),
@@ -1753,6 +1756,19 @@ mod tests {
         ));
         a.status.local_migration_targets = vec!["node-c".into()];
         assert!(may_migrate(&guest, &a, &b, &cached(), MigrationMode::Reboot).is_err());
+    }
+
+    #[test]
+    fn a_shared_boot_volume_needs_no_separate_image_cache_for_live_migration() {
+        let mut guest = instance(InstanceState::Running, Some("node-a"));
+        guest.spec.image.clear();
+        guest.spec.boot_volume = "projects/p1/volumes/boot".into();
+        let from = node("node-a", 16384, "0.1.0");
+        let to = node("node-b", 16384, "0.1.0");
+        assert!(
+            may_migrate(&guest, &from, &to, &[], MigrationMode::Live).is_ok(),
+            "a boot volume supplies the guest's image bytes on both hosts"
+        );
     }
 
     #[test]
