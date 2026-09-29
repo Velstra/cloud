@@ -1916,12 +1916,12 @@ impl Agent {
                 );
             }
         } else {
-            let ready = instance_condition(&next);
-            set_condition(&mut next.status.conditions, ready);
             set_condition(
                 &mut next.status.conditions,
                 host_condition(&outcome, acted_on),
             );
+            let ready = instance_condition(&next);
+            set_condition(&mut next.status.conditions, ready);
         }
         set_condition(
             &mut next.status.conditions,

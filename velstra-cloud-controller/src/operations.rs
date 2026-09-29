@@ -465,6 +465,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_create_waits_through_a_transient_stopped_report() {
+        let (f, controller) = fixture();
+        f.instance(
+            1,
+            Some(Condition::new(
+                "Ready",
+                ConditionStatus::Unknown,
+                "Starting",
+                "the node is applying the requested power state",
+                1,
+            )),
+        )
+        .await;
+        let op = f.operation("create", 1).await;
+        controller
+            .reconcile("projects/p1/operations/op-7", Some(&op))
+            .await
+            .unwrap();
+        let waiting = f.reload().await;
+        assert!(!waiting.status.done);
+        assert!(waiting.status.error.is_none());
+
+        let mut instance = f
+            .instances
+            .get("projects/p1/instances/i1")
+            .await
+            .unwrap()
+            .unwrap();
+        set_condition(&mut instance.status.conditions, Condition::ready(1));
+        f.instances
+            .update(
+                &instance,
+                &velstra_cloud_model::access::Writer::agent("node-a"),
+            )
+            .await
+            .unwrap();
+        controller
+            .reconcile("projects/p1/operations/op-7", Some(&waiting))
+            .await
+            .unwrap();
+        let done = f.reload().await;
+        assert!(done.status.done);
+        assert!(done.status.error.is_none());
+    }
+
+    #[tokio::test]
     async fn a_finished_operation_keeps_the_time_it_finished() {
         let (f, controller) = fixture();
         f.instance(1, Some(Condition::ready(1))).await;
