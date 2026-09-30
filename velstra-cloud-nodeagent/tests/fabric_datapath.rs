@@ -172,6 +172,8 @@ impl Fabric {
                  Kill the leftover controller, or give this fixture a port nothing else uses."
             );
         }
+        let stderr_path = dir.join("controller.stderr");
+        let stderr = std::fs::File::create(&stderr_path).ok()?;
         let child = std::process::Command::new(binary)
             .args([
                 "serve",
@@ -188,10 +190,10 @@ impl Fabric {
                 &format!("127.0.0.1:{raft}"),
             ])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr)
             .spawn()
             .ok()?;
-        let me = Self {
+        let mut me = Self {
             child,
             admin: format!("http://127.0.0.1:{admin}"),
             control: format!("http://127.0.0.1:{listen}"),
@@ -199,12 +201,17 @@ impl Fabric {
         // Waited for by asking it something, not by sleeping: a fixture that
         // sleeps is a fixture that is flaky on a busy machine.
         for _ in 0..80 {
+            if let Ok(Some(status)) = me.child.try_wait() {
+                let details = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+                panic!("fabric controller exited during startup ({status}): {details}");
+            }
             if me.client().await.is_ok() {
                 return Some(me);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        None
+        let details = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        panic!("fabric controller did not become ready: {details}");
     }
 
     async fn client(
