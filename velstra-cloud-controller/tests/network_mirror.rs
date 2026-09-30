@@ -220,12 +220,14 @@ async fn a_tenant_network_reaches_the_fabric_without_anybody_declaring_it() {
         subnets.clone(),
         Some(fabric.admin.clone()),
     );
-    sweep(&controller, &networks).await.unwrap();
+    sweep(&controller, &networks).await.unwrap(); // install release guard
+    sweep(&controller, &networks).await.unwrap(); // mirror network
 
-    client
+    let created = client
         .create_port(port("tap-after"))
         .await
-        .expect("a port still could not be created after the network was mirrored");
+        .expect("a port still could not be created after the network was mirrored")
+        .into_inner();
 
     // And the network says so about itself, so an operator sees it without
     // asking the fabric.
@@ -241,4 +243,65 @@ async fn a_tenant_network_reaches_the_fabric_without_anybody_declaring_it() {
     sweep(&controller, &networks)
         .await
         .expect("a second pass must restate, not fail");
+
+    // A deletion must retain the VNI until Fabric releases it. The subnet is
+    // already gone from Cloud, but the controller still has to retire its
+    // Fabric IPAM reservation before the guarded network record can disappear.
+    client
+        .remove_port(pb::RemovePortRequest { id: created.id })
+        .await
+        .unwrap();
+    let subnet = subnets
+        .get("projects/p1/subnets/s1")
+        .await
+        .unwrap()
+        .unwrap();
+    subnets
+        .delete(
+            "projects/p1/subnets/s1",
+            subnet.meta.revision,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+    let mut network = networks.get(NETWORK).await.unwrap().unwrap();
+    assert!(
+        network
+            .meta
+            .has_finalizer(velstra_cloud_model::resources::FABRIC_RELEASE_FINALIZER)
+    );
+    network.meta.deleted_at = Some(velstra_cloud_model::meta::Timestamp::now());
+    networks
+        .update(
+            &network,
+            &velstra_cloud_model::access::Writer::controller("test"),
+        )
+        .await
+        .unwrap();
+    assert!(networks.get(NETWORK).await.unwrap().is_some());
+    let disconnected = NetworkController::new(
+        raw.clone(),
+        CELL,
+        subnets.clone(),
+        Some("http://127.0.0.1:20964".into()),
+    );
+    sweep(&disconnected, &networks).await.unwrap();
+    assert!(
+        networks
+            .get(NETWORK)
+            .await
+            .unwrap()
+            .unwrap()
+            .meta
+            .has_finalizer(velstra_cloud_model::resources::FABRIC_RELEASE_FINALIZER),
+        "a disconnected Fabric must not be treated as a successful release"
+    );
+    sweep(&controller, &networks).await.unwrap(); // release guard
+    sweep(&controller, &networks).await.unwrap(); // delete record
+    assert!(networks.get(NETWORK).await.unwrap().is_none());
+    let refusal = client
+        .create_port(port("tap-after-delete"))
+        .await
+        .expect_err("Fabric still held a network after Cloud deleted it");
+    assert!(refusal.message().contains("unknown network"));
 }
