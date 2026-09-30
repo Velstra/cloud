@@ -163,12 +163,26 @@ impl CephAccess {
             .arg("--image-opts")
             .arg("-U")
             .arg(format!("driver=raw,{}", self.drive_options(rbd)));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            command.kill_on_drop(true).output(),
-        )
-        .await
-        .map_err(|_| HostError::failed("The compute host timed out opening the Ceph volume; check cluster connectivity."))?
+        // A package upgrade can briefly leave the sibling qemu-img executable
+        // open for writing. Retrying ETXTBSY is safe: exec did not start, so no
+        // image access or side effect occurred.
+        let mut attempts = 0;
+        let result = loop {
+            let started = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                command.kill_on_drop(true).output(),
+            )
+            .await
+            .map_err(|_| HostError::failed("The compute host timed out opening the Ceph volume; check cluster connectivity."))?;
+            match started {
+                Err(e) if e.raw_os_error() == Some(26) && attempts < 3 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                other => break other,
+            }
+        }
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HostError::failed("The compute host has no qemu-img beside its VM binary; install a complete QEMU package before placing Ceph volumes here.")
