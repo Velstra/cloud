@@ -3367,6 +3367,9 @@ impl Api {
         self.authorize_references(who, kind, &spec, home.as_deref())
             .await?;
         check_rules(kind, &spec, Document::Whole)?;
+        if kind == "bgp-peers" {
+            self.refuse_a_bgp_peer_on_non_gateway(&spec).await?;
+        }
         // What this project was given, as against what this caller may do. Two
         // different questions, both asked: a project admin may create a network,
         // and only the cell decides whether one of this project's networks may
@@ -4900,6 +4903,9 @@ impl Api {
             status: None,
         };
         if let Some(spec) = &mut patch.spec {
+            if name.collection() == "bgp-peers" && spec.get("node").is_some() {
+                self.refuse_a_bgp_peer_on_non_gateway(spec).await?;
+            }
             if name.collection() == "folders" || name.collection() == "projects" {
                 settle_parent(spec);
             }
@@ -9026,6 +9032,24 @@ impl Api {
         };
         spec["pool"] = Value::String(pool.meta.name.id().to_string());
         Ok(())
+    }
+
+    async fn refuse_a_bgp_peer_on_non_gateway(&self, spec: &Value) -> ApiResult<()> {
+        let node = spec.get("node").and_then(Value::as_str).unwrap_or_default();
+        let node_id = node.strip_prefix("nodes/").unwrap_or(node);
+        let nodes: Vec<Resource<NodeSpec, NodeStatus>> = self.typed_list("", "nodes").await?;
+        if nodes.iter().any(|candidate| {
+            candidate.meta.name.id() == node_id
+                && candidate.meta.deleted_at.is_none()
+                && candidate.spec.gateway
+        }) {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            "the selected node is not an active gateway; enable its gateway role before assigning a BGP peer",
+        )
+        .at("spec.node"))
     }
 
     async fn refuse_a_pool_this_cell_does_not_have(
