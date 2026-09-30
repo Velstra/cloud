@@ -32,7 +32,7 @@ no implicit plaintext fallback.
 
 Every run:
 
-1. verifies every target already has a control-plane seed and required tools;
+1. verifies every target already has a control-plane seed, Cloud binaries and service units, and required tools before changing membership;
 2. refuses an inventory that silently omits a running etcd member;
 3. saves an etcd snapshot before changing membership;
 4. admits missing members as non-voting learners, waits for catch-up, promotes them idempotently and writes the same complete cluster

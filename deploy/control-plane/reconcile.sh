@@ -104,7 +104,10 @@ trap 'exit 143' TERM
 
 echo "== preflight =="
 while IFS= read -r node; do
-  remote "$node" "id etcd >/dev/null && command -v etcdctl >/dev/null && command -v curl >/dev/null && test -s $api_ca_path && test -s /etc/velstra/node.env && grep -Eq '^VELSTRA_ROLES=.*control-plane' /etc/velstra/node.env"
+  # Membership changes must not precede package installation. A missing API
+  # unit used to admit healthy voters and only fail when replicas were rolled,
+  # leaving a quorum whose new nodes could not serve requests or register.
+  remote "$node" "id etcd >/dev/null && command -v etcdctl >/dev/null && command -v curl >/dev/null && test -s $api_ca_path && test -s /etc/velstra/node.env && grep -Eq '^VELSTRA_ROLES=.*control-plane' /etc/velstra/node.env && command -v velstra-cloud-api >/dev/null && command -v velstra-cloud-controller >/dev/null && command -v velstra-cloud-nodeagent >/dev/null && systemctl cat velstra-cloud-api.service velstra-cloud-controller.service velstra-cloud-nodeagent.service >/dev/null"
 done < <(jq -r '.controlPlanes[].name' "$inventory")
 
 if [[ "$etcd_scheme" == https ]]; then
