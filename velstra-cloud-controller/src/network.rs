@@ -44,6 +44,7 @@ const WHO: &str = "network";
 /// `observedGeneration: 0` for ever, and everything downstream renders that as
 /// "waiting".
 const MIRRORED: &str = "Mirrored";
+const NO_SUBNET: &str = "no subnet yet, so there is no range to allocate ports from";
 
 pub struct NetworkController {
     /// A network has no agent and never will — no machine owns a cell-wide
@@ -100,7 +101,7 @@ impl NetworkController {
             .collect();
         found.sort_by_key(|s| s.meta.name.to_string());
         Ok(match found.len() {
-            0 => Err("no subnet yet, so there is no range to allocate ports from".into()),
+            0 => Err(NO_SUBNET.into()),
             1 => Ok(found.remove(0)),
             n => Err(format!(
                 "{n} subnets ({}), and the fabric's network holds one range against which it \
@@ -113,6 +114,29 @@ impl NetworkController {
                     .join(", ")
             )),
         })
+    }
+
+    /// Reconcile Fabric's IPAM reservations with the one Cloud subnet this VNI
+    /// currently owns. A deleted Cloud subnet has no object left to run a
+    /// deletion controller, so the network's related watch must retire it.
+    async fn retire_stale_subnets(
+        &self,
+        client: &mut velstra_cloud_fabric::Connected,
+        vni: u32,
+        wanted: Option<&str>,
+    ) -> std::result::Result<(), Box<velstra_cloud_fabric::Status>> {
+        let listed = client
+            .list_subnets(pb::ListSubnetsRequest {})
+            .await?
+            .into_inner();
+        for subnet in listed.subnets {
+            if subnet.vni == vni && Some(subnet.id.as_str()) != wanted {
+                client
+                    .remove_subnet(pb::RemoveSubnetRequest { id: subnet.id })
+                    .await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -173,6 +197,44 @@ impl Reconciler for NetworkController {
         let subnet = match self.subnet_for(name).await? {
             Ok(subnet) => subnet,
             Err(why) => {
+                if why == NO_SUBNET {
+                    match velstra_cloud_fabric::connect(&endpoint).await {
+                        Ok(mut client) => {
+                            if let Err(status) = self
+                                .retire_stale_subnets(&mut client, network.spec.vni, None)
+                                .await
+                            {
+                                return self
+                                    .say(
+                                        network,
+                                        ConditionStatus::False,
+                                        "CleanupFailed",
+                                        status.message(),
+                                    )
+                                    .await;
+                            }
+                            if let Err(status) = client
+                                .remove_network(pb::RemoveNetworkRequest {
+                                    vni: network.spec.vni,
+                                })
+                                .await
+                            {
+                                return self
+                                    .say(
+                                        network,
+                                        ConditionStatus::False,
+                                        "CleanupFailed",
+                                        status.message(),
+                                    )
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(network = %name, error = %e, "cannot reach the fabric for subnet cleanup");
+                            return Ok(());
+                        }
+                    }
+                }
                 return self
                     .say(network, ConditionStatus::False, "Unmirrorable", &why)
                     .await;
@@ -259,24 +321,40 @@ impl Reconciler for NetworkController {
             enable_dhcp: false,
         };
         match velstra_cloud_fabric::connect(&endpoint).await {
-            Ok(mut client) => match client.add_network(spec).await {
-                Ok(_) => match client.add_subnet(fabric_subnet).await {
-                    Ok(_) => {
-                        self.say(network, ConditionStatus::True, "Mirrored", "")
-                            .await
-                    }
+            Ok(mut client) => {
+                if let Err(status) = self
+                    .retire_stale_subnets(&mut client, *vni, Some(&fabric_subnet.id))
+                    .await
+                {
+                    warn!(network = %name, error = %status, "the fabric could not retire an old subnet");
+                    return self
+                        .say(
+                            network,
+                            ConditionStatus::False,
+                            "CleanupFailed",
+                            status.message(),
+                        )
+                        .await;
+                }
+                match client.add_network(spec).await {
+                    Ok(_) => match client.add_subnet(fabric_subnet).await {
+                        Ok(_) => {
+                            self.say(network, ConditionStatus::True, "Mirrored", "")
+                                .await
+                        }
+                        Err(status) => {
+                            warn!(network = %name, error = %status, "the fabric refused the subnet");
+                            self.say(network, ConditionStatus::False, "Refused", status.message())
+                                .await
+                        }
+                    },
                     Err(status) => {
-                        warn!(network = %name, error = %status, "the fabric refused the subnet");
+                        warn!(network = %name, error = %status, "the fabric refused the network");
                         self.say(network, ConditionStatus::False, "Refused", status.message())
                             .await
                     }
-                },
-                Err(status) => {
-                    warn!(network = %name, error = %status, "the fabric refused the network");
-                    self.say(network, ConditionStatus::False, "Refused", status.message())
-                        .await
                 }
-            },
+            }
             Err(e) => {
                 // Unreachable is a wait, not a verdict: saying "Refused" here
                 // would blame the network for the network being down.
