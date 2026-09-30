@@ -305,6 +305,36 @@ impl QemuVmm {
         devices.iter().filter_map(volume_from_block).collect()
     }
 
+    async fn remove_volume_block_node(&self, instance: &str, volume: &str) -> Result<()> {
+        let node = block_node_name(volume);
+        // device_del only starts hot-unplug. The block node may still be in
+        // use when that command replies, and releasing the attachment then
+        // strands an RBD watcher that prevents the pool from deleting it.
+        let mut last_error = String::new();
+        for _ in 0..50 {
+            let listing = self
+                .qmp(instance, "query-named-block-nodes", json!({}))
+                .await?;
+            let present = named_block_node_exists(&listing, &node).ok_or_else(|| {
+                HostError::failed("QEMU returned an invalid named block-node listing")
+            })?;
+            if !present {
+                return Ok(());
+            }
+            match self
+                .qmp(instance, "blockdev-del", json!({ "node-name": node }))
+                .await
+            {
+                Ok(_) => continue, // Observe removal before reporting that the handle is gone.
+                Err(e) => last_error = e.to_string(),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Err(HostError::failed(format!(
+            "QEMU still holds the block node for {volume} after hot-unplug: {last_error}"
+        )))
+    }
+
     /// What every disk this guest holds has moved, added up.
     ///
     /// **Untested against a live QEMU;** the reply shape it reads is tested
@@ -832,15 +862,23 @@ impl Vmm for QemuVmm {
         Ok(id)
     }
 
-    /// **Untested:** unplugs the device and drops the block node behind it.
+    /// Unplug the device and wait until the block node releases its image.
     async fn close_volume(&self, instance: &str, volume: &str) -> Result<()> {
         let id = crate::hostfs::qmp_id(volume);
-        let node = block_node_name(volume);
-        self.qmp(instance, "device_del", json!({ "id": id }))
-            .await?;
-        self.qmp(instance, "blockdev-del", json!({ "node-name": node }))
+        if self
+            .open_volumes(instance)
             .await
-            .map(|_| ())
+            .iter()
+            .any(|(name, _)| name == volume)
+        {
+            self.qmp(instance, "device_del", json!({ "id": id }))
+                .await?;
+        }
+        self.remove_volume_block_node(instance, volume).await
+    }
+
+    async fn cleanup_detached_volume(&self, instance: &str, volume: &str) -> Result<()> {
+        self.remove_volume_block_node(instance, volume).await
     }
 
     async fn capacity(&self) -> Result<Capacity> {
@@ -1145,6 +1183,15 @@ fn block_node_name(volume: &str) -> String {
     } else {
         format!("v{:x}", Sha256::digest(volume.as_bytes()))[..31].to_string()
     }
+}
+
+fn named_block_node_exists(listing: &Value, node: &str) -> Option<bool> {
+    Some(
+        listing
+            .as_array()?
+            .iter()
+            .any(|block| block.get("node-name").and_then(Value::as_str) == Some(node)),
+    )
 }
 
 fn volume_from_block(block: &serde_json::Value) -> Option<(String, String)> {
@@ -1547,6 +1594,22 @@ fn throttle_args(id: &str, limits: velstra_cloud_model::throttle::Limits) -> ser
 mod tests {
     use super::*;
     use crate::host::Nic;
+
+    #[test]
+    fn a_detached_device_can_still_have_a_live_block_node() {
+        let volume = "projects/p1/volumes/data";
+        let node = block_node_name(volume);
+        let listing = json!([
+            {"node-name": "root"},
+            {"node-name": node, "file": "rbd:pool/data"}
+        ]);
+        assert_eq!(named_block_node_exists(&listing, &node), Some(true));
+        assert_eq!(
+            named_block_node_exists(&json!([{"node-name": "root"}]), &node),
+            Some(false)
+        );
+        assert_eq!(named_block_node_exists(&json!({"return": []}), &node), None);
+    }
 
     fn layout() -> Layout {
         Layout {
