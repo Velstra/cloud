@@ -197,6 +197,24 @@ pub struct FabricDatapath {
 }
 
 impl FabricDatapath {
+    /// XDP redirects an encapsulated frame before the host can complete a
+    /// TAP's partial checksum or segment a large packet. Both directions of
+    /// a TCP connection need this setting, including a migration receiver.
+    async fn configure_tap_offloads(tap: &str) -> Result<()> {
+        let output = Command::new("ethtool")
+            .args(["-K", tap, "tx", "off", "tso", "off", "gso", "off"])
+            .output()
+            .await
+            .map_err(|e| HostError::failed(format!("configuring fabric tap {tap}: {e}")))?;
+        if !output.status.success() {
+            return Err(HostError::failed(format!(
+                "configuring fabric tap {tap} offloads: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     fn guest_v4(address: &str) -> Option<Ipv4Addr> {
         address.split('/').next()?.parse().ok()
     }
@@ -795,9 +813,12 @@ impl Datapath for FabricDatapath {
         translate_all(rules)?;
         // The source still owns the address. An unadvertised tap is enough for
         // QEMU's receiver; normal reconciliation activates it after handover.
-        self.taps
+        let tap = self
+            .taps
             .program(port, &PortSpec::default(), network, &[])
-            .await
+            .await?;
+        Self::configure_tap_offloads(&tap).await?;
+        Ok(tap)
     }
 
     async fn program(
@@ -836,6 +857,7 @@ impl Datapath for FabricDatapath {
             .taps
             .program(port, &PortSpec::default(), network, &[])
             .await?;
+        Self::configure_tap_offloads(&tap).await?;
 
         let mut client = self.client().await?;
         self.declare_host(&mut client).await?;

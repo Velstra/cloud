@@ -526,6 +526,7 @@ in
         cfg.qemu
         cfg.cloudHypervisor
         pkgs.iproute2
+        pkgs.ethtool
         pkgs.util-linux
         pkgs.coreutils
         pkgs.systemd

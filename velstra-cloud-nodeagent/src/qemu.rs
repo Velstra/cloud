@@ -1438,7 +1438,11 @@ fn qemu_args(
         // Stated rather than left to QEMU, which would otherwise hand every
         // guest the same default address and give the second one on a link a
         // duplicate.
-        let mut device = format!("virtio-net-pci,netdev=n{index}");
+        // Fabric can deliver an overlay frame through XDP devmap before the
+        // host network stack completes a guest's partial L4 checksum. Keep
+        // checksums and segmentation in the guest so redirected TCP packets
+        // arrive at the destination with a valid checksum.
+        let mut device = format!("virtio-net-pci,netdev=n{index},csum=off,gso=off");
         if let Some(mac) = &nic.mac {
             device.push_str(&format!(",mac={mac}"));
         }
@@ -2080,6 +2084,23 @@ mod tests {
         ));
         assert!(!args.iter().any(|a| a.contains("vfio-pci")), "{args:?}");
         assert!(passed_devices(&args.join(" ")).is_empty());
+    }
+
+    #[test]
+    fn guest_nics_complete_checksums_before_fabric_redirects_them() {
+        let args = words(&qemu_args(
+            &layout(),
+            &request(),
+            Path::new("/run/qmp.sock"),
+            None,
+        ));
+        let nics: Vec<_> = args
+            .windows(2)
+            .filter(|words| words[0] == "-device" && words[1].starts_with("virtio-net-pci,"))
+            .map(|words| words[1].as_str())
+            .collect();
+        assert!(!nics.is_empty());
+        assert!(nics.iter().all(|nic| nic.contains(",csum=off,gso=off")));
     }
 
     /// Reading devices off a command line ignores everything that is not one.
