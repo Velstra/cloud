@@ -9,7 +9,7 @@ export type Density = "comfortable" | "compact";
 export type Motion = "auto" | "reduced";
 
 type State = {
-  who: { subject: string; displayName: string; cellAdmin: boolean; projects: Record<string, string> } | null;
+  who: { subject: string; displayName: string; cellAdmin: boolean; projects: Record<string, string>; capabilities?: Record<string, Record<string, ("read" | "operate" | "write" | "administer")[]>> } | null;
   project: string;
   theme: Theme;
   density: Density;

@@ -47,6 +47,8 @@
 
 use serde_json::{Value, json};
 
+use crate::host::{HostError, Result};
+
 /// The prefix a pool puts on a place it keeps in Ceph.
 pub const PREFIX: &str = "rbd:";
 
@@ -135,6 +137,69 @@ impl CephAccess {
             map.insert("user".into(), json!(user));
         }
         file
+    }
+
+    /// Ask qemu-img from the VM binary's package to open the exact image QEMU
+    /// is about to use. A working cephadm container or an `rbd` CLI wrapper
+    /// says nothing about the librbd linked into this host's QEMU.
+    pub async fn probe(&self, place: &str, qemu_binary: &str) -> Result<()> {
+        let Some(rbd) = split(place) else {
+            if place.starts_with(PREFIX) {
+                return Err(HostError::failed(
+                    "The Ceph volume address needs both a pool and an image.",
+                ));
+            }
+            return Ok(());
+        };
+        let qemu_img = std::path::Path::new(qemu_binary).with_file_name("qemu-img");
+        self.probe_with(&rbd, qemu_img.to_string_lossy().as_ref())
+            .await
+    }
+
+    async fn probe_with(&self, rbd: &Rbd<'_>, binary: &str) -> Result<()> {
+        let mut command = tokio::process::Command::new(binary);
+        command
+            .arg("info")
+            .arg("--image-opts")
+            .arg("-U")
+            .arg(format!("driver=raw,{}", self.drive_options(rbd)));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            command.kill_on_drop(true).output(),
+        )
+        .await
+        .map_err(|_| HostError::failed("The compute host timed out opening the Ceph volume; check cluster connectivity."))?
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HostError::failed("The compute host has no qemu-img beside its VM binary; install a complete QEMU package before placing Ceph volumes here.")
+            } else {
+                HostError::failed(format!("The compute host could not run qemu-img: {e}"))
+            }
+        })?;
+        if result.status.success() {
+            return Ok(());
+        }
+        // librados may print key material in its parser error. Neither the
+        // tenant condition nor the agent log may include that raw stderr.
+        let stderr = String::from_utf8_lossy(&result.stderr).to_ascii_lowercase();
+        if stderr.contains("unknown driver 'rbd'") {
+            Err(HostError::failed(
+                "This compute host's QEMU build has no Ceph RBD support; install a QEMU build with the RBD driver.",
+            ))
+        } else if stderr.contains("error parsing file") || stderr.contains("malformed input") {
+            Err(HostError::failed(
+                "The compute host's Ceph client cannot read the cluster keyring. Check client compatibility and keyring format.",
+            ))
+        } else if stderr.contains("permission denied") || stderr.contains("operation not permitted")
+        {
+            Err(HostError::failed(
+                "Ceph refused this compute host's client credentials for the volume.",
+            ))
+        } else {
+            Err(HostError::failed(
+                "The compute host cannot open the Ceph volume. Check client compatibility, credentials, and cluster connectivity.",
+            ))
+        }
     }
 }
 
@@ -323,5 +388,84 @@ mod tests {
             access.blockdev(&rbd)["conf"],
             json!("/etc/ceph/odd,name.conf")
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{CephAccess, Rbd};
+
+    fn fake_qemu_img(script: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("qemu-img");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("fake client");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("executable fake client");
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    #[tokio::test]
+    async fn the_qemu_client_checks_the_exact_pool_image_and_identity() {
+        let (dir, _binary) = fake_qemu_img(
+            "test \"$1\" = info && test \"$2\" = --image-opts && \\
+             test \"$3\" = -U && \\
+             test \"$4\" = 'driver=raw,file.driver=rbd,file.pool=tenant-volumes,file.image=root,file.conf=/var/lib/velstra/ceph/ceph.conf,file.user=velstra'",
+        );
+        let access = CephAccess::new(
+            Some("/var/lib/velstra/ceph/ceph.conf".into()),
+            Some("client.velstra".into()),
+        );
+        access
+            .probe(
+                "rbd:tenant-volumes/root",
+                dir.path().join("qemu-system-x86_64").to_str().unwrap(),
+            )
+            .await
+            .expect("QEMU's own client opens the image");
+    }
+
+    #[tokio::test]
+    async fn a_keyring_parser_error_is_actionable_without_leaking_the_key() {
+        let (_dir, binary) = fake_qemu_img(
+            "echo 'error parsing file: key = secret-material: Malformed input' >&2; exit 1",
+        );
+        let error = CephAccess::default()
+            .probe_with(
+                &Rbd {
+                    pool: "tenant-volumes",
+                    image: "root",
+                },
+                &binary,
+            )
+            .await
+            .expect_err("incompatible client must block the VM start")
+            .to_string();
+        assert!(error.contains("client compatibility"), "{error}");
+        assert!(!error.contains("secret-material"), "{error}");
+        assert!(
+            CephAccess::default()
+                .probe("rbd:missing-image", "qemu-system-x86_64")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_qemu_build_without_rbd_is_identified_before_the_vm_starts() {
+        let (_dir, binary) = fake_qemu_img("echo \"Unknown driver 'rbd'\" >&2; exit 1");
+        let error = CephAccess::default()
+            .probe_with(
+                &Rbd {
+                    pool: "tenant-volumes",
+                    image: "root",
+                },
+                &binary,
+            )
+            .await
+            .expect_err("QEMU cannot open an RBD disk without the driver")
+            .to_string();
+        assert!(error.contains("no Ceph RBD support"), "{error}");
     }
 }

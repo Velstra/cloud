@@ -53,9 +53,11 @@
   --glow-focus: 0 0 0 3px rgba(46, 150, 196, 0.32);
   --settled: #34d399;
   --drifting: #fbbf24;
+  --action: #fbbf24;
   --failing: #f87171;
   --dot-settled: #10b981;
   --dot-drifting: #f59e0b;
+  --dot-action: #f59e0b;
   --dot-failing: #ef4444;
   --wash-signal: rgba(46, 150, 196, 0.1);
   --product: #2e96c4;
@@ -83,9 +85,11 @@
   --glow-focus: 0 0 0 3px rgba(33, 121, 161, 0.22);
   --settled: #146c2e;
   --drifting: #805500;
+  --action: #805500;
   --failing: #b3202b;
   --dot-settled: #1a7f37;
   --dot-drifting: #9a6700;
+  --dot-action: #9a6700;
   --dot-failing: #cf222e;
   --wash-signal: rgba(33, 121, 161, 0.09);
   --product: #1b6c8e;

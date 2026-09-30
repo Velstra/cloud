@@ -33,6 +33,9 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
   // password, and a screen that stays silent is one that gets treated as
   // private.
   const [encrypted, setEncrypted] = useState<boolean | null>(null);
+  // Tenant responses intentionally hide host placement. Running is the
+  // user-visible evidence needed here; the API authorizes the session.
+  const available = r.status?.state === "Running";
 
   useEffect(() => () => { ++attempt.current; socket.current?.close(); input.current?.dispose(); fitObserver.current?.disconnect(); term.current?.dispose(); }, []);
 
@@ -73,10 +76,11 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
   return (
     <div className="grid gap-2">
       <div className="flex items-center gap-2 text-xs" style={{ color: "var(--text-muted)" }}>
-        {state === "closed" && <Pressed size="sm" onPress={attach}>Attach</Pressed>}
+        {state === "closed" && available && <Pressed size="sm" onPress={attach}>Attach</Pressed>}
+        {state === "closed" && !available && <span>Console available when running</span>}
         {state === "asking" && <span>Asking for a session…</span>}
         {state === "open" && <><span style={{ color: "var(--settled)" }}>● attached</span><Button size="sm" variant="secondary" onClick={() => socket.current?.close()}>Detach</Button></>}
-        {state === "gone" && <><span>Detached.</span><Button size="sm" variant="secondary" onClick={attach}>Attach again</Button></>}
+        {state === "gone" && <><span>Detached.</span>{available && <Button size="sm" variant="secondary" onClick={attach}>Attach again</Button>}</>}
         {readOnly && state === "open" && <span>Read-only session</span>}
         {why && <span role="alert" style={{ color: "var(--failing)" }}>{why}</span>}
         {encrypted === false && (
@@ -89,14 +93,14 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
         {encrypted === true && (
           <span style={{ color: "var(--settled)" }}>Encrypted end to end</span>
         )}
-        <span className="ml-auto">{Number(r.status?.consoleBytes ?? 0).toLocaleString()} bytes written so far</span>
+        {Number(r.status?.consoleBytes ?? 0) > 0 && <span className="ml-auto">{Number(r.status?.consoleBytes).toLocaleString()} bytes written</span>}
       </div>
       {String(r.status?.consoleTail ?? "") ? (
         <details className="rounded-md border border-border p-2 text-xs">
           <summary className="cursor-pointer font-medium">Raw boot log · {Number(r.status?.consoleBytes ?? 0).toLocaleString()} bytes</summary>
           <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-black p-3 font-mono text-[11px] text-zinc-100">{String(r.status?.consoleTail)}</pre>
         </details>
-      ) : state === "closed" ? (
+      ) : state === "closed" && available ? (
         <p className="text-xs text-muted-foreground">No captured output yet. Attach for the live serial console; enable Console while editing the VM to retain a tail.</p>
       ) : null}
       <div ref={host} className="h-[280px] overflow-hidden rounded-[4px] border"

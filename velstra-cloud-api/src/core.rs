@@ -1067,7 +1067,7 @@ impl Api {
                 .get(&name.to_string())
                 .await?
                 .ok_or_else(|| ApiError::not_found(name))?;
-            if !self.may_read(who, name, &document).await {
+            if !self.may_read(who, name, &document).await? {
                 return Err(self.refuse_a_read(who, name).await);
             }
             let mut document = document;
@@ -1394,7 +1394,11 @@ impl Api {
         kind: &str,
     ) -> ApiResult<()> {
         let verdict = self.judge(who, verb, name, kind).await;
-        if let Err(refusal) = &verdict {
+        // A broken policy store is an outage, not a decision to deny this
+        // person. Recording it as an access refusal misleads the audit reader.
+        if let Err(refusal) = &verdict
+            && refusal.code == Code::PermissionDenied
+        {
             self.record_refusal(who, verb, name, &refusal.to_string())
                 .await;
         }
@@ -1542,13 +1546,18 @@ impl Api {
     /// by **the person it is about**. Neither leaks: the first already reads
     /// the target, and the second is their own refusal. Everything else about
     /// the cell — who else was refused what — stays an operator's.
-    async fn may_read(&self, who: &Identity, name: &ResourceName, document: &Value) -> bool {
-        if self
-            .judge(who, Verb::Read, name, name.collection())
-            .await
-            .is_ok()
-        {
-            return true;
+    /// A storage failure while checking bindings is an error, not a hidden
+    /// row in a list that falsely claims to be complete.
+    async fn may_read(
+        &self,
+        who: &Identity,
+        name: &ResourceName,
+        document: &Value,
+    ) -> ApiResult<bool> {
+        match self.judge(who, Verb::Read, name, name.collection()).await {
+            Ok(()) => return Ok(true),
+            Err(error) if error.code == Code::PermissionDenied => {}
+            Err(error) => return Err(error),
         }
         // An image its owner shared. A one-way grant: whoever receives it may
         // read and boot, and this is a *read* check — editing, retiring and
@@ -1572,7 +1581,7 @@ impl Api {
                 // image a provider publishes once instead of copying it into
                 // every tenant.
                 if entry == velstra_cloud_model::resources::SHARED_WITH_EVERY_PROJECT {
-                    return true;
+                    return Ok(true);
                 }
                 let project = entry.strip_prefix("projects/").unwrap_or(entry);
                 // Any well-formed name in that project's images: the question
@@ -1582,55 +1591,69 @@ impl Api {
                 else {
                     continue;
                 };
-                if self.judge(who, Verb::Read, &there, "images").await.is_ok() {
-                    return true;
+                match self.judge(who, Verb::Read, &there, "images").await {
+                    Ok(()) => return Ok(true),
+                    Err(error) if error.code == Code::PermissionDenied => {}
+                    Err(error) => return Err(error),
                 }
             }
         }
         if name.collection() != "audit" {
-            return false;
+            return Ok(false);
         }
         let spec = &document["spec"];
         if spec.get("subject").and_then(Value::as_str) == Some(who.subject.as_str())
             && !who.subject.is_empty()
         {
-            return true;
+            return Ok(true);
         }
         let Some(target) = spec.get("target").and_then(Value::as_str) else {
-            return false;
+            return Ok(false);
         };
         let Ok(target) = ResourceName::parse(target) else {
-            return false;
+            return Ok(false);
         };
-        self.judge(who, Verb::Read, &target, target.collection())
+        match self
+            .judge(who, Verb::Read, &target, target.collection())
             .await
-            .is_ok()
+        {
+            Ok(()) => Ok(true),
+            Err(error) if error.code == Code::PermissionDenied => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
-    /// The strongest rung this subject holds in each project, by project id —
-    /// what `whoami` reports so a console can draw only what the account may
-    /// do, instead of every button and a refusal behind half of them.
-    ///
-    /// Folders count: a grant above a project reaches into it, exactly as
-    /// [`Self::judge`] reads it. A custom role is reported by its name, since
-    /// only the API can say what it admits; a console draws everything for
-    /// one and lets the refusal speak. A cell operator gets the map too —
-    /// it is the projects they are *named* in, not what they may do, which
-    /// is everything and is said by `cellAdmin`.
-    pub async fn project_roles(&self, who: &Identity) -> BTreeMap<String, String> {
-        let mut out = BTreeMap::new();
-        let Ok(projects) = self
+    /// Project membership and effective permissions for a session. The
+    /// display role is retained for older clients, but it cannot express two
+    /// additive bindings or a custom role's collection-specific grants.
+    pub async fn project_access(
+        &self,
+        who: &Identity,
+    ) -> ApiResult<(
+        BTreeMap<String, String>,
+        BTreeMap<String, BTreeMap<String, Vec<Verb>>>,
+    )> {
+        let mut roles = BTreeMap::new();
+        let mut capabilities = BTreeMap::new();
+        let projects = self
             .typed_list::<ProjectSpec, ProjectStatus>("", "projects")
-            .await
-        else {
-            return out;
-        };
+            .await?;
+        let mut memberships = Vec::new();
+        let mut ancestor_bindings: BTreeMap<String, Vec<velstra_cloud_model::authz::Binding>> =
+            BTreeMap::new();
         for project in projects {
             if project.meta.is_deleting() {
                 continue;
             }
             let mut bindings = project.spec.bindings.clone();
-            bindings.extend(self.bindings_above(&project.spec.parent).await);
+            let inherited = if let Some(cached) = ancestor_bindings.get(&project.spec.parent) {
+                cached.clone()
+            } else {
+                let inherited = self.bindings_above(&project.spec.parent).await?;
+                ancestor_bindings.insert(project.spec.parent.clone(), inherited.clone());
+                inherited
+            };
+            bindings.extend(inherited);
             let held = bindings
                 .iter()
                 .filter(|b| b.members.iter().any(|m| m == &who.subject))
@@ -1643,10 +1666,64 @@ impl Api {
                 });
             }
             if let Some(role) = best {
-                out.insert(project.meta.name.id().to_string(), role.to_string());
+                memberships.push((project.meta.name.id().to_string(), bindings, role));
             }
         }
-        out
+        // A role shared by many projects is one definition. Resolve the union
+        // once per session request instead of fetching it for every project.
+        let all_bindings: Vec<_> = memberships
+            .iter()
+            .flat_map(|(_, bindings, _)| bindings.iter().cloned())
+            .collect();
+        let defined = self.defined_roles(&all_bindings).await?;
+        for (project, bindings, role) in memberships {
+            let mut permitted = BTreeMap::new();
+            for collection in velstra_cloud_console::COLLECTIONS {
+                if collection.scope != velstra_cloud_console::Scope::Project
+                    || collection.id == "migrations"
+                {
+                    continue;
+                }
+                let verbs: Vec<Verb> = [Verb::Read, Verb::Operate, Verb::Write, Verb::Administer]
+                    .into_iter()
+                    .filter(|verb| {
+                        may(
+                            &who.subject,
+                            &self.inner.cell_admins,
+                            &bindings,
+                            *verb,
+                            collection.id,
+                            &defined,
+                        )
+                        .is_ok()
+                    })
+                    .collect();
+                if !verbs.is_empty() {
+                    permitted.insert(collection.id.to_string(), verbs);
+                }
+            }
+            let project_verbs: Vec<Verb> =
+                [Verb::Read, Verb::Operate, Verb::Write, Verb::Administer]
+                    .into_iter()
+                    .filter(|verb| {
+                        may(
+                            &who.subject,
+                            &self.inner.cell_admins,
+                            &bindings,
+                            *verb,
+                            "projects",
+                            &defined,
+                        )
+                        .is_ok()
+                    })
+                    .collect();
+            if !project_verbs.is_empty() {
+                permitted.insert("projects".to_string(), project_verbs);
+            }
+            capabilities.insert(project.clone(), permitted);
+            roles.insert(project, role.to_string());
+        }
+        Ok((roles, capabilities))
     }
 
     async fn judge(
@@ -1745,14 +1822,15 @@ impl Api {
         // somebody Admin on `folders/eng` is what lets them manage `eng`, the
         // same way a project governs itself.
         if name.collection() == "folders" && name.parent().is_none() {
-            let bindings = self.bindings_from(&name.to_string()).await;
+            let bindings = self.bindings_from(&name.to_string()).await?;
+            let defined = self.defined_roles(&bindings).await?;
             return may(
                 &who.subject,
                 &self.inner.cell_admins,
                 &bindings,
                 verb,
                 kind,
-                &self.defined_roles(&bindings).await,
+                &defined,
             )
             .map_err(|denied| ApiError::forbidden(denied.to_string()));
         }
@@ -1768,12 +1846,12 @@ impl Api {
         // refuses, so the error is not an oracle for which projects exist.
         let mut bindings = Vec::new();
         let mut parent = String::new();
-        if let Ok(Some(p)) = self.typed_project(&project).await {
+        if let Some(p) = self.typed_project(&project).await? {
             bindings = p.spec.bindings;
             parent = p.spec.parent;
         }
-        bindings.extend(self.bindings_above(&parent).await);
-        let defined = self.defined_roles(&bindings).await;
+        bindings.extend(self.bindings_above(&parent).await?);
+        let defined = self.defined_roles(&bindings).await?;
         may(
             &who.subject,
             &self.inner.cell_admins,
@@ -2239,7 +2317,7 @@ impl Api {
                 else {
                     return Err(refused);
                 };
-                if !self.may_read(who, &name, &document).await {
+                if !self.may_read(who, &name, &document).await? {
                     return Err(refused);
                 }
             }
@@ -2257,7 +2335,10 @@ impl Api {
     /// One read per folder in the chain, which is one or two in every cell
     /// anybody has drawn, and none at all for a project at the top — the
     /// ordinary case costs exactly what it cost before folders existed.
-    async fn bindings_above(&self, parent: &str) -> Vec<velstra_cloud_model::authz::Binding> {
+    async fn bindings_above(
+        &self,
+        parent: &str,
+    ) -> ApiResult<Vec<velstra_cloud_model::authz::Binding>> {
         use velstra_cloud_model::hierarchy::{FOLDER_PREFIX, MAX_DEPTH, folder_above};
 
         let mut out = Vec::new();
@@ -2268,7 +2349,7 @@ impl Api {
                 break;
             }
             seen.push(name.clone());
-            let Some(folder) = self.typed_folder(&name).await else {
+            let Some(folder) = self.typed_folder_checked(&name).await? else {
                 // A folder that is not there grants nothing and ends the walk.
                 // A project whose folder was deleted is a project whose own
                 // bindings still govern it: an outage caused by housekeeping
@@ -2279,17 +2360,20 @@ impl Api {
             here = folder_above(&folder.spec.parent).map(str::to_string);
         }
         let _ = FOLDER_PREFIX;
-        out
+        Ok(out)
     }
 
     /// A folder's own bindings, plus those of every folder above it.
-    async fn bindings_from(&self, folder: &str) -> Vec<velstra_cloud_model::authz::Binding> {
+    async fn bindings_from(
+        &self,
+        folder: &str,
+    ) -> ApiResult<Vec<velstra_cloud_model::authz::Binding>> {
         let mut out = Vec::new();
-        if let Some(here) = self.typed_folder(folder).await {
+        if let Some(here) = self.typed_folder_checked(folder).await? {
             out.extend(here.spec.bindings);
-            out.extend(self.bindings_above(&here.spec.parent).await);
+            out.extend(self.bindings_above(&here.spec.parent).await?);
         }
-        out
+        Ok(out)
     }
 
     /// The roles these bindings actually name, read once.
@@ -2301,7 +2385,7 @@ impl Api {
     async fn defined_roles(
         &self,
         bindings: &[velstra_cloud_model::authz::Binding],
-    ) -> Vec<velstra_cloud_model::authz::CustomRole> {
+    ) -> ApiResult<Vec<velstra_cloud_model::authz::CustomRole>> {
         use velstra_cloud_model::authz::Role;
 
         let mut wanted: Vec<&str> = bindings
@@ -2313,30 +2397,31 @@ impl Api {
             .collect();
         wanted.sort();
         wanted.dedup();
-        let Ok(collection) = self.collection("roles") else {
-            return Vec::new();
-        };
+        let collection = self.collection("roles")?;
         let mut out = Vec::new();
         for name in wanted {
-            let Ok(Some(document)) = collection.get(name).await else {
+            let Some(document) = collection.get(name).await? else {
                 continue;
             };
-            let Ok(object) =
-                serde_json::from_value::<velstra_cloud_model::hierarchy::RoleObject>(document)
-            else {
-                continue;
-            };
+            let object =
+                serde_json::from_value::<velstra_cloud_model::hierarchy::RoleObject>(document)?;
             out.push(velstra_cloud_model::authz::CustomRole {
                 name: name.to_string(),
                 grants: object.spec.grants,
             });
         }
-        out
+        Ok(out)
     }
 
-    async fn typed_folder(&self, name: &str) -> Option<velstra_cloud_model::hierarchy::Folder> {
-        let document = self.collection("folders").ok()?.get(name).await.ok()??;
-        serde_json::from_value(document).ok()
+    async fn typed_folder_checked(
+        &self,
+        name: &str,
+    ) -> ApiResult<Option<velstra_cloud_model::hierarchy::Folder>> {
+        let collection = self.collection("folders")?;
+        match collection.get(name).await? {
+            Some(document) => Ok(Some(serde_json::from_value(document)?)),
+            None => Ok(None),
+        }
     }
 
     async fn typed_project(&self, name: &str) -> ApiResult<Option<Project>> {
@@ -2775,7 +2860,7 @@ impl Api {
                         let Ok(parsed) = ResourceName::parse(&name) else {
                             continue;
                         };
-                        if !self.may_read(who, &parsed, &document).await {
+                        if !self.may_read(who, &parsed, &document).await? {
                             continue;
                         }
                     }
@@ -2962,7 +3047,7 @@ impl Api {
                     // records, one per object they were never asking for by
                     // name. The audit is for somebody who reached for a thing
                     // and was told no.
-                    if !self.may_read(who, &name, &document).await {
+                    if !self.may_read(who, &name, &document).await? {
                         continue;
                     }
                 }
@@ -4952,6 +5037,25 @@ impl Api {
             // second guest by an edit is the same silent failure as one handed
             // to it at birth.
             if name.collection() == "instances" && spec.get("ports").is_some() {
+                // The node can program a new tap while a VM is running, but
+                // QEMU does not hot-plug that NIC. A guest requested to run
+                // can also boot between this check and the edit, before its
+                // observed state says Running. Require an observed stop and
+                // a stopped desired state before changing the port list.
+                let current: Instance = self.typed(name).await?;
+                let requested: Vec<String> = serde_json::from_value(spec["ports"].clone())?;
+                if requested != current.spec.ports
+                    && (current.spec.desired_state
+                        != velstra_cloud_model::resources::DesiredState::Stopped
+                        || current.status.state
+                            != velstra_cloud_model::resources::InstanceState::Stopped)
+                {
+                    return Err(ApiError::new(
+                        Code::FailedPrecondition,
+                        "Stop the instance and wait until it reports Stopped before changing its network ports. Start it again to attach the new interface.",
+                    )
+                    .at("spec.ports"));
+                }
                 self.refuse_a_port_two_guests_would_share(name, spec)
                     .await?;
             }
@@ -5919,11 +6023,9 @@ impl Api {
         Ok(())
     }
 
-    /// Fill in an operation's `done` from the object it is about.
-    ///
-    /// `done` is never stored. An operation that kept its own copy of "finished"
-    /// could disagree with the resource it describes — and when those two
-    /// disagree, an operator believes the operation and debugs the wrong thing.
+    /// Fill in a pending operation's `done` from the object it is about.
+    /// A stored terminal result belongs to this request's history and cannot
+    /// be revised by a later edit of the target.
     async fn answer_operation(&self, document: &mut Value) -> ApiResult<()> {
         let Some(target) = document
             .get("spec")
@@ -5935,6 +6037,12 @@ impl Api {
         // Only an operation has a spec.target; everything else leaves here
         // untouched.
         if document.get("status").and_then(|s| s.get("done")).is_none() {
+            return Ok(());
+        }
+        // The stored terminal result belongs to this request. A subsequent
+        // edit of its target must not turn a finished operation back into a
+        // pending one or overwrite its original failure reason.
+        if document["status"]["done"].as_bool() == Some(true) {
             return Ok(());
         }
         let spec: OperationSpec = serde_json::from_value(document["spec"].clone())?;
@@ -5968,6 +6076,9 @@ impl Api {
                                 .unwrap_or(0);
                             TargetView::Present {
                                 observed_generation,
+                                condition_generation: settled
+                                    .map(|condition| condition.observed_generation)
+                                    .unwrap_or(observed_generation),
                                 ready: settled
                                     .map(|condition| condition.status)
                                     // An observed generation is itself a
@@ -8545,7 +8656,7 @@ impl Api {
             ))
             .at("spec.parent"));
         }
-        if self.typed_folder(parent).await.is_none() {
+        if self.typed_folder_checked(parent).await?.is_none() {
             return Err(ApiError::new(
                 Code::FailedPrecondition,
                 format!("there is no folder called `{parent}`"),
@@ -8569,7 +8680,10 @@ impl Api {
                     break;
                 }
                 seen.push(step.clone());
-                here = self.typed_folder(&step).await.map(|f| f.spec.parent);
+                here = self
+                    .typed_folder_checked(&step)
+                    .await?
+                    .map(|f| f.spec.parent);
             }
             if seen.len() >= velstra_cloud_model::hierarchy::MAX_DEPTH {
                 return Err(ApiError::invalid(format!(

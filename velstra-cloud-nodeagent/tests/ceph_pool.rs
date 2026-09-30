@@ -37,7 +37,7 @@ use velstra_cloud_model::{
 };
 use velstra_cloud_nodeagent::{
     ceph_pool::{CephConfig, CephPool},
-    pool::{PoolAgent, PoolConfig},
+    pool::{Origin, PoolAgent, PoolConfig, Storage},
 };
 use velstra_cloud_store::{Store, TypedStore};
 
@@ -101,6 +101,7 @@ impl Cluster {
         // here starts from unless it says otherwise.
         here.holds(&[]);
         here.answers("snap", "[]");
+        here.answers("info", r#"{"size":0}"#);
         here.answers(
             "df",
             &format!(
@@ -346,6 +347,46 @@ async fn a_cluster_that_cannot_be_reached_is_reported_rather_than_read_as_empty(
         !v.status.provisioned || v.status.actual_size_gib == 10,
         "an unreachable cluster changed what a volume claims to be"
     );
+}
+
+#[tokio::test]
+async fn restoring_an_equal_sized_snapshot_does_not_resize_its_clone() {
+    let cluster = Cluster::new("equal-snapshot");
+    cluster.answers("info", r#"{"size":2147483648}"#);
+    let storage = cluster.storage();
+    storage
+        .provision(
+            "projects/p1/volumes/restored",
+            2,
+            Origin::Snapshot("projects/p1/volumes/source/snapshots/base"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let argv = cluster.recorded();
+    assert!(argv.contains("clone"), "{argv}");
+    assert!(argv.contains("info"), "{argv}");
+    assert!(!argv.contains("resize"), "{argv}");
+}
+
+#[tokio::test]
+async fn an_existing_larger_rbd_is_never_shrunk() {
+    let cluster = Cluster::new("larger-snapshot");
+    cluster.answers("info", r#"{"size":3221225472}"#);
+    let storage = cluster.storage();
+    let error = storage
+        .provision(
+            "projects/p1/volumes/restored",
+            2,
+            Origin::Snapshot("projects/p1/volumes/source/snapshots/base"),
+            None,
+        )
+        .await
+        .expect_err("a smaller volume must be refused");
+
+    assert!(error.to_string().contains("shrinking would discard data"));
+    assert!(!cluster.recorded().contains("resize"));
 }
 
 /// Growing is `rbd resize`, and shrinking is refused before any command runs.

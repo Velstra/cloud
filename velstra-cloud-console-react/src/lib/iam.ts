@@ -2,11 +2,9 @@
 // refuse is not drawn for a person it would refuse. The API stays the judge;
 // this only keeps the console honest about it.
 //
-// The platform's answer is a ladder of four rungs per project, plus roles a
-// cell wrote down per collection. The session says which rung the caller
-// holds in each project; a cell operator holds everything everywhere.
+// The session carries effective permissions computed by the API from every
+// binding. A display rung alone cannot represent additive or custom grants.
 
-import { useEffect, useState } from "react";
 import { call } from "@/api/transport";
 import { useStore } from "@/app/store";
 import { SCHEMA, type Collection } from "./schema";
@@ -46,8 +44,6 @@ export const forgetRoles = () => { cached = null; };
 export function useCan() {
   const who = useStore((s) => s.who);
   const picked = useStore((s) => s.project);
-  const [roles, setRoles] = useState(cached);
-  useEffect(() => { if (!roles && who?.cellAdmin) loadRoles().then(setRoles).catch(() => setRoles({})); }, [roles, who]);
   return (verb: Verb, coll?: Collection | string, project?: string): boolean => {
     if (!who) return false;
     if (who.cellAdmin) return true;
@@ -57,18 +53,18 @@ export function useCan() {
     // binding is never permission to create or list other projects.
     if (c?.id === "projects") {
       const held = project ? who.projects?.[project] : undefined;
+      if (who.capabilities) return !!project && !!who.capabilities[project]?.projects?.includes(verb);
       return verb === "read" ? !!held : verb === "administer" && held === "admin";
     }
     // Objects outside every project are the cell operator's.
     if (c && c.scope !== "project") return false;
     const p = project ?? picked;
     const held = who.projects?.[p];
-    if (!held) return true;         // not told: let the API say no, with its reason
+    if (who.capabilities) return !!c && !!who.capabilities[p]?.[c.id]?.includes(verb);
+    if (!held) return false;
     if (isRung(held)) return rungAllows(held, verb);
-    // A role the cell wrote down grants per collection; read is implied.
-    const role = roles?.[held];
-    if (!role) return true;
-    if (verb === "read") return true;
-    return role.grants.some((g) => ORDER[g.verb] >= ORDER[verb] && (!c || g.collections.includes(c.id)));
+    // Older API versions do not report custom-role grants. Do not offer an
+    // action whose permission cannot be established from the session.
+    return false;
   };
 }

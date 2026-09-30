@@ -15,12 +15,25 @@ const fmt = (name: string, n: number) => name === "memoryMib" ? bytes(n * 1024 *
 const label = (name: string) => ({ memoryMib: "Memory", volumeGib: "Volume space", floatingIps: "Public IPs", loadBalancers: "Load balancers", vcpus: "vCPU" } as Record<string, string>)[name] ?? humanise(name);
 
 export function useQuota(project: string) {
-  const [q, setQ] = useState<Answer | null>(null); const [err, setErr] = useState("");
+  const who = useStore((s) => s.who);
+  const [result, setResult] = useState<{ who: typeof who; project: string; q: Answer | null; err: string } | null>(null);
+  const canReadProject = !!who?.cellAdmin || (who?.capabilities
+    ? !!who.capabilities[project]?.projects?.includes("read")
+    : !!who?.projects?.[project] && ["viewer", "operator", "editor", "admin"].includes(who.projects[project]));
   useEffect(() => {
-    if (!project || project === "*") { setQ(null); return; }
-    call("explainQuota", "GET", `/api/v1/projects/${encodeURIComponent(project)}:explainQuota`).then(setQ).catch((e) => setErr((e as Error).message));
-  }, [project]);
-  return { q, err };
+    if (!project || project === "*") return;
+    if (!canReadProject) return;
+    let active = true;
+    call("explainQuota", "GET", `/api/v1/projects/${encodeURIComponent(project)}:explainQuota`)
+      .then((answer) => { if (active) setResult({ who, project, q: answer, err: "" }); })
+      .catch((e) => { if (active) setResult({ who, project, q: null, err: (e as Error).message }); });
+    return () => { active = false; };
+  }, [project, who, canReadProject]);
+  const current = result?.who === who && result.project === project;
+  return {
+    q: current ? result.q : null,
+    err: !canReadProject && project && project !== "*" ? "Project limits are not available to this role." : current ? result.err : "",
+  };
 }
 
 export function QuotaBars({ q, compact }: { q: Answer; compact?: boolean }) {

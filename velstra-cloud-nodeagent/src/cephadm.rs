@@ -783,7 +783,8 @@ mod tests {
     #[tokio::test]
     async fn default_client_uses_the_cluster_image() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("cephadm-client-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("cephadm-client");
         std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let admin = CephAdmin {
@@ -801,7 +802,8 @@ mod tests {
     #[tokio::test]
     async fn distro_build_without_version_metadata_is_installed() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("cephadm-probe-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("cephadm-probe");
         std::fs::write(&path, "#!/bin/sh\ncase \"$1\" in version) echo 'cephadm version UNKNOWN'; exit 1;; --help) exit 0;; *) exit 2;; esac\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let admin = CephAdmin {
@@ -809,7 +811,17 @@ mod tests {
             ..CephAdmin::default()
         };
         let report = admin.installed().await;
-        assert!(report.installed);
+        if !report.installed {
+            let version = tokio::process::Command::new(&path)
+                .arg("version")
+                .output()
+                .await;
+            let help = tokio::process::Command::new(&path)
+                .arg("--help")
+                .output()
+                .await;
+            panic!("installed probe failed; version={version:?}, help={help:?}");
+        }
         assert!(report.version.is_empty(), "do not invent a version");
         std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
         assert!(
@@ -826,7 +838,8 @@ mod tests {
     #[tokio::test]
     async fn a_stuck_ceph_command_cannot_stop_the_agent_pass() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("ceph-stuck-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("ceph-stuck");
         std::fs::write(&path, "#!/bin/sh\nsleep 10\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let admin = CephAdmin {

@@ -358,7 +358,7 @@ await test("a settled object reads as settled", async () => {
   await openRow(page, it.id);
   const g = await gens(it.id);
   const text = await sheetText(page);
-  check(/Settled/.test(text), `${it.id} does not read as settled:\n` + text.slice(0, 400));
+  check(/Ready/.test(text), `${it.id} does not read as ready:\n` + text.slice(0, 400));
   check(new RegExp(`Asked at\\s*${g.generation}`, "i").test(text) &&
         new RegExp(`Observed at\\s*${g.observed}`, "i").test(text),
     `the two generations (${g.generation}/${g.observed}) are not both shown`);
@@ -373,7 +373,7 @@ await test("a drifting object shows the gap, and the reason for it", async () =>
   const text = await sheetText(page);
   // "Drifting" is the class; the word on the sheet says what is under way
   // when it can ("Stopping…", "Applying…") — either is the amber state.
-  check(/Drifting|Applying…|Stopping…|Starting…|Restarting…/.test(text),
+  check(/Updating…|Stopping…|Starting…|Restarting…/.test(text),
     `${it.id} does not read as drifting`);
   check(text.includes(`generation ${g.generation}`) && text.includes(`reported at ${g.observed}`),
     "the gap is not stated in generations:\n" + text.slice(0, 500));
@@ -397,7 +397,7 @@ await test("a failing object leads with the reason, not with a spinner", async (
   await openRow(page, it.id);
   const g = await gens(it.id);
   const text = await sheetText(page);
-  check(/Failing/.test(text), `${it.id} does not read as failing`);
+  check(/Failed/.test(text), `${it.id} does not read as failed`);
   check(text.includes(g.ready.reason), "the machine reason is missing");
   check(!g.ready.message || text.includes(g.ready.message), "the operator's sentence is missing");
 });
@@ -729,12 +729,13 @@ await test("a resource can be created, and appears", async () => {
     dialog: !!document.getElementById("dialog"),
     rows: [...document.querySelectorAll("#boardbody tr")].map((r) => r.dataset.name.split("/").pop()),
     sheet: document.getElementById("sheet") ? document.getElementById("sheet").innerText : "",
+    verdict: document.querySelector("#sheet .verdict .head")?.innerText || "",
   })`);
   check(!seen.dialog, "the form stayed open after a successful create");
   check(seen.rows.includes(MADE), "the new volume is not on the board: " + seen.rows.join(", "));
   // Created and honest about it. Whatever else it says, it may not claim an
   // agent has looked at something no agent can have looked at yet.
-  check(!/Settled/.test(seen.sheet),
+  check(!/Ready/.test(seen.verdict),
     "a brand new object claims to be settled before anything reported on it");
   noThrows("creating threw");
 });
@@ -824,7 +825,7 @@ await test("an open sheet follows a change all the way to settled", async () => 
     const r = view.items.find((x) => nameOf(x) === ${JSON.stringify(it.name)});
     if (!r || generation(r) <= ${before.generation} || verdict(r).kind !== "settled") return null;
     const text = document.getElementById("sheet") ? document.getElementById("sheet").innerText : "";
-    return text.includes("Settled") ? { text, generation: generation(r), observed: observed(r) } : null;
+    return text.includes("Ready") ? { text, generation: generation(r), observed: observed(r) } : null;
   })()`, { timeout: 20000 });
   if (!settled) skip("nothing in this cell reports on an object, so a change never settles");
   check(settled.generation > before.generation, "the generation never moved");
@@ -1278,6 +1279,27 @@ await test("a transfer shows what was copied, never a percentage of a promise", 
     "reading a migration twice moved its revision, so something is being written on read");
 });
 
+await test("a migration receiver error is visible before its first status report", async () => {
+  const states = await page.evaluate(`(() => {
+    const r = {
+      meta: { name: "projects/p1/migrations/stalled", generation: 1, createdAt: Date.now() },
+      spec: { toNode: "node-b" },
+      status: { observedGeneration: 0, conditions: [{
+        kind: "Moved", status: "Unknown", reason: "DestinationError",
+        message: "The destination cannot prepare a receiver", observedGeneration: 1,
+      }] },
+    };
+    const retrying = verdict(r, "Moved");
+    r.status.conditions[0].status = "False";
+    r.status.conditions[0].reason = "Timeout";
+    const failed = verdict(r, "Moved");
+    return { retrying, failed };
+  })()`);
+  equal(states.retrying.word, "Retrying", "a receiver error still reads Creating");
+  check(states.retrying.why.includes("cannot prepare"), "the retry state hides the reason");
+  equal(states.failed.word, "Failed", "an expired migration still reads as retrying");
+});
+
 await test("a migration that has arrived says so, and removing it is not abandoning it", async () => {
   await page.evaluate(`closeSheet()`);
   await open(page, "migrations");
@@ -1721,7 +1743,7 @@ await test("a migration that ran out of time stops reading as one in flight, wit
     const caught = await waitFor(page, `(() => {
       const row = [...document.querySelectorAll("#boardbody tr")]
         .find((r) => r.dataset.name === ${JSON.stringify(it.name)});
-      return row && /Failing/.test(row.innerText) ? row.innerText : null;
+      return row && /Failed/.test(row.innerText) ? row.innerText : null;
     })()`, { timeout: 15000 });
     check(caught, "an expired migration still reads as in flight; nothing asked again");
 
@@ -2151,6 +2173,35 @@ await test("a viewer is drawn no New, Edit or Delete; an operator gets Edit alon
   equal(seen.editor, { create: true, edit: true, del: true }, "an editor's buttons are wrong");
 });
 
+await test("additive custom grants draw only their exact collection actions", async () => {
+  await page.evaluate(`document.getElementById("cancelform")?.click(); closeSheet();`);
+  const seen = await page.evaluate(`(async () => {
+    const was = session.who;
+    session.who = { ...was, cellAdmin: false,
+      projects: { [session.project]: "roles/volume-writer" },
+      capabilities: { [session.project]: {
+        instances: ["read", "operate"], volumes: ["read", "write"]
+      } } };
+    try {
+      await show("instances");
+      const instanceCreate = !!document.getElementById("newbtn");
+      document.querySelector("#boardbody tr").click();
+      await new Promise((r) => setTimeout(r, 400));
+      const instanceEdit = !!document.getElementById("editbtn");
+      const instanceDelete = !!document.getElementById("deletebtn");
+      closeSheet();
+      await show("volumes");
+      const volumeCreate = !!document.getElementById("newbtn");
+      return { instanceCreate, instanceEdit, instanceDelete, volumeCreate };
+    } finally {
+      session.who = was;
+      await show("instances");
+    }
+  })()`);
+  equal(seen, { instanceCreate: false, instanceEdit: true, instanceDelete: false,
+    volumeCreate: true }, "custom grants were widened or ignored");
+});
+
 await test("work in progress reads as the verb, and the mark moves", async () => {
   // A migration copying memory read "Not reported" — the opposite of what
   // was happening. An Unknown condition with a reason is the agent saying
@@ -2167,7 +2218,7 @@ await test("work in progress reads as the verb, and the mark moves", async () =>
   const working = seen.filter((r) => /ing…$/.test(r.word));
   check(working.length >= 2, "guests being worked on do not say so: " + JSON.stringify(seen));
   check(working.every((r) => r.busy), "a guest being worked on does not show it: " + JSON.stringify(working));
-  check(seen.every((r) => !/Not reported|Settled|Failing/.test(r.word) || !r.busy),
+  check(seen.every((r) => !/Waiting|Ready|Failed/.test(r.word) || !r.busy),
     "a guest nothing is happening to is drawn as busy: " + JSON.stringify(seen));
 });
 

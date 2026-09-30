@@ -62,14 +62,16 @@
 //! are supported on purpose:
 //!
 //! * the agent holds the capability, and creates taps itself; or
-//! * something else creates them — a host provisioning step, an operator, a
-//!   `systemd` service — and the agent finds them.
+//! * something else creates and labels them for their ports — a host
+//!   provisioning step, an operator, a `systemd` service — and the agent finds
+//!   them.
 //!
 //! The second is what lets a node agent run unprivileged, which is worth having:
 //! the process reachable from the network is the last one to hand
-//! `CAP_NET_ADMIN` to. A tap that is already there is used as it is; only its
-//! label and its state are set, and if even that is refused it is reported rather
-//! than guessed at.
+//! `CAP_NET_ADMIN` to. An existing tap is adopted only when its alias already
+//! names the port; an unlabelled tap could be another port's in-progress
+//! creation. Bringing it up or attaching it to a bridge still requires the
+//! appropriate network privilege.
 //!
 //! A tap must also be openable by whoever runs the VMM, which is what `ip tuntap
 //! add … user <uid>` arranges for the taps this creates.
@@ -177,8 +179,8 @@ impl TapDatapath {
         // not permitted" from `ip tuntap` means one specific missing capability,
         // and whoever reads this on a Port should not have to know which.
         let hint = if stderr.contains("not permitted") {
-            " — this needs CAP_NET_ADMIN. Give the agent that capability, or create the taps \
-             outside it: an existing tap is adopted as it is."
+            " — this needs CAP_NET_ADMIN. Give the agent that capability, or provision and label \
+             the tap for this port outside it."
         } else {
             ""
         };
@@ -221,6 +223,18 @@ fn parse_link(line: &str) -> Option<(String, Option<String>)> {
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty());
     Some((name, alias))
+}
+
+fn link_alias(tap: &str, output: &str) -> Result<Option<String>> {
+    let (name, alias) = parse_link(output).ok_or_else(|| {
+        HostError::failed(format!("cannot identify the existing interface {tap}"))
+    })?;
+    if name != tap {
+        return Err(HostError::failed(format!(
+            "expected interface {tap}, but found {name}"
+        )));
+    }
+    Ok(alias)
 }
 
 #[async_trait]
@@ -301,6 +315,12 @@ impl Datapath for TapDatapath {
             // between the two commands, and either way naming a port for it
             // would be a guess.
             let Some(port) = alias else { continue };
+            // The VMM opens the tap derived from the port name. A different
+            // interface carrying the same alias must not make that port look
+            // ready: it cannot be the wire the guest will use.
+            if self.tap_for(&port) != tap {
+                continue;
+            }
             out.insert(
                 port,
                 ProgrammedPort {
@@ -402,7 +422,26 @@ impl Datapath for TapDatapath {
             )));
         }
         let tap = self.tap_for(port);
-        if !self.present(&tap).await {
+        let existing = self
+            .run(&["-o", "link", "show", "dev", &tap])
+            .await
+            .map_err(|e| HostError::failed(format!("checking interface {tap}: {e}")))?;
+        let created = !existing.status.success();
+        if existing.status.success() {
+            match link_alias(&tap, &String::from_utf8_lossy(&existing.stdout))? {
+                Some(owner) if owner == port => {}
+                Some(owner) => {
+                    return Err(HostError::failed(format!(
+                        "interface {tap} already belongs to {owner}, not {port}"
+                    )));
+                }
+                None => {
+                    return Err(HostError::failed(format!(
+                        "interface {tap} has no port alias; label it for {port} before adoption"
+                    )));
+                }
+            }
+        } else {
             let owner = self.owner.map(|uid| uid.to_string());
             let mut args = vec!["tuntap", "add", "dev", &tap, "mode", "tap"];
             if let Some(uid) = &owner {
@@ -418,8 +457,21 @@ impl Datapath for TapDatapath {
         // create: the agent asks for a desired state rather than a delta, and a
         // tap that exists with its link down is exactly what a host reboot
         // leaves behind.
-        self.ip(&["link", "set", "dev", &tap, "alias", port])
-            .await?;
+        if let Err(error) = self.ip(&["link", "set", "dev", &tap, "alias", port]).await {
+            // A new tap without its identity cannot safely be adopted on the
+            // next pass. Remove it while we still know this attempt created it.
+            if created {
+                if let Err(cleanup) = self
+                    .ip(&["tuntap", "del", "dev", &tap, "mode", "tap"])
+                    .await
+                {
+                    return Err(HostError::failed(format!(
+                        "{error}; removing the unlabelled tap also failed: {cleanup}"
+                    )));
+                }
+            }
+            return Err(error);
+        }
         self.ip(&["link", "set", "dev", &tap, "up"]).await?;
 
         // A network the operator put on a host bridge is the machine's own wire.
@@ -449,8 +501,18 @@ impl Datapath for TapDatapath {
 
     async fn unprogram(&self, port: &str) -> Result<()> {
         let tap = self.tap_for(port);
-        if !self.present(&tap).await {
+        let existing = self
+            .run(&["-o", "link", "show", "dev", &tap])
+            .await
+            .map_err(|e| HostError::failed(format!("checking interface {tap}: {e}")))?;
+        if !existing.status.success() {
             return Ok(());
+        }
+        let owner = link_alias(&tap, &String::from_utf8_lossy(&existing.stdout))?;
+        if owner.as_deref() != Some(port) {
+            return Err(HostError::failed(format!(
+                "interface {tap} is not labelled for {port}; refusing to delete it"
+            )));
         }
         self.ip(&["tuntap", "del", "dev", &tap, "mode", "tap"])
             .await
@@ -533,6 +595,131 @@ mod tests {
         .unwrap();
         assert_eq!(tap, "eth0");
         assert_eq!(alias, None);
+    }
+
+    #[test]
+    fn a_tap_label_identifies_its_owner_before_adoption_or_deletion() {
+        let line = "3: vtweb1a2b: <BROADCAST,UP> mtu 1500\\    link/ether aa:bb:cc:dd:ee:ff\\    alias projects/p1/ports/web";
+        assert_eq!(
+            link_alias("vtweb1a2b", line).unwrap().as_deref(),
+            Some("projects/p1/ports/web")
+        );
+        assert!(link_alias("vtother", line).is_err());
+        assert!(link_alias("vtweb1a2b", "malformed").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_foreign_tap_is_neither_adopted_nor_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let script = scratch.path().join("ip");
+        let port = "projects/p2/ports/web";
+        let mut dp = TapDatapath::new("vt", None);
+        let tap = dp.tap_for(port);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = '-o' ]; then\n  printf '%s\\n' '3: {tap}: <BROADCAST,UP> mtu 1500\\    alias projects/p1/ports/web'\n  exit 0\nfi\nexit 99\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dp.ip = script.to_string_lossy().into_owned();
+
+        let error = dp
+            .program(port, &PortSpec::default(), &NetworkSpec::default(), &[])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already belongs to"));
+        let error = dp.unprogram(port).await.unwrap_err();
+        assert!(error.to_string().contains("refusing to delete"));
+    }
+
+    #[tokio::test]
+    async fn an_unlabelled_existing_tap_is_not_adopted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let script = scratch.path().join("ip");
+        let port = "projects/p2/ports/web";
+        let mut dp = TapDatapath::new("vt", None);
+        let tap = dp.tap_for(port);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' '3: {tap}: <BROADCAST,UP> mtu 1500'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dp.ip = script.to_string_lossy().into_owned();
+
+        let error = dp
+            .program(port, &PortSpec::default(), &NetworkSpec::default(), &[])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("has no port alias"));
+    }
+
+    #[tokio::test]
+    async fn a_new_tap_is_removed_if_it_cannot_be_labelled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let script = scratch.path().join("ip");
+        let removed = scratch.path().join("removed");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = '-o' ]; then exit 1; fi\nif [ \"$1\" = 'tuntap' ] && [ \"$2\" = 'del' ]; then touch '{}'; exit 0; fi\nif [ \"$1\" = 'link' ]; then exit 1; fi\nexit 0\n",
+                removed.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut dp = TapDatapath::new("vt", None);
+        dp.ip = script.to_string_lossy().into_owned();
+        assert!(
+            dp.program(
+                "projects/p1/ports/web",
+                &PortSpec::default(),
+                &NetworkSpec::default(),
+                &[]
+            )
+            .await
+            .is_err()
+        );
+        assert!(removed.exists(), "an unlabelled new tap was left behind");
+    }
+
+    #[tokio::test]
+    async fn a_label_on_the_wrong_tap_does_not_report_a_ready_port() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let script = scratch.path().join("ip");
+        let port = "projects/p1/ports/web";
+        let dp = TapDatapath::new("vt", None);
+        let expected = dp.tap_for(port);
+        let wrong = format!("{}x", &expected[..expected.len() - 1]);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '3: {wrong}: <BROADCAST,UP> mtu 1500\\    alias {port}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut dp = dp;
+        dp.ip = script.to_string_lossy().into_owned();
+        assert!(dp.observe().await.unwrap().is_empty());
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '3: {expected}: <BROADCAST,UP> mtu 1500\\    alias {port}'\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(dp.observe().await.unwrap().get(port).unwrap().tap, expected);
     }
 
     #[test]

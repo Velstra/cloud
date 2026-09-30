@@ -17,19 +17,22 @@
 //! asserts the answer grows with the cell rather than with its square.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
 use serde_json::json;
-use velstra_cloud_api::{Api, Filter, Identity, StaticTokenVerifier, TokenVerifier};
+use velstra_cloud_api::{Api, Code, Filter, Identity, StaticTokenVerifier, TokenVerifier};
 use velstra_cloud_model::meta::Revision;
 use velstra_cloud_store::{Entry, Event, Expect, MemoryStore, Store, StoreError};
 
 struct Counting {
     inner: Arc<MemoryStore>,
     entries: AtomicUsize,
+    role_reads: AtomicUsize,
+    folder_reads: AtomicUsize,
+    fail_get: Mutex<Option<String>>,
 }
 
 impl Counting {
@@ -37,10 +40,15 @@ impl Counting {
         Arc::new(Self {
             inner: Arc::new(MemoryStore::new()),
             entries: AtomicUsize::new(0),
+            role_reads: AtomicUsize::new(0),
+            folder_reads: AtomicUsize::new(0),
+            fail_get: Mutex::new(None),
         })
     }
     fn reset(&self) {
         self.entries.store(0, Ordering::SeqCst);
+        self.role_reads.store(0, Ordering::SeqCst);
+        self.folder_reads.store(0, Ordering::SeqCst);
     }
     fn read(&self) -> usize {
         self.entries.load(Ordering::SeqCst)
@@ -48,11 +56,23 @@ impl Counting {
     fn inner_watchers(&self) -> usize {
         self.inner.watchers()
     }
+    fn fail_get(&self, key: Option<&str>) {
+        *self.fail_get.lock().unwrap() = key.map(str::to_string);
+    }
 }
 
 #[async_trait]
 impl Store for Counting {
     async fn get(&self, key: &str) -> Result<Option<Entry>, StoreError> {
+        if key.contains("/roles/roles/") {
+            self.role_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        if key.contains("/folders/folders/") {
+            self.folder_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.fail_get.lock().unwrap().as_deref() == Some(key) {
+            return Err(StoreError::Backend("policy store unavailable".into()));
+        }
         let out = self.inner.get(key).await?;
         self.entries
             .fetch_add(out.is_some() as usize, Ordering::SeqCst);
@@ -724,4 +744,151 @@ async fn a_months_bill_reads_a_month_and_not_a_year() {
         "a month's bill read {read} entries out of {year} — the scan is still reading the year"
     );
     eprintln!("a month's bill read {read} entries out of {year} in the store");
+}
+
+#[tokio::test]
+async fn a_policy_store_outage_is_an_error_not_an_empty_project_list() {
+    let counting = Counting::new();
+    let store: Arc<dyn Store> = counting.clone();
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
+    let api =
+        Api::new(store, "eu-central", "cell-1", verifier).with_cell_admins(vec!["ops".into()]);
+    let operator = Identity::new("ops");
+    api.create("", "roles", &json!({
+        "id": "volume-reader", "spec": {"grants": [{"verb": "read", "collections": ["volumes", "projects"]}]}
+    }), &operator).await.unwrap();
+    api.create(
+        "",
+        "projects",
+        &json!({
+            "id": "p1", "spec": {"bindings": [{"role": "roles/volume-reader", "members": ["ada"]}]}
+        }),
+        &operator,
+    )
+    .await
+    .unwrap();
+    let ada = Identity::new("ada");
+
+    counting.fail_get(Some("/cell-1/roles/roles/volume-reader"));
+    let error = api.project_access(&ada).await.unwrap_err();
+    assert_eq!(
+        error.code,
+        Code::Internal,
+        "a failed role read must not become no grants"
+    );
+    counting.fail_get(None);
+    assert_eq!(
+        api.project_access(&ada).await.unwrap().1["p1"]["volumes"],
+        vec![velstra_cloud_model::authz::Verb::Read]
+    );
+
+    counting.fail_get(Some("/cell-1/projects/projects/p1"));
+    let error = api
+        .list_for("", "projects", &Filter::none(), &ada)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        Code::Internal,
+        "an unreadable binding must not make the project list look empty"
+    );
+    let audit_prefix = velstra_cloud_store::prefix_for("cell-1", "audit");
+    let before = counting.inner.list(&audit_prefix).await.unwrap().len();
+    let error = api
+        .get(&"projects/p1".parse().unwrap(), &ada)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::Internal);
+    assert_eq!(
+        counting.inner.list(&audit_prefix).await.unwrap().len(),
+        before,
+        "a policy backend outage is not an access refusal in the audit"
+    );
+    counting.fail_get(None);
+    assert_eq!(
+        api.list_for("", "projects", &Filter::none(), &ada)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+
+    api.create(
+        "",
+        "folders",
+        &json!({"id": "engineering", "spec": {}}),
+        &operator,
+    )
+    .await
+    .unwrap();
+    counting.fail_get(Some("/cell-1/folders/folders/engineering"));
+    let project = json!({"id": "p2", "spec": {"parent": "folders/engineering"}});
+    let error = api
+        .create("", "projects", &project, &operator)
+        .await
+        .err()
+        .expect("the failed folder read refuses project creation");
+    assert_eq!(
+        error.code,
+        Code::Internal,
+        "a failed folder read is not a missing folder"
+    );
+    counting.fail_get(None);
+    api.create("", "projects", &project, &operator)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_shared_custom_role_is_fetched_once_for_a_multi_project_session() {
+    let counting = Counting::new();
+    let store: Arc<dyn Store> = counting.clone();
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(StaticTokenVerifier::single("t"));
+    let api =
+        Api::new(store, "eu-central", "cell-1", verifier).with_cell_admins(vec!["ops".into()]);
+    let operator = Identity::new("ops");
+    api.create(
+        "",
+        "roles",
+        &json!({"id": "reader", "spec": {"grants": [{"verb": "read", "collections": ["projects", "volumes"]}]}}),
+        &operator,
+    )
+    .await
+    .unwrap();
+    api.create(
+        "",
+        "folders",
+        &json!({"id": "shared", "spec": {}}),
+        &operator,
+    )
+    .await
+    .unwrap();
+    for n in 0..32 {
+        api.create(
+            "",
+            "projects",
+            &json!({"id": format!("p{n}"), "spec": {"parent": "folders/shared", "bindings": [{"role": "roles/reader", "members": ["ada"]}]}}),
+            &operator,
+        )
+        .await
+        .unwrap();
+    }
+    counting.reset();
+    let (roles, capabilities) = api.project_access(&Identity::new("ada")).await.unwrap();
+    assert_eq!(roles.len(), 32);
+    assert_eq!(
+        capabilities["p31"]["volumes"],
+        vec![velstra_cloud_model::authz::Verb::Read]
+    );
+    assert_eq!(
+        counting.role_reads.load(Ordering::SeqCst),
+        1,
+        "the shared role is one store read"
+    );
+    assert_eq!(
+        counting.folder_reads.load(Ordering::SeqCst),
+        1,
+        "the shared ancestor is one store read"
+    );
 }

@@ -1202,12 +1202,33 @@ pub(crate) fn validate_safe_value(s: &str) -> Result<()> {
 /// A control plane URL: http(s), and safe to write into the seed.
 pub(crate) fn validate_url(s: &str) -> Result<()> {
     validate_safe_value(s)?;
+    // Seed files are deliberately non-secret and world-readable. HTTP userinfo
+    // is neither used by these clients nor safe to preserve in a URL there.
+    if s.contains('@') {
+        bail!("controller URLs must not contain embedded credentials");
+    }
     if !(s.starts_with("http://") || s.starts_with("https://")) {
         bail!("{s:?} does not start with http:// or https://");
     }
     // A bare scheme is a typo, not a URL.
     if s == "http://" || s == "https://" {
         bail!("{s:?} names no host");
+    }
+    Ok(())
+}
+
+/// One or more controller URLs. A seed uses commas because spaces would need
+/// quoting in systemd's EnvironmentFile. All endpoints use the same transport
+/// so a failover cannot silently turn an mTLS connection into plaintext.
+pub(crate) fn validate_url_list(s: &str) -> Result<()> {
+    let mut scheme = None;
+    for endpoint in s.split(',') {
+        validate_url(endpoint)?;
+        let current = endpoint.split_once("://").map(|(scheme, _)| scheme);
+        if scheme.is_some_and(|first| first != current.unwrap_or_default()) {
+            bail!("all controller URLs must use the same HTTP or HTTPS scheme");
+        }
+        scheme = current;
     }
     Ok(())
 }
@@ -1377,6 +1398,16 @@ mod tests {
         assert!(validate_url("https://").is_err());
         // Shell-unsafe URLs are refused too — they land in node.env verbatim.
         assert!(validate_url("https://a b").is_err());
+        assert!(validate_url("https://user:password@cloud.example.net").is_err());
+    }
+
+    #[test]
+    fn ha_endpoint_lists_reject_empty_and_downgraded_members() {
+        assert!(validate_url_list("https://a:50052,https://b:50052").is_ok());
+        assert!(validate_url_list("http://a:50051").is_ok());
+        assert!(validate_url_list("https://a:50052,,https://b:50052").is_err());
+        assert!(validate_url_list("https://a:50052,").is_err());
+        assert!(validate_url_list("https://a:50052,http://b:50052").is_err());
     }
 
     #[test]

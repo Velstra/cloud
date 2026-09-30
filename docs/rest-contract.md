@@ -485,8 +485,9 @@ waiting five minutes for the next unsolicited one.
 
 On a cell whose datapath is the **fabric**, the gateway lives there and the node
 holds only a tap — so the node says nothing, because a router claiming a link it
-does not route is worse than no router. A v6-only guest on such a cell needs the
-fabric to advertise. Dual-stack, above, works on both.
+does not route is worse than no router. The fabric's TC egress hook cannot yet
+enforce inbound IPv6 guest policy. An IPv6 port is therefore refused on this
+datapath rather than shown as programmed while its protection is incomplete.
 
 ### What a guest is using
 
@@ -1450,15 +1451,25 @@ Four things a client may rely on:
   allowances, so a missing group is strictly fewer of them — the safe direction
   — and the port keeps working rather than a typo costing a guest its network.
 
-**On a cell whose datapath is the fabric, egress is closed.** The fabric's
-wire carries one default per group rather than one per direction, so a port
-that names any group is denied outbound except for the egress rules it
-carries, and a port that names no group at all is denied in both directions.
-That is not what the first bullet says, and it is stated here rather than left
-to be discovered: a guest that is reachable and can reach nothing looks like a
-broken image. The local datapath does what the bullet says. Closing the gap
-needs a per-direction default on the fabric's own API.
-  It is reported on the node that noticed.
+On a fabric cell, the guest tap uses separate defaults for each interface
+direction: guest-originated traffic passes by default, while unsolicited
+traffic entering the guest is denied. Cloud reverses its guest-relative rule
+directions when programming Fabric's interface-relative hooks. DHCP replies
+are a narrow exception so the guest can acquire its assigned address.
+
+The node-local metadata service currently identifies a guest by its source
+IPv4 address and installs one host return route per guest. Two guests with the
+same IPv4 address cannot safely share a node, even if their fabric networks
+have different VNIs: the node refuses programming a second port when the
+address already has a return route. If ambiguous guest views nevertheless
+exist, its DHCP and metadata responders answer for neither. Supporting
+overlapping tenant addresses on one node requires per-network routing and
+metadata isolation; VNI separation alone does not provide that host boundary.
+The node also refuses an address that would replace one of its own local,
+connected or specifically routed prefixes; only its default route may be
+superseded by the guest's return route. It tags its own return routes so a
+restarted agent can recover them and port deletion cannot remove an operator's
+route merely because it names the same tap.
 
 A rule whose port range is set on a protocol that has no ports, or that runs
 backwards, or whose `cidr` is not a prefix, is refused on write with the index
@@ -1761,8 +1772,9 @@ GET /api/v1/projects/p1/operations/op-7
   "status": { "done": false, "error": null, … } }
 ```
 
-`done` is computed from the target's convergence, never stored independently —
-an operation cannot disagree with the object it describes.
+While an operation is pending, `done` is computed from the target's convergence.
+The controller stores the first terminal result, including any error, so a
+later request on the same target cannot rewrite the outcome of an earlier one.
 
 ## Migrations
 
@@ -2717,15 +2729,17 @@ POST   /api/v1/users/{id}/tokens     # mint a token (a service account)
   password, disabled account — is the same `401` sentence, so the response is not
   an oracle for which usernames exist.
 - **`GET /sessions/current`** (`whoami`) returns `{subject, displayName,
-  cellAdmin, session, projects}`. `cellAdmin` is the combined operator answer
+  cellAdmin, session, projects, capabilities}`. `cellAdmin` is the combined operator answer
   (config list or stored flag). `session` is true only when *this token* is a
   live session — a static token or service account reads `false`, because there
   is no session behind it for a sign-out to end. `projects` maps each project
-  the subject is named in to the strongest rung they hold there
+  the subject is named in to a display role
   (`{"p1": "admin", "p2": "viewer"}`), folders included; a custom role appears
-  by its name. It is what lets a console draw the buttons an account can use
-  rather than every button and a refusal behind half of them — the API still
-  decides, this only says in advance.
+  by its name. `capabilities` maps those project ids to collections and the
+  exact verbs allowed by all direct and inherited bindings together (for
+  example `{"p1": {"volumes": ["read", "write"]}}`). It excludes cell-only
+  collections and migrations, which a tenant cannot manage. A console uses
+  this answer to draw controls; the API still authorizes every request.
 - **`DELETE /sessions/current`** ends the session the caller presented, and only
   that one. It names no session: a route that ended a session by name would be a
   way to sign somebody else out. Idempotent — a token already gone is not an

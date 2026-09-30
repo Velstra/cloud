@@ -224,7 +224,22 @@ impl Agent {
         }
 
         let me = host.ceph.clone().unwrap_or_default();
-        match perform(&self.cephadm, &step, cluster, &me).await {
+        // A Ceph step can download an image or wait for an OSD for minutes.
+        // The main reconcile loop cannot tick while it awaits this pass, so
+        // keep the node heartbeat alive here. The final node report follows
+        // only after the step completes; there are still no concurrent writers
+        // of this node's status.
+        let work = perform(&self.cephadm, &step, cluster, &me);
+        tokio::pin!(work);
+        let mut heartbeat = tokio::time::interval(self.heartbeat_interval());
+        heartbeat.tick().await; // discard the immediate first tick
+        let result = loop {
+            tokio::select! {
+                result = &mut work => break result,
+                _ = heartbeat.tick() => self.touch_heartbeat().await,
+            }
+        };
+        match result {
             Ok(()) => pass.actions += 1,
             Err(e) => {
                 // One step, one pass. A step that failed is asked for again next

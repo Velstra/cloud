@@ -36,7 +36,7 @@ export function Overview({ onRefresh }: { onRefresh: () => Promise<void> }) {
   const machines = [...(rows.instances ?? [])].sort((a, b) => Number(b.meta.createdAt ?? 0) - Number(a.meta.createdAt ?? 0)).slice(0, 6);
   const tiles = who?.cellAdmin
     ? [{ id: "nodes", title: "Hosts", Icon: Server }, { id: "instances", title: "Instances", Icon: Layers3 }, { id: "networks", title: "Networks", Icon: Network }, { id: "ceph-clusters", title: "Ceph clusters", Icon: Database }]
-    : [{ id: "instances", title: "Instances", Icon: Layers3 }, { id: "volumes", title: "Volumes", Icon: HardDrive }, { id: "networks", title: "Networks", Icon: Network }, { id: "snapshots", title: "Snapshots", Icon: Database }];
+    : [{ id: "instances", title: "Instances", Icon: Layers3 }, { id: "volumes", title: "Volumes", Icon: HardDrive }, { id: "networks", title: "Networks", Icon: Network }, { id: "snapshots", title: "Snapshots", Icon: Database }].filter(({ id }) => can("read", id));
   return <div className="arrive-up mx-auto grid max-w-[1600px] gap-5 pb-6">
     <header className="flex flex-wrap items-center justify-between gap-3">
       <div><p className="mb-1 text-xs font-medium text-muted-foreground">{who?.cellAdmin ? "Infrastructure" : "Workspace"} / {project === ALL ? "All projects" : project}</p>
@@ -66,9 +66,9 @@ export function Overview({ onRefresh }: { onRefresh: () => Promise<void> }) {
     </section>
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.6fr)_minmax(280px,1fr)]">
       <div className="grid min-w-0 gap-5">
-        <section className="overview-panel"><div className="flex items-center justify-between border-b border-border px-5 py-4"><h2>Instances</h2><a className="text-xs text-primary hover:underline" href="#/c/instances">View all →</a></div>
+        {can("read", "instances") && <section className="overview-panel"><div className="flex items-center justify-between border-b border-border px-5 py-4"><h2>Instances</h2><a className="text-xs text-primary hover:underline" href="#/c/instances">View all →</a></div>
           {!sweptAt || missing.instances ? <p className="p-5 text-sm text-muted-foreground">{missing.instances ? "Instances are unavailable. Refresh to retry." : "Loading instances…"}</p> : !machines.length ? <div className="p-5"><p className="text-sm text-muted-foreground">Your first instance starts here.</p>{can("write", "instances") && <a className="mt-2 inline-block text-sm text-primary hover:underline" href="#/c/instances/new">Create instance →</a>}</div> : machines.map((r) => <a key={nameOf(r)} href={link("instances", r)} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-5 py-3 last:border-0 hover:bg-accent"><span className="min-w-0"><span className="block truncate text-sm font-medium">{idOf(r)}</span><span className="text-xs text-muted-foreground">{r.spec?.vcpus ?? "—"} vCPU · {bytes(Number(r.spec?.memoryMib ?? 0) * 1024 ** 2)}</span></span><State of={r} coll={collection("instances")} /></a>)}
-        </section>
+        </section>}
         {who?.cellAdmin && <section className="overview-panel"><div className="flex items-center justify-between border-b border-border px-5 py-4"><h2>Host capacity</h2><a href="#/c/nodes" className="text-xs text-primary hover:underline">Manage hosts →</a></div>
           <div className="grid gap-3 p-4 sm:grid-cols-2">{nodes.slice(0, 6).map((n) => {
             const cap = n.status?.capacity ?? {}; const used = n.status?.allocated ?? {};
@@ -77,7 +77,7 @@ export function Overview({ onRefresh }: { onRefresh: () => Promise<void> }) {
             </a>;
           })}{!nodes.length && <p className="text-sm text-muted-foreground">{missing.nodes ? "Hosts are unavailable." : "No hosts reported."}</p>}</div>
         </section>}
-        {project !== ALL && quota.q && <section className="overview-panel p-5"><div className="mb-4 flex items-center justify-between gap-3"><h2>Project limits</h2>{!who?.cellAdmin && who?.projects?.[project] === "admin" && <a href={href({ view: "board", coll: "projects", id: project })} className="text-xs text-primary hover:underline">Manage members →</a>}</div><QuotaBars q={quota.q} compact /></section>}
+        {project !== ALL && quota.q && <section className="overview-panel p-5"><div className="mb-4 flex items-center justify-between gap-3"><h2>Project limits</h2>{!who?.cellAdmin && can("administer", "projects", project) && <a href={href({ view: "board", coll: "projects", id: project })} className="text-xs text-primary hover:underline">Manage members →</a>}</div><QuotaBars q={quota.q} compact /></section>}
       </div>
       <section className="overview-panel"><div className="flex items-center gap-2 border-b border-border px-5 py-4"><Activity className="size-4 text-primary" /><h2>Recent activity</h2></div>
         {auditError ? <p role="status" className="p-5 text-sm text-muted-foreground">{auditError}</p> : !audit.length ? <p className="p-5 text-sm text-muted-foreground">No activity to show.</p> : <ol>{audit.map((r) => {const s = r.spec ?? {}; const verbs: Record<string, string> = {create: "Created", update: "Updated", delete: "Deleted"}; const action = s.kind === "changed" ? (verbs[String(s.verb)] ?? s.verb) : s.kind === "signed-in" ? "Signed in" : s.kind === "signed-out" ? "Signed out" : "Access refused"; return <li key={nameOf(r)} className="border-b border-border px-5 py-3 last:border-0"><p className="break-words text-sm">{action}{s.target ? ` ${String(s.target).split("/").pop()}` : ""}</p><p className="mt-1 text-xs text-muted-foreground"><span>{s.subject || "System"}</span><span title={new Date(Number(s.at ?? r.meta.createdAt)).toLocaleString()}> · {ago(s.at ?? r.meta.createdAt)}</span></p></li>;})}</ol>}

@@ -11,6 +11,7 @@ repository.workspace = true
 tonic = { workspace = true, features = ["tls"] }
 prost = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

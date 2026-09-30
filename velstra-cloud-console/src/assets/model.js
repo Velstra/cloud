@@ -94,8 +94,8 @@ function verdict(r, kind) {
     };
   }
   // An operation says whether it is finished, and that is the answer — not the
-  // condition beside it. `status.done` is computed from the target on every
-  // read, so an operation that is done is done however it ended: the change
+  // condition beside it. A pending operation is computed from the target;
+  // its terminal result is retained, so it is done however it ended: the change
   // landed, or the thing it was about is gone. Either way there is nothing
   // left to wait for and nothing anybody can do to the operation itself.
   //
@@ -109,7 +109,8 @@ function verdict(r, kind) {
     const failed = pick(statusOf(r), "error");
     return {
       kind: "settled",
-      word: "Finished",
+      tone: failed ? "failing" : "settled",
+      word: failed ? "Failed" : "Finished",
       why: failed || "The change this was a receipt for has landed.",
       since: null,
     };
@@ -143,9 +144,20 @@ function verdict(r, kind) {
     Number(pick(ready, "observedGeneration") || 0) === gen;
   if (decided) {
     return {
-      kind: "failing", word: "Failing",
+      kind: "failing", word: "Failed",
       why: because(r, ready.message || "The " + named + " condition is false and says nothing more."),
       since: pick(ready, "lastTransition"), ready,
+    };
+  }
+  // Moved is computed by the API even before the destination reports a
+  // generation. Keep its source/receiver error visible instead of calling the
+  // migration Creating just because observedGeneration is still zero.
+  if (named === "Moved" && ready && ready.status === "Unknown" &&
+      ["SourceError", "DestinationError", "DestinationUnreachable"].includes(ready.reason)) {
+    return {
+      kind: "drifting", word: "Retrying", busy: true,
+      why: ready.message || ready.reason,
+      since: null, ready,
     };
   }
   // Observed generation zero is not "behind by one". Nobody has looked at this
@@ -163,7 +175,7 @@ function verdict(r, kind) {
     const fresh = age >= 0 && age < FIRST_REPORT_GRACE_MS;
     return {
       kind: "unreported",
-      word: fresh ? "Being made" : "Not reported",
+      word: fresh ? "Creating" : "Waiting",
       busy: fresh,
       why: fresh
         ? "Asked for at generation " + gen + ". Whatever owns it has not reported yet, \
@@ -176,7 +188,7 @@ which is the ordinary first moment of an object's life."
   if (obs < gen) {
     return {
       kind: "drifting",
-      word: underway(r) || "Applying…",
+      word: underway(r) || "Updating…",
       busy: true,
       why: "The ask moved to generation " + gen + "; the world is reported at " + obs + ".",
       since: ready ? pick(ready, "lastTransition") : null,
@@ -186,7 +198,7 @@ which is the ordinary first moment of an object's life."
   if (!ready) {
     return {
       kind: "unreported",
-      word: "Not reported",
+      word: "Waiting",
       why: "Nothing has written a " + named + " condition for generation " + gen + " yet.",
       since: null,
     };
@@ -197,7 +209,7 @@ which is the ordinary first moment of an object's life."
   // a new way to fail.
   if (ready.status === "False") {
     return {
-      kind: "failing", word: "Failing",
+      kind: "failing", word: "Failed",
       why: because(r, ready.message || "The " + named + " condition is false and says nothing more."),
       since: pick(ready, "lastTransition"), ready,
     };
@@ -216,13 +228,13 @@ which is the ordinary first moment of an object's life."
       };
     }
     return {
-      kind: "unreported", word: "Not reported",
+      kind: "unreported", word: "Waiting",
       why: ready.message || "The owning agent has not reported on generation " + gen + ".",
       since: pick(ready, "lastTransition"), ready,
     };
   }
   return {
-    kind: "settled", word: "Settled",
+    kind: "settled", word: "Ready",
     why: "The world matches generation " + gen + ".",
     since: pick(ready, "lastTransition"), ready,
   };
@@ -259,7 +271,7 @@ function mark(kind) { return el("span.mark." + kind); }
 
 // ---- what this account may do here --------------------------------------
 //
-// Asked of the API (`whoami` reports the strongest rung per project) rather
+// Asked of the API (`whoami` reports effective permissions per collection) rather
 // than decided here: the console draws the buttons that will be accepted and
 // leaves the refusal to the API for the rest. A cell operator may do
 // everything; an account the API says nothing about (a static token from
@@ -275,9 +287,19 @@ function roleHere() {
   return ["viewer", "operator", "editor", "admin"].includes(rung) ? rung : "custom";
 }
 
-/// `create`/`delete` need editor or above; `edit` — resize, power, attach —
-/// operator or above; a custom role is trusted with all of it.
-function allows(verb) {
+/// `create`/`delete` need Write; `edit` — resize, power, attach —
+/// needs Operate. Older APIs expose only a display rung, which remains a
+/// fallback until they report the exact collection grants.
+function allows(verb, coll) {
+  const who = session.who || {};
+  if (who.cellAdmin) return true;
+  if (who.capabilities) {
+    const id = typeof coll === "string" ? coll : coll && coll.id;
+    if (coll && coll.scope === "global" && (id !== "projects" || verb === "create")) return false;
+    const project = session.project;
+    return !!id && !!project && !!who.capabilities[project]
+      && (who.capabilities[project][id] || []).includes(verb === "edit" ? "operate" : "write");
+  }
   const rung = roleHere();
   if (rung === "custom" || rung === "admin" || rung === "editor") return true;
   if (rung === "operator") return verb === "edit";
@@ -302,7 +324,7 @@ function permissionDoubt() {
     return "This account's permissions could not be read, so every control is shown. "
       + "Whether a press is allowed is decided by the API, not here.";
   }
-  if (roleHere() !== "custom") return "";
+  if (who.capabilities || roleHere() !== "custom") return "";
   return "This account holds " + who.projects[session.project] + " in " + session.project
     + ", which this console has no rung for, so every control is shown. Whether a press "
     + "is allowed is decided by the API, not here.";
@@ -313,7 +335,7 @@ function stateOf(r, kind) {
   // `busy` pulses the mark: something is happening to this object right now,
   // and a table that changes only when the change is over shows nothing while
   // the person who asked for it is watching.
-  return el("span.state." + v.kind + (v.busy ? ".busy" : ""), mark(v.kind), v.word);
+  return el("span.state." + (v.tone || v.kind) + (v.busy ? ".busy" : ""), mark(v.tone || v.kind), v.word);
 }
 
 // ---- formatting ------------------------------------------------------------

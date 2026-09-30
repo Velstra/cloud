@@ -59,6 +59,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use sha2::{Digest, Sha256};
 use velstra_cloud_model::network::format_mac;
 
 use crate::guests::{GuestRegistry, GuestView, Interface};
@@ -107,6 +108,21 @@ fn router(registry: GuestRegistry) -> Router {
             get(nic_field),
         )
         .route("/latest/user-data", get(user_data))
+        // Older EC2 consumers, including CirrOS, probe this version before
+        // `latest` and require an EC2-shaped instance id.
+        .route("/2009-04-04/meta-data", get(index))
+        .route("/2009-04-04/meta-data/", get(index))
+        .route("/2009-04-04/meta-data/instance-id", get(legacy_instance_id))
+        .route("/2009-04-04/meta-data/hostname", get(hostname))
+        .route("/2009-04-04/meta-data/local-hostname", get(hostname))
+        .route("/2009-04-04/meta-data/local-ipv4", get(local_ipv4))
+        .route("/2009-04-04/meta-data/public-keys", get(public_keys))
+        .route("/2009-04-04/meta-data/public-keys/", get(public_keys))
+        .route(
+            "/2009-04-04/meta-data/public-keys/:index/openssh-key",
+            get(openssh_key),
+        )
+        .route("/2009-04-04/user-data", get(user_data))
         // NoCloud: the flat trio, for an image told `ds=nocloud-net`.
         .route("/meta-data", get(nocloud_meta_data))
         .route("/user-data", get(nocloud_user_data))
@@ -154,6 +170,27 @@ async fn instance_id(
 ) -> Response {
     match caller(&registry, peer) {
         Some(me) => text(me.instance_id.clone()),
+        None => not_found(),
+    }
+}
+
+fn legacy_id(name: &str) -> String {
+    let digest = Sha256::digest(name.as_bytes());
+    format!(
+        "i-{}",
+        digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+
+async fn legacy_instance_id(
+    State(registry): State<GuestRegistry>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    match caller(&registry, peer) {
+        Some(me) => text(legacy_id(&me.instance_id)),
         None => not_found(),
     }
 }
@@ -474,6 +511,7 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
                 == Some(n)
         });
         if first_of_its_family {
+            let mut routes = String::new();
             match (&public_default, nic.gateway) {
                 // Out through the public address, and the next hop is on-link
                 // and in no subnet — answered by the host itself. That is what
@@ -485,12 +523,12 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
                     } else {
                         "::/0"
                     };
-                    out.push_str(&format!(
-                        "    routes:\n      - to: \"{destination}\"\n        via: \"{}\"\n",
+                    routes.push_str(&format!(
+                        "      - to: \"{destination}\"\n        via: \"{}\"\n",
                         route.via
                     ));
                     if route.on_link {
-                        out.push_str("        on-link: true\n");
+                        routes.push_str("        on-link: true\n");
                     }
                 }
                 (None, Some(gateway)) => {
@@ -499,11 +537,20 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
                     } else {
                         "::/0"
                     };
-                    out.push_str(&format!(
-                        "    routes:\n      - to: \"{destination}\"\n        via: \"{gateway}\"\n"
+                    routes.push_str(&format!(
+                        "      - to: \"{destination}\"\n        via: \"{gateway}\"\n"
                     ));
                 }
                 (None, None) => {}
+            }
+            if mine == Some(true) {
+                routes.push_str(&format!(
+                    "      - to: \"{ADDRESS}/32\"\n        scope: link\n"
+                ));
+            }
+            if !routes.is_empty() {
+                out.push_str("    routes:\n");
+                out.push_str(&routes);
             }
             // Resolvers once, on the first NIC only: netplan takes them
             // per-interface and the resolver list is not per-family — a second
@@ -535,6 +582,9 @@ pub fn render_network_config(view: &GuestView) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
     use velstra_cloud_model::network::{Cidr, parse_mac};
 
     use super::*;
@@ -558,6 +608,60 @@ mod tests {
                 public: Vec::new(),
             }],
         }
+    }
+
+    async fn request_from(app: Router, address: &str, path: &str) -> (StatusCode, String) {
+        let mut request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            address.parse().unwrap(),
+            51000,
+        )));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_routes_keep_guest_identity_isolated() {
+        let mut first = guest();
+        first.user_data = Some("first guest secret".into());
+        let mut second = guest();
+        second.instance_id = "projects/p2/instances/i2".into();
+        second.interfaces[0].cidr = Some(Cidr::parse("10.20.0.11/24").unwrap());
+        second.user_data = Some("second guest secret".into());
+        let registry = GuestRegistry::new();
+        registry.replace(vec![first, second]);
+        let app = router(registry);
+
+        let (status, id) = request_from(
+            app.clone(),
+            "10.20.0.10",
+            "/2009-04-04/meta-data/instance-id",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(id, legacy_id("projects/p1/instances/i1"));
+        assert_eq!(
+            request_from(app.clone(), "10.20.0.10", "/2009-04-04/user-data").await,
+            (StatusCode::OK, "first guest secret".into())
+        );
+        assert_eq!(
+            request_from(app.clone(), "10.20.0.11", "/2009-04-04/user-data").await,
+            (StatusCode::OK, "second guest secret".into())
+        );
+        assert_eq!(
+            request_from(app.clone(), "10.20.0.99", "/2009-04-04/user-data")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request_from(app, "10.20.0.10", "/2009-04-04/not-a-path")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
@@ -591,7 +695,9 @@ mod tests {
                  mtu: 1450\n    \
                  routes:\n      \
                    - to: \"0.0.0.0/0\"\n        \
-                     via: \"10.20.0.1\"\n    \
+                     via: \"10.20.0.1\"\n      \
+                   - to: \"169.254.169.254/32\"\n        \
+                     scope: link\n    \
                  nameservers:\n      \
                    addresses:\n        \
                      - \"10.20.0.1\"\n"
@@ -623,9 +729,17 @@ mod tests {
         let config = render_network_config(&named).unwrap();
         assert!(config.contains("- \"10.9.9.9\""), "{config}");
         assert!(
-            !config.contains(&ADDRESS.to_string()),
+            !config.contains(&format!("        - \"{ADDRESS}\"")),
             "the operator's own resolver was overridden:\n{config}"
         );
+    }
+
+    #[test]
+    fn legacy_instance_identity_is_stable_and_ec2_shaped() {
+        let a = legacy_id("projects/p1/instances/i1");
+        assert_eq!(a, legacy_id("projects/p1/instances/i1"));
+        assert!(a.starts_with("i-"));
+        assert_ne!(a, legacy_id("projects/p2/instances/i1"));
     }
 
     #[test]

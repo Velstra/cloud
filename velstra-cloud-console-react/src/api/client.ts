@@ -1335,7 +1335,7 @@ export const OPERATIONS: Op[] = [
   "id": "whoami",
   "method": "GET",
   "path": "/api/v1/sessions/current",
-  "summary": "Who this token is, and what it may do (`cellAdmin`, and the strongest rung per project).",
+  "summary": "Who this token is, including effective permissions for every bound project and collection.",
   "tags": [
    "Sessions"
   ]
@@ -2241,7 +2241,7 @@ export const signIn = (body?: unknown) =>
 export const signOut = () =>
   call("sign-out", "DELETE", `/api/v1/sessions/current`, undefined);
 
-/** Who this token is, and what it may do (`cellAdmin`, and the strongest rung per project). — GET /api/v1/sessions/current */
+/** Who this token is, including effective permissions for every bound project and collection. — GET /api/v1/sessions/current */
 export const whoami = () =>
   call("whoami", "GET", `/api/v1/sessions/current`, undefined);
 

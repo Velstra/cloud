@@ -2,15 +2,10 @@
 //!
 //! ## What is true on this machine, and what is not
 //!
-//! QEMU is **not installed on the machine this was written on**. Everything
-//! that needs the binary or a live guest — `start`, `stop`, `delete`, the
-//! volume methods, and every migration method — is written from the documented
-//! QMP protocol and command line and has **never been run**. Each such method
-//! says so. What the tests at the bottom do exercise, because it needs nothing
-//! but bytes and a filesystem: the QMP framing and reply parsing, the command
-//! lines for a normal boot and for an incoming migration, the run-state
-//! mapping, how progress is read out of `query-migrate`, and reading a
-//! receiver's own URL back out of the unit that is listening.
+//! The QMP framing, command lines, and run-state mapping are covered by unit
+//! tests. Boot-volume startup and cross-node live migration have also been
+//! exercised against real QEMU processes; those observations do not replace
+//! testing every storage, network, and failure combination.
 //!
 //! ## The shape of a migration here
 //!
@@ -700,6 +695,9 @@ impl Vmm for QemuVmm {
         }
         // A socket left by a dead VMM would stop the new one binding.
         let _ = std::fs::remove_file(&monitor);
+        if let Some(place) = &request.boot_disk {
+            self.layout.ceph.probe(place, &self.layout.binary).await?;
+        }
         hostfs::systemd_run(
             self.layout.scope,
             &self.unit(&request.instance),
@@ -783,6 +781,7 @@ impl Vmm for QemuVmm {
         // `qcow2` for a file, because that is what the directory pool writes and
         // opening a qcow2 as `raw` hands the guest the image header as its first
         // sector. Ceph names itself.
+        self.layout.ceph.probe(at, &self.layout.binary).await?;
         let file = if let Some(rbd) = crate::ceph_access::split(at) {
             self.layout.ceph.blockdev(&rbd)
         } else {
@@ -854,6 +853,11 @@ impl Vmm for QemuVmm {
     /// started with `-incoming` and sitting in `inmigrate` until the transfer
     /// lands.
     async fn prepare_receiver(&self, request: &VmRequest, _mode: MigrationMode) -> Result<String> {
+        if self.layout.migration_address.is_some() && self.layout.migration_tls_dir.is_none() {
+            return Err(HostError::failed(
+                "network migration requires a configured X.509 certificate directory",
+            ));
+        }
         if let Some(receiver) = self.observe_receiver(&request.instance).await {
             return Ok(receiver.url);
         }
@@ -895,6 +899,9 @@ impl Vmm for QemuVmm {
         // guest's.
         let monitor = self.incoming_monitor(&request.instance);
         let _ = std::fs::remove_file(&monitor);
+        if let Some(place) = &request.boot_disk {
+            self.layout.ceph.probe(place, &self.layout.binary).await?;
+        }
         hostfs::systemd_run(
             self.layout.scope,
             &self.incoming_unit(&request.instance),
@@ -934,6 +941,13 @@ impl Vmm for QemuVmm {
     /// as the copy is under way — the same thing `-d` means on the human
     /// monitor — so this returns then too, and `observe` answers what happened.
     async fn send(&self, transfer: &Transfer) -> Result<()> {
+        let tls_creds = outgoing_tls_credentials(&self.layout, &transfer.url)?;
+        self.qmp(
+            &transfer.instance,
+            "migrate-set-parameters",
+            json!({ "tls-creds": tls_creds }),
+        )
+        .await?;
         for (parameter, value) in migrate_parameters(transfer)? {
             self.qmp(
                 &transfer.instance,
@@ -1383,11 +1397,47 @@ fn qemu_args(
         }
         args.push(device.into());
     }
+    if let Some(dir) = &layout.migration_tls_dir {
+        for (id, endpoint) in [
+            ("migration-client", "client"),
+            ("migration-server", "server"),
+        ] {
+            args.push("-object".into());
+            args.push(
+                format!(
+                    "tls-creds-x509,id={id},endpoint={endpoint},dir={}",
+                    dir.display()
+                )
+                .into(),
+            );
+        }
+        if incoming.is_some_and(|uri| uri.starts_with("tcp:")) {
+            // Require TLS from the instant QEMU binds, before its URL is
+            // published to the source.
+            args.push("-global".into());
+            args.push("migration.tls-creds=migration-server".into());
+        }
+    }
     if let Some(incoming) = incoming {
         args.push("-incoming".into());
         args.push(incoming.into());
     }
     args
+}
+
+fn outgoing_tls_credentials(layout: &Layout, url: &str) -> Result<&'static str> {
+    if url.starts_with("tcp:") {
+        if layout.migration_tls_dir.is_none() {
+            return Err(HostError::failed(
+                "network migration requires a configured X.509 certificate directory",
+            ));
+        }
+        Ok("migration-client")
+    } else {
+        // Same-host Unix transfers must not inherit an earlier TCP transfer's
+        // TLS setting from this long-lived QEMU process.
+        Ok("")
+    }
 }
 
 fn vsock_cid(instance: &str) -> u32 {
@@ -1860,6 +1910,35 @@ mod tests {
         assert!(nets[0].contains("id=n0,ifname=vt-a"), "{nets:?}");
         assert!(nets[1].contains("id=n1,ifname=vt-b"), "{nets:?}");
         assert!(booting.contains(&"8192".to_string()));
+    }
+
+    #[test]
+    fn network_migration_requires_mutual_tls_from_receiver_start() {
+        let mut secure = layout();
+        secure.migration_tls_dir = Some(PathBuf::from("/etc/velstra/migration"));
+        let args = words(&qemu_args(
+            &secure,
+            &request(),
+            Path::new("/run/qmp.sock"),
+            Some("tcp:0:4900"),
+        ));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "migration.tls-creds=migration-server")
+        );
+        assert!(args.iter().any(|arg| arg
+            == "tls-creds-x509,id=migration-server,endpoint=server,dir=/etc/velstra/migration"));
+        assert!(args.iter().any(|arg| arg
+            == "tls-creds-x509,id=migration-client,endpoint=client,dir=/etc/velstra/migration"));
+        assert_eq!(
+            outgoing_tls_credentials(&secure, "tcp:10.0.0.2:4900").unwrap(),
+            "migration-client"
+        );
+        assert_eq!(
+            outgoing_tls_credentials(&secure, "unix:/run/migrate.sock").unwrap(),
+            ""
+        );
+        assert!(outgoing_tls_credentials(&layout(), "tcp:10.0.0.2:4900").is_err());
     }
 
     /// A guest is never started on QEMU's default CPU.

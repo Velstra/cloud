@@ -374,7 +374,12 @@ packages cannot read (for example, Squid 19.2.6 with 19.2.3 clients). Pin the
 cluster image and provision compatible clients; never downgrade authentication
 to work around this. A matching `cephadm shell` CLI can manage the cluster, but
 it does not upgrade the native RBD library QEMU uses. Validate both before
-placing workloads on a new cluster.
+placing workloads on a new cluster. The node agent uses `qemu-img` from the
+VM binary's package to check the exact volume before boot, hot-plug or
+migration reception.
+An incompatible client now leaves the operation with a specific storage
+error, and reconciliation retries after the host client is corrected; it does
+not silently substitute the container client for QEMU's native library.
 
 Nothing is copied onto the hypervisors. Once a monitor is up, the cell
 publishes the client configuration — a minimal `ceph.conf` and a
@@ -447,6 +452,16 @@ VELSTRA_FABRIC_VTEP=10.0.0.7          # what other hosts send frames to
 VELSTRA_FABRIC_UNDERLAY=eth1          # the interface that address is on
 VELSTRA_FABRIC_SRV6_LOCATOR=fc00:0:1::/64   # optional; empty stays VXLAN
 ```
+
+For a Fabric controller cluster, supply every controller endpoint as a
+comma-separated list in both `VELSTRA_FABRIC` and
+`VELSTRA_FABRIC_CONTROL` (and in `velstra.cloud.controlPlane.fabric`). Use the
+orchestrator port for the former and the config-service port for the latter.
+Cloud discovers the current write leader from the orchestrator list on each
+reconciliation; the Fabric data-plane agent watches any reachable config
+service. All endpoints in a list must use the same HTTP or HTTPS scheme, and
+HTTPS requires the configured CA and client identity. A single endpoint remains
+valid for a standalone Fabric controller.
 
 The Fabric agent attaches to `VELSTRA_FABRIC_UNDERLAY` as well as tenant taps.
 Without the underlay attachment, remote hosts cannot decapsulate incoming

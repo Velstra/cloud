@@ -6,8 +6,9 @@ import type { Collection } from "@/lib/schema";
 
 export function State({ of, coll, detail }: { of: Resource; coll?: Collection; detail?: boolean }) {
   const v = verdict(of, coll);
-  const tone = v.kind === "unreported" || v.kind === "deleting" ? "var(--text-muted)" : `var(--${v.kind})`;
-  const dot = v.kind === "unreported" || v.kind === "deleting" ? undefined : `var(--dot-${v.kind})`;
+  const visual = v.tone ?? v.kind;
+  const tone = visual === "unreported" || visual === "deleting" ? "var(--text-muted)" : `var(--${visual})`;
+  const dot = visual === "unreported" || visual === "deleting" ? undefined : `var(--dot-${visual})`;
   return (
     <span className="inline-flex items-center gap-2 whitespace-nowrap text-xs" style={{ color: tone }}>
       <span className={"size-2 shrink-0 rounded-full" + (v.busy ? " breathing" : "")}

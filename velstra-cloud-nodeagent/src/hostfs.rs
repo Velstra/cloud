@@ -1161,15 +1161,24 @@ async fn last_words(scope: Scope, unit: &str) -> Option<String> {
         .await
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    // systemd's own lines say a unit failed; what is wanted is what the *program*
-    // said before it did.
-    text.lines()
-        .rev()
-        .find(|l| {
-            let l = l.trim();
-            !l.is_empty() && !l.starts_with("Started ") && !l.starts_with("Stopped ")
-        })
-        .map(|l| l.trim().to_string())
+    hypervisor_failure_line(&text)
+}
+
+/// Keep the VMM diagnostic rather than the systemd summary logged after it.
+/// Only VMM error lines are surfaced: a unit journal can also contain unrelated
+/// service output, which should never become a tenant-visible failure message.
+fn hypervisor_failure_line(journal: &str) -> Option<String> {
+    journal.lines().rev().find_map(|line| {
+        let line = line.trim();
+        let vmm = line.starts_with("qemu-system-") || line.starts_with("cloud-hypervisor:");
+        let lower = line.to_ascii_lowercase();
+        if !vmm
+            || !(lower.contains("error") || lower.contains("failed") || lower.contains("unable"))
+        {
+            return None;
+        }
+        Some(line.chars().filter(|c| !c.is_control()).take(500).collect())
+    })
 }
 
 /// **Untested:** needs systemd. The `velstra-vm-*` units that are actually
@@ -1877,5 +1886,30 @@ mod usage_tests {
     fn a_device_name_cannot_escape_its_directory() {
         assert_eq!(link_counters("../../etc"), None);
         assert_eq!(link_counters(""), None);
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::hypervisor_failure_line;
+
+    #[test]
+    fn early_rbd_failure_survives_following_systemd_messages() {
+        let journal = "Started velstra-vm-test.service.\n\
+qemu-system-x86_64: -drive file.driver=rbd,file.pool=volumes: error connecting: Input/output error\n\
+velstra-vm-test.service: Main process exited, code=exited, status=1/FAILURE\n\
+velstra-vm-test.service: Failed with result 'exit-code'.\n";
+        assert_eq!(
+            hypervisor_failure_line(journal).as_deref(),
+            Some(
+                "qemu-system-x86_64: -drive file.driver=rbd,file.pool=volumes: error connecting: Input/output error"
+            )
+        );
+        assert_eq!(
+            hypervisor_failure_line(
+                "Started velstra-vm-test.service.\nFailed with result 'exit-code'.\n"
+            ),
+            None
+        );
     }
 }

@@ -1812,10 +1812,9 @@ message MigrationExplanation {
 // A long-running operation is a resource an operator can look at, not a
 // connection they have to hold open.
 //
-// It carries no state of its own beyond a pointer at its target and the
-// generation of that target it is waiting for: `done` is computed from the
-// target's own convergence, so an operation cannot disagree with the object it
-// describes.
+// While pending, progress is computed from the target at the generation this
+// request concerns. Once finished, the outcome is retained so a later target
+// change cannot rewrite this request's history.
 message OperationSpec {
   string target = 1;
   uint64 target_generation = 2;

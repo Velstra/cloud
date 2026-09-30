@@ -5,7 +5,7 @@
 //! writes `status`, and the store refuses either the other's half. That rule is
 //! right for every object an agent owns — and three of the objects here have no
 //! agent and never will. A project's `used` quota is counted from what exists.
-//! An operation's `done` is computed from its target. An instance nobody has
+//! A pending operation's `done` is computed from its target. An instance nobody has
 //! placed yet is owned by nobody, which is precisely when the scheduler must
 //! say on the object *why* it could not be placed.
 //!

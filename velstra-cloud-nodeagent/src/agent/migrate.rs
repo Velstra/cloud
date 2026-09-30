@@ -771,8 +771,15 @@ impl Agent {
             for action in actions {
                 let result = match action {
                     DestinationAction::PrepareReceiver { instance: _, mode } => {
-                        self.prepare_to_receive(&name, instance.as_ref(), mode, &host, taps, cell)
-                            .await
+                        self.prepare_to_receive(
+                            migration,
+                            instance.as_ref(),
+                            mode,
+                            &host,
+                            taps,
+                            cell,
+                        )
+                        .await
                     }
                     DestinationAction::TearDownReceiver { instance } => self
                         .vmm
@@ -852,13 +859,15 @@ impl Agent {
     /// prepared destination does nothing.
     async fn prepare_to_receive(
         &self,
-        name: &str,
+        migration: &Migration,
         instance: Option<&Instance>,
         mode: MigrationMode,
         host: &HostState,
         taps: &BTreeMap<String, String>,
         cell: &super::CellView<'_>,
     ) -> Result<bool, String> {
+        let name = migration.spec.instance.as_str();
+        let from_node = migration.spec.from_node.as_str();
         let (ports, groups) = (cell.ports, cell.groups);
         let Some(instance) = instance else {
             // Not an error on the machine — a thing to wait for, said out loud
@@ -992,13 +1001,22 @@ impl Agent {
             },
             cloud_init,
         )?;
-        self.vmm
+        let url = self
+            .vmm
             .prepare_receiver(&request, mode)
             .await
-            .map(|url| {
-                tracing::info!(instance = %name, %url, "listening for a guest");
-                true
-            })
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if from_node != self.config.node && url.starts_with("unix:") {
+            self.vmm
+                .tear_down_receiver(name)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Err(format!(
+                "{} has no network migration address; configure one before moving a guest from {}",
+                self.config.node, from_node
+            ));
+        }
+        tracing::info!(instance = %name, %url, "listening for a guest");
+        Ok(true)
     }
 }

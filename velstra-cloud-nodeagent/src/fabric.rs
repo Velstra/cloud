@@ -45,9 +45,10 @@
 //! is expanded when it is small enough to expand and refused when it is not,
 //! because sixty-five thousand rules is not an encoding either.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::Ipv4Addr, process::Stdio};
 
 use async_trait::async_trait;
+use tokio::process::Command;
 /// The fabric's contract, from the one crate that owns it.
 ///
 /// Re-exported rather than generated here: a controller mirrors networks to the
@@ -71,6 +72,20 @@ use crate::{
 /// service against the control plane — and a range wider than that is almost
 /// always somebody meaning "any", which has its own answer above.
 const MAX_EXPANDED_PORTS: u32 = 64;
+
+/// Route attributes used only for the node-local metadata return path. A tap
+/// name alone is not proof that a route belongs to this agent: an operator may
+/// have created one on the same device. The metric plus a private protocol
+/// number let reconciliation adopt its own routes after a restart and leave
+/// foreign routes untouched during teardown.
+const METADATA_ROUTE_PROTOCOL: u32 = 222;
+const METADATA_ROUTE_METRIC: u32 = 51986;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostRoute {
+    device: String,
+    owned: bool,
+}
 
 /// Where this machine's overlay traffic enters and leaves it.
 ///
@@ -178,10 +193,223 @@ pub struct FabricDatapath {
     /// *fabric's* answer, thrown away and asked for again on every pass, and it
     /// lives here only because [`Datapath::agrees`] is asked the question
     /// outside the call that can go and ask.
-    fabric_rules: std::sync::Mutex<BTreeMap<String, Vec<pb::PortRule>>>,
+    fabric_rules: std::sync::Mutex<BTreeMap<String, pb::SecurityGroupInfo>>,
 }
 
 impl FabricDatapath {
+    fn guest_v4(address: &str) -> Option<Ipv4Addr> {
+        address.split('/').next()?.parse().ok()
+    }
+
+    async fn metadata_route(ip: Ipv4Addr) -> Result<Option<HostRoute>> {
+        let output = Command::new("ip")
+            .args([
+                "-N",
+                "-j",
+                "-4",
+                "route",
+                "show",
+                "exact",
+                &format!("{ip}/32"),
+            ])
+            .stdout(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| {
+                HostError::failed(format!("checking metadata return route for {ip}: {e}"))
+            })?;
+        if !output.status.success() {
+            return Err(HostError::failed(format!(
+                "checking metadata return route for {ip}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(Self::host_route_claims(&String::from_utf8_lossy(&output.stdout))?.remove(&ip))
+    }
+
+    fn conflicts_with_host_route(route: &str, tap: &str) -> bool {
+        let words: Vec<_> = route.split_whitespace().collect();
+        if words.first() == Some(&"local") {
+            return true;
+        }
+        let device = words.windows(2).find(|w| w[0] == "dev").map(|w| w[1]);
+        device != Some(tap) && !words.contains(&"via")
+    }
+
+    fn has_nondefault_host_route(routes: &str) -> Result<bool> {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(routes)
+            .map_err(|e| HostError::failed(format!("decoding host routes: {e}")))?;
+        Ok(rows
+            .iter()
+            .any(|route| route.get("dst").and_then(serde_json::Value::as_str) != Some("default")))
+    }
+
+    fn host_route_claims(routes: &str) -> Result<BTreeMap<Ipv4Addr, HostRoute>> {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(routes)
+            .map_err(|e| HostError::failed(format!("decoding host routes: {e}")))?;
+        let mut claims: BTreeMap<Ipv4Addr, HostRoute> = BTreeMap::new();
+        for row in rows {
+            let Some(dst) = row.get("dst").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let (address, prefix) = dst.split_once('/').unwrap_or((dst, "32"));
+            if prefix != "32" {
+                continue;
+            }
+            let (Ok(address), Some(device)) = (
+                address.parse::<Ipv4Addr>(),
+                row.get("dev").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            let owned = row
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(METADATA_ROUTE_PROTOCOL)
+                && row.get("metric").and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(METADATA_ROUTE_METRIC));
+            if let Some(previous) = claims.get_mut(&address) {
+                // Two equal destinations, even if one is ours, are ambiguous.
+                previous.owned = false;
+            } else {
+                claims.insert(
+                    address,
+                    HostRoute {
+                        device: device.to_string(),
+                        owned,
+                    },
+                );
+            }
+        }
+        Ok(claims)
+    }
+
+    async fn observed_host_routes() -> Result<BTreeMap<Ipv4Addr, HostRoute>> {
+        let output = Command::new("ip")
+            .args(["-N", "-j", "-4", "route", "show", "table", "main"])
+            .output()
+            .await
+            .map_err(|e| HostError::failed(format!("observing host routes: {e}")))?;
+        if !output.status.success() {
+            return Err(HostError::failed(format!(
+                "observing host routes: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Self::host_route_claims(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    async fn check_host_route(ip: Ipv4Addr, tap: &str) -> Result<()> {
+        let output = Command::new("ip")
+            .args(["-4", "route", "get", &ip.to_string()])
+            .output()
+            .await
+            .map_err(|e| HostError::failed(format!("checking host route for {ip}: {e}")))?;
+        if !output.status.success() {
+            return Err(HostError::failed(format!(
+                "checking host route for {ip}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        let route = String::from_utf8_lossy(&output.stdout);
+        if Self::conflicts_with_host_route(&route, tap) {
+            return Err(HostError::failed(format!(
+                "guest address {ip} would replace a host-local or directly connected route"
+            )));
+        }
+        let output = Command::new("ip")
+            .args(["-j", "-4", "route", "show", "match", &format!("{ip}/32")])
+            .output()
+            .await
+            .map_err(|e| HostError::failed(format!("checking routed prefixes for {ip}: {e}")))?;
+        if !output.status.success() {
+            return Err(HostError::failed(format!(
+                "checking routed prefixes for {ip}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        if Self::has_nondefault_host_route(&String::from_utf8_lossy(&output.stdout))? {
+            return Err(HostError::failed(format!(
+                "guest address {ip} would replace an existing host route"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn ensure_metadata_route(ip: Ipv4Addr, tap: &str) -> Result<()> {
+        match Self::metadata_route(ip).await? {
+            Some(existing) if existing.owned && existing.device == tap => return Ok(()),
+            Some(existing) => {
+                return Err(HostError::failed(format!(
+                    "metadata return route for {ip} is not owned by this port (device {}); overlapping guest addresses on one host require network isolation",
+                    existing.device
+                )));
+            }
+            None => {}
+        }
+        Self::check_host_route(ip, tap).await?;
+        let output = Command::new("ip")
+            .args([
+                "-4",
+                "route",
+                "add",
+                &format!("{ip}/32"),
+                "dev",
+                tap,
+                "proto",
+                &METADATA_ROUTE_PROTOCOL.to_string(),
+                "metric",
+                &METADATA_ROUTE_METRIC.to_string(),
+            ])
+            .output()
+            .await
+            .map_err(|e| {
+                HostError::failed(format!("installing metadata return route for {ip}: {e}"))
+            })?;
+        if !output.status.success() {
+            return Err(HostError::failed(format!(
+                "installing metadata return route for {ip}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
+    }
+
+    async fn remove_metadata_route(ip: Ipv4Addr, tap: &str) -> Result<()> {
+        if !Self::metadata_route(ip)
+            .await?
+            .is_some_and(|route| route.owned && route.device == tap)
+        {
+            return Ok(());
+        }
+        let output = Command::new("ip")
+            .args([
+                "-4",
+                "route",
+                "del",
+                &format!("{ip}/32"),
+                "dev",
+                tap,
+                "proto",
+                &METADATA_ROUTE_PROTOCOL.to_string(),
+                "metric",
+                &METADATA_ROUTE_METRIC.to_string(),
+            ])
+            .output()
+            .await
+            .map_err(|e| {
+                HostError::failed(format!("removing metadata return route for {ip}: {e}"))
+            })?;
+        if !output.status.success() {
+            return Err(HostError::failed(format!(
+                "removing metadata return route for {ip}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(taps: TapDatapath, endpoint: &str, host: &str, underlay: Underlay) -> Self {
         Self {
             taps,
@@ -264,7 +492,7 @@ impl FabricDatapath {
     /// One call for the whole node rather than one per port: the answer is a
     /// property of the fabric, and asking it once per carried port would be the
     /// same answer fetched many times.
-    async fn groups_in_fabric(&self) -> Result<BTreeMap<String, Vec<pb::PortRule>>> {
+    async fn groups_in_fabric(&self) -> Result<BTreeMap<String, pb::SecurityGroupInfo>> {
         let mut client = self.client().await?;
         let listed = client
             .list_security_groups(pb::ListSecurityGroupsRequest {})
@@ -274,7 +502,7 @@ impl FabricDatapath {
         Ok(listed
             .groups
             .into_iter()
-            .map(|g| (g.name, g.rules))
+            .map(|g| (g.name.clone(), g))
             .collect())
     }
 }
@@ -309,9 +537,11 @@ pub fn translate(rule: &ResolvedRule) -> std::result::Result<Vec<pb::PortRule>, 
     // And which *hook* the rule applies at. Without that, an ingress allowance
     // would also admit the same traffic outbound — a rule matching more than it
     // says, which is the one direction a firewall must never be wrong in.
+    // Fabric names hooks from the interface's point of view. On a guest tap,
+    // guest ingress is TC egress, while guest egress is XDP ingress.
     let (src, dst, direction) = match rule.direction {
-        Direction::Ingress => (rule.remote.clone(), String::new(), "in"),
-        Direction::Egress => (String::new(), rule.remote.clone(), "out"),
+        Direction::Ingress => (rule.remote.clone(), String::new(), "out"),
+        Direction::Egress => (String::new(), rule.remote.clone(), "in"),
     };
 
     let ports: Vec<u32> = match rule.ports {
@@ -422,7 +652,23 @@ fn same_rules(a: &[pb::PortRule], b: &[pb::PortRule]) -> bool {
 }
 
 fn translate_all(rules: &[ResolvedRule]) -> Result<Vec<pb::PortRule>> {
-    let mut out = Vec::new();
+    // The guest needs DHCP before it has an address. This is the only
+    // unsolicited host-to-guest exception to default-deny ingress.
+    let mut out = vec![pb::PortRule {
+        proto: pb::Proto::Udp as i32,
+        port: 68,
+        action: pb::Action::Pass as i32,
+        log: false,
+        src: String::new(),
+        dst: String::new(),
+        limit: 0,
+        burst: 0,
+        icmp_type: 0,
+        family: "ipv4".into(),
+        direction: "out".into(),
+        in_interface: String::new(),
+        src_mac: String::new(),
+    }];
     for rule in rules {
         match translate(rule) {
             Ok(mut some) => out.append(&mut some),
@@ -460,11 +706,32 @@ impl Datapath for FabricDatapath {
             .map_err(|e| HostError::failed(format!("listing the fabric's ports: {e}")))?
             .into_inner()
             .ports;
-        carried.retain(|_, local| {
-            fabric_ports
-                .iter()
-                .any(|remote| remote.host == self.host && remote.tap == local.tap)
-        });
+        let fabric_by_tap: BTreeMap<_, _> = fabric_ports
+            .iter()
+            .filter(|remote| remote.host == self.host)
+            .map(|remote| (remote.tap.as_str(), remote))
+            .collect();
+        carried.retain(|_, local| fabric_by_tap.contains_key(local.tap.as_str()));
+        // A lost host route makes metadata and the fallback resolver fail even
+        // while the overlay still reports the port as programmed. Mark the
+        // port stale so the normal reconciliation restores the route.
+        let host_routes = Self::observed_host_routes().await?;
+        let mut missing_routes = Vec::new();
+        for (port, local) in &carried {
+            if let Some(remote) = fabric_by_tap.get(local.tap.as_str()) {
+                if let Some(ip) = Self::guest_v4(&remote.ip) {
+                    if !host_routes
+                        .get(&ip)
+                        .is_some_and(|route| route.owned && route.device == local.tap)
+                    {
+                        missing_routes.push(port.clone());
+                    }
+                }
+            }
+        }
+        for port in missing_routes {
+            carried.remove(&port);
+        }
 
         // The rules are a different question with a different answer-holder.
         // The tap layer does not know them — it is deliberately programmed with
@@ -505,18 +772,26 @@ impl Datapath for FabricDatapath {
             // Nothing under this port's name. Either the fabric has never been
             // asked, or it does not have the group — and wanting nothing is
             // then genuinely satisfied, while wanting something is not.
-            return wanted.is_empty();
+            return false;
         };
-        same_rules(there, &wanted)
+        there.default_action() == pb::Action::Pass
+            && there.egress_default_drop
+            && there.stateful
+            && same_rules(&there.rules, &wanted)
     }
 
     async fn prepare_incoming(
         &self,
         port: &str,
-        _spec: &PortSpec,
+        spec: &PortSpec,
         network: &NetworkSpec,
         rules: &[ResolvedRule],
     ) -> Result<String> {
+        if spec.address.as_deref().is_some_and(|a| a.contains(':')) {
+            return Err(HostError::failed(
+                "the fabric cannot enforce inbound IPv6 guest policy yet",
+            ));
+        }
         translate_all(rules)?;
         // The source still owns the address. An unadvertised tap is enough for
         // QEMU's receiver; normal reconciliation activates it after handover.
@@ -532,9 +807,27 @@ impl Datapath for FabricDatapath {
         network: &NetworkSpec,
         rules: &[ResolvedRule],
     ) -> Result<String> {
+        if spec.address.as_deref().is_some_and(|a| a.contains(':')) {
+            return Err(HostError::failed(
+                "the fabric cannot enforce inbound IPv6 guest policy yet",
+            ));
+        }
         // The refusal first, before anything is created: a rule that cannot be
         // expressed must not leave a half-programmed port behind.
         let fabric_rules = translate_all(rules)?;
+        if let Some(ip) = spec.address.as_deref().and_then(Self::guest_v4) {
+            let tap = self.taps.tap_for(port);
+            match Self::metadata_route(ip).await? {
+                Some(existing) if existing.owned && existing.device == tap => {}
+                Some(existing) => {
+                    return Err(HostError::failed(format!(
+                        "guest address {ip} has a route not owned by this port (device {}); overlapping guest addresses on one host require network isolation",
+                        existing.device
+                    )));
+                }
+                None => Self::check_host_route(ip, &tap).await?,
+            }
+        }
 
         // The tap, with no rules — this datapath, not the tap one, is what
         // enforces them, so the tap half must not refuse the port for carrying
@@ -554,16 +847,39 @@ impl Datapath for FabricDatapath {
         client
             .add_security_group(pb::SecurityGroupSpec {
                 name: group.clone(),
-                // The platform's own default: nothing is allowed that was not
-                // asked for. An empty rule set is a closed port, not an open one.
-                default_action: pb::Action::Drop as i32,
+                // XDP ingress on the tap is traffic leaving the guest; TC
+                // egress is traffic entering it. The two defaults differ.
+                default_action: pb::Action::Pass as i32,
+                egress_default_drop: true,
                 drop_icmp: false,
                 stateful: true,
                 blocklist: Vec::new(),
-                rules: fabric_rules,
+                rules: fabric_rules.clone(),
             })
             .await
             .map_err(|e| HostError::failed(format!("declaring {group} on the fabric: {e}")))?;
+
+        // An older fabric silently ignores an unknown protobuf field. Verify
+        // the reflected policy before binding a guest to it, or a rolling
+        // upgrade would expose the guest with default-pass ingress.
+        let declared = client
+            .list_security_groups(pb::ListSecurityGroupsRequest {})
+            .await
+            .map_err(|e| HostError::failed(format!("checking {group} on the fabric: {e}")))?
+            .into_inner()
+            .groups
+            .into_iter()
+            .find(|g| g.name == group);
+        if !declared.as_ref().is_some_and(|g| {
+            g.default_action() == pb::Action::Pass
+                && g.egress_default_drop
+                && g.stateful
+                && same_rules(&g.rules, &fabric_rules)
+        }) {
+            return Err(HostError::failed(format!(
+                "fabric did not confirm the guest ingress policy for {port}"
+            )));
+        }
 
         let info = client
             .create_port(pb::CreatePortRequest {
@@ -605,11 +921,15 @@ impl Datapath for FabricDatapath {
             .await
             .map_err(|e| HostError::failed(format!("setting the ceiling for {port}: {e}")))?;
 
+        if let Some(ip) = spec.address.as_deref().and_then(Self::guest_v4) {
+            Self::ensure_metadata_route(ip, &tap).await?;
+        }
+
         Ok(tap)
     }
 
-    /// Undo all three of the things [`Self::program`] made, in the reverse
-    /// order it made them.
+    /// Remove the local tap and its remaining owned routes independently of Fabric availability,
+    /// then remove the remote port before its security group.
     ///
     /// It used to undo one and a half. The tap went, `RemoveSecurityGroup` was
     /// called and its answer discarded with `let _`, and nothing ever removed
@@ -624,11 +944,27 @@ impl Datapath for FabricDatapath {
     /// `let _ = datapath.unprogram(PORT).await` and asked the fabric nothing
     /// afterwards — an assertion that would have held with this function empty.
     async fn unprogram(&self, port: &str) -> Result<()> {
-        // The tap goes whatever the fabric says: a device this host is done with
-        // is this host's to remove, and leaving it would have the next pass
-        // adopt a port nobody asked for.
+        let tap = self.taps.tap_for(port);
+        // Validate the tap's port alias before touching its routes. Short tap
+        // names can collide; deleting a route by tap name before this check
+        // could remove a different port's return path.
         self.taps.unprogram(port).await?;
+        // The local half must be removable even if Fabric is unreachable or
+        // has already forgotten the port. Any remaining marked routes can be
+        // found by the deterministic tap name, without a remote address lookup.
+        for (ip, route) in Self::observed_host_routes().await? {
+            if route.owned && route.device == tap {
+                Self::remove_metadata_route(ip, &tap).await?;
+            }
+        }
+
         let mut client = self.client().await?;
+        let ports = client
+            .list_ports(pb::ListPortsRequest {})
+            .await
+            .map_err(|e| HostError::failed(format!("asking the fabric for {port}: {e}")))?
+            .into_inner()
+            .ports;
 
         // The fabric's port id is not something this crate remembers — nothing
         // here remembers anything, which is the recovery model — so it is asked
@@ -641,13 +977,6 @@ impl Datapath for FabricDatapath {
         // migrating guest's VMM command line names it. Matching on the name
         // alone would have a source node remove the fabric port a destination
         // has just taken over, and the guest would lose its network on arrival.
-        let tap = self.taps.tap_for(port);
-        let ports = client
-            .list_ports(pb::ListPortsRequest {})
-            .await
-            .map_err(|e| HostError::failed(format!("asking the fabric for {port}: {e}")))?
-            .into_inner()
-            .ports;
         if let Some(mine) = ports.iter().find(|p| p.tap == tap && p.host == self.host) {
             client
                 .remove_port(pb::RemovePortRequest {
@@ -682,6 +1011,69 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_guest_route_must_not_capture_host_local_or_connected_addresses() {
+        let tap = "vt-guest";
+        assert!(FabricDatapath::conflicts_with_host_route(
+            "local 10.42.0.10 dev lo src 10.42.0.10\n",
+            tap
+        ));
+        assert!(FabricDatapath::conflicts_with_host_route(
+            "10.42.0.20 dev ens3 src 10.42.0.10\n",
+            tap
+        ));
+        assert!(!FabricDatapath::conflicts_with_host_route(
+            "10.120.1.2 via 10.42.0.1 dev ens3 src 10.42.0.10\n",
+            tap
+        ));
+        assert!(!FabricDatapath::conflicts_with_host_route(
+            "10.120.1.2 dev vt-guest src 169.254.169.254\n",
+            tap
+        ));
+        assert!(
+            !FabricDatapath::has_nondefault_host_route(
+                r#"[{"dst":"default","gateway":"10.42.0.1","dev":"ens3"}]"#
+            )
+            .unwrap()
+        );
+        assert!(
+            FabricDatapath::has_nondefault_host_route(
+                r#"[{"dst":"10.120.0.0/16","gateway":"10.42.0.1","dev":"ens3"}]"#
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            FabricDatapath::host_route_claims(
+                r#"[{"dst":"default","dev":"ens3"},{"dst":"10.42.0.0/24","dev":"ens3"},{"dst":"10.120.1.2","dev":"vt-guest","protocol":"222","metric":51986}]"#
+            )
+            .unwrap(),
+            BTreeMap::from([(
+                Ipv4Addr::new(10, 120, 1, 2),
+                HostRoute { device: tap.into(), owned: true }
+            )])
+        );
+        assert_eq!(
+            FabricDatapath::host_route_claims(
+                r#"[{"dst":"10.120.1.2","dev":"vt-guest","protocol":"4","metric":51986}]"#
+            )
+            .unwrap()
+            .get(&Ipv4Addr::new(10, 120, 1, 2))
+            .map(|route| route.owned),
+            Some(false),
+            "a same-device operator route must not be adopted or deleted"
+        );
+        assert_eq!(
+            FabricDatapath::host_route_claims(
+                r#"[{"dst":"10.120.1.2","dev":"vt-guest","protocol":"222","metric":51986},{"dst":"10.120.1.2","dev":"other","protocol":"4"}]"#
+            )
+            .unwrap()
+            .get(&Ipv4Addr::new(10, 120, 1, 2))
+            .map(|route| route.owned),
+            Some(false),
+            "duplicate routes cannot establish ownership"
+        );
+    }
+
     fn rule(protocol: Protocol, ports: Option<PortRange>, direction: Direction) -> ResolvedRule {
         ResolvedRule {
             direction,
@@ -703,7 +1095,7 @@ mod tests {
         assert_eq!(out[0].port, 443);
         assert_eq!(out[0].src, "10.0.0.0/24", "an ingress rule lost its source");
         assert!(out[0].dst.is_empty());
-        assert_eq!(out[0].direction, "in");
+        assert_eq!(out[0].direction, "out");
         assert_eq!(out[0].action, pb::Action::Pass as i32);
     }
 
@@ -720,7 +1112,7 @@ mod tests {
         .unwrap();
         assert!(out[0].src.is_empty(), "an egress rule kept a source");
         assert_eq!(out[0].dst, "10.0.0.0/24");
-        assert_eq!(out[0].direction, "out");
+        assert_eq!(out[0].direction, "in");
     }
 
     #[test]
@@ -797,8 +1189,37 @@ mod tests {
 
     #[test]
     fn a_port_with_no_rules_is_a_closed_port_and_not_an_error() {
-        // The platform's own default is nothing allowed that was not asked for.
-        assert_eq!(translate_all(&[]).unwrap().len(), 0);
+        // DHCP is the sole unsolicited ingress exception; everything else
+        // entering the guest meets the fabric's deny-by-default TC hook.
+        let rules = translate_all(&[]).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].port, 68);
+        assert_eq!(rules[0].direction, "out");
+    }
+
+    #[tokio::test]
+    async fn ipv6_port_is_refused_before_a_tap_or_fabric_binding_exists() {
+        let datapath = FabricDatapath::new(
+            TapDatapath::new("vt", None),
+            "http://127.0.0.1:1",
+            "node-a",
+            Underlay {
+                vtep: "127.0.0.1".into(),
+                iface: "lo".into(),
+                mac: "02:00:00:00:00:01".into(),
+                mtu: 1500,
+                srv6_locator: None,
+            },
+        );
+        let spec = PortSpec {
+            address: Some("fd00::2".into()),
+            ..PortSpec::default()
+        };
+        let error = datapath
+            .program("projects/p1/ports/v6", &spec, &NetworkSpec::default(), &[])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("inbound IPv6 guest policy"));
     }
 
     #[test]

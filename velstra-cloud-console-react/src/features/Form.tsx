@@ -23,6 +23,8 @@ import { z } from "zod";
 import { check, crossCheck } from "@/lib/checks";
 import { entry } from "@/registry";
 import { useAsk } from "./Ask";
+import { InfoIcon } from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
 type Values = Record<string, any>;
 
@@ -432,10 +434,10 @@ function Row({ label, help, error, children }: {
   const control = direct ? cloneElement(children as React.ReactElement<Record<string, unknown>>, {
     id, "aria-invalid": !!error || undefined, "aria-describedby": description,
   }) : children;
-  const helpContent = <>{error && <p id={`${id}-error`} className="text-xs text-destructive">{error}</p>}
-    {help && <details className="text-xs text-muted-foreground"><summary className="w-fit hover:text-foreground">Help with {label.replace(" *", "").toLowerCase()}</summary><p className="mt-1.5 leading-relaxed">{help.replace(/\*\*(.+?)\*\*/g, "$1").replace(/`(.+?)`/g, "$1")}</p></details>}</>;
-  return direct ? <div className="grid gap-1.5"><Label htmlFor={id} className="text-[13px] text-foreground">{label}</Label>{control}{helpContent}</div>
-    : <fieldset aria-invalid={!!error || undefined} aria-describedby={description} className="grid min-w-0 gap-1.5"><legend className="mb-1.5 text-[13px] font-medium text-foreground">{label}</legend>{children}{helpContent}</fieldset>;
+  const helpButton = help && <Popover><PopoverTrigger render={<button type="button" className="inline-flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" aria-label={`Help with ${label.replace(" *", "").toLowerCase()}`} />}><InfoIcon className="size-3.5" aria-hidden="true" /></PopoverTrigger><PopoverContent side="right" align="start" className="max-w-72 text-xs leading-relaxed">{help.replace(/\*\*(.+?)\*\*/g, "$1").replace(/`(.+?)`/g, "$1")}</PopoverContent></Popover>;
+  const errorContent = error && <p id={`${id}-error`} className="text-xs text-destructive">{error}</p>;
+  return direct ? <div className="grid gap-1.5"><div className="flex items-center gap-1"><Label htmlFor={id} className="text-[13px] text-foreground">{label}</Label>{helpButton}</div>{control}{errorContent}</div>
+    : <fieldset aria-invalid={!!error || undefined} aria-describedby={description} className="grid min-w-0 gap-1.5"><legend className="mb-1.5 text-[13px] font-medium text-foreground"><span className="inline-flex items-center gap-1">{label}{helpButton}</span></legend>{children}{errorContent}</fieldset>;
 }
 
 function FieldRow({ f, coll, existing, value, onChange, error, locked }: {

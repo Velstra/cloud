@@ -2430,7 +2430,7 @@
   "params": [],
   "query": [],
   "body": false,
-  "summary": "Who this token is, and what it may do (`cellAdmin`, and the strongest rung per project).",
+  "summary": "Who this token is, including effective permissions for every bound project and collection.",
   "tags": [
    "Sessions"
   ]

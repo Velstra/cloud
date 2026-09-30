@@ -2979,9 +2979,9 @@ pub type Port = Resource<PortSpec, PortStatus>;
 /// AIP-151: a long-running operation is a resource an operator can look at,
 /// not a connection they must hold open.
 ///
-/// It carries no state of its own beyond a pointer at the target and what the
-/// caller asked for — "done" is computed from the target's own convergence, so
-/// an operation cannot disagree with the object it describes.
+/// While pending, its result is computed from the target's convergence. The
+/// controller stores the first terminal result so later changes to the same
+/// target cannot rewrite this request's history.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct OperationSpec {
     /// The resource this operation is about.

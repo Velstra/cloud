@@ -13,7 +13,7 @@ import { RUNGS, loadRoles, useCan, type CustomRole } from "@/lib/iam";
 import { basePath, type Collection } from "@/lib/schema";
 import { listEvery } from "@/lib/listing";
 import { SCHEMA } from "@/lib/schema";
-import { useStore } from "@/app/store";
+import { setState, useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
 
 type Binding = { role: string; members: string[] };
@@ -45,6 +45,11 @@ export function Members({ r, coll, reload }: { r: Resource; coll: Collection; re
     try {
       await call("patch:projects", "PATCH", `${basePath(coll, "")}/${encodeURIComponent(idOf(r))}`, undefined,
         { spec: { bindings: bindings(list) } }, r.meta.revision ? { "if-match": String(r.meta.revision) } : undefined);
+      try {
+        const current = await call("session", "GET", "/api/v1/sessions/current");
+        setState({ who: { subject: current.subject, displayName: current.displayName ?? current.subject,
+          cellAdmin: !!current.cellAdmin, projects: current.projects ?? {}, capabilities: current.capabilities } });
+      } catch { toast.warning("Members saved. Refresh to update your permissions."); }
       toast("Members saved."); reload();
     } catch (e) { toast.error((e as Error).message); }
   };

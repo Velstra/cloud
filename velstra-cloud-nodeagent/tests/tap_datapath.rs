@@ -38,15 +38,19 @@ fn link(tap: &str) -> Option<String> {
 /// Whether this process may make an interface. Asked by trying, because the
 /// answer depends on the namespace and not on the uid.
 fn may_create() -> bool {
-    let probe = "vtprobe0";
+    static NEXT_PROBE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let probe = format!(
+        "vtp{:04x}",
+        NEXT_PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let made = std::process::Command::new("ip")
-        .args(["tuntap", "add", "dev", probe, "mode", "tap"])
+        .args(["tuntap", "add", "dev", &probe, "mode", "tap"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if made {
         let _ = std::process::Command::new("ip")
-            .args(["tuntap", "del", "dev", probe, "mode", "tap"])
+            .args(["tuntap", "del", "dev", &probe, "mode", "tap"])
             .status();
     }
     made
@@ -132,6 +136,43 @@ async fn programming_twice_is_programming_once() {
     dp.unprogram(port).await.unwrap();
     // And unprogramming twice, for the same reason on the other side.
     dp.unprogram(port).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_precreated_tap_needs_the_correct_port_label() {
+    needs_cap!();
+    let dp = TapDatapath::new("vx", None);
+    let port = "projects/p1/ports/precreated";
+    let tap = dp.tap_for(port);
+    assert!(
+        std::process::Command::new("ip")
+            .args(["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let refused = dp
+        .program(port, &PortSpec::default(), &NetworkSpec::default(), &[])
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("has no port alias"));
+    assert!(
+        std::process::Command::new("ip")
+            .args(["link", "set", "dev", &tap, "alias", port])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    assert_eq!(
+        dp.program(port, &PortSpec::default(), &NetworkSpec::default(), &[])
+            .await
+            .unwrap(),
+        tap
+    );
+    dp.unprogram(port).await.unwrap();
+    assert!(link(&tap).is_none());
 }
 
 #[tokio::test]

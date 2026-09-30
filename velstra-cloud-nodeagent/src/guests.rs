@@ -207,6 +207,14 @@ impl GuestRegistry {
             }
         }
 
+        // DHCP must share metadata's fail-closed identity decision. Otherwise
+        // two different taps can each lease the same address even though the
+        // metadata service (correctly) refuses to identify either guest.
+        index.by_wire.retain(|_, (view, n)| {
+            !view.interfaces[*n]
+                .address()
+                .is_some_and(|address| ambiguous_addresses.contains(&address))
+        });
         for address in ambiguous_addresses {
             index.by_address.remove(&address);
         }
@@ -639,6 +647,45 @@ mod tests {
         assert!(
             registry
                 .on_wire("vt-shared", parse_mac("52:54:00:12:34:56").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn two_distinct_wires_claiming_one_address_get_no_dhcp_lease() {
+        let registry = GuestRegistry::new();
+        let first = Interface {
+            cidr: Some(Cidr::parse("10.20.0.10/24").unwrap()),
+            mac: parse_mac("52:54:00:12:34:56"),
+            tap: Some("vt-first".into()),
+            ..Default::default()
+        };
+        let second = Interface {
+            mac: parse_mac("52:54:00:65:43:21"),
+            tap: Some("vt-second".into()),
+            ..first.clone()
+        };
+        registry.replace(vec![
+            GuestView {
+                instance_id: "projects/p1/instances/i1".into(),
+                interfaces: vec![first],
+                ..Default::default()
+            },
+            GuestView {
+                instance_id: "projects/p2/instances/i2".into(),
+                interfaces: vec![second],
+                ..Default::default()
+            },
+        ]);
+        assert!(registry.at_address("10.20.0.10".parse().unwrap()).is_none());
+        assert!(
+            registry
+                .on_wire("vt-first", parse_mac("52:54:00:12:34:56").unwrap())
+                .is_none()
+        );
+        assert!(
+            registry
+                .on_wire("vt-second", parse_mac("52:54:00:65:43:21").unwrap())
                 .is_none()
         );
     }

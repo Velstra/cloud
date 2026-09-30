@@ -99,6 +99,7 @@ function rungIn(project) {
 function mayGrant(project) {
   const who = session.who || {};
   if (who.cellAdmin) return true;
+  if (who.capabilities) return (who.capabilities[idOf(project)]?.projects || []).includes("administer");
   if (!who.projects) return true;
   const rung = rungIn(project);
   if (!rung) return false;
@@ -279,6 +280,13 @@ function grantsInto(host, coll, project, onSaved) {
       stored = answer;
       grants = grantsOf(stored);
       note = el("span.muted", "Saved.");
+      try {
+        session.who = (await request("GET", "/api/v1/sessions/current")).body;
+        renderWhoami();
+        renderPermissionDoubt();
+      } catch {
+        note = el("span.warn", "Saved. Refresh to update your permissions.");
+      }
       if (onSaved) onSaved(answer);
     } catch (e) {
       // Refused. The rows go back to what is **stored**, because leaving the

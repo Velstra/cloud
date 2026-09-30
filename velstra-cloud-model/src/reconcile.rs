@@ -925,7 +925,13 @@ pub fn instance_condition(instance: &Instance) -> Condition {
             "Ready",
             ConditionStatus::False,
             "VmFailed",
-            "the virtual machine exited and could not be restarted",
+            if instance.status.console_tail.contains("file.driver=rbd")
+                && instance.status.console_tail.contains("error connecting:")
+            {
+                "The compute host could not open the Ceph volume. Check its Ceph client compatibility, credentials, and cluster connectivity."
+            } else {
+                "The VM process exited. Velstra will retry the requested state; check the VM logs for the cause."
+            },
             at_generation,
         ),
         (_, InstanceState::Unknown) => Condition::new(
@@ -958,7 +964,7 @@ pub fn may_delete(meta: &Meta) -> bool {
 ///
 /// Invariant 1 hands `status` to the owning agent — but some objects have no
 /// agent and never will. A project's `used` quota is counted from what exists,
-/// an operation's `done` is computed from its target, and an instance that has
+/// a pending operation's `done` is computed from its target, and an instance that has
 /// not been placed yet is owned by nobody, which is exactly when the scheduler
 /// has to say on the object *why* it could not place it.
 ///
@@ -1194,6 +1200,9 @@ pub enum TargetView {
     Gone,
     Present {
         observed_generation: u64,
+        /// Generation of the condition itself. A controller can refuse a
+        /// request before any agent has observed it.
+        condition_generation: u64,
         ready: ConditionStatus,
         reason: String,
         message: String,
@@ -1298,14 +1307,11 @@ pub fn is_a_record(kind: &str) -> bool {
     matches!(kind, "audit" | "usage" | "operations")
 }
 
-/// Whether an operation has finished, computed from its target and nothing
-/// else.
+/// Whether a pending operation has finished, computed from its target.
 ///
-/// This is what makes AIP-151 honest here: `done` is never a fact somebody
-/// remembered to write, so an operation cannot outlive the truth of the object
-/// it describes. A controller that dies between "the instance came up" and
-/// "mark the operation done" leaves an operation that computes to done on the
-/// next pass, not one that says `false` forever.
+/// A controller that dies between "the instance came up" and "mark the
+/// operation done" still computes the result on the next pass. Once stored,
+/// the terminal result is retained so later target edits cannot rewrite it.
 pub fn operation_progress(spec: &OperationSpec, target: &TargetView) -> OperationProgress {
     // Some things nobody reports on. A subnet, an image, a security group, a
     // schedule: no agent owns one, so `observedGeneration` stays at zero for
@@ -1345,10 +1351,12 @@ pub fn operation_progress(spec: &OperationSpec, target: &TargetView) -> Operatio
             done: true,
             error: Some(format!("{} no longer exists", spec.target)),
         },
+        // A condition from an older request cannot finish this operation,
+        // even when the target has subsequently advanced its observed count.
         TargetView::Present {
-            observed_generation,
+            condition_generation,
             ..
-        } if *observed_generation < spec.target_generation => OperationProgress::default(),
+        } if *condition_generation < spec.target_generation => OperationProgress::default(),
         TargetView::Present { ready, .. } if *ready == ConditionStatus::Unknown => {
             OperationProgress::default()
         }
@@ -1365,6 +1373,10 @@ pub fn operation_progress(spec: &OperationSpec, target: &TargetView) -> Operatio
                 format!("{reason}: {message}")
             }),
         },
+        TargetView::Present {
+            observed_generation,
+            ..
+        } if *observed_generation < spec.target_generation => OperationProgress::default(),
         TargetView::Present { .. } => OperationProgress {
             done: true,
             error: None,
@@ -2402,6 +2414,19 @@ mod tests {
     }
 
     #[test]
+    fn an_rbd_open_failure_has_an_actionable_condition_without_exposing_the_journal() {
+        let mut i = super::tests::inst("projects/p1/instances/i1");
+        i.status.observed_generation = i.meta.generation;
+        i.status.state = InstanceState::Failed;
+        i.status.console_tail = "qemu-system-x86_64: -drive file.driver=rbd,file.pool=private: error connecting: Input/output error".into();
+        let condition = instance_condition(&i);
+        assert_eq!(condition.status, ConditionStatus::False);
+        assert_eq!(condition.reason, "VmFailed");
+        assert!(condition.message.contains("Ceph client compatibility"));
+        assert!(!condition.message.contains("file.pool=private"));
+    }
+
+    #[test]
     fn a_controller_may_speak_for_an_object_only_while_no_agent_owns_it() {
         assert!(controller_may_write_status(None));
         assert!(
@@ -2585,6 +2610,7 @@ mod tests {
         };
         let behind = TargetView::Present {
             observed_generation: 3,
+            condition_generation: 3,
             ready: ConditionStatus::True,
             reason: "Ready".into(),
             message: String::new(),
@@ -2593,6 +2619,7 @@ mod tests {
 
         let caught_up = TargetView::Present {
             observed_generation: 4,
+            condition_generation: 4,
             ready: ConditionStatus::True,
             reason: "Ready".into(),
             message: String::new(),
@@ -2633,6 +2660,7 @@ mod tests {
             // looked at it, and there is no condition to read.
             let never_reported = TargetView::Present {
                 observed_generation: 0,
+                condition_generation: 0,
                 ready: ConditionStatus::Unknown,
                 reason: String::new(),
                 message: String::new(),
@@ -2658,6 +2686,7 @@ mod tests {
             };
             let not_yet = TargetView::Present {
                 observed_generation: 0,
+                condition_generation: 0,
                 ready: ConditionStatus::Unknown,
                 reason: String::new(),
                 message: String::new(),
@@ -2672,6 +2701,7 @@ mod tests {
         };
         let not_yet = TargetView::Present {
             observed_generation: 0,
+            condition_generation: 0,
             ready: ConditionStatus::Unknown,
             reason: String::new(),
             message: String::new(),
@@ -2706,6 +2736,7 @@ mod tests {
         };
         let failed = TargetView::Present {
             observed_generation: 1,
+            condition_generation: 1,
             ready: ConditionStatus::False,
             reason: "NoValidHost".into(),
             message: "node-a: draining".into(),
@@ -2716,6 +2747,44 @@ mod tests {
             progress.error.as_deref(),
             Some("NoValidHost: node-a: draining"),
             "the caller was left to guess why"
+        );
+    }
+
+    #[test]
+    fn a_current_controller_refusal_finishes_without_an_agent_report() {
+        let spec = OperationSpec {
+            target: "projects/p1/instances/i1".into(),
+            target_generation: 2,
+            verb: "create".into(),
+            requested_by: "someone".into(),
+        };
+        let refused = TargetView::Present {
+            observed_generation: 0,
+            condition_generation: 2,
+            ready: ConditionStatus::False,
+            reason: "NoValidHost".into(),
+            message: "no compute node has enough memory".into(),
+        };
+        let progress = operation_progress(&spec, &refused);
+        assert!(
+            progress.done,
+            "a scheduler refusal cannot wait for a node that was never chosen"
+        );
+        assert_eq!(
+            progress.error.as_deref(),
+            Some("NoValidHost: no compute node has enough memory")
+        );
+
+        let stale = TargetView::Present {
+            observed_generation: 0,
+            condition_generation: 1,
+            ready: ConditionStatus::False,
+            reason: "NoValidHost".into(),
+            message: "no compute node has enough memory".into(),
+        };
+        assert!(
+            !operation_progress(&spec, &stale).done,
+            "an old refusal must not finish a newer request"
         );
     }
 

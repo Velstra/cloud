@@ -192,6 +192,12 @@ struct RbdImage {
     size: u64,
 }
 
+/// The current byte size returned by `rbd info --format json`.
+#[derive(serde::Deserialize)]
+struct RbdInfo {
+    size: u64,
+}
+
 /// One row of `rbd snap ls --format json`.
 #[derive(serde::Deserialize)]
 struct RbdSnap {
@@ -520,18 +526,29 @@ impl Storage for CephPool {
     }
 
     async fn grow(&self, volume: &str, to_gib: u64) -> Result<()> {
+        let target = spec(&self.config.pool, &rbd_name(volume));
+        let info = self.rbd(&["info", &target, "--format", "json"]).await?;
+        let current: RbdInfo = serde_json::from_slice(&info).map_err(|e| {
+            HostError::failed(format!("`rbd info` did not answer with a size: {e}"))
+        })?;
+        let wanted = to_gib.checked_mul(1024 * 1024 * 1024).ok_or_else(|| {
+            HostError::failed("requested volume size exceeds the supported range")
+        })?;
+        if current.size == wanted {
+            return Ok(());
+        }
+        if current.size > wanted {
+            return Err(HostError::failed(format!(
+                "{target} is already larger than the requested {to_gib} GiB; shrinking would discard data"
+            )));
+        }
         // `--allow-shrink` is deliberately not passed. The model refuses to
         // shrink a volume and this is the second lock on the same door: a spec
         // that somehow asked for less would have `rbd` refuse rather than
         // discard whatever is past the new end.
-        self.rbd(&[
-            "resize",
-            "--size",
-            &format!("{to_gib}G"),
-            &spec(&self.config.pool, &rbd_name(volume)),
-        ])
-        .await
-        .map(|_| ())
+        self.rbd(&["resize", "--size", &format!("{to_gib}G"), &target])
+            .await
+            .map(|_| ())
     }
 
     async fn destroy(&self, volume: &str) -> Result<()> {

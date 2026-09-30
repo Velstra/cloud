@@ -1114,6 +1114,114 @@ async fn an_operation_is_done_when_the_target_has_caught_up() {
 }
 
 #[tokio::test]
+async fn a_scheduler_refusal_finishes_the_operation_without_an_agent_report() {
+    let h = Harness::new();
+    let created = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i1", "spec": { "vcpus": 2 } }),
+        )
+        .await;
+    let operation = created.body["operation"].as_str().unwrap();
+    let name = "projects/p1/instances/i1";
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut refused = instances.get(name).await.unwrap().unwrap();
+    assert_eq!(refused.status.observed_generation, 0);
+    refused
+        .status
+        .conditions
+        .push(velstra_cloud_model::meta::Condition::new(
+            "Ready",
+            velstra_cloud_model::meta::ConditionStatus::False,
+            "NoValidHost",
+            "no compute node has enough memory",
+            refused.meta.generation,
+        ));
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "instances", name),
+            serde_json::to_vec(&refused).unwrap(),
+            velstra_cloud_store::Expect::Revision(refused.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    let finished = h.get(operation).await;
+    assert_eq!(finished.body["status"]["done"], true);
+    assert_eq!(
+        finished.body["status"]["error"],
+        "NoValidHost: no compute node has enough memory"
+    );
+
+    let updated = h.patch(name, json!({ "spec": { "vcpus": 3 } })).await;
+    assert_eq!(updated.status, StatusCode::OK);
+    let operations: TypedStore<
+        velstra_cloud_model::resources::OperationSpec,
+        velstra_cloud_model::resources::OperationStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "operations");
+    let mut next = operations.get(operation).await.unwrap().unwrap();
+    next.spec.target_generation = updated.body["meta"]["generation"].as_u64().unwrap();
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "operations", operation),
+            serde_json::to_vec(&next).unwrap(),
+            velstra_cloud_store::Expect::Revision(next.meta.revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.get(operation).await.body["status"]["done"],
+        false,
+        "a prior refusal must not finish the new generation"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_operation_keeps_its_original_outcome_after_a_later_edit() {
+    let h = Harness::new();
+    let created = h
+        .post(
+            "projects/p1/instances",
+            json!({ "id": "i1", "spec": { "vcpus": 2 } }),
+        )
+        .await;
+    let operation = created.body["operation"].as_str().unwrap();
+    let operations: TypedStore<
+        velstra_cloud_model::resources::OperationSpec,
+        velstra_cloud_model::resources::OperationStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "operations");
+    let mut completed = operations.get(operation).await.unwrap().unwrap();
+    completed.status.done = true;
+    completed.status.error = Some("NoValidHost: no node has enough memory".into());
+    completed.status.finished_at = Some(velstra_cloud_model::meta::Timestamp::now());
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "operations", operation),
+            serde_json::to_vec(&completed).unwrap(),
+            velstra_cloud_store::Expect::Revision(completed.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    let updated = h
+        .patch(
+            "projects/p1/instances/i1",
+            json!({ "spec": { "vcpus": 3 } }),
+        )
+        .await;
+    assert_eq!(updated.status, StatusCode::OK);
+    let receipt = h.get(operation).await;
+    assert_eq!(receipt.body["status"]["done"], true);
+    assert_eq!(
+        receipt.body["status"]["error"],
+        "NoValidHost: no node has enough memory"
+    );
+}
+
+#[tokio::test]
 async fn operations_use_the_targets_actual_settlement_contract() {
     let h = Harness::new();
 
@@ -1756,6 +1864,75 @@ async fn running_guest(h: &Harness) -> String {
 }
 
 #[tokio::test]
+async fn a_running_guest_cannot_claim_a_new_nic_it_does_not_have() {
+    let h = Harness::new();
+    let name = running_guest(&h).await;
+    let before = h.get(&name).await;
+    let ports = before.body["spec"]["ports"].clone();
+    assert!(ports.as_array().is_some_and(|ports| !ports.is_empty()));
+
+    let refused = h.patch(&name, json!({ "spec": { "ports": [] } })).await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(refused.body["error"]["field"], "spec.ports");
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Stop the instance")
+    );
+    assert_eq!(h.get(&name).await.body["spec"]["ports"], ports);
+
+    // Restating the same interfaces does not require an outage.
+    let same = h.patch(&name, json!({ "spec": { "ports": ports } })).await;
+    assert_eq!(same.status, StatusCode::OK, "{:?}", same.body);
+}
+
+#[tokio::test]
+async fn network_ports_wait_for_an_observed_stop_before_an_edit() {
+    let h = Harness::new();
+    let name = running_guest(&h).await;
+    let instances: TypedStore<
+        velstra_cloud_model::resources::InstanceSpec,
+        velstra_cloud_model::resources::InstanceStatus,
+    > = TypedStore::new(h.store.clone(), "cell-1", "instances");
+    let mut guest = instances.get(&name).await.unwrap().unwrap();
+    guest.status.state = velstra_cloud_model::resources::InstanceState::Unknown;
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "instances", &name),
+            serde_json::to_vec(&guest).unwrap(),
+            velstra_cloud_store::Expect::Revision(guest.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    // A requested start can race this edit even before the node reports
+    // Running. The guest must be stopped in both spec and observation.
+    let refused = h.patch(&name, json!({ "spec": { "ports": [] } })).await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+
+    let stopped = h
+        .patch(&name, json!({ "spec": { "desiredState": "Stopped" } }))
+        .await;
+    assert_eq!(stopped.status, StatusCode::OK, "{:?}", stopped.body);
+    let still_refused = h.patch(&name, json!({ "spec": { "ports": [] } })).await;
+    assert_eq!(still_refused.error_code(), "FAILED_PRECONDITION");
+
+    let mut guest = instances.get(&name).await.unwrap().unwrap();
+    guest.status.state = velstra_cloud_model::resources::InstanceState::Stopped;
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "instances", &name),
+            serde_json::to_vec(&guest).unwrap(),
+            velstra_cloud_store::Expect::Revision(guest.meta.revision),
+        )
+        .await
+        .unwrap();
+    let accepted = h.patch(&name, json!({ "spec": { "ports": [] } })).await;
+    assert_eq!(accepted.status, StatusCode::OK, "{:?}", accepted.body);
+}
+
+#[tokio::test]
 async fn explain_migration_gives_every_node_a_verdict() {
     // Placement and migration ask different questions. A scheduler picks, so
     // `:explainPlacement` answers with the one it picked; a person picks, so
@@ -2166,6 +2343,55 @@ async fn a_migration_that_ran_out_of_time_reports_it_with_nothing_running() {
         condition["lastTransition"],
         "two reads disagreed about when it gave up"
     );
+}
+
+#[tokio::test]
+async fn a_destination_error_does_not_hide_an_expired_migration() {
+    let h = Harness::new();
+    two_nodes(&h).await;
+    running_guest(&h).await;
+    migrate(&h).await;
+
+    let store = migrations(&h);
+    let mut migration = store
+        .get("projects/p1/migrations/m1")
+        .await
+        .unwrap()
+        .unwrap();
+    migration.meta.created_at = velstra_cloud_model::meta::Timestamp(
+        velstra_cloud_model::meta::Timestamp::now().0 - 3_600_000,
+    );
+    migration.spec.timeout_s = 60;
+    migration.status.conditions.push(Condition::new(
+        "HostActions",
+        velstra_cloud_model::meta::ConditionStatus::False,
+        "HostError",
+        "receiver TLS credentials are unavailable",
+        migration.meta.generation,
+    ));
+    // Metadata and host status have separate writers in production; set up
+    // their combined stored result directly for this read-path regression.
+    h.store
+        .put(
+            &velstra_cloud_store::key_for("cell-1", "migrations", "projects/p1/migrations/m1"),
+            serde_json::to_vec(&migration).unwrap(),
+            velstra_cloud_store::Expect::Revision(migration.meta.revision),
+        )
+        .await
+        .unwrap();
+
+    for path in ["projects/p1/migrations/m1", "projects/p1/migrations"] {
+        let answer = h.get(path).await;
+        let migration = if path.ends_with("/m1") {
+            &answer.body
+        } else {
+            &answer.body["items"][0]
+        };
+        let condition = moved(migration).unwrap();
+        assert_eq!(condition["status"], "False", "{condition}");
+        assert_eq!(condition["reason"], "Timeout", "{condition}");
+        assert!(condition["message"].as_str().unwrap().contains("node-a"));
+    }
 }
 
 #[tokio::test]

@@ -4238,10 +4238,9 @@ const OPERATION_FIELDS: &[Field] = &[
         },
         required: false,
         advanced: false,
-        help: "Which version of the target's spec this was asked against. The \
-               operation is finished when the target reports having caught up \
-               with that version — which is why it cannot disagree with the \
-               object it describes.",
+        help: "Which version of the target's spec this request concerns. A \
+               pending operation follows that version's progress; once finished, \
+               its outcome is retained even if the target changes again.",
         when_empty: "",
         derived: true,
         at_creation: false,
@@ -6098,10 +6097,8 @@ pub const COLLECTIONS: &[Collection] = &[
         group: "Records",
         scope: Scope::Project,
         audience: Audience::Plumbing,
-        blurb: "Something that could not finish inside a request. Finished is \
-                computed from the target itself — whether the object has caught \
-                up with what was asked of it — so an operation cannot disagree \
-                with the thing it describes.",
+        blurb: "Track long-running requests and their outcomes. Pending progress \
+                follows the target; completed results are retained.",
         empty: "",
         fields: OPERATION_FIELDS,
         columns: &[
