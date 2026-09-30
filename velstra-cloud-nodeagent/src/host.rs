@@ -415,6 +415,13 @@ pub trait Vmm: Send + Sync + 'static {
 
     async fn close_volume(&self, instance: &str, volume: &str) -> Result<()>;
 
+    /// Finish backend cleanup after the guest device has disappeared. QEMU can
+    /// remove the device asynchronously while its block node still holds the
+    /// storage image open; other VMMs have no second cleanup step.
+    async fn cleanup_detached_volume(&self, _instance: &str, _volume: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// What this machine has. Reported, never assumed by a scheduler.
     async fn capacity(&self) -> Result<Capacity>;
 

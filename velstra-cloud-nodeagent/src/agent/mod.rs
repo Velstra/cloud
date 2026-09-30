@@ -2599,11 +2599,29 @@ impl Agent {
             };
         }
 
+        // A disappearing QEMU device does not prove that its block node has
+        // closed the backing image. Retry that second cleanup step even when
+        // query-block no longer lists the attachment; a failed attempt must
+        // keep the finalizer until the storage handle is really gone.
+        if stored.meta.is_deleting()
+            && !host.volumes.contains_key(&volume)
+            && host.vms.get(&stored.spec.instance).is_some_and(|vm| {
+                vm.state == velstra_cloud_model::resources::InstanceState::Running
+            })
+            && let Err(e) = self
+                .vmm
+                .cleanup_detached_volume(&stored.spec.instance, &volume)
+                .await
+        {
+            outcome = Err(e.to_string());
+        }
+
         // The same observation as for an instance: the node has let go when
         // the volume is not open here. Two nodes with one volume open is the
         // failure the whole finalizer dance exists to prevent, so the signal a
         // controller acts on is a fact rather than an inference.
-        let released = stored.meta.is_deleting() && !host.volumes.contains_key(&volume);
+        let released =
+            stored.meta.is_deleting() && !host.volumes.contains_key(&volume) && outcome.is_ok();
 
         let mut next = stored.clone();
         next.status.node = Some(self.config.node.clone());
