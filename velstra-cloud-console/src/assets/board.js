@@ -504,7 +504,7 @@ function renderBoard() {
   // board somebody has reached on their first day.
   empty.textContent = !emptyShown ? "" :
     (coll.empty || "No " + coll.title.toLowerCase() + " here yet.") +
-    (coll.creatable && allows("create") ? " Create the first one above." : "");
+    (coll.creatable && allows("create", coll) ? " Create the first one above." : "");
   $("board").classList.toggle("hidden", rows.length === 0);
   renderPicked();
 }
@@ -526,7 +526,7 @@ function bulkActions(coll) {
   // Start, Stop and Delete over the same rows — three presses whose only
   // outcome was "0 done, 1 refused". The session says the rung outright; there
   // was never a reason to ask the API by pressing.
-  if (coll.id === "instances" && allows("edit")) {
+  if (coll.id === "instances" && allows("edit", coll)) {
     out.push({ id: "start", label: "Start", body: { spec: { desiredState: "Running" } } });
     // Stopping is not a change of shape, it is the machine going away for a
     // while, and forty of them go away together. It asks, like Delete.
@@ -546,7 +546,7 @@ function bulkActions(coll) {
   if (coll.id === "nodes" && session.who && session.who.cellAdmin) {
     out.push({ id: "upgrade", label: "Upgrade\u2026", upgrade: true });
   }
-  if (coll.deletable && mayDelete && coll.id !== "migrations" && allows("create")) {
+  if (coll.deletable && mayDelete && coll.id !== "migrations" && allows("create", coll)) {
     out.push({ id: "delete", label: "Delete", destroys: true, asks: true });
   }
   return out;
@@ -742,7 +742,7 @@ function renderListHead() {
   // exists where pressing it can work.
   const OPERATOR_WRITES = ["flavors"];
   const mayCreate = (!OPERATOR_WRITES.includes(coll.id) || (session.who && session.who.cellAdmin))
-    && allows("create");
+    && allows("create", coll);
   if (coll.creatable && mayCreate) {
     acts.appendChild(btn("New " + coll.singular, { primary: true, id: "newbtn", onclick: () => openCreate(coll) }));
   }

@@ -47,7 +47,7 @@ use crate::{
     roles::{Role, render_list},
     wizard::{
         ask_valid, ask_valid_or, ask_yes, prompt, prompt_secret, validate_interface, validate_ip,
-        validate_node_name, validate_srv6_locator, validate_token, validate_url,
+        validate_node_name, validate_srv6_locator, validate_token, validate_url, validate_url_list,
     },
 };
 
@@ -1396,9 +1396,9 @@ fn collect() -> Result<Option<Machine>> {
         println!("localhost by default — reaching it from here may mean widening it, and that");
         println!("channel can reconfigure any node in the cell.");
         let orchestrator = ask_valid(
-            "Orchestrator URL (http://host:50052): ",
-            validate_url,
-            "a URL with a scheme and a host",
+            "Orchestrator URLs (comma-separated for HA): ",
+            validate_url_list,
+            "HTTP or HTTPS URLs with hosts and a consistent scheme",
         )?;
         let mut fabric = Fabric {
             orchestrator,
@@ -1409,9 +1409,9 @@ fn collect() -> Result<Option<Machine>> {
         };
         if roles.contains(&Role::Hypervisor) {
             fabric.control = ask_valid(
-                "Config service URL (http://host:50051): ",
-                validate_url,
-                "a URL with a scheme and a host",
+                "Config service URLs (comma-separated for HA): ",
+                validate_url_list,
+                "HTTP or HTTPS URLs with hosts and a consistent scheme",
             )?;
             println!("\nThis host's place on the wire. The VTEP address is stated rather than");
             println!("guessed: nothing here can tell which of this machine's addresses its peers");

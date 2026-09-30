@@ -355,6 +355,7 @@ async fn whoami(
         Some(token) => api.identity().session_present(&token).await,
         None => false,
     };
+    let (projects, capabilities) = api.project_access(&who).await?;
     Ok(Json(serde_json::json!({
         "subject": who.subject,
         "displayName": record
@@ -366,9 +367,10 @@ async fn whoami(
         // record behind those, so there is nothing for a sign-out to end and the
         // console should not offer one.
         "session": session,
-        // The strongest rung held in each project, by id — so a console draws
-        // the buttons an account can use and not every button plus a refusal.
-        "projects": api.project_roles(&who).await,
+        // Keep the display role for existing clients. Effective permissions
+        // account for every binding, including inherited and custom roles.
+        "projects": projects,
+        "capabilities": capabilities,
         // Which cell answered. A node being joined holds an address and a
         // registration token and has read nothing else, so the region and the
         // cell are two answers it would otherwise have to be told twice — once

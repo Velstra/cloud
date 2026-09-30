@@ -704,7 +704,7 @@ fn fixed_paths(paths: &mut Map<String, Value>) {
     paths.insert("/api/v1/sessions/current".into(), json!({
         "get": {
             "tags": ["Sessions"],
-            "summary": "Who this token is, and what it may do (`cellAdmin`, and the strongest rung per project).",
+            "summary": "Who this token is, including effective permissions for every bound project and collection.",
             "operationId": "whoami",
             "responses": {
                 "200": { "description": "The caller.", "content": { "application/json": { "schema": {
@@ -713,7 +713,9 @@ fn fixed_paths(paths: &mut Map<String, Value>) {
                         "subject": { "type": "string" },
                         "displayName": { "type": "string" },
                         "cellAdmin": { "type": "boolean" },
-                        "projects": { "type": "object", "additionalProperties": { "type": "string", "enum": ["viewer", "operator", "editor", "admin"] } },
+                        "session": { "type": "boolean" },
+                        "projects": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "capabilities": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string", "enum": ["read", "operate", "write", "administer"] } } } },
                     },
                 } } } },
                 "default": error_response(),

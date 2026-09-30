@@ -17,27 +17,52 @@ if [ ! -x "$agent" ]; then
   echo "Fabric data-plane agent is not installed at $agent" >&2
   exit 1
 fi
-if [ "${1:-}" = --check ]; then
-  exit 0
-fi
-
-set -- run --controller "$VELSTRA_FABRIC_CONTROL" --node-id "$VELSTRA_NODE" \
-  --iface "$VELSTRA_FABRIC_UNDERLAY"
+check_mode=${1:-}
+set -- run --node-id "$VELSTRA_NODE" --iface "$VELSTRA_FABRIC_UNDERLAY"
+remaining=$VELSTRA_FABRIC_CONTROL
+transport=
+while :; do
+  case "$remaining" in
+    *,*) endpoint=${remaining%%,*}; remaining=${remaining#*,} ;;
+    *) endpoint=$remaining; remaining= ;;
+  esac
+  case "$endpoint" in
+    *@*) echo 'fabric config service URLs must not contain embedded credentials' >&2; exit 1 ;;
+  esac
+  case "$endpoint" in
+    https://?*) scheme=https ;;
+    http://?*) scheme=http ;;
+    *) echo 'VELSTRA_FABRIC_CONTROL must contain HTTP or HTTPS URLs with hosts' >&2; exit 1 ;;
+  esac
+  if [ -n "$transport" ] && [ "$scheme" != "$transport" ]; then
+    echo 'fabric config service URLs must use the same scheme' >&2
+    exit 1
+  fi
+  transport=$scheme
+  set -- "$@" --controller "$endpoint"
+  [ -n "$remaining" ] || break
+done
 case "$VELSTRA_FABRIC_CONTROL" in
-  https://*)
+  *,) echo 'VELSTRA_FABRIC_CONTROL has an empty final URL' >&2; exit 1 ;;
+esac
+case "$transport" in
+  https)
     : "${VELSTRA_FABRIC_AGENT_CA:?HTTPS fabric requires VELSTRA_FABRIC_AGENT_CA}" \
       "${VELSTRA_FABRIC_AGENT_CERT:?HTTPS fabric requires VELSTRA_FABRIC_AGENT_CERT}" \
       "${VELSTRA_FABRIC_AGENT_KEY:?HTTPS fabric requires VELSTRA_FABRIC_AGENT_KEY}"
     set -- "$@" --tls-ca "$VELSTRA_FABRIC_AGENT_CA" \
       --tls-cert "$VELSTRA_FABRIC_AGENT_CERT" --tls-key "$VELSTRA_FABRIC_AGENT_KEY"
     ;;
-  http://*)
+  http)
     if [ -n "${VELSTRA_FABRIC_AGENT_CA:-}${VELSTRA_FABRIC_AGENT_CERT:-}${VELSTRA_FABRIC_AGENT_KEY:-}" ]; then
       echo 'fabric client credentials require HTTPS' >&2
       exit 1
     fi
     ;;
-  *) echo 'VELSTRA_FABRIC_CONTROL must use HTTP or HTTPS' >&2; exit 1 ;;
 esac
+
+if [ "$check_mode" = --check ]; then
+  exit 0
+fi
 
 exec "$agent" "$@"

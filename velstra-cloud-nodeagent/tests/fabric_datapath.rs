@@ -410,15 +410,19 @@ async fn a_port_with_rules_reaches_the_fabric() {
         .iter()
         .find(|g| g.name == format!("cloud:{PORT}"))
         .expect("the port's rules never reached the fabric");
-    // Two rules in, three out: 8000-8001 is a range and the fabric keys one port.
-    assert_eq!(group.rules.len(), 3, "{:?}", group.rules);
+    // Three tenant rules plus the DHCP bootstrap allowance.
+    assert_eq!(group.rules.len(), 4, "{:?}", group.rules);
     let mut ports_allowed: Vec<u32> = group.rules.iter().map(|r| r.port).collect();
     ports_allowed.sort_unstable();
-    assert_eq!(ports_allowed, vec![443, 8000, 8001]);
+    assert_eq!(ports_allowed, vec![68, 443, 8000, 8001]);
     assert_eq!(
         group.default_action,
-        pb::Action::Drop as i32,
-        "an empty allowance list has to be a closed port, not an open one"
+        pb::Action::Pass as i32,
+        "guest-originated traffic must pass by default"
+    );
+    assert!(
+        group.egress_default_drop,
+        "unsolicited guest ingress must be denied"
     );
 
     // Restating is what keeps a port current as its groups' members come and go.
@@ -440,7 +444,7 @@ async fn a_port_with_rules_reaches_the_fabric() {
         .expect("the group vanished when it was restated");
     assert_eq!(
         group.rules.len(),
-        1,
+        2,
         "restating the rules did not replace them: {:?}",
         group.rules
     );
@@ -627,6 +631,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
         .add_security_group(pb::SecurityGroupSpec {
             name: group.clone(),
             default_action: pb::Action::Drop as i32,
+            egress_default_drop: false,
             drop_icmp: false,
             stateful: true,
             blocklist: Vec::new(),
@@ -718,6 +723,7 @@ async fn unprogramming_a_port_leaves_the_fabric_holding_nothing() {
         .add_security_group(pb::SecurityGroupSpec {
             name: group.clone(),
             default_action: pb::Action::Drop as i32,
+            egress_default_drop: false,
             drop_icmp: false,
             stateful: true,
             blocklist: Vec::new(),

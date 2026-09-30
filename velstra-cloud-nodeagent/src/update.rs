@@ -586,9 +586,8 @@ mod tests {
 
     #[test]
     fn an_interrupted_update_is_not_replayed_and_attempts_are_exclusive() {
-        let dir =
-            std::env::temp_dir().join(format!("velstra-update-restart-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().join("restart");
         let w = wanted();
         let lock = record_attempt(&dir, &w).unwrap();
         let other = Wanted {
@@ -610,7 +609,20 @@ mod tests {
             Decision::Say(ConditionStatus::False, "UpToDate", _)
         ));
         assert!(record_attempt(&dir, &w).is_err());
-        clear_attempt(&dir).unwrap();
+        // Other tests spawn processes in parallel. A released lock may remain
+        // transiently busy while an inherited descriptor is still closing;
+        // the required invariant is that it becomes clear, not that one
+        // nonblocking attempt succeeds at a particular instant.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match clear_attempt(&dir) {
+                Ok(()) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("clearing the released lock stayed blocked: {error}"),
+            }
+        }
         assert_eq!(read_attempt(&dir), Phase::Idle);
         drop(record_attempt(&dir, &w).unwrap());
         std::fs::remove_dir_all(dir).unwrap();

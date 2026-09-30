@@ -709,6 +709,8 @@ pub fn migration_condition(
     }
     // Checked after arrival, never before: a guest that landed on second 3601
     // landed. Only a migration that is still not there has run out of time.
+    // Checked before a destination error: a persistent failure must not leave
+    // this request in an in-progress state indefinitely after its deadline.
     if age_s > u64::from(migration.spec.timeout_s) {
         let where_it_is = instance
             .status
@@ -723,6 +725,17 @@ pub fn migration_condition(
                 "gave up after {}s; the guest is on {where_it_is}",
                 migration.spec.timeout_s
             ),
+            at,
+        );
+    }
+    if let Some(failure) = migration.status.conditions.iter().find(|condition| {
+        condition.kind == "HostActions" && condition.status == ConditionStatus::False
+    }) {
+        return Condition::new(
+            "Moved",
+            ConditionStatus::Unknown,
+            "DestinationError",
+            &failure.message,
             at,
         );
     }
@@ -783,21 +796,33 @@ pub fn migration_condition(
         };
         return Condition::new("Moved", ConditionStatus::Unknown, reason, &message, at);
     }
-    if !migration.status.receiver_ready {
-        return Condition::new(
-            "Moved",
-            ConditionStatus::Unknown,
-            "PreparingReceiver",
-            &format!("{} is not listening yet", migration.spec.to_node),
-            at,
-        );
-    }
     if instance.status.node.is_none() {
         return Condition::new(
             "Moved",
             ConditionStatus::Unknown,
             "HandingOver",
             "the source has let go and the destination has not claimed it yet",
+            at,
+        );
+    }
+    if instance.status.node.as_deref() == Some(migration.spec.to_node.as_str()) {
+        return Condition::new(
+            "Moved",
+            ConditionStatus::Unknown,
+            "StartingDestination",
+            &format!(
+                "{} has claimed the guest and is starting it",
+                migration.spec.to_node
+            ),
+            at,
+        );
+    }
+    if !migration.status.receiver_ready {
+        return Condition::new(
+            "Moved",
+            ConditionStatus::Unknown,
+            "PreparingReceiver",
+            &format!("{} is not listening yet", migration.spec.to_node),
             at,
         );
     }
@@ -1570,6 +1595,18 @@ mod tests {
     }
 
     #[test]
+    fn a_receiver_that_closed_after_handover_does_not_look_unprepared() {
+        let m = migration("node-b");
+        let mut i = instance(InstanceState::Unknown, None);
+        assert_eq!(migration_condition(&m, Some(&i), 5).reason, "HandingOver");
+        i.status.node = Some("node-b".into());
+        assert_eq!(
+            migration_condition(&m, Some(&i), 5).reason,
+            "StartingDestination"
+        );
+    }
+
+    #[test]
     fn a_reboot_move_reports_its_handover_instead_of_waiting_for_a_receiver() {
         let mut m = migration("node-b");
         m.spec.mode = MigrationMode::Reboot;
@@ -1617,6 +1654,30 @@ mod tests {
         assert_eq!(condition.status, ConditionStatus::Unknown);
         assert_eq!(condition.reason, "SourceError");
         assert!(condition.message.contains("QMP monitor"));
+    }
+
+    #[test]
+    fn a_destination_failure_is_visible_before_a_receiver_exists() {
+        let mut m = migration("node-b");
+        m.status.conditions.push(Condition::new(
+            "HostActions",
+            ConditionStatus::False,
+            "HostError",
+            "network migration requires X.509 certificates",
+            m.meta.generation,
+        ));
+        let i = instance(InstanceState::Running, Some("node-a"));
+        let condition = migration_condition(&m, Some(&i), 1);
+        assert_eq!(condition.reason, "DestinationError");
+        assert!(condition.message.contains("X.509"));
+
+        // A destination that remains broken after the deadline used to keep
+        // this migration in DestinationError/Unknown forever, hiding its
+        // terminal timeout from both the API and the console.
+        let expired = migration_condition(&m, Some(&i), u64::from(m.spec.timeout_s) + 1);
+        assert_eq!(expired.status, ConditionStatus::False);
+        assert_eq!(expired.reason, "Timeout");
+        assert!(expired.message.contains("node-a"));
     }
 
     #[test]

@@ -351,8 +351,8 @@ function pendingBlock(r) {
 
 function verdictBlock(coll, r) {
   const v = verdict(r, coll.condition);
-  const box = el("div.verdict." + v.kind,
-    el("div.head", mark(v.kind), v.word),
+  const box = el("div.verdict." + (v.tone || v.kind),
+    el("div.head", mark(v.tone || v.kind), v.word),
     el("div.why.muted", v.why));
 
   const gen = generation(r), obs = observed(r);
@@ -1426,14 +1426,14 @@ function renderSheet(coll, r) {
   // power, attach — the API refuses the rest of the form for them), a viewer
   // gets neither. Drawn from `whoami`, so the button that appears is one
   // that will be accepted.
-  if (coll.editable && holdsThePen && allows("edit")) {
+  if (coll.editable && holdsThePen && allows("edit", coll)) {
     acts.appendChild(btn("Edit", { primary: true, id: "editbtn", onclick: () => openEdit(coll, r) }));
   }
   // Power, beside the rest, on the machine it is about. The same rung as Edit,
   // and for the same reason: the API treats a change of desired state as one of
   // the things an operator may do, so the button that appears is one that will
   // be accepted.
-  if (coll.id === "instances" && allows("edit")) {
+  if (coll.id === "instances" && allows("edit", coll)) {
     acts.appendChild(powerControl(coll, r));
   }
   // Placement is a statement about the machine room, and the API refuses the
@@ -1464,7 +1464,7 @@ function renderSheet(coll, r) {
   // Abandoning a migration is not deleting a row: what it costs depends on the
   // mode, and the sentence is different enough that it is written where the
   // modes are.
-  if (coll.deletable && holdsThePen && allows("delete")
+  if (coll.deletable && holdsThePen && allows("delete", coll)
       && (coll.id !== "audit" || (session.who && session.who.cellAdmin))) {
     acts.appendChild(coll.id === "migrations"
       ? deleteControl(coll, r, abandonAsk(r))

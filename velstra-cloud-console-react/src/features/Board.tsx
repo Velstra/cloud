@@ -18,7 +18,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import { call } from "@/api/transport";
-import { cellText, idOf, nameOf, verdict, VERDICT_ORDER, type Resource, type Verdict } from "@/lib/model";
+import { cellText, idOf, nameOf, verdict, VERDICT_ORDER, VERDICT_WORD, type Resource, type Verdict } from "@/lib/model";
 import { ALL, at, basePath, projectOf, routeId, type Collection } from "@/lib/schema";
 import { entry, collectionActions } from "@/registry";
 import { getState, setState, useStore } from "@/app/store";
@@ -51,13 +51,21 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
   const [selection, setSelection] = useState<Record<string, boolean>>({});
   const can = useCan();
   const [cursor, setCursor] = useState(0);
+  useEffect(() => { setSelection({}); setCursor(0); }, [coll.id, project]);
   // Beside an open detail the board is a list, not a table: the name, the
   // verdict and one column that tells rows apart. Ten columns in the width
   // that is left were an ellipsis in every cell — and the person reading the
   // detail was not reading them anyway. Every column comes back the moment the
   // detail closes, or on the switch for whoever wants it now.
   const [full, setFull] = useState(false);
-  const asList = !!narrow && !full;
+  const [mobile, setMobile] = useState(() => matchMedia("(max-width: 640px)").matches);
+  useEffect(() => {
+    const query = matchMedia("(max-width: 640px)");
+    const changed = () => setMobile(query.matches);
+    query.addEventListener("change", changed);
+    return () => query.removeEventListener("change", changed);
+  }, []);
+  const asList = (!!narrow || mobile) && !full;
   const custom = entry(coll.id);
 
   const rows = useMemo(() => {
@@ -73,32 +81,33 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
 
   const columns = useMemo<ColumnDef<Resource>[]>(() => [
     {
-      id: "pick", size: 36, enableSorting: false, enableHiding: false,
+      id: "pick", size: mobile && asList ? 32 : 36, enableSorting: false, enableHiding: false,
       header: ({ table }) => (
-        <Checkbox aria-label="Select every row"
+        table.getRowModel().rows.some((row) => row.getCanSelect()) ? <Checkbox aria-label="Select every row"
           checked={table.getIsAllRowsSelected()} indeterminate={!table.getIsAllRowsSelected() && table.getIsSomeRowsSelected()}
-          onCheckedChange={(v) => table.toggleAllRowsSelected(!!v)} />
+          onCheckedChange={(v) => table.toggleAllRowsSelected(!!v)} /> : null
       ),
       cell: ({ row }) => (
-        <Checkbox aria-label={`Select ${idOf(row.original)}`} checked={row.getIsSelected()}
+        row.getCanSelect() ? <Checkbox aria-label={`Select ${idOf(row.original)}`} checked={row.getIsSelected()}
           onCheckedChange={(v) => row.toggleSelected(!!v)} onClick={(e) => e.stopPropagation()} />
+          : null
       ),
     },
     {
-      id: "name", accessorFn: (r) => idOf(r), header: coll.singular === "project" ? "Project" : "Name", size: 240,
-      cell: ({ row }) => <span className="font-medium" style={{ color: "var(--text-strong)" }}>{idOf(row.original)}</span>,
+      id: "name", accessorFn: (r) => idOf(r), header: coll.singular === "project" ? "Project" : "Name", size: mobile && asList ? 165 : 240,
+      cell: ({ row }) => <span className="flex min-w-0 flex-col" style={{ color: "var(--text-strong)" }}><span className="truncate font-medium">{idOf(row.original)}</span>{mobile && asList && project === ALL && coll.scope === "project" && <span className="truncate font-mono text-[11px] text-muted-foreground">{projectOf(nameOf(row.original))}</span>}</span>,
     },
-    ...(coll.condition !== "" ? [...(project === ALL && coll.scope === "project" ? [{
+    ...(coll.condition !== "" ? [...(project === ALL && coll.scope === "project" && !(mobile && asList) ? [{
       id: "project", accessorFn: (r: Resource) => projectOf(nameOf(r)) ?? "", header: "Project", size: 140,
       cell: (x: { getValue: () => unknown }) => <span className="font-mono text-xs" style={{ color: "var(--text-muted)" }}>{String(x.getValue() ?? "")}</span>,
     }] : []),
     {
-      id: "verdict", accessorFn: (r: Resource) => VERDICT_ORDER[verdict(r, coll).kind], header: "Status", size: 160,
+      id: "verdict", accessorFn: (r: Resource) => VERDICT_ORDER[verdict(r, coll).kind], header: "Status", size: mobile && asList ? 130 : 160,
       cell: ({ row }: { row: { original: Resource } }) => <State of={row.original} coll={coll} />,
     }] : []),
     // The one column that tells rows apart: the first that carries a word or
     // a name, not a yes/no or a count.
-    ...(asList ? [coll.columns.find((c) => c.cell === "text" || c.cell === "mono") ?? coll.columns[0]].filter(Boolean) : coll.columns).map<ColumnDef<Resource>>((c) => ({
+    ...(asList ? mobile ? [] : [coll.columns.find((c) => c.cell === "text" || c.cell === "mono") ?? coll.columns[0]].filter(Boolean) : coll.columns).map<ColumnDef<Resource>>((c) => ({
       id: c.path, accessorFn: (r) => at(r, c.path) as any, header: c.label, size: Math.max(c.width, 120),
       cell: ({ row }) => {
         const override = custom.cells?.[c.path];
@@ -113,15 +122,21 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
         );
       },
     })),
-  ], [coll, custom, asList]);
+  ], [coll, custom, asList, mobile, project]);
 
+  const maySelect = (r: Resource) => {
+    const here = projectOf(nameOf(r)) ?? project;
+    if (coll.id === "instances") return can("operate", coll, here);
+    if (coll.id === "nodes") return can("administer", coll, here);
+    return coll.deletable && can("write", coll, here);
+  };
   const table = useReactTable({
     data: rows, columns, getRowId: (r) => nameOf(r),
     state: { sorting, columnVisibility: visibility, globalFilter, rowSelection: selection },
     onSortingChange: setSorting, onColumnVisibilityChange: setVisibility,
     onGlobalFilterChange: setGlobalFilter, onRowSelectionChange: setSelection,
     getCoreRowModel: getCoreRowModel(), getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(), enableRowSelection: true,
+    getFilteredRowModel: getFilteredRowModel(), enableRowSelection: (row) => maySelect(row.original),
     globalFilterFn: (row, _c, q) => JSON.stringify(row.original).toLowerCase().includes(String(q).toLowerCase()),
   });
   const visible = table.getRowModel().rows;
@@ -142,9 +157,13 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
   // reach the filter, and typing j into it should type j.
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
-      // A key can arrive on the document itself, which has no ancestors to ask.
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+      // The board's shortcuts must never steal activation from a focused
+      // control. A key can arrive on the document itself, which has no
+      // ancestors to ask.
       const t = e.target;
-      if (t instanceof Element && t.closest("input, textarea, select, [role=dialog], [cmdk-root]")) return;
+      if (t instanceof Element && t.closest("input, textarea, select, button, a[href], summary, [contenteditable], [role=button], [role=checkbox], [role=combobox], [role=dialog], [role=listbox], [role=menu], [role=menuitem], [role=tab], [cmdk-root]")) return;
+      if (!visible.length) return;
       if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); setCursor((c) => Math.min(visible.length - 1, c + 1)); }
       else if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); setCursor((c) => Math.max(0, c - 1)); }
       else if (e.key === "Enter" && visible[cursor]) go({ view: "board", coll: coll.id, id: routeId(coll, visible[cursor].original, project) });
@@ -153,10 +172,13 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
       else if (e.key === "Escape") { setSelection({}); setKind(null); }
     };
     addEventListener("keydown", on); return () => removeEventListener("keydown", on);
-  }, [visible, cursor, coll.id]);
-  useEffect(() => { virt.scrollToIndex(cursor); }, [cursor, virt]);
+  }, [visible, cursor, coll.id, project]);
+  useEffect(() => { setCursor((c) => Math.min(c, Math.max(visible.length - 1, 0))); }, [visible.length]);
+  useEffect(() => { if (visible.length) virt.scrollToIndex(cursor); }, [cursor, visible.length, virt]);
 
-  const picked = Object.keys(selection).filter((k) => selection[k]);
+  const selectable = new Set(rows.filter(maySelect).map(nameOf));
+  const picked = Object.keys(selection).filter((k) => selection[k] && selectable.has(k));
+  const pickedCanWrite = picked.every((name) => can("write", coll, projectOf(name) ?? project));
   const bulk = async (label: string, body: unknown | null, destructive = false) => {
     // **Named, not counted.** "Delete 12?" is a number somebody agrees with;
     // seeing `db-1` in the list is what makes them stop.
@@ -216,13 +238,13 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
                 className="inline-flex items-center gap-1.5 rounded-[3px] border px-2 py-0.5 text-xs font-medium"
                 style={{ background: "var(--surface-sunken)", borderColor: kind === k ? "var(--focus-ring)" : "var(--border)", color: kind === k ? "var(--text-strong)" : "var(--text-body)" }}>
                 <span className="size-[7px] rounded-full" style={{ background: `var(--dot-${k === "unreported" ? "muted" : k})` }} />
-                {counts[k]} {k}
+                {counts[k]} {VERDICT_WORD[k].toLowerCase()}
               </button>
             ))}
           </div>
         )}
-        <div className="ml-auto flex items-center gap-2">
-          {collectionActions(coll.id, !!who?.cellAdmin).map((a) => (
+        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2 max-sm:ml-0 max-sm:w-full max-sm:justify-start">
+          {collectionActions(coll.id, !!who?.cellAdmin).filter(() => can("operate", coll)).map((a) => (
             <Pressed key={a.id} size="sm" title={a.summary} variant="secondary" onPress={async () => {
               try {
                 const r = await call(a.id, a.method, a.path.replace("{project}", project), undefined, a.needsBody ? {} : undefined);
@@ -230,7 +252,7 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
               } catch (e) { toast.error((e as Error).message); }
             }}>{a.label}</Pressed>
           ))}
-          {narrow && (
+          {(narrow || mobile) && (
             <Button size="sm" variant="ghost" aria-pressed={full} onClick={() => setFull((f) => !f)} title={full ? "Back to the list" : "Every column, scrolling sideways"}>
               {full ? "As a list" : "All columns"}
             </Button>
@@ -259,7 +281,7 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
             <Button size="sm" variant="secondary" onClick={() => bulk("Stop", { spec: { desiredState: "Stopped" } })}>Stop</Button>
           </>}
           {coll.id === "nodes" && <UpgradeButton picked={picked} onDone={() => { setSelection({}); loaded.refresh(); }} />}
-          {coll.deletable && <Button size="sm" variant="destructive" onClick={() => bulk("Delete", null, true)}>Delete</Button>}
+          {coll.deletable && pickedCanWrite && <Button size="sm" variant="destructive" onClick={() => bulk("Delete", null, true)}>Delete</Button>}
           <Button size="sm" variant="ghost" className="ml-auto" onClick={() => setSelection({})}>Clear</Button>
         </div>
       )}

@@ -35,18 +35,89 @@ pub use tonic::Status;
 
 /// Connect to the fabric's orchestrator.
 ///
-/// A plain helper rather than a wrapper type: every caller wants the generated
-/// client, and a type that only forwarded to it would be one more thing to read
-/// before finding out it does nothing.
+/// A single endpoint retains the original wire contract. With a comma-separated
+/// list, each controller is asked whether it currently leads before returning
+/// a client for mutations. The next reconcile re-discovers leadership after a
+/// failover; a follower must never make an otherwise healthy tenant port look
+/// permanently refused just because it was first in the configured list.
 pub type ConnectError = Box<dyn std::error::Error + Send + Sync>;
 
-pub async fn connect(endpoint: &str) -> Result<Connected, ConnectError> {
+type LeaderCache = std::sync::Mutex<std::collections::HashMap<String, String>>;
+static LAST_LEADER: std::sync::OnceLock<LeaderCache> = std::sync::OnceLock::new();
+
+fn endpoints(configured: &str) -> Result<Vec<&str>, ConnectError> {
+    let entries: Vec<_> = configured.split(',').map(str::trim).collect();
+    if entries.iter().any(|e| e.is_empty()) {
+        return Err("fabric endpoint list contains an empty URL".into());
+    }
+    if entries.iter().any(|e| e.contains('@')) {
+        return Err("fabric endpoints must not contain embedded credentials".into());
+    }
+    let scheme = if entries[0].starts_with("https://") {
+        "https://"
+    } else if entries[0].starts_with("http://") {
+        "http://"
+    } else {
+        return Err("fabric endpoint must use HTTP or HTTPS".into());
+    };
+    if entries.iter().any(|e| !e.starts_with(scheme)) {
+        return Err("all fabric endpoints must use the same HTTP or HTTPS scheme".into());
+    }
+    Ok(entries)
+}
+
+pub async fn connect(configured: &str) -> Result<Connected, ConnectError> {
+    let mut entries = endpoints(configured)?;
+    if entries.len() == 1 {
+        return connect_one(entries[0], 5).await;
+    }
+    // A controller or node agent can reconcile many ports per pass. Probe the
+    // last successful leader first instead of contacting the same follower for
+    // every port. The probe still checks leadership, so failover is discovered
+    // rather than trusting a stale cache entry.
+    let cache = LAST_LEADER.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    if let Some(last) = cache
+        .lock()
+        .ok()
+        .and_then(|map| map.get(configured).cloned())
+        && let Some(position) = entries.iter().position(|endpoint| *endpoint == last)
+    {
+        entries.swap(0, position);
+    }
+    let mut last = String::from("no fabric controller reported a leader");
+    for endpoint in entries {
+        match connect_one(endpoint, 3).await {
+            Ok(mut client) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    client.get_leader(pb::LeaderRequest {}),
+                )
+                .await
+                {
+                    Ok(Ok(response)) if response.get_ref().leader => {
+                        if let Ok(mut map) = cache.lock() {
+                            map.insert(configured.to_owned(), endpoint.to_owned());
+                        }
+                        return Ok(client);
+                    }
+                    Ok(Ok(_)) => last = format!("{endpoint} is a follower"),
+                    Ok(Err(error)) => last = format!("{endpoint}: leader probe: {error}"),
+                    Err(_) => last = format!("{endpoint}: leader probe timed out"),
+                }
+            }
+            Err(error) => last = format!("{endpoint}: {error}"),
+        }
+    }
+    Err(format!("no writable fabric controller: {last}").into())
+}
+
+async fn connect_one(endpoint: &str, connect_timeout_s: u64) -> Result<Connected, ConnectError> {
     // Fabric is part of a reconciliation pass, so an unreachable daemon must
     // become a reported failure instead of stopping heartbeats, migrations and
     // every unrelated guest action on the node.  The channel timeout applies
     // to each RPC made through the returned client as well as bounding setup.
     let mut channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())?
-        .connect_timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_s))
         .timeout(std::time::Duration::from_secs(10));
     if let Some(tls) = tls_config(
         endpoint,
@@ -103,6 +174,18 @@ mod tests {
     use super::*;
     fn path() -> Option<std::path::PathBuf> {
         Some("missing-identity.pem".into())
+    }
+    #[test]
+    fn endpoint_list_rejects_empty_members() {
+        assert_eq!(
+            endpoints("https://a:50052,https://b:50052").unwrap(),
+            ["https://a:50052", "https://b:50052"]
+        );
+        assert!(endpoints("").is_err());
+        assert!(endpoints("https://a:50052,,https://b:50052").is_err());
+        assert!(endpoints("https://a:50052,").is_err());
+        assert!(endpoints("https://a:50052,http://b:50052").is_err());
+        assert!(endpoints("https://user:password@a:50052").is_err());
     }
     #[test]
     fn partial_identity_is_rejected() {

@@ -206,6 +206,81 @@ async fn whoami_names_the_projects_and_the_rung_held_in_each() {
 }
 
 #[tokio::test]
+async fn whoami_reports_additive_custom_role_permissions_without_implying_higher_verbs() {
+    let cell = Cell::new().await;
+    let (_, root) = cell.sign_in("root", ROOT).await;
+    let root = root["token"].as_str().unwrap().to_string();
+    let (status, _) = cell
+        .send(
+            "POST",
+            "/api/v1/users",
+            Some(&root),
+            Some(json!({"id":"ada","spec":{}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = cell
+        .send(
+            "PUT",
+            "/api/v1/users/ada/password",
+            Some(&root),
+            Some(json!({"password":ADA})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for (id, verb, collections) in [
+        ("volume-writer", "write", vec!["volumes"]),
+        ("instance-operator", "operate", vec!["instances"]),
+    ] {
+        let (status, body) = cell
+            .send(
+                "POST",
+                "/api/v1/roles",
+                Some(&root),
+                Some(json!({
+                    "id": id, "spec": {"grants": [{"verb": verb, "collections": collections}]}
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+    let (status, body) = cell
+        .send(
+            "POST",
+            "/api/v1/projects",
+            Some(&root),
+            Some(json!({
+                "id": "p1", "spec": {"bindings": [
+                    {"role":"roles/volume-writer","members":["ada"]},
+                    {"role":"roles/instance-operator","members":["ada"]}
+                ]}
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (_, ada) = cell.sign_in("ada", ADA).await;
+    let (status, who) = cell
+        .send(
+            "GET",
+            "/api/v1/sessions/current",
+            Some(ada["token"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{who}");
+    assert_eq!(
+        who["capabilities"]["p1"]["volumes"],
+        json!(["read", "write"])
+    );
+    assert_eq!(
+        who["capabilities"]["p1"]["instances"],
+        json!(["read", "operate"])
+    );
+    assert!(who["capabilities"]["p1"].get("networks").is_none());
+    assert!(who["capabilities"]["p1"].get("migrations").is_none());
+}
+
+#[tokio::test]
 async fn an_administrator_can_create_a_user_who_can_then_sign_in() {
     let cell = Cell::new().await;
     let (_, body) = cell.sign_in("root", ROOT).await;

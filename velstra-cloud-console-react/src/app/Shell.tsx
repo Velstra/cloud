@@ -35,6 +35,7 @@ export function Shell({ census, onSweep, children }: {
 }) {
   const route = useRoute();
   const who = useStore((s) => s.who);
+  const can = useCan();
   const project = useStore((s) => s.project);
   const theme = useStore((s) => s.theme);
   const density = useStore((s) => s.density);
@@ -116,7 +117,7 @@ export function Shell({ census, onSweep, children }: {
             badge={attention.length ? <Badge n={attention.length} tone={failing ? "failing" : "drifting"} /> : null} />
           {!compact && <RailLink compact={compact} active={route.view === "map"} to={href({ view: "map" })} label="Map" />}
           {groups(!!who?.cellAdmin).map((g) => {
-            const items = g.items.filter((c) => (who?.cellAdmin || c.scope === "project") && (!navQuery || c.title.toLowerCase().includes(navQuery.toLowerCase())));
+            const items = g.items.filter((c) => (who?.cellAdmin || (c.scope === "project" && can("read", c))) && (!navQuery || c.title.toLowerCase().includes(navQuery.toLowerCase())));
             if (!items.length) return null;
             const open = !!navQuery || !(collapsed[g.name] ?? ["Records", "Access"].includes(g.name));
             const expanded = !!navQuery || (expandedSections[g.name] ?? items.some((c) => c.id === current?.id && !primarySections.has(c.id)));
@@ -292,7 +293,7 @@ function Palette({ open, onOpenChange, census }: { open: boolean; onOpenChange: 
   useEffect(() => {
     if (!open || q.trim().length < 2) { setFound([]); return; }
     let live = true;
-    const targets = navigable(!!who?.cellAdmin).filter((c) => c.condition !== "").slice(0, 12);
+    const targets = navigable(!!who?.cellAdmin).filter((c) => c.condition !== "" && (who?.cellAdmin || c.scope !== "project" || !who?.capabilities || !!who.capabilities[project]?.[c.id]?.includes("read"))).slice(0, 12);
     Promise.all(targets.map((c) =>
       listEvery(c, project).then((a) =>
         a.rows.filter((r: Resource) => idOf(r).toLowerCase().includes(q.toLowerCase())).slice(0, 4).map((r: Resource) => ({ coll: c, r })))
@@ -342,7 +343,7 @@ function Palette({ open, onOpenChange, census }: { open: boolean; onOpenChange: 
           <CommandItem value="spend" onSelect={() => run(() => go({ view: "spend" }))}>Spend</CommandItem>
           <CommandItem value="account" onSelect={() => run(() => go({ view: "me" }))}>Your account</CommandItem>
           <CommandItem value="map topology network" onSelect={() => run(() => go({ view: "map" }))}>Map</CommandItem>
-          {navigable(!!who?.cellAdmin).map((c) => (
+          {navigable(!!who?.cellAdmin).filter((c) => who?.cellAdmin || c.scope !== "project" || can("read", c)).map((c) => (
             <CommandItem key={c.id} value={`${c.title} ${c.group}`} onSelect={() => run(() => go({ view: "board", coll: c.id }))}>
               {c.title}<span className="ml-auto text-xs" style={{ color: "var(--text-faint)" }}>{c.group}{census[c.id] ? ` · ${census[c.id].total}` : ""}</span>
             </CommandItem>

@@ -84,6 +84,7 @@ mod option {
     pub const MESSAGE_TYPE: u8 = 53;
     pub const SERVER_ID: u8 = 54;
     pub const MESSAGE: u8 = 56;
+    pub const CLASSLESS_STATIC_ROUTE: u8 = 121;
     pub const END: u8 = 255;
 }
 
@@ -425,6 +426,17 @@ fn build(
     if let Some(gateway) = gateway {
         options.push((option::ROUTER, gateway.octets().to_vec()));
     }
+    // The metadata service is on this link, while the default router may be
+    // another fabric node. RFC 3442 requires the default route to be repeated
+    // here: clients receiving option 121 must ignore the older router option.
+    let mut routes = vec![32];
+    routes.extend_from_slice(&crate::metadata::ADDRESS.octets());
+    routes.extend_from_slice(&Ipv4Addr::UNSPECIFIED.octets());
+    if let Some(gateway) = gateway {
+        routes.push(0);
+        routes.extend_from_slice(&gateway.octets());
+    }
+    options.push((option::CLASSLESS_STATIC_ROUTE, routes));
     // The subnet's own resolvers when it names any; otherwise this node's, at
     // the metadata address. A guest used to come up with an address, a gateway
     // and no resolver at all — the default subnet is made with `dns: []` — so
@@ -851,6 +863,10 @@ mod tests {
         assert_eq!(yiaddr, "10.20.0.10".parse::<Ipv4Addr>().unwrap());
         assert_eq!(options[&option::SUBNET_MASK], vec![255, 255, 255, 0]);
         assert_eq!(options[&option::ROUTER], vec![10, 20, 0, 1]);
+        assert_eq!(
+            options[&option::CLASSLESS_STATIC_ROUTE],
+            vec![32, 169, 254, 169, 254, 0, 0, 0, 0, 0, 10, 20, 0, 1]
+        );
         // Only the v4 resolver: a v6 one in this option would be four bytes of
         // something else entirely to the client.
         assert_eq!(options[&option::DNS], vec![10, 20, 0, 1]);
@@ -1109,6 +1125,10 @@ mod tests {
         let (_, _, options) = parsed(&reply);
         assert_eq!(options[&option::SERVER_ID], vec![169, 254, 169, 254]);
         assert!(!options.contains_key(&option::ROUTER));
+        assert_eq!(
+            options[&option::CLASSLESS_STATIC_ROUTE],
+            vec![32, 169, 254, 169, 254, 0, 0, 0, 0]
+        );
     }
 
     #[test]

@@ -73,6 +73,11 @@ export function Detail({ coll, id, mode, onChanged }: {
   const mayOperate = can("operate", coll, here); const mayWrite = can("write", coll, here);
 
   if (mode === "edit") {
+    if (!coll.editable || !mayOperate) {
+      return <Pane title={`Edit ${idOf(r)}`} sub={nameOf(r)} onClose={() => go({ view: "board", coll: coll.id, id })}>
+        <p role="alert" className="text-sm text-muted-foreground">You do not have permission to edit this {coll.singular}.</p>
+      </Pane>;
+    }
     return (
       <Pane title={`Edit ${idOf(r)}`} sub={nameOf(r)} onClose={() => go({ view: "board", coll: coll.id, id })}>
         <ResourceForm coll={coll} existing={r}
@@ -93,7 +98,7 @@ export function Detail({ coll, id, mode, onChanged }: {
           <Pressed size="sm" variant="outline" onPress={load}><RefreshCw className="size-3.5" />Refresh</Pressed>
           {coll.editable && mayOperate && <Button size="sm" onClick={() => go({ view: "board", coll: coll.id, id, mode: "edit" })}><Pencil className="size-3.5" /> Edit</Button>}
           {mayOperate && custom.quick?.(r, coll, load)}
-          {actions.length > 0 && <details className="relative text-xs"><summary className="rounded-md border border-border px-3 py-2 hover:bg-accent">More actions</summary><div className="mt-2 flex flex-wrap gap-2">{actions.map((a) => (
+          {mayOperate && actions.length > 0 && <details className="relative text-xs"><summary className="rounded-md border border-border px-3 py-2 hover:bg-accent">More actions</summary><div className="mt-2 flex flex-wrap gap-2">{actions.map((a) => (
             <Pressed key={a.id} size="sm" title={a.summary} variant={a.destructive ? "destructive" : "secondary"} onPress={async () => {
               if (a.destructive && !(await ask({ title: `${a.label} ${idOf(r)}?`, confirmLabel: a.label, tone: "danger" }))) return;
               try {

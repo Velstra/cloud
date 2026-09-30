@@ -3,7 +3,7 @@
 
 import { at, type Collection, type Column } from "./schema";
 
-export type Verdict = "settled" | "drifting" | "failing" | "unreported" | "deleting";
+export type Verdict = "settled" | "drifting" | "failing" | "action" | "unreported" | "deleting";
 
 export type Resource = {
   meta: {
@@ -30,21 +30,23 @@ export const attentionName = (r: Resource, c: Collection) => c.id === "operation
   : idOf(r);
 
 export const VERDICT_ORDER: Record<Verdict, number> = {
-  failing: 0, drifting: 1, unreported: 2, deleting: 3, settled: 4,
+  failing: 0, action: 1, drifting: 2, unreported: 3, deleting: 4, settled: 5,
 };
 
 export const VERDICT_WORD: Record<Verdict, string> = {
-  settled: "Settled", drifting: "Applying", failing: "Failing",
-  unreported: "Not reported", deleting: "Deleting",
+  settled: "Ready", drifting: "Updating", failing: "Failed", action: "Action required",
+  unreported: "Waiting", deleting: "Deleting",
 };
 
 export function verdict(r: Resource, c?: Collection): {
-  kind: Verdict; word: string; reason?: string; detail?: string; busy?: boolean;
+  kind: Verdict; word: string; tone?: Verdict; reason?: string; detail?: string; busy?: boolean;
 } {
   // The same rules, in the same order, as the console this is compared with.
   if (c && c.condition === "") return { kind: "settled", word: "Recorded" };
   if (r.status?.done === true) {
-    return { kind: "settled", word: "Finished", detail: r.status?.error ? String(r.status.error) : undefined };
+    return r.status?.error
+      ? { kind: "settled", tone: "failing", word: "Failed", detail: String(r.status.error) }
+      : { kind: "settled", word: "Finished" };
   }
   const named = c?.condition || "Ready";
   const ready = (r.status?.conditions ?? []).find((x) => x.kind === named);
@@ -55,7 +57,18 @@ export function verdict(r: Resource, c?: Collection): {
   // from before the last edit is not a verdict on what was just asked for.
   const decided = ready && ready.status === "False" &&
     Number((ready as any).observedGeneration ?? 0) === gen;
-  if (decided) return { kind: "failing", word: "Failing", reason: ready!.reason, detail: ready!.message };
+  if (decided && named === "Mirrored" && ready?.reason === "Unmirrorable" &&
+      ready.message?.startsWith("no subnet yet")) {
+    return { kind: "action", word: "Needs subnet", detail: "Add a subnet to use this network." };
+  }
+  if (decided) return { kind: "failing", word: "Failed", reason: ready!.reason, detail: ready!.message };
+  // A migration's owning destination may not have reported a generation yet.
+  // Its computed Moved condition can still explain a source/receiver problem;
+  // showing Creating in that case hides the only useful feedback.
+  if (named === "Moved" && ready?.status === "Unknown" &&
+      ["SourceError", "DestinationError", "DestinationUnreachable"].includes(ready.reason ?? "")) {
+    return { kind: "drifting", word: "Retrying", busy: true, reason: ready.reason, detail: ready.message };
+  }
   // A guest that nothing has reported on yet is being made, and "not reported"
   // reads as a fault to somebody arriving from a cloud that says "pending". The
   // word says the verb; the kind stays honest.
@@ -68,9 +81,9 @@ export function verdict(r: Resource, c?: Collection): {
   // opposite of what this branch is for.
   const reported = !!r.status?.state && r.status.state !== "Unknown";
   const fresh = !reported && (Date.now() - Number(r.meta.createdAt ?? 0)) < 15 * 60_000;
-  if (obs === 0) return fresh ? { kind: "unreported", word: "Creating", busy: true } : { kind: "unreported", word: "Not reported" };
-  if (obs < gen) return { kind: "drifting", word: underway(r) || "Applying", busy: true, reason: ready?.reason };
-  if (!ready) return { kind: "unreported", word: "Not reported" };
+  if (obs === 0) return fresh ? { kind: "unreported", word: "Creating", busy: true } : { kind: "unreported", word: "Waiting" };
+  if (obs < gen) return { kind: "drifting", word: underway(r) || "Updating", busy: true, reason: ready?.reason };
+  if (!ready) return { kind: "unreported", word: "Waiting" };
   if (ready.status === "True") {
     // An instance's Ready condition means the hypervisor applied the request.
     // It does not prove that the guest OS has booted or passed a health check.
@@ -78,9 +91,9 @@ export function verdict(r: Resource, c?: Collection): {
     if (c?.id === "instances" && (instanceState === "Running" || instanceState === "Stopped")) {
       return { kind: "settled", word: instanceState };
     }
-    return { kind: "settled", word: "Settled" };
+    return { kind: "settled", word: "Ready" };
   }
-  return { kind: "drifting", word: underway(r) || "Applying", busy: true, reason: ready.reason, detail: ready.message };
+  return { kind: "drifting", word: underway(r) || "Updating", busy: true, reason: ready.reason, detail: ready.message };
 }
 
 /** The verb, when what was asked for and what is are both known and differ. */

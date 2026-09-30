@@ -1,9 +1,10 @@
-//! AIP-151 operations, computed rather than remembered.
+//! AIP-151 operations, computed until they finish.
 //!
-//! An operation's `done` is derived on every pass from the object it points at:
+//! A pending operation's `done` is derived on every pass from the object it points at:
 //! has the target caught up with the generation this operation was created for,
-//! and what does the target say about itself now. Nothing here writes a fact
-//! that could later be wrong, so the failure this design is built against —
+//! and what does the target say about itself now. Once finished, its outcome
+//! is retained: a later request on that target cannot rewrite history. This
+//! avoids the failure this design is built against —
 //! an operation that says `false` forever because whatever was going to mark it
 //! done died first — cannot happen. The worst a crash costs is one pass of
 //! latency.
@@ -150,6 +151,9 @@ impl OperationsController {
             } else {
                 peek.status.observed_generation
             },
+            condition_generation: ready
+                .map(|condition| condition.observed_generation)
+                .unwrap_or(peek.status.observed_generation),
             ready: ready
                 .map(|c| c.status)
                 .unwrap_or(if peek.status.observed_generation > 0 {
@@ -249,8 +253,18 @@ impl Reconciler for OperationsController {
             return Ok(());
         };
 
-        let target = self.look_at(&operation.spec.target).await?;
-        let progress = operation_progress(&operation.spec, &target);
+        let progress = if operation.status.done {
+            // A completed request is history. Recomputing it against a later
+            // generation could reopen it or replace its outcome with the
+            // result of an unrelated update to the same target.
+            velstra_cloud_model::reconcile::OperationProgress {
+                done: true,
+                error: operation.status.error.clone(),
+            }
+        } else {
+            let target = self.look_at(&operation.spec.target).await?;
+            operation_progress(&operation.spec, &target)
+        };
 
         let mut next = operation.clone();
         next.status.done = progress.done;
@@ -538,6 +552,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_operation_does_not_reopen_after_a_later_target_update() {
+        let (f, controller) = fixture();
+        f.instance(1, Some(Condition::ready(1))).await;
+        let op = f.operation("create", 1).await;
+        controller
+            .reconcile("projects/p1/operations/op-7", Some(&op))
+            .await
+            .unwrap();
+        let finished = f.reload().await;
+        assert!(finished.status.done);
+
+        let mut target = f
+            .instances
+            .get("projects/p1/instances/i1")
+            .await
+            .unwrap()
+            .unwrap();
+        target.meta.generation = 2;
+        target.status.observed_generation = 1;
+        set_condition(
+            &mut target.status.conditions,
+            Condition::new(
+                "Ready",
+                ConditionStatus::Unknown,
+                "Updating",
+                "a later request is pending",
+                2,
+            ),
+        );
+        f.raw
+            .put(
+                &key_for("cell-1", "instances", "projects/p1/instances/i1"),
+                serde_json::to_vec(&target).unwrap(),
+                Expect::Revision(target.meta.revision),
+            )
+            .await
+            .unwrap();
+
+        controller
+            .reconcile("projects/p1/operations/op-7", Some(&finished))
+            .await
+            .unwrap();
+        let still_finished = f.reload().await;
+        assert!(still_finished.status.done, "a finished operation reopened");
+        assert_eq!(
+            still_finished.status.finished_at,
+            finished.status.finished_at
+        );
+    }
+
+    #[tokio::test]
     async fn an_operation_carries_its_targets_failure() {
         let (f, controller) = fixture();
         f.instance(
@@ -563,6 +628,35 @@ mod tests {
             done.status.error.as_deref(),
             Some("NoValidHost: node-a: draining")
         );
+    }
+
+    #[tokio::test]
+    async fn a_controller_refusal_finishes_before_a_node_reports() {
+        let (f, controller) = fixture();
+        f.instance(
+            0,
+            Some(Condition::new(
+                "Ready",
+                ConditionStatus::False,
+                "NoValidHost",
+                "no node has enough memory",
+                1,
+            )),
+        )
+        .await;
+        let op = f.operation("create", 1).await;
+        controller
+            .reconcile("projects/p1/operations/op-7", Some(&op))
+            .await
+            .unwrap();
+
+        let done = f.reload().await;
+        assert!(done.status.done);
+        assert_eq!(
+            done.status.error.as_deref(),
+            Some("NoValidHost: no node has enough memory")
+        );
+        assert!(done.status.finished_at.is_some());
     }
 
     #[tokio::test]

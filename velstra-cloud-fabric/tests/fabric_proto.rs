@@ -36,12 +36,19 @@ fn the_vendored_copy_matches_fabric_when_fabric_is_here() {
     // Skips loudly rather than failing. A red test on a machine that simply does
     // not have the other repository checked out is a test people learn to
     // scroll past, and this one has real work to do on the machines that do.
+    // A Cloud change can be reviewed alongside an unmerged Fabric worktree.
+    // Point this check at that worktree explicitly instead of comparing the
+    // new client contract with an older checkout of Fabric's main branch.
+    let source = std::env::var_os("VELSTRA_FABRIC_PROTO_SOURCE").map(PathBuf::from);
     let candidates = [
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fabric/velstra-proto/proto/velstra.proto"),
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../fabric/velstra-proto/proto/velstra.proto"),
     ];
-    let Some(theirs) = candidates.iter().find(|p| p.exists()) else {
+    let Some(theirs) = source
+        .as_ref()
+        .or_else(|| candidates.iter().find(|p| p.exists()))
+    else {
         eprintln!("skipped: the fabric repository is not checked out beside this one");
         return;
     };

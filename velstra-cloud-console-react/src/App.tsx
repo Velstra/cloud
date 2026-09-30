@@ -9,9 +9,10 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { AskProvider } from "@/features/Ask";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { Button } from "@/components/ui/button";
+import { useCan } from "@/lib/iam";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { call, setToken, token, whenSessionEnds } from "@/api/transport";
+import { call, clearToken, setToken, token, whenSessionEnds } from "@/api/transport";
 import { verdict } from "@/lib/model";
 import { ALL, SCHEMA, collection, routeId } from "@/lib/schema";
 import { useRoute, go } from "@/app/router";
@@ -34,8 +35,12 @@ import { Cloud, Eye, EyeOff } from "lucide-react";
 export default function App() {
   const who = useStore((s) => s.who);
   const project = useStore((s) => s.project);
+  const can = useCan();
   const route = useRoute();
   const [census, setCensus] = useState<Census>({});
+  const [sessionAttempt, setSessionAttempt] = useState(0);
+  const [sessionChecking, setSessionChecking] = useState(!!token());
+  const [sessionError, setSessionError] = useState("");
   const sweepId = useRef(0);
   const runningSweep = useRef<{ who: typeof who; project: string } | null>(null);
   // A registration's credential, held on screen until it is copied. It is
@@ -45,9 +50,11 @@ export default function App() {
 
   useEffect(() => {
     if (!token()) return;
+    let active = true;
     call("session", "GET", "/api/v1/sessions/current").then((w) => {
+      if (!active) return;
       const projects: Record<string, string> = w.projects ?? {};
-      setState({ who: { subject: w.subject, displayName: w.displayName ?? w.subject, cellAdmin: !!w.cellAdmin, projects } });
+      setState({ who: { subject: w.subject, displayName: w.displayName ?? w.subject, cellAdmin: !!w.cellAdmin, projects, capabilities: w.capabilities } });
       // A tenant lands in a project they are bound in, not in whatever the
       // last person on this browser had picked.
       const mine = Object.keys(projects);
@@ -75,12 +82,15 @@ export default function App() {
           })
           .catch(() => { if (picked !== ALL) setState({ project: ALL }); });
       }
-    }).catch(() => setToken(""));
-  }, []);
+    }).catch(() => {
+      if (active && token()) setSessionError("The session could not be loaded. Retry when the connection is available.");
+    }).finally(() => { if (active) setSessionChecking(false); });
+    return () => { active = false; };
+  }, [sessionAttempt]);
 
   // The API is the one that knows a session ended; when it says so, the shell
   // shows the sign-in form rather than a signed-in frame that refuses.
-  useEffect(() => whenSessionEnds(() => setState({ who: null })), []);
+  useEffect(() => whenSessionEnds(() => { setState({ who: null }); setSessionChecking(false); setSessionError(""); }), []);
 
   const sweep = useCallback(async () => {
     if (!who) return;
@@ -104,7 +114,8 @@ export default function App() {
       // `nodes` and count two silent 403s as "nothing there".
       const mine = SCHEMA.filter((c) =>
         (who.cellAdmin ? c.audience !== undefined : c.audience !== "operator")
-        && c.id !== "audit" && c.id !== "usage");
+        && c.id !== "audit" && c.id !== "usage"
+        && (who.cellAdmin || c.scope !== "project" || !who.capabilities || !!who.capabilities[project]?.[c.id]?.includes("read")));
       // What could not be read, and what was cut short — kept, not swallowed.
       // The relations panel puts a claim beside the Delete button that is only
       // true of a sweep that saw everything, and it cannot tell whether this was
@@ -138,7 +149,10 @@ export default function App() {
     return () => { ++sweepId.current; clearInterval(timer); };
   }, [sweep]);
 
-  if (!who) return <SignIn />;
+  if (!who) return token() ? <SessionGate checking={sessionChecking} error={sessionError}
+    retry={() => { setSessionChecking(true); setSessionError(""); setSessionAttempt((attempt) => attempt + 1); }}
+    useAnotherAccount={() => { clearToken(); setSessionError(""); setSessionChecking(false); setSessionAttempt((attempt) => attempt + 1); }} />
+    : <SignIn onSignedIn={() => { setSessionChecking(true); setSessionAttempt((attempt) => attempt + 1); }} />;
 
   const coll = route.view === "board" ? collection(route.coll) : undefined;
 
@@ -156,7 +170,7 @@ export default function App() {
           <div className="h-full overflow-y-auto px-4 py-5 md:px-7 md:py-6"><Overview onRefresh={sweep} /></div>
         ) : (
           <ResizablePanelGroup orientation="horizontal" className="resource-workspace h-full" data-detail={!!(route.id || route.mode === "new")}>
-            <ResizablePanel defaultSize={route.id || route.mode === "new" ? "42%" : "100%"} minSize="28%">
+            <ResizablePanel defaultSize={route.id || route.mode === "new" ? "58%" : "100%"} minSize="28%">
               <div className="flex h-full flex-col px-6 py-5">
                 <div className="mb-3 flex items-baseline gap-3">
                   <h1 className="text-[26px] font-bold leading-tight" style={{ color: "var(--text-strong)" }}>{coll.title}</h1>
@@ -168,7 +182,7 @@ export default function App() {
             {(route.id || route.mode === "new") && (
               <>
                 <ResizableHandle withHandle />
-                <ResizablePanel defaultSize="58%" minSize="40%">
+                <ResizablePanel defaultSize="42%" minSize="40%">
                   <div className="h-full border-l" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
                     {route.mode === "new" ? (
                       <div className="h-full overflow-y-auto">
@@ -186,6 +200,8 @@ export default function App() {
                                 <Pressed size="sm" onPress={() => { const id = minted.id; setMinted(null); go({ view: "board", coll: coll.id, id }); }}>I have copied it</Pressed>
                               </div>
                             </div>
+                          ) : !coll.creatable || !can("write", coll) ? (
+                            <p role="alert" className="text-sm text-muted-foreground">You do not have permission to create {coll.title.toLowerCase()} here.</p>
                           ) : (
                           <ResourceForm coll={coll}
                             onDone={(r, answer) => {
@@ -223,7 +239,17 @@ export default function App() {
   );
 }
 
-function SignIn() {
+function SessionGate({ checking, error, retry, useAnotherAccount }: { checking: boolean; error: string; retry: () => void; useAnotherAccount: () => void }) {
+  return <div className="flex h-full items-center justify-center" style={{ background: "var(--bg-app)" }}>
+    <div className="mx-4 w-full max-w-[26rem] rounded-2xl border p-8" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+      <h1 className="text-xl font-semibold">{checking ? "Checking your session…" : "Session unavailable"}</h1>
+      {!checking && <><p role="alert" className="mt-3 text-sm text-muted-foreground">{error || "The session could not be loaded."}</p>
+        <div className="mt-5 flex gap-2"><Button onClick={retry}>Retry</Button><Button variant="ghost" onClick={useAnotherAccount}>Use another account</Button></div></>}
+    </div>
+  </div>;
+}
+
+function SignIn({ onSignedIn }: { onSignedIn: () => void }) {
   const [u, setU] = useState("");
   const [p, setP] = useState("");
   const [err, setErr] = useState("");
@@ -244,12 +270,7 @@ function SignIn() {
             try {
               const s = await call("signIn", "POST", "/api/v1/sessions", undefined, { username: u, password: p });
               setToken(s.token);
-              // The sign-in answer names the person; the session says where they are
-              // bound, so that is asked for next rather than guessed at.
-              const w = await call("session", "GET", "/api/v1/sessions/current").catch(() => s);
-              const projects: Record<string, string> = w.projects ?? {};
-              setState({ who: { subject: w.subject ?? s.subject, displayName: w.displayName ?? s.displayName ?? s.subject, cellAdmin: !!w.cellAdmin, projects } });
-              const mine = Object.keys(projects); if (!w.cellAdmin && mine.length && !projects[getState().project]) setState({ project: mine[0] });
+              onSignedIn();
             } catch (e) { setErr((e as Error).message || "That was not accepted."); }
           }}>Sign in</Pressed>
         </div>

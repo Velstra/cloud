@@ -37,6 +37,11 @@ rather than fails when fabric is not there, because a test that goes red on a
 machine that simply does not have the other repo is a test people learn to
 ignore.
 
+When developing Cloud against an unmerged Fabric worktree, point the comparison
+at that worktree's source file with `VELSTRA_FABRIC_PROTO_SOURCE=/path/to/velstra.proto`.
+The digest check still runs independently; the override only chooses which
+Fabric checkout is compared.
+
 Refreshing it is one command and the digest below moves with it:
 
     cp ../fabric/velstra-proto/proto/velstra.proto vendor/velstra.proto
