@@ -22,6 +22,42 @@ use velstra_cloud_model::{
 };
 use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
+#[tokio::test]
+async fn a_bgp_peer_cannot_wait_forever_on_a_node_that_is_not_a_gateway() {
+    let h = Harness::new();
+    let node = h
+        .post(
+            "nodes",
+            json!({ "id": "cp01", "spec": { "gateway": false } }),
+        )
+        .await;
+    assert_eq!(node.status, StatusCode::ACCEPTED);
+    let peer = json!({ "id": "upstream", "spec": {
+        "node": "cp01", "peer": "10.0.0.1", "localAs": 65010, "peerAs": 65020
+    } });
+    let refused = h.post("bgp-peers", peer.clone()).await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(refused.field(), "spec.node");
+    let enabled = h
+        .patch("nodes/cp01", json!({ "spec": { "gateway": true } }))
+        .await;
+    assert_eq!(enabled.status, StatusCode::OK);
+    let accepted = h.post("bgp-peers", peer).await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED);
+    let other = h
+        .post(
+            "nodes",
+            json!({ "id": "cp02", "spec": { "gateway": false } }),
+        )
+        .await;
+    assert_eq!(other.status, StatusCode::ACCEPTED);
+    let refused = h
+        .patch("bgp-peers/upstream", json!({ "spec": { "node": "cp02" } }))
+        .await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(refused.field(), "spec.node");
+}
+
 const TOKEN: &str = "development-token";
 
 struct Harness {
