@@ -195,6 +195,10 @@ try {
   await custom.goto(url + '#/c/instances/new'); await wait(custom, `document.body.innerText.includes('do not have permission to create')`);
   assert.deepEqual(custom.thrown, [], 'no custom-role browser exceptions');
   for (const prior of [b, mobile, memberAdmin, custom]) prior.close();
+  // Closing a tab can leave a request that was already forwarded to the
+  // fixture in flight. Let that role's requests drain before attributing
+  // subsequent inventory reads to the volume-only session.
+  await new Promise((resolve) => setTimeout(resolve, 500));
   volumeOnly = true;
   const volumeWriter = await browser({width: 1440, height: 900}); pages.push(volumeWriter); await login(volumeWriter);
   await wait(volumeWriter, `document.body.innerText.includes('Your workspace')`);

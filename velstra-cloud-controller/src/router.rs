@@ -1,4 +1,4 @@
-//! Telling the fabric that a tenant's networks route to each other.
+//! Recording a tenant's requested routed adjacency in the fabric.
 //!
 //! A cloud router is a *statement of adjacency*: these networks reach one
 //! another, everything else does not. The fabric calls the same thing an
@@ -35,7 +35,7 @@ use crate::{Result, runner::Reconciler, status::StatusWriter};
 
 const WHO: &str = "router";
 
-/// The condition this controller owns: whether the fabric routes these networks.
+/// The condition this controller owns: whether routing is verified in the data plane.
 const ROUTED: &str = "Routed";
 
 /// Derive a router's routed VNI from its name.
@@ -201,19 +201,14 @@ impl Reconciler for RouterController {
             // samples, not one byte of status written, while the console
             // counted the minutes.
             //
-            // `network.rs` had the same defect and the same fix, and its
-            // comment describes this symptom word for word; the router was
-            // simply never given it. `True`, because nothing is outstanding
-            // and nothing is broken — and the message carries what a green
-            // tick would otherwise hide.
+            // Record the lack of forwarding as a failure. A settled but
+            // disconnected router must not render as operational.
             return self
                 .say(
                     router,
-                    ConditionStatus::True,
+                    ConditionStatus::False,
                     "NoFabric",
-                    "this cell has no fabric, so there is no routed context to program for this \
-                     router — it routes nothing between networks. The node carries each segment \
-                     itself; see --local-network.",
+                    "No network fabric is configured. This router cannot forward traffic.",
                     None,
                 )
                 .await;
@@ -245,8 +240,14 @@ impl Reconciler for RouterController {
         match velstra_cloud_fabric::connect(&endpoint).await {
             Ok(mut client) => match client.add_ip_vrf(spec).await {
                 Ok(_) => {
-                    self.say(router, ConditionStatus::True, "Routed", "", assigned)
-                        .await
+                    self.say(
+                        router,
+                        ConditionStatus::False,
+                        "ForwardingUnverified",
+                        "Routing is not verified. Guests may not reach other networks.",
+                        assigned,
+                    )
+                    .await
                 }
                 Err(status) => {
                     warn!(router = %name, error = %status, "the fabric refused the router");
@@ -517,9 +518,7 @@ mod tests {
     /// live cell: forty-six samples over ninety seconds, every one identical,
     /// not one byte of status written.
     ///
-    /// This test used to pin the silence. It now pins the answer: `True`,
-    /// because nothing is outstanding and nothing is broken, with a message
-    /// that carries what a green tick would otherwise hide — and still no VNI,
+    /// The answer is negative because no gateway exists, with no VNI recorded
     /// because nothing was routed.
     #[tokio::test]
     async fn with_no_fabric_a_router_says_there_is_nothing_to_route_to() {
@@ -553,9 +552,9 @@ mod tests {
             .unwrap();
         let said = condition(&after.status.conditions, ROUTED)
             .expect("a router with no fabric said nothing at all");
-        assert_eq!(said.status, ConditionStatus::True, "{said:?}");
+        assert_eq!(said.status, ConditionStatus::False, "{said:?}");
         assert_eq!(said.reason, "NoFabric", "{said:?}");
-        assert!(said.message.contains("no fabric"), "{said:?}");
+        assert!(said.message.contains("cannot forward traffic"), "{said:?}");
         assert_eq!(
             after.status.observed_generation, after.meta.generation,
             "a router that has been answered still reads as waiting"

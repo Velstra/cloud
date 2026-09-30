@@ -590,9 +590,14 @@ fn encode(
 /// tap has one, the tap otherwise — and the listener is keyed by it. A tap that
 /// gains or loses a master changes the key, which replaces the listener, which
 /// is the whole recovery story.
+struct Listener {
+    taps: Vec<String>,
+    index: Option<u32>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 pub async fn serve(guests: GuestRegistry, server: Server, every: Duration) {
-    let mut listening: BTreeMap<String, (Vec<String>, tokio::task::JoinHandle<()>)> =
-        BTreeMap::new();
+    let mut listening: BTreeMap<String, Listener> = BTreeMap::new();
     let mut ticker = tokio::time::interval(every);
     loop {
         ticker.tick().await;
@@ -600,13 +605,18 @@ pub async fn serve(guests: GuestRegistry, server: Server, every: Duration) {
         for tap in guests.taps() {
             wanted.entry(l3_device(&tap).await).or_default().push(tap);
         }
-        listening.retain(|device, (taps, task)| {
+        listening.retain(|device, listener| {
             // The tap set is part of the key in everything but name: a guest
             // arriving on a bridge that is already listened to has to be
             // answerable, and a listener holding a stale set would not know it.
-            let keep = wanted.get(device) == Some(taps) && !task.is_finished();
+            // A guest TAP may disappear and return under the same name between
+            // polls. SO_BINDTODEVICE keeps the old socket on the old netdev;
+            // the name and guest set alone cannot prove it still hears DHCP.
+            let keep = wanted.get(device) == Some(&listener.taps)
+                && listener.index == device_ifindex(device)
+                && !listener.task.is_finished();
             if !keep {
-                task.abort();
+                listener.task.abort();
                 tracing::info!(%device, "stopped answering DHCP");
             }
             keep
@@ -625,7 +635,8 @@ pub async fn serve(guests: GuestRegistry, server: Server, every: Duration) {
                         guests.clone(),
                         server,
                     ));
-                    listening.insert(device, (taps, task));
+                    let index = device_ifindex(&device);
+                    listening.insert(device, Listener { taps, index, task });
                 }
                 Err(e) => {
                     tracing::error!(%device, error = %e, "could not answer DHCP on this device")
@@ -633,6 +644,14 @@ pub async fn serve(guests: GuestRegistry, server: Server, every: Duration) {
             }
         }
     }
+}
+
+fn device_ifindex(device: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{device}/ifindex"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Where frames from `tap` are actually delivered: its bridge, or itself.
