@@ -1047,7 +1047,10 @@ impl Api {
         // `families/debian-13` and was told there is no such collection.
         if name.collection() == velstra_cloud_model::resources::FAMILIES {
             let parent = name.parent().map(|p| p.to_string()).unwrap_or_default();
-            let wanted = name.to_string();
+            // A family is listed by its portable reference (`families/name`),
+            // even in a project-scoped catalogue. The project in the GET path
+            // selects which image wins; it is not part of the listed name.
+            let wanted = format!("{}/{}", velstra_cloud_model::resources::FAMILIES, name.id());
             return self
                 .list_families(&parent, who)
                 .await?
