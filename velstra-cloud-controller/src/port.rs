@@ -281,6 +281,23 @@ impl Reconciler for PortController {
         )]
     }
 
+    fn requeue_after(&self, object: Option<&Port>) -> Option<std::time::Duration> {
+        let port = object?;
+        if port.meta.is_deleting()
+            || !port
+                .meta
+                .labels
+                .contains_key(velstra_cloud_model::resources::MINTED_FOR)
+        {
+            return None;
+        }
+        let age = velstra_cloud_model::meta::Timestamp::now()
+            .0
+            .saturating_sub(port.meta.created_at.0);
+        (age < MINTED_PORT_GRACE_MS)
+            .then(|| std::time::Duration::from_millis(MINTED_PORT_GRACE_MS - age))
+    }
+
     async fn reconcile(&self, name: &str, object: Option<&Port>) -> Result<()> {
         let Some(port) = object else {
             return Ok(());
@@ -746,6 +763,7 @@ mod a_wire_nobody_will_ever_come_back_for {
                 < MINTED_PORT_GRACE_MS,
             "the fixture's port has to be young for this test to mean anything"
         );
+        assert!(controller.requeue_after(Some(&port)).is_some());
 
         controller.reconcile(PORT, Some(&port)).await.unwrap();
 
@@ -772,6 +790,8 @@ mod a_wire_nobody_will_ever_come_back_for {
             .await
             .unwrap();
         let port = ports.get(PORT).await.unwrap().unwrap();
+
+        assert!(controller.requeue_after(Some(&port)).is_none());
 
         controller.reconcile(PORT, Some(&port)).await.unwrap();
 
