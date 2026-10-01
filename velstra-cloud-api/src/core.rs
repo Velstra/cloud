@@ -3380,6 +3380,7 @@ impl Api {
                 .await?;
         }
         if kind == "subnets" {
+            self.require_subnet_network(&name, &spec).await?;
             self.refuse_a_subnet_that_would_unmirror_a_network(&spec)
                 .await?;
         }
@@ -3675,6 +3676,35 @@ impl Api {
     /// with no fabric never mirrors anything and carries several subnets per
     /// network perfectly well; refusing there would take away something that
     /// works to prevent something that cannot happen.
+    async fn require_subnet_network(&self, subnet: &ResourceName, spec: &Value) -> ApiResult<()> {
+        let Some(raw) = spec.get("network").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let network = ResourceName::parse(raw).map_err(|_| {
+            ApiError::invalid("Choose a network in this project.").at("spec.network")
+        })?;
+        if network.collection() != "networks" || network.project() != subnet.project() {
+            return Err(ApiError::invalid("Choose a network in this project.").at("spec.network"));
+        }
+        let existing: Resource<NetworkSpec, NetworkStatus> = match self.typed(&network).await {
+            Ok(value) => value,
+            Err(error) if error.code == Code::NotFound => {
+                return Err(ApiError::invalid(format!(
+                    "{raw} does not exist. Choose an existing network."
+                ))
+                .at("spec.network"));
+            }
+            Err(error) => return Err(error),
+        };
+        if existing.meta.deleted_at.is_some() {
+            return Err(ApiError::invalid(format!(
+                "{raw} is being deleted. Choose another network."
+            ))
+            .at("spec.network"));
+        }
+        Ok(())
+    }
+
     async fn refuse_a_subnet_that_would_unmirror_a_network(&self, spec: &Value) -> ApiResult<()> {
         let Some(named) = spec.get("network").and_then(Value::as_str) else {
             return Ok(());
@@ -4925,6 +4955,9 @@ impl Api {
                 governing_project(name).as_deref(),
             )
             .await?;
+            if name.collection() == "subnets" && spec.get("network").is_some() {
+                self.require_subnet_network(name, spec).await?;
+            }
             // Only when this change carries it. A patch carries what it changes,
             // so a project stored before folders existed — with the
             // `organizations/o1` the field's own documentation used to promise —
