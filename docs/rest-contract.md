@@ -466,6 +466,10 @@ POST /api/v1/projects/p1/instances  { "id": "web-1", "spec": {
     "ports": ["projects/p1/ports/p4", "projects/p1/ports/p6"], … } }
 ```
 
+The subnet's network must already exist in the same project. A missing,
+deleted, or cross-project network is refused at `spec.network` before a subnet
+is stored, rather than leaving a subnet that cannot be provisioned.
+
 The allocator hands out v6 addresses like any other (`fd00:19:136::2`), and
 `status.addresses` carries both. Each family gets **its own default route** —
 they are different route tables and cannot race, and a guest given a v6 address

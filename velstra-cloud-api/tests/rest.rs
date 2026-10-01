@@ -5497,6 +5497,95 @@ async fn a_network_needs_no_number_from_the_person_asking_for_one() {
 }
 
 #[tokio::test]
+async fn a_subnet_requires_an_existing_network_in_its_project() {
+    let h = Harness::new();
+    let spec = json!({
+        "network": "projects/p2/networks/missing",
+        "cidr": "10.251.9.0/24",
+        "gateway": "10.251.9.1"
+    });
+    let refused = h
+        .post(
+            "projects/p2/subnets",
+            json!({ "id": "orphan", "spec": spec }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.body["error"]["field"], json!("spec.network"));
+    assert_eq!(
+        h.get("projects/p2/subnets/orphan").await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    for network in [
+        "projects/p1/networks/other",
+        "projects/p2/subnets/not-a-network",
+    ] {
+        let refused = h
+            .post(
+                "projects/p2/subnets",
+                json!({ "id": "wrong-parent", "spec": {
+            "network": network,
+            "cidr": "10.251.8.0/24",
+            "gateway": "10.251.8.1"
+        } }),
+            )
+            .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{:?}",
+            refused.body
+        );
+        assert_eq!(refused.body["error"]["field"], json!("spec.network"));
+    }
+
+    let network = h
+        .post(
+            "projects/p2/networks",
+            json!({ "id": "present", "spec": {} }),
+        )
+        .await;
+    assert_eq!(network.status, StatusCode::ACCEPTED, "{:?}", network.body);
+    let made = h
+        .post(
+            "projects/p2/subnets",
+            json!({ "id": "attached", "spec": {
+        "network": "projects/p2/networks/present",
+        "cidr": "10.251.9.0/24",
+        "gateway": "10.251.9.1"
+    } }),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+
+    let changed = h
+        .patch(
+            "projects/p2/subnets/attached",
+            json!({ "spec": {
+        "network": "projects/p2/networks/missing"
+    } }),
+        )
+        .await;
+    assert_eq!(
+        changed.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        changed.body
+    );
+    assert_eq!(changed.body["error"]["field"], json!("spec.network"));
+    assert_eq!(
+        h.get("projects/p2/subnets/attached").await.body["spec"]["network"],
+        json!("projects/p2/networks/present")
+    );
+}
+
+#[tokio::test]
 async fn one_machine_is_one_request() {
     // The largest gap between this and a platform somebody would buy. A customer
     // who wanted one machine had to create a network, then a subnet on it, then
