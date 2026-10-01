@@ -58,7 +58,13 @@ export async function listEvery(c: Collection, project: string, query: Record<st
   const names = await projectNames();
   const each = await Promise.all(names.map((p) => pages(c, p, query)));
   return {
-    rows: each.flatMap((x) => x.rows),
+    // Families are virtual, project-scoped views of images. The API gives the
+    // same reference (`families/<name>`) in every project's response, so an
+    // all-project board needs a distinct view name to route back to the
+    // project it read. Single-project reads keep the actual family reference.
+    rows: each.flatMap((x, i) => c.id === "families"
+      ? x.rows.map((r) => ({ ...r, meta: { ...r.meta, name: `projects/${names[i]}/${r.meta.name}` } }))
+      : x.rows),
     revision: each.find((x) => x.revision)?.revision ?? "",
     truncated: each.some((x) => x.truncated),
   };

@@ -59,6 +59,12 @@ try {
   await wait(b, '!document.body.innerText.includes("Checking resources")');
   assert.ok(projectLists <= 3, `concurrent first inventory reads must share their project lookup (got ${projectLists})`);
   assert.ok(await b.evaluate(`(()=>{const networks=document.querySelector('#rail a[href="#/c/networks"] svg');const subnets=document.querySelector('#rail a[href="#/c/subnets"] svg');return !!networks && !!subnets && networks.innerHTML!==subnets.innerHTML})()`), 'collections in one section use distinct icons');
+  await b.goto(url + '#/c/families');
+  await wait(b, `document.querySelectorAll('tbody tr.cursor-pointer').length > 0`);
+  assert.equal(await b.evaluate(`[...document.querySelectorAll('table th')].some(x=>x.textContent.trim()==='Project')`), true, 'all-project family rows identify their project');
+  await b.evaluate(`document.querySelector('tbody tr.cursor-pointer').click()`);
+  await wait(b, `location.hash.startsWith('#/c/families/')`);
+  assert.match(await b.evaluate('location.hash'), /#\/c\/families\/(p1|p2)%2F/, 'all-project family rows retain their source project');
   await b.goto(url + '#/c/volumes/new');
   await wait(b, '!!document.querySelector("form")');
   assert.equal(await b.evaluate(`document.querySelector('form').innerText.includes('Pool')`), true, 'cell admin may choose a volume pool');

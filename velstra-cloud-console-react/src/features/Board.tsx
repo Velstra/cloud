@@ -97,11 +97,11 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
       id: "name", accessorFn: (r) => idOf(r), header: coll.singular === "project" ? "Project" : "Name", size: mobile && asList ? 165 : 240,
       cell: ({ row }) => <span className="flex min-w-0 flex-col" style={{ color: "var(--text-strong)" }}><span className="truncate font-medium">{idOf(row.original)}</span>{mobile && asList && project === ALL && coll.scope === "project" && <span className="truncate font-mono text-[11px] text-muted-foreground">{projectOf(nameOf(row.original))}</span>}</span>,
     },
-    ...(coll.condition !== "" ? [...(project === ALL && coll.scope === "project" && !(mobile && asList) ? [{
+    ...(project === ALL && coll.scope === "project" && !(mobile && asList) ? [{
       id: "project", accessorFn: (r: Resource) => projectOf(nameOf(r)) ?? "", header: "Project", size: 140,
       cell: (x: { getValue: () => unknown }) => <span className="font-mono text-xs" style={{ color: "var(--text-muted)" }}>{String(x.getValue() ?? "")}</span>,
     }] : []),
-    {
+    ...(coll.condition !== "" ? [{
       id: "verdict", accessorFn: (r: Resource) => VERDICT_ORDER[verdict(r, coll).kind], header: "Status", size: mobile && asList ? 130 : 160,
       cell: ({ row }: { row: { original: Resource } }) => <State of={row.original} coll={coll} />,
     }] : []),

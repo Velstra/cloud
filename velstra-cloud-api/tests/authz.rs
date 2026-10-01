@@ -2096,6 +2096,12 @@ async fn a_projects_own_family_shadows_the_catalogues_in_the_listing_too() {
         json!(false),
         "an image under a project is that project's alone"
     );
+    let opened = api
+        .get(&name("projects/p1/families/debian-13"), &who(ADA))
+        .await
+        .expect("a project-scoped family listed by the API can be opened");
+    assert_eq!(opened["spec"]["version"], json!("our-build"));
+    assert_eq!(opened["meta"]["name"], json!("families/debian-13"));
 }
 
 #[tokio::test]
