@@ -5116,6 +5116,15 @@ impl Api {
             // that will not happen, and answering `200` to one is agreeing to
             // something that will not be done.
             collection.check_known(spec)?;
+            if name.collection() == "image-sources" {
+                // A partial edit must be judged as the source it would leave
+                // behind. Create checks this trust boundary, but a patch used
+                // to replace the checksum URL with HTTP without any check.
+                let stored: Value = self.get(name, who).await?;
+                let mut merged = stored["spec"].clone();
+                merge(&mut merged, spec);
+                refuse_an_unusable_image_source(&merged)?;
+            }
             // After the shape is settled, never before: quota reads the spec as
             // its real type, and asking first means a mistyped field is
             // reported as a failed parse with no field named rather than as the

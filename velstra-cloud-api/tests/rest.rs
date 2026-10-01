@@ -23,6 +23,44 @@ use velstra_cloud_model::{
 use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
 #[tokio::test]
+async fn an_image_source_edit_cannot_downgrade_its_checksum_transport() {
+    let h = Harness::new();
+    let created = h
+        .post(
+            "image-sources",
+            json!({ "id": "test-source", "spec": {
+                "family": "test-family",
+                "url": "http://example.invalid/test.qcow2",
+                "checksums": "https://example.invalid/SHA256SUMS"
+            } }),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED);
+
+    let refused = h
+        .patch(
+            "image-sources/test-source",
+            json!({ "spec": { "checksums": "http://example.invalid/SHA256SUMS" } }),
+        )
+        .await;
+    assert_eq!(refused.error_code(), "INVALID_ARGUMENT");
+    assert_eq!(refused.field(), "spec.checksums");
+    let unchanged = h.get("image-sources/test-source").await;
+    assert_eq!(
+        unchanged.body["spec"]["checksums"],
+        "https://example.invalid/SHA256SUMS"
+    );
+
+    let paused = h
+        .patch(
+            "image-sources/test-source",
+            json!({ "spec": { "paused": true } }),
+        )
+        .await;
+    assert_eq!(paused.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn a_bgp_peer_cannot_wait_forever_on_a_node_that_is_not_a_gateway() {
     let h = Harness::new();
     let node = h
