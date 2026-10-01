@@ -232,7 +232,6 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
           onChange={(e) => setLabels(e.target.value)} />
         {unsettled.length > 0 && (
           <div className="ml-1 flex items-center gap-1.5">
-            <span className="text-xs" style={{ color: "var(--text-faint)" }}>{unsettled.length} not settled —</span>
             {(Object.keys(counts) as Verdict[]).sort((a, b) => VERDICT_ORDER[a] - VERDICT_ORDER[b]).map((k) => (
               <button key={k} aria-pressed={kind === k} onClick={() => setKind(kind === k ? null : k)}
                 className="inline-flex items-center gap-1.5 rounded-[3px] border px-2 py-0.5 text-xs font-medium"
