@@ -23,6 +23,44 @@ use velstra_cloud_model::{
 use velstra_cloud_store::{MemoryStore, Store, TypedStore};
 
 #[tokio::test]
+async fn an_image_source_edit_cannot_downgrade_its_checksum_transport() {
+    let h = Harness::new();
+    let created = h
+        .post(
+            "image-sources",
+            json!({ "id": "test-source", "spec": {
+                "family": "test-family",
+                "url": "http://example.invalid/test.qcow2",
+                "checksums": "https://example.invalid/SHA256SUMS"
+            } }),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED);
+
+    let refused = h
+        .patch(
+            "image-sources/test-source",
+            json!({ "spec": { "checksums": "http://example.invalid/SHA256SUMS" } }),
+        )
+        .await;
+    assert_eq!(refused.error_code(), "INVALID_ARGUMENT");
+    assert_eq!(refused.field(), "spec.checksums");
+    let unchanged = h.get("image-sources/test-source").await;
+    assert_eq!(
+        unchanged.body["spec"]["checksums"],
+        "https://example.invalid/SHA256SUMS"
+    );
+
+    let paused = h
+        .patch(
+            "image-sources/test-source",
+            json!({ "spec": { "paused": true } }),
+        )
+        .await;
+    assert_eq!(paused.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn a_bgp_peer_cannot_wait_forever_on_a_node_that_is_not_a_gateway() {
     let h = Harness::new();
     let node = h
@@ -1283,6 +1321,76 @@ async fn operations_use_the_targets_actual_settlement_contract() {
     let finished = h.get(group_operation).await;
     assert_eq!(finished.body["status"]["done"], true, "{}", finished.body);
     assert!(finished.body["status"]["error"].is_null());
+}
+
+#[tokio::test]
+async fn a_flavor_must_have_usable_compute_memory_and_disk() {
+    let h = Harness::new();
+    for (field, value) in [("vcpus", 0), ("memoryMib", 0), ("rootDiskGib", 0)] {
+        let mut spec = json!({ "vcpus": 1, "memoryMib": 512, "rootDiskGib": 8 });
+        spec[field] = json!(value);
+        let refused = h
+            .post("flavors", json!({ "id": "bad", "spec": spec }))
+            .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{field}");
+        assert_eq!(refused.field(), format!("spec.{field}"));
+        assert_eq!(h.get("flavors/bad").await.status, StatusCode::NOT_FOUND);
+    }
+    let valid = h
+        .post(
+            "flavors",
+            json!({ "id": "small", "spec": { "vcpus": 1, "memoryMib": 512, "rootDiskGib": 8 } }),
+        )
+        .await;
+    assert_eq!(valid.status, StatusCode::ACCEPTED);
+    let refused = h
+        .patch("flavors/small", json!({ "spec": { "memoryMib": 0 } }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.memoryMib");
+    assert_eq!(h.get("flavors/small").await.body["spec"]["memoryMib"], 512);
+}
+
+#[tokio::test]
+async fn a_device_class_must_name_real_pci_id_shapes() {
+    let h = Harness::new();
+    for (matches, field) in [
+        (json!([]), "spec.matches"),
+        (json!(["not-pci"]), "spec.matches[0]"),
+        (json!(["10de:2204", "10de:xyz0"]), "spec.matches[1]"),
+    ] {
+        let refused = h
+            .post(
+                "device-classes",
+                json!({ "id": "gpu", "spec": { "matches": matches } }),
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.field(), field);
+        assert_eq!(
+            h.get("device-classes/gpu").await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let accepted = h
+        .post(
+            "device-classes",
+            json!({ "id": "gpu", "spec": { "matches": ["10DE:2204"] } }),
+        )
+        .await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED);
+    let refused = h
+        .patch(
+            "device-classes/gpu",
+            json!({ "spec": { "matches": ["bad"] } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.matches[0]");
+    assert_eq!(
+        h.get("device-classes/gpu").await.body["spec"]["matches"],
+        json!(["10DE:2204"])
+    );
 }
 
 // ---- authentication ------------------------------------------------------
@@ -2998,6 +3106,24 @@ async fn sending_back_the_pool_a_volume_already_has_is_not_a_move() {
         .patch(&volume, json!({ "spec": { "pool": same, "sizeGib": 200 } }))
         .await;
     assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
+}
+
+#[tokio::test]
+async fn a_volume_cannot_be_shrunk_after_it_has_grown() {
+    let h = Harness::new();
+    h.pool("pool-a").await;
+    let volume = h.volume("data-1", 100).await;
+    let grown = h
+        .patch(&volume, json!({ "spec": { "sizeGib": 200 } }))
+        .await;
+    assert_eq!(grown.status, StatusCode::OK);
+
+    let refused = h
+        .patch(&volume, json!({ "spec": { "sizeGib": 100 } }))
+        .await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(refused.field(), "spec.sizeGib");
+    assert_eq!(h.get(&volume).await.body["spec"]["sizeGib"], 200);
 }
 
 #[tokio::test]

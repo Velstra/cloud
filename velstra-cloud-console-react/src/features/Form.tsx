@@ -330,7 +330,7 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
       }
     } catch (e) {
       const err = e as ApiError;
-      const key = (err.field ?? "").replace(/^spec\./, "");
+      const key = (err.field ?? "").replace(/^spec\./, "").split(".")[0].split("[")[0];
       if (key && fields.some((f) => f.key === key)) setErrors({ [key]: err.message });
       setProblem(err.message);
       return;
