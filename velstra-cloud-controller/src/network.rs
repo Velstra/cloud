@@ -22,8 +22,13 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use velstra_cloud_fabric::pb;
 use velstra_cloud_model::{
+    access::Writer,
     meta::{Condition, ConditionStatus, condition, set_condition},
-    resources::{Network, NetworkSpec, NetworkStatus, Subnet, SubnetSpec, SubnetStatus},
+    reconcile::{FinalizerStep, finalizer_step},
+    resources::{
+        FABRIC_RELEASE_FINALIZER, Network, NetworkSpec, NetworkStatus, Subnet, SubnetSpec,
+        SubnetStatus,
+    },
 };
 use velstra_cloud_store::TypedStore;
 
@@ -47,6 +52,7 @@ const MIRRORED: &str = "Mirrored";
 const NO_SUBNET: &str = "no subnet yet, so there is no range to allocate ports from";
 
 pub struct NetworkController {
+    networks: TypedStore<NetworkSpec, NetworkStatus>,
     /// A network has no agent and never will — no machine owns a cell-wide
     /// fact — so the condition below goes through the narrow path that lets a
     /// controller write `status` on an object nobody holds. See
@@ -71,6 +77,7 @@ impl NetworkController {
         fabric: Option<String>,
     ) -> Self {
         Self {
+            networks: TypedStore::new(store.clone(), cell, "networks"),
             say: StatusWriter::new(store, cell, "networks", WHO),
             subnets,
             fabric: fabric.map(Arc::from),
@@ -161,15 +168,21 @@ impl Reconciler for NetworkController {
 
     async fn reconcile(&self, name: &str, object: Option<&Network>) -> Result<()> {
         let Some(network) = object else {
-            // Gone. Retiring it on the fabric is deliberately not done here: a
-            // network with ports still on it cannot be retired anyway, and this
-            // controller has no way to know whether the ports are gone — that is
-            // the node agents' half, and it is the reason a delete is not simply
-            // the mirror run backwards. Left for the same pass that learns to
-            // count them.
+            // A mirrored network cannot disappear before its finalizer has
+            // released the corresponding Fabric state.
             return Ok(());
         };
         let Some(endpoint) = self.fabric.clone() else {
+            if network.meta.is_deleting() && network.meta.has_finalizer(FABRIC_RELEASE_FINALIZER) {
+                return self
+                    .say(
+                        network,
+                        ConditionStatus::False,
+                        "CleanupUnavailable",
+                        "Fabric is not configured, so the mirrored network cannot be released yet",
+                    )
+                    .await;
+            }
             // A cell with no fabric is a supported configuration, not an
             // unfinished one — the node carries the segment itself, as a first
             // hop. Saying nothing here left every network in such a cell at
@@ -193,6 +206,61 @@ impl Reconciler for NetworkController {
                 )
                 .await;
         };
+
+        match finalizer_step(&network.meta, FABRIC_RELEASE_FINALIZER) {
+            FinalizerStep::Add => {
+                let mut next = network.clone();
+                next.meta.add_finalizer(FABRIC_RELEASE_FINALIZER);
+                self.networks
+                    .update(&next, &Writer::controller(WHO))
+                    .await?;
+                return Ok(());
+            }
+            FinalizerStep::Delete => {
+                self.networks
+                    .delete(name, network.meta.revision, &Writer::controller(WHO))
+                    .await?;
+                return Ok(());
+            }
+            FinalizerStep::Wait if network.meta.is_deleting() => {
+                if !network.meta.has_finalizer(FABRIC_RELEASE_FINALIZER) {
+                    return Ok(());
+                }
+                let mut client = match velstra_cloud_fabric::connect(&endpoint).await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        warn!(network = %name, %error, "waiting to release Fabric network");
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = self
+                    .retire_stale_subnets(&mut client, network.spec.vni, None)
+                    .await
+                {
+                    warn!(network = %name, %error, "waiting to release Fabric subnets");
+                    return Ok(());
+                }
+                if let Err(error) = client
+                    .remove_network(pb::RemoveNetworkRequest {
+                        vni: network.spec.vni,
+                    })
+                    .await
+                {
+                    // Fabric rejects removal while ports or routed VRFs still
+                    // reference this VNI. Keep the object visibly deleting and
+                    // retry after those owners let go.
+                    warn!(network = %name, %error, "waiting to release Fabric network");
+                    return Ok(());
+                }
+                let mut next = network.clone();
+                next.meta.remove_finalizer(FABRIC_RELEASE_FINALIZER);
+                self.networks
+                    .update(&next, &Writer::controller(WHO))
+                    .await?;
+                return Ok(());
+            }
+            FinalizerStep::Wait => {}
+        }
 
         let subnet = match self.subnet_for(name).await? {
             Ok(subnet) => subnet,

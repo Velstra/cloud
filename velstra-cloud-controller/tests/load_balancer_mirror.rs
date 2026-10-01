@@ -232,7 +232,8 @@ async fn a_load_balancer_is_programmed_follows_its_spec_and_is_torn_down() {
         subnets.clone(),
         Some(fabric.admin.clone()),
     );
-    sweep(&net_controller, &networks).await.unwrap();
+    sweep(&net_controller, &networks).await.unwrap(); // install release guard
+    sweep(&net_controller, &networks).await.unwrap(); // mirror network and subnet
 
     for (id, address, tap) in [
         ("web", "10.41.0.10", "vt-web"),

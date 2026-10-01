@@ -236,7 +236,8 @@ async fn a_floating_ip_reaches_a_port_and_follows_when_it_is_moved() {
         subnets.clone(),
         Some(fabric.admin.clone()),
     );
-    sweep(&net_controller, &networks).await.unwrap();
+    sweep(&net_controller, &networks).await.unwrap(); // install release guard
+    sweep(&net_controller, &networks).await.unwrap(); // mirror network and subnet
     let known = client
         .list_subnets(pb::ListSubnetsRequest {})
         .await
@@ -527,7 +528,8 @@ async fn a_routed_address_is_bound_to_the_port_rather_than_translated() {
         subnets.clone(),
         Some(fabric.admin.clone()),
     );
-    sweep(&net_controller, &networks).await.unwrap();
+    sweep(&net_controller, &networks).await.unwrap(); // install release guard
+    sweep(&net_controller, &networks).await.unwrap(); // mirror network and subnet
 
     let mut client = velstra_cloud_fabric::connect(&fabric.admin).await.unwrap();
     client

@@ -231,7 +231,8 @@ async fn a_router_makes_two_tenant_networks_route_on_the_real_fabric() {
         early.status.conditions
     );
 
-    sweep(&net_controller, &networks).await.unwrap();
+    sweep(&net_controller, &networks).await.unwrap(); // install release guard
+    sweep(&net_controller, &networks).await.unwrap(); // mirror network and subnet
     sweep(&router_controller, &routers).await.unwrap();
 
     // The proof: the fabric holds one routed context, over both VNIs, with the

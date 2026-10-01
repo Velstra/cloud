@@ -3456,12 +3456,29 @@ async fn a_tenant_sums_their_own_bill_and_not_a_neighbours() {
             .await
             .unwrap();
     }
-    let sum = api2
+    let mut sum = api2
         .explain_usage(&name("projects/p1"), None, &who(ADA))
         .await
         .expect("a tenant reads their own bill");
-    // Two readings might straddle a month boundary at exactly the wrong hour;
-    // both fields still have to agree with what was counted.
+    // Right after midnight UTC on the first day of a month, both recent
+    // readings can belong to the previous month. Query that month explicitly
+    // instead of mistaking a legitimate zero for a lost usage record.
+    if sum["hours"] == 0 {
+        let current = sum["month"].as_str().unwrap();
+        let year: i32 = current[..4].parse().unwrap();
+        let month: u32 = current[5..].parse().unwrap();
+        let previous = if month == 1 {
+            format!("{}-12", year - 1)
+        } else {
+            format!("{year}-{:02}", month - 1)
+        };
+        sum = api2
+            .explain_usage(&name("projects/p1"), Some(&previous), &who(ADA))
+            .await
+            .expect("a tenant reads the previous month's bill");
+    }
+    // Two readings might straddle a month boundary; both fields still have
+    // to agree with what was counted.
     let hours = sum["hours"].as_u64().unwrap();
     assert!(hours >= 1, "{sum}");
     if hours == 2 {
