@@ -112,6 +112,7 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
 }) {
   const [existing] = useState(received);
   const storeProject = useStore((s) => s.project);
+  const isCellAdmin = useStore((s) => !!s.who?.cellAdmin);
   // The project this form writes to: an existing object's own, or — when the
   // picker says every project — the one chosen at the top of the form.
   const [formProject, setFormProject] = useState(existing ? projectOf(nameOf(existing)) ?? storeProject : storeProject === ALL ? "" : storeProject);
@@ -141,7 +142,10 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
     (invalid?.matches("fieldset") ? invalid.querySelector<HTMLElement>("input,button,textarea,select") : invalid)?.focus();
   }, [problem, errors]);
 
-  const fields = coll.fields.filter((f) => !f.derived && (existing ? !f.atCreation || true : true));
+  // Pool inventory is an operator-only resource. Tenant volumes use the
+  // scheduler's default placement, so do not fetch a list the tenant cannot read.
+  const fields = coll.fields.filter((f) => !f.derived &&
+    !(coll.id === "volumes" && f.key === "pool" && !isCellAdmin));
   const basic = fields.filter((f) => !f.advanced);
   const advanced = fields.filter((f) => f.advanced);
 
