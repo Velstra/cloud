@@ -111,7 +111,7 @@ export function Detail({ coll, id, mode, onChanged }: {
           ))}</div></details>}
           {coll.deletable && mayWrite && (
             <Pressed size="sm" variant="destructive" onPress={async () => {
-              if (!(await ask({ title: `Delete ${idOf(r)}?`, body: `It stays visible until its finalizers let go.`, confirmLabel: "Delete", tone: "danger" }))) return;
+              if (!(await ask({ title: `Delete ${idOf(r)}?`, body: "This can take a moment if other resources still use it.", confirmLabel: "Delete", tone: "danger" }))) return;
               try {
                 // The revision this screen is showing, so a delete cannot
                 // land on a version somebody else changed while the dialog was
@@ -120,7 +120,7 @@ export function Detail({ coll, id, mode, onChanged }: {
                 await call(`delete:${coll.id}`, "DELETE", `${pathOf(coll, r, project)}/${encodeURIComponent(idOf(r))}`,
                   undefined, undefined,
                   r.meta.revision ? { "if-match": String(r.meta.revision) } : undefined);
-                toast("Deletion asked for.", { description: "It stays listed until its finalizers let go." });
+                toast("Deleting…", { description: "The resource will disappear when cleanup finishes." });
                 onChanged(); collectionChanged(coll.id); close();
               } catch (e) { toast.error((e as Error).message); }
             }}><Trash2 className="size-3.5" /> Delete</Pressed>
