@@ -29,6 +29,7 @@ const server = createServer(async (req, res) => {
     if (customOperator && path === '/api/v1/sessions/current') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ subject: 'custom-operator', cellAdmin: false, projects: { p1: 'roles/volume-writer' }, capabilities: { p1: volumeOnly ? { volumes: ['read', 'write'] } : { instances: ['read', 'operate'], volumes: ['read', 'write'] } } })); return; }
     if (req.method === 'POST' && path.endsWith('/networks')) creates++;
     if (volumeOnly && req.method === 'GET' && (/^\/api\/v1\/projects\/p1\/(instances|networks|snapshots)$/.test(path) || path === '/api/v1/projects/p1:explainQuota')) unauthorizedLists.push(req.url);
+    if (volumeOnly && req.method === 'GET' && path === '/api/v1/users') { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'Operator access required' } })); return; }
     if (projectAdmin && req.method === 'PATCH' && path === '/api/v1/projects/p1') projectAdminDowngraded = true;
     if (refuseDetail && req.method === 'GET' && path.endsWith('/networks/browser-network')) { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'Temporarily unavailable' } })); return; }
     if (refuseAudit && req.method === 'GET' && path === '/api/v1/audit') { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'Audit temporarily unavailable' } })); return; }
@@ -212,6 +213,11 @@ try {
   await wait(volumeWriter, '!!document.querySelector("form")');
   assert.equal(await volumeWriter.evaluate(`document.body.innerText.includes('Could not load options')`), false, 'tenant volume form does not fetch operator-only pools');
   assert.equal(await volumeWriter.evaluate(`document.querySelector('form').innerText.includes('Pool')`), false, 'tenant volume form uses automatic pool placement');
+  await volumeWriter.goto(url + '#/c/volumes');
+  await wait(volumeWriter, `document.body.innerText.includes('data-1')`);
+  await volumeWriter.goto(url + '#/c/users');
+  await wait(volumeWriter, `document.body.innerText.includes('Users')`);
+  assert.equal(await volumeWriter.evaluate(`document.body.innerText.includes('data-1')`), false, 'previous volume rows never appear on a denied users page');
   assert.deepEqual(unauthorizedLists, [], 'inventory does not request unreadable project collections');
   assert.deepEqual(volumeWriter.thrown, [], 'no volume-only browser exceptions');
   volumeWriter.close(); customOperator = false; volumeOnly = false; refuseSession = true;

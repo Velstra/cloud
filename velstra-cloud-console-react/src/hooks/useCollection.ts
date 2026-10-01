@@ -25,8 +25,6 @@ export type Loaded = {
   refresh: () => Promise<void>;
 };
 
-const cache = new Map<string, { rows: Resource[]; revision: string }>();
-
 // Who is looking at what, so a write on one screen reaches the list on
 // another. A create used to leave the board it was made from without the row:
 // the form navigated to the new object and the list beside it still held the
@@ -41,11 +39,18 @@ export function collectionChanged(id: string) {
 
 export function useCollection(c: Collection | undefined, labels = ""): Loaded {
   const project = useStore((s) => s.project);
-  const key = c ? `${basePath(c, project)}?${labels}` : "";
+  const who = useStore((s) => s.who);
+  const key = c ? `${who?.subject ?? ""}|${who?.cellAdmin ?? false}|${JSON.stringify(who?.projects ?? {})}|${JSON.stringify(who?.capabilities ?? {})}|${basePath(c, project)}?${labels}` : "";
   const [state, set] = useState(() => ({
-    rows: c ? cache.get(key)?.rows ?? [] : [], revision: "", loading: !!c, error: "",
+    key, rows: [] as Resource[], revision: "", loading: !!c, error: "",
     changed: new Set<string>(), truncated: false,
   }));
+  // A board reuses this hook across collection and project changes. Never
+  // render rows from the previous scope while its new request is in flight.
+  const visible = state.key === key ? state : {
+    key, rows: [] as Resource[], revision: "", loading: !!c, error: "",
+    changed: new Set<string>(), truncated: false,
+  };
   const [live, setLive] = useState<WatchState>("connecting");
   const previous = useRef<Map<string, string>>(new Map());
   const run = useRef(0);
@@ -53,7 +58,10 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
   const refresh = useCallback(async () => {
     if (!c) return;
     const mine = ++run.current;
-    set((s) => ({ ...s, loading: true, error: "" }));
+    set((s) => s.key === key ? { ...s, loading: true, error: "" } : {
+      key, rows: [], revision: "", loading: true, error: "",
+      changed: new Set<string>(), truncated: false,
+    });
     try {
       // The list, every page of it. The contract pages with a token; a board
       // that shows the first page and calls it the collection is a board that
@@ -69,11 +77,10 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
         if (was && was !== k) moved.add(nameOf(r));
       }
       previous.current = now;
-      cache.set(key, { rows, revision });
-      set({ rows, revision, loading: false, error: "", changed: moved, truncated });
+      set({ key, rows, revision, loading: false, error: "", changed: moved, truncated });
     } catch (e) {
       if (mine !== run.current) return;
-      set((s) => ({ ...s, loading: false, error: String((e as Error).message) }));
+      set((s) => s.key === key ? { ...s, loading: false, error: String((e as Error).message) } : s);
     }
   }, [c, project, labels, key]);
 
@@ -103,20 +110,20 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
   // Only for one project at a time. The ALL board's fan-out would be one
   // stream per project and cannot show anything the list did not; it stays on
   // the read, with the indicator saying so.
-  const streamable = !!c && project !== ALL && !!state.revision;
+  const streamable = !!c && project !== ALL && !!visible.revision;
   useEffect(() => {
     if (!c || !streamable) { setLive("unsupported"); return; }
     setLive("connecting");
     const wants = labelFilter(labels);
-    const stream = watch(basePath(c, project), state.revision, (e: WatchEvent) => {
+    const stream = watch(basePath(c, project), visible.revision, (e: WatchEvent) => {
       set((s) => {
+        if (s.key !== key) return s;
         const rows = fold(s.rows, e, wants);
         if (rows === s.rows) return s;
         // `previous` is what the changed-row highlight diffs against. Folding
         // one event has to keep it in step, or the next whole-list read lights
         // up every row that moved while the stream was carrying it.
         for (const r of rows) if (c) previous.current.set(nameOf(r), verdict(r, c).kind);
-        cache.set(key, { rows, revision: s.revision });
         return { ...s, rows };
       });
     }, setLive);
@@ -153,7 +160,7 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
   // load balancers that use it; nothing writes to the subnet, so there is no
   // watch event either. Between the two, that board was frozen from the moment
   // it loaded.
-  const busy = state.rows.some((r) => c && verdict(r, c).busy);
+  const busy = visible.rows.some((r) => c && verdict(r, c).busy);
   const ticking = !!c && (busy || c.recheck > 0 || !streamable || live !== "live");
   useEffect(() => {
     if (!c || !ticking) return;
@@ -162,7 +169,7 @@ export function useCollection(c: Collection | undefined, labels = ""): Loaded {
     return () => clearInterval(t);
   }, [c, ticking, busy, refresh]);
 
-  return { ...state, refresh, busy, live };
+  return { ...visible, refresh, busy, live };
 }
 
 /** `env=prod, tier=web` as a map, the same reading the list sends. */
