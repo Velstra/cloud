@@ -3109,6 +3109,24 @@ async fn sending_back_the_pool_a_volume_already_has_is_not_a_move() {
 }
 
 #[tokio::test]
+async fn a_volume_cannot_be_shrunk_after_it_has_grown() {
+    let h = Harness::new();
+    h.pool("pool-a").await;
+    let volume = h.volume("data-1", 100).await;
+    let grown = h
+        .patch(&volume, json!({ "spec": { "sizeGib": 200 } }))
+        .await;
+    assert_eq!(grown.status, StatusCode::OK);
+
+    let refused = h
+        .patch(&volume, json!({ "spec": { "sizeGib": 100 } }))
+        .await;
+    assert_eq!(refused.error_code(), "FAILED_PRECONDITION");
+    assert_eq!(refused.field(), "spec.sizeGib");
+    assert_eq!(h.get(&volume).await.body["spec"]["sizeGib"], 200);
+}
+
+#[tokio::test]
 async fn where_a_volume_came_from_is_history_rather_than_a_control() {
     let h = Harness::new();
     h.pool("pool-a").await;

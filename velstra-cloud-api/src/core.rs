@@ -4952,6 +4952,7 @@ impl Api {
             if name.collection() == "volumes" {
                 self.refuse_a_new_source(name, spec).await?;
                 self.refuse_a_moved_pool(name, spec).await?;
+                self.refuse_a_smaller_volume(name, spec).await?;
             }
             if name.collection() == "ceph-clusters" {
                 self.refuse_a_disk_that_is_not_free(spec).await?;
@@ -6418,6 +6419,25 @@ impl Api {
             ),
         )
         .at("spec.rootDiskGib"))
+    }
+
+    async fn refuse_a_smaller_volume(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
+        let Some(asked) = spec.get("size_gib").and_then(Value::as_u64) else {
+            return Ok(());
+        };
+        let stored: Volume = self.typed(name).await?;
+        let current = stored.spec.size_gib.max(stored.status.actual_size_gib);
+        if asked >= current {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            Code::FailedPrecondition,
+            format!(
+                "{name} is already {current} GiB and cannot be shrunk to {asked}: \
+                 shrinking would discard data. Restore a backup into a smaller volume instead."
+            ),
+        )
+        .at("spec.sizeGib"))
     }
 
     /// Fill in a capture's node from its guest, and refuse the one thing that
