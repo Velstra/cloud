@@ -142,9 +142,9 @@ export function Detail({ coll, id, mode, onChanged }: {
       </Section>
 
       {diffs.length > 0 && (
-        <Section label="Asked vs is" sub="the two halves, where they differ">
+        <Section label="Requested and current">
           <table className="w-full text-xs">
-            <thead><tr style={{ color: "var(--text-faint)" }}><th className="text-left font-medium">Field</th><th className="text-left font-medium">Asked for</th><th className="text-left font-medium">Is</th></tr></thead>
+            <thead><tr style={{ color: "var(--text-faint)" }}><th className="text-left font-medium">Field</th><th className="text-left font-medium">Requested</th><th className="text-left font-medium">Current</th></tr></thead>
             <tbody>
               {diffs.map((d) => (
                 <tr key={d.label} className="border-t" style={{ borderColor: "var(--border-subtle)" }}>
