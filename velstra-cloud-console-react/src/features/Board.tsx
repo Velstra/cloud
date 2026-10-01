@@ -339,7 +339,7 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
         </table>
         {!loaded.loading && !visible.length && !loaded.error && (
           <p className="p-6 text-sm" style={{ color: "var(--text-muted)" }}>
-            {globalFilter || kind || labels ? "Nothing matches." : `No ${coll.title.toLowerCase()} here yet.${coll.creatable ? " Create the first one above." : ""}`}
+            {globalFilter || kind || labels ? "Nothing matches." : `No ${coll.title.toLowerCase()} here yet.${coll.creatable && can("write", coll) ? " Create the first one above." : ""}`}
           </p>
         )}
       </div>

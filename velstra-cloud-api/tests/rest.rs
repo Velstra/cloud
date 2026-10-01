@@ -1285,6 +1285,76 @@ async fn operations_use_the_targets_actual_settlement_contract() {
     assert!(finished.body["status"]["error"].is_null());
 }
 
+#[tokio::test]
+async fn a_flavor_must_have_usable_compute_memory_and_disk() {
+    let h = Harness::new();
+    for (field, value) in [("vcpus", 0), ("memoryMib", 0), ("rootDiskGib", 0)] {
+        let mut spec = json!({ "vcpus": 1, "memoryMib": 512, "rootDiskGib": 8 });
+        spec[field] = json!(value);
+        let refused = h
+            .post("flavors", json!({ "id": "bad", "spec": spec }))
+            .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{field}");
+        assert_eq!(refused.field(), format!("spec.{field}"));
+        assert_eq!(h.get("flavors/bad").await.status, StatusCode::NOT_FOUND);
+    }
+    let valid = h
+        .post(
+            "flavors",
+            json!({ "id": "small", "spec": { "vcpus": 1, "memoryMib": 512, "rootDiskGib": 8 } }),
+        )
+        .await;
+    assert_eq!(valid.status, StatusCode::ACCEPTED);
+    let refused = h
+        .patch("flavors/small", json!({ "spec": { "memoryMib": 0 } }))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.memoryMib");
+    assert_eq!(h.get("flavors/small").await.body["spec"]["memoryMib"], 512);
+}
+
+#[tokio::test]
+async fn a_device_class_must_name_real_pci_id_shapes() {
+    let h = Harness::new();
+    for (matches, field) in [
+        (json!([]), "spec.matches"),
+        (json!(["not-pci"]), "spec.matches[0]"),
+        (json!(["10de:2204", "10de:xyz0"]), "spec.matches[1]"),
+    ] {
+        let refused = h
+            .post(
+                "device-classes",
+                json!({ "id": "gpu", "spec": { "matches": matches } }),
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.field(), field);
+        assert_eq!(
+            h.get("device-classes/gpu").await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let accepted = h
+        .post(
+            "device-classes",
+            json!({ "id": "gpu", "spec": { "matches": ["10DE:2204"] } }),
+        )
+        .await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED);
+    let refused = h
+        .patch(
+            "device-classes/gpu",
+            json!({ "spec": { "matches": ["bad"] } }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.field(), "spec.matches[0]");
+    assert_eq!(
+        h.get("device-classes/gpu").await.body["spec"]["matches"],
+        json!(["10DE:2204"])
+    );
+}
+
 // ---- authentication ------------------------------------------------------
 
 #[tokio::test]

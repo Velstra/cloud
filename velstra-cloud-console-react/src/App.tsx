@@ -216,7 +216,9 @@ export default function App() {
                                 setMinted({ coll: coll.id, id, minted: answer, resource: r });
                                 return;
                               }
-                              toast.success(`${id} created`, { description: "Tracking deployment status." });
+                              toast.success(`${id} created`, coll.condition
+                                ? { description: "Tracking deployment status." }
+                                : undefined);
                               go({ view: "board", coll: coll.id, id: routeId(coll, r, project) });
                             }}
                             onCancel={() => go({ view: "board", coll: coll.id })} />

@@ -10983,6 +10983,12 @@ fn check_port(spec: &Value, document: Document) -> ApiResult<()> {
 }
 
 fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
+    if kind == "device-classes" {
+        return check_device_class(spec, document);
+    }
+    if kind == "flavors" {
+        return check_flavor(spec, document);
+    }
     if kind == "load-balancers" {
         check_listeners(spec)?;
         // A change carrying only one of the two lists cannot be judged from
@@ -11031,6 +11037,66 @@ fn check_rules(kind: &str, spec: &Value, document: Document) -> ApiResult<()> {
         velstra_cloud_model::security::programmable(&parsed).map_err(|e| {
             ApiError::new(Code::FailedPrecondition, e.to_string()).at(format!("spec.rules[{i}]"))
         })?;
+    }
+    Ok(())
+}
+
+fn check_device_class(spec: &Value, document: Document) -> ApiResult<()> {
+    let Some(matches) = spec.get("matches") else {
+        return if document == Document::Part {
+            Ok(())
+        } else {
+            Err(ApiError::invalid("name at least one PCI vendor:device ID").at("spec.matches"))
+        };
+    };
+    let Some(matches) = matches.as_array() else {
+        return Err(ApiError::invalid("PCI IDs must be a list").at("spec.matches"));
+    };
+    if matches.is_empty() {
+        return Err(ApiError::invalid("name at least one PCI vendor:device ID").at("spec.matches"));
+    }
+    for (index, id) in matches.iter().enumerate() {
+        let valid = id.as_str().is_some_and(|id| {
+            let bytes = id.as_bytes();
+            bytes.len() == 9
+                && bytes[4] == b':'
+                && bytes[..4].iter().all(u8::is_ascii_hexdigit)
+                && bytes[5..].iter().all(u8::is_ascii_hexdigit)
+        });
+        if !valid {
+            return Err(ApiError::invalid(
+                "use four hex digits for the vendor and device, such as 10de:2204",
+            )
+            .at(format!("spec.matches[{index}]")));
+        }
+    }
+    Ok(())
+}
+
+fn check_flavor(spec: &Value, document: Document) -> ApiResult<()> {
+    for (field, public_field, minimum) in [
+        ("vcpus", "vcpus", 1),
+        ("memory_mib", "memoryMib", 256),
+        ("root_disk_gib", "rootDiskGib", 1),
+    ] {
+        let value = spec.get(field);
+        if value.is_none() && document == Document::Part {
+            continue;
+        }
+        if value
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value < minimum)
+        {
+            return Err(ApiError::invalid(format!(
+                "a flavor needs at least {minimum} {}",
+                match field {
+                    "vcpus" => "vCPU",
+                    "memory_mib" => "MiB of memory",
+                    _ => "GiB of root disk",
+                }
+            ))
+            .at(format!("spec.{public_field}")));
+        }
     }
     Ok(())
 }
