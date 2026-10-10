@@ -177,6 +177,17 @@ pub trait Reconciler: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Revisit a successfully reconciled object after a deadline. This is for
+    /// time-dependent decisions that cannot be woken by a store event, such as
+    /// a freshly minted port becoming old enough to collect. The periodic
+    /// resync remains the fallback if this process loses leadership or exits.
+    fn requeue_after(
+        &self,
+        _object: Option<&Resource<Self::Spec, Self::Status>>,
+    ) -> Option<Duration> {
+        None
+    }
+
     fn reconcile(
         &self,
         name: &str,
@@ -397,7 +408,7 @@ pub async fn run_when_leading<R: Reconciler>(
 async fn reconcile_one<R: Reconciler>(
     reconciler: &Arc<R>,
     store: &TypedStore<R::Spec, R::Status>,
-    queue: &WorkQueue,
+    queue: &Arc<WorkQueue>,
     metrics: &Metrics,
     name: &str,
 ) {
@@ -413,7 +424,19 @@ async fn reconcile_one<R: Reconciler>(
 
     metrics.count("controller_reconcile_total", &[("controller", controller)]);
     match reconciler.reconcile(name, object.as_ref()).await {
-        Ok(()) => queue.done(name),
+        Ok(()) => {
+            queue.done(name);
+            if let Some(delay) = reconciler.requeue_after(object.as_ref()) {
+                let queue = Arc::downgrade(queue);
+                let name = name.to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Some(queue) = queue.upgrade() {
+                        queue.add(&name);
+                    }
+                });
+            }
+        }
         Err(error) if error.is_conflict() => {
             // Somebody wrote first. Read again and decide again — this is the
             // expected outcome of two controllers on one object, not a failure,
@@ -573,6 +596,56 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn a_successful_time_dependent_reconcile_is_woken_at_its_deadline() {
+        struct Timed;
+        impl Reconciler for Timed {
+            type Spec = InstanceSpec;
+            type Status = InstanceStatus;
+
+            fn name(&self) -> &'static str {
+                "timed"
+            }
+
+            fn requeue_after(
+                &self,
+                object: Option<&Resource<InstanceSpec, InstanceStatus>>,
+            ) -> Option<Duration> {
+                object.map(|_| Duration::from_millis(20))
+            }
+
+            async fn reconcile(
+                &self,
+                _name: &str,
+                _object: Option<&Resource<InstanceSpec, InstanceStatus>>,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let raw = Arc::new(MemoryStore::new());
+        let store: TypedStore<InstanceSpec, InstanceStatus> =
+            TypedStore::new(raw, "cell-1", "instances");
+        let name = "projects/p1/instances/timed";
+        store
+            .create(
+                &instance("timed"),
+                &velstra_cloud_model::access::Writer::controller("runner"),
+            )
+            .await
+            .unwrap();
+        let queue = Arc::new(WorkQueue::new(
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        ));
+        reconcile_one(&Arc::new(Timed), &store, &queue, &Metrics::new(), name).await;
+        let woken = tokio::time::timeout(Duration::from_secs(1), queue.next())
+            .await
+            .expect("a successful reconcile must wake again at its deadline");
+        assert_eq!(woken.as_deref(), Some(name));
     }
 
     fn instance(id: &str) -> Resource<InstanceSpec, InstanceStatus> {
