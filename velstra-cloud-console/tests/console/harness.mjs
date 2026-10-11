@@ -209,6 +209,12 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
 
   return {
     evaluate, thrown, requests,
+    async closePopup(title) {
+      const targets = (await send("Target.getTargets")).result.targetInfos;
+      const popup = targets.find(t => t.type === "page" && t.title === title);
+      if (!popup) throw new Error(`screen window not found: ${title}`);
+      await send("Target.closeTarget", { targetId: popup.targetId });
+    },
     async click(x, y) {
       await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
       await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
