@@ -261,6 +261,11 @@ pub fn key_for(cell: &str, kind: &str, name: &str) -> String {
     format!("/{cell}/{kind}/{name}")
 }
 
+/// Prefix for every resource in one cell, including the trailing boundary.
+pub fn cell_prefix(cell: &str) -> String {
+    format!("/{cell}/")
+}
+
 pub fn prefix_for(cell: &str, kind: &str) -> String {
     format!("/{cell}/{kind}/")
 }
