@@ -300,6 +300,12 @@ pub fn backup_path(target_path: &str, backup: &str) -> String {
 /// every test uses.
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Actual directory holding this pool's bytes, when it is a directory pool.
+    /// This comes from the running backend, including externally configured pools.
+    fn directory_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     async fn observe(&self) -> Result<PoolState>;
     /// Create the backing store, from whatever `source` says it starts as.
     ///
@@ -1117,9 +1123,20 @@ impl PoolAgent {
         let view = velstra_cloud_model::backup::TargetView {
             name: target.meta.name.to_string(),
             path: target.spec.path.clone(),
-            accepting: target.spec.accepting,
+            accepting: target.spec.accepting && !target.meta.is_deleting(),
             writable: target.status.writable,
-            same_pool_as: None,
+            same_pool_as: self
+                .storage
+                .directory_root()
+                .filter(|root| {
+                    let target_path = std::fs::canonicalize(&target.spec.path)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&target.spec.path));
+                    velstra_cloud_model::backup::path_is_within(
+                        &target_path.to_string_lossy(),
+                        &root.to_string_lossy(),
+                    )
+                })
+                .map(|_| self.config.pool.clone()),
         };
         if let Err(why) =
             velstra_cloud_model::backup::may_back_up(&stored.spec.volume, &self.config.pool, &view)
@@ -1574,6 +1591,23 @@ impl PoolAgent {
         next.status.allocated_gib = allocated;
         next.status.agent_version = self.config.agent_version.clone();
         next.status.last_heartbeat = Timestamp::now();
+        if let Some(root) = self.storage.directory_root() {
+            set_condition(
+                &mut next.status.conditions,
+                Condition::new(
+                    "Located",
+                    ConditionStatus::True,
+                    "PathIs",
+                    &root.to_string_lossy(),
+                    stored.meta.generation,
+                ),
+            );
+        } else {
+            // A backend change must not retain a previous directory's identity.
+            next.status
+                .conditions
+                .retain(|condition| condition.kind != "Located");
+        }
         let expected = expected_backend(stored.spec.backend);
         let mismatch = expected.filter(|expected| *expected != seen.backend);
         set_condition(
@@ -3581,5 +3615,91 @@ mod tests {
             old.status.digest, None,
             "verification invented a digest, which would certify the wrong moment"
         );
+    }
+    #[tokio::test]
+    async fn directory_backups_refuse_the_source_tree_and_symlink_aliases_before_copying() {
+        let (cell, _) = cell("nvme");
+        cell.register_pool("nvme").await;
+        let root = std::path::PathBuf::from(cell.target_dir("source", true));
+        let child = root.join("copies");
+        std::fs::create_dir(&child).unwrap();
+        let alias = root.with_extension("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let storage = Arc::new(crate::directory_pool::DirectoryPool::new(
+            &root,
+            root.join("images"),
+        ));
+        let agent = PoolAgent::new(
+            cell.store.clone(),
+            PoolConfig::new("nvme", "eu", "cell-1"),
+            storage,
+        );
+        cell.target("archive", true, true).await;
+        let mut target = cell
+            .targets
+            .get("backup-targets/archive")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut paths = vec![root.clone(), child];
+        #[cfg(unix)]
+        paths.push(alias.clone());
+        for (index, path) in paths.iter().enumerate() {
+            target.spec.path = path.to_string_lossy().into_owned();
+            let id = format!("b{index}");
+            let backup = cell.backup(&id, "nvme", "archive").await;
+            agent
+                .backup_pass(&backup, &[target.clone()], &mut Pass::default())
+                .await;
+            let claimed = cell.reload_backup(&id).await;
+            agent
+                .backup_pass(&claimed, &[target.clone()], &mut Pass::default())
+                .await;
+            let rejected = cell.reload_backup(&id).await;
+            assert!(!rejected.status.taken);
+            assert!(
+                rejected
+                    .status
+                    .conditions
+                    .iter()
+                    .any(|c| c.reason == "TargetUnusable"
+                        && c.message.contains("lost with the pool")),
+                "{:?}",
+                rejected.status
+            );
+            assert!(
+                !std::path::Path::new(&backup_path(
+                    &target.spec.path,
+                    &backup.meta.name.to_string()
+                ))
+                .exists()
+            );
+        }
+        agent
+            .pool_pass(
+                &[],
+                &PoolState {
+                    backend: "directory".into(),
+                    ..Default::default()
+                },
+                &mut Pass::default(),
+            )
+            .await;
+        let pool = cell.pools.get("pools/nvme").await.unwrap().unwrap();
+        let located = pool
+            .status
+            .conditions
+            .iter()
+            .find(|c| c.reason == "PathIs")
+            .unwrap();
+        assert_eq!(
+            located.message,
+            std::fs::canonicalize(&root).unwrap().to_string_lossy()
+        );
+        assert_eq!(located.status, ConditionStatus::True);
+        #[cfg(unix)]
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

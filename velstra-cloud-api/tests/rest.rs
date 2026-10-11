@@ -4351,158 +4351,181 @@ async fn a_baseline_a_node_cannot_reach_is_refused_before_it_is_declared() {
 /// does not keep, and the operator would find out at the worst moment there is.
 #[tokio::test]
 async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
-    let h = Harness::new();
+    for declared_directory in [false, true] {
+        let h = Harness::new();
 
-    // A pool, a volume in it, and a target pointed at that same pool's path.
-    // The pool publishes where it is, which is how the API can tell — a flag on
-    // the target would be a claim, and this has to be a fact.
-    let mut pool: velstra_cloud_model::resources::Pool = Resource::new(
-        Meta::new(
-            ResourceName::parse("pools/fast").unwrap(),
-            Placement::new("eu-central", "cell-1"),
-        ),
-        velstra_cloud_model::resources::PoolSpec {
-            scope: Default::default(),
-            backend: Default::default(),
-            backend_target: String::new(),
-            thin_pool: String::new(),
-            accepting: true,
-            node: String::new(),
-            labels: vec![],
-            projects: vec![],
-            volume_ceiling: Default::default(),
-        },
-        velstra_cloud_model::resources::PoolStatus {
-            backend: "directory".into(),
-            ..Default::default()
-        },
-    );
-    velstra_cloud_model::meta::set_condition(
-        &mut pool.status.conditions,
-        velstra_cloud_model::meta::Condition::new(
-            "Located",
-            velstra_cloud_model::meta::ConditionStatus::True,
-            "PathIs",
-            "/srv/pool-fast",
-            1,
-        ),
-    );
-    h.pools().create(&pool, &writer()).await.unwrap();
-
-    let volume: velstra_cloud_model::resources::Volume = Resource::new(
-        Meta::new(
-            ResourceName::parse("projects/p1/volumes/data-1").unwrap(),
-            Placement::new("eu-central", "cell-1"),
-        ),
-        velstra_cloud_model::resources::VolumeSpec {
-            source_backup: None,
-            size_gib: 40,
-            pool: "fast".into(),
-            encryption_key: None,
-            source_image: None,
-            source_snapshot: None,
-            limits: Default::default(),
-        },
-        Default::default(),
-    );
-    h.volumes().create(&volume, &writer()).await.unwrap();
-
-    for (id, path) in [
-        ("same-pool", "/srv/pool-fast"),
-        ("elsewhere", "/srv/backups"),
-    ] {
-        let t: velstra_cloud_model::resources::BackupTarget = Resource::new(
+        // A pool, a volume in it, and a target pointed at that same pool's path.
+        // The pool publishes where it is, which is how the API can tell — a flag on
+        // the target would be a claim, and this has to be a fact.
+        let mut pool: velstra_cloud_model::resources::Pool = Resource::new(
             Meta::new(
-                ResourceName::parse(&format!("backup-targets/{id}")).unwrap(),
+                ResourceName::parse("pools/fast").unwrap(),
                 Placement::new("eu-central", "cell-1"),
             ),
-            velstra_cloud_model::backup::BackupTargetSpec {
-                kind: velstra_cloud_model::backup::TargetKind::Directory,
-                path: path.into(),
+            velstra_cloud_model::resources::PoolSpec {
+                scope: Default::default(),
+                backend: Default::default(),
+                backend_target: String::new(),
+                thin_pool: String::new(),
                 accepting: true,
-                agent: String::new(),
-                verify_every_hours: 0,
+                node: String::new(),
+                labels: vec![],
+                projects: vec![],
+                volume_ceiling: Default::default(),
             },
-            velstra_cloud_model::backup::BackupTargetStatus {
-                writable: Some(true),
+            velstra_cloud_model::resources::PoolStatus {
+                backend: "directory".into(),
                 ..Default::default()
             },
         );
-        h.backup_targets().create(&t, &writer()).await.unwrap();
-    }
+        if declared_directory {
+            pool.spec.backend = velstra_cloud_model::resources::PoolBackend::Directory;
+            pool.spec.scope = velstra_cloud_model::resources::PoolScope::Machine;
+            pool.spec.node = "node-a".into();
+            pool.spec.backend_target = "/srv/pool-fast".into();
+        } else {
+            velstra_cloud_model::meta::set_condition(
+                &mut pool.status.conditions,
+                velstra_cloud_model::meta::Condition::new(
+                    "Located",
+                    velstra_cloud_model::meta::ConditionStatus::True,
+                    "PathIs",
+                    "/srv/pool-fast",
+                    1,
+                ),
+            );
+        }
+        h.pools().create(&pool, &writer()).await.unwrap();
 
-    let refused = h
-        .post(
-            "projects/p1/backups",
-            json!({ "meta": { "name": "projects/p1/backups/b1" },
+        let volume: velstra_cloud_model::resources::Volume = Resource::new(
+            Meta::new(
+                ResourceName::parse("projects/p1/volumes/data-1").unwrap(),
+                Placement::new("eu-central", "cell-1"),
+            ),
+            velstra_cloud_model::resources::VolumeSpec {
+                source_backup: None,
+                size_gib: 40,
+                pool: "fast".into(),
+                encryption_key: None,
+                source_image: None,
+                source_snapshot: None,
+                limits: Default::default(),
+            },
+            Default::default(),
+        );
+        h.volumes().create(&volume, &writer()).await.unwrap();
+
+        for (id, path) in [
+            ("same-pool", "/srv/pool-fast"),
+            ("nested-pool", "/srv/pool-fast/backups"),
+            ("alias-pool", "/srv/staging/../pool-fast/copies"),
+            ("elsewhere", "/srv/backups"),
+        ] {
+            let t: velstra_cloud_model::resources::BackupTarget = Resource::new(
+                Meta::new(
+                    ResourceName::parse(&format!("backup-targets/{id}")).unwrap(),
+                    Placement::new("eu-central", "cell-1"),
+                ),
+                velstra_cloud_model::backup::BackupTargetSpec {
+                    kind: velstra_cloud_model::backup::TargetKind::Directory,
+                    path: path.into(),
+                    accepting: true,
+                    agent: String::new(),
+                    verify_every_hours: 0,
+                },
+                velstra_cloud_model::backup::BackupTargetStatus {
+                    writable: Some(true),
+                    ..Default::default()
+                },
+            );
+            h.backup_targets().create(&t, &writer()).await.unwrap();
+        }
+
+        let refused = h
+            .post(
+                "projects/p1/backups",
+                json!({ "meta": { "name": "projects/p1/backups/b1" },
                     "spec": { "volume": "projects/p1/volumes/data-1",
                               "target": "backup-targets/same-pool" } }),
-        )
-        .await;
-    assert_eq!(
-        refused.status,
-        StatusCode::BAD_REQUEST,
-        "{:?}",
-        refused.body
-    );
-    let message = refused.body["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("lost with the pool"),
-        "the refusal does not say why it would not be a backup: {message}"
-    );
-    assert_eq!(refused.body["error"]["field"], json!("spec.target"));
+            )
+            .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{:?}",
+            refused.body
+        );
+        let message = refused.body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("lost with the pool"),
+            "the refusal does not say why it would not be a backup: {message}"
+        );
+        assert_eq!(refused.body["error"]["field"], json!("spec.target"));
 
-    let unsafe_schedule = h
-        .post(
-            "projects/p1/backup-schedules",
-            json!({"id": "daily", "spec": {
-                "volume": "projects/p1/volumes/data-1", "target": "backup-targets/same-pool"
-            }}),
-        )
-        .await;
-    assert_eq!(unsafe_schedule.error_code(), "FAILED_PRECONDITION");
-    let automatic = h
-        .post(
-            "projects/p1/backup-schedules",
-            json!({"id": "safe", "spec": {
-                "volume": "projects/p1/volumes/data-1"
-            }}),
-        )
-        .await;
-    assert_eq!(
-        automatic.status,
-        StatusCode::ACCEPTED,
-        "{:?}",
-        automatic.body
-    );
-    assert_eq!(
-        h.get("projects/p1/backup-schedules/safe").await.body["spec"]["target"],
-        "backup-targets/elsewhere"
-    );
+        for target in ["nested-pool", "alias-pool"] {
+            let refused = h.post("projects/p1/backups", json!({
+                "id": target, "spec": {"volume": "projects/p1/volumes/data-1", "target": format!("backup-targets/{target}")}
+            })).await;
+            assert_eq!(
+                refused.status,
+                StatusCode::BAD_REQUEST,
+                "{:?}",
+                refused.body
+            );
+        }
 
-    // A target somewhere else is the ordinary case, and the pool holding the
-    // source is filled in — without it the object is assigned to nobody and no
-    // agent could ever claim it.
-    let made = h
-        .post(
-            "projects/p1/backups",
-            json!({ "meta": { "name": "projects/p1/backups/b2" },
+        let unsafe_schedule = h
+            .post(
+                "projects/p1/backup-schedules",
+                json!({"id": "daily", "spec": {
+                    "volume": "projects/p1/volumes/data-1", "target": "backup-targets/same-pool"
+                }}),
+            )
+            .await;
+        assert_eq!(unsafe_schedule.error_code(), "FAILED_PRECONDITION");
+        let automatic = h
+            .post(
+                "projects/p1/backup-schedules",
+                json!({"id": "safe", "spec": {
+                    "volume": "projects/p1/volumes/data-1"
+                }}),
+            )
+            .await;
+        assert_eq!(
+            automatic.status,
+            StatusCode::ACCEPTED,
+            "{:?}",
+            automatic.body
+        );
+        assert_eq!(
+            h.get("projects/p1/backup-schedules/safe").await.body["spec"]["target"],
+            "backup-targets/elsewhere"
+        );
+
+        // A target somewhere else is the ordinary case, and the pool holding the
+        // source is filled in — without it the object is assigned to nobody and no
+        // agent could ever claim it.
+        let made = h
+            .post(
+                "projects/p1/backups",
+                json!({ "meta": { "name": "projects/p1/backups/b2" },
                     "spec": { "volume": "projects/p1/volumes/data-1",
                               "target": "backup-targets/elsewhere" } }),
-        )
-        .await;
-    // Accepted, with an operation naming what it will become — this API's
-    // shape for every create.
-    assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
-    let target = made.body["target"].as_str().unwrap();
+            )
+            .await;
+        // Accepted, with an operation naming what it will become — this API's
+        // shape for every create.
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{:?}", made.body);
+        let target = made.body["target"].as_str().unwrap();
 
-    let read = h.get(target).await;
-    assert_eq!(read.status, StatusCode::OK, "{:?}", read.body);
-    assert_eq!(
-        read.body["spec"]["pool"],
-        json!("fast"),
-        "the pool holding the source was not filled in, so no agent could ever claim this copy"
-    );
+        let read = h.get(target).await;
+        assert_eq!(read.status, StatusCode::OK, "{:?}", read.body);
+        assert_eq!(
+            read.body["spec"]["pool"],
+            json!("fast"),
+            "the pool holding the source was not filled in, so no agent could ever claim this copy"
+        );
+    }
 }
 
 /// A list can be narrowed by label, and clearing the filter shows everything

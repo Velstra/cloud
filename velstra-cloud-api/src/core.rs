@@ -6675,9 +6675,22 @@ impl Api {
             let same_pool_as = pools
                 .iter()
                 .find(|pool| {
-                    pool.status.conditions.iter().any(|condition| {
-                        condition.reason == "PathIs" && condition.message == target.spec.path
-                    })
+                    pool.meta.name.to_string() == source_pool
+                        && ((pool.spec.backend
+                            == velstra_cloud_model::resources::PoolBackend::Directory
+                            && velstra_cloud_model::backup::path_is_within(
+                                &target.spec.path,
+                                &pool.spec.backend_target,
+                            ))
+                            || pool.status.conditions.iter().any(|condition| {
+                                condition.reason == "PathIs"
+                                    && condition.status
+                                        == velstra_cloud_model::ConditionStatus::True
+                                    && velstra_cloud_model::backup::path_is_within(
+                                        &target.spec.path,
+                                        &condition.message,
+                                    )
+                            }))
                 })
                 .map(|pool| pool.meta.name.to_string());
             velstra_cloud_model::backup::TargetView {
