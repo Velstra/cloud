@@ -315,9 +315,16 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
           setProblem("This resource changed while you were editing. Reopen the form to review the latest values before saving.");
           return;
         }
+        // PATCH carries the user's changes, not the whole populated form.
+        // A managed reference may be readable only through this resource;
+        // resubmitting it turns an interval edit into a privileged target change.
+        const before = initial(coll, existing);
+        const changes = nest(Object.fromEntries(Object.entries(spec).filter(
+          ([key, value]) => JSON.stringify(value) !== JSON.stringify(before[key]),
+        )));
         saved = await call(`patch:${coll.id}`, "PATCH",
           `${basePath(coll, project)}/${encodeURIComponent(idOf(existing))}`,
-          undefined, { spec: body, meta: meta() }, latest.meta.revision ? { "if-match": String(latest.meta.revision) } : undefined);
+          undefined, { spec: changes, meta: meta() }, latest.meta.revision ? { "if-match": String(latest.meta.revision) } : undefined);
       } else {
         const name = coll.scope === "project"
           ? `projects/${project}/${coll.id}/${id.trim()}` : `${coll.id}/${id.trim()}`;
