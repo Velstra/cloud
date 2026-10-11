@@ -229,15 +229,38 @@ impl QemuVmm {
     /// **Untested:** needs a live QEMU. Whether a transfer this node started is
     /// still running — the thing that stops a pass from issuing a second
     /// `migrate` on top of the first.
-    async fn is_sending(&self, instance: &str) -> bool {
-        match self.qmp(instance, "query-migrate", json!({})).await {
-            Ok(answer) => answer
-                .get("status")
-                .and_then(|s| s.as_str())
-                .map(still_going)
-                .unwrap_or(false),
-            Err(_) => false,
+    async fn migration_state(&self, instance: &str) -> Option<Value> {
+        self.qmp(instance, "query-migrate", json!({})).await.ok()
+    }
+
+    async fn ensure_outgoing_tls(&self, instance: &str) -> Result<()> {
+        let Some(dir) = &self.layout.migration_tls_dir else {
+            return Err(HostError::failed(
+                "network migration requires a configured X.509 certificate directory",
+            ));
+        };
+        let objects = self
+            .qmp(instance, "qom-list", json!({ "path": "/objects" }))
+            .await?;
+        if objects.as_array().is_some_and(|objects| {
+            objects.iter().any(|object| {
+                object.get("name").and_then(Value::as_str) == Some("migration-client")
+            })
+        }) {
+            return Ok(());
         }
+        // A guest can predate migration configuration. Add credentials to its
+        // existing process rather than restarting it or falling back to plaintext.
+        self.qmp(
+            instance,
+            "object-add",
+            json!({
+                "qom-type": "tls-creds-x509", "id": "migration-client",
+                "endpoint": "client", "dir": dir, "verify-peer": true,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     /// **Untested:** needs a live QEMU.
@@ -555,8 +578,17 @@ impl Vmm for QemuVmm {
                 }
                 continue;
             }
-            if self.is_sending(&instance).await {
-                host.sending.insert(instance.clone());
+            if let Some(migration) = self.migration_state(&instance).await {
+                if migration
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(still_going)
+                {
+                    host.sending.insert(instance.clone());
+                }
+                if let Some(why) = migration_failure(&migration) {
+                    host.migration_failures.insert(instance.clone(), why);
+                }
             }
             // Which volumes this guest has open, asked of the VMM itself.
             //
@@ -980,6 +1012,9 @@ impl Vmm for QemuVmm {
     /// monitor — so this returns then too, and `observe` answers what happened.
     async fn send(&self, transfer: &Transfer) -> Result<()> {
         let tls_creds = outgoing_tls_credentials(&self.layout, &transfer.url)?;
+        if !tls_creds.is_empty() {
+            self.ensure_outgoing_tls(&transfer.instance).await?;
+        }
         self.qmp(
             &transfer.instance,
             "migrate-set-parameters",
@@ -1016,6 +1051,11 @@ impl Vmm for QemuVmm {
             json!({ "uri": transfer.url }),
         )
         .await?;
+        if let Some(answer) = self.migration_state(&transfer.instance).await
+            && let Some(why) = migration_failure(&answer)
+        {
+            return Err(HostError::failed(why));
+        }
         if transfer.mode == MigrationMode::PostCopy {
             // Post-copy resumes the destination first and faults pages in, so
             // from here on a failure loses the guest. That is why it is never a
@@ -1563,6 +1603,18 @@ fn still_going(status: &str) -> bool {
         status,
         "setup" | "active" | "postcopy-active" | "postcopy-paused" | "device" | "cancelling"
     )
+}
+
+fn migration_failure(answer: &Value) -> Option<String> {
+    (answer.get("status").and_then(Value::as_str) == Some("failed")).then(|| {
+        format!(
+            "The migration failed: {}",
+            answer
+                .get("error-desc")
+                .and_then(Value::as_str)
+                .unwrap_or("QEMU did not provide a reason")
+        )
+    })
 }
 
 /// What `query-migrate` says has moved, in MiB. Zero when it says nothing,
@@ -2179,6 +2231,82 @@ mod tests {
         assert!(!still_going("completed"));
         assert!(!still_going("failed"));
         assert!(!still_going("cancelled"));
+    }
+
+    #[test]
+    fn an_asynchronous_transfer_failure_preserves_the_monitor_reason() {
+        let failed = json!({"status":"failed", "error-desc":"No TLS credentials with id 'migration-client'"});
+        assert!(
+            migration_failure(&failed)
+                .unwrap()
+                .contains("No TLS credentials")
+        );
+        assert!(migration_failure(&json!({"status":"active"})).is_none());
+        assert!(migration_failure(&json!({"status":"completed"})).is_none());
+        assert!(
+            migration_failure(&json!({"status":"failed"}))
+                .unwrap()
+                .contains("did not provide a reason")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_credentials_can_be_added_to_an_existing_guest_once() {
+        let dir = std::env::temp_dir().join(format!("qmp-runtime-tls-{}", std::process::id()));
+        let mut config = layout();
+        config.run_dir = dir.clone();
+        config.migration_tls_dir = Some(PathBuf::from("/etc/velstra/migration"));
+        let vmm = QemuVmm::new(config);
+        std::fs::create_dir_all(vmm.layout.dir("projects/p1/instances/i1")).unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(vmm.monitor("projects/p1/instances/i1")).unwrap();
+        let server = tokio::spawn(async move {
+            let mut added = false;
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                write.write_all(b"{\"QMP\":{}}\n").await.unwrap();
+                lines.next_line().await.unwrap();
+                write.write_all(b"{\"return\":{}}\n").await.unwrap();
+                let command: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                let reply = match command["execute"].as_str().unwrap() {
+                    "qom-list" => {
+                        assert_eq!(command["arguments"]["path"], "/objects");
+                        if added {
+                            json!([{ "name":"migration-client", "type":"child<tls-creds-x509>" }])
+                        } else {
+                            json!([])
+                        }
+                    }
+                    "object-add" => {
+                        assert!(!added, "an existing credential must not be recreated");
+                        assert_eq!(command["arguments"]["qom-type"], "tls-creds-x509");
+                        assert_eq!(command["arguments"]["id"], "migration-client");
+                        assert_eq!(command["arguments"]["endpoint"], "client");
+                        assert_eq!(command["arguments"]["verify-peer"], true);
+                        assert_eq!(command["arguments"]["dir"], "/etc/velstra/migration");
+                        added = true;
+                        json!({})
+                    }
+                    other => panic!("unexpected QMP command {other}"),
+                };
+                write
+                    .write_all(format!("{}\n", json!({"return":reply})).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            assert!(added);
+        });
+        vmm.ensure_outgoing_tls("projects/p1/instances/i1")
+            .await
+            .unwrap();
+        vmm.ensure_outgoing_tls("projects/p1/instances/i1")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

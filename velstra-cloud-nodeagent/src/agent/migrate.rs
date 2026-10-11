@@ -317,6 +317,9 @@ impl Agent {
             // with the guest already running on the destination.
             let still_here = match self.vmm.observe().await {
                 Ok(fresh) => {
+                    if let Some(why) = fresh.migration_failures.get(&name) {
+                        moving.trouble.insert(name.clone(), why.clone());
+                    }
                     fresh.sending.contains(&name)
                         || fresh
                             .vms
