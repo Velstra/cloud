@@ -7,6 +7,7 @@
 
 import type { ReactNode } from "react";
 import { Usage } from "@/features/Usage";
+import { Volume } from "@/features/Volume";
 import { usageTime } from "@/lib/model";
 import type { Resource } from "@/lib/model";
 import type { Collection, Field } from "@/lib/schema";
@@ -216,6 +217,7 @@ register("pools", {
 });
 
 register("volumes", {
+  panels: [{ id: "volume", title: "Storage", render: (r) => <Volume r={r} /> }],
   quick: (r, c, reload) => <Suspense fallback={null}><VolumeQuick r={r} c={c} reload={reload} /></Suspense>,
 });
 
