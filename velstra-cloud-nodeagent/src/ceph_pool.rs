@@ -188,6 +188,10 @@ fn gib_of(bytes: u64) -> u64 {
 #[derive(serde::Deserialize)]
 struct RbdImage {
     image: String,
+    /// Long listings include snapshots under the same image name. Their
+    /// historical size must never replace the current volume's size.
+    #[serde(default)]
+    snapshot: Option<String>,
     #[serde(default)]
     size: u64,
 }
@@ -236,6 +240,7 @@ pub fn parse_volumes(json: &str) -> Result<BTreeMap<String, u64>> {
         .map_err(|e| HostError::failed(format!("`rbd ls` did not answer with json: {e}")))?;
     Ok(rows
         .into_iter()
+        .filter(|row| row.snapshot.is_none())
         .filter_map(|row| {
             let name = from_rbd_name(&row.image);
             ResourceName::parse(&name)
@@ -1132,6 +1137,20 @@ mod tests {
         // compared against what was asked for and rounding down would have the
         // model grow the volume on every pass, for ever.
         assert_eq!(volumes["projects/p1/volumes/v2"], 2);
+    }
+
+    #[test]
+    fn historical_snapshot_sizes_do_not_replace_the_resized_volume() {
+        // Real long listings contain the head and every snapshot, each with
+        // the same image name. Listing order must not determine current size.
+        let head = r#"{"image":"projects~p1~volumes~data","size":2147483648,"format":2}"#;
+        let snapshot = r#"{"image":"projects~p1~volumes~data","snapshot":"before-growth","snapshot_id":3,"size":1073741824,"format":2,"protected":"false"}"#;
+        for json in [format!("[{head},{snapshot}]"), format!("[{snapshot},{head}]")] {
+            let volumes = parse_volumes(&json).unwrap();
+            assert_eq!(volumes.len(), 1);
+            assert_eq!(volumes["projects/p1/volumes/data"], 2);
+        }
+        assert!(parse_volumes(&format!("[{snapshot}]")).unwrap().is_empty());
     }
 
     #[test]
