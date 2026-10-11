@@ -5861,10 +5861,8 @@ fn a_full_store_is_a_precondition_and_not_an_internal_error() {
     //     has been exhausted', message: "etcdserver: mvcc: database space
     //     exceeded"
     //
-    // An operator reading that has been told the platform broke. It had not:
-    // etcd keeps every revision until somebody compacts, and the answer is two
-    // commands — which the sentence now carries, because the moment somebody
-    // needs them is the moment they cannot use the console to look them up.
+    // Users need a clear operational refusal, without privileged commands or
+    // internal state-service implementation details.
     let refusal: velstra_cloud_api::ApiError = velstra_cloud_store::StoreError::Backend(
         "grpc request error: code: 'Some resource has been exhausted', message: \
          \"etcdserver: mvcc: database space exceeded\""
@@ -5873,8 +5871,9 @@ fn a_full_store_is_a_precondition_and_not_an_internal_error() {
     .into();
     assert_eq!(refusal.code, velstra_cloud_api::Code::FailedPrecondition);
     let said = refusal.to_string();
-    assert!(said.contains("etcdctl defrag"), "{said}");
-    assert!(said.contains("compacted"), "{said}");
+    assert!(said.contains("full"), "{said}");
+    assert!(said.contains("cloud administrator"), "{said}");
+    assert!(!said.contains("etcdctl"), "{said}");
 
     // Anything else is still what it was: a backend that answered something
     // nobody anticipated is an internal error, and dressing it up as advice
@@ -5882,6 +5881,34 @@ fn a_full_store_is_a_precondition_and_not_an_internal_error() {
     let other: velstra_cloud_api::ApiError =
         velstra_cloud_store::StoreError::Backend("connection reset".into()).into();
     assert_eq!(other.code, velstra_cloud_api::Code::Internal);
+    assert!(other.message.contains("Retry shortly"));
+    assert!(!other.message.contains("connection reset"));
+}
+
+#[tokio::test]
+async fn backend_diagnostics_do_not_escape_through_rest_or_grpc() {
+    use axum::response::IntoResponse;
+    let error: velstra_cloud_api::ApiError = velstra_cloud_store::StoreError::Backend(
+        "grpc transport error at https://private-store.example:2379 using /private/client.key"
+            .into(),
+    )
+    .into();
+    let grpc: tonic::Status = error.clone().into();
+    assert_eq!(grpc.code(), tonic::Code::Internal);
+    let response = error.into_response();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "INTERNAL");
+    assert_eq!(body["error"]["message"], grpc.message());
+    assert!(!grpc.message().contains("private-store"));
+    assert!(!grpc.message().contains("client.key"));
+    assert!(grpc.message().contains("Retry shortly"));
 }
 
 /// A field nobody has is refused wherever it sits, not only at the top.
