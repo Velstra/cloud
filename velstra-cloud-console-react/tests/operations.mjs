@@ -13,11 +13,15 @@ const fakePort = await new Promise((resolve, reject) => { let text = ''; fake.st
 let viewer = false, projectAdmin = false, projectAdminDowngraded = false, customOperator = false, volumeOnly = false, migrationError = false, unauthorizedLists = [], refuseSession = false, refuseDetail = false, htmlDetailStatus = 0, refuseAudit = false, creates = 0, consoleMessages = 0, projectLists = 0;
 let projectEditor = false, schedulePatch = null;
 const schedule = {meta:{name:'projects/p1/backup-schedules/nightly',generation:1,revision:'100',labels:{}},spec:{volume:'projects/p1/volumes/data-1',target:'backup-targets/managed',everyHours:24,keep:2},status:{observedGeneration:1,conditions:[{kind:'Ready',status:'True',observedGeneration:1}]}};
+const usageRecord = {meta:{name:'projects/p1/usage/1791691200000',generation:1,labels:{}},spec:{at:1791691200000,project:'p1',used:{instances:4,vcpus:8,memoryMib:4096,volumes:3,volumeGib:14,floatingIps:0,backups:2,backupGib:6},traffic:{rxBytes:1024,txBytes:2048}},status:{}};
 const streams = new Set();
 let screenGrants = 0, screenInput = 0, screenConnections = 0, screenGrantDelay = 0, consoleEncrypted = true;
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   if (path.startsWith('/api/')) {
+    if (req.method === 'GET' && (path === '/api/v1/projects/p1/usage' || path === '/api/v1/projects/p1/usage/1791691200000')) {
+      res.setHeader('content-type','application/json'); res.end(JSON.stringify(path.endsWith('/usage') ? {items:[usageRecord]} : usageRecord)); return;
+    }
     if (projectEditor && path === '/api/v1/sessions/current') { res.setHeader('content-type','application/json'); res.end(JSON.stringify({subject:'editor',cellAdmin:false,projects:{p1:'editor'}})); return; }
     if (path === '/api/v1/projects/p1/backup-schedules/nightly') {
       if (req.method === 'PATCH') {
@@ -103,7 +107,19 @@ try {
   await click(scheduleEditor, 'Save');
   await wait(scheduleEditor, '!location.hash.endsWith("/edit")');
   assert.deepEqual(schedulePatch.spec, {everyHours:12}, 'editing an interval must not resubmit the managed global destination or unchanged source');
+  await scheduleEditor.goto(url + '#/c/usage/1791691200000');
+  await wait(scheduleEditor, 'document.body.innerText.includes("Resource usage")');
+  assert.ok(await scheduleEditor.evaluate(`[...document.querySelectorAll('h2')].some(x=>x.textContent.includes('2026-10-11 04:00 UTC'))`), 'usage detail identifies a human-readable recording time');
+  assert.deepEqual(await scheduleEditor.evaluate(`[...document.querySelectorAll('dt')].map(x=>[x.textContent,x.nextElementSibling.textContent]).slice(0,6)`), [['Instances','4'],['vCPUs','8'],['Memory','4,096 MiB'],['Volumes','3'],['Storage','14 GiB'],['Public IPs','0']]);
+  assert.equal(await scheduleEditor.evaluate(`[...document.querySelectorAll('button')].some(x=>['Edit','Delete'].includes(x.textContent.trim()))`), false, 'a usage record is immutable');
+  await scheduleEditor.evaluate(`[...document.querySelectorAll('summary')].find(x=>x.textContent==='More usage').click()`);
+  assert.ok(await scheduleEditor.evaluate(`[...document.querySelectorAll('dt')].some(x=>x.textContent==='Backups' && x.nextElementSibling.textContent==='2')`));
+  await scheduleEditor.evaluate('location.reload()');
+  await wait(scheduleEditor, 'document.body.innerText.includes("Resource usage")');
   projectEditor = false;
+  await b.goto(url + '#/c/usage/p1%2F1791691200000');
+  await wait(b, 'document.body.innerText.includes("Resource usage")');
+  assert.equal(await b.evaluate(`[...document.querySelectorAll('button')].some(x=>['Edit','Delete'].includes(x.textContent.trim()))`), false, 'administrators also see read-only usage records');
   await b.goto(url + '#/c/families');
   await wait(b, `document.querySelectorAll('tbody tr.cursor-pointer').length > 0`);
   assert.equal(await b.evaluate(`[...document.querySelectorAll('table th')].some(x=>x.textContent.trim()==='Project')`), true, 'all-project family rows identify their project');
