@@ -102,6 +102,21 @@ function ScreenSession({ r, coll }: { r: Resource; coll: Collection }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [popup]);
 
+  useEffect(() => {
+    if (!popup) return;
+    // Browsers may remove a window without firing its unload handlers.
+    // Detect that independently so a dead portal never keeps a live session.
+    const timer = window.setInterval(() => {
+      if (!popup.closed || popupRef.current !== popup) return;
+      popupRef.current = null;
+      disconnect();
+      setPopup(null);
+    }, 500);
+    return () => window.clearInterval(timer);
+    // The watched window changes only when a screen is moved or closed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [popup]);
+
   const popOut = () => {
     const win = window.open("", `velstra-vnc-${idOf(r)}`, "popup,width=1280,height=820");
     if (!win) { setWhy("The browser blocked the screen window."); return; }
@@ -109,12 +124,14 @@ function ScreenSession({ r, coll }: { r: Resource; coll: Collection }) {
     win.document.body.style.cssText = "margin:0;background:#000;overflow:hidden";
     disconnect();
     popupRef.current = win;
-    win.addEventListener("beforeunload", () => {
+    const closed = () => {
       if (popupRef.current !== win) return;
       popupRef.current = null;
       disconnect();
       setPopup(null);
-    });
+    };
+    win.addEventListener("pagehide", closed);
+    win.addEventListener("beforeunload", closed);
     setPopup(win);
   };
 

@@ -185,7 +185,7 @@ try {
   await activate(b, 'Open in window');
   await wait(b, `document.body.innerText.includes('● connected') && !!window.screenPopup?.document.querySelector('canvas')`);
   assert.equal(screenGrants, 2, 'moving an active screen requests exactly one new ticket');
-  await b.evaluate('window.screenPopup.close()');
+  await b.closePopup(await b.evaluate('window.screenPopup.document.title'));
   await wait(b, `[...document.querySelectorAll('button')].some(x=>x.innerText==='Open screen')`);
   await click(b, 'Open screen'); await wait(b, `document.body.innerText.includes('● connected')`);
   await click(b, 'Close');
