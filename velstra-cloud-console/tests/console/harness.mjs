@@ -209,6 +209,10 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
 
   return {
     evaluate, thrown, requests,
+    async click(x, y) {
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+      await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    },
     async key(key, code = key) {
       await send("Input.dispatchKeyEvent", { type: "keyDown", key, code, windowsVirtualKeyCode: key === "Enter" ? 13 : undefined });
       await send("Input.dispatchKeyEvent", { type: "keyUp", key, code });
