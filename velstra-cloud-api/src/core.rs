@@ -3482,6 +3482,9 @@ impl Api {
         if kind == "backups" {
             self.settle_backup(&mut spec).await?;
         }
+        if kind == "backup-schedules" {
+            self.settle_backup_schedule(&mut spec).await?;
+        }
         if kind == "captures" {
             self.settle_capture(&mut spec).await?;
         }
@@ -4960,6 +4963,16 @@ impl Api {
             )
             .await?;
             self.require_schedule_source(name, spec).await?;
+            if name.collection() == "backup-schedules"
+                && (spec.get("volume").is_some() || spec.get("target").is_some())
+            {
+                let stored = self.get(name, who).await?;
+                let mut combined = stored["spec"].clone();
+                merge(&mut combined, spec);
+                collection.check_spec(&combined)?;
+                self.settle_backup_schedule(&mut combined).await?;
+                spec["target"] = combined["target"].clone();
+            }
             if name.collection() == "subnets" && spec.get("network").is_some() {
                 self.require_subnet_network(name, spec).await?;
             }
@@ -6616,6 +6629,15 @@ impl Api {
         Ok(())
     }
 
+    /// Schedules use the same destination checks as a manual backup, without
+    /// persisting a pool assignment that can change before the next run.
+    async fn settle_backup_schedule(&self, spec: &mut Value) -> ApiResult<()> {
+        let mut backup = spec.clone();
+        self.settle_backup(&mut backup).await?;
+        spec["target"] = backup["target"].clone();
+        Ok(())
+    }
+
     /// Fill in a backup's pool from its volume, and refuse the one target that
     /// makes it not a backup.
     ///
@@ -6638,6 +6660,35 @@ impl Api {
             )
             .await?;
 
+        let pools: Vec<velstra_cloud_model::resources::Pool> = self.typed_list("", "pools").await?;
+        // Current volume specs carry a bare pool id; older stored volumes
+        // may still carry its full name. Compare identities in one spelling.
+        let source_pool = format!(
+            "pools/{}",
+            volume
+                .spec
+                .pool
+                .strip_prefix("pools/")
+                .unwrap_or(&volume.spec.pool)
+        );
+        let view_for = |target: &velstra_cloud_model::resources::BackupTarget| {
+            let same_pool_as = pools
+                .iter()
+                .find(|pool| {
+                    pool.status.conditions.iter().any(|condition| {
+                        condition.reason == "PathIs" && condition.message == target.spec.path
+                    })
+                })
+                .map(|pool| pool.meta.name.to_string());
+            velstra_cloud_model::backup::TargetView {
+                name: target.meta.name.to_string(),
+                path: target.spec.path.clone(),
+                accepting: target.spec.accepting && target.meta.deleted_at.is_none(),
+                writable: target.status.writable,
+                same_pool_as,
+            }
+        };
+
         let mut target_name = spec
             .get("target")
             .and_then(Value::as_str)
@@ -6654,9 +6705,13 @@ impl Api {
             let chosen = targets
                 .iter()
                 .filter(|t| {
-                    t.spec.accepting
-                        && t.meta.deleted_at.is_none()
-                        && t.status.writable == Some(true)
+                    t.status.writable == Some(true)
+                        && velstra_cloud_model::backup::may_back_up(
+                            &volume_name,
+                            &source_pool,
+                            &view_for(t),
+                        )
+                        .is_ok()
                 })
                 .max_by_key(|t| t.status.free_gib);
             let Some(target) = chosen else {
@@ -6671,38 +6726,18 @@ impl Api {
             target_name = target.meta.name.to_string();
             spec["target"] = Value::String(target_name.clone());
         }
-        let target: velstra_cloud_model::resources::BackupTarget = self
-            .typed(
-                &ResourceName::parse(&target_name).map_err(|e| {
-                    ApiError::invalid(format!("spec.target: {e}")).at("spec.target")
-                })?,
-            )
-            .await?;
-
-        // Whether this target's path is a pool's. Answered from the pools
-        // themselves rather than from a flag somebody set on the target: a
-        // flag is a claim, and the thing that matters here is a fact.
-        let pools: Vec<velstra_cloud_model::resources::Pool> =
-            self.typed_list("", "pools").await.unwrap_or_default();
-        let same_pool_as = pools
-            .iter()
-            .find(|p| {
-                p.status
-                    .conditions
-                    .iter()
-                    .any(|c| c.reason == "PathIs" && c.message == target.spec.path)
-            })
-            .map(|p| p.meta.name.to_string());
-
-        let view = velstra_cloud_model::backup::TargetView {
-            name: target.meta.name.to_string(),
-            path: target.spec.path.clone(),
-            accepting: target.spec.accepting,
-            writable: target.status.writable,
-            same_pool_as,
-        };
+        let target_resource = ResourceName::parse(&target_name)
+            .map_err(|e| ApiError::invalid(format!("spec.target: {e}")).at("spec.target"))?;
+        if target_resource.collection() != "backup-targets" {
+            return Err(
+                ApiError::invalid("a backup destination must be a backup target").at("spec.target"),
+            );
+        }
+        let target: velstra_cloud_model::resources::BackupTarget =
+            self.typed(&target_resource).await?;
+        let view = view_for(&target);
         if let Err(refusal) =
-            velstra_cloud_model::backup::may_back_up(&volume_name, &volume.spec.pool, &view)
+            velstra_cloud_model::backup::may_back_up(&volume_name, &source_pool, &view)
         {
             return Err(
                 ApiError::new(Code::FailedPrecondition, refusal.to_string()).at("spec.target")
