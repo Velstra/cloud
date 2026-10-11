@@ -6,6 +6,7 @@ receives only its own node credential; neither etcd nor an admin token is
 copied to the joining node.
 """
 import json
+import inspect
 import os
 from pathlib import Path
 import shlex
@@ -19,6 +20,23 @@ import urllib.request
 
 def fail(message):
     raise SystemExit(message)
+
+
+def control_plane_roles(spec):
+    # Nodes stored before roles existed are compute nodes. Adding a control
+    # plane service must preserve that placement meaning during an upgrade.
+    roles = spec.get('roles') or ['compute']
+    return roles if 'control-plane' in roles else [*roles, 'control-plane']
+
+
+def agent_seed(lines, url, ca_path):
+    wanted = {'VELSTRA_API_URL': url, 'VELSTRA_API_CA': ca_path}
+    if all(f'{key}={value}' in lines and
+           sum(line.startswith(key + '=') for line in lines) == 1
+           for key, value in wanted.items()):
+        return lines
+    return [line for line in lines if line.partition('=')[0] not in wanted] + [
+        f'{key}={value}' for key, value in wanted.items()]
 
 
 def main(inventory_path):
@@ -80,10 +98,10 @@ def main(inventory_path):
         code, current = request('GET', '/nodes/' + name, expected=(200, 404))
         if code == 200:
             spec = current.get('spec', {})
-            roles = spec.get('roles') or []
-            if 'control-plane' not in roles:
+            roles = control_plane_roles(spec)
+            if roles != spec.get('roles'):
                 request('PATCH', '/nodes/' + name,
-                        {'spec': {'roles': [*roles, 'control-plane']}},
+                        {'spec': {'roles': roles}},
                         expected=(200,))
         if present.stdout.strip() == 'missing':
             if code == 404:
@@ -112,24 +130,29 @@ def main(inventory_path):
 test -s /etc/velstra/node.env
 grep -Eq '^VELSTRA_ROLES=.*control-plane' /etc/velstra/node.env
 curl --max-time 10 --cacert '''+shlex.quote(agent_ca_path)+' '+shlex.quote(agent_url+'/readyz')+''' >/dev/null
-python3 - '''+shlex.quote(agent_url)+''' <<'PY'
+python3 - '''+shlex.quote(agent_url)+' '+shlex.quote(agent_ca_path)+''' <<'PY'
 from pathlib import Path
 import sys
+'''+inspect.getsource(agent_seed)+'''
 path=Path('/etc/velstra/node.env')
 lines=path.read_text().splitlines()
-wanted='VELSTRA_API_URL='+sys.argv[1]
-if wanted not in lines or sum(line.startswith('VELSTRA_API_URL=') for line in lines) != 1:
-    lines=[line for line in lines if not line.startswith('VELSTRA_API_URL=')]
-    lines.append(wanted)
-    path.write_text('\\n'.join(lines)+'\\n')
+updated=agent_seed(lines,sys.argv[1],sys.argv[2])
+if updated != lines:
+    path.write_text('\\n'.join(updated)+'\\n')
     Path('/run/velstra-agent-endpoint-changed').touch()
 PY
+ca_state=/run/velstra-agent-api-ca.sha256
+ca_current=$(sha256sum '''+shlex.quote(agent_ca_path)+''')
+if ! test -s "$ca_state" || test "$(cat "$ca_state")" != "$ca_current"; then
+  touch /run/velstra-agent-endpoint-changed
+fi
 if test -e /run/velstra-agent-endpoint-changed; then
   rm -f /run/velstra-agent-endpoint-changed
   systemctl restart velstra-cloud-nodeagent
 else
   systemctl is-active --quiet velstra-cloud-nodeagent || systemctl restart velstra-cloud-nodeagent
 fi
+printf '%s\\n' "$ca_current" > "$ca_state"
 systemctl enable velstra-cloud-nodeagent >/dev/null
 ''')
         if configured.returncode:

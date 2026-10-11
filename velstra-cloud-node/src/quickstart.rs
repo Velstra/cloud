@@ -480,6 +480,14 @@ pub(crate) fn ensure_node(api: &str, token: &str, id: &str, dir: &std::path::Pat
         say("the node already has its token");
         return Ok(());
     }
+    let payload = serde_json::json!({
+        "id": id,
+        "spec": {
+            "roles": ["control-plane", "compute", "storage"],
+            "schedulable": true
+        }
+    })
+    .to_string();
     let body = curl(&[
         "-X",
         "POST",
@@ -488,7 +496,7 @@ pub(crate) fn ensure_node(api: &str, token: &str, id: &str, dir: &std::path::Pat
         "-H",
         "Content-Type: application/json",
         "-d",
-        &format!("{{\"id\":\"{id}\",\"spec\":{{\"schedulable\":true}}}}"),
+        &payload,
         &format!("{api}/nodes"),
     ])?;
     let node_token = match field(&body, "nodeToken") {
@@ -638,6 +646,13 @@ mod tests {
                     );
                 } else {
                     assert!(headers.contains("Authorization: Bearer session-secret"));
+                    if path == "/api/v1/nodes" {
+                        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(
+                            created["spec"]["roles"],
+                            serde_json::json!(["control-plane", "compute", "storage"])
+                        );
+                    }
                 }
                 write!(
                     stream,
