@@ -94,8 +94,8 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
       ),
     },
     {
-      id: "name", accessorFn: (r) => idOf(r), header: coll.singular === "project" ? "Project" : "Name", size: mobile && asList ? 165 : 240,
-      cell: ({ row }) => <span className="flex min-w-0 flex-col" style={{ color: "var(--text-strong)" }}><span className="truncate font-medium">{idOf(row.original)}</span>{mobile && asList && project === ALL && coll.scope === "project" && <span className="truncate font-mono text-[11px] text-muted-foreground">{projectOf(nameOf(row.original))}</span>}</span>,
+      id: "name", accessorFn: (r) => custom.name?.(r) ?? idOf(r), header: custom.nameLabel ?? (coll.singular === "project" ? "Project" : "Name"), size: mobile && asList ? 165 : 240,
+      cell: ({ row }) => <span className="flex min-w-0 flex-col" style={{ color: "var(--text-strong)" }}><span className="truncate font-medium">{custom.name?.(row.original) ?? idOf(row.original)}</span>{mobile && asList && project === ALL && coll.scope === "project" && <span className="truncate font-mono text-[11px] text-muted-foreground">{projectOf(nameOf(row.original))}</span>}</span>,
     },
     ...(project === ALL && coll.scope === "project" && !(mobile && asList) ? [{
       id: "project", accessorFn: (r: Resource) => projectOf(nameOf(r)) ?? "", header: "Project", size: 140,

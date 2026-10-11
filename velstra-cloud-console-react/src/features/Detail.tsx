@@ -92,7 +92,7 @@ export function Detail({ coll, id, mode, onChanged }: {
   }
 
   return (
-    <Pane title={idOf(r)} sub={nameOf(r)} onClose={close}
+    <Pane title={custom.name?.(r) ?? idOf(r)} sub={nameOf(r)} onClose={close}
       head={
         <div className="flex flex-wrap gap-2">
           <Pressed size="sm" variant="outline" onPress={load}><RefreshCw className="size-3.5" />Refresh</Pressed>

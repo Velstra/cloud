@@ -6,6 +6,7 @@
 // (a console, a map) is adding an entry, not editing a renderer.
 
 import type { ReactNode } from "react";
+import { Usage, usageTime } from "@/features/Usage";
 import type { Resource } from "@/lib/model";
 import type { Collection, Field } from "@/lib/schema";
 import operations from "@/api/operations.json";
@@ -64,6 +65,8 @@ export type Panel = {
 export type FieldEditor = (p: { f: Field; value: any; onChange: (v: any) => void; disabled: boolean; existing?: Resource }) => ReactNode;
 
 type Entry = {
+  name?: (r: Resource) => string;
+  nameLabel?: string;
   cells?: Record<string, (r: Resource) => ReactNode>;
   actions?: Action[];
   panels?: Panel[];
@@ -239,4 +242,9 @@ register("networks", {
     id: "map", title: "Map", sub: "this network among the others",
     render: () => <a href="#/map" className="text-xs underline-offset-2 hover:underline" style={{ color: "var(--brand)" }}>Open the map →</a>,
   }],
+});
+
+register("usage", {
+  name: usageTime, nameLabel: "Recorded",
+  panels: [{ id: "usage", title: "Resource usage", render: (r) => <Usage r={r} /> }],
 });
