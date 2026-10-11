@@ -13,12 +13,14 @@ const fakePort = await new Promise((resolve, reject) => { let text = ''; fake.st
 let viewer = false, projectAdmin = false, projectAdminDowngraded = false, customOperator = false, volumeOnly = false, migrationError = false, unauthorizedLists = [], refuseSession = false, refuseDetail = false, htmlDetailStatus = 0, refuseAudit = false, creates = 0, consoleMessages = 0, projectLists = 0;
 let projectEditor = false, schedulePatch = null;
 const schedule = {meta:{name:'projects/p1/backup-schedules/nightly',generation:1,revision:'100',labels:{}},spec:{volume:'projects/p1/volumes/data-1',target:'backup-targets/managed',everyHours:24,keep:2},status:{observedGeneration:1,conditions:[{kind:'Ready',status:'True',observedGeneration:1}]}};
+const volumeRecord = {meta:{name:'projects/p1/volumes/detail-check',generation:1,labels:{}},spec:{sizeGib:8,pool:'fast'},status:{actualSizeGib:4,provisioned:true,pool:'fast',conditions:[]}};
 const usageRecord = {meta:{name:'projects/p1/usage/1791691200000',generation:1,labels:{}},spec:{at:1791691200000,project:'p1',used:{instances:4,vcpus:8,memoryMib:4096,volumes:3,volumeGib:14,floatingIps:0,backups:2,backupGib:6},traffic:{rxBytes:1024,txBytes:2048}},status:{}};
 const streams = new Set();
 let screenGrants = 0, screenInput = 0, screenConnections = 0, screenGrantDelay = 0, consoleEncrypted = true;
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   if (path.startsWith('/api/')) {
+    if (req.method === 'GET' && path === '/api/v1/projects/p1/volumes/detail-check') { res.setHeader('content-type','application/json'); res.end(JSON.stringify(volumeRecord)); return; }
     if (req.method === 'GET' && (path === '/api/v1/projects/p1/usage' || path === '/api/v1/projects/p1/usage/1791691200000')) {
       res.setHeader('content-type','application/json'); res.end(JSON.stringify(path.endsWith('/usage') ? {items:[usageRecord]} : usageRecord)); return;
     }
@@ -116,6 +118,20 @@ try {
   assert.ok(await scheduleEditor.evaluate(`[...document.querySelectorAll('dt')].some(x=>x.textContent==='Backups' && x.nextElementSibling.textContent==='2')`));
   await scheduleEditor.evaluate('location.reload()');
   await wait(scheduleEditor, 'document.body.innerText.includes("Resource usage")');
+  await scheduleEditor.goto(url + '#/c/volumes/detail-check');
+  await wait(scheduleEditor, 'document.body.innerText.includes("Capacity")');
+  assert.deepEqual(await scheduleEditor.evaluate(`[...document.querySelectorAll('dl[aria-label="Volume storage"] dt')].map(x=>[x.textContent,x.nextElementSibling.textContent])`), [['Capacity','4 GiB'],['Storage pool','fast']]);
+  assert.ok(await scheduleEditor.evaluate(`document.body.innerText.includes('Requested: 8 GiB')`), 'requested growth is not presented as allocated capacity');
+  volumeRecord.status.actualSizeGib = 8;
+  await scheduleEditor.evaluate('location.reload()');
+  await wait(scheduleEditor, `document.querySelector('dl[aria-label="Volume storage"]')?.innerText.includes('8 GiB')`);
+  assert.equal(await scheduleEditor.evaluate(`document.querySelector('dl[aria-label="Volume storage"]').innerText.includes('Requested:')`), false);
+  volumeRecord.status = {actualSizeGib:0,provisioned:false,conditions:[]};
+  volumeRecord.spec.pool = '';
+  await scheduleEditor.evaluate('location.reload()');
+  await wait(scheduleEditor, `document.querySelector('dl[aria-label="Volume storage"]')?.innerText.includes('Not allocated')`);
+  assert.ok(await scheduleEditor.evaluate(`document.querySelector('dl[aria-label="Volume storage"]').innerText.includes('Not assigned')`));
+  scheduleEditor.close();
   projectEditor = false;
   await b.goto(url + '#/c/usage/p1%2F1791691200000');
   await wait(b, 'document.body.innerText.includes("Resource usage")');
