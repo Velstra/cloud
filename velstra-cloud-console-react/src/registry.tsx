@@ -6,7 +6,8 @@
 // (a console, a map) is adding an entry, not editing a renderer.
 
 import type { ReactNode } from "react";
-import { Usage, usageTime } from "@/features/Usage";
+import { Usage } from "@/features/Usage";
+import { usageTime } from "@/lib/model";
 import type { Resource } from "@/lib/model";
 import type { Collection, Field } from "@/lib/schema";
 import operations from "@/api/operations.json";
