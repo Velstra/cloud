@@ -1487,17 +1487,18 @@ That is the same two-field ownership as an instance and its node, and it is why
 that has claimed it. A volume whose `status.pool` is null has not been picked up
 by anything, which usually means no agent is running for the pool it names.
 
-Pools are an ordinary collection. `status.backend` is what the agent found
-itself running, not something an operator declares; `status.allocatedGib` is
-counted from the volumes in the pool rather than tracked as a total.
+Pools are an ordinary collection. `spec.backend` selects the requested backend
+and `spec.backendTarget` its destination; `status.backend` reports what the agent
+is actually running. `status.allocatedGib` is counted from the volumes in the
+pool rather than tracked as a total.
 
 Two behaviours a client may rely on:
 
-- **A volume is grown, never shrunk.** A `sizeGib` smaller than what exists is
-  accepted as a spec — it is a legitimate thing to write — but nothing happens
-  to the bytes, and the volume reports `Ready=False` with reason
-  `WillNotShrink` and a sentence saying what to do instead. Shrinking would
-  destroy whatever is past the new end, and no request makes that recoverable.
+- **A volume is grown, never shrunk.** A `sizeGib` smaller than the current
+  requested or provisioned size is rejected with HTTP 400 and a field-specific
+  error. The agent also refuses shrink requests encountered in existing state.
+  Shrinking would destroy whatever is past the new end, and no request makes
+  that recoverable.
 - **Deleting waits for the pool.** `DELETE` returns 202 and the volume stays
   listable, carrying `pool.velstra.io/release`, until the pool reports it holds
   nothing of it. A volume that vanished from the API while its pool still held
