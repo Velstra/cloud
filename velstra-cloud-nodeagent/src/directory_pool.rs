@@ -285,6 +285,10 @@ impl DirectoryPool {
 
 #[async_trait::async_trait]
 impl Storage for DirectoryPool {
+    fn directory_root(&self) -> Option<PathBuf> {
+        Some(std::fs::canonicalize(&self.dir).unwrap_or_else(|_| self.dir.clone()))
+    }
+
     fn at(&self, volume: &str) -> Option<String> {
         Some(self.volume_path(volume).to_string_lossy().into_owned())
     }
