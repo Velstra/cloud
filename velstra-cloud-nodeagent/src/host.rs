@@ -169,6 +169,9 @@ pub struct HostState {
     /// that started it: without this an agent would start a second send on top
     /// of the first on every resync while a large guest copies.
     pub sending: BTreeSet<String>,
+    /// Asynchronous transfer failures reported by the running VMM. These do
+    /// not mean the source guest failed or that ownership may be released.
+    pub migration_failures: BTreeMap<String, String>,
 }
 
 /// What a guest needs to exist. Assembled by the agent from the instance's
