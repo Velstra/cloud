@@ -4336,6 +4336,31 @@ async fn a_tenant_may_not_write_a_machine_on_an_attachment_by_either_path() {
 #[tokio::test]
 async fn schedules_cannot_copy_another_projects_volume_on_create_or_patch() {
     let api = cell().await;
+    api.create(
+        "",
+        "backup-targets",
+        &json!({"id": "archive", "spec": {
+            "kind": "directory", "path": "/srv/archive", "agent": "pool-a", "accepting": true
+        }}),
+        &who(OPERATOR),
+    )
+    .await
+    .unwrap();
+    let targets: TypedStore<
+        velstra_cloud_model::backup::BackupTargetSpec,
+        velstra_cloud_model::backup::BackupTargetStatus,
+    > = TypedStore::new(api.store.clone(), "cell-1", "backup-targets");
+    let mut target = targets
+        .get("backup-targets/archive")
+        .await
+        .unwrap()
+        .unwrap();
+    target.status.writable = Some(true);
+    target.status.free_gib = 100;
+    targets
+        .update(&target, &Writer::agent("pool-a"))
+        .await
+        .unwrap();
     for (project, owner) in [("p1", ADA), ("p2", BOB)] {
         api.create(
             &format!("projects/{project}"),

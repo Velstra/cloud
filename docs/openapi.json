@@ -196,7 +196,7 @@
             "x-unit": "copies"
           },
           "target": {
-            "description": "The name of a `backup-targets` object. Where the copies go.",
+            "description": "The name of a `backup-targets` object. Leave empty to use an available backup destination.",
             "type": "string"
           },
           "volume": {
@@ -206,7 +206,6 @@
         },
         "required": [
           "volume",
-          "target",
           "everyHours",
           "keep"
         ],
