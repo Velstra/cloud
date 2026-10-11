@@ -1190,7 +1190,14 @@ impl PoolAgent {
             .await;
             return;
         }
-        let written = match self.storage.copy_out_snapshot(&moment, &path).await {
+        let copied = self.storage.copy_out_snapshot(&moment, &path).await;
+        // The export has stopped reading the snapshot on both outcomes. A
+        // failed target must not pin source blocks until the next retry (which
+        // may never happen if the backup is deleted or its target disabled).
+        if let Err(e) = self.storage.destroy_snapshot(&moment).await {
+            tracing::warn!(backup = %name, error = %e, "the moment taken for this copy could not be removed");
+        }
+        let written = match copied {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!(backup = %name, error = %e, "this copy could not be made");
@@ -1202,12 +1209,6 @@ impl PoolAgent {
         };
         pass.actions += 1;
 
-        // The moment has been read; it costs space until it is gone. Best
-        // effort: a snapshot that will not go is worth a line, not a failed
-        // backup whose bytes are already on the target.
-        if let Err(e) = self.storage.destroy_snapshot(&moment).await {
-            tracing::warn!(backup = %name, error = %e, "the moment taken for this copy could not be removed");
-        }
         // The source's size as this pool has it, which is the smallest volume
         // that can be restored from the copy — a different number from what the
         // copy occupies, and both are worth knowing.
@@ -3164,6 +3165,40 @@ mod tests {
             Some(ConditionStatus::True),
             "the agent did not say it had let go"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_backup_copy_releases_its_temporary_snapshot_and_can_retry() {
+        let (cell, agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        agent.resync().await;
+        cell.backup("b1", "nvme", "archive").await;
+        agent.resync().await;
+        let moment = format!(
+            "{VOLUME}/snapshots/{}",
+            backup_moment("projects/p1/backups/b1")
+        );
+        cell.fake.fail("copy_out", &moment, "target unavailable");
+        agent.resync().await;
+        let failed = cell.reload_backup("b1").await;
+        assert!(!failed.status.taken);
+        assert!(
+            failed
+                .status
+                .conditions
+                .iter()
+                .any(|c| c.reason == "CopyFailed")
+        );
+        assert!(
+            !cell.fake.has_snapshot(&moment),
+            "failed export leaked its temporary snapshot"
+        );
+        cell.fake.heal("copy_out", &moment);
+        agent.resync().await;
+        assert!(cell.reload_backup("b1").await.status.taken);
+        assert!(!cell.fake.has_snapshot(&moment));
     }
 
     #[tokio::test]
