@@ -585,6 +585,7 @@ impl Vmm for FakeVmm {
             volumes: m.volumes.clone(),
             receivers: m.receivers.clone(),
             sending: m.sending.keys().cloned().collect(),
+            migration_failures: BTreeMap::new(),
             devices: m.devices.clone(),
             ceph: m.ceph.clone(),
             cpu: m.cpu.clone(),
