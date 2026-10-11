@@ -8,5 +8,6 @@ declare module "@novnc/novnc" {
     addEventListener(kind: string, handler: (e: any) => void): void;
     scaleViewport: boolean;
     resizeSession: boolean;
+    viewOnly: boolean;
   }
 }

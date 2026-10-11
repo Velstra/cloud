@@ -5,12 +5,14 @@ import { createServer, request } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import { screenFixture } from './rfb-fixture.mjs';
 import { browser } from '../../velstra-cloud-console/tests/console/harness.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const fake = spawn(process.execPath, [fileURLToPath(new URL('../../velstra-cloud-console/tests/console/fake-api.mjs', import.meta.url))], { env: { ...process.env, FAKE_PORT: '0' }, stdio: ['ignore', 'pipe', 'inherit'] });
 const fakePort = await new Promise((resolve, reject) => { let text = ''; fake.stdout.on('data', (data) => { text += data; const m = /listening (\d+)/.exec(text); if (m) resolve(Number(m[1])); }); fake.on('exit', () => reject(new Error('Fixture exited'))); });
 let viewer = false, projectAdmin = false, projectAdminDowngraded = false, customOperator = false, volumeOnly = false, migrationError = false, unauthorizedLists = [], refuseSession = false, refuseDetail = false, htmlDetailStatus = 0, refuseAudit = false, creates = 0, consoleMessages = 0, projectLists = 0;
 const streams = new Set();
+let screenGrants = 0, screenInput = 0, screenConnections = 0, screenGrantDelay = 0, consoleEncrypted = true;
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   if (path.startsWith('/api/')) {
@@ -27,7 +29,14 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && path === '/api/v1/flavors') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({items:[{meta:{name:'flavors/test-size'},spec:{vcpus:2,memoryMib:4096,rootDiskGib:10}}]})); return; }
     if (req.method === 'GET' && path === '/api/v1/flavors/test-size') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({meta:{name:'flavors/test-size'},spec:{vcpus:2,memoryMib:4096,rootDiskGib:10}})); return; }
     if (migrationError && req.method === 'GET' && path === '/api/v1/projects/p1/migrations') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({items:[{meta:{name:'projects/p1/migrations/blocked-transfer',generation:1,createdAt:Date.now()},spec:{instance:'projects/p1/instances/web-1',fromNode:'node-a',toNode:'node-b',mode:'Live'},status:{observedGeneration:0,conditions:[{kind:'Moved',status:'Unknown',reason:'DestinationError',message:'The destination cannot prepare a receiver',observedGeneration:1}]}}]})); return; }
-    if (req.method === 'POST' && path.endsWith(':console')) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ session: 'test-session', ticket: 'one-time-fixture', readOnly: viewer, encrypted: true })); return; }
+    if (req.method === 'POST' && path.endsWith(':console')) {
+      let body = ''; for await (const chunk of req) body += chunk;
+      const screen = JSON.parse(body).kind === 'Vnc';
+      if (screen) screenGrants++;
+      if (screen && screenGrantDelay) await new Promise(r=>setTimeout(r, screenGrantDelay));
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ session: screen ? 'screen-session' : 'test-session', ticket: 'one-time-fixture', readOnly: viewer, encrypted: consoleEncrypted })); return;
+    }
     if (refuseSession && req.method === 'GET' && path === '/api/v1/sessions/current') { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'Session backend unavailable' } })); return; }
     if (viewer && path === '/api/v1/sessions/current') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ subject: 'viewer', cellAdmin: false, projects: { p1: 'viewer' } })); return; }
     if (projectAdmin && path === '/api/v1/sessions/current') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ subject: 'project-admin', cellAdmin: false, projects: { p1: projectAdminDowngraded ? 'viewer' : 'admin' }, capabilities: { p1: { projects: projectAdminDowngraded ? ['read'] : ['read', 'operate', 'write', 'administer'] } } })); return; }
@@ -47,6 +56,10 @@ server.on('upgrade', (req, socket) => {
   const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
   streams.add(socket); socket.on('close', () => streams.delete(socket)); socket.on('error', () => {});
+  if (new URL(req.url, 'http://localhost').searchParams.get('session') === 'screen-session') {
+    screenConnections++;
+    screenFixture(socket, () => screenInput++); return;
+  }
   const text = Buffer.from('Binary console ready\r\n');
   socket.write(Buffer.concat([Buffer.from([0x82, text.length]), text]));
   socket.on('data', (data) => { if ((data[0] & 15) === 1) consoleMessages++; if ((data[0] & 15) === 8) socket.end(Buffer.from([0x88, 0])); });
@@ -56,6 +69,11 @@ const url = `http://127.0.0.1:${server.address().port}/`;
 const pages = [];
 const wait = async (b, expression) => { for (let i = 0; i < 100; i++) { if (await b.evaluate(expression)) return; await new Promise(r => setTimeout(r, 100)); } throw new Error(`Timed out: ${expression}\n${await b.evaluate("document.body.innerText")}`); };
 const click = (b, text) => b.evaluate(`[...document.querySelectorAll('button')].find(x=>x.innerText===${JSON.stringify(text)}).click()`);
+// Popups require a trusted user gesture, not a scripted element.click().
+const activate = async (b, text) => {
+  const [x, y] = await b.evaluate(`(()=>{const e=[...document.querySelectorAll('button')].find(x=>x.innerText===${JSON.stringify(text)});e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();return [r.x+r.width/2,r.y+r.height/2];})()`);
+  await b.click(x, y);
+};
 const fill = (b, selector, value) => b.evaluate(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});const proto=e.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;Object.getOwnPropertyDescriptor(proto,'value').set.call(e,${JSON.stringify(value)});e.dispatchEvent(new Event(e.tagName==='SELECT'?'change':'input',{bubbles:true}));})()`);
 const login = async (b) => { await b.goto(url); await fill(b, '#u', 'operator'); await fill(b, '#p', 'a test operator passphrase'); await click(b, 'Sign in'); await wait(b, '!!document.querySelector("#rail")'); };
 try {
@@ -156,8 +174,41 @@ try {
   await click(b, 'Attach again'); await wait(b, `document.body.innerText.includes('● attached')`);
   await b.type('y'); await new Promise(r=>setTimeout(r,150));
   assert.equal(consoleMessages, 2, 'reattaching must dispose the previous input subscription');
-  await b.goto(url + '#/c/instances/p1%2Fdb-1');
+  await click(b, 'Screen');
+  await wait(b, `[...document.querySelectorAll('button')].some(x=>x.innerText==='Open screen')`);
+  await click(b, 'Open screen');
+  await wait(b, `document.body.innerText.includes('● connected')`);
+  assert.ok(await b.evaluate(`document.body.innerText.includes('Encrypted end to end')`));
+  await click(b, 'Ctrl-Alt-Del'); await new Promise(r=>setTimeout(r,150));
+  assert.ok(screenInput > 0, 'operator input reaches the real RFB stream');
+  await b.evaluate(`(()=>{const open=window.open.bind(window);window.open=(...args)=>{window.screenPopup=open(...args);return window.screenPopup;};})()`);
+  await activate(b, 'Open in window');
+  await wait(b, `document.body.innerText.includes('● connected') && !!window.screenPopup?.document.querySelector('canvas')`);
+  assert.equal(screenGrants, 2, 'moving an active screen requests exactly one new ticket');
+  await b.closePopup(await b.evaluate('window.screenPopup.document.title'));
+  await wait(b, `[...document.querySelectorAll('button')].some(x=>x.innerText==='Open screen')`);
+  await click(b, 'Open screen'); await wait(b, `document.body.innerText.includes('● connected')`);
+  await click(b, 'Close');
+  await wait(b, `[...document.querySelectorAll('button')].some(x=>x.innerText==='Open in window')`);
+  await activate(b, 'Open in window');
+  await wait(b, `document.body.innerText.includes('● connected') && !window.screenPopup.closed`);
+  assert.equal(screenGrants, 4, 'closing and reopening never duplicate a console grant');
+  await b.evaluate('window.screenPopup.close()');
+  await wait(b, `[...document.querySelectorAll('button')].some(x=>x.innerText==='Open screen')`);
+  consoleEncrypted = false;
+  await click(b, 'Open screen'); await wait(b, `document.body.innerText.includes('● connected')`);
+  assert.ok(await b.evaluate(`document.body.innerText.includes('not encrypted')`), 'screen reports an unencrypted node hop honestly');
+  consoleEncrypted = true;
+  await click(b, 'Close');
+  screenGrantDelay = 300;
+  const beforeConnections = screenConnections;
+  await click(b, 'Open screen');
+  await wait(b, `document.body.innerText.includes('Asking for the screen')`);
+  await b.evaluate(`location.hash='#/c/instances/p1%2Fdb-1'`);
   await wait(b, 'document.body.innerText.includes("db-1") && document.body.innerText.includes("Access")');
+  await new Promise(r=>setTimeout(r,500));
+  assert.equal(screenConnections, beforeConnections, 'a late grant cannot open the previous guest after navigation');
+  screenGrantDelay = 0;
   assert.equal(await b.evaluate(`[...document.querySelectorAll('button')].some(x=>x.innerText==='Attach')`), false, 'an unplaced instance must not offer a live console session');
   assert.ok(await b.evaluate(`document.body.innerText.includes('Console available when running')`), 'console availability must be explained in user terms');
   await b.goto(url + '#/c/projects/p1');
@@ -191,6 +242,10 @@ try {
   await wait(mobile, `document.body.innerText.includes('Read-only session') && document.querySelector('.xterm-rows')?.innerText.includes('Binary console ready')`);
   await mobile.type('z'); await new Promise(r=>setTimeout(r,150));
   assert.equal(consoleMessages, 2, 'viewer console must not transmit input');
+  await click(mobile, 'Screen');
+  await wait(mobile, `document.body.innerText.includes('Read-only access is available in Console')`);
+  assert.equal(await mobile.evaluate(`[...document.querySelectorAll('button')].some(x=>x.innerText==='Ctrl-Alt-Del')`), false, 'viewer has no guest reboot shortcut');
+  assert.equal(await mobile.evaluate(`[...document.querySelectorAll('button')].some(x=>x.innerText==='Open screen' || x.innerText==='Open in window')`), false, 'viewer is directed to the supported serial console, not a refused VNC session');
   await mobile.goto(url + '#/c/instances/new');
   await wait(mobile, `document.body.innerText.includes('do not have permission to create')`);
   assert.equal(await mobile.evaluate('!!document.querySelector("form")'), false, 'direct create URL must not expose a viewer form');
