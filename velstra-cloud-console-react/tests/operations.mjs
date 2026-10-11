@@ -11,11 +11,23 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const fake = spawn(process.execPath, [fileURLToPath(new URL('../../velstra-cloud-console/tests/console/fake-api.mjs', import.meta.url))], { env: { ...process.env, FAKE_PORT: '0' }, stdio: ['ignore', 'pipe', 'inherit'] });
 const fakePort = await new Promise((resolve, reject) => { let text = ''; fake.stdout.on('data', (data) => { text += data; const m = /listening (\d+)/.exec(text); if (m) resolve(Number(m[1])); }); fake.on('exit', () => reject(new Error('Fixture exited'))); });
 let viewer = false, projectAdmin = false, projectAdminDowngraded = false, customOperator = false, volumeOnly = false, migrationError = false, unauthorizedLists = [], refuseSession = false, refuseDetail = false, htmlDetailStatus = 0, refuseAudit = false, creates = 0, consoleMessages = 0, projectLists = 0;
+let projectEditor = false, schedulePatch = null;
+const schedule = {meta:{name:'projects/p1/backup-schedules/nightly',generation:1,revision:'100',labels:{}},spec:{volume:'projects/p1/volumes/data-1',target:'backup-targets/managed',everyHours:24,keep:2},status:{observedGeneration:1,conditions:[{kind:'Ready',status:'True',observedGeneration:1}]}};
 const streams = new Set();
 let screenGrants = 0, screenInput = 0, screenConnections = 0, screenGrantDelay = 0, consoleEncrypted = true;
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   if (path.startsWith('/api/')) {
+    if (projectEditor && path === '/api/v1/sessions/current') { res.setHeader('content-type','application/json'); res.end(JSON.stringify({subject:'editor',cellAdmin:false,projects:{p1:'editor'}})); return; }
+    if (path === '/api/v1/projects/p1/backup-schedules/nightly') {
+      if (req.method === 'PATCH') {
+        let raw=''; for await (const chunk of req) raw+=chunk;
+        schedulePatch=JSON.parse(raw);
+        if (schedulePatch.spec?.target) { res.writeHead(403,{'content-type':'application/json'}); res.end(JSON.stringify({error:{message:'Only an operator may select a global target'}})); return; }
+        Object.assign(schedule.spec,schedulePatch.spec); schedule.meta.generation++;
+      }
+      res.setHeader('content-type','application/json'); res.end(JSON.stringify(schedule)); return;
+    }
     if (htmlDetailStatus && req.method === 'GET' && path === '/api/v1/projects/p1/networks/browser-network') {
       res.writeHead(htmlDetailStatus, { 'content-type': 'text/html' });
       res.end('<!DOCTYPE html><html><body>private-upstream.example: connection refused</body></html>');
@@ -82,6 +94,16 @@ try {
   await wait(b, '!document.body.innerText.includes("Checking resources")');
   assert.ok(projectLists <= 3, `concurrent first inventory reads must share their project lookup (got ${projectLists})`);
   assert.ok(await b.evaluate(`(()=>{const networks=document.querySelector('#rail a[href="#/c/networks"] svg');const subnets=document.querySelector('#rail a[href="#/c/subnets"] svg');return !!networks && !!subnets && networks.innerHTML!==subnets.innerHTML})()`), 'collections in one section use distinct icons');
+  projectEditor = true;
+  const scheduleEditor = await browser(); pages.push(scheduleEditor);
+  await login(scheduleEditor);
+  await scheduleEditor.goto(url + '#/c/backup-schedules/nightly/edit');
+  await wait(scheduleEditor, '!!document.querySelector("form input[type=number]")');
+  await fill(scheduleEditor, 'form input[type=number]', '12');
+  await click(scheduleEditor, 'Save');
+  await wait(scheduleEditor, '!location.hash.endsWith("/edit")');
+  assert.deepEqual(schedulePatch.spec, {everyHours:12}, 'editing an interval must not resubmit the managed global destination or unchanged source');
+  projectEditor = false;
   await b.goto(url + '#/c/families');
   await wait(b, `document.querySelectorAll('tbody tr.cursor-pointer').length > 0`);
   assert.equal(await b.evaluate(`[...document.querySelectorAll('table th')].some(x=>x.textContent.trim()==='Project')`), true, 'all-project family rows identify their project');
