@@ -1274,7 +1274,6 @@ pub fn nobody_reports_on(kind: &str) -> bool {
             | "maintenance-windows"
             | "subnets"
             | "images"
-            | "snapshot-schedules"
             // A view of the images, grouped by family and computed on the way
             // out. There is no object here for anything to report on.
             | "families"
@@ -2633,6 +2632,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn schedule_operations_wait_for_the_controller_and_finish_on_its_report() {
+        for kind in ["backup-schedules", "snapshot-schedules"] {
+            let spec = OperationSpec {
+                target: format!("projects/p1/{kind}/nightly"),
+                target_generation: 2,
+                verb: "update".into(),
+                requested_by: "ada".into(),
+            };
+            let mut target = TargetView::Present {
+                observed_generation: 1,
+                condition_generation: 1,
+                ready: ConditionStatus::True,
+                reason: "Ready".into(),
+                message: String::new(),
+            };
+            assert!(!operation_progress(&spec, &target).done);
+            if let TargetView::Present {
+                observed_generation,
+                condition_generation,
+                ..
+            } = &mut target
+            {
+                *observed_generation = 2;
+                *condition_generation = 2;
+            }
+            let completed = operation_progress(&spec, &target);
+            assert!(completed.done);
+            assert!(completed.error.is_none());
+            if let TargetView::Present { ready, reason, .. } = &mut target {
+                *ready = ConditionStatus::False;
+                *reason = "SourceMissing".into();
+            }
+            let failed = operation_progress(&spec, &target);
+            assert!(failed.done);
+            assert!(failed.error.is_some());
+        }
+    }
+
     /// An operation for something nobody reports on has to finish.
     ///
     /// A subnet, an image, a security group: no agent owns one, so
@@ -2647,7 +2685,6 @@ mod tests {
         for target in [
             "projects/p1/subnets/lan0",
             "projects/p1/images/sha256-abc",
-            "projects/p1/snapshot-schedules/nightly",
             "users/ada",
         ] {
             let spec = OperationSpec {
