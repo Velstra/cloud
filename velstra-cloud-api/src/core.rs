@@ -6177,6 +6177,15 @@ impl Api {
             Err(_) => TargetView::Gone,
         };
         let progress = operation_progress(&spec, &view);
+        let generation = document["meta"]["generation"].as_u64().unwrap_or(0);
+        let mut ready = progress.ready_condition(generation);
+        // This is a read-time fallback, not a persisted completion. Do not
+        // invent a finish time or make each poll look like a new transition.
+        ready.last_transition = Timestamp(0);
+        let mut conditions: Vec<Condition> =
+            serde_json::from_value(document["status"]["conditions"].clone()).unwrap_or_default();
+        set_condition(&mut conditions, ready);
+        document["status"]["conditions"] = json!(conditions);
         document["status"]["done"] = Value::Bool(progress.done);
         document["status"]["error"] = progress.error.map(Value::String).unwrap_or(Value::Null);
         Ok(())
