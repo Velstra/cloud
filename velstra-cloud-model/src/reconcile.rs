@@ -1215,6 +1215,26 @@ pub struct OperationProgress {
     pub error: Option<String>,
 }
 
+impl OperationProgress {
+    /// The same outcome for clients that use conditions and clients that use
+    /// the AIP-151 done/error fields.
+    pub fn ready_condition(&self, generation: u64) -> Condition {
+        match (self.done, &self.error) {
+            (false, _) => Condition::new(
+                "Ready",
+                ConditionStatus::Unknown,
+                "Working",
+                "the target has not caught up yet",
+                generation,
+            ),
+            (true, None) => Condition::ready(generation),
+            (true, Some(error)) => {
+                Condition::new("Ready", ConditionStatus::False, "Failed", error, generation)
+            }
+        }
+    }
+}
+
 /// The collection a resource name belongs to.
 ///
 /// The last path segment before the id — `projects/p1/subnets/lan0` is a

@@ -28,23 +28,9 @@ use velstra_cloud_model::{
     resources::{Operation, OperationSpec, OperationStatus, PortSpec, PortStatus},
     security::group_condition,
 };
-use velstra_cloud_store::{Expect, Store, TypedStore, key_for, prefix_for};
+use velstra_cloud_store::{Expect, Store, TypedStore, cell_prefix, key_for};
 
 use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
-
-/// Collections an operation can be about. A watch on each, so an operation
-/// finishes when its target does rather than when the resync comes round.
-const TARGET_KINDS: [&str; 9] = [
-    "instances",
-    "volumes",
-    "attachments",
-    "networks",
-    "subnets",
-    "ports",
-    "security-groups",
-    "backup-schedules",
-    "snapshot-schedules",
-];
 
 /// How long a finished operation is kept.
 ///
@@ -231,20 +217,20 @@ impl Reconciler for OperationsController {
     }
 
     fn related(&self) -> Vec<Related> {
-        TARGET_KINDS
-            .iter()
-            .map(|kind| {
-                let watching = self.watching.clone();
-                Related::named(prefix_for(&self.cell, kind), move |target: &str| {
-                    watching
-                        .lock()
-                        .unwrap()
-                        .get(target)
-                        .map(|ops| ops.iter().cloned().collect())
-                        .unwrap_or_default()
-                })
-            })
-            .collect()
+        let watching = self.watching.clone();
+        // Every resource can be an operation target. A collection allowlist
+        // silently leaves newer kinds waiting for the periodic resync.
+        vec![Related::named(
+            cell_prefix(&self.cell),
+            move |target: &str| {
+                watching
+                    .lock()
+                    .unwrap()
+                    .get(target)
+                    .map(|ops| ops.iter().cloned().collect())
+                    .unwrap_or_default()
+            },
+        )]
     }
 
     async fn reconcile(&self, name: &str, object: Option<&Operation>) -> Result<()> {
@@ -264,6 +250,14 @@ impl Reconciler for OperationsController {
                 error: operation.status.error.clone(),
             }
         } else {
+            // Register before reading: a target may finish during this pass.
+            // Its event must queue another pass even before our status write.
+            self.watching
+                .lock()
+                .unwrap()
+                .entry(operation.spec.target.clone())
+                .or_default()
+                .insert(name.to_string());
             let target = self.look_at(&operation.spec.target).await?;
             operation_progress(&operation.spec, &target)
         };
@@ -280,23 +274,7 @@ impl Reconciler for OperationsController {
         }
         set_condition(
             &mut next.status.conditions,
-            match (progress.done, &progress.error) {
-                (false, _) => Condition::new(
-                    "Ready",
-                    ConditionStatus::Unknown,
-                    "Working",
-                    "the target has not caught up yet",
-                    operation.meta.generation,
-                ),
-                (true, None) => Condition::ready(operation.meta.generation),
-                (true, Some(error)) => Condition::new(
-                    "Ready",
-                    ConditionStatus::False,
-                    "Failed",
-                    error,
-                    operation.meta.generation,
-                ),
-            },
+            progress.ready_condition(operation.meta.generation),
         );
         self.status.write(operation, &next).await?;
 
@@ -438,6 +416,116 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn every_target_kind_finishes_without_waiting_for_resync() {
+        use serde_json::json;
+
+        use crate::{LoopConfig, Metrics, runner};
+
+        for kind in ["backups", "snapshots", "routers", "future-resources"] {
+            let (f, controller) = fixture();
+            let target = format!("projects/p1/{kind}/copy");
+            let key = key_for("cell-1", kind, &target);
+            let mut source = json!({
+                "meta": {"generation": 1},
+                "status": {"observed_generation": 0, "conditions": []}
+            });
+            f.raw
+                .put(&key, serde_json::to_vec(&source).unwrap(), Expect::Absent)
+                .await
+                .unwrap();
+            let mut op = f.operation("create", 1).await;
+            op.spec.target = target.clone();
+            f.raw
+                .put(
+                    &key_for("cell-1", "operations", &op.meta.name.to_string()),
+                    serde_json::to_vec(&op).unwrap(),
+                    Expect::Revision(op.meta.revision),
+                )
+                .await
+                .unwrap();
+            let controller = Arc::new(controller);
+            let (stop, rx) = tokio::sync::watch::channel(false);
+            let running = tokio::spawn(runner::run(
+                controller.clone(),
+                f.operations.clone(),
+                f.raw.clone(),
+                LoopConfig {
+                    resync: Duration::from_secs(300),
+                    ..Default::default()
+                },
+                Metrics::new(),
+                rx,
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if !f.reload().await.status.conditions.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // Let the controller's own initial status event settle first.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!f.reload().await.status.done);
+            source["status"] = json!({"observed_generation": 1,
+                "conditions": [Condition::new(operation_condition(kind), ConditionStatus::False,
+                    "TargetUnusable", "backup destination is unavailable", 1)]});
+            f.raw
+                .put(&key, serde_json::to_vec(&source).unwrap(), Expect::Any)
+                .await
+                .unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let finished = f.reload().await;
+                    if finished.status.done {
+                        break finished;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            stop.send(true).unwrap();
+            running.await.unwrap();
+            let finished = outcome.unwrap_or_else(|_| panic!("{kind} waited for resync"));
+            let related = controller.related();
+            assert_eq!(related.len(), 1);
+            assert!(!key_for("cell-10", kind, &target).starts_with(&related[0].prefix));
+            assert_eq!(
+                (related[0].wake)(crate::runner::Changed {
+                    name: "projects/p2/backups/unrelated",
+                    value: None,
+                }),
+                crate::runner::Wake::These(vec![])
+            );
+
+            assert!(finished.status.finished_at.is_some());
+            assert!(
+                finished
+                    .status
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("TargetUnusable")
+            );
+            assert_eq!(
+                condition(&finished.status.conditions, "Ready")
+                    .unwrap()
+                    .status,
+                ConditionStatus::False
+            );
+            assert_eq!(
+                (related[0].wake)(crate::runner::Changed {
+                    name: &target,
+                    value: None,
+                }),
+                crate::runner::Wake::These(vec![])
+            );
         }
     }
 

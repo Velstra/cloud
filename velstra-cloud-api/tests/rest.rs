@@ -1143,6 +1143,21 @@ async fn an_operation_is_computed_from_the_object_it_describes() {
         .await;
     let finished = h.get(&operation).await;
     assert_eq!(finished.body["status"]["done"], json!(true));
+    let ready = finished.body["status"]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "Ready")
+        .unwrap();
+    assert_ne!(
+        ready["status"], "Unknown",
+        "completed operations must not look pending"
+    );
+    assert_eq!(
+        ready["lastTransition"], 0,
+        "computed reads must not invent completion times"
+    );
+
     assert!(
         finished.body["status"]["error"]
             .as_str()
@@ -1184,6 +1199,21 @@ async fn an_operation_is_done_when_the_target_has_caught_up() {
 
     let finished = h.get(&operation).await;
     assert_eq!(finished.body["status"]["done"], json!(true));
+    let ready = finished.body["status"]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "Ready")
+        .unwrap();
+    assert_ne!(
+        ready["status"], "Unknown",
+        "completed operations must not look pending"
+    );
+    assert_eq!(
+        ready["lastTransition"], 0,
+        "computed reads must not invent completion times"
+    );
+
     assert!(finished.body["status"]["error"].is_null());
 }
 
