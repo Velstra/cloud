@@ -4332,3 +4332,75 @@ async fn a_tenant_may_not_write_a_machine_on_an_attachment_by_either_path() {
     assert_eq!(refused.code, Code::PermissionDenied, "{refused}");
     assert!(!refused.to_string().contains("node-a"), "{refused}");
 }
+
+#[tokio::test]
+async fn schedules_cannot_copy_another_projects_volume_on_create_or_patch() {
+    let api = cell().await;
+    for (project, owner) in [("p1", ADA), ("p2", BOB)] {
+        api.create(
+            &format!("projects/{project}"),
+            "volumes",
+            &json!({"id": "data", "spec": {"size_gib": 1, "pool": "pool-a"}}),
+            &who(owner),
+        )
+        .await
+        .unwrap();
+    }
+    for kind in ["snapshot-schedules", "backup-schedules"] {
+        let schedule = name(&format!("projects/p1/{kind}/daily"));
+        api.create(
+            "projects/p1",
+            kind,
+            &json!({"id": "daily", "spec": {"volume": "projects/p1/volumes/data"}}),
+            &who(ADA),
+        )
+        .await
+        .expect("a tenant schedules its own volume");
+        api.patch(&schedule, &json!({"spec": {"keep": 3}}), None, &who(ADA))
+            .await
+            .expect("retention remains editable without repeating the source");
+        for subject in [ADA, OPERATOR] {
+            let denied = api
+                .create(
+                    "projects/p1",
+                    kind,
+                    &json!({"id": "foreign", "spec": {"volume": "projects/p2/volumes/data"}}),
+                    &who(subject),
+                )
+                .await
+                .err()
+                .expect("foreign source was admitted");
+            assert_eq!(denied.code, Code::PermissionDenied);
+            let denied = api
+                .patch(
+                    &schedule,
+                    &json!({"spec": {"volume": "projects/p2/volumes/data"}}),
+                    None,
+                    &who(subject),
+                )
+                .await
+                .expect_err("source changed across projects");
+            assert_eq!(denied.code, Code::PermissionDenied);
+        }
+        let missing = api
+            .create(
+                "projects/p1",
+                kind,
+                &json!({"id": "missing", "spec": {"volume": "projects/p1/volumes/missing"}}),
+                &who(ADA),
+            )
+            .await
+            .err()
+            .expect("a nonexistent source was admitted");
+        assert_eq!(missing.code, Code::NotFound);
+        let stored = api.get(&schedule, &who(ADA)).await.unwrap();
+        assert_eq!(stored["spec"]["volume"], "projects/p1/volumes/data");
+        let held = api
+            .delete(&name("projects/p1/volumes/data"), None, &who(ADA))
+            .await
+            .err()
+            .expect("a scheduled source was deleted");
+        assert_eq!(held.code, Code::FailedPrecondition);
+        assert!(held.message.contains(&schedule.to_string()));
+    }
+}
