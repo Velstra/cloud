@@ -47,7 +47,8 @@ export async function call(
   });
   const text = await r.text();
   let parsed: any = null;
-  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { message: text }; }
+  let invalidResponse = false;
+  try { parsed = text ? JSON.parse(text) : null; } catch { invalidResponse = true; }
   if (!r.ok) {
     // An expired or revoked session: drop the token AND the identity, so the
     // shell falls back to the sign-in form instead of leaving a signed-in
@@ -56,9 +57,18 @@ export async function call(
     // The API's refusal is `{ error: { code, message, field } }`; some paths
     // say it flat. Either way the sentence is what the person is shown.
     const e = parsed?.error && typeof parsed.error === "object" ? parsed.error : parsed ?? {};
-    const message = e.message ?? (typeof parsed?.error === "string" ? parsed.error : null) ?? r.statusText;
+    // A reverse proxy can return its own HTML error page. Keep that body out
+    // of user-facing errors, including any internal proxy details it contains.
+    const fallback = r.status === 502 || r.status === 503
+      ? "The service is temporarily unavailable. Try again shortly."
+      : r.status === 504
+        ? "The service did not respond in time. Refresh to check the operation before retrying."
+        : `The request could not be completed (HTTP ${r.status}).`;
+    const message = (typeof e.message === "string" && e.message)
+      || (typeof parsed?.error === "string" && parsed.error) || fallback;
     throw new ApiError(r.status, e.code ?? "", message, e.field);
   }
+  if (invalidResponse) throw new ApiError(r.status, "INVALID_RESPONSE", "The service returned an invalid response. Refresh to try again.");
   return parsed;
 }
 
