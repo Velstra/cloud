@@ -5308,8 +5308,8 @@ pub const COLLECTIONS: &[Collection] = &[
         title: "Snapshot schedules",
         singular: "snapshot schedule",
         recheck: 0,
-        condition: "",
-        // Nothing reports on these: a schedule is a statement about time — the snapshots it produces report, it does not.
+        condition: "Ready",
+        // The controller reports whether the schedule is active; each snapshot reports its own outcome.
         group: "Storage",
         scope: Scope::Project,
         audience: Audience::Tenant,
@@ -6452,7 +6452,6 @@ mod tests {
             "backups",
             "backup-schedules",
             "captures",
-            "snapshot-schedules",
             "audit",
             "users",
             "ceph-clusters",
@@ -6507,7 +6506,6 @@ mod tests {
             // a subnet belongs to is what gets mirrored.
             "subnets",
             "images",
-            "snapshot-schedules",
             // Derived on the way out of the API by grouping the images. There is
             // no object to report on.
             "families",
@@ -6529,6 +6527,8 @@ mod tests {
                 unreported.contains(&c.id)
             );
         }
+        assert_eq!(find("snapshot-schedules").unwrap().condition, "Ready");
+        assert_eq!(find("backup-schedules").unwrap().condition, "Ready");
         assert_eq!(find("migrations").unwrap().condition, "Moved");
         assert_eq!(find("instances").unwrap().condition, "Ready");
     }

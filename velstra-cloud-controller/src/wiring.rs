@@ -371,7 +371,8 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
         "snapshot-schedule",
         crate::snapshot_schedule::SnapshotScheduleController::new(
             snapshots.clone(),
-            volumes.clone()
+            volumes.clone(),
+            StatusWriter::new(store.clone(), id, "snapshot-schedules", "snapshot-schedule")
         ),
         TypedStore::new(store.clone(), id, "snapshot-schedules")
     );
@@ -443,7 +444,11 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
     );
     spawn!(
         "backup-schedule",
-        crate::backup_schedule::BackupScheduleController::new(backups.clone(), volumes.clone()),
+        crate::backup_schedule::BackupScheduleController::new(
+            backups.clone(),
+            volumes.clone(),
+            StatusWriter::new(store.clone(), id, "backup-schedules", "backup-schedule")
+        ),
         backup_schedules.clone()
     );
 

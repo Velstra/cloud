@@ -34,7 +34,7 @@ use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
 
 /// Collections an operation can be about. A watch on each, so an operation
 /// finishes when its target does rather than when the resync comes round.
-const TARGET_KINDS: [&str; 7] = [
+const TARGET_KINDS: [&str; 9] = [
     "instances",
     "volumes",
     "attachments",
@@ -42,6 +42,8 @@ const TARGET_KINDS: [&str; 7] = [
     "subnets",
     "ports",
     "security-groups",
+    "backup-schedules",
+    "snapshot-schedules",
 ];
 
 /// How long a finished operation is kept.

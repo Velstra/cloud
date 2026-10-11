@@ -23,22 +23,29 @@
 //! every other agent in this platform. This controller only ever creates and
 //! deletes objects.
 
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
 use tracing::info;
 use velstra_cloud_model::{
     access::Writer,
     backup::{
         self, BackupScheduleSpec, BackupScheduleStatus, BackupSpec, BackupStatus, BackupView,
     },
-    meta::{Meta, ResourceName, Timestamp},
+    meta::{Condition, ConditionStatus, Meta, ResourceName, Timestamp, set_condition},
     resources::{Backup, BackupSchedule, Resource},
 };
 use velstra_cloud_store::TypedStore;
 
-use crate::{Result, runner::Reconciler};
+use crate::{Related, Result, runner::Reconciler, status::StatusWriter};
 
 const WHO: &str = "backup-schedule";
 
 pub struct BackupScheduleController {
+    sources: Arc<Mutex<BTreeMap<String, String>>>,
+    status: StatusWriter<BackupScheduleSpec, BackupScheduleStatus>,
     backups: TypedStore<BackupSpec, BackupStatus>,
     /// Read to find which pool holds the source.
     ///
@@ -72,12 +79,44 @@ impl BackupScheduleController {
             velstra_cloud_model::resources::VolumeSpec,
             velstra_cloud_model::resources::VolumeStatus,
         >,
+        status: StatusWriter<BackupScheduleSpec, BackupScheduleStatus>,
     ) -> Self {
         Self {
+            status,
+            sources: Arc::new(Mutex::new(BTreeMap::new())),
             backups,
             volumes,
             now: std::sync::Arc::new(Timestamp::now),
         }
+    }
+
+    // Ready acknowledges an active schedule, not completion of its copies.
+    // Copies retain their own independently reported outcomes.
+    async fn report(
+        &self,
+        schedule: &Resource<BackupScheduleSpec, BackupScheduleStatus>,
+        ready: bool,
+        reason: &str,
+        message: &str,
+    ) -> Result<()> {
+        let mut next = schedule.clone();
+        next.status.observed_generation = schedule.meta.generation;
+        set_condition(
+            &mut next.status.conditions,
+            Condition::new(
+                "Ready",
+                if ready {
+                    ConditionStatus::True
+                } else {
+                    ConditionStatus::False
+                },
+                reason,
+                message,
+                schedule.meta.generation,
+            ),
+        );
+        self.status.write(schedule, &next).await?;
+        Ok(())
     }
 
     /// Drive this controller from a clock the caller owns.
@@ -120,25 +159,79 @@ impl Reconciler for BackupScheduleController {
         "backup-schedule"
     }
 
+    fn related(&self) -> Vec<Related> {
+        let sources = self.sources.clone();
+        vec![Related::named(self.volumes.prefix(), move |volume| {
+            sources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, source)| source.as_str() == volume)
+                .map(|(schedule, _)| schedule.clone())
+                .collect()
+        })]
+    }
+
     async fn reconcile(&self, name: &str, object: Option<&BackupSchedule>) -> Result<()> {
         let Some(schedule) = object else {
+            self.sources.lock().unwrap().remove(name);
             return Ok(());
         };
         // A schedule on its way out asks for nothing more. Its copies stay:
         // deleting the intention is not deleting the data, and an operator who
         // meant both can say so about each.
         if schedule.meta.is_deleting() {
+            self.sources.lock().unwrap().remove(name);
             return Ok(());
         }
 
+        self.sources
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), schedule.spec.volume.clone());
         let Ok(volume_name) = ResourceName::parse(&schedule.spec.volume) else {
-            return Ok(());
+            return self
+                .report(
+                    schedule,
+                    false,
+                    "InvalidSource",
+                    "Select a volume in this project.",
+                )
+                .await;
         };
         if volume_name.collection() != "volumes"
             || volume_name.project() != schedule.meta.name.project()
         {
             tracing::warn!(schedule = %name, "refusing a schedule outside its volume's project");
-            return Ok(());
+            return self
+                .report(
+                    schedule,
+                    false,
+                    "InvalidSource",
+                    "Select a volume in this project.",
+                )
+                .await;
+        }
+
+        let Some(volume) = self.volumes.get(&schedule.spec.volume).await? else {
+            return self
+                .report(
+                    schedule,
+                    false,
+                    "SourceMissing",
+                    "The source volume no longer exists.",
+                )
+                .await;
+        };
+        if volume.meta.is_deleting() || volume.spec.pool.is_empty() {
+            return self
+                .report(
+                    schedule,
+                    false,
+                    "SourceUnavailable",
+                    "The source volume is being deleted or has no storage pool.",
+                )
+                .await;
         }
 
         let now = (self.now)();
@@ -150,17 +243,7 @@ impl Reconciler for BackupScheduleController {
         let writer = Writer::controller(WHO);
 
         if backup::due(schedule.spec.every_hours, name, &all, now) {
-            // Which pool holds the source. Read here rather than carried on
-            // the schedule, because a volume can be moved and a schedule that
-            // remembered the old pool would keep asking the wrong agent.
-            //
-            // A volume that has gone is not an error and not a copy: the
-            // schedule simply has nothing to copy until somebody points it at
-            // something that exists.
-            let pool = match self.volumes.get(&schedule.spec.volume).await? {
-                Some(v) if !v.spec.pool.is_empty() => v.spec.pool,
-                _ => return Ok(()),
-            };
+            let pool = volume.spec.pool.clone();
             let id = backup_name(&schedule.meta.name, now);
             // A sibling of the schedule: same project, different collection.
             // A schedule with no parent is not a shape this platform makes, so
@@ -218,7 +301,8 @@ impl Reconciler for BackupScheduleController {
                 }
             }
         }
-        Ok(())
+        self.report(schedule, true, "Ready", "Schedule active.")
+            .await
     }
 }
 
@@ -290,7 +374,7 @@ mod tests {
         let volumes: TypedStore<
             velstra_cloud_model::resources::VolumeSpec,
             velstra_cloud_model::resources::VolumeStatus,
-        > = TypedStore::new(store, "cell-1", "volumes");
+        > = TypedStore::new(store.clone(), "cell-1", "volumes");
 
         let v: velstra_cloud_model::resources::Volume = Resource::new(
             Meta::new(
@@ -334,8 +418,12 @@ mod tests {
         let base = Timestamp::now().0;
         let now = Arc::new(AtomicU64::new(base));
         let reading = now.clone();
-        let controller = BackupScheduleController::new(backups.clone(), volumes)
-            .with_clock(move || Timestamp(reading.load(Ordering::Relaxed)));
+        let controller = BackupScheduleController::new(
+            backups.clone(),
+            volumes,
+            StatusWriter::new(store, "cell-1", "backup-schedules", WHO),
+        )
+        .with_clock(move || Timestamp(reading.load(Ordering::Relaxed)));
         Fixture {
             schedules,
             backups,
@@ -419,6 +507,16 @@ mod tests {
         let before = f.backups.list().await.unwrap();
         let mut legacy = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
         legacy.meta.name = ResourceName::parse(foreign).unwrap();
+        f.schedules
+            .create(&legacy, &Writer::controller("test"))
+            .await
+            .unwrap();
+        let legacy = f
+            .schedules
+            .get(&legacy.meta.name.to_string())
+            .await
+            .unwrap()
+            .unwrap();
         f.after(100);
         f.controller
             .reconcile(foreign, Some(&legacy))
@@ -565,5 +663,103 @@ mod tests {
             before,
             "deleting the intention deleted the data, or asked for more of it"
         );
+    }
+    #[tokio::test]
+    async fn source_changes_wake_only_the_affected_schedule() {
+        let f = fixture(2).await;
+        f.pass().await;
+        let schedule = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        let related = f.controller.related();
+        let changed = |name| crate::runner::Changed { name, value: None };
+        assert_eq!(
+            (related[0].wake)(changed(&schedule.spec.volume)),
+            crate::runner::Wake::These(vec![SCHEDULE.to_string()])
+        );
+        assert_eq!(
+            (related[0].wake)(changed("projects/p1/volumes/unrelated")),
+            crate::runner::Wake::These(vec![])
+        );
+        f.controller.reconcile(SCHEDULE, None).await.unwrap();
+        assert_eq!(
+            (related[0].wake)(changed(&schedule.spec.volume)),
+            crate::runner::Wake::These(vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_schedule_reports_once_and_repeated_passes_do_not_write() {
+        let f = fixture(2).await;
+        f.pass().await;
+        let ready = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        assert_eq!(ready.status.observed_generation, ready.meta.generation);
+        let condition = &ready.status.conditions[0];
+        assert_eq!(condition.status, ConditionStatus::True);
+        assert_eq!(condition.reason, "Ready");
+        f.pass().await;
+        let same = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        assert_eq!(
+            same.meta.revision, ready.meta.revision,
+            "a settled schedule caused a write loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_source_reports_failure_then_recovers_without_recreating_the_schedule() {
+        let f = fixture(2).await;
+        let schedule = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        let volume = f
+            .controller
+            .volumes
+            .get(&schedule.spec.volume)
+            .await
+            .unwrap()
+            .unwrap();
+        f.controller
+            .volumes
+            .delete(
+                &schedule.spec.volume,
+                volume.meta.revision,
+                &Writer::controller("test"),
+            )
+            .await
+            .unwrap();
+        f.pass().await;
+        let failed = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        assert_eq!(failed.status.conditions[0].reason, "SourceMissing");
+        assert_eq!(failed.status.conditions[0].status, ConditionStatus::False);
+        assert_eq!(failed.status.observed_generation, failed.meta.generation);
+        assert!(f.backups.list().await.unwrap().is_empty());
+        f.controller
+            .volumes
+            .create(&volume, &Writer::controller("test"))
+            .await
+            .unwrap();
+        f.pass().await;
+        let recovered = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        assert_eq!(recovered.status.conditions[0].status, ConditionStatus::True);
+        assert_eq!(f.backups.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deleting_source_is_not_copied_or_reported_ready() {
+        let f = fixture(2).await;
+        let schedule = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        let mut volume = f
+            .controller
+            .volumes
+            .get(&schedule.spec.volume)
+            .await
+            .unwrap()
+            .unwrap();
+        volume.meta.deleted_at = Some(Timestamp::now());
+        f.controller
+            .volumes
+            .update(&volume, &Writer::controller("test"))
+            .await
+            .unwrap();
+        f.pass().await;
+        let failed = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        assert_eq!(failed.status.conditions[0].reason, "SourceUnavailable");
+        assert!(f.backups.list().await.unwrap().is_empty());
     }
 }

@@ -2411,7 +2411,7 @@
   "title": "Snapshot schedules",
   "singular": "snapshot schedule",
   "recheck": 0,
-  "condition": "",
+  "condition": "Ready",
   "group": "Storage",
   "scope": "project",
   "audience": "tenant",
