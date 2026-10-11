@@ -115,6 +115,14 @@ impl Reconciler for SnapshotScheduleController {
         let Ok(volume_name) = ResourceName::parse(&schedule.spec.volume) else {
             return Ok(());
         };
+        // Stored objects may predate admission checks. Refuse before either
+        // creating snapshots or pruning another project's existing copies.
+        if volume_name.collection() != "volumes"
+            || volume_name.project() != schedule.meta.name.project()
+        {
+            tracing::warn!(schedule = %name, "refusing a schedule outside its volume's project");
+            return Ok(());
+        }
         let id = schedule.meta.name.id().to_string();
 
         let objects = self.snapshots.list().await?;
@@ -326,6 +334,32 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_stored_cross_project_schedule_neither_copies_nor_prunes() {
+        let f = fixture(1).await;
+        for hour in [0, 2] {
+            f.after(hour);
+            f.pass().await;
+            let id = f.ids().await.last().unwrap().clone();
+            f.finish(&id).await;
+        }
+        let before = f.snapshots.list().await.unwrap();
+        assert_eq!(before.len(), 2);
+        let mut legacy = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        legacy.meta.name = ResourceName::parse("projects/p2/snapshot-schedules/hourly").unwrap();
+        f.after(48);
+        f.controller
+            .reconcile(&legacy.meta.name.to_string(), Some(&legacy))
+            .await
+            .unwrap();
+        let after = f.snapshots.list().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "a legacy schedule created copies or expired another project's snapshots"
+        );
     }
 
     /// One per interval, and a second pass in the same hour asks for nothing.

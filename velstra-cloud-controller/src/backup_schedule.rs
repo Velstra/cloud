@@ -131,6 +131,16 @@ impl Reconciler for BackupScheduleController {
             return Ok(());
         }
 
+        let Ok(volume_name) = ResourceName::parse(&schedule.spec.volume) else {
+            return Ok(());
+        };
+        if volume_name.collection() != "volumes"
+            || volume_name.project() != schedule.meta.name.project()
+        {
+            tracing::warn!(schedule = %name, "refusing a schedule outside its volume's project");
+            return Ok(());
+        }
+
         let now = (self.now)();
         // Listed once and kept: the views drive the decision, and the objects
         // carry the revisions a delete needs. Two lists would be two pictures
@@ -382,6 +392,44 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_stored_cross_project_schedule_neither_copies_nor_prunes() {
+        let f = fixture(1).await;
+        let foreign = "projects/p2/backup-schedules/nightly";
+        for day in [0, 1] {
+            f.after(day * 24);
+            f.pass().await;
+            let id = format!("nightly-{}", f.stamp(day * 24));
+            f.finish(&id, f.base + day * 24 * HOUR).await;
+            let mut copy = f
+                .backups
+                .get(&format!("projects/p1/backups/{id}"))
+                .await
+                .unwrap()
+                .unwrap();
+            copy.meta.name = ResourceName::parse(&format!("projects/p2/backups/{id}")).unwrap();
+            copy.spec.schedule = Some(foreign.into());
+            f.backups
+                .create(&copy, &Writer::controller("test"))
+                .await
+                .unwrap();
+        }
+        let before = f.backups.list().await.unwrap();
+        let mut legacy = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        legacy.meta.name = ResourceName::parse(foreign).unwrap();
+        f.after(100);
+        f.controller
+            .reconcile(foreign, Some(&legacy))
+            .await
+            .unwrap();
+        let after = f.backups.list().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "a legacy schedule copied or pruned data across projects"
+        );
     }
 
     /// Nothing yet: one copy is asked for, and asking again changes nothing.
