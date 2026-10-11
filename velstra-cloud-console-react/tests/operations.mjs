@@ -9,11 +9,16 @@ import { browser } from '../../velstra-cloud-console/tests/console/harness.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const fake = spawn(process.execPath, [fileURLToPath(new URL('../../velstra-cloud-console/tests/console/fake-api.mjs', import.meta.url))], { env: { ...process.env, FAKE_PORT: '0' }, stdio: ['ignore', 'pipe', 'inherit'] });
 const fakePort = await new Promise((resolve, reject) => { let text = ''; fake.stdout.on('data', (data) => { text += data; const m = /listening (\d+)/.exec(text); if (m) resolve(Number(m[1])); }); fake.on('exit', () => reject(new Error('Fixture exited'))); });
-let viewer = false, projectAdmin = false, projectAdminDowngraded = false, customOperator = false, volumeOnly = false, migrationError = false, unauthorizedLists = [], refuseSession = false, refuseDetail = false, refuseAudit = false, creates = 0, consoleMessages = 0, projectLists = 0;
+let viewer = false, projectAdmin = false, projectAdminDowngraded = false, customOperator = false, volumeOnly = false, migrationError = false, unauthorizedLists = [], refuseSession = false, refuseDetail = false, htmlDetailStatus = 0, refuseAudit = false, creates = 0, consoleMessages = 0, projectLists = 0;
 const streams = new Set();
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   if (path.startsWith('/api/')) {
+    if (htmlDetailStatus && req.method === 'GET' && path === '/api/v1/projects/p1/networks/browser-network') {
+      res.writeHead(htmlDetailStatus, { 'content-type': 'text/html' });
+      res.end('<!DOCTYPE html><html><body>private-upstream.example: connection refused</body></html>');
+      return;
+    }
     if (req.method === 'GET' && path === '/api/v1/projects') {
       projectLists++;
       if (projectLists === 1) await new Promise((r) => setTimeout(r, 200));
@@ -88,6 +93,17 @@ try {
   await b.evaluate(`[...document.querySelectorAll('button')].filter(x=>x.innerText==='Refresh').at(-1).click()`);
   await wait(b, 'document.body.innerText.includes("Displaying the last known state")');
   refuseDetail = false;
+  await b.evaluate(`[...document.querySelectorAll('button')].filter(x=>x.innerText==='Refresh').at(-1).click()`);
+  await wait(b, '!document.body.innerText.includes("Displaying the last known state")');
+  for (const [status, message] of [[502, 'temporarily unavailable'], [504, 'did not respond in time'], [200, 'invalid response']]) {
+    htmlDetailStatus = status;
+    await b.evaluate(`[...document.querySelectorAll('button')].filter(x=>x.innerText==='Refresh').at(-1).click()`);
+    await wait(b, `document.body.innerText.includes(${JSON.stringify(message)})`);
+    const errorText = await b.evaluate('document.body.innerText');
+    assert.ok(errorText.includes('Displaying the last known state'), 'retain the resource when its refresh fails');
+    assert.ok(!errorText.includes('private-upstream.example') && !errorText.includes('<!DOCTYPE'), 'proxy HTML must not appear in the UI');
+  }
+  htmlDetailStatus = 0;
   await b.evaluate(`[...document.querySelectorAll('button')].filter(x=>x.innerText==='Refresh').at(-1).click()`);
   await wait(b, '!document.body.innerText.includes("Displaying the last known state")');
   await click(b, 'Edit'); await wait(b, '!!document.querySelector("form")');
