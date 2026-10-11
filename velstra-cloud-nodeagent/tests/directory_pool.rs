@@ -60,6 +60,41 @@ impl Drop for Dir {
 }
 
 #[tokio::test]
+async fn a_failed_backup_publish_removes_its_partial_and_can_retry() {
+    needs_qemu_img!();
+    let dir = Dir::new("backup-publish-failure");
+    let pool = dir.pool();
+    pool.provision(VOLUME, 1, Origin::Blank, None)
+        .await
+        .unwrap();
+    pool.take_snapshot(SNAPSHOT, VOLUME).await.unwrap();
+    let destination = dir.0.join("backup.qcow2");
+    std::fs::create_dir(&destination).unwrap();
+    let error = pool
+        .copy_out_snapshot(SNAPSHOT, destination.to_str().unwrap())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("could not be moved into place"));
+    assert!(
+        destination.is_dir(),
+        "the conflicting destination must be preserved"
+    );
+    assert!(
+        !destination.with_extension("partial").exists(),
+        "failed publication leaked a complete temporary copy"
+    );
+    std::fs::remove_dir(&destination).unwrap();
+    assert!(
+        pool.copy_out_snapshot(SNAPSHOT, destination.to_str().unwrap())
+            .await
+            .unwrap()
+            > 0
+    );
+    assert!(destination.is_file());
+    assert!(!destination.with_extension("partial").exists());
+}
+
+#[tokio::test]
 async fn a_blank_volume_is_made_and_read_back_at_the_size_that_was_asked_for() {
     needs_qemu_img!();
     let dir = Dir::new("blank");
