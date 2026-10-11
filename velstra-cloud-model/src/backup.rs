@@ -353,6 +353,33 @@ pub struct TargetView {
     pub same_pool_as: Option<String>,
 }
 
+/// Compare absolute directory paths by components, including `.` and `..`.
+/// Agents additionally resolve symlinks on the machine that owns the bytes.
+pub fn path_is_within(path: &str, directory: &str) -> bool {
+    fn normalized(value: &str) -> Option<std::path::PathBuf> {
+        use std::path::{Component, Path, PathBuf};
+        let path = Path::new(value);
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut result = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::ParentDir => {
+                    result.pop();
+                }
+                Component::CurDir => {}
+                part => result.push(part.as_os_str()),
+            }
+        }
+        Some(result)
+    }
+    match (normalized(path), normalized(directory)) {
+        (Some(path), Some(directory)) => path.starts_with(directory),
+        _ => false,
+    }
+}
+
 /// Whether this volume may be backed up to this target.
 ///
 /// Answered before anything is created, because every one of these is knowable
@@ -862,5 +889,25 @@ mod tests {
         assert_eq!(next_to_verify(24, &copies, now).as_deref(), Some("a"));
         let reversed = [copy("a", 1, None), copy("b", 1, None)];
         assert_eq!(next_to_verify(24, &reversed, now).as_deref(), Some("a"));
+    }
+    #[test]
+    fn directory_identity_uses_components_and_resolves_parent_segments() {
+        for path in [
+            "/srv/pool",
+            "/srv/pool/",
+            "/srv/pool/backups",
+            "/srv/other/../pool/copies",
+        ] {
+            assert!(path_is_within(path, "/srv/pool"), "{path}");
+        }
+        for path in [
+            "/srv/pool-other",
+            "/srv/pool/../backups",
+            "relative/pool",
+            "/srv",
+        ] {
+            assert!(!path_is_within(path, "/srv/pool"), "{path}");
+        }
+        assert!(!path_is_within("/srv/pool", ""));
     }
 }
