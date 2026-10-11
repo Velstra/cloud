@@ -21,6 +21,13 @@ def fail(message):
     raise SystemExit(message)
 
 
+def control_plane_roles(spec):
+    # Nodes stored before roles existed are compute nodes. Adding a control
+    # plane service must preserve that placement meaning during an upgrade.
+    roles = spec.get('roles') or ['compute']
+    return roles if 'control-plane' in roles else [*roles, 'control-plane']
+
+
 def main(inventory_path):
     inventory = json.loads(Path(inventory_path).read_text())
     registration = inventory['api']['nodeRegistration']
@@ -80,10 +87,10 @@ def main(inventory_path):
         code, current = request('GET', '/nodes/' + name, expected=(200, 404))
         if code == 200:
             spec = current.get('spec', {})
-            roles = spec.get('roles') or []
-            if 'control-plane' not in roles:
+            roles = control_plane_roles(spec)
+            if roles != spec.get('roles'):
                 request('PATCH', '/nodes/' + name,
-                        {'spec': {'roles': [*roles, 'control-plane']}},
+                        {'spec': {'roles': roles}},
                         expected=(200,))
         if present.stdout.strip() == 'missing':
             if code == 404:

@@ -2308,6 +2308,8 @@
         #   nix build .#checks.x86_64-linux.setup -L
         setup =
           pkgs.runCommand "velstra-cloud-setup-check" { } ''
+            PYTHONDONTWRITEBYTECODE=1 ${pkgs.python3}/bin/python3 -m unittest discover \
+              -s ${self}/deploy/control-plane -p 'test_register_nodes.py'
             mkdir -p seed
             # roles (control-plane + hypervisor + pool), API url, token, then —
             # because nothing answers in the sandbox — region, cell, node id,
