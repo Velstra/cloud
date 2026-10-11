@@ -3369,6 +3369,7 @@ impl Api {
         // reason and learns nothing about whether it is there.
         self.authorize_references(who, kind, &spec, home.as_deref())
             .await?;
+        self.require_schedule_source(&name, &spec).await?;
         check_rules(kind, &spec, Document::Whole)?;
         if kind == "bgp-peers" {
             self.refuse_a_bgp_peer_on_non_gateway(&spec).await?;
@@ -4958,6 +4959,7 @@ impl Api {
                 governing_project(name).as_deref(),
             )
             .await?;
+            self.require_schedule_source(name, spec).await?;
             if name.collection() == "subnets" && spec.get("network").is_some() {
                 self.require_subnet_network(name, spec).await?;
             }
@@ -6586,6 +6588,31 @@ impl Api {
         // the object is assigned to nobody and no agent may ever claim it —
         // the same hole the backup schedule had.
         spec["node"] = Value::String(guest.node.unwrap_or_default());
+        Ok(())
+    }
+
+    /// A schedule may copy only an existing volume in its own project.
+    async fn require_schedule_source(&self, name: &ResourceName, spec: &Value) -> ApiResult<()> {
+        if !matches!(name.collection(), "backup-schedules" | "snapshot-schedules") {
+            return Ok(());
+        }
+        // PATCH may change only the interval or retention. Judge a source only
+        // when supplied; create defaults always carry the volume field.
+        let Some(volume) = spec.get("volume") else {
+            return Ok(());
+        };
+        let source = ResourceName::parse(volume.as_str().unwrap_or_default())
+            .map_err(|e| ApiError::invalid(format!("spec.volume: {e}")).at("spec.volume"))?;
+        if source.collection() != "volumes" {
+            return Err(ApiError::invalid("a schedule copies a volume").at("spec.volume"));
+        }
+        if source.project() != name.project() {
+            return Err(ApiError::forbidden(
+                "a schedule and its volume must belong to the same project",
+            )
+            .at("spec.volume"));
+        }
+        let _: Volume = self.typed(&source).await?;
         Ok(())
     }
 

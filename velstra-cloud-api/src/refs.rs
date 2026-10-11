@@ -79,6 +79,8 @@ fn fields(kind: &str) -> &'static [(&'static str, Form)] {
             ("target", Form::Name),
             ("pool", Form::BareId),
         ],
+        "snapshot-schedules" => &[("volume", Form::Name)],
+        "backup-schedules" => &[("volume", Form::Name), ("target", Form::Name)],
         "ports" => &[
             ("network", Form::Name),
             ("subnet", Form::Name),
@@ -142,6 +144,8 @@ pub const REFERRING_KINDS: &[&str] = &[
     // them naming nothing.
     "snapshots",
     "backups",
+    "backup-schedules",
+    "snapshot-schedules",
 ];
 
 /// Every resource this spec names, in full-name form.
