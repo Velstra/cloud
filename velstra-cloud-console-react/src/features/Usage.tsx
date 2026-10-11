@@ -1,13 +1,6 @@
 import type { Resource } from "@/lib/model";
 import { bytes } from "@/lib/model";
 
-export function usageTime(r: Resource): string {
-  const at = Number(r.spec?.at);
-  if (!Number.isFinite(at) || at <= 0) return "Unknown time";
-  const date = new Date(at);
-  return Number.isNaN(date.getTime()) ? "Unknown time" : date.toISOString().slice(0, 16).replace("T", " ") + " UTC";
-}
-
 const value = (n: unknown, unit = "") => typeof n === "number" && Number.isFinite(n)
   ? n.toLocaleString() + (unit ? ` ${unit}` : "") : "—";
 const traffic = (n: unknown) => typeof n === "number" && Number.isFinite(n) ? bytes(n) : "—";

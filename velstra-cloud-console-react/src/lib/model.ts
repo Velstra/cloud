@@ -23,6 +23,13 @@ export type Resource = {
   };
 };
 
+export function usageTime(r: Resource): string {
+  const at = Number(r.spec?.at);
+  if (!Number.isFinite(at) || at <= 0) return "Unknown time";
+  const date = new Date(at);
+  return Number.isNaN(date.getTime()) ? "Unknown time" : date.toISOString().slice(0, 16).replace("T", " ") + " UTC";
+}
+
 export const idOf = (r: Resource) => r.meta.name.split("/").pop() ?? r.meta.name;
 export const nameOf = (r: Resource) => r.meta.name;
 export const attentionName = (r: Resource, c: Collection) => c.id === "operations" && r.spec?.target
