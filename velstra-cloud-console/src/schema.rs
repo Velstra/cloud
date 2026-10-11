@@ -3504,7 +3504,7 @@ const CAPTURE_FIELDS: &[Field] = &[
         kind: Kind::Ref {
             collection: "backup-targets",
             filter_by: None,
-            spelling: Spelling::Id,
+            spelling: Spelling::Name,
         },
         required: true,
         advanced: false,
@@ -3618,7 +3618,7 @@ const BACKUP_FIELDS: &[Field] = &[
         kind: Kind::Ref {
             collection: "backup-targets",
             filter_by: None,
-            spelling: Spelling::Id,
+            spelling: Spelling::Name,
         },
         required: false,
         // Behind More settings: where the cell keeps copies is the cell's
@@ -3659,11 +3659,11 @@ const BACKUP_SCHEDULE_FIELDS: &[Field] = &[
         kind: Kind::Ref {
             collection: "backup-targets",
             filter_by: None,
-            spelling: Spelling::Id,
+            spelling: Spelling::Name,
         },
-        required: true,
-        advanced: false,
-        help: "Where the copies go.",
+        required: false,
+        advanced: true,
+        help: "Leave empty to use an available backup destination.",
         when_empty: "",
         derived: false,
         at_creation: false,
@@ -6732,17 +6732,11 @@ mod tests {
                     } => (collection, spelling),
                     _ => continue,
                 };
-                // A cell-scoped root object is referred to by its bare id —
-                // `hv-1`, not `nodes/hv-1`; `gpu-a100`, not
-                // `device-classes/gpu-a100`. Everything else lives under a
-                // project and is named in full.
-                //
-                // Expressed as the rule rather than as a list of collections,
-                // because the list was the accident: the reason has always
-                // been the scope, and hardcoding one name meant the second
-                // cell-scoped collection to arrive looked like a mistake.
+                // Most global resources use an id. Backup destinations are
+                // followed by full resource name, including in manual copies,
+                // schedules and image captures; scope alone cannot decide it.
                 let want = match find(collection).map(|t| t.scope) {
-                    Some(Scope::Global) => Spelling::Id,
+                    Some(Scope::Global) if collection != "backup-targets" => Spelling::Id,
                     _ => Spelling::Name,
                 };
                 assert_eq!(
