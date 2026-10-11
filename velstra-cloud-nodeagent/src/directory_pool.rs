@@ -275,6 +275,9 @@ impl DirectoryPool {
             return Err(e);
         }
         std::fs::rename(&partial, final_path).map_err(|e| {
+            // Publication can fail even after conversion succeeded. The
+            // unreferenced copy must not consume capacity until another retry.
+            let _ = std::fs::remove_file(&partial);
             HostError::failed(format!(
                 "{} was built and could not be moved into place: {e}",
                 final_path.display()
