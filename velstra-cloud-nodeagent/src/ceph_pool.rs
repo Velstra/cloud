@@ -1145,7 +1145,10 @@ mod tests {
         // the same image name. Listing order must not determine current size.
         let head = r#"{"image":"projects~p1~volumes~data","size":2147483648,"format":2}"#;
         let snapshot = r#"{"image":"projects~p1~volumes~data","snapshot":"before-growth","snapshot_id":3,"size":1073741824,"format":2,"protected":"false"}"#;
-        for json in [format!("[{head},{snapshot}]"), format!("[{snapshot},{head}]")] {
+        for json in [
+            format!("[{head},{snapshot}]"),
+            format!("[{snapshot},{head}]"),
+        ] {
             let volumes = parse_volumes(&json).unwrap();
             assert_eq!(volumes.len(), 1);
             assert_eq!(volumes["projects/p1/volumes/data"], 2);
