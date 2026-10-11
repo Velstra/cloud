@@ -7764,8 +7764,8 @@ impl Api {
 
         Ok(json!({
             "node": here,
-            "open": open.map(&describe),
-            "next": next.map(&describe),
+            "open": open.map(describe),
+            "next": next.map(describe),
             // Whether the guests are being asked to leave right now, from
             // either source: the switch an operator flipped, or a window that
             // is open with `drain` set.
