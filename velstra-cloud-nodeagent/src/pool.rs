@@ -11,9 +11,10 @@
 //! three LVM groups. Tying storage to whichever hypervisor happened to be asked
 //! is how a volume ends up unreachable when that node is drained.
 //!
-//! Nothing here remembers what it did. `observe()` re-reads the backend on every
-//! pass, so an agent that was killed mid-`lvcreate` comes back knowing exactly
-//! what the disks know — which is the only thing that is true.
+//! `observe()` re-reads the backend on every pass. In-flight reservations keep
+//! concurrent work from changing the same source; they are not persisted truth.
+//! An agent that restarts discovers the disks again and reconciles persisted
+//! resource status before reporting an operation complete.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -400,6 +401,7 @@ impl PoolConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct PoolAgent {
     config: PoolConfig,
     writer: Writer,
@@ -429,6 +431,40 @@ pub struct PoolAgent {
     /// API and no store. It had grown the *reading* half of the API path and its
     /// own comment said so.
     sink: Option<Arc<dyn crate::sink::StatusSink>>,
+}
+
+/// Keep disk exports out of the reconciliation loop. A source stays reserved
+/// until its worker has finished, including hashing and temporary cleanup.
+#[derive(Default)]
+struct BackupWorkers {
+    tasks: tokio::task::JoinSet<(String, Pass)>,
+    active: BTreeMap<String, String>,
+    attempted: BTreeMap<String, (u64, bool, std::time::Instant)>,
+}
+
+impl BackupWorkers {
+    const LIMIT: usize = 4;
+
+    fn holds_volume(&self, name: &str) -> bool {
+        self.active.values().any(|source| source == name)
+    }
+
+    fn finished(&mut self, result: std::result::Result<(String, Pass), tokio::task::JoinError>) {
+        match result {
+            Ok((name, pass)) => {
+                self.active.remove(&name);
+                if pass.failures > 0 || pass.refused > 0 {
+                    tracing::warn!(backup = %name, failures = pass.failures,
+                        refused = pass.refused, "backup worker did not finish cleanly");
+                }
+            }
+            Err(error) => {
+                // Do not release unknown reservations and race an export.
+                // A panicking worker is a process-level failure, not success.
+                panic!("backup worker terminated unexpectedly: {error}");
+            }
+        }
+    }
 }
 
 impl PoolAgent {
@@ -487,9 +523,20 @@ impl PoolAgent {
         let mut ticker = tokio::time::interval(self.config.resync);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tokio::pin!(shutdown);
+        let mut workers = BackupWorkers::default();
         loop {
             tokio::select! {
-                _ = &mut shutdown => return,
+                _ = &mut shutdown => {
+                    // Finish exports before releasing their source reservations.
+                    // Dropping a subprocess future is not proof its I/O stopped.
+                    while let Some(result) = workers.tasks.join_next().await {
+                        workers.finished(result);
+                    }
+                    return;
+                },
+                result = workers.tasks.join_next(), if !workers.tasks.is_empty() => {
+                    if let Some(result) = result { workers.finished(result); }
+                },
                 _ = ticker.tick() => {},
                 event = wake.recv(), if watching => {
                     if event.is_none() {
@@ -499,7 +546,7 @@ impl PoolAgent {
                 }
             }
             while wake.try_recv().is_ok() {}
-            let pass = self.resync().await;
+            let pass = self.resync_with_workers(Some(&mut workers)).await;
             if pass.failures > 0 || pass.refused > 0 {
                 tracing::warn!(
                     pool = %self.config.pool,
@@ -513,6 +560,10 @@ impl PoolAgent {
 
     /// One full pass: every volume assigned here, then the pool's own object.
     pub async fn resync(&self) -> Pass {
+        self.resync_with_workers(None).await
+    }
+
+    async fn resync_with_workers(&self, mut workers: Option<&mut BackupWorkers>) -> Pass {
         let mut pass = Pass::default();
 
         let seen = match self.storage.observe().await {
@@ -575,6 +626,16 @@ impl PoolAgent {
         copies.targets = self.target_sweep(copies.targets, &mut pass).await;
 
         for volume in volumes.iter().filter(|v| v.spec.pool == self.config.pool) {
+            if workers.as_ref().is_some_and(|w| {
+                w.holds_volume(&volume.meta.name.to_string())
+                    || volume
+                        .spec
+                        .source_backup
+                        .as_ref()
+                        .is_some_and(|name| w.active.contains_key(name))
+            }) {
+                continue;
+            }
             self.volume_pass(volume, &seen, &copies, &mut pass).await;
         }
 
@@ -586,6 +647,14 @@ impl PoolAgent {
         match self.cell.snapshots().await {
             Ok(snapshots) => {
                 for snapshot in snapshots.iter().filter(|s| s.spec.pool == self.config.pool) {
+                    let name = snapshot.meta.name.to_string();
+                    let source = name.rsplit_once("/snapshots/").map(|(source, _)| source);
+                    if workers
+                        .as_ref()
+                        .is_some_and(|w| source.is_some_and(|s| w.holds_volume(s)))
+                    {
+                        continue;
+                    }
                     self.snapshot_pass(snapshot, &mut pass).await;
                 }
             }
@@ -598,7 +667,11 @@ impl PoolAgent {
         // Copies that leave the pool, last: a backup is of a volume, and one
         // asked for in the same pass that provisions its source would be a copy
         // of something not there yet.
-        self.backup_sweep(&copies, &mut pass).await;
+        if let Some(workers) = workers.as_mut() {
+            self.dispatch_backups(&copies, workers, &mut pass).await;
+        } else {
+            self.backup_sweep(&copies, &mut pass).await;
+        }
 
         self.pool_pass(&volumes, &seen, &mut pass).await;
         pass
@@ -837,6 +910,120 @@ impl PoolAgent {
         }
     }
 
+    async fn dispatch_backups(
+        &self,
+        copies: &Copies,
+        workers: &mut BackupWorkers,
+        pass: &mut Pass,
+    ) {
+        workers.attempted.retain(|name, _| {
+            copies
+                .backups
+                .iter()
+                .any(|b| b.meta.name.to_string() == *name)
+        });
+        for backup in copies
+            .backups
+            .iter()
+            .filter(|b| b.spec.pool == self.config.pool)
+        {
+            let name = backup.meta.name.to_string();
+            if workers.active.contains_key(&name) {
+                continue;
+            }
+            if backup.status.agent.is_none() {
+                // Claiming is a status write, not a disk operation; do not queue
+                // it behind an export or delay the first copy by a retry period.
+                self.backup_pass(backup, &copies.targets, pass).await;
+                continue;
+            }
+            if backup.status.agent.as_deref() == Some(&self.config.pool)
+                && !backup.status.taken
+                && !backup.meta.is_deleting()
+                && self
+                    .backup_destination(backup, &copies.targets, pass)
+                    .await
+                    .is_none()
+            {
+                continue;
+            }
+            if backup.status.agent.as_deref() != Some(&self.config.pool)
+                || (backup.status.taken && !backup.meta.is_deleting())
+                || workers.tasks.len() >= BackupWorkers::LIMIT
+                || workers.holds_volume(&backup.spec.volume)
+            {
+                continue;
+            }
+            if workers
+                .attempted
+                .get(&name)
+                .is_some_and(|(generation, deleting, at)| {
+                    *generation == backup.meta.generation
+                        && *deleting == backup.meta.is_deleting()
+                        && at.elapsed() < self.config.resync
+                })
+            {
+                continue;
+            }
+            workers.attempted.insert(
+                name.clone(),
+                (
+                    backup.meta.generation,
+                    backup.meta.is_deleting(),
+                    std::time::Instant::now(),
+                ),
+            );
+            workers
+                .active
+                .insert(name.clone(), backup.spec.volume.clone());
+            let agent = self.clone();
+            let backup = backup.clone();
+            let targets = copies.targets.clone();
+            workers.tasks.spawn(async move {
+                let mut pass = Pass::default();
+                agent.backup_pass(&backup, &targets, &mut pass).await;
+                (name, pass)
+            });
+        }
+        for (backup, path) in self.verification_candidates(copies) {
+            let name = backup.meta.name.to_string();
+            if workers.tasks.len() >= BackupWorkers::LIMIT
+                || workers.active.contains_key(&name)
+                || workers.holds_volume(&backup.spec.volume)
+            {
+                continue;
+            }
+            if workers
+                .attempted
+                .get(&name)
+                .is_some_and(|(generation, deleting, at)| {
+                    *generation == backup.meta.generation
+                        && *deleting == backup.meta.is_deleting()
+                        && at.elapsed() < self.config.resync
+                })
+            {
+                continue;
+            }
+            workers.attempted.insert(
+                name.clone(),
+                (
+                    backup.meta.generation,
+                    backup.meta.is_deleting(),
+                    std::time::Instant::now(),
+                ),
+            );
+            workers
+                .active
+                .insert(name.clone(), backup.spec.volume.clone());
+            let agent = self.clone();
+            workers.tasks.spawn(async move {
+                let mut pass = Pass::default();
+                agent.verify_one(&backup, &path, &mut pass).await;
+                (name, pass)
+            });
+        }
+    }
+
     async fn backup_sweep(&self, copies: &Copies, pass: &mut Pass) {
         for backup in copies
             .backups
@@ -861,7 +1048,11 @@ impl PoolAgent {
     /// snapshots, and those are not optional; reading every overdue copy would
     /// let a target with a hundred of them starve the work somebody is waiting
     /// on. See [`velstra_cloud_model::backup::next_to_verify`].
-    async fn verify_sweep(&self, copies: &Copies, pass: &mut Pass) {
+    fn verification_candidates(
+        &self,
+        copies: &Copies,
+    ) -> Vec<(velstra_cloud_model::resources::Backup, String)> {
+        let mut selected = Vec::new();
         for target in &copies.targets {
             let target_name = target.meta.name.to_string();
             // Only the agent that owns the target reads from it. A shared mount
@@ -906,7 +1097,14 @@ impl PoolAgent {
             else {
                 continue;
             };
-            self.verify_one(stored, &target.spec.path, pass).await;
+            selected.push((stored.clone(), target.spec.path.clone()));
+        }
+        selected
+    }
+
+    async fn verify_sweep(&self, copies: &Copies, pass: &mut Pass) {
+        for (stored, path) in self.verification_candidates(copies) {
+            self.verify_one(&stored, &path, pass).await;
         }
     }
 
@@ -1103,69 +1301,10 @@ impl PoolAgent {
             return;
         }
 
-        let Some(target) = targets
-            .iter()
-            .find(|t| t.meta.name.to_string() == stored.spec.target)
-        else {
-            self.backup_trouble(
-                stored,
-                format!("{} does not exist", stored.spec.target),
-                "NoTarget",
-                pass,
-            )
-            .await;
+        let Some(target_path) = self.backup_destination(stored, targets, pass).await else {
             return;
         };
-
-        // The model's rule, asked here rather than re-derived: a target that is
-        // the volume's own pool is a copy that dies with what it was copied
-        // from, and it is refused by name.
-        let view = velstra_cloud_model::backup::TargetView {
-            name: target.meta.name.to_string(),
-            path: target.spec.path.clone(),
-            accepting: target.spec.accepting && !target.meta.is_deleting(),
-            writable: target.status.writable,
-            same_pool_as: self
-                .storage
-                .directory_root()
-                .filter(|root| {
-                    let target_path = std::fs::canonicalize(&target.spec.path)
-                        .unwrap_or_else(|_| std::path::PathBuf::from(&target.spec.path));
-                    velstra_cloud_model::backup::path_is_within(
-                        &target_path.to_string_lossy(),
-                        &root.to_string_lossy(),
-                    )
-                })
-                .map(|_| self.config.pool.clone()),
-        };
-        if let Err(why) =
-            velstra_cloud_model::backup::may_back_up(&stored.spec.volume, &self.config.pool, &view)
-        {
-            self.backup_trouble(stored, why.to_string(), "TargetUnusable", pass)
-                .await;
-            return;
-        }
-
-        // Is there room to write at all? Asked before a byte is read, because
-        // the alternative is discovering it after minutes of copying — with a
-        // truncated file on the target and a filesystem too full for anybody
-        // else's backup, or for the delete that would make room. Skipped when
-        // nobody reports on the target: unknown is not "full", and the copy
-        // then fails on the write, loudly, on this backup. Same rule as
-        // writability, and see `room_on` for why this is not "does this copy
-        // fit".
-        if target.status.agent.is_some()
-            && let Err(why) = velstra_cloud_model::backup::room_on(
-                &target.meta.name.to_string(),
-                target.status.free_gib,
-            )
-        {
-            self.backup_trouble(stored, why.to_string(), "NoRoom", pass)
-                .await;
-            return;
-        }
-
-        let path = backup_path(&target.spec.path, &name);
+        let path = backup_path(&target_path, &name);
         // A snapshot first, and the copy from that. Reading a device the guest
         // is still writing to for minutes gives blocks from many moments,
         // which is not the crash-consistent copy the contract promises and is
@@ -1268,6 +1407,78 @@ impl PoolAgent {
             pass,
         )
         .await;
+    }
+
+    /// Admission remains responsive even when every disk worker is occupied.
+    async fn backup_destination(
+        &self,
+        stored: &velstra_cloud_model::resources::Backup,
+        targets: &[velstra_cloud_model::resources::BackupTarget],
+        pass: &mut Pass,
+    ) -> Option<String> {
+        let Some(target) = targets
+            .iter()
+            .find(|t| t.meta.name.to_string() == stored.spec.target)
+        else {
+            self.backup_trouble(
+                stored,
+                format!("{} does not exist", stored.spec.target),
+                "NoTarget",
+                pass,
+            )
+            .await;
+            return None;
+        };
+
+        // The model's rule, asked here rather than re-derived: a target that is
+        // the volume's own pool is a copy that dies with what it was copied
+        // from, and it is refused by name.
+        let view = velstra_cloud_model::backup::TargetView {
+            name: target.meta.name.to_string(),
+            path: target.spec.path.clone(),
+            accepting: target.spec.accepting && !target.meta.is_deleting(),
+            writable: target.status.writable,
+            same_pool_as: self
+                .storage
+                .directory_root()
+                .filter(|root| {
+                    let target_path = std::fs::canonicalize(&target.spec.path)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&target.spec.path));
+                    velstra_cloud_model::backup::path_is_within(
+                        &target_path.to_string_lossy(),
+                        &root.to_string_lossy(),
+                    )
+                })
+                .map(|_| self.config.pool.clone()),
+        };
+        if let Err(why) =
+            velstra_cloud_model::backup::may_back_up(&stored.spec.volume, &self.config.pool, &view)
+        {
+            self.backup_trouble(stored, why.to_string(), "TargetUnusable", pass)
+                .await;
+            return None;
+        }
+
+        // Is there room to write at all? Asked before a byte is read, because
+        // the alternative is discovering it after minutes of copying — with a
+        // truncated file on the target and a filesystem too full for anybody
+        // else's backup, or for the delete that would make room. Skipped when
+        // nobody reports on the target: unknown is not "full", and the copy
+        // then fails on the write, loudly, on this backup. Same rule as
+        // writability, and see `room_on` for why this is not "does this copy
+        // fit".
+        if target.status.agent.is_some()
+            && let Err(why) = velstra_cloud_model::backup::room_on(
+                &target.meta.name.to_string(),
+                target.status.free_gib,
+            )
+        {
+            self.backup_trouble(stored, why.to_string(), "NoRoom", pass)
+                .await;
+            return None;
+        }
+
+        Some(target.spec.path.clone())
     }
 
     /// Say on the object why a copy has not been made.
@@ -1774,6 +1985,16 @@ pub const RELEASE: &str = POOL_RELEASE_FINALIZER;
 #[derive(Clone, Default)]
 pub struct FakePool {
     inner: Arc<std::sync::Mutex<FakeInner>>,
+    #[cfg(test)]
+    copy_gate: Arc<std::sync::Mutex<Option<CopyGate>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CopyGate {
+    started: Arc<std::sync::atomic::AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -2041,6 +2262,16 @@ impl Storage for FakePool {
     /// the volume the snapshot was taken from, so a test that corrupts a copy
     /// still knows what the difference is.
     async fn copy_out_snapshot(&self, snapshot: &str, path: &str) -> Result<u64> {
+        #[cfg(test)]
+        {
+            let gate = self.copy_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.started
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
         self.fault("copy_out", snapshot)?;
         let volume = {
             let inner = self.inner.lock().unwrap();
@@ -3105,6 +3336,313 @@ mod tests {
     /// A minutes-long read of a live volume gives blocks from many moments,
     /// which is not the crash-consistent copy the contract promises — and the
     /// moment is put back afterwards, or every backup would leave one behind.
+    async fn blocked_backup() -> (
+        Cell,
+        CopyGate,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (cell, mut agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 1).await;
+        cell.target("archive", true, true).await;
+        agent.resync().await;
+        agent.resync().await;
+        cell.backup("slow", "nvme", "archive").await;
+        agent.resync().await; // Claim before starting the controlled copy.
+        let gate = CopyGate {
+            started: Arc::default(),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *cell.fake.copy_gate.lock().unwrap() = Some(gate.clone());
+        agent.config.resync = Duration::from_millis(20);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            agent
+                .run(async {
+                    let _ = stopped.await;
+                })
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("backup did not reach its copy operation");
+        (cell, gate, stop, task)
+    }
+
+    async fn finish_backup(
+        gate: &CopyGate,
+        stop: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = stop.send(());
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_running_backup_does_not_block_an_unrelated_volume() {
+        let (cell, gate, stop, task) = blocked_backup().await;
+        let source = cell.reload().await;
+        let name = "projects/p1/volumes/independent";
+        let mut volume: Volume = Resource::new(
+            Meta::new(
+                ResourceName::parse(name).unwrap(),
+                Placement::new("eu", "cell-1"),
+            ),
+            source.spec,
+            VolumeStatus::default(),
+        );
+        volume.meta.finalizers = vec![POOL_RELEASE_FINALIZER.to_string()];
+        cell.volumes
+            .create(&volume, &Writer::controller("pool"))
+            .await
+            .unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cell
+                    .volumes
+                    .get(name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .provisioned
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        gate.release.notify_one();
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ready.is_ok(),
+            "unrelated volume waited for a blocked backup export"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_export_does_not_block_heartbeat_or_backup_refusals() {
+        let (cell, gate, stop, task) = blocked_backup().await;
+        let before = cell.reload_pool("nvme").await.status.last_heartbeat;
+        cell.backup("invalid", "nvme", "missing-target").await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed = cell.reload_backup("invalid").await;
+                let heartbeat = cell.reload_pool("nvme").await.status.last_heartbeat;
+                if failed
+                    .status
+                    .conditions
+                    .iter()
+                    .any(|c| c.reason == "NoTarget")
+                    && heartbeat > before
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        finish_backup(&gate, stop, task).await;
+        assert!(
+            result.is_ok(),
+            "a disk export delayed heartbeat or independent admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_changes_wait_until_the_export_finishes_then_resume() {
+        let (cell, gate, stop, task) = blocked_backup().await;
+        let mut source = cell.reload().await;
+        source.spec.size_gib = 2;
+        source.meta.generation += 1;
+        cell.volumes
+            .update(&source, &Writer::controller("test"))
+            .await
+            .unwrap();
+        let before = cell.reload_pool("nvme").await.status.last_heartbeat;
+        let loop_ran = tokio::time::timeout(Duration::from_secs(2), async {
+            while cell.reload_pool("nvme").await.status.last_heartbeat <= before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let during = cell.fake.observe().await.unwrap().volumes[VOLUME];
+        gate.release.notify_one();
+        let resized = tokio::time::timeout(Duration::from_secs(2), async {
+            while cell.fake.observe().await.unwrap().volumes[VOLUME] != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        finish_backup(&gate, stop, task).await;
+        assert!(loop_ran.is_ok(), "main reconciliation stopped");
+        assert_eq!(during, 1, "source changed while its export was reading it");
+        assert!(resized.is_ok(), "source reservation was never released");
+    }
+
+    #[tokio::test]
+    async fn backup_workers_are_bounded_and_never_duplicate_an_inflight_copy() {
+        use std::sync::atomic::Ordering;
+        let (cell, mut agent) = cell("nvme");
+        cell.register_pool("nvme").await;
+        let source = cell.volume("nvme", 1).await;
+        cell.target("archive", true, true).await;
+        for index in 0..5 {
+            let volume: Volume = Resource::new(
+                Meta::new(
+                    ResourceName::parse(&format!("projects/p1/volumes/source-{index}")).unwrap(),
+                    Placement::new("eu", "cell-1"),
+                ),
+                source.spec.clone(),
+                VolumeStatus::default(),
+            );
+            cell.volumes
+                .create(&volume, &Writer::controller("test"))
+                .await
+                .unwrap();
+        }
+        agent.resync().await;
+        agent.resync().await;
+        for index in 0..5 {
+            let mut backup = cell
+                .backup(&format!("copy-{index}"), "nvme", "archive")
+                .await;
+            backup.spec.volume = format!("projects/p1/volumes/source-{index}");
+            backup.meta.generation += 1;
+            cell.backups
+                .update(&backup, &Writer::controller("test"))
+                .await
+                .unwrap();
+        }
+        agent.resync().await;
+        let gate = CopyGate {
+            started: Arc::default(),
+            entered: Arc::default(),
+            release: Arc::default(),
+        };
+        *cell.fake.copy_gate.lock().unwrap() = Some(gate.clone());
+        agent.config.resync = Duration::from_millis(20);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            agent
+                .run(async {
+                    let _ = stopped.await;
+                })
+                .await;
+        });
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            while gate.started.load(Ordering::SeqCst) < BackupWorkers::LIMIT {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let count = gate.started.load(Ordering::SeqCst);
+        let _ = stop.send(());
+        *cell.fake.copy_gate.lock().unwrap() = None;
+        gate.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.is_ok(),
+            "independent copies were unnecessarily serialized"
+        );
+        assert_eq!(
+            count,
+            BackupWorkers::LIMIT,
+            "unbounded or duplicate disk operations"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_export_waits_for_its_writer_then_removes_the_copy() {
+        let (cell, gate, stop, task) = blocked_backup().await;
+        cell.delete_backup("slow").await;
+        let before = cell.reload_pool("nvme").await.status.last_heartbeat;
+        let loop_ran = tokio::time::timeout(Duration::from_secs(2), async {
+            while cell.reload_pool("nvme").await.status.last_heartbeat <= before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let during = cell.reload_backup("slow").await;
+        let released_early = during
+            .status
+            .conditions
+            .iter()
+            .any(|c| c.kind == "Released" && c.status == ConditionStatus::True);
+        gate.release.notify_one();
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let backup = cell.reload_backup("slow").await;
+                if backup
+                    .status
+                    .conditions
+                    .iter()
+                    .any(|c| c.kind == "Released" && c.status == ConditionStatus::True)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        finish_backup(&gate, stop, task).await;
+        assert!(
+            loop_ran.is_ok(),
+            "the deletion was never reconciled during export"
+        );
+        assert!(
+            !released_early,
+            "copy was released while its writer was still active"
+        );
+        assert!(
+            released.is_ok(),
+            "deletion never recovered after the export completed"
+        );
+        let path = backup_path(
+            &cell.target_dir("archive", true),
+            "projects/p1/backups/slow",
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "deleted copy reappeared after its writer finished"
+        );
+        assert!(cell.fake.observe().await.unwrap().snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_the_export_before_returning() {
+        let (cell, gate, stop, task) = blocked_backup().await;
+        stop.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let returned_early = task.is_finished();
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !returned_early,
+            "shutdown abandoned an export still reading its source"
+        );
+        assert!(cell.reload_backup("slow").await.status.taken);
+        assert!(cell.fake.observe().await.unwrap().snapshots.is_empty());
+    }
+
     #[tokio::test]
     async fn a_copy_is_taken_from_a_moment_and_the_moment_is_put_back() {
         let (cell, agent) = cell("nvme");
