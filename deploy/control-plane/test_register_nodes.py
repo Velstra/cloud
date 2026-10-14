@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -67,7 +68,7 @@ class AgentReload(unittest.TestCase):
                 'systemctl': 'echo "$*" >>"$COMMAND_LOG"\nif [ "$1" = try-restart ] && [ "${FAIL_POOL:-0}" = 1 ]; then exit 1; fi',
             }.items():
                 file = binary / name
-                file.write_text('#!/bin/sh\n' + body + '\n')
+                file.write_text('#!' + shutil.which('sh') + '\n' + body + '\n')
                 file.chmod(0o755)
             script = registration.endpoint_script('https://api.example', str(ca))
             script = script.replace('/etc/velstra/node.env', str(root / 'node.env')).replace('/run/velstra-agent-', str(root / 'agent-'))
