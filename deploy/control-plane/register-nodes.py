@@ -39,6 +39,42 @@ def agent_seed(lines, url, ca_path):
         f'{key}={value}' for key, value in wanted.items()]
 
 
+def endpoint_script(agent_url, agent_ca_path):
+    """Apply shared agent trust and restart consumers only after it changes."""
+    return '''set -euo pipefail
+test -s /etc/velstra/node.env
+grep -Eq '^VELSTRA_ROLES=.*control-plane' /etc/velstra/node.env
+curl --fail --max-time 10 --cacert '''+shlex.quote(agent_ca_path)+' '+shlex.quote(agent_url+'/readyz')+''' >/dev/null
+python3 - '''+shlex.quote(agent_url)+' '+shlex.quote(agent_ca_path)+''' <<'PY'
+from pathlib import Path
+import sys
+'''+inspect.getsource(agent_seed)+'''
+path=Path('/etc/velstra/node.env')
+lines=path.read_text().splitlines()
+updated=agent_seed(lines,sys.argv[1],sys.argv[2])
+if updated != lines:
+    path.write_text('\\n'.join(updated)+'\\n')
+    Path('/run/velstra-agent-endpoint-changed').touch()
+PY
+ca_state=/run/velstra-agent-api-ca.sha256
+ca_current=$(sha256sum '''+shlex.quote(agent_ca_path)+''')
+if ! test -s "$ca_state" || test "$(cat "$ca_state")" != "$ca_current"; then
+  touch /run/velstra-agent-endpoint-changed
+fi
+if test -e /run/velstra-agent-endpoint-changed; then
+  systemctl restart velstra-cloud-nodeagent
+  # Local storage agents read the same endpoint and CA once at startup.
+  # Keep inactive pools inactive; include active named pool instances.
+  systemctl try-restart 'velstra-cloud-poolagent*.service'
+  rm -f /run/velstra-agent-endpoint-changed
+else
+  systemctl is-active --quiet velstra-cloud-nodeagent || systemctl restart velstra-cloud-nodeagent
+fi
+printf '%s\\n' "$ca_current" > "$ca_state"
+systemctl enable velstra-cloud-nodeagent >/dev/null
+'''
+
+
 def main(inventory_path):
     inventory = json.loads(Path(inventory_path).read_text())
     registration = inventory['api']['nodeRegistration']
@@ -126,35 +162,7 @@ def main(inventory_path):
         # Reconcile the endpoint on every run. A freshly joined control plane
         # may start against a bootstrap API, then switch to the HA address;
         # leaving the first URL in node.env strands its heartbeat on failure.
-        configured = remote(node, 'bash -s', input_text='''set -euo pipefail
-test -s /etc/velstra/node.env
-grep -Eq '^VELSTRA_ROLES=.*control-plane' /etc/velstra/node.env
-curl --max-time 10 --cacert '''+shlex.quote(agent_ca_path)+' '+shlex.quote(agent_url+'/readyz')+''' >/dev/null
-python3 - '''+shlex.quote(agent_url)+' '+shlex.quote(agent_ca_path)+''' <<'PY'
-from pathlib import Path
-import sys
-'''+inspect.getsource(agent_seed)+'''
-path=Path('/etc/velstra/node.env')
-lines=path.read_text().splitlines()
-updated=agent_seed(lines,sys.argv[1],sys.argv[2])
-if updated != lines:
-    path.write_text('\\n'.join(updated)+'\\n')
-    Path('/run/velstra-agent-endpoint-changed').touch()
-PY
-ca_state=/run/velstra-agent-api-ca.sha256
-ca_current=$(sha256sum '''+shlex.quote(agent_ca_path)+''')
-if ! test -s "$ca_state" || test "$(cat "$ca_state")" != "$ca_current"; then
-  touch /run/velstra-agent-endpoint-changed
-fi
-if test -e /run/velstra-agent-endpoint-changed; then
-  rm -f /run/velstra-agent-endpoint-changed
-  systemctl restart velstra-cloud-nodeagent
-else
-  systemctl is-active --quiet velstra-cloud-nodeagent || systemctl restart velstra-cloud-nodeagent
-fi
-printf '%s\\n' "$ca_current" > "$ca_state"
-systemctl enable velstra-cloud-nodeagent >/dev/null
-''')
+        configured = remote(node, 'bash -s', input_text=endpoint_script(agent_url, agent_ca_path))
         if configured.returncode:
             fail(f'{name}: could not configure the credentialed node agent')
         if remote(node, 'systemctl is-active --quiet velstra-cloud-nodeagent').returncode:
