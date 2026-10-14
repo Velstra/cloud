@@ -11,15 +11,25 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const fake = spawn(process.execPath, [fileURLToPath(new URL('../../velstra-cloud-console/tests/console/fake-api.mjs', import.meta.url))], { env: { ...process.env, FAKE_PORT: '0' }, stdio: ['ignore', 'pipe', 'inherit'] });
 const fakePort = await new Promise((resolve, reject) => { let text = ''; fake.stdout.on('data', (data) => { text += data; const m = /listening (\d+)/.exec(text); if (m) resolve(Number(m[1])); }); fake.on('exit', () => reject(new Error('Fixture exited'))); });
 let viewer = false, projectAdmin = false, projectAdminDowngraded = false, customOperator = false, volumeOnly = false, migrationError = false, unauthorizedLists = [], refuseSession = false, refuseDetail = false, htmlDetailStatus = 0, refuseAudit = false, creates = 0, consoleMessages = 0, projectLists = 0;
-let projectEditor = false, schedulePatch = null;
+let projectEditor = false, schedulePatch = null, restoreRequest = null;
 const schedule = {meta:{name:'projects/p1/backup-schedules/nightly',generation:1,revision:'100',labels:{}},spec:{volume:'projects/p1/volumes/data-1',target:'backup-targets/managed',everyHours:24,keep:2},status:{observedGeneration:1,conditions:[{kind:'Ready',status:'True',observedGeneration:1}]}};
 const volumeRecord = {meta:{name:'projects/p1/volumes/detail-check',generation:1,labels:{}},spec:{sizeGib:8,pool:'fast'},status:{actualSizeGib:4,provisioned:true,pool:'fast',conditions:[]}};
+const backupRecord = {meta:{name:'projects/p1/backups/safe-copy',generation:1,labels:{}},spec:{volume:'projects/p1/volumes/data-1',target:'backup-targets/managed'},status:{taken:true,sizeGib:4,storedBytes:1024,takenAt:1791936000000,verifiedAt:1791936000000,conditions:[]}};
 const usageRecord = {meta:{name:'projects/p1/usage/1791691200000',generation:1,labels:{}},spec:{at:1791691200000,project:'p1',used:{instances:4,vcpus:8,memoryMib:4096,volumes:3,volumeGib:14,floatingIps:0,backups:2,backupGib:6},traffic:{rxBytes:1024,txBytes:2048}},status:{}};
 const streams = new Set();
 let screenGrants = 0, screenInput = 0, screenConnections = 0, screenGrantDelay = 0, consoleEncrypted = true;
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   if (path.startsWith('/api/')) {
+    if (req.method === 'POST' && path === '/api/v1/projects/p1/volumes') {
+      let raw = ''; for await (const chunk of req) raw += chunk;
+      restoreRequest = JSON.parse(raw);
+      res.writeHead(202, {'content-type':'application/json'});
+      res.end(JSON.stringify({meta:{name:'projects/p1/volumes/restored-copy'},spec:restoreRequest.spec,status:{provisioned:false}})); return;
+    }
+
+    if (req.method === 'GET' && (path === '/api/v1/projects/p1/backups/safe-copy' || path === '/api/v1/projects/p1/backups')) { res.setHeader('content-type','application/json'); res.end(JSON.stringify(path.endsWith('/backups') ? {items:[backupRecord]} : backupRecord)); return; }
+
     if (req.method === 'GET' && path === '/api/v1/projects/p1/volumes/detail-check') { res.setHeader('content-type','application/json'); res.end(JSON.stringify(volumeRecord)); return; }
     if (req.method === 'GET' && (path === '/api/v1/projects/p1/usage' || path === '/api/v1/projects/p1/usage/1791691200000')) {
       res.setHeader('content-type','application/json'); res.end(JSON.stringify(path.endsWith('/usage') ? {items:[usageRecord]} : usageRecord)); return;
@@ -85,7 +95,7 @@ server.on('upgrade', (req, socket) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const url = `http://127.0.0.1:${server.address().port}/`;
 const pages = [];
-const wait = async (b, expression) => { for (let i = 0; i < 100; i++) { if (await b.evaluate(expression)) return; await new Promise(r => setTimeout(r, 100)); } throw new Error(`Timed out: ${expression}\n${await b.evaluate("document.body.innerText")}`); };
+const wait = async (b, expression) => { for (let i = 0; i < 100; i++) { if (await b.evaluate(`document.body && (${expression})`)) return; await new Promise(r => setTimeout(r, 100)); } throw new Error(`Timed out: ${expression}\n${await b.evaluate("document.body.innerText")}`); };
 const click = (b, text) => b.evaluate(`[...document.querySelectorAll('button')].find(x=>x.innerText===${JSON.stringify(text)}).click()`);
 // Popups require a trusted user gesture, not a scripted element.click().
 const activate = async (b, text) => {
@@ -131,6 +141,29 @@ try {
   await scheduleEditor.evaluate('location.reload()');
   await wait(scheduleEditor, `document.querySelector('dl[aria-label="Volume storage"]')?.innerText.includes('Not allocated')`);
   assert.ok(await scheduleEditor.evaluate(`document.querySelector('dl[aria-label="Volume storage"]').innerText.includes('Not assigned')`));
+  await scheduleEditor.goto(url + '#/c/backups/safe-copy');
+  await wait(scheduleEditor, `!!document.querySelector('dl[aria-label="Backup details"]')`);
+  assert.ok(await scheduleEditor.evaluate(`document.querySelector('dl[aria-label="Backup details"]').innerText.includes('4 GiB')`));
+  await click(scheduleEditor, 'Restore volume');
+  await wait(scheduleEditor, `!!document.querySelector('section[aria-label="Restore volume"] form')`);
+  assert.equal(await scheduleEditor.evaluate(`document.querySelector('section[aria-label="Restore volume"]').innerText.includes('Pool')`), false, 'project editor cannot select global storage pool');
+  await fill(scheduleEditor, 'section[aria-label="Restore volume"] input[placeholder="volume-1"]', 'restored-copy');
+  await scheduleEditor.evaluate(`[...document.querySelectorAll('section[aria-label="Restore volume"] form button')].find(x=>x.innerText==='Create').click()`);
+  await wait(scheduleEditor, `decodeURIComponent(location.hash).endsWith('/volumes/p1/restored-copy')`);
+  assert.equal(restoreRequest.spec.sourceBackup, backupRecord.meta.name, 'restore submits the original full backup identity');
+  assert.equal(restoreRequest.spec.sizeGib, 4);
+  assert.equal(restoreRequest.spec.pool, undefined, 'restore leaves placement to the operator');
+  await scheduleEditor.goto(url + '#/c/backups/safe-copy');
+  backupRecord.status.verifyError = 'checksum mismatch';
+  await scheduleEditor.evaluate('location.reload()');
+  await wait(scheduleEditor, `document.body.innerText.includes('This backup failed its integrity check')`);
+  assert.equal(await scheduleEditor.evaluate(`[...document.querySelectorAll('button')].find(x=>x.innerText==='Restore volume').disabled`), true);
+  delete backupRecord.status.verifyError;
+  backupRecord.status.taken = false;
+  await scheduleEditor.evaluate('location.reload()');
+  await wait(scheduleEditor, `document.querySelector('dl[aria-label="Backup details"]')?.innerText.includes('Not available yet')`);
+  assert.equal(await scheduleEditor.evaluate(`[...document.querySelectorAll('button')].find(x=>x.innerText==='Restore volume').disabled`), true);
+  backupRecord.status.taken = true;
   scheduleEditor.close();
   projectEditor = false;
   await b.goto(url + '#/c/usage/p1%2F1791691200000');
@@ -142,6 +175,12 @@ try {
   await b.evaluate(`document.querySelector('tbody tr.cursor-pointer').click()`);
   await wait(b, `location.hash.startsWith('#/c/families/')`);
   assert.match(await b.evaluate('location.hash'), /#\/c\/families\/(p1|p2)%2F/, 'all-project family rows retain their source project');
+  await b.goto(url + '#/c/backups/p1%2Fsafe-copy');
+  await wait(b, `!!document.querySelector('dl[aria-label="Backup details"]')`);
+  await wait(b, `document.querySelector('tr[aria-selected="true"]')?.innerText.includes('safe-copy')`);
+  await click(b, 'Restore volume');
+  await wait(b, `!!document.querySelector('section[aria-label="Restore volume"] form')`);
+  assert.equal(await b.evaluate(`document.querySelector('section[aria-label="Restore volume"] form').innerText.includes('Choose a project')`), false, 'backup restore retains its source project in all-project mode');
   await b.goto(url + '#/c/volumes/new');
   await wait(b, '!!document.querySelector("form")');
   assert.equal(await b.evaluate(`document.querySelector('form').innerText.includes('Pool')`), true, 'cell admin may choose a volume pool');
@@ -285,6 +324,10 @@ try {
   await wait(mobile, 'document.body.innerText.includes("Your workspace")');
   assert.equal(await mobile.evaluate('!!document.querySelector("a[href=\\"#/c/instances/new\\"]")'), false, 'viewer has no create affordance');
   assert.ok(await mobile.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'overview fits phone');
+  await mobile.goto(url + '#/c/backups/safe-copy');
+  await wait(mobile, `!!document.querySelector('dl[aria-label="Backup details"]')`);
+  assert.equal(await mobile.evaluate(`[...document.querySelectorAll('button')].some(x=>x.innerText==='Restore volume')`), false, 'viewer can inspect a backup but cannot restore');
+  assert.ok(await mobile.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'backup details fit phone');
   await mobile.goto(url + '#/c/instances'); await wait(mobile, '!!document.querySelector("tbody tr")');
   assert.equal(await mobile.evaluate(`document.querySelectorAll('[aria-label^="Select "]').length`), 0, 'viewer must not be offered bulk selection');
   await mobile.evaluate(`[...document.querySelectorAll('tbody tr')].find(x=>x.innerText.includes('web-1')).click()`);

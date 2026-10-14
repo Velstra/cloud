@@ -107,20 +107,20 @@ const initial = (c: Collection, r?: Resource): Values => {
   return v;
 };
 
-export function Form({ coll, existing: received, onDone, onCancel }: {
-  coll: Collection; existing?: Resource; onDone: (r: Resource, answer?: unknown) => void; onCancel: () => void;
+export function Form({ coll, existing: received, defaults, initialProject, onDone, onCancel }: {
+  coll: Collection; existing?: Resource; defaults?: Record<string, unknown>; initialProject?: string; onDone: (r: Resource, answer?: unknown) => void; onCancel: () => void;
 }) {
   const [existing] = useState(received);
   const storeProject = useStore((s) => s.project);
   const isCellAdmin = useStore((s) => !!s.who?.cellAdmin);
   // The project this form writes to: an existing object's own, or — when the
   // picker says every project — the one chosen at the top of the form.
-  const [formProject, setFormProject] = useState(existing ? projectOf(nameOf(existing)) ?? storeProject : storeProject === ALL ? "" : storeProject);
+  const [formProject, setFormProject] = useState(existing ? projectOf(nameOf(existing)) ?? storeProject : initialProject ?? (storeProject === ALL ? "" : storeProject));
   const project = formProject;
   const [names, setNames] = useState<string[]>([]);
-  useEffect(() => { if (!existing && storeProject === ALL && coll.scope === "project") projectNames().then(setNames).catch(() => setNames([])); }, [existing, storeProject, coll.scope]);
+  useEffect(() => { if (!existing && !initialProject && storeProject === ALL && coll.scope === "project") projectNames().then(setNames).catch(() => setNames([])); }, [existing, initialProject, storeProject, coll.scope]);
   const [id, setId] = useState(existing ? idOf(existing) : "");
-  const [values, setValues] = useState<Values>(() => initial(coll, existing));
+  const [values, setValues] = useState<Values>(() => ({ ...initial(coll, existing), ...(!existing ? defaults : {}) }));
   // The platform's only tagging mechanism. Every board can filter on labels
   // and the API takes them on create and change — and until now nothing but an
   // API client could write one, so cost attribution, environment separation
@@ -364,7 +364,7 @@ export function Form({ coll, existing: received, onDone, onCancel }: {
     <FormProject.Provider value={project}>
     <FormValues.Provider value={values}>
     <form ref={formRef} noValidate className="grid gap-5" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
-      {!existing && storeProject === ALL && coll.scope === "project" && (
+      {!existing && !initialProject && storeProject === ALL && coll.scope === "project" && (
         <Row label="Project" help="Every project is on the board; this one gets the new object." error={!project && problem ? "Still needed." : undefined}>
           <select value={project} onChange={(e) => setFormProject(e.target.value)} autoFocus
             className="h-9 rounded-[4px] border px-2 text-sm" style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text-body)" }}>

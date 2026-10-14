@@ -7,6 +7,7 @@
 
 import type { ReactNode } from "react";
 import { Usage } from "@/features/Usage";
+import { Backup } from "@/features/Backup";
 import { Volume } from "@/features/Volume";
 import { usageTime } from "@/lib/model";
 import type { Resource } from "@/lib/model";
@@ -197,6 +198,10 @@ register("security-groups", {
 
 register("load-balancers", {
   fieldEditors: { listeners: (p) => <Suspense fallback={loading("the listeners")}><ListenerList {...p} /></Suspense> },
+});
+
+register("backups", {
+  panels: [{ id: "backup", title: "Backup", render: (r) => <Backup key={r.meta.name} r={r} /> }],
 });
 
 register("ceph-clusters", {
