@@ -315,14 +315,15 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
             ))}
             {virt.getVirtualItems().map((vi) => {
               const row = visible[vi.index]; const r = row.original;
+              const selected = selectedId === routeId(coll, r, project) || selectedId === routeId(coll, r, ALL);
               const open = () => go({ view: "board", coll: coll.id, id: routeId(coll, r, project) });
               return (
-                <tr key={row.id} data-changed={loaded.changed.has(nameOf(r)) || undefined}
+                <tr key={row.id} aria-selected={selected} data-changed={loaded.changed.has(nameOf(r)) || undefined}
                   className="absolute left-0 table cursor-pointer border-b"
                   style={{
                     top: vi.start, height: rowH, tableLayout: "fixed", width: tableW,
                     borderColor: "var(--border-subtle)",
-                    background: idOf(r) === selectedId ? "var(--surface-hover)" : vi.index === cursor ? "color-mix(in srgb, var(--surface-hover) 55%, transparent)" : undefined,
+                    background: selected ? "var(--surface-hover)" : vi.index === cursor ? "color-mix(in srgb, var(--surface-hover) 55%, transparent)" : undefined,
                     boxShadow: vi.index === cursor ? "inset 2px 0 0 var(--brand)" : undefined,
                   }}
                   onClick={open} onMouseEnter={() => setCursor(vi.index)}>

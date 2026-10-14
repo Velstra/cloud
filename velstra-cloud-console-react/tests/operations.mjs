@@ -28,7 +28,7 @@ const server = createServer(async (req, res) => {
       res.end(JSON.stringify({meta:{name:'projects/p1/volumes/restored-copy'},spec:restoreRequest.spec,status:{provisioned:false}})); return;
     }
 
-    if (req.method === 'GET' && path === '/api/v1/projects/p1/backups/safe-copy') { res.setHeader('content-type','application/json'); res.end(JSON.stringify(backupRecord)); return; }
+    if (req.method === 'GET' && (path === '/api/v1/projects/p1/backups/safe-copy' || path === '/api/v1/projects/p1/backups')) { res.setHeader('content-type','application/json'); res.end(JSON.stringify(path.endsWith('/backups') ? {items:[backupRecord]} : backupRecord)); return; }
 
     if (req.method === 'GET' && path === '/api/v1/projects/p1/volumes/detail-check') { res.setHeader('content-type','application/json'); res.end(JSON.stringify(volumeRecord)); return; }
     if (req.method === 'GET' && (path === '/api/v1/projects/p1/usage' || path === '/api/v1/projects/p1/usage/1791691200000')) {
@@ -177,6 +177,7 @@ try {
   assert.match(await b.evaluate('location.hash'), /#\/c\/families\/(p1|p2)%2F/, 'all-project family rows retain their source project');
   await b.goto(url + '#/c/backups/p1%2Fsafe-copy');
   await wait(b, `!!document.querySelector('dl[aria-label="Backup details"]')`);
+  await wait(b, `document.querySelector('tr[aria-selected="true"]')?.innerText.includes('safe-copy')`);
   await click(b, 'Restore volume');
   await wait(b, `!!document.querySelector('section[aria-label="Restore volume"] form')`);
   assert.equal(await b.evaluate(`document.querySelector('section[aria-label="Restore volume"] form').innerText.includes('Choose a project')`), false, 'backup restore retains its source project in all-project mode');
