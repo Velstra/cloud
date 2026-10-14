@@ -355,6 +355,16 @@ pub async fn observe_node(
     me.monitor = monitor;
     me.manager = manager;
 
+    me.trusts_key = trusts(&admin.authorized_keys, cluster_key).await;
+    // OSD-only hosts normally have no cluster client configuration. Starting
+    // four cephadm containers on every observation cannot produce an answer
+    // there. Still report their local disks and enrollment trust above.
+    // Monitors/managers may supply cephadm's daemon-local configuration, and an
+    // explicitly configured client may obtain credentials through its wrapper.
+    if admin.ceph == "ceph" && !monitor && !manager && !admin.has_cluster().await {
+        return me;
+    }
+
     // Everything below needs the admin keyring, so a node that is not an admin
     // fails here and reports nothing — which is correct, and is why the reader
     // takes a union.
@@ -376,7 +386,6 @@ pub async fn observe_node(
     // Health, fill, the OSD table: what Ceph says rather than what was made.
     // Same rule as the three above — kept if it came, nothing if it did not.
     me.seen = seen.ok();
-    me.trusts_key = trusts(&admin.authorized_keys, cluster_key).await;
     me
 }
 
@@ -535,6 +544,69 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn osd_only_observation_does_not_spawn_unconfigured_cluster_clients() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let command = dir.path().join("cephadm");
+        std::fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf '[]\\n'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut admin = CephAdmin::default();
+        admin.cephadm = command.to_string_lossy().into_owned();
+        admin.ceph_conf = dir.path().join("ceph.conf").to_string_lossy().into_owned();
+        admin.authorized_keys = dir
+            .path()
+            .join("authorized_keys")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&admin.authorized_keys, "ssh-ed25519 test-cluster-key\n").unwrap();
+        let local = vec![disk("/dev/sdb", DeviceUse::Osd { id: "osd.1".into() })];
+        let installed = NodeCeph {
+            installed: true,
+            ..Default::default()
+        };
+        let seen = observe_node(
+            &admin,
+            "",
+            &local,
+            "ssh-ed25519 test-cluster-key",
+            installed.clone(),
+            (false, false),
+        )
+        .await;
+        assert!(
+            !calls.exists(),
+            "a node without cluster client configuration spawned Ceph clients"
+        );
+        assert_eq!(seen.osd_devices, vec!["/dev/sdb"]);
+        assert!(seen.trusts_key, "joining nodes must still report SSH trust");
+        assert!(seen.seen.is_none());
+
+        // Configuration delivered during enrollment enables queries next pass;
+        // no process restart or monitor role is required.
+        std::fs::write(&admin.ceph_conf, "[global]\n").unwrap();
+        observe_node(&admin, "", &local, "", installed.clone(), (false, false)).await;
+        assert!(calls.exists());
+        std::fs::remove_file(&calls).unwrap();
+        std::fs::remove_file(&admin.ceph_conf).unwrap();
+        // A running monitor may provide cephadm's own daemon configuration.
+        observe_node(&admin, "", &local, "", installed.clone(), (true, false)).await;
+        assert!(calls.exists());
+        std::fs::remove_file(&calls).unwrap();
+        // Explicit clients can obtain credentials through their own wrapper.
+        admin.ceph = command.to_string_lossy().into_owned();
+        observe_node(&admin, "", &local, "", installed, (false, false)).await;
+        assert!(calls.exists());
+    }
 
     #[test]
     fn monitor_placement_is_reconciled_after_automatic_daemon_creation() {
