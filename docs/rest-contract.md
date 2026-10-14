@@ -2404,6 +2404,11 @@ happened to run that pool.
 
 Restoring is creating a volume **from** a copy:
 
+Omit `sizeGib` (or use zero) to inherit the backup's original volume size. The
+API resolves that size before checking pool capacity and project quotas. A
+smaller explicit size, an unfinished or deleting backup, an unknown source size,
+or a failed integrity check is refused before a volume is created.
+
 ```
 POST /api/v1/projects/p1/volumes
 { "id": "restored", "spec": { "sizeGib": 40, "pool": "nvme",
