@@ -67,6 +67,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to wait for the far end to accept a connection and finish TLS.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The API sends a keep-alive every fifteen seconds, even on a quiet watch.
+/// Missing three is a broken stream, not a reason to wait indefinitely.
+const WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
+struct ConnectionPump(tokio::task::JoinHandle<()>);
+
+impl Drop for ConnectionPump {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct ApiCell {
     /// `http://host:port`, no trailing slash.
     base: String,
@@ -392,37 +404,40 @@ impl ApiCell {
 
     /// One subscription, until it ends.
     ///
-    /// The body is read without a deadline, and that is right: a subscription
-    /// that says nothing for an hour is a cell where nothing changed. Only the
-    /// connection is bounded — and this runs in its own task, so even a
-    /// subscription that hung could never park a pass.
+    /// Bound response headers and the gap between frames. A half-open TCP
+    /// connection can survive failover without delivering a reset; the API's
+    /// keep-alives distinguish that from a healthy watch with no changes.
     async fn stream(&self, path: &str, tx: &tokio::sync::mpsc::Sender<()>) -> Result<()> {
         let (mut sender, connection) = self.connect_within().await?;
-        let pump = tokio::spawn(async move {
+        let _pump = ConnectionPump(tokio::spawn(async move {
             let _ = connection.await;
-        });
-        let response = sender
-            .send_request(self.request(path)?)
+        }));
+        let response = tokio::time::timeout(READ_TIMEOUT, sender.send_request(self.request(path)?))
             .await
+            .map_err(|_| {
+                HostError::failed(format!("{path}: the API did not start the watch in time"))
+            })?
             .map_err(|e| HostError::failed(format!("{path}: {e}")))?;
         if response.status() != StatusCode::OK {
-            pump.abort();
             return Err(HostError::failed(format!(
                 "{path}: the API answered {}",
                 response.status()
             )));
         }
         let mut body = response.into_body();
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = tokio::time::timeout(WATCH_IDLE_TIMEOUT, body.frame())
+            .await
+            .map_err(|_| {
+                HostError::failed(format!("{path}: the API watch stopped sending keep-alives"))
+            })?
+        {
             let frame = frame.map_err(|e| HostError::failed(format!("{path}: {e}")))?;
             // The payload is deliberately not read. What a pass needs is that
             // *something* changed; what changed it will find by looking.
             if frame.data_ref().is_some() && tx.try_send(()).is_err() && tx.is_closed() {
-                pump.abort();
                 return Ok(());
             }
         }
-        pump.abort();
         Ok(())
     }
 }
@@ -783,6 +798,130 @@ impl crate::cell::PoolReader for ApiCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn read_request_headers(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+            assert!(headers.len() < 8192);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_watch_reconnects_without_an_agent_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cell = Arc::new(
+            ApiCell::for_pool(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                "test-token",
+                "local",
+            )
+            .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let follower = tokio::spawn(cell.follow("volumes", tx));
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut request = [0; 2048];
+        read_request_headers(&mut first).await;
+        first.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n3\r\n:\n\n\r\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Leave the socket established but silent, as after a broken forwarding
+        // path. No resource change, TCP reset or manual restart helps the client.
+        let reconnected = tokio::time::timeout(Duration::from_secs(50), listener.accept()).await;
+        follower.abort();
+        assert!(
+            reconnected.is_ok(),
+            "an established but silent watch never reconnected"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), first.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "timed-out connection pump was not closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_with_no_response_headers_reconnects() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cell = Arc::new(
+            ApiCell::for_pool(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                "test-token",
+                "local",
+            )
+            .unwrap(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let follower = tokio::spawn(cell.follow("volumes", tx));
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut request = [0; 2048];
+        read_request_headers(&mut first).await;
+        let reconnected =
+            tokio::time::timeout(READ_TIMEOUT + Duration::from_secs(5), listener.accept()).await;
+        follower.abort();
+        assert!(
+            reconnected.is_ok(),
+            "the watch waited indefinitely for headers"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), first.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "timed-out connection pump was not closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alives_preserve_an_idle_watch_and_cancellation_closes_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cell = Arc::new(
+            ApiCell::for_pool(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                "test-token",
+                "local",
+            )
+            .unwrap(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let follower = tokio::spawn(cell.follow("volumes", tx));
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut request = [0; 2048];
+        read_request_headers(&mut first).await;
+        first.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").await.unwrap();
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            first.write_all(b"3\r\n:\n\n\r\n").await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_err(),
+            "a healthy quiet watch was unnecessarily reconnected"
+        );
+        follower.abort();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), first.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "cancelled connection pump was not closed"
+        );
+    }
 
     /// A cell that opens a connection and then says nothing does not stop the
     /// agent.
