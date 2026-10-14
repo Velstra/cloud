@@ -6833,6 +6833,46 @@ impl Api {
     ///   made is an ordinary thing to want. Asking for a smaller one is the
     ///   clone not fitting in what it is written into.
     async fn settle_volume_source(&self, volume: &ResourceName, spec: &mut Value) -> ApiResult<()> {
+        if let Some(source) = spec
+            .get("source_backup")
+            .and_then(Value::as_str)
+            .filter(|source| !source.is_empty())
+        {
+            // References have already been authorized. Resolve capacity before
+            // pool selection and quota admission, exactly as for snapshots.
+            let name = ResourceName::parse(source)
+                .map_err(|_| ApiError::invalid("name a backup in full").at("spec.sourceBackup"))?;
+            let backup = self
+                .typed::<
+                    velstra_cloud_model::backup::BackupSpec,
+                    velstra_cloud_model::backup::BackupStatus,
+                >(&name)
+                .await?;
+            if backup.meta.is_deleting()
+                || !backup.status.taken
+                || backup.status.size_gib == 0
+                || backup.status.verify_error.is_some()
+            {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    "The backup is not available for restore. Wait for it to finish and resolve any integrity error.",
+                )
+                .at("spec.sourceBackup"));
+            }
+            let requested = spec.get("size_gib").and_then(Value::as_u64).unwrap_or(0);
+            if requested == 0 {
+                spec["size_gib"] = json!(backup.status.size_gib);
+            } else if requested < backup.status.size_gib {
+                return Err(ApiError::new(
+                    Code::FailedPrecondition,
+                    format!(
+                        "The backup requires at least {} GiB; this volume requests {requested} GiB.",
+                        backup.status.size_gib
+                    ),
+                )
+                .at("spec.sizeGib"));
+            }
+        }
         let named = spec
             .get("source_snapshot")
             .and_then(Value::as_str)
