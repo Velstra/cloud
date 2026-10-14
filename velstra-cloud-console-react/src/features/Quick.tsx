@@ -14,7 +14,7 @@ import { call } from "@/api/transport";
 import { humanise, idOf, nameOf, type Resource } from "@/lib/model";
 import { SCHEMA, basePath, projectOf, type Collection } from "@/lib/schema";
 import { listEvery } from "@/lib/listing";
-import { href } from "@/app/router";
+import { go, href } from "@/app/router";
 import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
 import { useAsk } from "@/features/Ask";
@@ -367,11 +367,12 @@ export function VolumeQuick({ r, reload }: { r: Resource; c: Collection; reload:
           catch (e) { toast.error((e as Error).message); }
         }}>Detach from {idOf(holder)}</Pressed>
       )}
-      <Pressed size="sm" variant="secondary" title="Copy it to the cell's most roomy backup target, now" onPress={async () => {
+      <Pressed size="sm" variant="secondary" title="Create a backup using an available destination" onPress={async () => {
         try {
           const name = await freeName(project, "backups", `${idOf(r)}-${stamp()}`);
           await call("create:backups", "POST", basePath(backups, project), undefined, { meta: { name }, spec: { volume: nameOf(r) } });
-          toast(`Backup ${name.split("/").pop()} asked for.`); reload();
+          toast("Backup queued."); reload();
+          go({ view: "board", coll: "backups", id: `${project}/${name.split("/").pop()!}` });
         } catch (e) { toast.error((e as Error).message); }
       }}>Back up now</Pressed>
     </>

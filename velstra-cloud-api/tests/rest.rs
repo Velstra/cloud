@@ -5982,7 +5982,7 @@ async fn a_backup_without_a_target_goes_to_the_cells_most_roomy_one() {
         refused.body["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("nowhere in this cell takes backups"),
+            .contains("No backup destination is available."),
         "{:?}",
         refused.body
     );

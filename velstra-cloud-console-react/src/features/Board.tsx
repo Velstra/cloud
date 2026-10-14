@@ -228,7 +228,7 @@ export function Board({ coll, selectedId, narrow }: { coll: Collection; selected
             value={globalFilter} onChange={(e) => setGlobalFilter(e.target.value)} />
           {globalFilter && <button aria-label="Clear row filter" className="absolute right-2 top-2" onClick={() => { setGlobalFilter(""); document.getElementById("boardfilter")?.focus(); }}><X className="size-4" /></button>}
         </div>
-        <Input placeholder="labels: env=prod, tier=web" className="h-8 w-56 text-xs" value={labels}
+        <Input aria-label="Filter by labels" placeholder="labels: env=prod, tier=web" className="h-8 w-56 text-xs" value={labels}
           onChange={(e) => setLabels(e.target.value)} />
         {unsettled.length > 0 && (
           <div className="ml-1 flex items-center gap-1.5">

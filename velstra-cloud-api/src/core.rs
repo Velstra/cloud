@@ -6739,9 +6739,7 @@ impl Api {
             let Some(target) = chosen else {
                 return Err(ApiError::new(
                     Code::FailedPrecondition,
-                    "nowhere in this cell takes backups: no backup target is accepting and \
-                     writable. A cell operator declares one — a directory on a machine, or a \
-                     mount every pool agent reaches.",
+                    "No backup destination is available. Ask your cloud administrator to configure one.",
                 )
                 .at("spec.target"));
             };
