@@ -7485,3 +7485,122 @@ async fn deleting_an_attachment_does_not_free_its_volume_before_release() {
         second.body
     );
 }
+
+#[tokio::test]
+async fn backup_restore_inherits_size_before_capacity_and_quota_checks() {
+    use velstra_cloud_model::backup::{BackupSpec, BackupStatus};
+    let h = Harness::new();
+    h.post("projects", json!({"id":"p1", "spec":{"quota":{}}}))
+        .await;
+    h.pool("pool-a").await;
+    h.pool("pool-b").await;
+    let volume = h.volume("source", 3).await;
+    assert_eq!(h.post("backup-targets", json!({"id":"archive","spec":{"kind":"directory","path":"/srv/archive","accepting":true}})).await.status, StatusCode::ACCEPTED);
+    let made = h
+        .post(
+            "projects/p1/backups",
+            json!({"id":"copy","spec":{"volume":volume,"target":"backup-targets/archive"}}),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::ACCEPTED, "{}", made.body);
+    let backups: TypedStore<BackupSpec, BackupStatus> =
+        TypedStore::new(h.store.clone(), "cell-1", "backups");
+    let name = "projects/p1/backups/copy";
+    let mut backup = backups.get(name).await.unwrap().unwrap();
+    backup.status.agent = Some("pool-a".into());
+    backup.status.taken = true;
+    backup.status.size_gib = 3;
+    backups
+        .update(&backup, &Writer::agent("pool-a"))
+        .await
+        .unwrap();
+    for (id, taken, size, error) in [
+        ("pending", false, 3, None),
+        ("unknown-size", true, 0, None),
+        ("damaged", true, 3, Some("checksum mismatch")),
+    ] {
+        let mut changed = backups.get(name).await.unwrap().unwrap();
+        changed.status.taken = taken;
+        changed.status.size_gib = size;
+        changed.status.verify_error = error.map(str::to_string);
+        backups
+            .update(&changed, &Writer::agent("pool-a"))
+            .await
+            .unwrap();
+        let refused = h
+            .post(
+                "projects/p1/volumes",
+                json!({"id":id,"spec":{"pool":"pool-b","sourceBackup":name}}),
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+        assert_eq!(refused.field(), "spec.sourceBackup");
+        assert_eq!(
+            h.get(&format!("projects/p1/volumes/{id}")).await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let mut ready = backups.get(name).await.unwrap().unwrap();
+    ready.status.taken = true;
+    ready.status.size_gib = 3;
+    ready.status.verify_error = None;
+    backups
+        .update(&ready, &Writer::agent("pool-a"))
+        .await
+        .unwrap();
+    for (id, size) in [("inherited", None), ("zero", Some(0)), ("larger", Some(4))] {
+        let mut spec = json!({"pool":"pool-b", "sourceBackup":name});
+        if let Some(size) = size {
+            spec["sizeGib"] = json!(size);
+        }
+        let made = h
+            .post("projects/p1/volumes", json!({"id":id,"spec":spec}))
+            .await;
+        assert_eq!(made.status, StatusCode::ACCEPTED, "{}", made.body);
+        let got = h.get(&format!("projects/p1/volumes/{id}")).await;
+        assert_eq!(
+            got.body["spec"]["sizeGib"],
+            size.filter(|s| *s > 0).unwrap_or(3)
+        );
+    }
+    let small = h
+        .post(
+            "projects/p1/volumes",
+            json!({"id":"small","spec":{"pool":"pool-b","sourceBackup":name,"sizeGib":2}}),
+        )
+        .await;
+    assert_eq!(small.field(), "spec.sizeGib", "{}", small.body);
+    let mut pool = h.pools().get("pools/pool-b").await.unwrap().unwrap();
+    pool.status.backend = "directory".into();
+    pool.status.capacity_gib = 2;
+    h.pools()
+        .update(&pool, &Writer::agent("pool-b"))
+        .await
+        .unwrap();
+    let full = h
+        .post(
+            "projects/p1/volumes",
+            json!({"id":"full","spec":{"pool":"pool-b","sourceBackup":name}}),
+        )
+        .await;
+    assert_eq!(full.status, StatusCode::BAD_REQUEST, "{}", full.body);
+    assert_eq!(full.field(), "spec.sizeGib");
+    h.patch("projects/p1", json!({"spec":{"quota":{"volumeGib":14}}}))
+        .await;
+    let limited = h
+        .post(
+            "projects/p1/volumes",
+            json!({"id":"quota","spec":{"pool":"pool-a","sourceBackup":name}}),
+        )
+        .await;
+    assert_ne!(
+        limited.status,
+        StatusCode::ACCEPTED,
+        "restore bypassed quota: {}",
+        limited.body
+    );
+    assert_eq!(
+        h.get("projects/p1/volumes/quota").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
