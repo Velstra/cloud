@@ -27,6 +27,7 @@ import { ALL, SCHEMA, collection, groups, navigable, routeId, type Collection } 
 import { go, href, useRoute } from "@/app/router";
 import { setState, useStore } from "@/app/store";
 import { State } from "@/features/State";
+import { useCensus, whole } from "@/app/census";
 
 export type Census = Record<string, { total: number; unsettled: Resource[] }>;
 
@@ -63,11 +64,24 @@ export function Shell({ census, onSweep, children }: {
       .then((a) => setProjects((a.items ?? []).map((p: Resource) => idOf(p)))).catch(() => {});
   }, [who]);
 
+  const inventory = useCensus();
   const attention = useMemo(() => {
     const out: { coll: Collection; r: Resource; kind: Verdict }[] = [];
-    for (const c of SCHEMA) for (const r of census[c.id]?.unsettled ?? []) out.push({ coll: c, r, kind: verdict(r, c).kind });
+    for (const c of SCHEMA) {
+      if (c.condition === "") continue;
+      for (const r of inventory.rows[c.id] ?? []) {
+        const kind = verdict(r, c).kind;
+        if (kind !== "settled") out.push({ coll: c, r, kind });
+      }
+    }
     return out.sort((a, b) => VERDICT_ORDER[a.kind] - VERDICT_ORDER[b.kind]);
-  }, [census]);
+  }, [inventory]);
+  const checked = whole(inventory);
+  const incomplete = inventory.sweptAt > 0 && !checked;
+  const inboxLabel = !inventory.sweptAt ? "Attention inbox, checking resource status"
+    : incomplete ? (attention.length ? `${attention.length} objects need attention; inventory incomplete` : "Attention inbox, inventory incomplete")
+    : `${attention.length} objects need attention`;
+  const failedCollections = Object.keys(inventory.missing);
   const failing = attention.filter((a) => a.kind === "failing").length;
   const current = route.view === "board" ? collection(route.coll) : undefined;
 
@@ -198,16 +212,24 @@ export function Shell({ census, onSweep, children }: {
           <div className="ml-auto flex items-center gap-1">
             <Popover>
               <Tooltip><TooltipTrigger render={
-                <PopoverTrigger render={<Button size="sm" variant="ghost" aria-label={`${attention.length} objects need attention`} className="relative" />}>
+                <PopoverTrigger render={<Button size="sm" variant="ghost" aria-label={inboxLabel} className="relative" />}>
                   <Bell className="size-4" />
                   {attention.length > 0 && <span className="absolute -right-0.5 -top-0.5 rounded-full px-1 font-mono text-[10px]" style={{ background: failing ? "var(--dot-failing)" : "var(--dot-drifting)", color: "#fff" }}>{attention.length}</span>}
+                  {incomplete && !attention.length && <span className="absolute -right-0.5 -top-0.5 rounded-full px-1 font-mono text-[10px]" style={{ color: "var(--dot-drifting)" }} aria-hidden="true">!</span>}
                 </PopoverTrigger>
               } /><TooltipContent>Attention inbox</TooltipContent></Tooltip>
               <PopoverContent align="end" className="w-[min(26rem,calc(100vw-1.5rem))] p-0">
                 <div className="flex items-center justify-between border-b px-3 py-2 text-xs" style={{ borderColor: "var(--border-subtle)" }}>
-                  <span className="font-semibold" style={{ color: "var(--text-strong)" }}>{attention.length ? `${attention.length} not settled` : "Everything has settled"}</span>
-                  <button className="hover:underline" style={{ color: "var(--text-muted)" }} onClick={onSweep}>Sweep again</button>
+                  <span className="font-semibold" style={{ color: "var(--text-strong)" }}>{!inventory.sweptAt ? "Checking resource status" : attention.length ? `${attention.length} need attention` : incomplete ? "Some resources could not be checked" : "No resources need attention"}</span>
+                  <button className="hover:underline" style={{ color: "var(--text-muted)" }} onClick={onSweep}>Refresh</button>
                 </div>
+                {!inventory.sweptAt && <p role="status" className="px-3 py-2 text-xs" style={{ color: "var(--text-muted)" }}>Checking resources…</p>}
+                {incomplete && <div role="status" className="border-b px-3 py-2 text-xs" style={{ borderColor: "var(--border-subtle)" }}>
+                  {attention.length > 0 && <p className="mb-1" style={{ color: "var(--text-muted)" }}>Some resources could not be checked.</p>}
+                  {[...new Set([...failedCollections, ...inventory.truncated])].map((id) => <a key={id} href={href({ view: "board", coll: id })} className="flex items-center justify-between gap-3 py-1 hover:underline">
+                    <span>{collection(id)?.title ?? id}</span><span style={{ color: "var(--text-muted)" }}>{failedCollections.includes(id) ? "Unavailable" : "Partial results"}</span>
+                  </a>)}
+                </div>}
                 <ul className="max-h-[24rem] overflow-y-auto">
                   {attention.slice(0, 60).map(({ coll, r }) => (
                     <li key={nameOf(r)}>

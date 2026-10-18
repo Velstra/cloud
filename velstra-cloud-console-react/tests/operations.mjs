@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer, request } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { screenFixture } from './rfb-fixture.mjs';
@@ -11,6 +11,7 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const fake = spawn(process.execPath, [fileURLToPath(new URL('../../velstra-cloud-console/tests/console/fake-api.mjs', import.meta.url))], { env: { ...process.env, FAKE_PORT: '0' }, stdio: ['ignore', 'pipe', 'inherit'] });
 const fakePort = await new Promise((resolve, reject) => { let text = ''; fake.stdout.on('data', (data) => { text += data; const m = /listening (\d+)/.exec(text); if (m) resolve(Number(m[1])); }); fake.on('exit', () => reject(new Error('Fixture exited'))); });
 let viewer = false, projectAdmin = false, projectAdminDowngraded = false, customOperator = false, volumeOnly = false, migrationError = false, unauthorizedLists = [], refuseSession = false, refuseDetail = false, htmlDetailStatus = 0, refuseAudit = false, creates = 0, consoleMessages = 0, projectLists = 0;
+let inventoryMode = null, inventoryRelease;
 let projectEditor = false, schedulePatch = null, restoreRequest = null;
 const schedule = {meta:{name:'projects/p1/backup-schedules/nightly',generation:1,revision:'100',labels:{}},spec:{volume:'projects/p1/volumes/data-1',target:'backup-targets/managed',everyHours:24,keep:2},status:{observedGeneration:1,conditions:[{kind:'Ready',status:'True',observedGeneration:1}]}};
 const volumeRecord = {meta:{name:'projects/p1/volumes/detail-check',generation:1,labels:{}},spec:{sizeGib:8,pool:'fast'},status:{actualSizeGib:4,provisioned:true,pool:'fast',conditions:[]}};
@@ -28,6 +29,13 @@ const server = createServer(async (req, res) => {
       res.end(JSON.stringify({meta:{name:'projects/p1/volumes/restored-copy'},spec:restoreRequest.spec,status:{provisioned:false}})); return;
     }
 
+    if (inventoryMode && req.method === 'GET' && new URL(req.url, 'http://localhost').searchParams.has('pageSize')) {
+      if (path === '/api/v1/nodes' && inventoryMode === 'loading') await new Promise(resolve => { inventoryRelease = resolve; });
+      res.setHeader('content-type', 'application/json');
+      if ((path === '/api/v1/nodes' && inventoryMode === 'unavailable') || (path === '/api/v1/pools' && inventoryMode === 'known')) { res.writeHead(503); res.end(JSON.stringify({error:{message:'Node service unavailable'}})); return; }
+      const items = path === '/api/v1/nodes' && inventoryMode === 'known' ? [{meta:{name:'nodes/failed-host',generation:1},status:{observedGeneration:1,conditions:[{kind:'Ready',status:'False',observedGeneration:1,reason:'HeartbeatLost'}]}}] : path === '/api/v1/projects' ? [{meta:{name:'projects/p1',generation:1},status:{observedGeneration:1,conditions:[{kind:'Ready',status:'True',observedGeneration:1}]}}] : [];
+      res.end(JSON.stringify({items, ...(path === '/api/v1/nodes' && inventoryMode === 'partial' ? {nextPageToken:'repeat'} : {})})); return;
+    }
     if (req.method === 'GET' && (path === '/api/v1/projects/p1/backups/safe-copy' || path === '/api/v1/projects/p1/backups')) { res.setHeader('content-type','application/json'); res.end(JSON.stringify(path.endsWith('/backups') ? {items:[backupRecord]} : backupRecord)); return; }
 
     if (req.method === 'GET' && path === '/api/v1/projects/p1/volumes/detail-check') { res.setHeader('content-type','application/json'); res.end(JSON.stringify(volumeRecord)); return; }
@@ -105,6 +113,34 @@ const activate = async (b, text) => {
 const fill = (b, selector, value) => b.evaluate(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});const proto=e.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;Object.getOwnPropertyDescriptor(proto,'value').set.call(e,${JSON.stringify(value)});e.dispatchEvent(new Event(e.tagName==='SELECT'?'change':'input',{bubbles:true}));})()`);
 const login = async (b) => { await b.goto(url); await fill(b, '#u', 'operator'); await fill(b, '#p', 'a test operator passphrase'); await click(b, 'Sign in'); await wait(b, '!!document.querySelector("#rail")'); };
 try {
+  inventoryMode = 'loading';
+  const inventory = await browser({width:1280,height:800}); pages.push(inventory); await login(inventory);
+  await wait(inventory, `!!document.querySelector('button[aria-label="Attention inbox, checking resource status"]')`);
+  await inventory.evaluate(`document.querySelector('button[aria-label="Attention inbox, checking resource status"]').click()`);
+  await wait(inventory, `document.body.innerText.includes('Checking resource status')`);
+  assert.equal(await inventory.evaluate(`document.body.innerText.includes('No resources need attention')`), false, 'pending inventory must not claim an all-clear');
+  inventoryMode = 'unavailable'; inventoryRelease();
+  await wait(inventory, `document.body.innerText.includes('Some resources could not be checked')`);
+  await wait(inventory, `!!document.querySelector('button[aria-label="Attention inbox, inventory incomplete"]')`);
+  inventoryMode = 'partial'; await inventory.evaluate(`[...document.querySelectorAll('[data-slot="popover-content"] button')].find(x=>x.innerText==='Refresh').click()`);
+  await wait(inventory, `document.body.innerText.includes('Partial results')`);
+  assert.equal(await inventory.evaluate(`document.body.innerText.includes('No resources need attention')`), false, 'truncated inventory must not claim an all-clear');
+  await inventory.resize(390, 844);
+  await wait(inventory, `(()=>{const r=document.querySelector('[data-slot="popover-content"]').getBoundingClientRect();return r.left>=0 && r.right<=innerWidth})()`);
+  if (process.env.VELSTRA_TEST_SCREENSHOT_DIR) await writeFile(process.env.VELSTRA_TEST_SCREENSHOT_DIR + '/attention-partial-mobile.png', Buffer.from(await inventory.screenshot(), 'base64'));
+  await inventory.key('Escape'); await wait(inventory, `!document.querySelector('[data-slot="popover-content"]')`);
+  assert.equal(await inventory.evaluate(`document.activeElement.getAttribute('aria-label')`), 'Attention inbox, inventory incomplete', 'closing returns focus to the inbox');
+  await inventory.key('Enter'); await wait(inventory, `!!document.querySelector('[data-slot="popover-content"]')`);
+  await inventory.resize(1280, 800);
+  inventoryMode = 'known'; await inventory.evaluate(`[...document.querySelectorAll('[data-slot="popover-content"] button')].find(x=>x.innerText==='Refresh').click()`);
+  await wait(inventory, `!!document.querySelector('button[aria-label="1 objects need attention; inventory incomplete"]')`);
+  await wait(inventory, `document.body.innerText.includes('failed-host')`);
+  if (process.env.VELSTRA_TEST_SCREENSHOT_DIR) await writeFile(process.env.VELSTRA_TEST_SCREENSHOT_DIR + '/attention-known-failure.png', Buffer.from(await inventory.screenshot(), 'base64'));
+  inventoryMode = 'complete'; await inventory.evaluate(`[...document.querySelectorAll('[data-slot="popover-content"] button')].find(x=>x.innerText==='Refresh').click()`);
+  await wait(inventory, `document.body.innerText.includes('No resources need attention')`);
+  await inventory.goto(url); await wait(inventory, `!!document.querySelector('button[aria-label="0 objects need attention"]')`);
+  assert.deepEqual(inventory.thrown, [], 'inventory failure/recovery has no browser exceptions');
+  inventory.close(); inventoryMode = null;
   const b = await browser({width: 1440, height: 1000}); pages.push(b); await login(b);
   await wait(b, 'document.body.innerText.includes("Cloud overview")');
   await wait(b, '!document.body.innerText.includes("Checking resources")');
@@ -407,6 +443,7 @@ try {
   assert.deepEqual(retrySession.thrown, [], 'session retry has no browser exceptions');
   console.log('PASS: admin CRUD, duplicate prevention, project routing, failed refresh recovery, validation focus, reduced motion, viewer, project-admin and additive custom permissions, binary console output, reattachment, read-only input and mobile detail');
 } finally {
+  inventoryRelease?.();
   for (const b of pages) b.close();
   for (const socket of streams) socket.destroy();
   server.closeAllConnections(); server.close(); fake.kill();
