@@ -261,9 +261,12 @@ try {
   await wait(b, `[...document.querySelectorAll('button')].some(x=>x.innerText==='Attach')`);
   await click(b, 'Attach');
   await wait(b, `document.querySelector('.xterm-rows')?.innerText.includes('Binary console ready')`);
+  assert.ok(await b.evaluate(`document.body.innerText.includes('Browser connection is not encrypted.')`), 'a TLS node hop does not make the HTTP browser connection encrypted');
+  assert.equal(await b.evaluate(`document.body.innerText.includes('Encrypted end to end')`), false);
   await b.type('x'); await new Promise(r=>setTimeout(r,150));
   assert.equal(consoleMessages, 1, 'console input reaches the stream once');
   await click(b, 'Detach'); await wait(b, `document.body.innerText.includes('Attach again')`);
+  assert.equal(await b.evaluate(`document.body.innerText.includes('Browser connection is not encrypted.')`), false, 'a closed console has no current transport verdict');
   await click(b, 'Attach again'); await wait(b, `document.body.innerText.includes('● attached')`);
   await b.type('y'); await new Promise(r=>setTimeout(r,150));
   assert.equal(consoleMessages, 2, 'reattaching must dispose the previous input subscription');
@@ -271,7 +274,7 @@ try {
   await wait(b, `[...document.querySelectorAll('button')].some(x=>x.innerText==='Open screen')`);
   await click(b, 'Open screen');
   await wait(b, `document.body.innerText.includes('● connected')`);
-  assert.ok(await b.evaluate(`document.body.innerText.includes('Encrypted end to end')`));
+  assert.ok(await b.evaluate(`document.body.innerText.includes('Browser connection is not encrypted.')`), 'screen considers the browser hop as well as the node grant');
   await click(b, 'Ctrl-Alt-Del'); await new Promise(r=>setTimeout(r,150));
   assert.ok(screenInput > 0, 'operator input reaches the real RFB stream');
   await b.evaluate(`(()=>{const open=window.open.bind(window);window.open=(...args)=>{window.screenPopup=open(...args);return window.screenPopup;};})()`);
@@ -290,7 +293,7 @@ try {
   await wait(b, `[...document.querySelectorAll('button')].some(x=>x.innerText==='Open screen')`);
   consoleEncrypted = false;
   await click(b, 'Open screen'); await wait(b, `document.body.innerText.includes('● connected')`);
-  assert.ok(await b.evaluate(`document.body.innerText.includes('not encrypted')`), 'screen reports an unencrypted node hop honestly');
+  assert.ok(await b.evaluate(`document.body.innerText.includes('Browser and node connections are not encrypted.')`), 'screen reports both unencrypted hops');
   consoleEncrypted = true;
   await click(b, 'Close');
   screenGrantDelay = 300;

@@ -566,6 +566,11 @@ Binary frames are the guest's bytes in both directions. A caller with `Read`
 but not `Write` on the project is given `readOnly`, and what it types is
 dropped rather than refused mid-session.
 
+The grant's `encrypted` flag describes only the API-to-node connection. Clients
+must also check their own WebSocket transport before reporting encryption;
+`encrypted: true` does not make an HTTP/WS browser connection private. The API
+relays the stream, so transport TLS is not end-to-end encryption through the API.
+
 **The display, over the same door.** `{"kind": "Vnc"}` in the `:console` body
 asks for the guest's screen instead of its serial line — what a guest whose
 kernel has stopped writing to `ttyS0` is still showing. The answer has the same

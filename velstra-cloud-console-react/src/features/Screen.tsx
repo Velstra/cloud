@@ -17,6 +17,7 @@ import { pathOf, projectOf, type Collection } from "@/lib/schema";
 import { useCan } from "@/lib/iam";
 import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
+import { ConsoleTransport } from "./ConsoleTransport";
 
 type Rfb = { disconnect: () => void; sendCtrlAltDel: () => void; addEventListener: (k: string, f: (e: any) => void) => void; scaleViewport: boolean; resizeSession: boolean; viewOnly: boolean; focus: () => void };
 
@@ -152,8 +153,7 @@ function ScreenSession({ r, coll }: { r: Resource; coll: Collection }) {
         {state === "gone" && <><span>Closed.</span><Button size="sm" variant="secondary" onClick={attach}>Open again</Button></>}
         {why && <span role="alert" style={{ color: "var(--failing)" }}>{why}</span>}
       </div>
-      {encrypted === true && <span className="text-xs" style={{ color: "var(--text-muted)" }}>Encrypted end to end</span>}
-      {encrypted === false && <span role="status" className="text-xs" style={{ color: "var(--pending)" }}>The connection from the API to this node is not encrypted.</span>}
+      {state === "open" && <ConsoleTransport nodeEncrypted={encrypted} />}
       {popup ? createPortal(display, popup.document.body) : display}
     </div>
   );

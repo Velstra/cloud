@@ -14,6 +14,7 @@ import { idOf, type Resource } from "@/lib/model";
 import { pathOf, type Collection } from "@/lib/schema";
 import { useStore } from "@/app/store";
 import { Pressed } from "./Pressed";
+import { ConsoleTransport } from "./ConsoleTransport";
 
 export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
   const project = useStore((s) => s.project);
@@ -41,7 +42,7 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
 
   const attach = async () => {
     const current = ++attempt.current;
-    setWhy(""); setState("asking");
+    setWhy(""); setState("asking"); setEncrypted(null);
     try {
       const path = `${pathOf(coll, r, project)}/${encodeURIComponent(idOf(r))}`;
       const grant = await call("console", "POST", `${path}:console`, undefined, {});
@@ -83,16 +84,7 @@ export function Terminal({ r, coll }: { r: Resource; coll: Collection }) {
         {state === "gone" && <><span>Detached.</span>{available && <Button size="sm" variant="secondary" onClick={attach}>Attach again</Button>}</>}
         {readOnly && state === "open" && <span>Read-only session</span>}
         {why && <span role="alert" style={{ color: "var(--failing)" }}>{why}</span>}
-        {encrypted === false && (
-          // Not an error and not decoration: it is the one thing somebody
-          // needs to know before they type a password into this box.
-          <span role="status" style={{ color: "var(--drifting)" }}>
-            ⚠ Node connection is unencrypted. Configure console TLS before entering secrets.
-          </span>
-        )}
-        {encrypted === true && (
-          <span style={{ color: "var(--settled)" }}>Encrypted end to end</span>
-        )}
+        {state === "open" && <ConsoleTransport nodeEncrypted={encrypted} />}
         {Number(r.status?.consoleBytes ?? 0) > 0 && <span className="ml-auto">{Number(r.status?.consoleBytes).toLocaleString()} bytes written</span>}
       </div>
       {String(r.status?.consoleTail ?? "") ? (
