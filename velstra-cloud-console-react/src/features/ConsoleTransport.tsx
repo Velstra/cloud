@@ -11,5 +11,5 @@ export function ConsoleTransport({ nodeEncrypted }: { nodeEncrypted: boolean | n
       : !browserEncrypted
         ? "Browser connection is not encrypted."
         : "The connection from the API to this node is not encrypted.";
-  return <span role="status" className="text-xs" style={{ color: encrypted ? "var(--settled)" : "var(--pending)" }}>{message}</span>;
+  return <span role="status" className="text-xs" style={{ color: encrypted ? "var(--settled)" : "var(--drifting)" }}>{message}</span>;
 }
