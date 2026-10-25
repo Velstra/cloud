@@ -589,6 +589,13 @@ pub fn translate(rule: &ResolvedRule) -> std::result::Result<Vec<pb::PortRule>, 
     Ok(ports
         .into_iter()
         .map(|port| pb::PortRule {
+            // Effective rules have no individual resource ID. Their semantic
+            // key remains stable when another allowance is inserted or removed.
+            name: format!(
+                "cloud:{direction}:{}:{port}:{}",
+                proto.as_str_name(),
+                rule.remote
+            ),
             proto: proto as i32,
             port,
             action: pb::Action::Pass as i32,
@@ -643,6 +650,7 @@ fn same_rules(a: &[pb::PortRule], b: &[pb::PortRule]) -> bool {
     // and the generated type has no `Hash`.
     let key = |r: &pb::PortRule| {
         let pb::PortRule {
+            name,
             proto,
             port,
             action,
@@ -658,7 +666,7 @@ fn same_rules(a: &[pb::PortRule], b: &[pb::PortRule]) -> bool {
             src_mac,
         } = r;
         format!(
-            "{proto}|{port}|{action}|{log}|{src}|{dst}|{limit}|{burst}|{icmp_type}|{family}|\
+            "{name}|{proto}|{port}|{action}|{log}|{src}|{dst}|{limit}|{burst}|{icmp_type}|{family}|\
              {direction}|{in_interface}|{src_mac}"
         )
     };
@@ -673,6 +681,7 @@ fn translate_all(rules: &[ResolvedRule]) -> Result<Vec<pb::PortRule>> {
     // The guest needs DHCP before it has an address. This is the only
     // unsolicited host-to-guest exception to default-deny ingress.
     let mut out = vec![pb::PortRule {
+        name: "cloud:dhcp-reply".into(),
         proto: pb::Proto::Udp as i32,
         port: 68,
         action: pb::Action::Pass as i32,
@@ -1152,6 +1161,24 @@ mod tests {
             out.iter().map(|r| r.port).collect::<Vec<_>>(),
             vec![8000, 8001, 8002, 8003]
         );
+        let single = translate(&rule(
+            Protocol::Tcp,
+            Some(PortRange {
+                from: 8002,
+                to: 8002,
+            }),
+            Direction::Ingress,
+        ))
+        .unwrap();
+        assert_eq!(
+            out[2].name, single[0].name,
+            "range edits must preserve rule identity"
+        );
+        assert!(!single[0].name.is_empty());
+        assert_ne!(
+            out[0].name, out[1].name,
+            "distinct ports need distinct identities"
+        );
     }
 
     #[test]
@@ -1264,6 +1291,7 @@ mod tests {
 
     fn pb_rule(port: u32) -> pb::PortRule {
         pb::PortRule {
+            name: format!("test:tcp:{port}"),
             proto: pb::Proto::Tcp as i32,
             port,
             action: pb::Action::Pass as i32,
@@ -1316,6 +1344,7 @@ mod tests {
         let base = pb_rule(80);
         let mut differing = vec![];
         for change in [
+            |r: &mut pb::PortRule| r.name = "another-rule".into(),
             |r: &mut pb::PortRule| r.proto = pb::Proto::Udp as i32,
             |r: &mut pb::PortRule| r.port = 81,
             |r: &mut pb::PortRule| r.action = pb::Action::Drop as i32,
@@ -1342,6 +1371,6 @@ mod tests {
         // `same_rules` is what makes a new field a compile error there; this is
         // what makes it a *test* failure here, so the number is asserted rather
         // than trusted.
-        assert_eq!(differing.len(), 13, "a field of PortRule has no case here");
+        assert_eq!(differing.len(), 14, "a field of PortRule has no case here");
     }
 }
