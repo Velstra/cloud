@@ -28,6 +28,7 @@ All component paths below are relative to velstra-cloud-console-react/src.
 | Scrollbar | index.css | DESIGN.md | stable table gutters | Computed style |
 | Toast | components/ui/sonner.tsx | App.tsx | success/error/info | Live regions |
 | CRUD | App.tsx and features/Detail.tsx | REST contract | create-to-detail/edit-to-detail | Live browser |
+| Attention inbox | app/Shell.tsx and app/census.ts | complete shared inventory | loading, unavailable, partial, complete | Browser failure/recovery tests |
 | Console transport | features/ConsoleTransport.tsx | page protocol and console grant | serial and VNC | Browser console tests |
 
 ## Behavior

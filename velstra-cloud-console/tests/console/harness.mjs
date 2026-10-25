@@ -220,7 +220,7 @@ export async function browser({ width = 1600, height = 1000 } = {}) {
       await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
     },
     async key(key, code = key) {
-      await send("Input.dispatchKeyEvent", { type: "keyDown", key, code, windowsVirtualKeyCode: key === "Enter" ? 13 : undefined });
+      await send("Input.dispatchKeyEvent", { type: "keyDown", key, code, text: key === "Enter" ? "\r" : undefined, windowsVirtualKeyCode: key === "Enter" ? 13 : undefined });
       await send("Input.dispatchKeyEvent", { type: "keyUp", key, code });
     },
     async type(text) { await send("Input.insertText", { text }); },
