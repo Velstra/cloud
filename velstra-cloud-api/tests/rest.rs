@@ -4397,7 +4397,7 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
         velstra_cloud_model::resources::VolumeSpec {
             source_backup: None,
             size_gib: 40,
-            pool: "pools/fast".into(),
+            pool: "fast".into(),
             encryption_key: None,
             source_image: None,
             source_snapshot: None,
@@ -4452,6 +4452,34 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
     );
     assert_eq!(refused.body["error"]["field"], json!("spec.target"));
 
+    let unsafe_schedule = h
+        .post(
+            "projects/p1/backup-schedules",
+            json!({"id": "daily", "spec": {
+                "volume": "projects/p1/volumes/data-1", "target": "backup-targets/same-pool"
+            }}),
+        )
+        .await;
+    assert_eq!(unsafe_schedule.error_code(), "FAILED_PRECONDITION");
+    let automatic = h
+        .post(
+            "projects/p1/backup-schedules",
+            json!({"id": "safe", "spec": {
+                "volume": "projects/p1/volumes/data-1"
+            }}),
+        )
+        .await;
+    assert_eq!(
+        automatic.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        automatic.body
+    );
+    assert_eq!(
+        h.get("projects/p1/backup-schedules/safe").await.body["spec"]["target"],
+        "backup-targets/elsewhere"
+    );
+
     // A target somewhere else is the ordinary case, and the pool holding the
     // source is filled in — without it the object is assigned to nobody and no
     // agent could ever claim it.
@@ -4472,7 +4500,7 @@ async fn a_backup_into_the_volumes_own_pool_is_refused_with_the_reason() {
     assert_eq!(read.status, StatusCode::OK, "{:?}", read.body);
     assert_eq!(
         read.body["spec"]["pool"],
-        json!("pools/fast"),
+        json!("fast"),
         "the pool holding the source was not filled in, so no agent could ever claim this copy"
     );
 }
@@ -5822,6 +5850,61 @@ async fn a_backup_without_a_target_goes_to_the_cells_most_roomy_one() {
         stored.body["spec"]
     );
 
+    let scheduled = h
+        .post(
+            "projects/p1/backup-schedules",
+            json!({"id": "daily", "spec": {
+                "volume": "projects/p1/volumes/data"
+            }}),
+        )
+        .await;
+    assert_eq!(
+        scheduled.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        scheduled.body
+    );
+    let stored = h.get("projects/p1/backup-schedules/daily").await;
+    assert_eq!(stored.body["spec"]["target"], "backup-targets/big");
+    assert!(
+        stored.body["spec"].get("pool").is_none(),
+        "schedule must not pin the source pool"
+    );
+    let chosen = h
+        .patch(
+            "projects/p1/backup-schedules/daily",
+            json!({"spec": {
+                "target": "backup-targets/small"
+            }}),
+        )
+        .await;
+    assert_eq!(chosen.status, StatusCode::OK, "{:?}", chosen.body);
+    let reset = h
+        .patch(
+            "projects/p1/backup-schedules/daily",
+            json!({"spec": {"target": ""}}),
+        )
+        .await;
+    assert_eq!(reset.status, StatusCode::OK, "{:?}", reset.body);
+    let stored = h.get("projects/p1/backup-schedules/daily").await;
+    assert_eq!(stored.body["spec"]["target"], "backup-targets/big");
+    let invalid = h
+        .patch(
+            "projects/p1/backup-schedules/daily",
+            json!({"spec": {"target": 7}}),
+        )
+        .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    let wrong_kind = h
+        .patch(
+            "projects/p1/backup-schedules/daily",
+            json!({"spec": {
+                "target": "projects/p1/volumes/data"
+            }}),
+        )
+        .await;
+    assert_eq!(wrong_kind.status, StatusCode::BAD_REQUEST);
+
     // A cell with nowhere to put a copy says so, with what an operator must do.
     let h2 = Harness::new();
     h2.pool("nvme").await;
@@ -5850,6 +5933,15 @@ async fn a_backup_without_a_target_goes_to_the_cells_most_roomy_one() {
         "{:?}",
         refused.body
     );
+    let unschedulable = h2
+        .post(
+            "projects/p1/backup-schedules",
+            json!({"id": "daily", "spec": {
+                "volume": "projects/p1/volumes/data"
+            }}),
+        )
+        .await;
+    assert_eq!(unschedulable.error_code(), "FAILED_PRECONDITION");
 }
 
 #[test]
