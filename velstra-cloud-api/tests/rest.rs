@@ -2793,6 +2793,66 @@ async fn a_snapshot_that_is_not_under_a_volume_is_refused() {
 }
 
 #[tokio::test]
+async fn snapshot_schedule_ownership_is_output_only_and_cannot_be_reassigned() {
+    use velstra_cloud_model::resources::Snapshot;
+    let h = Harness::new();
+    h.pool("pool-a").await;
+    let volume = h.volume("data-1", 100).await;
+    let collection = format!("{volume}/snapshots");
+    let refused = h
+        .post(
+            &collection,
+            json!({
+                "id": "forged", "spec": {"scheduleUid": "some-schedule"}
+            }),
+        )
+        .await;
+    assert_eq!(refused.error_code(), "INVALID_ARGUMENT");
+    assert_eq!(refused.field(), "spec.scheduleUid");
+    assert!(
+        h.get(&collection).await.body["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let created = h.post(&collection, json!({"id": "scheduled"})).await;
+    assert_eq!(created.status, StatusCode::ACCEPTED);
+    let name = created.body["target"].as_str().unwrap();
+    let snapshots = h.snapshots();
+    let mut snapshot: Snapshot = snapshots.get(name).await.unwrap().unwrap();
+    snapshot.spec.schedule_uid = Some("actual-owner".into());
+    snapshot.meta.generation += 1;
+    snapshots
+        .update(&snapshot, &Writer::controller("snapshot-schedule"))
+        .await
+        .unwrap();
+    for changed in [json!("other-owner"), Value::Null, json!("")] {
+        let refused = h
+            .patch(name, json!({"spec": {"scheduleUid": changed}}))
+            .await;
+        assert_eq!(refused.error_code(), "INVALID_ARGUMENT", "{}", refused.body);
+        assert_eq!(refused.field(), "spec.scheduleUid");
+        assert_eq!(
+            h.get(name).await.body["spec"]["scheduleUid"],
+            "actual-owner"
+        );
+    }
+    let echo = h
+        .patch(name, json!({"spec": {"scheduleUid": "actual-owner"}}))
+        .await;
+    assert_eq!(echo.status, StatusCode::OK, "{}", echo.body);
+    let metadata = h
+        .patch(name, json!({"meta": {"labels": {"note": "keep"}}}))
+        .await;
+    assert_eq!(metadata.status, StatusCode::OK, "{}", metadata.body);
+    assert_eq!(
+        h.get(name).await.body["spec"]["scheduleUid"],
+        "actual-owner"
+    );
+}
+
+#[tokio::test]
 async fn a_copy_is_refused_of_a_volume_that_has_nothing_in_it_yet() {
     // Knowable before anything is written. Otherwise the object exists, the
     // pool fails on it, and an operator reads a backend error instead of a

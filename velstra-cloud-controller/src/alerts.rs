@@ -690,6 +690,11 @@ impl Notifier {
             }
             self.beat(Timestamp::now()).await;
         }
+        // mem::take above drains the queue before retrying it. Successful
+        // attempts do not requeue anything, so publish the final state even
+        // when every retry succeeds and no failure path updates the gauge.
+        self.metrics
+            .set(WAITING, &[], self.undelivered.len() as f64);
         Transitions { fired, resolved }
     }
 
@@ -837,33 +842,91 @@ pub fn mail_body(targets: &Targets, cell: &str, kind: &str, alert: &Alert) -> St
 }
 
 async fn send_mail(targets: &Targets, cell: &str, kind: &str, alert: &Alert) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new(&targets.sendmail)
+    run_sendmail(
+        &targets.sendmail,
+        mail_body(targets, cell, kind, alert),
+        DELIVERY_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_sendmail(
+    program: &std::path::Path,
+    body: String,
+    budget: Duration,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut child = tokio::process::Command::new(program)
         .arg("-t")
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("starting {}: {e}", targets.sendmail.display()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(mail_body(targets, cell, kind, alert).as_bytes())
-            .await
-            .map_err(|e| format!("writing the message: {e}"))?;
-    }
-    let done = tokio::time::timeout(DELIVERY_TIMEOUT, child.wait_with_output())
+        .map_err(|e| format!("starting {}: {e}", program.display()))?;
+    // Dropping the caller closes this signal. An independent owner then kills
+    // AND reaps the child instead of abandoning wait_with_output on cancellation.
+    let (cancel_guard, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+    let owner = tokio::spawn(async move {
+        let mut diagnostics = tokio::task::JoinSet::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            diagnostics.spawn(async move {
+                let mut saved = Vec::new();
+                let mut buffer = [0; 1024];
+                // Drain all output so pipe capacity cannot wedge sendmail,
+                // retaining at most 4096 bytes regardless of child behavior.
+                loop {
+                    let count = stderr.read(&mut buffer).await?;
+                    if count == 0 {
+                        break;
+                    }
+                    let keep = count.min(4096 - saved.len());
+                    saved.extend_from_slice(&buffer[..keep]);
+                }
+                Ok::<_, std::io::Error>(saved)
+            });
+        }
+        let outcome = tokio::select! {
+            _ = &mut cancelled => Err("sendmail delivery cancelled".to_string()),
+            result = tokio::time::timeout_at(deadline, async {
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(body.as_bytes()).await.map_err(|e| format!("writing the message: {e}"))?;
+                }
+                child.wait().await.map_err(|e| format!("waiting for sendmail: {e}"))
+            }) => result.unwrap_or_else(|_| Err("sendmail did not finish in time".to_string())),
+        };
+        if outcome.is_err() {
+            let _ = child.start_kill();
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(_)) => {}
+                _ => {
+                    return Err(
+                        "sendmail cleanup did not complete; kill-on-drop remains armed".to_string(),
+                    );
+                }
+            }
+        }
+        let stderr =
+            match tokio::time::timeout(Duration::from_millis(250), diagnostics.join_next()).await {
+                Ok(Some(Ok(Ok(bytes)))) => bytes,
+                _ => Vec::new(),
+            }; // JoinSet drop aborts any inherited-pipe reader still waiting.
+        let status = outcome?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "sendmail exited with {status}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ))
+        }
+    });
+    let result = owner
         .await
-        .map_err(|_| "sendmail did not finish in time".to_string())?
-        .map_err(|e| format!("waiting for sendmail: {e}"))?;
-    if done.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "sendmail exited with {}: {}",
-            done.status,
-            String::from_utf8_lossy(&done.stderr).trim()
-        ))
-    }
+        .map_err(|e| format!("sendmail owner failed: {e}"))?;
+    drop(cancel_guard);
+    result
 }
 
 #[cfg(test)]
@@ -875,6 +938,114 @@ mod tests {
     };
 
     use super::*;
+
+    fn mail_fixture(name: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(format!(
+            "velstra-mail-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let program = directory.join("sendmail");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf '%s' \"$$\" > \"${{0}}.pid\"\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, program)
+    }
+
+    async fn fixture_pid(program: &std::path::Path) -> u32 {
+        let file = program.with_extension("pid");
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(pid) = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| text.parse().ok())
+            {
+                return pid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "fixture did not publish its PID"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sendmail_deadline_covers_blocked_stdin_and_wait_and_reaps_both() {
+        for (name, script) in [
+            ("no-read", "exec sleep 30"),
+            ("no-exit", "cat >/dev/null\nexec sleep 30"),
+        ] {
+            let (directory, program) = mail_fixture(name, script);
+            let started = std::time::Instant::now();
+            let error = run_sendmail(
+                &program,
+                "x".repeat(1024 * 1024),
+                Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("did not finish in time"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let pid = fixture_pid(&program).await;
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "timed-out child was not reaped"
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_alert_delivery_kills_and_reaps_the_mail_child() {
+        let (directory, program) = mail_fixture("cancel", "exec sleep 30");
+        let child_program = program.clone();
+        let delivery = tokio::spawn(async move {
+            run_sendmail(
+                &child_program,
+                "x".repeat(1024 * 1024),
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        let pid = fixture_pid(&program).await;
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        delivery.abort();
+        let _ = delivery.await;
+        let started = std::time::Instant::now();
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "cancelled child was not reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sendmail_stderr_is_drained_but_retained_diagnostics_are_bounded() {
+        let (directory, program) = mail_fixture(
+            "stderr",
+            "cat >/dev/null\nhead -c 1048576 /dev/zero >&2\nexit 1",
+        );
+        let error = run_sendmail(&program, "test".into(), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(error.contains("sendmail exited"), "{error}");
+        assert!(error.len() < 5000);
+        let pid = fixture_pid(&program).await;
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn meta(name: &str) -> Meta {
         Meta::new(
@@ -1072,7 +1243,7 @@ mod tests {
                 rules: Rules::default(),
             },
             "cell-1",
-            metrics,
+            metrics.clone(),
         );
         let a = Alert {
             rule: "stuck",
@@ -1081,6 +1252,7 @@ mod tests {
         };
         n.observe(vec![a.clone()], true).await;
         assert_eq!(n.waiting(), 1, "a delivery nobody took was forgotten");
+        assert_eq!(metrics.get(WAITING, &[]), Some(1.0));
 
         // The next pass tries it again — and, still failing, keeps it. What it
         // must not do is drop it or double it.
@@ -1090,6 +1262,15 @@ mod tests {
         // And a pass that is not the leader's does not touch the queue.
         n.observe(vec![], false).await;
         assert_eq!(n.waiting(), 1);
+
+        // Recover through a real stdin-consuming target. cat -t accepts the
+        // same switch, consumes the complete message and exits successfully.
+        n.config.targets.webhook = None;
+        n.config.targets.mail_to = vec!["alerts@example.invalid".into()];
+        n.config.targets.sendmail = "cat".into();
+        n.observe(vec![a], true).await;
+        assert_eq!(n.waiting(), 0);
+        assert_eq!(metrics.get(WAITING, &[]), Some(0.0));
     }
 
     /// A node whose wires lead nowhere says so. It is the shape that looks like

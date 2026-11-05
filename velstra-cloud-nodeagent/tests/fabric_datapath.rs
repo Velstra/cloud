@@ -68,15 +68,22 @@ fn controller_binary() -> Option<PathBuf> {
 }
 
 fn may_make_a_tap() -> bool {
-    let probe = "vtprobe9";
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // Parallel cases must not mistake another fixture's probe for missing
+    // CAP_NET_ADMIN and silently skip their actual datapath assertions.
+    let probe = format!(
+        "vp{:08x}{:04x}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u16
+    );
     let made = std::process::Command::new("ip")
-        .args(["tuntap", "add", "dev", probe, "mode", "tap"])
+        .args(["tuntap", "add", "dev", &probe, "mode", "tap"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if made {
         let _ = std::process::Command::new("ip")
-            .args(["tuntap", "del", "dev", probe, "mode", "tap"])
+            .args(["tuntap", "del", "dev", &probe, "mode", "tap"])
             .status();
     }
     made

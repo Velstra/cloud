@@ -364,30 +364,67 @@ impl OverHttp {
     }
 }
 
-impl Fetch for OverHttp {
-    fn text(&self, url: &str) -> impl Future<Output = std::result::Result<String, String>> + Send {
+impl OverHttp {
+    fn text_with_timeout(
+        &self,
+        url: &str,
+        deadline: std::time::Duration,
+    ) -> impl Future<Output = std::result::Result<String, String>> + Send {
         let url = url.to_string();
         let request = url
             .strip_prefix("file://")
             .map(|path| path.to_string())
             .ok_or_else(|| self.client.get(&url).send());
         async move {
-            let bytes = match request {
-                Ok(path) => tokio::fs::read(&path).await.map_err(|e| e.to_string())?,
-                Err(request) => {
-                    let response = request.await.map_err(|e| e.to_string())?;
-                    let status = response.status();
-                    if !status.is_success() {
-                        return Err(format!("the server answered {status}"));
+            tokio::time::timeout(deadline, async move {
+                use tokio::io::AsyncReadExt;
+                const LIMIT: usize = 4 * 1024 * 1024;
+                let too_large = || "that is not a checksums file: over 4 MiB".to_string();
+                let bytes = match request {
+                    Ok(path) => {
+                        let file = tokio::fs::File::open(&path)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let mut bytes = Vec::new();
+                        file.take((LIMIT + 1) as u64)
+                            .read_to_end(&mut bytes)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        bytes
                     }
-                    response.bytes().await.map_err(|e| e.to_string())?.to_vec()
+                    Err(request) => {
+                        let mut response = request.await.map_err(|e| e.to_string())?;
+                        let status = response.status();
+                        if !status.is_success() {
+                            return Err(format!("the server answered {status}"));
+                        }
+                        if response.content_length().is_some_and(|n| n > LIMIT as u64) {
+                            return Err(too_large());
+                        }
+                        let mut bytes = Vec::new();
+                        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+                            if chunk.len() > LIMIT - bytes.len() {
+                                return Err(too_large());
+                            }
+                            bytes.extend_from_slice(&chunk);
+                        }
+                        bytes
+                    }
+                };
+                if bytes.len() > LIMIT {
+                    return Err(too_large());
                 }
-            };
-            if bytes.len() > 4 * 1024 * 1024 {
-                return Err("that is not a checksums file: over 4 MiB".into());
-            }
-            String::from_utf8(bytes).map_err(|_| "not text".to_string())
+                String::from_utf8(bytes).map_err(|_| "not text".to_string())
+            })
+            .await
+            .map_err(|_| "checksums metadata exceeded its overall deadline".to_string())?
         }
+    }
+}
+
+impl Fetch for OverHttp {
+    fn text(&self, url: &str) -> impl Future<Output = std::result::Result<String, String>> + Send {
+        self.text_with_timeout(url, std::time::Duration::from_secs(60))
     }
 
     fn download(
@@ -434,6 +471,93 @@ mod tests {
 
     const DEB: &str = "velstra-cloud_0.2.0+20260918.c571d71_amd64.deb";
     const ISO: &str = "velstra-cloud-installer_0.2.0+20260918.c571d71_amd64.iso";
+
+    #[tokio::test]
+    async fn metadata_limit_applies_before_complete_http_or_file_buffering() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let fetch = OverHttp::new().unwrap();
+        for chunked in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/SHA256SUMS", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                if chunked {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let chunk = vec![b'x'; 16384];
+                    for _ in 0..(LIMIT / chunk.len() + 1) {
+                        if socket.write_all(b"4000\r\n").await.is_err() {
+                            break;
+                        }
+                        if socket.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                        if socket.write_all(b"\r\n").await.is_err() {
+                            break;
+                        }
+                    }
+                } else {
+                    socket
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", LIMIT + 1)
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                // Do not complete the HTTP body: refusal must not wait for EOF.
+                std::future::pending::<()>().await;
+            });
+            let error = fetch
+                .text_with_timeout(&url, std::time::Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            server.abort();
+            let _ = server.await;
+            assert!(error.contains("over 4 MiB"), "{error}");
+        }
+        let path =
+            std::env::temp_dir().join(format!("velstra-checksums-bound-{}", std::process::id()));
+        let file = std::fs::File::create_new(&path).unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap(); // Sparse, not a 1 GiB allocation.
+        let result = fetch.text(&format!("file://{}", path.display())).await;
+        std::fs::remove_file(path).unwrap();
+        assert!(result.unwrap_err().contains("over 4 MiB"));
+    }
+
+    #[tokio::test]
+    async fn progressing_metadata_still_has_an_overall_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/SHA256SUMS", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            loop {
+                if socket.write_all(b"1\r\nx\r\n").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        let result = OverHttp::new()
+            .unwrap()
+            .text_with_timeout(&url, std::time::Duration::from_millis(150))
+            .await;
+        server.abort();
+        let _ = server.await;
+        assert!(result.unwrap_err().contains("overall deadline"));
+    }
 
     fn sha256(bytes: &[u8]) -> String {
         use sha2::Digest as _;
