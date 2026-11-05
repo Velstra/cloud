@@ -262,6 +262,15 @@ impl FabricDatapath {
             .any(|route| route.get("dst").and_then(serde_json::Value::as_str) != Some("default")))
     }
 
+    fn no_covering_host_route(routes: &str) -> Result<bool> {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(routes)
+            .map_err(|e| HostError::failed(format!("decoding all-table host route lookup: {e}")))?;
+        // Only positive absence authorizes allocation after route-get fails.
+        // Do not interpret malformed data, a default, blackhole, local route,
+        // or a route in another table as an unused address.
+        Ok(rows.is_empty())
+    }
+
     fn host_route_claims(routes: &str) -> Result<BTreeMap<Ipv4Addr, HostRoute>> {
         let rows: Vec<serde_json::Value> = serde_json::from_str(routes)
             .map_err(|e| HostError::failed(format!("decoding host routes: {e}")))?;
@@ -325,6 +334,31 @@ impl FabricDatapath {
             .await
             .map_err(|e| HostError::failed(format!("checking host route for {ip}: {e}")))?;
         if !output.status.success() {
+            // On a clean isolated host there may be no default route at all.
+            // route-get then reports ENETUNREACH, not an ownership conflict.
+            // Establish absence independently, including local/policy tables;
+            // never classify an arbitrary command error as a free address.
+            let covering = Command::new("ip")
+                .args([
+                    "-j",
+                    "-4",
+                    "route",
+                    "show",
+                    "table",
+                    "all",
+                    "match",
+                    &format!("{ip}/32"),
+                ])
+                .output()
+                .await
+                .map_err(|e| {
+                    HostError::failed(format!("checking all host route tables for {ip}: {e}"))
+                })?;
+            if covering.status.success()
+                && Self::no_covering_host_route(&String::from_utf8_lossy(&covering.stdout))?
+            {
+                return Ok(());
+            }
             return Err(HostError::failed(format!(
                 "checking host route for {ip}: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -1041,6 +1075,23 @@ mod tests {
     use velstra_cloud_model::security::PortRange;
 
     use super::*;
+
+    #[test]
+    fn unreachable_lookup_requires_positive_absence_in_all_route_tables() {
+        assert!(FabricDatapath::no_covering_host_route("[]").unwrap());
+        for occupied in [
+            r#"[{"dst":"default","gateway":"192.0.2.1"}]"#,
+            r#"[{"type":"local","dst":"10.20.0.7","table":"local"}]"#,
+            r#"[{"type":"blackhole","dst":"10.20.0.0/24"}]"#,
+            r#"[{"dst":"10.20.0.7","table":100,"dev":"other"}]"#,
+            "[null]",
+        ] {
+            assert!(!FabricDatapath::no_covering_host_route(occupied).unwrap());
+        }
+        for invalid in ["", "null", "{}", "not JSON"] {
+            assert!(FabricDatapath::no_covering_host_route(invalid).is_err());
+        }
+    }
 
     #[test]
     fn a_guest_route_must_not_capture_host_local_or_connected_addresses() {

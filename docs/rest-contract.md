@@ -337,6 +337,20 @@ ones count toward `keep`, at least one always survives, and ones taken by hand
 are never expired. A rule written twice is a rule that will eventually be two
 rules.
 
+Generated snapshots carry output-only `spec.scheduleUid`, equal to the creating
+schedule's immutable `meta.uid`. Cadence and retention use that exact identity,
+never a name prefix. Recreating a schedule with the same name does not transfer
+ownership of existing snapshots. Clients cannot set, clear or reassign the UID;
+restating its unchanged value in an edit is allowed.
+
+**Upgrade conservatively:** snapshots without this field (manual or legacy)
+remain readable and restorable, but no schedule adopts or automatically deletes
+them. Review and delete old copies explicitly after confirming their provenance;
+do not infer ownership from names such as `hourly-*`. Upgrade APIs and pool agents
+to the schema carrying this field before enabling the updated schedule controller,
+so status reports preserve ownership. A schedule missing its own UID reports
+`OwnerMissing` and neither creates nor prunes snapshots.
+
 ### Networks: logical, or the machine's own wire
 
 A network is **logical** by default: the platform allocates its addresses, the

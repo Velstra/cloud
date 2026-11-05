@@ -2296,6 +2296,12 @@ pub struct SnapshotSpec {
     /// at all so that a pool agent's watch filter is one comparison, exactly as
     /// an attachment carries the node it is opened on.
     pub pool: String,
+    /// Immutable identity of the schedule that created this snapshot. Only the
+    /// schedule controller sets it, on creation. A name (or a name prefix) is
+    /// not ownership: schedules may overlap or be deleted and recreated.
+    /// Legacy/manual snapshots have no owner and are never adopted for pruning.
+    #[serde(default)]
+    pub schedule_uid: Option<String>,
 }
 
 /// What the pool can see of the copy. Every value here is observable on the

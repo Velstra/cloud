@@ -1081,6 +1081,65 @@ impl Datapath for FakeDatapath {
     }
 }
 
+// ---- bgp -------------------------------------------------------------------
+
+/// A routing daemon that remembers what it was told and says what a test set.
+#[derive(Clone, Default)]
+pub struct FakeBgp {
+    inner: Arc<Mutex<FakeBgpState>>,
+}
+
+#[derive(Default)]
+struct FakeBgpState {
+    applied: Option<crate::bgp::BgpDesired>,
+    applies: usize,
+    peers: BTreeMap<String, crate::bgp::PeerObservation>,
+}
+
+impl FakeBgp {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// What the daemon was last asked to say.
+    pub fn applied(&self) -> Option<crate::bgp::BgpDesired> {
+        self.inner.lock().unwrap().applied.clone()
+    }
+    pub fn applies(&self) -> usize {
+        self.inner.lock().unwrap().applies
+    }
+    /// Make a neighbour answer.
+    pub fn answer(&self, peer: &str, state: &str, announced: u32) {
+        self.inner.lock().unwrap().peers.insert(
+            peer.to_string(),
+            crate::bgp::PeerObservation {
+                state: state.to_string(),
+                announced,
+            },
+        );
+    }
+}
+
+#[async_trait]
+impl crate::bgp::BgpSpeaker for FakeBgp {
+    async fn apply(&self, desired: &crate::bgp::BgpDesired) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.applied = Some(desired.clone());
+        inner.applies += 1;
+        Ok(())
+    }
+    async fn observe(&self) -> Result<BTreeMap<String, crate::bgp::PeerObservation>> {
+        Ok(self.inner.lock().unwrap().peers.clone())
+    }
+    async fn is_speaking(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .applied
+            .as_ref()
+            .is_some_and(|d| !d.sessions.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1374,64 +1433,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first, again);
-    }
-}
-
-// ---- bgp -------------------------------------------------------------------
-
-/// A routing daemon that remembers what it was told and says what a test set.
-#[derive(Clone, Default)]
-pub struct FakeBgp {
-    inner: Arc<Mutex<FakeBgpState>>,
-}
-
-#[derive(Default)]
-struct FakeBgpState {
-    applied: Option<crate::bgp::BgpDesired>,
-    applies: usize,
-    peers: BTreeMap<String, crate::bgp::PeerObservation>,
-}
-
-impl FakeBgp {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    /// What the daemon was last asked to say.
-    pub fn applied(&self) -> Option<crate::bgp::BgpDesired> {
-        self.inner.lock().unwrap().applied.clone()
-    }
-    pub fn applies(&self) -> usize {
-        self.inner.lock().unwrap().applies
-    }
-    /// Make a neighbour answer.
-    pub fn answer(&self, peer: &str, state: &str, announced: u32) {
-        self.inner.lock().unwrap().peers.insert(
-            peer.to_string(),
-            crate::bgp::PeerObservation {
-                state: state.to_string(),
-                announced,
-            },
-        );
-    }
-}
-
-#[async_trait]
-impl crate::bgp::BgpSpeaker for FakeBgp {
-    async fn apply(&self, desired: &crate::bgp::BgpDesired) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.applied = Some(desired.clone());
-        inner.applies += 1;
-        Ok(())
-    }
-    async fn observe(&self) -> Result<BTreeMap<String, crate::bgp::PeerObservation>> {
-        Ok(self.inner.lock().unwrap().peers.clone())
-    }
-    async fn is_speaking(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .applied
-            .as_ref()
-            .is_some_and(|d| !d.sessions.is_empty())
     }
 }

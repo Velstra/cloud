@@ -5005,6 +5005,17 @@ impl Api {
                 self.refuse_a_moved_pool(name, spec).await?;
                 self.refuse_a_smaller_volume(name, spec).await?;
             }
+            if name.collection() == "snapshots"
+                && let Some(asked) = spec.get("schedule_uid")
+            {
+                let stored: velstra_cloud_model::resources::Snapshot = self.typed(name).await?;
+                if *asked != json!(stored.spec.schedule_uid) {
+                    return Err(ApiError::invalid(
+                        "Snapshot schedule ownership is immutable and assigned by the schedule controller.",
+                    )
+                    .at("spec.scheduleUid"));
+                }
+            }
             if name.collection() == "ceph-clusters" {
                 self.refuse_a_disk_that_is_not_free(spec).await?;
             }
@@ -6785,6 +6796,15 @@ impl Api {
     /// not something any backend does. Stated and wrong is refused rather than
     /// corrected.
     async fn settle_snapshot(&self, name: &ResourceName, spec: &mut Value) -> ApiResult<()> {
+        if spec
+            .get("schedule_uid")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(ApiError::invalid(
+                "Snapshot schedule ownership is assigned by the schedule controller, not by clients.",
+            )
+            .at("spec.scheduleUid"));
+        }
         let source = name
             .parent()
             .filter(|parent| parent.collection() == "volumes")

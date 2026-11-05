@@ -556,6 +556,7 @@ mod tests {
             ),
             SnapshotSpec {
                 pool: "pool-a".into(),
+                schedule_uid: None,
             },
             SnapshotStatus::default(),
         );

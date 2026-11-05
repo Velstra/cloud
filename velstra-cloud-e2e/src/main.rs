@@ -534,6 +534,7 @@ async fn seed(store: Arc<dyn Store>) {
             meta("projects/p1/volumes/data-1/snapshots/nightly"),
             SnapshotSpec {
                 pool: "rbd-standard".into(),
+                schedule_uid: None,
             },
             SnapshotStatus::default(),
         ),
