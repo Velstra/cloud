@@ -2762,6 +2762,7 @@ mod tests {
                 ),
                 SnapshotSpec {
                     pool: pool.to_string(),
+                    schedule_uid: None,
                 },
                 SnapshotStatus::default(),
             );

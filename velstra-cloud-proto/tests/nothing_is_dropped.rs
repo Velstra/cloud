@@ -728,8 +728,9 @@ survives_the_wire!(
     v1::SnapshotSpec,
     resources::SnapshotSpec {
         pool: "rbd-standard".into(),
+        schedule_uid: Some("schedule-uid".into()),
     },
-    { pool }
+    { pool, schedule_uid }
 );
 
 survives_the_wire!(
@@ -1130,6 +1131,7 @@ whole_object_survives!(
     v1::Snapshot,
     resources::SnapshotSpec {
         pool: "rbd-standard".into(),
+        schedule_uid: Some("schedule-uid".into()),
     },
     resources::SnapshotStatus {
         observed_generation: 3,

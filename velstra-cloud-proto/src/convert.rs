@@ -1387,6 +1387,7 @@ impl From<&resources::SnapshotSpec> for v1::SnapshotSpec {
     fn from(s: &resources::SnapshotSpec) -> Self {
         Self {
             pool: s.pool.clone(),
+            schedule_uid: s.schedule_uid.clone(),
         }
     }
 }
@@ -1395,6 +1396,7 @@ impl From<&v1::SnapshotSpec> for resources::SnapshotSpec {
     fn from(s: &v1::SnapshotSpec) -> Self {
         Self {
             pool: s.pool.clone(),
+            schedule_uid: s.schedule_uid.clone(),
         }
     }
 }

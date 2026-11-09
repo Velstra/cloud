@@ -110,16 +110,13 @@ impl SnapshotScheduleController {
 
 /// This schedule's snapshots, seen the way the shared arithmetic sees a copy.
 ///
-/// The `schedule` field is the id carried in the snapshot's own name rather
-/// than a field on it, because a snapshot has no place to record who asked for
-/// one — and inventing a field for it would mean touching the object a pool
-/// agent owns. The name is a fact nobody else writes.
-fn view(s: &Snapshot, schedule_id: &str) -> BackupView {
-    let id = s.meta.name.id().to_string();
+/// Only an explicit schedule UID grants ownership. In particular, legacy names
+/// are never adopted: even an exact old spelling may have been made by hand.
+/// Spec belongs to the controller; the pool's independently written status is
+/// unchanged by recording who requested the snapshot.
+fn view(s: &Snapshot) -> BackupView {
     BackupView {
-        schedule: id
-            .starts_with(&format!("{schedule_id}-"))
-            .then(|| schedule_id.to_string()),
+        schedule: s.spec.schedule_uid.clone(),
         name: s.meta.name.to_string(),
         taken: s.status.taken,
         created_at: s.meta.created_at,
@@ -217,6 +214,17 @@ impl Reconciler for SnapshotScheduleController {
         }
 
         let id = schedule.meta.name.id().to_string();
+        let owner = &schedule.meta.uid;
+        if owner.is_empty() {
+            return self
+                .report(
+                    schedule,
+                    false,
+                    "OwnerMissing",
+                    "Schedule identity is missing.",
+                )
+                .await;
+        }
 
         let objects = self.snapshots.list().await?;
         // This volume's, and this schedule's. A snapshot under another volume
@@ -225,15 +233,15 @@ impl Reconciler for SnapshotScheduleController {
             .iter()
             .filter(|s| s.meta.name.parent().as_ref() == Some(&volume_name))
             .collect();
-        let seen: Vec<BackupView> = mine.iter().map(|s| view(s, &id)).collect();
+        let seen: Vec<BackupView> = mine.iter().map(|s| view(s)).collect();
         let now = (self.now)();
 
-        if backup::due(schedule.spec.every_hours, &id, &seen, now) {
+        if backup::due(schedule.spec.every_hours, owner, &seen, now) {
             // Derived from the schedule and the second, so two controllers on
             // one pass ask for the same object and the loser's create is
             // refused as a duplicate rather than making a second snapshot of
             // the same moment.
-            let taken_id = format!("{id}-{}", now.0 / 1000);
+            let taken_id = format!("{id}-{owner}-{}", now.0 / 1000);
             let full = format!("{volume_name}/snapshots/{taken_id}");
             let Ok(snapshot_name) = ResourceName::parse(&full) else {
                 return Ok(());
@@ -242,6 +250,7 @@ impl Reconciler for SnapshotScheduleController {
                 Meta::new(snapshot_name, schedule.meta.placement.clone()),
                 SnapshotSpec {
                     pool: volume.spec.pool.clone(),
+                    schedule_uid: Some(owner.clone()),
                 },
                 SnapshotStatus::default(),
             );
@@ -256,7 +265,7 @@ impl Reconciler for SnapshotScheduleController {
             }
         }
 
-        for expired in backup::prune(schedule.spec.keep, &id, &seen) {
+        for expired in backup::prune(schedule.spec.keep, owner, &seen) {
             let Some(object) = mine.iter().find(|s| s.meta.name.to_string() == expired) else {
                 continue;
             };
@@ -396,8 +405,12 @@ mod tests {
         }
 
         async fn pass(&self) {
-            let s = self.schedules.get(SCHEDULE).await.unwrap().unwrap();
-            self.controller.reconcile(SCHEDULE, Some(&s)).await.unwrap();
+            self.pass_named(SCHEDULE).await;
+        }
+
+        async fn pass_named(&self, name: &str) {
+            let s = self.schedules.get(name).await.unwrap().unwrap();
+            self.controller.reconcile(name, Some(&s)).await.unwrap();
         }
 
         async fn ids(&self) -> Vec<String> {
@@ -426,6 +439,140 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn overlapping_names_have_independent_cadence_and_retention() {
+        let f = fixture(1).await;
+        let other_name = "projects/p1/snapshot-schedules/hourly-extra";
+        let mut other = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        other.meta = Meta::new(
+            ResourceName::parse(other_name).unwrap(),
+            other.meta.placement.clone(),
+        );
+        other.spec.keep = 2;
+        f.schedules
+            .create(&other, &Writer::controller("test"))
+            .await
+            .unwrap();
+        let original = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+
+        // A legacy/manual snapshot looks exactly like an old generated name.
+        let manual: Snapshot = Resource::new(
+            Meta::new(
+                ResourceName::parse(&format!("{VOLUME}/snapshots/hourly-extra-123")).unwrap(),
+                other.meta.placement.clone(),
+            ),
+            SnapshotSpec {
+                pool: "pools/fast".into(),
+                schedule_uid: None,
+            },
+            SnapshotStatus::default(),
+        );
+        f.snapshots
+            .create(&manual, &Writer::controller("test"))
+            .await
+            .unwrap();
+        f.finish(manual.meta.name.id()).await;
+        for hour in [0, 2, 4] {
+            f.after(hour);
+            // The longer prefix runs first and must not suppress the shorter.
+            f.pass_named(other_name).await;
+            f.pass().await;
+            for snapshot in f.snapshots.list().await.unwrap() {
+                if !snapshot.meta.is_deleting() && !snapshot.status.taken {
+                    f.finish(snapshot.meta.name.id()).await;
+                }
+            }
+            // Prune after the just-created snapshots have completed.
+            f.pass_named(other_name).await;
+            f.pass().await;
+        }
+        let snapshots = f.snapshots.list().await.unwrap();
+        let owned = |uid: &str| {
+            snapshots
+                .iter()
+                .filter(|s| !s.meta.is_deleting() && s.spec.schedule_uid.as_deref() == Some(uid))
+                .count()
+        };
+        assert_eq!(owned(&original.meta.uid), 1);
+        assert_eq!(owned(&other.meta.uid), 2);
+        let still_manual = f
+            .snapshots
+            .get(&manual.meta.name.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!still_manual.meta.is_deleting());
+        assert_eq!(still_manual.spec.schedule_uid, None);
+    }
+
+    #[tokio::test]
+    async fn recreating_a_schedule_does_not_adopt_its_predecessors_snapshots() {
+        let f = fixture(1).await;
+        f.pass().await;
+        let first = f.ids().await[0].clone();
+        f.finish(&first).await;
+        let old = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        f.schedules
+            .delete(SCHEDULE, old.meta.revision, &Writer::controller("test"))
+            .await
+            .unwrap();
+        let mut replacement = old.clone();
+        replacement.meta = Meta::new(old.meta.name.clone(), old.meta.placement.clone());
+        replacement.status = SnapshotScheduleStatus::default();
+        f.schedules
+            .create(&replacement, &Writer::controller("test"))
+            .await
+            .unwrap();
+        // Even in the same second this is a new owner and a different name.
+        f.pass().await;
+        assert_eq!(f.ids().await.len(), 2);
+        for hour in [2, 4] {
+            f.after(hour);
+            f.pass().await;
+            for snapshot in f.snapshots.list().await.unwrap() {
+                if !snapshot.meta.is_deleting() && !snapshot.status.taken {
+                    f.finish(snapshot.meta.name.id()).await;
+                }
+            }
+            f.pass().await;
+        }
+        let retained = f
+            .snapshots
+            .get(&format!("{VOLUME}/snapshots/{first}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!retained.meta.is_deleting());
+        assert_eq!(
+            retained.spec.schedule_uid.as_deref(),
+            Some(old.meta.uid.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_schedule_without_identity_neither_adopts_nor_creates() {
+        let f = fixture(1).await;
+        let mut schedule = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        f.schedules
+            .delete(
+                SCHEDULE,
+                schedule.meta.revision,
+                &Writer::controller("test"),
+            )
+            .await
+            .unwrap();
+        schedule.meta.uid.clear();
+        f.schedules
+            .create(&schedule, &Writer::controller("legacy-fixture"))
+            .await
+            .unwrap();
+        f.pass().await;
+        assert!(f.snapshots.list().await.unwrap().is_empty());
+        let reported = f.schedules.get(SCHEDULE).await.unwrap().unwrap();
+        assert_eq!(reported.status.conditions[0].reason, "OwnerMissing");
+        assert_eq!(reported.status.conditions[0].status, ConditionStatus::False);
     }
 
     #[tokio::test]
@@ -516,6 +663,7 @@ mod tests {
             ),
             SnapshotSpec {
                 pool: "pools/fast".into(),
+                schedule_uid: None,
             },
             SnapshotStatus {
                 taken: true,

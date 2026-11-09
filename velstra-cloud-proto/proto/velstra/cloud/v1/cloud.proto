@@ -1141,6 +1141,9 @@ message SnapshotSpec {
   // the volume; it is a field so that a pool agent's watch filter is one
   // comparison.
   string pool = 1;
+  // Output-only, immutable identity of the schedule that created the copy.
+  // Absent on manual and legacy snapshots; names do not establish ownership.
+  optional string schedule_uid = 2;
 }
 
 message SnapshotStatus {

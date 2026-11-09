@@ -41,6 +41,29 @@ use crate::{
     snapshot::SnapshotController, status::StatusWriter, volume::VolumeController,
 };
 
+const ALERT_SCAN_COMPLETE: &str = "alert_drift_scan_complete";
+
+/// Missing observations cannot establish recovery. Keep the previous complete
+/// notification state until every scanned collection can be observed again.
+fn complete_alert_scan<E: std::fmt::Display>(
+    scans: impl IntoIterator<Item = Result<Vec<drift::Divergent>, E>>,
+    metrics: &Metrics,
+) -> Option<Vec<drift::Divergent>> {
+    let mut complete = true;
+    let mut divergent = Vec::new();
+    for scan in scans {
+        match scan {
+            Ok(found) => divergent.extend(found),
+            Err(error) => {
+                complete = false;
+                error!(%error, "drift scan failed; retaining the previous complete alert state");
+            }
+        }
+    }
+    metrics.set(ALERT_SCAN_COMPLETE, &[], if complete { 1.0 } else { 0.0 });
+    complete.then_some(divergent)
+}
+
 /// The cell the controllers work for.
 pub struct Cell {
     pub store: Arc<dyn Store>,
@@ -523,13 +546,9 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
                             // And the cluster the volumes live on.
                             drift::scan("ceph-clusters", &scanned_ceph, &scan_metrics, now).await,
                         ];
-                        let mut divergent = Vec::new();
-                        for scan in scans {
-                            match scan {
-                                Ok(found) => divergent.extend(found),
-                                Err(error) => error!(%error, "drift scan failed"),
-                            }
-                        }
+                        let Some(divergent) = complete_alert_scan(scans, &scan_metrics) else {
+                            continue;
+                        };
                         let listed = tokio::try_join!(
                             scanned_nodes.list(),
                             pools.list(),
@@ -582,4 +601,62 @@ pub fn every_controller(cell: &Cell, loops: &Loops) -> Vec<(&'static str, Loop)>
         }),
     ));
     out
+}
+
+#[cfg(test)]
+mod alert_scan_tests {
+    use super::*;
+    use crate::alerts::{Alert, Config, Notifier};
+
+    #[tokio::test]
+    async fn failed_collection_scan_cannot_send_a_false_recovery() {
+        let metrics = Metrics::new();
+        let mut notifier = Notifier::new(
+            Config {
+                targets: Default::default(),
+                rules: Default::default(),
+            },
+            "cell",
+            metrics.clone(),
+        );
+        let alert = Alert {
+            rule: "stuck",
+            subject: "projects/p/attachments/a".into(),
+            message: "not reconciled".into(),
+        };
+        assert_eq!(
+            notifier
+                .observe(vec![alert.clone()], false)
+                .await
+                .fired
+                .len(),
+            1
+        );
+        let scans: [Result<Vec<drift::Divergent>, &str>; 3] = [
+            Ok(Vec::new()),
+            Err("attachment store read failed"),
+            Ok(Vec::new()),
+        ];
+        assert!(
+            complete_alert_scan(scans, &metrics).is_none(),
+            "incomplete observation must not reach notifier.observe"
+        );
+        assert_eq!(metrics.get(ALERT_SCAN_COMPLETE, &[]), Some(0.0));
+        // The old active observation remains active, not re-fired or resolved.
+        let unchanged = notifier.observe(vec![alert], false).await;
+        assert!(unchanged.fired.is_empty());
+        assert!(unchanged.resolved.is_empty());
+        let healthy: [Result<Vec<drift::Divergent>, &str>; 2] = [Ok(Vec::new()), Ok(Vec::new())];
+        assert!(complete_alert_scan(healthy, &metrics).is_some());
+        assert_eq!(metrics.get(ALERT_SCAN_COMPLETE, &[]), Some(1.0));
+        let recovery = notifier.observe(Vec::new(), false).await;
+        assert_eq!(recovery.resolved.len(), 1);
+        assert!(
+            notifier
+                .observe(Vec::new(), false)
+                .await
+                .resolved
+                .is_empty()
+        );
+    }
 }
