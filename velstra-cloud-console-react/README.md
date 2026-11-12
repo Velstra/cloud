@@ -1,32 +1,37 @@
-# React + TypeScript + Vite
+# Cloud console
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React/TypeScript frontend for the Cloud API. Requires Node.js 22.12+ and npm.
 
-Currently, two official plugins are available:
+From the Cloud repository root, start the disposable API fixture:
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```sh
+FAKE_PORT=18300 node velstra-cloud-console/tests/console/fake-api.mjs
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+In another terminal:
+
+```sh
+cd velstra-cloud-console-react
+npm ci
+npm run dev -- --host 127.0.0.1
+```
+
+Open [localhost:5180](http://localhost:5180). Fixture login: `operator`,
+password `a test operator passphrase`. This is synthetic data, not a real cell.
+
+To use a development cell instead, set `VELSTRA_API` to its API URL when
+starting Vite. The proxy accepts self-signed TLS for local development; do not
+expose it as a production gateway.
+
+## Check
+
+From this directory:
+
+```sh
+npm run lint
+npm run build
+npm run test:browser
+```
+
+Browser tests require Chromium/Chrome and create their own API fixtures.
+Set `CHROMIUM` if needed. [Full testing guide](../docs/testing.md).
