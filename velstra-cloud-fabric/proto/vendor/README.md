@@ -1,48 +1,17 @@
-# fabric's service contract, vendored
+# Vendored Fabric contract
 
-`velstra.proto` is a copy of `velstra-proto/proto/velstra.proto` from the
-**fabric** repository (github.com/Velstra/fabric). It is here because this agent
-is a *client* of fabric's orchestrator, and a gRPC client needs the schema, not
-the crate.
+[velstra.proto](velstra.proto) comes from
+[Velstra Fabric's protobuf crate](https://github.com/Velstra/fabric/tree/main/velstra-proto).
+It retains **MIT OR Apache-2.0**, not Cloud's AGPL license.
 
-## Its licence is not this repository's
+From the Cloud repository root, refresh from a reviewed sibling Fabric checkout:
 
-Everything else here is AGPL-3.0-or-later. This file is not: it comes from
-fabric's `velstra-proto`, which is **MIT OR Apache-2.0**, and vendoring a file
-does not relicense it.
+```sh
+cp ../fabric/velstra-proto/proto/velstra.proto velstra-cloud-fabric/proto/vendor/velstra.proto
+sha256sum velstra-cloud-fabric/proto/vendor/velstra.proto | cut -d ' ' -f 1 > velstra-cloud-fabric/proto/vendor/velstra.proto.sha256
+cargo test -p velstra-cloud-fabric --test fabric_proto --locked -- --nocapture
+```
 
-The distinction is deliberate on fabric's side rather than incidental — the wire
-contract is linked into both the GPL eBPF object and the AGPL control plane, so
-it has to be compatible with both, and it is meant to be reusable by anybody
-writing a client. See `LICENSING.md` in the fabric repository.
-
-Recorded here because a reader who found this file inside an AGPL repository
-would reasonably assume the repository's terms, and be wrong in the direction
-that makes them ask permission they do not need.
-
-## Why a copy rather than a dependency
-
-The two repositories are built and released independently — fabric is public and
-this one is not — so a path dependency works on one laptop and breaks both CIs,
-and a git dependency ties this repo's build to a revision of a repo it does not
-control. Vendoring the schema is what everyone else does with somebody else's
-gRPC contract, and it has one honest cost: the copy can fall behind.
-
-## The cost is checked, not hoped for
-
-`velstra.proto.sha256` records the digest of the file this copy was taken from.
-`tests/fabric_proto.rs` re-checks it, and — when the fabric repository happens to
-be checked out beside this one — compares the two files directly. It **skips**
-rather than fails when fabric is not there, because a test that goes red on a
-machine that simply does not have the other repo is a test people learn to
-ignore.
-
-When developing Cloud against an unmerged Fabric worktree, point the comparison
-at that worktree's source file with `VELSTRA_FABRIC_PROTO_SOURCE=/path/to/velstra.proto`.
-The digest check still runs independently; the override only chooses which
-Fabric checkout is compared.
-
-Refreshing it is one command and the digest below moves with it:
-
-    cp ../fabric/velstra-proto/proto/velstra.proto vendor/velstra.proto
-    sha256sum vendor/velstra.proto | cut -d' ' -f1 > vendor/velstra.proto.sha256
+The test always checks the recorded digest and also compares the upstream copy
+when available. `VELSTRA_FABRIC_PROTO_SOURCE` selects another reviewed source
+file; it does not disable the digest check.
