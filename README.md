@@ -34,6 +34,6 @@ The project is under development. Check the release and exercise the chosen hype
 
 ## Develop
 
-The Rust workspace separates the resource model and scheduling decisions (`velstra-cloud-model`), persistence (`velstra-cloud-store`), transport (`velstra-cloud-api`), controllers, node agents and console. [Design](DESIGN.md) · [Contribution and test instructions](CONTRIBUTING.md) · [Security reporting](SECURITY.md)
+The Rust workspace separates the resource model and scheduling decisions (`velstra-cloud-model`), persistence (`velstra-cloud-store`), transport (`velstra-cloud-api`), controllers, node agents and console. [Design](DESIGN.md) · [Contribution and test instructions](CONTRIBUTING.md) · [Testing](docs/testing.md) · [Console development](velstra-cloud-console-react/README.md) · [Security reporting](SECURITY.md)
 
 Velstra Cloud is [AGPL-3.0-or-later](LICENSE). The vendored Fabric protocol retains its [upstream terms](velstra-cloud-fabric/proto/vendor/README.md).
