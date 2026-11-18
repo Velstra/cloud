@@ -1,576 +1,84 @@
-# Setting up a cell
+# Set up a cell
 
-From nothing to a machine running guests, twice: once by hand through the
-console, once from a file with nobody watching. Both end at the same place —
-the same seed, the same units, the same objects — because they are the same two
-halves in a different order.
+A cell has one shared control-plane store. Compute nodes report what their hypervisors observe. Pool agents report the storage they manage. An object visible in the console is ready for work once its agent has reported.
 
-**Running this at home, on one machine?** Start at §0, which is the whole thing
-for a single box. A cell of one is a supported shape, not a cut-down one: the
-same roles, the same objects, all on the same host.
+## Bring the first node online
 
-## The two halves
+Follow [Installation](install.md) and sign in as an operator. Check these things before adding more hosts:
 
-Every machine in a cell is described in two places, and keeping them apart is
-what makes a registration token safe:
+| Check | Passing result |
+| --- | --- |
+| API and controller use the same region, cell and etcd endpoints | The controller observes resources created through the API |
+| The compute role is configured and its agent is running | Node shows its current capacity and heartbeat |
+| The pool object's ID matches its pool agent configuration | Pool reports backend health and capacity |
+| Networking mode and the subnet's gateway suit the deployment | A test guest receives metadata and can reach its intended gateway |
 
-| | Where it lives | Who writes it | Examples |
-|---|---|---|---|
-| **What runs here** | the machine's seed, `/var/lib/velstra/node.env` | the installer, or a file you wrote | `VELSTRA_ROLES=hypervisor,pool` |
-| **What the cell believes about it** | the Node object in the API | an operator, through the console | `gateway`, labels, `schedulable`, `cpuBaseline`, `vcpuOvercommit` |
-
-A machine cannot write the second. Its token exists so it can **report** —
-capacity, health, what it is running — and a token that could also declare its
-holder a gateway would be a token that grants itself the cell's external
-traffic.
-
-So the order is always: **the cell is told a machine is coming** (and hands out
-a token), then **the machine is told what it is** (and uses the token).
-
----
-
-## 0. One machine, all of it
-
-> **From the installer ISO** the same thing is door 1 — *the first machine of
-> a new cell*. It asks for the administrator, where the API listens, and
-> whether storage is a directory or Ceph on the machine's other disks; the
-> objects and their credentials are made at first boot. Every later machine is
-> door 2 with the join token from the console. See [`joining.md`](joining.md).
-
-**One command, if this box is the whole cell:**
-
-```
-sudo apt install etcd-server qemu-system-x86 qemu-utils
-sudo apt install ./velstra-cloud_*.deb
-sudo velstra-cloud-node quickstart
-```
-
-That writes the seed, brings up the control plane, creates the node and pool
-objects, moves the node's one-time token, and starts the agents. It is
-idempotent — run it again after a failure rather than reinstalling — and it
-refuses on NixOS, where the module below is the answer instead.
-
-Unattended, for config management:
-
-```
-VELSTRA_BOOTSTRAP_PASSWORD=… velstra-cloud-node quickstart \
-  --node home-1 --listen 0.0.0.0:8443
-```
-
-The password comes through the environment rather than a flag: an argument is
-in `ps` for every user on the machine, and this one is the cell's first
-administrator.
-
-The rest of this section is the same thing spelled out, for when you want to
-know what it did or do it differently.
-
-### The long way
-
-The smallest real installation is **one box that is every role**, and it is a
-supported shape rather than a degraded one. If that is what you want, this
-section is the whole guide; the rest is for when you add a second machine.
-
-On Debian:
-
-```
-sudo apt install ./velstra-cloud_*.deb
-sudo velstra-cloud-node setup
-```
-
-Answer `1 2 3` at the roles question — control plane, hypervisor and storage
-pool together. Then enable the four units it names, create the node and pool
-objects, and move the node's one-time token onto the machine. That last part is
-what `quickstart` above does for you.
-
-On NixOS, the same thing declared:
-
-```nix
-{
-  imports = with velstra.nixosModules; [ controlPlane node pool ];
-  velstra.cloud = {
-    controlPlane = {
-      enable = true;
-      package = velstra-cloud;
-      listen = "0.0.0.0:8443";
-      cell = "cell-1";
-      region = "eu-central";
-      cellAdmins = [ "ops" ];
-      tokenFile = "/etc/velstra/tokens";
-    };
-    node.enable = true;
-    pool = { enable = true; id = "local"; backend = "directory"; store = "127.0.0.1:2379"; };
-  };
-}
-```
-
-Then create the node and pool objects through the console (§2 and §4) with the
-ids this machine's seed uses, and it is a cell.
-
-**What one machine changes, honestly:**
-
-* **Nothing to spread across.** `spread` and `affinity` set to `Preferred` still
-  place — the guest runs beside its sibling rather than not at all. Set to
-  `Required` they are refused, and `:explainPlacement` names this node and the
-  rule. That refusal is the correct answer, not a bug.
-* **A backup on the same machine survives a lost pool, not a lost machine.** A
-  target on a second disk is worth having; a target on a NAS is worth more. The
-  platform refuses a target that is the volume's own pool and will not pretend
-  otherwise.
-* **Maintenance has nowhere to evacuate to.** You can still drain the node —
-  it is your machine — and `:explainMaintenance` says what it costs.
-* **No overlay needed.** Skip §5 entirely. Without a fabric, guests get real tap
-  devices and reach the network; what you do not get is tenant separation, which
-  is not what a household is asking for. A network carrying security groups is
-  then refused rather than silently unenforced.
-* **etcd is a single member.** Fine for one machine — it is the same disk either
-  way. It is not an HA story, and the platform does not claim one.
-
-`nix build .#checks.x86_64-linux.single-node` runs exactly this: all three roles
-on one 2 GiB machine, a volume provisioned locally, a guest placed, and both
-halves of the placement behaviour above.
-
----
-
-## 1. The control plane
-
-One machine first, because everything else needs an address to talk to.
-
-### NixOS
-
-```nix
-{
-  imports = [ velstra.nixosModules.controlPlane ];
-  velstra.cloud.controlPlane = {
-    enable = true;
-    package = velstra-cloud;
-    listen = "0.0.0.0:8443";
-    cell = "cell-1";
-    region = "eu-central";
-    cellAdmins = [ "ops" ];
-    tokenFile = "/etc/velstra/tokens";   # `<token> <subject>` per line
-  };
-}
-```
-
-A single-member etcd comes with it (`store.bundledEtcd`, on by default). For a
-cell that has its own, set `store.bundledEtcd = false;` and `store.endpoints`.
-
-### Debian
-
-```
-sudo apt install ./velstra-cloud_*.deb
-sudo velstra-cloud-node setup
-```
-
-Answer `1` at the roles question. The wizard writes the seed and names the two
-units to enable. Nothing started before that, on purpose: a unit is conditional
-on its role being in the seed, and a machine that has just been unpacked has no
-seed.
-
-Either way, open `http://<host>:8443/` and sign in as the administrator the
-wizard asked for. `http`, not `https`: the API serves plain HTTP and belongs
-behind something that terminates TLS — and it binds loopback unless the seed
-says otherwise, which is the question the wizard asks just before the password.
-
----
-
-## 2. Adding a machine — the short way
-
-**Nodes → New node.** Give it an id. The answer is a **join token**: one
-string, shown once, that carries everything the machine needs — cell, region,
-node id, where the API answers, its certificate, and the credential.
-
-On the new machine, one of:
-
-```
-sudo velstra-cloud-node setup --join velstra1.…        # a box that runs Debian
-```
-
-or boot the installer ISO and choose *a machine joining a cell* — it asks for
-the disk, the network, and the token, and nothing else.
-
-The token was minted *for* this node, so region, cell and id are facts, not
-questions. The certificate is inside it, so nothing is copied. The URL is one
-the certificate verifies for, so `https://<ip>:8443` works. If the token is
-lost, the node's page has *Join token*, which mints another; the one the
-machine holds keeps working until revoked. The design is in
-[`joining.md`](joining.md).
-
-Everything below is the same thing by hand, for a machine that cannot take a
-token — a seed written by configuration management, or a pool on its own.
-
-## 2a. Adding a machine — through the console
-
-**Nodes → New node.** Give it an id. That id is what everything else will refer
-to, and it cannot be changed afterwards.
-
-The response carries a **registration token, shown once**. The platform keeps a
-hash of it and cannot show it again. If it is lost, ask the machine for another
-one rather than deleting it:
-
-```
-POST /api/v1/nodes/<id>:issueCredential
-POST /api/v1/pools/<id>:issueCredential
-```
-
-The body is optional; `purpose` and `expiresAt` are accepted. Issuing is
-additive: the credential the machine already holds keeps working until it is
-revoked, so a mistyped token does not take the agent down while it is being
-fixed. `GET .../credentials` lists what a machine holds and
-`DELETE .../credentials/<id>` takes one out of use.
-
-This page used to say to delete the node and add it back. That costs the
-object's labels, its taints and its schedulability, and there has been no
-reason to pay it since `:issueCredential` existed.
-
-**A machine that holds volumes needs two tokens.** A pool is a separate agent
-with a separate identity — it speaks as `pool:<id>` where the node agent speaks
-as `node:<id>` — so create the pool object as well and keep both tokens. One
-presented for the other is answered `401 the bearer token was not accepted`,
-on every pass, for ever.
-
-On the machine:
-
-```
-sudo VELSTRA_TOKEN=<the node's token> \
-     VELSTRA_POOL_TOKEN=<the pool's token> \
-     velstra-cloud-node setup
-```
-
-The answers: roles (`hypervisor`, or `hypervisor pool` if it also holds
-volumes — the numbers from the list work too), the control-plane URL, where the
-cell's certificate is, and, for a pool, its id and backend. Either token can be
-typed at its prompt instead; they are 64 hex characters each, which is why the
-environment is offered.
-
-**The region, the cell and the node id are not questions.** The wizard presents
-the token to the control plane, which answers which node it was issued for and
-which cell this is, and says so:
-
-```
-The cell answered: this token is node hv-2 in cell cell-1, region eu-central.
-```
-
-A typo there used to be a machine that came up, registered nowhere and was
-found weeks later; now there is nothing to mistype. If the cell cannot be
-reached — not up yet, air-gapped — it says why and asks the three questions
-instead.
-
-**Use a name the certificate carries.** A cell's own certificate names its
-hostname, `localhost` and `127.0.0.1`, so `https://<the IP>:8443` fails
-verification. The wizard tries the URL while you are still looking at it and
-says exactly that, rather than leaving it for an agent to discover later.
-
-The certificate itself is `/var/lib/velstra/tls/cert.pem` on the control plane.
-Copy it across — it is a certificate, not a secret — and the wizard writes its
-path into the seed as `VELSTRA_API_CA`, which is what the agents verify
-against. Without it they refuse an `https` cell outright.
-
-Then enable what it names. Within a pass the node appears on the board with its
-capacity — that first status report *is* the registration working.
-
-### Then give it its role in the cell
-
-Open the node and edit:
-
-* **Accepts work** — a machine can be registered and drained from the first
-  moment.
-* **Carries external traffic** — this is the "gateway" role, and the reason it
-  is here rather than in the installer.
-* **vCPUs per core** — sharing a processor is a trade somebody makes on
-  purpose.
-* **CPU baseline** — what this machine presents to guests, refused if it cannot
-  reach it.
-* **Labels** — what `placementPolicy.requiredLabels` matches.
-
----
-
-## 3. Adding a machine — from a file
-
-The same, with nobody watching. Create the node through the API and keep the
-token:
-
-```
-token=$(curl -fsS -X POST -H "Authorization: Bearer $OPS" \
-  -H 'Content-Type: application/json' \
-  -d '{"id": "node-a", "spec": {"schedulable": true}}' \
-  https://cell-1:8443/api/v1/nodes | jq -r .nodeToken)
-```
-
-Write the machine's answers — **the file is a seed**, the same `KEY=value` lines
-the wizard writes, so one taken off a working machine installs the next with two
-lines changed:
+With the CLI configured for your cell:
 
 ```sh
-cat > /var/lib/velstra/setup.env <<'EOF'
-# the Frankfurt cell, hypervisor + local storage
-VELSTRA_REGION=eu-central
-VELSTRA_CELL=cell-1
-VELSTRA_ROLES=hypervisor,pool
-VELSTRA_API_URL=https://cell-1:8443
-VELSTRA_NODE=node-a
-VELSTRA_VMM=qemu
-VELSTRA_POOL=nvme
-VELSTRA_POOL_BACKEND=directory
-EOF
-
-VELSTRA_TOKEN="$token" velstra-cloud-node setup --config /var/lib/velstra/setup.env
-systemctl enable --now velstra-cloud-nodeagent velstra-cloud-poolagent
+velstra get nodes
+velstra get pools
+velstra get projects
 ```
 
-The token comes through the environment rather than the file: a file with a
-secret in it is a file somebody copies.
+## Add a compute node and storage
 
-A missing answer is an **error naming the key**, never a default — an unattended
-install that guessed a cell name would produce a machine that comes up,
-registers nowhere, and is found weeks later.
+Use [Join a node](joining.md) for registration. A remote compute agent uses its own node credential. An independently authenticated pool agent needs the credential for its pool.
 
-Only what the named roles need is required. A pool file that had to carry a node
-id would be a file with a value nobody reads.
+| Pool type | What to set | What to check |
+| --- | --- | --- |
+| Directory | Absolute directory and owning node | The agent can allocate a test volume on that host |
+| LVM | Volume group, optional thin pool, owning node | The agent reports available capacity |
+| Ceph | Velstra pool ID, RBD pool and image pool, keyring and cluster config | The separate Ceph pool agent reports a healthy backend |
 
-One optional key is worth knowing here, because the usual recipe for it does not
-work on a sealed machine: `VELSTRA_PASSTHROUGH=10de:2204,10de:1aef` names the
-cards this machine holds back for its guests, as `vendor:device` pairs or PCI
-addresses. `velstra-cloud-passthrough` binds each one — and everything else in
-its IOMMU group, which is the unit whether you asked for it or not — to
-`vfio-pci` before the node agent starts. The pair is the spelling to prefer: an
-address is a fact about one slot in one box, and this file is meant to install
-the next machine too. `lspci -Dnn` on the machine prints both spellings on one
-line. Adding this to an installed machine is the same two steps — the line, then
-`systemctl restart velstra-cloud-nodeagent` — and removing it again is deleting
-the line, which is why it is not one of the installer's questions.
+The Velstra pool identifier used by `spec.pool` can differ from the RBD pool name. A remote guest using shared storage needs access to the same bytes on the destination host. [Storage operations](operations.md#ceph-pools-for-the-cell)
 
-### On NixOS
+## Connect tenant networking
 
-The seed is the same; the units are a declaration rather than something a wizard
-enables. `setup` prints the module snippet for the answers it was given:
+For a small single-host evaluation, the local gateway option connects its guests to the host. For tenant networks spanning hosts, configure Fabric.
 
-```nix
-{
-  velstra.cloud = {
-    node.enable = true;
-    pool = { enable = true; id = "nvme"; backend = "directory"; cell = "cell-1"; };
-  };
-}
-```
+| Setting | Consumer | Purpose |
+| --- | --- | --- |
+| `VELSTRA_FABRIC` | Orchestrator client | Create and reconcile networks, ports and routes |
+| `VELSTRA_FABRIC_CONTROL` | Fabric agent | Receive configuration for this host |
 
----
+Use the endpoint and TLS identity that belong to each service. Swapping endpoints can yield an `unimplemented` response even when both are reachable. Verify registration in Fabric and connectivity between disposable tenant endpoints that should be able to communicate. [Fabric documentation](https://velstra.github.io/fabric/)
 
-## 4. Storage
+## Multiple cells or control-plane replicas
 
-### Ceph, added afterwards
+A second cell has its own store and placement domain. Configure the API's cell routing for access to multiple cells from a common entry point. Several replicas of one cell instead share its store and durable release files. [Replication and recovery](operations.md#replicated-control-planes-and-release-storage)
 
-A cell does not have to be born with Ceph. Create the cluster from the console
-whenever — **Storage → Ceph clusters → New** — name the monitors and pick the
-OSD disks from what the nodes report (a USB stick is refused as unsuitable
-until you say *even if unsuitable* for it; that is a lab's answer, spelled out
-per disk). The deployment blocks by name until `cephadm` is on the named
-nodes; the appliance image carries it, and a Debian node gets it with
-`apt install cephadm`.
+[CLI](cli.md) · [Deployment models and PCI](deployment-and-devices.md)
 
-Keep the cluster image and host-side `ceph-common`/`librbd` clients compatible.
-A floating cephadm image tag can introduce an authentication format the host
-packages cannot read (for example, Squid 19.2.6 with 19.2.3 clients). Pin the
-cluster image and provision compatible clients; never downgrade authentication
-to work around this. A matching `cephadm shell` CLI can manage the cluster, but
-it does not upgrade the native RBD library QEMU uses. Validate both before
-placing workloads on a new cluster. The node agent uses `qemu-img` from the
-VM binary's package to check the exact volume before boot, hot-plug or
-migration reception.
-An incompatible client now leaves the operation with a specific storage
-error, and reconciliation retries after the host client is corrected; it does
-not silently substitute the container client for QEMU's native library.
+## Wire Fabric to a real host
 
-Nothing is copied onto the hypervisors. Once a monitor is up, the cell
-publishes the client configuration — a minimal `ceph.conf` and a
-`client.velstra` keyring with read/write on the platform's pools — on the
-cluster's status, and every node agent writes both to
-`/var/lib/velstra/ceph/` and opens volumes with them. A hypervisor installed a
-month before the cluster existed needs nothing done to it. Only `qemu` can
-open an RBD image; a machine that joined with a token is `qemu` already.
+Example values for a host with a routable VTEP at `192.0.2.27` and a verified underlay interface. Replace every address and interface with inventory values before applying.
 
-The rest of this section is storage as it was: pools declared per machine.
-
-
-A pool is not a machine — several nodes reach one Ceph pool, one node may export
-three volume groups — so it is its own role and its own module.
-
-Same two halves as a node, same order: **Pools → New pool** in the console (or a
-`POST` to `/api/v1/pools`), choose its reach and backend, then give the machine
-the `pool` role with that id in its seed. Ceph names an RBD pool; Directory names
-an absolute path; LVM names a volume group and, optionally, its thin pool. Local
-Directory and LVM pools must name the one machine that holds their bytes.
-
-The id has to match. Every volume is written against it, and a mismatch is a
-pool that claims nothing and volumes that are never provisioned — quietly.
-Creating the object before writing the seed is what stops that, which is why it
-is worth the extra step rather than letting an agent invent one.
-
-A pool receives its own token once when it is created. The console keeps that
-token on screen with the matching environment for the selected backend; write
-it to the configured token file before starting the agent. The API stores only
-its digest, so a lost token must be minted again from the pool's page.
-
----
-
-## 5. The data plane
-
-Everything so far decides what *should* be true — which guest is on which
-network, which rules apply to its port. The fabric is what makes it true on the
-wire, and it is the one part of a cell that can be missing without anything
-looking wrong: guests boot, addresses are handed out, every dashboard is green,
-and tenant networks separate no traffic.
-
-So it is asked for explicitly and never guessed.
-
-**Two addresses, and they are different services.** The fabric controller
-serves them on different ports for different audiences:
-
-| | Seed key | Who talks to it | Asked to |
-|---|---|---|---|
-| Orchestrator | `VELSTRA_FABRIC` | control plane, node agent | create a port, a network, a route |
-| Config service | `VELSTRA_FABRIC_CONTROL` | the eBPF agent on each node | say what this host should be running |
-
-Pointing either at the other's port gets `unimplemented`, which is a confusing
-way to learn this. Fabric binds the orchestrator to **localhost** by default.
-Its TLS settings protect both channels; with a client CA, orchestrator writes
-are authorized by client-certificate identity. Configure these before exposing
-the orchestrator beyond loopback.
-
-On the control plane:
-
-```nix
-velstra.cloud.controlPlane.fabric = "http://fabric.cell-1:50052";
-```
-
-On a hypervisor, the seed carries both, plus this host's own place on the wire:
-
-```sh
-VELSTRA_FABRIC=http://fabric.cell-1:50052
-VELSTRA_FABRIC_CONTROL=http://fabric.cell-1:50051
-VELSTRA_FABRIC_VTEP=10.0.0.7          # what other hosts send frames to
-VELSTRA_FABRIC_UNDERLAY=eth1          # the interface that address is on
-VELSTRA_FABRIC_SRV6_LOCATOR=fc00:0:1::/64   # optional; empty stays VXLAN
-```
-
-For a Fabric controller cluster, supply every controller endpoint as a
-comma-separated list in both `VELSTRA_FABRIC` and
-`VELSTRA_FABRIC_CONTROL` (and in `velstra.cloud.controlPlane.fabric`). Use the
-orchestrator port for the former and the config-service port for the latter.
-Cloud discovers the current write leader from the orchestrator list on each
-reconciliation; the Fabric data-plane agent watches any reachable config
-service. All endpoints in a list must use the same HTTP or HTTPS scheme, and
-HTTPS requires the configured CA and client identity. A single endpoint remains
-valid for a standalone Fabric controller.
-
-The Fabric agent attaches to `VELSTRA_FABRIC_UNDERLAY` as well as tenant taps.
-Without the underlay attachment, remote hosts cannot decapsulate incoming
-traffic even when their ports report as programmed.
-
-For a TLS-protected orchestrator, use `https://` and deliver trust material to
-each Cloud controller/node-agent service through its environment:
-
-```sh
-VELSTRA_FABRIC=https://fabric.cell-1:50052
+```ini
+VELSTRA_FABRIC=https://fabric.example.net:50052
+VELSTRA_FABRIC_CONTROL=https://fabric.example.net:50051
+VELSTRA_FABRIC_VTEP=192.0.2.27
+VELSTRA_FABRIC_UNDERLAY=ens5
 VELSTRA_FABRIC_CA=/etc/velstra/fabric/ca.pem
-VELSTRA_FABRIC_CERT=/etc/velstra/fabric/client.pem
-VELSTRA_FABRIC_KEY=/etc/velstra/fabric/client.key
-```
-
-The certificate and private key must be supplied together; the identity needs
-a CA, and credentials on an `http://` endpoint are rejected. Keys should be
-readable only by the service account. The Fabric data-plane agent has its own
-TLS configuration; these variables configure the Cloud orchestrator client.
-Authentication does not grant authorization: the controller's `--admin-cn`
-policy must permit the operations that each identity performs. In particular,
-Cloud's port programming currently creates security groups, an admin-only
-Fabric operation; a host-scoped identity alone cannot complete that workflow.
-
-The Fabric data-plane agent connects to the separate config service. Give it
-its own certificate with a node-scoped CN matching `VELSTRA_NODE`, not the
-Cloud orchestrator's admin identity. On a Debian or NixOS node, add these to
-the node environment when `VELSTRA_FABRIC_CONTROL` uses HTTPS:
-
-```sh
+VELSTRA_FABRIC_CERT=/etc/velstra/fabric/orchestrator.pem
+VELSTRA_FABRIC_KEY=/etc/velstra/fabric/orchestrator.key
 VELSTRA_FABRIC_AGENT_CA=/etc/velstra/fabric/ca.pem
 VELSTRA_FABRIC_AGENT_CERT=/etc/velstra/fabric/node.pem
 VELSTRA_FABRIC_AGENT_KEY=/etc/velstra/fabric/node.key
 ```
 
-The unit rejects an HTTPS endpoint missing any of these values, and refuses to
-send client credentials to an HTTP endpoint. Keep the private key readable only
-by the Fabric service. On Debian, install the Fabric data-plane executable as
-`/usr/local/libexec/velstra-fabric-agent`, or set
-`VELSTRA_FABRIC_AGENT_BINARY` in the node environment to another absolute path.
-The Cloud package already installs its own CLI as `/usr/bin/velstra`; that name
-must not be used to discover the Fabric executable. NixOS uses the explicit
-`velstra.cloud.node.fabricAgent` package path.
+The Cloud orchestrator identity needs authorization for the resources it programs, including security groups. Give the dataplane agent its own node-scoped identity matching `VELSTRA_NODE`. Its underlay attachment handles traffic arriving from remote hosts. A controller cluster accepts comma-separated endpoints of the same scheme in each service list. For SRv6, each host needs its own routable locator (`VELSTRA_FABRIC_SRV6_LOCATOR`).
 
-The VTEP address is stated rather than derived: nothing on a machine can tell
-which of its addresses its peers route to, and picking one would pick wrong on
-every host with more than one interface. The locator is the same argument one
-step further — it is a slice of your own IPv6 plan, has to be routable in the
-underlay and unique per host, and nothing local knows any of that.
+On Debian, point `VELSTRA_FABRIC_AGENT_BINARY` at the actual Fabric executable, or install it at `/usr/local/libexec/velstra-fabric-agent`. Cloud installs its own CLI as `/usr/bin/velstra`. A host running only local gateway networking needs a route from the LAN to the guest subnet for direct inbound reachability.
 
-Naming a fabric and leaving out this host's place on it is **an error**, not a
-default. That combination is the failure that looks most like success.
+## Route requests across cells
 
-On NixOS the unit comes with the node module once you give it the agent:
-
-```nix
-velstra.cloud.node.fabricAgent = pkgs.velstra;   # the fabric agent
-```
-
-On Debian install the Fabric executable at the explicit path above, then
-`systemctl enable --now velstra-fabric-agent`. Either way the unit skips itself
-on a machine whose seed names no fabric, and says so in the journal rather than
-turning red.
-
----
-
-## 6. More than one cell
-
-A cell is the failure and scaling domain: **a machine belongs to exactly one**,
-and growing means adding cells rather than making one bigger. Objects carry
-their region and cell from creation and neither can be changed afterwards.
-
-Working across them is several control planes, with one (or each) told where the
-others are:
+For a NixOS control plane, add peer API endpoints under the cell names used in project placement:
 
 ```nix
 velstra.cloud.controlPlane.cells = {
-  "cell-2" = "https://cell-2.example:8443";
+  "cell-2" = "https://cell-2.example.net:8443";
 };
 ```
 
-A client then reaches one address and the request lands in the cell holding the
-resource. Which cell owns what is read from the **projects**, not from that map
-— the map only says where each cell is. A project this installation has not
-heard of yet is answered locally rather than refused: a router a few seconds
-behind must not turn propagation delay into an error a tenant sees.
-
----
-
-## 7. What to check when it does not work
-
-| Symptom | Ask |
-|---|---|
-| the node never appears | `journalctl -u velstra-cloud-nodeagent`; is the token file 0600 and the id the same on both sides? |
-| a unit says "skipped" | that is a role that is not in the seed — `cat /var/lib/velstra/node.env` |
-| a guest will not place | `…/instances/i1:explainPlacement` |
-| a public address answers nothing | `…/floatingips/web:explainReach` |
-| a machine is out of service and nobody said so | `nodes/node-b:explainMaintenance` |
-| a tenant cannot start anything | `projects/p1:explainQuota` |
-
-Every one of those is a plain `GET` that changes nothing, and every one answers
-in the operator's own words rather than "no valid host".
-
----
-
-## What this guide does not cover
-
-* **The sealed appliance.** `docs/install.md` — a machine you flash and forget,
-  with A/B slots and verity. The wizard there also partitions.
-* **Day two.** `docs/operating.md` — maintenance windows, recovery, overcommit,
-  placement groups, which copy survives which loss.
-* **The API itself.** `docs/rest-contract.md`.
+Every node belongs to one cell. A single host cannot drain a guest to another node in that cell. Place backup targets on an independent machine or storage system when protection against host loss matters.

@@ -1,391 +1,73 @@
-# Installing Velstra Cloud
+# Install Velstra Cloud
 
-> Looking for "how do I get a cell running"? That is `docs/setup-guide.md` —
-> control plane, then a machine, through the console or from a file. This
-> document is the packaging underneath it: what each artefact is and what it
-> imposes on its host.
+Choose the installation that matches the machine you have. Use the [development cell](quickstart.md) for evaluation without guest hardware.
 
-Written 2026-08-24, implementing `deployment-and-devices.md`. Two deployment
-problems, deliberately kept apart: the **control plane** is Rust binaries plus
-an etcd and imposes nothing on its host; a **compute node** owns a kernel, KVM,
-and (soon) an IOMMU, so it ships as a sealed appliance. Everything below comes
-out of `flake.nix`.
+| Target | Install | Persistent state |
+| --- | --- | --- |
+| Debian 13 / amd64 host | Cloud Debian package | Host files and etcd |
+| Dedicated x86-64 node | Velstra installer ISO and sealed image | Data partition and cell store |
+| Existing NixOS deployment | Control-plane, node and pool modules | As declared in the modules |
+| Containerized control plane | API and controller OCI images | Shared etcd and release storage |
 
-## The compute-node image
+## Boot real guests on Debian
 
-Every release publishes both media, with a `SHA256SUMS` beside them:
+Use a dedicated Debian 13 host with hardware virtualization enabled and a matching package from the [release](https://github.com/Velstra/cloud/releases). Install QEMU **before** the quickstart so the wizard can select it. Run the following from the directory containing the downloaded package:
 
-```
-velstra-cloud-installer_<version>_amd64.iso    # boot this to install
-velstra-cloud-node_<version>_amd64.raw.zst     # the sealed image itself
-velstra-cloud_<version>_amd64.deb              # for a machine that runs Debian
+```sh
+sudo apt install etcd-server qemu-system-x86 qemu-utils
+sudo apt install ./velstra-cloud_*.deb
+sudo velstra-cloud-node quickstart
 ```
 
-**Check the file before you boot it.** `sha256sum -c SHA256SUMS` is the whole
-gesture, and it is the same one the appliance's own story rests on — a medium
-written to a stick is verified before it is booted, or it is not verified at
-all.
+The wizard provisions a single cell, creates its node and local pool, and starts its units. Record the console URL it prints and sign in with the administrator you created. The URL scheme depends on the TLS configuration. The development launcher's plain HTTP URL belongs only to that local example.
 
-Or build them, which is the same artefact by the same recipe:
-
-```
-nix build .#node-image     # → result/…/velstra-cloud-node.raw (signed, sealed)
-nix build .#node-iso       # → result/iso/velstra-cloud-node-installer.iso
+```sh
+systemctl is-active velstra-cloud-api velstra-cloud-controller
+systemctl status velstra-cloud-nodeagent --no-pager
 ```
 
-The nightly CI lane builds both, so a stale input or a renamed output is found
-on a Tuesday rather than while somebody is cutting a release.
+In **Nodes**, verify that the host reports capacity. In **Pools**, verify that the pool reports its backend before creating a volume. For provisioning only the seed, run `velstra-cloud-node setup`; that command leaves startup to the operator.
 
-The image is built by the same factory as the Velstra Sentinel firewall
-appliance (the Sentinel flake exports it as `nixosModules.applianceImage` /
-`applianceIso`; this flake consumes it as an input): a dm-verity-protected
-store whose root hash is sealed into a signed Unified Kernel Image, a volatile
-tmpfs root, **two A/B store slots** with systemd-boot boot counting — a bad
-update gets three boot attempts and then the machine is back on the previous
-slot — and one writable partition, mounted at `/var/lib/velstra`, optionally
-LUKS2-encrypted. Secure Boot ships with generated demo PK/KEK/db keys under
-`/loader/keys/velstra-node/`; a real fleet enrolls its own.
+## Install the sealed appliance
 
-On the image: **all three roles**, and the seed decides which of them runs.
-The node agent with **QEMU and Cloud Hypervisor**, the pool agent, the API and
-the controllers with a bundled etcd, the Velstra fabric agent binary, and a
-kernel booted with `intel_iommu=on amd_iommu=on iommu=pt` — the passthrough
-phase of `deployment-and-devices.md` needs the IOMMU on from the first install,
-because a node that must reboot to *see* its devices cannot report them.
+1. Check the [release assets](https://github.com/Velstra/cloud/releases) for an installer ISO and its checksums. If the release includes only a Debian package, build the ISO from the Cloud revision you intend to deploy using the commands below. For downloaded media, verify the checksum from your trusted release source.
+2. Boot the ISO on the target. Identify the target disk by model and capacity. Installing the image overwrites the selected disk.
+3. Select **Start a cell** for the first node, or [join an existing cell](joining.md). Keep the registration material private.
+4. After boot, verify that the node appears under the expected name and reports capacity.
 
-Every unit is gated by its own `ExecCondition` on `velstra-cloud-node has-role`,
-so a box installed as a hypervisor shows the other two as **skipped** — which
-systemd distinguishes from failed, and which is the difference between "this box
-is not a pool" and "the pool agent is broken". etcd carries the same gate: an
-etcd on every appliance would be a second, empty store on every machine,
-listening on exactly the address the API looks for, so a control plane that lost
-its seed would come up against a store that answers and holds nothing. Its data
-lives under the data partition, at `/var/lib/velstra/etcd` — the one place on
-this image a reboot does not empty. (etcd's own default is `/var/lib/etcd`,
-which here is the volatile root: a cell kept there lasted exactly until its
-control plane was first rebooted.)
+To build the media from source:
 
-The image has to carry what it cannot fetch. An appliance is built once for a
-fleet and installed onto boxes weeks later, and which of them turns out to be
-the control plane is answered at a console by whoever is standing there. Until
-this was so, a cell built from this image still needed a separately-managed
-Debian machine to be its own control plane and to own its storage.
-
-QEMU here is built with the RBD block driver, which nixpkgs leaves off
-(`cephSupport ? false`). Without it a guest whose disk is a Ceph volume cannot
-start at all — QEMU answers `Unknown driver 'rbd'` — and the node reports a
-guest that will not boot with no indication that the cause is which QEMU was
-built. Cloud Hypervisor has no equivalent: it takes a path and nothing else, so
-an `rbd:` disk is refused there by name.
-
-## Installing a node, start to finish
-
-1. In the console (or `POST /api/v1/nodes`), create the node. The response
-   carries `nodeToken` — a one-time credential, shown exactly once, that lets
-   this node read its cell and write only its own status.
-2. Boot the installer ISO. It drops straight into the wizard
-   (`velstra-cloud-node install`): what it is about to do and to which disk or
-   RAID set, then **who may log in** (an SSH key, a console password, or
-   neither, which is the sealed default), then optional LUKS2 encryption of the
-   data partition, the hostname, DHCP or a static uplink, and finally **what
-   this machine is for**: the first machine of a new cell, a machine joining one
-   with a join token, a machine that **asks the cell to let it in** — you type
-   only the cell's address, compare a fingerprint, and approve it in the
-   console — or the questions one by one. [`joining.md`](joining.md) has the
-   four doors, the token and what the fingerprints are for.
-
-   Passing a card into guests is deliberately **not** asked here: it is a
-   decision about what the machine will run, which nobody has made yet while
-   standing in front of a disk that is about to be erased, and it is one line
-   in the seed afterwards — see [`setup-guide.md`](setup-guide.md).
-
-   Behind the third door, roles are a set, not a choice, and the rest of the
-   questions follow the answer. A control plane is asked what its API binds
-   rather than where the control plane is: it *is* the API, and a URL pointing
-   at itself would be a fact with two owners. A pool is asked for its id, its
-   backend and its **own** one-time token — a second credential, because the API
-   authenticates a pool agent as `pool:<id>` and a node agent as `node:<id>`, and
-   a node token presented by a pool agent is answered `401` for ever with the
-   seed looking complete. A pool on the control plane's own machine gets no token
-   at all: its agent reaches the store directly.
-3. The wizard clones the sealed image onto the disk(s) and seeds the data
-   partition (`node.env`, `node-token`, optional `network/`). Nothing needs to
-   be reachable during the install; the wizard records.
-4. First boot: the seed applies (hostname, network), the agent starts with
-   `--api <url> --api-token-file …`, and the node appears in the console
-   reporting its capacity. That is the whole onboarding.
-
-A flashed-but-unseeded node parks instead of crash-looping: the agent unit's
-condition names the missing file, `systemctl status velstra-cloud-nodeagent`
-shows it.
-
-Updates are A/B: `velstra-cloud-node update --image <new.raw>` writes the
-inactive slot, re-types it, points systemd-boot at it with three tries, and a
-clean boot blesses it. The **signed update channel** (manifest + Ed25519 +
-subscription key, as Sentinel ships) is a documented seam in
-`velstra-cloud-node/src/update.rs` — the slot writer refuses nothing it will
-later need for it.
-
-## The control plane, two shapes
-
-**OCI images**, for the customer who already runs a scheduler:
-
-```
-nix build .#api-image && docker load < result
-nix build .#controller-image && docker load < result
+```sh
+nix build .#node-iso --out-link result-iso
+nix build .#node-image --out-link result-image
 ```
 
-`velstra-cloud-api:<version>` listens on 8443 (REST + gRPC + console, one
-port); `velstra-cloud-controller:<version>` serves Prometheus metrics on 9310.
-Both take their store as `--store <etcd endpoints>` / `VELSTRA_STORE`. Neither
-terminates TLS — put them behind the ingress the cluster already trusts.
+## Use an existing control plane
 
-**A systemd module**, for the customer with one machine:
+Import the NixOS modules from the same Cloud revision as your package, or load the two OCI images:
 
-```nix
-{
-  imports = [ velstra-cloud.nixosModules.controlPlane ];
-  velstra.cloud.controlPlane = {
-    enable = true;
-    package = velstra-cloud.packages.x86_64-linux.velstra-cloud;
-    listen = "0.0.0.0:8443";
-    # A PEM pair. `quickstart` makes a self-signed one; any real certificate
-    # goes in the same place. Without both, this port is plaintext and the API
-    # says so in its log at startup.
-    tlsCert = "/var/lib/velstra/tls/cert.pem";
-    tlsKey = "/var/lib/velstra/tls/key.pem";
-    bootstrapAdmin = {
-      username = "admin";
-      passwordFile = "/run/keys/velstra-admin-password";
-    };
-  };
-}
+```sh
+nix build .#api-image --out-link result-api
+nix build .#controller-image --out-link result-controller
+docker load < result-api
+docker load < result-controller
 ```
 
-etcd is **bundled by default** (`store.bundledEtcd`), single-member, loopback —
-the single-cell case from the design doc. A cell with its own etcd disables it
-and sets `store.endpoints`. There is deliberately no in-memory option here: two
-processes with two memory stores are two empty universes, which is exactly the
-failure `velstra-cloud-dev` exists to prevent — and that one-process cell is
-what `nix run .#dev` starts.
+Configure both services against the same etcd cell. Supply API TLS credentials or terminate TLS at your ingress. The single-member bundled etcd setup has no quorum redundancy. See [Set up a cell](setup-guide.md) and [replicated control planes](operations.md#replicated-control-planes-and-release-storage).
 
-The node side has its own module, `nixosModules.node`, used by the image and
-usable on any NixOS host: agent unit gated on the seed, both hypervisors on
-PATH, the metadata dummy interface (the agent's 169.254.169.254:80 bind is
-fatal by design), unlock unit for encrypted installs.
+## Add a guest
 
-## Which machine is which: roles
+Register a cloud image using its publisher’s digest, create a project network and subnet, and create an instance with its image, size, port and SSH key. Compare the requested and observed states in the console. If the instance is running but unreachable, verify the guest port and the cell’s networking mode before retrying installation.
 
-Two questions that look like one, and conflating them is how a platform ends up
-letting a machine promote itself:
+![Create an instance in the console](images/new-instance.png)
 
-* **What runs here** — the units this box starts. The machine's own business,
-  decided at setup, written into its seed:
-  `VELSTRA_ROLES=control-plane,hypervisor,pool`.
-* **What the cell believes about it** — that it carries external traffic
-  (`node.spec.gateway`), its labels, whether it is schedulable. Those live on
-  the Node object and are an operator's to write.
+## Boot, encryption and service defaults
 
-`gateway` is deliberately **not** a setup role. A registration token exists so a
-machine can *report*; one that could also declare its holder a gateway would be
-a token that grants itself the cell's external traffic.
-
-Roles are a set, not a choice: the smallest real cell is one box that is all of
-them. Every unit is conditional on its own role being named in the seed
-(`ExecCondition`), so a machine that has the package and no seed runs nothing —
-and systemd shows those units as *skipped*, not failed, which is the difference
-between "this box is not a pool" and "the pool agent is broken".
-
-```
-sudo velstra-cloud-node setup
-```
-
-asks region, cell, roles, and the role-specific answers (node id + token,
-pool id + backend, store endpoints + other cells), writes the seed, and then
-either names the units to enable (Debian) or prints the NixOS module snippet
-(NixOS — units there are a declaration, and a wizard reaching into them would be
-fighting the operating system).
-
-`velstra-cloud-node install` asks the same questions for a machine that is being
-flashed, and **writes the seed with the same renderer**. There used to be two of
-those, and only one of them knew about `VELSTRA_ROLES`: the installer wrote six
-keys and this wizard twenty-eight. An absent `VELSTRA_ROLES` reads as
-`[hypervisor]` — correctly, for a seed written before roles existed — so every
-flashed machine was a hypervisor whatever it had been installed to be, and
-nothing was going to notice: both renderers had tests, both passed, and each was
-right about the keys it knew.
-
-**One seed, three systems.** The appliance, Debian and NixOS all read the same
-file, written by one renderer and read through one `EnvironmentFile`. No unit
-assembles a command line out of it: every agent's own arguments carry `env =`
-fallbacks, so a unit that built the arguments itself would be a second place for
-these keys to be spelled — and the last time two places spelled one of them
-differently, it cost a Ceph volume that could be created and not opened. The appliance decides the path: its `/etc` is on a
-read-only verity store and its writable partition mounts at `/var/lib/velstra`.
-
-## Debian
-
-```
-nix build .#deb        # → result: velstra-cloud_<version>_amd64.deb
-sudo apt install ./velstra-cloud_*.deb   # not `dpkg -i`: that resolves nothing
-sudo velstra-cloud-node setup
-```
-
-The package installs five binaries and five units and **enables none of them**;
-`postinst` says so and points at the two ways in:
-
-* `velstra-cloud-node quickstart` — one box that is the whole cell. Seed, units,
-  node and pool objects, the one-time token, agents. Idempotent, and unattended
-  when `VELSTRA_BOOTSTRAP_PASSWORD` is in the environment.
-* `velstra-cloud-node setup` — say what this machine is and stop there, for a
-  machine joining a cell somebody else runs. `--config <file>` takes the answers
-  from a seed instead of asking, which is the unattended path. etcd, QEMU and Ceph are `Depends:`
-and `Recommends:` resolved against Debian's own packages — a platform that
-vendored its own etcd would be a platform whose security updates are its own
-problem. Removing the package stops the units and leaves the seed: it holds
-which cell this machine belongs to and the credential it was given, so taking it
-would make reinstalling mean re-registering.
-
-## Several cells, one address
-
-A cell is the failure and scaling domain, so a machine belongs to exactly one
-and growing means adding cells. Working across them is several control planes,
-with one (or each) told where the others are:
-
-```nix
-velstra.cloud.controlPlane.cells = {
-  "cell-2" = "https://cell-2.example:8443";
-};
-```
-
-A request then lands in the cell holding the resource. Which cell owns what is
-read from the **projects**, not from that map — the map only says where each
-cell is. A project this installation has not heard of yet is answered locally
-rather than refused: a router a few seconds behind must not turn propagation
-delay into an error a tenant sees. Every forwarded request carries a hop marker,
-so two routers whose directories disagree produce a wrong answer from a named
-cell instead of a loop.
-
-Regions are the coordinate above cells. Both are stamped into every object's
-`meta.placement` at creation and neither can be changed afterwards — a resource
-id that does not carry its cell cannot be routed to the right store.
-
-## Storage: a third module, on purpose
-
-```nix
-{
-  imports = [ velstra.nixosModules.pool ];
-  velstra.cloud.pool = {
-    enable = true;
-    package = velstra-cloud;
-    id = "nvme";                       # matches the `pools/nvme` object
-    backend = "directory";             # or "ceph"
-    store = "127.0.0.1:2379";
-  };
-}
-```
-
-A pool is **not** a machine, which is why this is not part of the node module:
-several nodes reach one Ceph pool, one node may export three volume groups, and
-tying storage to whichever hypervisor happened to be asked is how a volume
-becomes unreachable the moment that node is drained. A box that is both a
-hypervisor and a pool imports both modules and says so.
-
-Three backends, and the choice is about what a volume *is*:
-
-`directory` keeps volumes as qcow2 files and needs nothing but a writable
-directory — with the property worth knowing: everything it holds is on one
-machine, so a guest on such a volume cannot migrate to a node that cannot see
-that directory.
-
-`lvm` makes each volume a logical volume in one volume group, and hands the
-guest the device itself: no image format between it and the disk, and a resize
-is an `lvextend`. `--lvm-group` names the group and has no default — a machine
-may have several, and guessing would put a tenant's bytes in whichever came
-first. `--lvm-thin-pool` is worth answering: a thick snapshot reserves its space
-up front and is dropped by the kernel when it fills, a thin one costs nothing
-until something is written. Same-machine only, like `directory`.
-
-`ceph` keeps them as RBD images, and every node reaches every volume. It works
-against a cluster **this machine deployed** and against an **existing external
-one** — for the second, `VELSTRA_CEPH_CONF` and `VELSTRA_CEPH_USER` are what
-point it at yours, with `VELSTRA_CEPH_POOL` and `VELSTRA_CEPH_IMAGE_POOL` for
-the pools to use. Those are seed keys, so `velstra-cloud-node setup` asks for
-them and the unit picks them up; before this they were command-line only, which
-meant a package install could reach no cluster but its own.
-
-Until this module existed the pool agent was a binary that nothing started, so a
-cell built from this repository could hold a Pool object, a Volume object, and
-no process anywhere that would put a byte on a disk.
-
-## What the checks prove
-
-```
-nix build .#checks.x86_64-linux.dev-smoke        # the dev cell answers, seeded
-nix build .#checks.x86_64-linux.console          # the console suite, real browser
-nix build .#checks.x86_64-linux.node-image-boots # the sealed image boots: verity, parked agent, IOMMU cmdline
-nix build .#checks.x86_64-linux.register         # operator creates node → token → agent reports (two VMs)
-nix build .#checks.x86_64-linux.wizard           # the ISO wizard, driven prompt by prompt onto a blank disk
-nix build .#checks.x86_64-linux.guest            # API → scheduler → agent → a real KVM guest prints a kernel banner
-nix build .#checks.x86_64-linux.maintenance      # a window closes a node to new work, and expiry reopens it
-nix build .#checks.x86_64-linux.storage          # a volume becomes a file, a backup becomes bytes, a restore reads them back
-nix build .#checks.x86_64-linux.setup           # the setup wizard, answer by answer, with the seed read back
-nix build .#checks.x86_64-linux.deb             # what is actually in the Debian package
-```
-
-`guest` needs nested KVM (the agent's QEMU backend is `accel=kvm`, on
-purpose); on a host without it the check fails on the `/dev/kvm` assertion
-rather than pretending TCG proved the same thing.
-
-## Deliberate seams
-
-- **Fabric endpoint**: the agent has a unit now (`velstra-fabric-agent`), and
-  it starts when the seed names a fabric. What is still nobody's default is the
-  *address*: `VELSTRA_FABRIC_CONTROL` has to be answered, because a service
-  pointed at a controller nobody named would be a promise nothing keeps. A node
-  whose seed has no fabric skips the unit rather than failing it — running a
-  cell with no overlay is a real choice, and the skip says so in the journal.
-  Debian also needs the separate Fabric executable at
-  `/usr/local/libexec/velstra-fabric-agent` (or an absolute
-  `VELSTRA_FABRIC_AGENT_BINARY`); `/usr/bin/velstra` is Cloud's CLI. An HTTPS
-  config service needs the data-plane agent's own CA and client certificate.
-- **Update channel**: slot writer shipped, signed channel not yet (above).
-- **Sentinel input**: pinned to the public repository, so the flake evaluates
-  for anybody — it used to point at a sibling checkout by absolute path, which
-  is why none of these checks had ever run in CI. Working on both at once:
-  `--override-input sentinel path:../sentinel` for the length of one command.
-- **Local accounts**: the node image has none — fleet access is through the
-  control plane, break-glass is the console on the ISO. If operations needs an
-  on-box account, that is an installer question plus a module option, added
-  together.
-
-## TLS on the console's own port
-
-`quickstart` makes the machine a self-signed certificate and points the API at
-it, so the console is served over https from the first minute. The API takes any
-PEM pair (`VELSTRA_TLS_CERT` / `VELSTRA_TLS_KEY`, both or neither), and without
-them it serves plaintext and says so in the log.
-
-That used to be the only option, with "put a reverse proxy in front" as the
-documented answer. It is the right answer for a cluster and the wrong one for
-the box that *is* the whole cell: it has nothing in front of it, nobody installs
-nginx to look at a dashboard, and until they did an administrator's password
-crossed the wire in the clear on a port numbered 8443.
-
-**The fingerprint is the point.** A self-signed certificate stops somebody
-reading the password off the wire; it does not tell a browser which machine it
-is talking to, so the browser warns — correctly. The warning is only worth
-something to somebody who can check what they are agreeing to, so `quickstart`
-prints the sha256 of the certificate once, on the machine's own console, in the
-`AB:CD:…` form every browser shows:
-
-```
-  9F:2C:…:41
-
-To use a real certificate instead, put it at /var/lib/velstra/tls/cert.pem and
-its key at /var/lib/velstra/tls/key.pem, then restart velstra-cloud-api.
-```
-
-Nothing is ever overwritten: a second `quickstart` keeps the pair that is there,
-so a real certificate survives a rerun of an installer that is otherwise safe to
-repeat.
+| Before deployment | What to account for |
+| --- | --- |
+| Appliance boot chain | The signed UKI carries the dm-verity root hash. Two store slots use boot counting. Secure Boot demonstration keys ship with the image; enroll keys you control for a fleet. |
+| Writable data | The appliance root is volatile. Persistent seeds, etcd and service data belong on the writable partition under `/var/lib/velstra`. Optional LUKS2 encryption requires a working unlock procedure after power loss. |
+| Remote management | Choose an SSH key or console login during install if needed. Validate access while an independent console is available. |
+| API identity | Debian quickstart provisions a self-signed certificate and prints the fingerprint. Verify it through the host console or install a trusted PEM pair using `VELSTRA_TLS_CERT` and `VELSTRA_TLS_KEY`. Both are required for native TLS. |
+| RBD-backed guests | Use QEMU built with RBD support. Cloud Hypervisor takes a disk path and cannot open the QEMU RBD backend. |
+| Validation | `nix build .#checks.x86_64-linux.node-image-boots` exercises the image and `nix build .#checks.x86_64-linux.guest` boots an actual guest on a KVM-capable runner. |

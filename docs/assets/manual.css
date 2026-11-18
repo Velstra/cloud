@@ -1,0 +1,51 @@
+:root {
+  color-scheme: light;
+  --paper: #faf9f5;
+  --ink: #232521;
+  --muted: #575a52;
+  --line: #d4d4c9;
+  --accent: #a83220;
+  font: 100%/1.65 system-ui, sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+a { color: var(--accent); text-underline-offset: .18em; }
+a:hover { text-decoration-thickness: .14em; }
+:focus-visible { outline: 3px solid #b63722; outline-offset: 3px; }
+.skip { position: absolute; transform: translateY(-150%); padding: .5rem; background: white; }
+.skip:focus { transform: none; }
+
+.mast, footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem max(1.2rem, calc((100vw - 68rem) / 2));
+  border-block-end: 1px solid var(--line);
+}
+.mast img { display: block; max-width: 100%; object-fit: contain; }
+nav { display: flex; flex-wrap: wrap; gap: 1.25rem; }
+nav a, footer a { color: var(--ink); font-size: .94rem; }
+main { width: min(calc(100% - 2.4rem), 52rem); margin: 3rem auto 5rem; overflow-wrap: break-word; }
+h1, h2, h3 { line-height: 1.15; letter-spacing: -.035em; }
+h1 { font-size: clamp(2.3rem, 5.5vw, 3.8rem); }
+h2 { font-size: 1.65rem; margin: 2.6rem 0 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+h3 { font-size: 1.23rem; margin: 1.8rem 0 .65rem; }
+main img { display: block; max-width: 100%; height: auto; margin: 2rem auto; border: 1px solid var(--line); }
+pre { padding: 1rem 1.25rem; background: #252924; color: #faf9f5; overflow: auto; border-radius: .25rem; }
+code { font: .89em/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
+:not(pre) > code { padding: .1em .23em; background: #eaeae2; }
+table { display: block; max-width: 100%; overflow: auto; border-collapse: collapse; }
+td, th { text-align: left; padding: .55rem .75rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { background: #eeeee6; }
+blockquote { border-left: 3px solid var(--accent); color: var(--muted); margin-left: 0; padding-left: 1rem; }
+footer { border-block: 1px solid var(--line); }
+@media (max-width: 38rem) {
+  .mast { align-items: flex-start; flex-direction: column; }
+  main { margin-top: 2rem; }
+  nav { gap: 1rem; }
+}
