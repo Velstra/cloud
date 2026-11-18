@@ -15,6 +15,18 @@ velstra --project p1 get instances too-big --json | jq '.status.conditions'
 
 The first command evaluates the current inventory. When no host fits, `placed` is null and `rejected` contains a host, reason and detail for each refusal. The second reads the scheduler’s last recorded decision. A `Ready=False` condition with reason `NoValidHost` means the scheduler has evaluated the request. If the cluster was just started, allow a reconciliation pass.
 
+One run of the default cell returned this placement report after `web-1` started. The free counts reflect the inventory at query time.
+
+```json
+{
+  "placed": null,
+  "rejected": [
+    {"node": "node-a", "why": "InsufficientVcpus", "detail": "30 free, 64 wanted"},
+    {"node": "node-b", "why": "InsufficientVcpus", "detail": "16 free, 64 wanted"}
+  ]
+}
+```
+
 | What you see | Check next |
 | --- | --- |
 | Node has insufficient free memory | Look for a **single** host with enough headroom. Free memory summed across hosts cannot fit a larger VM. |
