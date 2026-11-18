@@ -30,7 +30,7 @@ In **Nodes**, verify that the host reports capacity. In **Pools**, verify that t
 
 ## Install the sealed appliance
 
-1. Download the ISO and corresponding checksums from one release. Verify the artifact against the checksum obtained from your trusted release source.
+1. Check the [release assets](https://github.com/Velstra/cloud/releases) for an installer ISO and its checksums. If the release includes only a Debian package, build the ISO from the Cloud revision you intend to deploy using the commands below. For downloaded media, verify the checksum from your trusted release source.
 2. Boot the ISO on the target. Identify the target disk by model and capacity. Installing the image overwrites the selected disk.
 3. Select **Start a cell** for the first node, or [join an existing cell](joining.md). Keep the registration material private.
 4. After boot, verify that the node appears under the expected name and reports capacity.

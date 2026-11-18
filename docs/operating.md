@@ -2,6 +2,8 @@
 
 Use the cell operator identity for placement, capacity and host maintenance questions. Tenant users can read the state of their own instances subject to their project permissions. [Connect the CLI](cli.md) before trying the examples.
 
+<a id="1-ask-before-you-act"></a>
+
 ## VM placement
 
 The [development cell](quickstart.md) seeds a VM called `too-big` in project `p1`. It asks for 64 vCPUs and 262144 MiB. Neither default host can satisfy it.
