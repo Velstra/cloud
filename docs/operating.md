@@ -1,442 +1,74 @@
-# Running a cell
+# Diagnose and operate a cell
 
-The day-2 half: what to do when a machine has to come out, when a tenant runs
-out of room, when a guest will not start, and when something has gone wrong and
-nobody can see why.
+Use the cell operator identity for placement, capacity and host maintenance questions. Tenant users can read the state of their own instances subject to their project permissions. [Connect the CLI](cli.md) before trying the examples.
 
-`docs/rest-contract.md` says what each call answers. This says which one to
-reach for, and — more usefully — which of them will tell you the answer
-*before* you commit to anything.
+## VM placement
 
----
+The [development cell](quickstart.md) seeds a VM called `too-big` in project `p1`. It asks for 64 vCPUs and 262144 MiB. Neither default host can satisfy it.
 
-## 1. Ask before you act
-
-Seven calls answer questions that are otherwise found out afterwards, at the
-worst moment. Every one of them is a plain `GET` that changes nothing.
-
-| Question | Ask |
-|---|---|
-| Why is this guest not running? | `…/instances/g1:explainPlacement` |
-| What will taking this machine out cost? | `nodes/node-b:explainMaintenance` |
-| Can this guest move, and where to? | `…/instances/g1:explainMigration` |
-| Is this cell one migration domain? | `nodes:explainCpu` |
-| Has this tenant room, and is it their quota or the machines? | `projects/p1:explainQuota` |
-| What is left in the cell at all? | `nodes:explainCapacity` |
-| Why has this guest not come back? | `…/instances/g1:explainRecovery` |
-
-Two of them are worth reading even when nothing is wrong.
-
-**`:explainMaintenance` before every maintenance window.** It lists the guests
-that *cannot* move. A guest holding a passed-through device is bound to that
-machine and will be stopped when the machine is; finding that out while the
-machine is on a trolley is finding it out too late.
-
-**`:explainQuota` before promising a tenant anything.** It names the binding
-limit. `quota` means a message to you; `cell` means waiting, a smaller shape, or
-another machine. Answering the wrong one sends somebody to buy hardware they do
-not need.
-
----
-
-## 2. Taking a machine out of service
-
-Do not flip switches by hand at two in the morning. Declare the window in
-advance:
-
-```
-POST /api/v1/maintenance-windows
-{ "id": "dimm-swap",
-  "spec": { "node": "node-b", "startsAt": 1755600000000, "minutes": 60,
-            "drain": false, "note": "swapping the failed DIMM in slot 3" } }
+```sh
+velstra --project p1 explain instances too-big placement
+velstra --project p1 get instances too-big --json | jq '.status.conditions'
 ```
 
-* `drain: false` — nothing new is placed there, everything running stays put.
-  A firmware update, a reboot, anything measured in minutes.
-* `drain: true` — and the guests are migrated away first. Pulling the machine.
+The first command evaluates the current inventory. When no host fits, `placed` is null and `rejected` contains a host, reason and detail for each refusal. The second reads the scheduler’s last recorded decision. A `Ready=False` condition with reason `NoValidHost` means the scheduler has evaluated the request. If the cluster was just started, allow a reconciliation pass.
 
-The window is a **declaration**, not a switch. Nothing writes `schedulable` or
-`evacuate` on your behalf, so those two stay yours — and when the window ends,
-service resumes because the window has *stopped being open*. There is nothing
-to flip back and nothing left flipped if a controller died in the middle.
+| What you see | Check next |
+| --- | --- |
+| Node has insufficient free memory | Look for a **single** host with enough headroom. Free memory summed across hosts cannot fit a larger VM. |
+| Node is draining or inside maintenance | Read the window and decide whether to wait or use a different host. |
+| A required device class or affinity rule excludes every host | Compare the instance request to host inventory and existing group membership. |
+| Request rejected at admission | Inspect project quota and permissions. Such a request may never reach the scheduler. |
 
-Two consequences worth knowing:
+## Before maintenance
 
-* A window that has passed is a **record**, not a claim. Leave it; it is the
-  answer to "what did we do to node-b last Tuesday".
-* A node inside an open window is not counted into `largestFit`, so
-  `:explainQuota` stops promising a shape that cannot be placed.
-
-`note` earns its place: it is what turns "no capacity" into "node-b is out
-until 03:00 for the memory swap" wherever a placement is refused.
-
----
-
-## 3. When a machine dies without being asked to
-
-Recovery requires all three:
-
-1. a node fencing deadline (`fenceAfterS`) and the additional recovery margin have elapsed;
-2. the guest requests `onNodeLoss: "restart"` and has storage reachable from its replacement;
-3. a cell operator has confirmed **external fencing** for the node's current last heartbeat.
-
-The agent attempts a hard stop when contact is lost, but a crashed or blocked
-agent cannot guarantee it. A silent host is never proof that its guests stopped.
-Power the host off through an independent management path, keep it off, and
-follow the confirmation procedure in `operations.md`. `:explainRecovery` reports
-`FenceNotConfirmed` until the confirmation is present. A new heartbeat invalidates
-an old confirmation.
-
----
-
-## 3a. Being told
-
-The metrics say everything (`/metrics` on the API and the controller). An
-alert is for the handful of conditions where waiting until somebody reads a
-dashboard is already too late. The controller judges eight, on every resync
-pass, and tells somebody only when one **appears** or **goes away** — a pool at
-85 % is at 85 % on every pass, and what a person wants to hear is that it
-became so:
-
-| rule | severity | fires when |
-|---|---|---|
-| `node-silent` | critical | a machine has not reported for longer than its own `fenceAfterS` plus a minute — external fencing must be checked before recovery may move its guests |
-| `ceph-error` | critical | the cluster says `HEALTH_ERR` |
-| `ceph-osd-down` | critical | a disk is not up, or is up and out |
-| `ceph-warning` | warning | the cluster says `HEALTH_WARN`, with the checks it named |
-| `ceph-nearly-full` | warning | the cluster holds 80 % of its raw capacity |
-| `pool-nearly-full` | warning | a pool has allocated 80 % of its capacity (`--alert-pool-full-percent`) |
-| `quota-exhausted` | warning | a project has used every unit of some dimension, so its next create is refused |
-| `stuck` | warning | an object has disagreed with itself — unconverged, unreported, not ready, deletion blocked — for 15 minutes (`--alert-stuck-after`) |
-
-Two rungs and no more. A scheme with five is a scheme where three of them mean
-"later", and the only decision a rota makes is whether to wake somebody. The
-severity is on the webhook body and in the mail subject, which is what a
-receiver routes on.
-
-**A machine inside a maintenance window does not page.** Declare the window
-before you pull the power and `node-silent` stays quiet until it closes; being
-paged for work you announced is how a team learns to ignore the pager.
-
-Two targets, both optional, both tried, one failing never stopping the other:
-
-```
-velstra-cloud-controller …   --alert-webhook https://hooks.example.org/velstra   --alert-mail-to noc@example.org --alert-mail-from velstra@example.org
+```sh
+velstra explain nodes node-a maintenance
+velstra --project p1 explain instances web-1 migration
+velstra explain projects p1 quota
 ```
 
-The webhook receives one JSON object per transition —
-`{"kind":"firing"|"resolved","rule":…,"severity":…,"subject":…,"message":…,"cell":…,"at":…}`
-— and the mail goes through a sendmail-compatible binary
-(`--alert-sendmail`, `/usr/sbin/sendmail` by default; msmtp works). On NixOS the
-same knobs are `velstra.cloud.controlPlane.alerts.{webhook,mailTo,mailFrom}`.
+The maintenance report lists affected guests. The migration report lists potential destinations with reasons. The quota report distinguishes project limits from physical capacity. A VM that owns a PCI device may need a maintenance outage.
 
-A message a target refuses is **kept and tried again** on the next pass, up to
-a few hundred; `alerts_undelivered` is how many are waiting. Before that they
-were dropped, and the drop was silent — the firing set is updated before
-delivery is attempted, so nothing would ever mention it again.
+Create a **Maintenance window** for a particular node, start time and duration. A window with `drain=false` blocks new placements while existing guests continue. With `drain=true`, check the migration report and wait for guests to move before touching the host.
 
-**Point your monitoring at the heartbeat.** Every rule here fires only when
-something is wrong, so a controller that is down, or has lost the election, or
-whose store reads are failing, produces exactly the stream a healthy cell does:
-none. Once a minute the leader posts
-`{"kind":"heartbeat","rule":"watchdog","subject":<cell>,"firing":<count>,…}` to
-the webhook. Alert on its **absence** — that is the thing that makes the quiet
-mean something.
+## When a host disappears
 
-Only the leader delivers, so a cell with three controllers says each thing
-once. A restarted controller repeats every open alert once, deliberately: for
-something that exists to be noticed, that is the right side to err on. What is
-firing right now is `alerts_firing{rule,severity}` on the controller's metrics,
-and whether deliveries are getting through is
-`alert_deliveries_total{target,outcome}`.
+A missed heartbeat is insufficient evidence that a guest stopped. Check the recovery report and the independent fencing state before authorizing a restart elsewhere.
 
----
-
-## 4. Sharing a processor
-
-```
-PATCH /api/v1/nodes/node-a   { "spec": { "vcpuOvercommit": 4 } }
+```sh
+velstra --project p1 explain instances web-1 recovery
 ```
 
-Placement only: the guest still gets the vCPUs it asked for. What changes is how
-many the cell believes the machine has room for. `nodes:explainCapacity` then
-reports both numbers — `total.vcpus` is silicon, `offeredVcpus` is the promise.
+[Recovery, external fencing and store restore](operations.md) · [Cold migration of local disks](local-disk-migration.md)
 
-There is no memory ratio and there should not be one until this platform can
-take a page back. A guest promised 8 GiB and handed 4 is not slow; it is killed.
+## Choose the right copy
 
----
+| Copy | Protects | What to verify |
+| --- | --- | --- |
+| Volume snapshot | Point-in-time state on its backing pool | Snapshot is ready and the pool survives |
+| Backup to another target | Volume data after loss of the source pool | Restore or verify the backup from the target |
+| etcd snapshot | Cell objects, users, policies and metadata | Restore into an isolated etcd member and read the inventory |
 
-## 5. Keeping guests apart, and together
+If a detached volume remains pending deletion, check the pool agent and its backend. A finalizer can mean disk cleanup is still outstanding. Removing the finalizer bypasses that work.
 
-```
-"placementPolicy": {
-  "antiAffinityGroup": "web", "spread": "Required",
-  "affinityGroup": "checkout", "affinity": "Preferred"
-}
-```
+[Storage and backups](rest-contract.md#backups) · [CPU compatibility](cpu-heterogeneity.md) · [Release rollouts](upgrading.md)
 
-Anti-affinity keeps a service alive when a machine dies. Affinity keeps it fast
-while they all live — an application and the cache it reads on every request.
+## Verify a backup after it was written
 
-`Required` refuses; `Preferred` prefers and takes the second-best rather than
-not running. Three replicas of a database want the first even if it means one
-stays down. Twelve web servers want the second.
+Set the backup target’s `verifyEveryHours` to enable periodic read-back. Its default, zero, schedules no verification. Inspect the **Read back** result and **Trouble** field after a verification pass. Old backups without an original digest can be restorable but unverifiable. Retention counts copies independently of verification; choose an interval that leaves time to react before older good copies expire.
 
----
+To change a volume's backing pool, take a backup to a different target, create a volume in the new pool using `spec.sourceBackup`, then test the restored data before switching attachments. Retain the original volume until the owner confirms the new one.
 
-## 6. Public addresses
+## Know what an image signature covers
 
-Two decisions, and both are worth making on purpose.
+A tenant image may carry an Ed25519 signature over the digest string. Configure trusted image signing keys on the API and node agents, and require signed images on nodes where unsigned guest images must be refused. This policy covers guest images; node release channels have separate verification rules. [Signed images](rest-contract.md#signed-images) · [Node rollouts](upgrading.md)
 
-**Does the guest hold the address?** `delivery: "Routed"` binds it to the
-guest's port and the guest configures it — nothing rewrites a packet, and the
-guest can tell anybody its own address, which SIP, FTP, IPsec and mDNS all need.
-`delivery: "Nat"` keeps it at the edge; the guest never knows.
+## More operator checks
 
-**Who tells the world where it is?**
-
-| | `FromHost` | `FromGateway` |
-|---|---|---|
-| Path | straight to the machine holding the guest | via a gateway, then the overlay |
-| Encapsulation for public traffic | none | both directions |
-| Follows a live migration | by itself | by itself |
-| Needs | every hypervisor to peer upstream | one machine (or a few) to peer |
-| Fails when | the rack will not let hypervisors peer | the gateway is full or down |
-
-`FromHost` is the efficient one and it is the reason the address is a `/32` with
-a next hop in no subnet: nothing is tied to an L2 segment, so the same guest
-configuration is right on every machine, and the announcement follows the guest
-because each host announces the addresses of the ports it holds. There is no
-sequencing to get right — no central thing has to move an address at the same
-moment the guest moves.
-
-Set the cell's usual answer on the external network, and let a particular
-address disagree when it has a reason to.
-
-**Before it works, three things have to be true outside this control plane.**
-Two are yours, one is the fabric's, and none of them is claimed by
-`:explainReach` — that call says who *should* be announcing and what the guest
-was told, never that a session exists.
-
-*Yours:*
-
-1. The prefix is routed to this cell, and the machine doing the announcing has
-   a BGP session with the router above it. A rack decision, not a platform one.
-2. The external network's subnet carries the real prefix and the real upstream
-   gateway.
-
-*The datapath's — and until these are true on a node, that node does not
-configure a routed address into its guests at all.* A guest told to default
-through a next hop nobody answers for is a guest off the network, which is
-worse than an address that does not work; the address stays allocated and its
-condition says so. On the local datapath (`--local-network`) the node answers
-for the next hop and routes the address itself; on a fabric cell these are the
-fabric's open items:
-
-3. **Answer for the next hop.** A guest routes through `169.254.1.1` (or
-   `fe80::1`), which is in no subnet: the host has to answer ARP/ND for it and
-   route what arrives. Without this the guest has an address and no way to send
-   from it.
-4. **Announce a bound address upstream.** `velstra-app/src/wren.rs` already
-   drives Wren for EVPN type-2 inside the fabric; what is missing is announcing
-   a port's *bound* addresses to an external peer, and withdrawing them when the
-   port leaves the host. That is what makes `FromHost` follow a migration — and
-   it is the only piece of that mechanism that does not exist yet.
-5. **List a port's bound addresses.** `PortInfo` reports one address, the fixed
-   one, so the control plane cannot ask whether a public address is still bound
-   and has to remember instead — the one fact in the floating-IP controller that
-   is remembered rather than observed, marked as such in the code. A fabric
-   restored from a snapshot older than the binding will not have it, and nothing
-   notices; clearing `spec.port` and setting it again re-binds.
-
-Everything on the cloud side is in place: the address is allocated, refused
-where it could not work, bound to the port on the fabric, carried into the
-guest's own network configuration, and answerable at `:explainReach`.
-
----
-
-## 6a. Copies: which tool for which loss
-
-| You lost | Reach for |
-|---|---|
-| the last hour's work, pool intact | a **snapshot** (or a snapshot schedule) |
-| the pool | a **backup** (or a backup schedule) |
-| nothing — you want ten more like this one | a **capture**, which becomes an image |
-
-A snapshot lives in the volume's own pool: taken in a moment, costs almost
-nothing, and is lost with the pool it is in. A backup is a copy on a target that
-survives losing the pool. They are not substitutes and the platform will not
-pretend otherwise.
-
-Restoring is making a **new** volume from a copy (`sourceBackup`), never an
-in-place restore: an in-place restore is a command sitting in a spec, performed
-again on every resync, undoing whatever the guest wrote in between. If the copy
-cannot be read — never taken, or its target is not mounted on that pool's
-machine — the volume is refused rather than made blank.
-
-A capture refuses a running guest, and the refusal says why: a disk copied from
-under a running machine is crash-consistent, which a template stamped out a
-hundred times must not be.
-
-### When a pool's backend is unreachable
-
-Nothing on it is provisioned, and the pool says so: `Ready` goes false with
-**`BackendUnreachable`** and the backend's own words. It is written on the
-**pool**, once — one backend being down is one fact, not a hundred identical
-conditions on the volumes waiting for it.
-
-Two things are deliberately preserved while it lasts:
-
-* **The capacity numbers stay**, stale, rather than dropping to zero. Zeroes
-  would tell the scheduler the pool is full, turning "we cannot see it" into a
-  claim nobody made.
-* **The heartbeat keeps moving.** The agent *is* alive; it is the storage behind
-  it that is not, and the condition is where that is said. Silence would be
-  indistinguishable from a dead agent, which is a different problem with a
-  different fix.
-
-Nothing is acted on until the backend can be read again — a pass that worked
-from the last known picture is how a volume gets created twice.
-
-### Moving a volume to another disk
-
-You added an SSD and want a guest's disk on it. **Changing `spec.pool` is
-refused**, and the refusal says why: it moves no bytes. A pool agent watches for
-its own name in that field, so editing it makes the pool holding the volume let
-go and the named pool decline something it does not own — the volume then
-converges on nothing, its data intact on a disk nobody watches any more.
-
-The way that works is the one the refusal points at, and it is four steps
-because each of them is a decision:
-
-1. Back the volume up to a target.
-2. Create a volume in the new pool with `spec.sourceBackup` set to that copy.
-3. Point whatever uses it at the new volume.
-4. Delete the old one.
-
-A first-class "move this volume" does not exist yet, and the reason is not
-oversight: across two machines it is a byte transfer between agents, which is
-the hard half of instance migration all over again. On one machine with two
-disks it would be a copy — worth having, and not yet built.
-
-### Has anybody read it?
-
-"Copied" says an agent once wrote bytes. That is a weaker claim than it looks:
-bit rot, a filesystem that lied about a flush, a target quietly remounted over
-an older copy of itself — none of them change the fact that a write once
-succeeded, and all of them are found at restore time, which is the worst moment
-to find anything.
-
-Set **`verifyEveryHours`** on a target and the copies there are read back and
-checked against what they hashed to when they were written. `0` — the default —
-checks nothing, because reading every byte of every copy is real I/O somebody
-has to decide to spend.
-
-| Column | Means |
-|---|---|
-| Copied | bytes were written |
-| Read back | somebody has since read them and they matched |
-| Trouble | what the last read-back found, when it did not match |
-
-Three things worth knowing about how it behaves:
-
-* **One copy per target per pass**, the one whose check is stalest. The same
-  pass provisions volumes and takes snapshots, and those are not optional — a
-  target with a hundred copies checks each less often rather than starving the
-  work somebody is waiting on.
-* **A failed check never deletes anything.** It may be the copy that rotted, or
-  the filesystem under it, or a restore already running from that very file.
-  The platform says so loudly and leaves the artefact; that decision is yours.
-* **A copy made before this existed reads as `Unverifiable`**, not as good. Its
-  digest was never recorded, and recording one now would only certify whatever
-  is on the target today — which is exactly what is being questioned. `Ready`
-  stays true: the copy is there and restorable, and what is unknown is whether
-  it is intact.
-
-One thing it does **not** do, and is worth holding in your head: retention keeps
-the newest N copies and knows nothing about verification. A run of corrupt
-copies will still push good older ones out. Verify often enough that you find
-out before retention does.
-
----
-
-## 6b. Signed images
-
-An image's digest proves the bytes are the bytes. A signature proves whose
-bytes they are, under a key you chose. One key for the cell, kept off the
-machines, is enough:
-
-```
-openssl genpkey -algorithm ed25519 -out image-signing.pem
-openssl pkey -in image-signing.pem -pubout -outform DER | tail -c 32 | base64 -w0
-```
-
-The second line is the public key as the API and the node agent take it —
-`--image-signing-key <that>` on `velstra-cloud-api` and on
-`velstra-cloud-nodeagent` (or `VELSTRA_IMAGE_SIGNING_KEYS`, comma-separated,
-for several). On NixOS: `velstra.cloud.controlPlane.imageSigningKeys`, and the
-same variable in a node's seed.
-
-Signing is over the digest line, exactly as `spec.digest` carries it:
-
-```
-printf '%s' 'sha256:<64 hex>' | openssl pkeyutl -sign -inkey image-signing.pem -rawin | base64 -w0
-```
-
-Put the result in `spec.signature` when publishing the image (the console's
-image form has it behind *Advanced*). The API stores it only if it verifies,
-refuses it at the field with the reason if it does not, and refuses every
-signature when it was started without a key — a claim nobody can check is
-worse than no claim. A node with `--require-signed-images` fetches nothing
-unsigned, and says so on the guest that asked.
-
----
-
-## 7. When somebody says "I clicked it and nothing happened"
-
-Open the object and read its **History**. It carries two things:
-
-* what was **accepted** — operations, with who asked and whether it finished;
-* what was **refused** — audit records, carrying *the same sentence* the person
-  was given.
-
-Reading only the first is how the conversation goes in circles. The refusal is
-the answer, and the person who was refused can read it themselves: a record is
-readable by whoever may read what it is about, and by the person it is about.
-
----
-
-## 8. The console, in one paragraph
-
-It opens on the **Overview**: what needs attention across every collection, what
-the machines have room for, what is out of service or scheduled to be, and what
-the current project has left. Clicking a row goes to the board the object lives
-on and opens it. `⌘K` finds a collection *or* an object by name. Long boards
-take a label filter (`env=prod, tier=web`), narrowed by the API rather than in
-the browser. Rows can be selected for a bulk start, stop or delete — done one at
-a time, with every refusal reported in the API's own words and the selection
-keeping exactly what did not work.
-
----
-
-## 9. Checks worth running against a real machine
-
-```
-nix build .#checks.x86_64-linux.register -L      # a node registers over a token
-nix build .#checks.x86_64-linux.guest -L         # a guest really boots (needs nested KVM)
-nix build .#checks.x86_64-linux.maintenance -L   # a window closes a node, and expiry reopens it
-nix build .#checks.x86_64-linux.wizard -L        # the installer ISO, prompt by prompt
-nix build .#checks.x86_64-linux.console -L       # the console in a real browser
-```
-
-`register`, `guest` and `maintenance` run a real API, a real controller and a
-real node agent in a VM; `wizard` boots the installer ISO and answers it prompt
-by prompt.
-
-`console` is different and it is worth knowing how: it drives a real browser
-against `fake-api.mjs`, an in-memory implementation of the contract, so it can
-run in a second and without a cell. What keeps that honest is
-`velstra-cloud-api/tests/contract_shapes.rs`, which records the shape of every
-answer the *real* API gives and holds the fixture to it — see the contract
-document's "One recorded shape, two implementations".
+| Task | Read |
+| --- | --- |
+| Find what changed after a request | [Object history](rest-contract.md#the-records-about-one-object) |
+| Understand vCPU overcommit and hard memory limits | [Capacity rules](rest-contract.md#sharing-a-processor-and-never-sharing-memory) |
+| Keep replicas on different hosts | [Affinity and anti-affinity](rest-contract.md#keeping-guests-apart-and-keeping-them-together) |
+| Diagnose floating and guest public addresses | [Address pools](rest-contract.md#public-address-pools-and-who-sees-machines) |

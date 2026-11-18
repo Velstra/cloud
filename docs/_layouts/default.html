@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ page.title | default: 'Documentation' | escape }} · Velstra Cloud</title>
+  <meta name="description" content="{{ page.description | default: site.description | escape }}">
+  <link rel="stylesheet" href="{{ '/assets/manual.css' | relative_url }}">
+</head>
+<body>
+  <a class="skip" href="#manual">Skip to content</a>
+  <header class="mast">
+    <a class="brand" href="{{ '/' | relative_url }}"><img src="{{ '/assets/cloud-logo.svg' | relative_url }}" width="130" height="38" alt="Velstra Cloud"></a>
+    <nav aria-label="Documentation"><a href="{{ '/quickstart.html' | relative_url }}">Quickstart</a><a href="{{ '/operating.html' | relative_url }}">Operate</a><a href="{{ '/api-guide.html' | relative_url }}">API</a><a href="https://github.com/Velstra/cloud">GitHub</a></nav>
+  </header>
+  <main id="manual">{{ content }}</main>
+  <footer><a href="{{ '/' | relative_url }}">Cloud documentation</a><a href="https://github.com/Velstra/cloud/issues">Report a documentation issue</a></footer>
+</body>
+</html>

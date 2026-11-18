@@ -1,278 +1,87 @@
-# Operating a cell
+# Recover and maintain the infrastructure
 
-The short list of things an operator does that are not in the REST contract:
-what to back up, how to restore it, and what to do when a machine is gone.
+This runbook covers control-plane state, host loss and storage. For ordinary VM placement and maintenance decisions, use the [operator guide](operating.md).
 
-## The store is the cell
+## Back up the store
 
-Every object — guests, networks, addresses, users, grants — lives in etcd on
-the control-plane machine. **The guests survive their control plane dying**:
-QEMU keeps running, DHCP and metadata keep answering, nothing a tenant is
-running notices. What dies with the store is the ability to *manage* any of it,
-for ever. So the store is the one thing to back up.
+The etcd store contains resource specifications, observed state, identities and policies. Volume data and release artifacts have separate lifecycles. Configure `VELSTRA_STORE_BACKUP_DIR` on durable storage outside the control-plane machine. Keep the directory private and verify that snapshots continue arriving. The Debian default is `/var/lib/velstra/store-backups`.
 
-The API snapshots it hourly into `VELSTRA_STORE_BACKUP_DIR`
-(`/var/lib/velstra/store-backups` by default on Debian; empty disables), keeps
-the newest 24, and writes each file under a temporary name first — a snapshot
-that exists is a snapshot that finished. **Point the directory at storage that
-is not the control plane's own disk** (an NFS mount, a disk on another
-machine): the failure this exists for is that disk dying.
+Check one snapshot before relying on it. Supply the path of a **completed** snapshot:
 
-## Restoring the store
-
-Before restoring, stop the node and pool agents throughout the cell as well as
-the API and controllers. Their managed guests run in independent units and
-continue running. If a fencing deadline is configured, fence affected hosts
-externally before permitting recovery; do not rely on a stopped agent to fence.
-
-On a fresh or repaired control-plane machine:
-
-```
-systemctl stop velstra-cloud-api velstra-cloud-controller etcd
-etcdutl snapshot restore /path/to/etcd-<newest>.snap \
-  --data-dir /var/lib/etcd.new
-mv /var/lib/etcd /var/lib/etcd.dead && mv /var/lib/etcd.new /var/lib/etcd
-chown -R etcd:etcd /var/lib/etcd    # if etcd runs as its own user
-systemctl start etcd velstra-cloud-api velstra-cloud-controller
+```sh
+etcdutl snapshot status "$SNAPSHOT" --write-out=table
 ```
 
-(Older etcd installs ship the same verb as `etcdctl snapshot restore`.)
+## Rehearse a restore without touching the cell
 
-On the sealed image the store's data directory is **`/var/lib/velstra/etcd`**
-— on the data partition, the one place a reboot of that machine does not
-empty — and the snapshots are beside it under `/var/lib/velstra/store-backups`.
-Substitute that path above; `etcdutl` and `etcd` are on the image.
+Choose a fresh directory and free loopback ports on a rehearsal machine. The following creates a separate etcd member. Leave the live store and its data directory untouched.
 
-What comes back is the cell as of the snapshot, with up to an hour of object
-changes missing. Reconcile the restored inventory with the machines before
-restarting their agents. An agent preserves a local guest whose instance is
-absent or unreadable and logs it for operator reconciliation; it never infers a
-deletion request from that absence. Restore its instance record deliberately or
-stop the orphan explicitly after identifying its unit and disks. Existing
-objects still reconcile to their restored specifications, so inventory review
-is necessary even though absent objects no longer trigger automatic kills.
-
-Two things restore does **not** bring back, by design:
-
-* **Sessions and console tickets** — everybody signs in again.
-* **The store's own history** — watches resume by re-listing, which every
-  agent does on its resync anyway.
-
-### Rehearsing it without touching the cell
-
-A restore procedure nobody has run is a procedure, not a capability. This one
-can be exercised on a live control plane without going near it, because a
-restored store is just a second etcd on other ports:
-
-```
-SNAP=$(ls -t /var/lib/velstra/store-backups/etcd-*.snap | head -1)
-etcdutl snapshot restore "$SNAP" --data-dir /var/lib/etcd.rehearsal \
-  --name rehearsal \
+```sh
+work=$(mktemp -d)
+etcdutl snapshot restore "$SNAPSHOT" --name rehearsal \
+  --data-dir "$work/store" \
   --initial-cluster rehearsal=http://127.0.0.1:23800 \
   --initial-advertise-peer-urls http://127.0.0.1:23800
-etcd --data-dir /var/lib/etcd.rehearsal --name rehearsal \
+etcd --name rehearsal --data-dir "$work/store" \
   --listen-client-urls http://127.0.0.1:23790 \
   --advertise-client-urls http://127.0.0.1:23790 \
   --listen-peer-urls http://127.0.0.1:23800 \
   --initial-advertise-peer-urls http://127.0.0.1:23800 \
-  --initial-cluster rehearsal=http://127.0.0.1:23800 \
-  --initial-cluster-state existing &
+  --initial-cluster rehearsal=http://127.0.0.1:23800
 ```
 
-The `--name` and the peer URL have to be given to **both** commands and have to
-match: `etcdutl` writes the member into the restored data directory, and etcd
-refuses to start against a directory that names a different member. Leaving
-them at the defaults puts the rehearsal on 2380, which is the live store's peer
-port.
+In a separate shell, run `etcdctl --endpoints=http://127.0.0.1:23790 endpoint health`. Inspect the keys for a known resource and compare the snapshot timestamp with the recovery objective. Stop the rehearsal process with Ctrl+C and protect the temporary directory as a copy of the cell.
 
-Then compare, and read something real out of it:
+## Restore after loss
 
-```
-etcdctl --endpoints=127.0.0.1:23790 endpoint health
-etcdctl --endpoints=127.0.0.1:23790 get --prefix --keys-only "" | grep -c .
-etcdctl --endpoints=127.0.0.1:2379  get --prefix --keys-only "" | grep -c .
-etcdctl --endpoints=127.0.0.1:23790 get /<cell>/instances/ --prefix --keys-only
-```
+1. Stop the API, controller, node and pool agents before reintroducing a restored inventory. Managed guest processes may continue running independently.
+2. Retain the original data directory. Restore a known snapshot into a fresh directory using the deployment's actual etcd identity, ownership and membership. Debian and appliance paths differ.
+3. Start the store and verify endpoint health before reconnecting API and controller replicas.
+4. Compare restored instance and pool records with the actual hosts and disks. Reconcile missing or newer objects deliberately, then restart the agents. Existing guests absent from the snapshot need operator reconciliation.
+5. Sign in again and verify a read and reconciliation on the recovered cell. Watches relist; session and console tickets need to be reissued.
 
-A key count one or two short of the live one is the writes since the snapshot,
-not a fault. Afterwards, stop it by port rather than by name — `kill $(ss -lptn
-'sport = :23790' | grep -oP 'pid=\K[0-9]+')` — and remove the directory. A
-restore of a 225 MiB snapshot takes about a second and lands in roughly 280 MiB
-on disk, so check `df` first.
+## Recover after host loss
 
-Done on this cell on 10 September 2026: 234 930 keys against 234 931 live, the
-guests and their specs readable out of the restored store, and the live control
-plane untouched throughout.
+A node may still be running guests after its management path fails. Cordon it and verify external fencing through an independent mechanism. Keep it fenced. Read the node’s last reported heartbeat **after** fencing and use the recovery procedure for that same host and heartbeat:
 
-## When the store filled up anyway
-
-`mvcc: database space exceeded` means history outgrew etcd's quota. The API
-compacts hourly, so this points at something writing far faster than usual —
-find that first. To recover:
-
-```
-export ETCDCTL_API=3
-rev=$(etcdctl endpoint status -w json | jq '.[0].Status.header.revision')
-etcdctl compact "$rev"
-etcdctl defrag --command-timeout=120s
-etcdctl alarm disarm
+```sh
+velstra get nodes node-a --json | jq '.status.lastHeartbeat'
+velstra --project p1 explain instances web-1 recovery
 ```
 
-Compaction stops the growth (freed pages are reused); `defrag` is what shrinks
-the file, and it blocks the store briefly — run it in a quiet moment.
-
-## A machine that stopped answering
-
-The platform deliberately declares no node dead on its own. What you configure
-decides what happens:
-
-* `node.spec.fenceAfterS` — after this many seconds of silence the node's own
-  agent stops its guests (it fences *itself*; it needs no network to do so).
-  `0`, the default, never fences.
-* `instance.spec.onNodeLoss` — `leave` (default) strands the guest until the
-  node returns; `restart` lets the cell start it elsewhere **once the node is
-  externally fenced** and the deadline plus margin has elapsed.
-
-For recovery after a host outage:
-
-1. Cordon the node and fence it through an independent power-management or
-   storage-fencing path. Keep the host fenced until its old workloads have been
-   reconciled; do not boot it into an isolated, stale copy of the cell.
-2. Read `status.lastHeartbeat` from `GET /api/v1/nodes/<id>` after fencing.
-3. As a cell operator, PATCH that node with
-   `{"meta":{"labels":{"velstra.io/fenced-heartbeat":"<lastHeartbeat in milliseconds>"}}}`.
-4. With `fenceAfterS` configured and `onNodeLoss: "restart"`, recovery may proceed
-   after the deadline and margin. A later heartbeat invalidates the confirmation.
-
-This is operator-confirmed recovery, not unattended hardware fencing. Automate
-the confirmation only through an independent fencer that has verified success;
-never set the label merely because a heartbeat expired.
-
-
-## Announcing the cell over BGP
-
-A gateway that should speak BGP needs one thing installed by hand: `apt-get
-install frr`. Everything else is the platform's — the agent enables `bgpd`
-(and `staticd`, for the blackhole routes that satisfy `network` statements),
-renders `/etc/frr/frr.conf` from the `bgp-peers` objects, and reloads FRR only
-when the derived announcement set actually changed.
-
-Create a session as the operator:
-
-```
-POST /api/v1/bgp-peers
-{ "id": "edge", "spec": { "peer": "10.10.10.1", "peerAs": 65000,
-                          "localAs": 65010, "node": "gw-1" } }
-```
-
-`status.session` reports FRR's own word (`Established`, `Active`, …) and
-`status.announced` the prefix count. What is announced is derived: every
-external subnet, plus a host route per floating address that names a port.
-The far end must accept eBGP without an import policy or carry its own
-(RFC 8212 — modern FRR filters everything until a policy exists; the rendered
-config on our side already says `no bgp ebgp-requires-policy` because the
-network statements *are* the policy).
-
+Only after confirming that external fencing succeeded, a cell operator may record the millisecond heartbeat as string label `velstra.io/fenced-heartbeat` on that node. A newer heartbeat invalidates the confirmation. Recovery also requires a configured fence deadline, elapsed margin, an instance with restart-on-loss policy and accessible storage. Investigate `FenceNotConfirmed` before proceeding.
 
 ## Ceph pools for the cell
 
-Two units serve pools on one machine: `velstra-cloud-poolagent` for its local
-disks and `velstra-cloud-poolagent-ceph` for the cluster. The second does
-nothing unless the seed names `VELSTRA_CEPH_POOL_ID` — **the pool object's id
-in this cell**, what a volume's `spec.pool` names, as against
-`VELSTRA_CEPH_POOL` / `VELSTRA_CEPH_IMAGE_POOL`, which are RBD pools inside
-the cluster.
+A pool object represents the Velstra allocation target; the RBD pool stores the bytes. Configure the Ceph pool agent with the correct pool ID, RBD pool, cluster configuration and credentials. The `velstra-cloud-poolagent-ceph` unit is separate from the local pool agent.
 
-Bringing one up, in the order the platform expects:
+```sh
+systemctl status velstra-cloud-poolagent-ceph --no-pager
+velstra get pools
+```
 
-1. `apt-get install cephadm podman` on the machines that will run daemons.
-2. Create the `ceph-clusters` object (monitors, OSDs, pools). The agents
-   bootstrap, add hosts and create the pools by themselves; the board says
-   which step is outstanding and who owns it.
-3. Create a `pools` object for it (`POST /api/v1/pools`, id `ceph`), put its
-   id in the seed as `VELSTRA_CEPH_POOL_ID`, and start
-   `velstra-cloud-poolagent-ceph`.
-4. Publish images into the cluster once, from any machine with the keyring:
-   `velstra-cloud-poolagent --import-image images/sha256-… --from <file>
-   --backend ceph`. The image lands in the image pool with a protected
-   `@base` snapshot, and every volume made from it is an `rbd clone` — no
-   bytes move, and "which nodes hold this image" stops being a question.
-
-More RBD pools use the same sequence. Add the RBD pool on the Ceph object's
-**Pools** field first; the Ceph controller creates it and reports `Expanding`
-while it does so. Then create one Velstra `pools` object and run one Ceph pool
-agent for that RBD pool. The two names are intentionally separate: for example,
-Velstra pool `archive` can serve RBD pool `tenant-archive`.
-
-Removing an RBD pool is explicit: edit the Ceph cluster and mark that pool for
-removal. The agent first asks Ceph for its object count and refuses deletion
-unless it is zero; merely omitting a pool from an older manifest never destroys
-it. Once Ceph reports it absent, the removal is settled and the console offers
-to remove the completed row from the spec.
-
-The Velstra pool's **Projects** field limits new placement. Empty or `*` means
-every project; `projects/team-a` and `projects/team-b` make it available only to
-those projects. Both an explicitly named pool and the cell's automatic choice
-enforce the list. Removing a project is a drain of access: its existing volumes
-stay and new ones are refused or placed elsewhere.
-
-**A pool object with no agent is a black hole, and the cell now says so.**
-Steps 3 and 4 are easy to leave half-done — the `pools` object exists, the
-agent was never started — and the result is a pool that swallows work
-silently: a volume created on it waits for ever, and a volume *deleted* from it
-keeps its `pool.velstra.io/release` finalizer for ever, because the agent that
-would remove it does not exist. The `pool-unwatched` alert fires for a pool
-nothing has ever reported on, and again for one whose agent has stopped (ten
-minutes by default, `--alert-pool-silent-after`). If you find such a pool with
-volumes already stuck on it, the way out is to start its agent — nothing else
-removes that finalizer, by design: a platform that dropped it would be
-declaring bytes released that nobody has released.
-
-Two things Ceph itself insists on, both handled by the platform and both worth
-knowing when reading a cluster by hand: a pool with `size: 1` needs
-`mon_allow_pool_size_one` set globally *and* `--yes-i-really-mean-it` on the
-`set`; and `ceph-volume` refuses a whole disk that carries a partition table,
-so a disk that was something else has to be wiped (`wipefs -a`) before it can
-be an OSD.
-
-## Guest metadata access
-
-Cloud's NixOS modules use the native nftables host firewall. The node's Podman
-networking also selects nftables. Fabric continues to enforce its dataplane
-policies through eBPF/XDP; nodes using the local networking mode use nftables
-for guest filtering and NAT. The Debian package does not replace an existing
-operator-managed host firewall.
-
-The NixOS node firewall allows metadata HTTP only to `169.254.169.254:80`
-from the default guest bridges (`vbr+`) and taps (`vt+`). When using custom
-guest-facing interface names, set `velstra.cloud.node.metadataInterfaces`
-accordingly. Do not include uplinks or open port 80 globally. Unknown guest
-addresses still receive no metadata from the node agent.
+Check the backend condition before offering the pool to a project. If a volume or deletion stalls, restore agent/backend health before intervening in the volume lifecycle. The pool agent owns physical cleanup. [Storage semantics](rest-contract.md#storage)
 
 ## Replicated control planes and release storage
 
-The bundled etcd is a single-member development/small-cell default and is a
-single point of failure. For an HA cell, declare the complete odd quorum and
-run [`deploy/control-plane/reconcile.sh`](../deploy/control-plane/README.md)
-from the hardware deployment pipeline. It snapshots the live store, admits
-missing members idempotently, writes the complete membership and client
-endpoint set to every replica, rolls the services, and removes a voter it
-admitted when that join fails. A running member absent from the inventory is a
-hard error rather than an implicit destructive removal.
+The bundled single-member etcd setup cannot tolerate losing its only voter. For a replicated deployment, declare a complete odd voting set and follow the [control-plane reconciliation procedure](https://github.com/Velstra/cloud/blob/main/deploy/control-plane/README.md). Use mutually authenticated etcd connections and verify membership and health on every replica.
 
-Production etcd endpoints should use mutual TLS. Set `VELSTRA_STORE_CA` for a
-private CA and `VELSTRA_STORE_CERT` plus `VELSTRA_STORE_KEY` for the API and
-controller client identity; the reconciler writes these from its per-member
-mTLS inventory. Certificate and key must be set together, and a client identity
-without a CA is refused. Plaintext membership requires the reconciler's
-explicit `etcd.allowPlaintext=true` setting and is intended for isolated labs.
+Mount the same durable `VELSTRA_RELEASES_DIR` on all API and controller replicas and back it up separately. A restored etcd record can say an artifact is ready while the bytes it references are missing on an individual replica.
 
-All API and controller replicas must mount the **same durable release directory**
-at `VELSTRA_RELEASES_DIR` (default `/var/lib/velstra/releases`). Release readiness
-is shared in etcd, while downloads are served from this directory. A controller
-re-fetches missing artifacts after disk loss; a replica with an unrelated local
-directory cannot serve another replica's files. Back up or replicate this
-storage separately from the etcd snapshots.
+[Guest networking and security groups](rest-contract.md#security-groups) · [Release rollouts](upgrading.md)
 
-Snapshots are created with mode 0600 inside a mode-0700 directory. Preserve
-these permissions on remote backup storage: snapshots contain private cell data.
+## If etcd reports database space exceeded
+
+Inspect the write rate and available disk space first. Take a verified snapshot, then plan compaction and per-member defragmentation for the affected cluster. Defragmentation blocks that member while it runs. Recheck health and disk use before clearing a space alarm. Use the deployment's TLS credentials for all `etcdctl` calls. A production quorum restore must use the intended membership and the same snapshot for each member.
+
+## Connect Ceph clients
+
+Ensure host-native `librbd` and the QEMU RBD driver support the network cluster's authentication format. A working CLI in a `cephadm` container does not verify that host QEMU can open the volume. Specify compatible Ceph and client versions before admitting workloads. Never reinitialize a disk containing useful data to satisfy OSD selection.
+
+The agent obtains the managed Ceph configuration and client keyring for its configured pools. Restrict access to keyrings. A pool can restrict project access; removing a project stops new placement there while existing volumes remain. When retiring a pool, verify ownership, move dependencies and confirm it is empty before requesting removal.
+
+## Check announcements and guest metadata
+
+Gateway node agents render FRR from operator-managed BGP peer objects. Install FRR on Debian gateways, configure the adjacent router's import/export policy, and inspect the reported session and actual announcement count. [BGP peer contract](rest-contract.md#bgp-peers-announcing-the-cell-to-the-router-in-front-of-it)
+
+Guest metadata is scoped to the guest network. If defaults `vbr+` or `vt+` do not match your guest-facing interfaces, set the NixOS node's `metadataInterfaces` option to the intended bridges or taps. Keep the uplink out of that list. Verify metadata access from a test guest before changing host firewall rules.

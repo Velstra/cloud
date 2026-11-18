@@ -1,52 +1,24 @@
-# Velstra Cloud
+# Velstra Cloud documentation
 
-A virtualisation platform for people who want OpenStack's separation without
-OpenStack's weight, and Proxmox's directness without its ceiling.
+Build a self-hosted cell for tenant VMs, volumes and networks. Each instance records both what you asked for and what its host observed. Use the placement report to find out why a request is waiting.
 
-Everything the platform decides, it says out loud: what was asked for and what
-is actually running are two columns, never one; a guest that will not place
-names the rule that stopped it; a backup says whether anybody has read it back.
+## Start with a working cell
 
----
+[Run the development quickstart](quickstart.md) to compare a running instance with one that cannot fit anywhere. The two simulated hosts need no KVM device. To boot real guests, use the [installation guide](install.md).
 
-## Start here
+## Choose a task
 
-**[Quick start](quickstart.md)** — one machine, from nothing to a guest you can
-log into, with pictures of the console it describes. Twenty minutes, most of it
-waiting for a download.
+| Task | Start here |
+| --- | --- |
+| Install a node or control plane | [Installation options](install.md) |
+| Add compute, storage or a second cell | [Set up a cell](setup-guide.md) · [Join a node](joining.md) |
+| Diagnose a VM or plan maintenance | [Operator guide](operating.md) |
+| Check processor compatibility before a move | [CPU compatibility](cpu-heterogeneity.md) |
+| Move a guest whose root disk is local | [Local disk migration](local-disk-migration.md) |
+| Restore the store or recover after host loss | [Recovery runbook](operations.md) |
+| Update a group of nodes | [Release rollouts](upgrading.md) |
+| Script against the cell | [CLI guide](cli.md) · [REST recipes](api-guide.md) |
+| Look up wire semantics or generate a client | [REST contract](rest-contract.md) · [OpenAPI JSON](openapi.json) |
+| Understand image packaging or allocate PCI hardware | [Deployment and devices](deployment-and-devices.md) |
 
-Three machines rather than one? Start there anyway. A cell of one is the same
-platform with fewer boxes in it.
-
----
-
-## Then, when you have a reason
-
-| You want | Read |
-|---|---|
-| a second and third machine, or several cells | [Setting up a cell](setup-guide.md) |
-| to run it day to day: maintenance, recovery, which copy survives which loss | [Operating it](operating.md) |
-| the appliance image, the installer ISO, the Debian package | [Installing it](install.md) |
-| to drive it from a terminal or a script | [The command line](cli.md) |
-| to drive it from a program | [The REST contract](rest-contract.md) |
-| to generate a client, or feed an IDE | [`openapi.json`](openapi.json) — OpenAPI 3.1, generated from the router and served at `/api/v1/openapi.json` |
-| a cell of mixed processor generations | [CPU heterogeneity](cpu-heterogeneity.md) |
-| the decision record behind the packaging | [Deployment and devices](deployment-and-devices.md) |
-
----
-
-## What it looks like
-
-The boards show two things most platforms collapse into one. **Asked** is what
-you wanted; **State** is what the node reports. When they differ, that is the
-interesting moment — and hiding it behind a single "status" is how a guest sits
-stopped for a week while a dashboard says Running.
-
-![The instances board](images/instances.png)
-
----
-
-## Licence
-
-AGPL-3.0-or-later — the same model Proxmox and VyOS use. The source is at
-[github.com/Velstra/cloud](https://github.com/Velstra/cloud).
+![Instances board showing requested and observed state](images/instances.png)
