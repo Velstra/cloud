@@ -1,5 +1,10 @@
 # Velstra Cloud
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/logo-on-dark.svg">
+  <img src=".github/brand/logo.svg" alt="Velstra Cloud" height="72">
+</picture>
+
 An IaaS control plane: OpenStack's scope and tenancy, Proxmox's operational
 feel, hyperscaler mechanics underneath. The network is
 [Velstra fabric](https://github.com/Velstra/fabric), the eBPF/XDP SDN this is
