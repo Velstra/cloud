@@ -582,6 +582,19 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
+      # `cargo-deny` judges the resolved build graph for the targets in
+      # `deny.toml`; a crate that sits in Cargo.lock behind a feature nothing
+      # enables (quinn under reqwest's `http3`) is invisible to it. `cargo
+      # audit` reads every entry in Cargo.lock, which is what anybody outside
+      # this repository runs against it. Both run, so the two can no longer
+      # disagree silently: a dormant entry with an advisory fails here too and
+      # gets bumped instead of lingering until somebody else finds it.
+      - name: Every Cargo.lock entry has no advisory
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-audit --version 0.23.0
+          cargo audit
+
       # The bill of materials, in the format an auditor and a scanner both
       # read. Attached to the run rather than committed: it is a fact about a
       # build, and a file in the tree would be a fact about whenever somebody
