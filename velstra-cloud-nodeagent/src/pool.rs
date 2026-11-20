@@ -106,7 +106,7 @@ impl PoolState {
 /// because the mount is gone and what is left is the empty mountpoint on the
 /// root disk — which is the failure this exists to catch, and the one a stat
 /// cannot see.
-fn look_at_target(path: &str) -> (bool, u64, Option<String>) {
+fn look_at_target(path: &str, free_space: FreeSpace) -> (bool, u64, Option<String>) {
     let dir = std::path::Path::new(path);
     if !dir.is_dir() {
         return (
@@ -124,8 +124,19 @@ fn look_at_target(path: &str) -> (bool, u64, Option<String>) {
         return (false, 0, Some(format!("{path} cannot be written: {e}")));
     }
     let _ = std::fs::remove_file(&probe);
-    (true, free_gib(dir), None)
+    (true, free_space(dir), None)
 }
+
+/// How a pool agent measures the room left on a backup target, in GiB.
+///
+/// A plain function rather than a call to `df` hard-wired into
+/// [`look_at_target`], so the agent's own tests can say how full a target is.
+/// They used to measure whatever filesystem `$TMPDIR` happened to be on, and
+/// every backup test failed with `NoRoom` on a machine with less than
+/// [`velstra_cloud_model::backup::TARGET_HEADROOM_GIB`] free there — the
+/// production guard firing on a test fixture. Production always uses
+/// [`free_gib`].
+type FreeSpace = fn(&std::path::Path) -> u64;
 
 /// How much room is left where this path is. Zero when it cannot be asked,
 /// which reads as "unknown" everywhere it is shown rather than as "full".
@@ -431,6 +442,9 @@ pub struct PoolAgent {
     /// API and no store. It had grown the *reading* half of the API path and its
     /// own comment said so.
     sink: Option<Arc<dyn crate::sink::StatusSink>>,
+    /// How the room left on a backup target is measured. Always [`free_gib`]
+    /// outside this module's tests; see [`FreeSpace`].
+    free_space: FreeSpace,
 }
 
 /// Keep disk exports out of the reconciliation loop. A source stays reserved
@@ -509,7 +523,17 @@ impl PoolAgent {
             cell: reader,
             storage,
             sink: None,
+            free_space: free_gib,
         }
+    }
+
+    /// The same agent, measuring backup targets with `free_space` instead of
+    /// `df`. Only for tests: a fixture's room must not depend on the disk the
+    /// test happens to run on.
+    #[cfg(test)]
+    fn measuring_free_space_with(mut self, free_space: FreeSpace) -> Self {
+        self.free_space = free_space;
+        self
     }
 
     pub fn pool(&self) -> &str {
@@ -874,7 +898,7 @@ impl PoolAgent {
         pass: &mut Pass,
     ) -> velstra_cloud_model::resources::BackupTarget {
         {
-            let (writable, free_gib, why) = look_at_target(&target.spec.path);
+            let (writable, free_gib, why) = look_at_target(&target.spec.path, self.free_space);
             next.status.writable = Some(writable);
             next.status.free_gib = free_gib;
             next.status.observed_generation = target.meta.generation;
@@ -2297,6 +2321,8 @@ mod tests {
     use super::*;
 
     const VOLUME: &str = "projects/p1/volumes/data-1";
+    /// What a fixture backup target reports as free: far above the headroom.
+    const AMPLE_GIB: u64 = 1000;
 
     #[tokio::test]
     async fn a_pool_fetches_and_verifies_an_uncached_image_before_using_it() {
@@ -2497,7 +2523,10 @@ mod tests {
             targets: TypedStore::new(store.clone(), "cell-1", "backup-targets"),
             fake: fake.clone(),
         };
-        let agent = PoolAgent::new(store, PoolConfig::new(pool, "eu", "cell-1"), Arc::new(fake));
+        // Every fixture target has ample room, whatever the disk under
+        // `$TMPDIR` has left. The one test about a full target says so itself.
+        let agent = PoolAgent::new(store, PoolConfig::new(pool, "eu", "cell-1"), Arc::new(fake))
+            .measuring_free_space_with(|_| AMPLE_GIB);
         (cell, agent)
     }
 
@@ -3878,6 +3907,49 @@ mod tests {
                 ))
                 .is_none(),
             "bytes were written to a target that is not accepting"
+        );
+    }
+
+    /// A target with less than the headroom left refuses the copy before a
+    /// byte is read, and says so on the backup. The room is the agent's own
+    /// measurement, injected here so the test does not depend on how full the
+    /// disk under `$TMPDIR` is (STATIC-12) — and asserted on the target, so
+    /// the refusal is known to come from that measurement and not from
+    /// something earlier in the pass.
+    #[tokio::test]
+    async fn a_target_below_the_headroom_refuses_the_copy_and_says_so() {
+        let (cell, agent) = cell("nvme");
+        let agent = agent
+            .measuring_free_space_with(|_| velstra_cloud_model::backup::TARGET_HEADROOM_GIB - 4);
+        cell.register_pool("nvme").await;
+        cell.volume("nvme", 40).await;
+        cell.target("archive", true, true).await;
+        cell.backup("b1", "nvme", "archive").await;
+        for _ in 0..3 {
+            agent.resync().await;
+        }
+
+        let target = cell.reload_target("archive").await;
+        assert_eq!(target.status.writable, Some(true), "{:?}", target.status);
+        assert_eq!(
+            target.status.free_gib,
+            velstra_cloud_model::backup::TARGET_HEADROOM_GIB - 4,
+            "the pass never measured the target"
+        );
+        let refused = cell.reload_backup("b1").await;
+        assert!(!refused.status.taken, "a copy was made onto a full target");
+        let ready = velstra_cloud_model::meta::condition(&refused.status.conditions, "Ready")
+            .expect("a backup that was not made says why");
+        assert_eq!(ready.status, ConditionStatus::False);
+        assert_eq!(ready.reason, "NoRoom", "{ready:?}");
+        assert!(
+            cell.fake
+                .copied_out(&backup_path(
+                    &cell.target_dir("archive", true),
+                    "projects/p1/backups/b1"
+                ))
+                .is_none(),
+            "bytes were written to a target below the headroom"
         );
     }
 
